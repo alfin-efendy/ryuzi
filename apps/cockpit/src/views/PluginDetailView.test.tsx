@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { DoctorFinding, PluginDetail } from "@/bindings";
+import type { DoctorFinding, ExtensionStatusEntry, PluginDetail } from "@/bindings";
 
 // The view fetches straight from `commands.pluginDetail` (bypassing the
 // `usePlugins` list store, which only carries the flattened `PluginInfo`)
@@ -135,6 +135,45 @@ const sandboxDetail: PluginDetail = {
   models: [],
   homepage: "https://vercel.com/docs/vercel-sandbox",
   publisher: "Vercel (no MCP surface)",
+};
+
+// A plugin declaring an `[[extension]]` (Track D "code plugin") capability —
+// exercises the Extension status card (DT8), gated on
+// `info.capabilities.includes("extension")`.
+const extensionDetail: PluginDetail = {
+  info: {
+    id: "acme-ext",
+    name: "Acme Ext",
+    description: "Ships a supervised extension subprocess.",
+    icon: "sparkles",
+    categories: [],
+    slot: null,
+    ownsSlot: false,
+    verified: false,
+    experimental: false,
+    enabled: true,
+    source: "catalog",
+    capabilities: ["extension"],
+    configured: false,
+    kind: "integration",
+    installed: false,
+    family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
+  },
+  auth: null,
+  settings: [],
+  mcp: [],
+  models: [],
+  homepage: null,
+  publisher: "Acme",
 };
 
 // Installed via the tracked git-clone path — carries a full
@@ -315,6 +354,7 @@ const pluginDetail = mock((id: string) => {
   if (id === "acme-oauth") return ok(oauthDetail);
   if (id === "acme-rich") return ok(richFieldsDetail);
   if (id === "vercel-sandbox") return ok(sandboxDetail);
+  if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
   return err("unknown plugin");
 });
@@ -334,6 +374,8 @@ const pluginsRestartRequired = mock(() => ok(false));
 const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
+let extensionStatusFixture: ExtensionStatusEntry[] = [];
+const extensionStatus = mock(() => ok(extensionStatusFixture));
 const updatePlugin = mock((_id: string, _force: boolean) => ok({ kind: "updated" as const }));
 const setPluginPin = mock((id: string, pinned: boolean, _reason: string | null) => {
   if (id === "acme-pack") acmePackPinned = pinned;
@@ -375,6 +417,7 @@ mock.module("@/bindings", () => ({
     pluginDoctor,
     updatePlugin,
     setPluginPin,
+    extensionStatus,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -402,7 +445,9 @@ beforeEach(() => {
   pluginDoctor.mockClear();
   updatePlugin.mockClear();
   setPluginPin.mockClear();
+  extensionStatus.mockClear();
   doctorFindingsFixture = [];
+  extensionStatusFixture = [];
   acmePackPinned = false;
   openUrl.mockClear();
   usePlugins.setState({
@@ -679,4 +724,77 @@ test("omits the attach-failed banner when doctor has no finding for this plugin"
   await screen.findByText("GitHub");
 
   expect(screen.queryByText("Attach failed")).toBeNull();
+});
+
+// ---------- Extension (Track D "code plugin") status card — DT8 ----------
+
+test("a non-extension plugin never calls extension_status and renders no Extension card", async () => {
+  render(<PluginDetailView id="github" />);
+  await screen.findByText("GitHub");
+
+  expect(extensionStatus).not.toHaveBeenCalled();
+  expect(screen.queryByText("Extension")).toBeNull();
+  expect(screen.queryByText("Runs code")).toBeNull();
+});
+
+test("an extension-capable plugin fetches extension_status and shows the Runs code badge", async () => {
+  extensionStatusFixture = [];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(screen.getByText("Runs code")).toBeTruthy();
+  expect(await screen.findByText("Extension")).toBeTruthy();
+  await waitFor(() => expect(extensionStatus).toHaveBeenCalled());
+  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
+});
+
+test("renders a Running extension's status badge", async () => {
+  extensionStatusFixture = [
+    {
+      pluginId: "acme-ext",
+      name: "linter",
+      status: "running",
+      restartCount: 0,
+      lastError: null,
+      confirmedEvents: ["tool.before"],
+      toolCount: 2,
+    },
+  ];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(await screen.findByText("linter")).toBeTruthy();
+  expect(screen.getByText("Running")).toBeTruthy();
+  expect(screen.queryByText(/restart/)).toBeNull();
+});
+
+test("renders a Failed extension's restart count and sanitized last error", async () => {
+  extensionStatusFixture = [
+    {
+      pluginId: "acme-ext",
+      name: "linter",
+      status: "failed",
+      restartCount: 5,
+      lastError: "linter: restart-exhausted: 5 restarts within 300s",
+      confirmedEvents: [],
+      toolCount: 0,
+    },
+  ];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(await screen.findByText("Failed")).toBeTruthy();
+  expect(screen.getByText("5 restarts")).toBeTruthy();
+  expect(screen.getByText("linter: restart-exhausted: 5 restarts within 300s")).toBeTruthy();
+});
+
+test("extension_status entries for a different plugin are filtered out", async () => {
+  extensionStatusFixture = [
+    { pluginId: "other-plugin", name: "other", status: "running", restartCount: 0, lastError: null, confirmedEvents: [], toolCount: 0 },
+  ];
+  render(<PluginDetailView id="acme-ext" />);
+  await screen.findByText("Acme Ext");
+
+  expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
+  expect(screen.queryByText("other")).toBeNull();
 });

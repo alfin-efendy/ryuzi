@@ -155,6 +155,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::plugins_restart_required,
             plugins_cmd::refresh_catalog,
             plugins_cmd::catalog_status,
+            plugins_cmd::extension_status,
             session_io::export_session,
             session_io::import_session,
             session_io::share_session,

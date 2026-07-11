@@ -1181,6 +1181,22 @@ async catalogStatus() : Promise<Result<CatalogStatus, CmdError>> {
 }
 },
 /**
+ * Per-extension live state (running/starting/restarting/failed/stopped/
+ * not-running), restart count, and sanitized last error — one entry per
+ * extension the daemon's `ExtensionHost` currently knows about, across
+ * every enabled extension-capable plugin. Read-only, never mutates state
+ * (no spawn/restart/shutdown). `PluginDetailView` calls this for an
+ * extension-capable plugin and filters the result down to its own `id`.
+ */
+async extensionStatus() : Promise<Result<ExtensionStatusEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("extension_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -1492,12 +1508,54 @@ export type DoctorFinding = { pluginId: string;
  */
 severity: string; 
 /**
- * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked`.
+ * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked` |
+ * `slot-conflict` | `not-running` | `crashed` | `restart-exhausted` |
+ * `init-failed` (the last four are Track D extension findings — DT8,
+ * see `crate::plugins::doctor::plugin_doctor`'s extension section).
  */
 kind: string; message: string; suggestedAction: string }
 export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
+/**
+ * `extension_status` rpc result — one entry per extension (Track D "code
+ * plugin") the daemon's `ExtensionHost` currently knows about (DT8). Mirrors
+ * `plugins::extension::{ExtensionSnapshot, ExtensionStatus}` flattened into
+ * a specta-able, UI-friendly shape (same rationale as `DoctorFinding`
+ * mirroring `plugins::doctor::DoctorFinding`) rather than deriving `Type` on
+ * the core enum directly. `crate::api::extension_status_api` builds these
+ * field by field (no `From` impl) since `ExtensionStatus::Failed`'s reason
+ * needs to fan out into both `status` (the canned string) and `last_error`
+ * (the sanitized detail) — a single `From` conversion would need the same
+ * branching anyway.
+ */
+export type ExtensionStatusEntry = { pluginId: string; 
+/**
+ * The manifest's `[[extension]] name` — unique within its own plugin,
+ * not globally (mirrors `ExtensionSnapshot::name`'s own namespace note).
+ */
+name: string; 
+/**
+ * `running` | `starting` | `restarting` | `failed` | `stopped` |
+ * `not-running` (the last one has no `ExtensionStatus` counterpart — it
+ * means the plugin declares an extension and is enabled, but the host
+ * has no spawned entry for it at all, e.g. a still-pending spawn or a
+ * resolution failure prior to ever reaching `Failed`).
+ */
+status: string; 
+/**
+ * Lifetime count of restart attempts DT4's supervisor has made for this
+ * entry. Always `0` for an entry that has never needed a restart
+ * (including the synthetic `not-running` entries, which were never
+ * spawned at all).
+ */
+restartCount: number; 
+/**
+ * Present only when `status == "failed"` — `ExtensionStatus::Failed`'s
+ * already-sanitized reason (`proc::sanitize_init_error`/the
+ * `restart-exhausted: ...` marker), never extension-supplied raw text.
+ */
+lastError: string | null; confirmedEvents: string[]; toolCount: number }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**

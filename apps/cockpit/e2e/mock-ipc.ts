@@ -337,6 +337,12 @@ const FIXTURES: Record<string, unknown> = {
   // `CatalogStatus` shape.
   catalog_status: { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
   refresh_catalog: { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
+  // An extension-capable plugin's detail view calls `extension_status` on
+  // mount (Track D observability, DT8) — same "without a fixture the
+  // unmocked fallback returns `null` and the view crashes" lesson as
+  // `catalog_status` above. Empty list is a safe default (no plugin in these
+  // fixtures declares an `extension` capability).
+  extension_status: [],
   get_setting: null,
   backdrop_capability: "none",
   system_accent_color: null,

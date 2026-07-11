@@ -15,7 +15,7 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
-import { commands, events, type PluginDetail } from "@/bindings";
+import { commands, events, type ExtensionStatusEntry, type PluginDetail } from "@/bindings";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
@@ -35,6 +35,46 @@ function shortCommit(commit: string): string {
  *  `PluginInfo.installedAt`/`updatedAt`). */
 function formatLedgerTimestamp(ms: number): string {
   return new Date(ms).toLocaleDateString();
+}
+
+/** Human label for an `ExtensionStatusEntry.status` value (Track D
+ *  observability, DT8). Pure and exported so it stays unit-testable without
+ *  mounting the view — mirrors `PluginsView.tsx`'s `catalogStatusLabel`
+ *  convention. */
+export function extensionStatusLabel(status: string): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "starting":
+      return "Starting";
+    case "restarting":
+      return "Restarting";
+    case "failed":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+    case "not-running":
+      return "Not running";
+    default:
+      return status;
+  }
+}
+
+/** `Pill` color variant for an `ExtensionStatusEntry.status` value — green-ish
+ *  "primary" for healthy/running, "warn" amber for a mid-restart/transient
+ *  state, "danger" red for failed, muted "secondary" for stopped/not-running. */
+export function extensionStatusPillVariant(status: string): "primary" | "warn" | "danger" | "secondary" {
+  switch (status) {
+    case "running":
+      return "primary";
+    case "starting":
+    case "restarting":
+      return "warn";
+    case "failed":
+      return "danger";
+    default:
+      return "secondary";
+  }
 }
 
 // One label+input+Save row, shared by the auth credential and every
@@ -162,6 +202,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const [oauthCode, setOauthCode] = useState("");
   const [oauthBusy, setOauthBusy] = useState<"begin" | "complete" | "disconnect" | null>(null);
   const [updatingPack, setUpdatingPack] = useState(false);
+  const [extensionEntries, setExtensionEntries] = useState<ExtensionStatusEntry[]>([]);
   // Scroll targets for the attach-failure banner's "Configure" affordance —
   // whichever of Authentication/Settings actually rendered (each ref only
   // attaches when its section is present, so an absent section reads as
@@ -192,6 +233,26 @@ export function PluginDetailView({ id }: { id: string }) {
   useEffect(() => {
     if (!doctorLoaded) void loadDoctor();
   }, [doctorLoaded, loadDoctor]);
+
+  // Extension (Track D "code plugin") status — DT8. `extension_status` is a
+  // params-free rpc returning every plugin's entries (mirrors `catalog_status`),
+  // so this view fetches it only when the plugin actually declares the
+  // capability, then filters down to its own `id` client-side (same pattern
+  // `doctorFindings.find((f) => f.pluginId === id ...)` above uses).
+  const isExtensionPlugin = detail?.info.capabilities.includes("extension") ?? false;
+  useEffect(() => {
+    if (!isExtensionPlugin) {
+      setExtensionEntries([]);
+      return;
+    }
+    let active = true;
+    void commands.extensionStatus().then((res) => {
+      if (active && res.status === "ok") setExtensionEntries(res.data.filter((e) => e.pluginId === id));
+    });
+    return () => {
+      active = false;
+    };
+  }, [isExtensionPlugin, id]);
 
   useEffect(() => {
     let active = true;
@@ -411,6 +472,7 @@ export function PluginDetailView({ id }: { id: string }) {
 
         <div className="mb-4 flex flex-wrap items-center gap-1.5">
           <PluginStatusBadge verified={info.verified} experimental={info.experimental} />
+          {info.capabilities.includes("extension") && <Pill variant="mono">Runs code</Pill>}
           {pinned && (
             <Pill variant="mono">
               <Pin aria-hidden size={9} strokeWidth={2} className="mr-1 inline align-[-1px]" />
@@ -655,6 +717,30 @@ export function PluginDetailView({ id }: { id: string }) {
                 <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{m.commandOrUrl}</span>
               </CardRow>
             ))}
+          </Card>
+        )}
+
+        {info.capabilities.includes("extension") && (
+          <Card className="mb-3">
+            <CardHeader>
+              <CardTitle>Extension</CardTitle>
+            </CardHeader>
+            {extensionEntries.length === 0 ? (
+              <div className="px-[18px] py-3.5 text-[12.5px] text-muted-foreground">No extension status reported yet.</div>
+            ) : (
+              extensionEntries.map((e) => (
+                <CardRow key={e.name}>
+                  <span className="w-[120px] shrink-0 truncate text-[13px] font-medium">{e.name}</span>
+                  <Pill variant={extensionStatusPillVariant(e.status)}>{extensionStatusLabel(e.status)}</Pill>
+                  {e.restartCount > 0 && (
+                    <span className="shrink-0 text-[11.5px] text-muted-foreground">
+                      {e.restartCount} restart{e.restartCount === 1 ? "" : "s"}
+                    </span>
+                  )}
+                  {e.lastError && <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">{e.lastError}</span>}
+                </CardRow>
+              ))
+            )}
           </Card>
         )}
 

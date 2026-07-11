@@ -124,7 +124,7 @@
 //! latency is bounded by the single slowest shutdown, not `N × grace`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -855,6 +855,7 @@ async fn supervise(
     state: Arc<Mutex<ExtensionProc>>,
     cancel: CancellationToken,
     cfg: SupervisorConfig,
+    restart_count: Arc<AtomicU32>,
 ) {
     let mut restart_attempts: Vec<tokio::time::Instant> = Vec::new();
     let mut healthy_since = tokio::time::Instant::now();
@@ -913,6 +914,14 @@ async fn supervise(
             }
 
             restart_attempts.push(tokio::time::Instant::now());
+            // DT8: every restart *attempt* (not just a successful one) bumps
+            // the shared counter `ExtensionSnapshot::restart_count` surfaces
+            // — mirrors `restart_attempts`'s own "attempt, not detection"
+            // accounting one line above, but never pruned/reset (unlike
+            // `restart_attempts`, which the give-up/healthy-reset logic
+            // above trims) so it reads as a lifetime total in
+            // `plugin_doctor`/`extension_status`, not a windowed count.
+            restart_count.fetch_add(1, Ordering::Relaxed);
 
             let new_proc = tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -939,6 +948,10 @@ pub struct ExtensionSnapshot {
     pub status: ExtensionStatus,
     pub confirmed_events: Vec<String>,
     pub tools: Vec<Value>,
+    /// Lifetime count of restart attempts DT4's supervisor has made for this
+    /// entry (DT8) — see [`SupervisedExtension::restart_count`]'s doc. `0`
+    /// for an entry that has never needed a restart.
+    pub restart_count: u32,
 }
 
 /// A cheap, `'static`, cloned-out handle to one supervised extension's live
@@ -981,6 +994,13 @@ pub struct SupervisedExtension {
     state: Arc<Mutex<ExtensionProc>>,
     cancel: CancellationToken,
     supervisor: Option<JoinHandle<()>>,
+    /// Lifetime count of restart *attempts* [`supervise`] has made for this
+    /// entry (DT8) — see that function's own doc at the increment site.
+    /// `Arc`, not a bare `AtomicU32` field read directly, because the
+    /// counter is shared with (and only ever incremented by) the detached
+    /// `supervise` task; [`Self::snapshot`] just clones the current value
+    /// out.
+    restart_count: Arc<AtomicU32>,
 }
 
 impl SupervisedExtension {
@@ -1004,12 +1024,55 @@ impl SupervisedExtension {
         let proc = ExtensionProc::spawn_and_handshake(spec.clone()).await;
         let state = Arc::new(Mutex::new(proc));
         let cancel = CancellationToken::new();
-        let supervisor = tokio::spawn(supervise(spec.clone(), state.clone(), cancel.clone(), cfg));
+        let restart_count = Arc::new(AtomicU32::new(0));
+        let supervisor = tokio::spawn(supervise(
+            spec.clone(),
+            state.clone(),
+            cancel.clone(),
+            cfg,
+            restart_count.clone(),
+        ));
         SupervisedExtension {
             spec,
             state,
             cancel,
             supervisor: Some(supervisor),
+            restart_count,
+        }
+    }
+
+    /// Test-only: build a `SupervisedExtension` already parked in a fixed
+    /// `status`/`confirmed_events`/`restart_count`, with no live subprocess
+    /// and no background [`supervise`] task (DT8). Exists so cross-module
+    /// tests (`plugins::doctor`, `api::extension_status_api`) can exercise
+    /// every [`ExtensionStatus`] branch — including
+    /// `Failed("restart-exhausted: ...")`, which the real supervisor only
+    /// reaches after `MAX_RESTARTS_IN_WINDOW` real restart attempts — without
+    /// spawning a real subprocess or waiting on one. `shutdown`/`Drop` on a
+    /// value built this way are no-ops beyond marking `Stopped`: `supervisor`
+    /// is `None`, so there is nothing to cancel/join, and `state`'s
+    /// `ExtensionProc` has no `child`/`io` to tear down.
+    #[cfg(test)]
+    pub(crate) fn fixed_for_test(
+        spec: ExtensionSpec,
+        status: ExtensionStatus,
+        confirmed_events: Vec<String>,
+        restart_count: u32,
+    ) -> SupervisedExtension {
+        let proc = ExtensionProc {
+            spec: spec.clone(),
+            status,
+            confirmed_events,
+            tools: Vec::new(),
+            child: None,
+            io: None,
+        };
+        SupervisedExtension {
+            spec,
+            state: Arc::new(Mutex::new(proc)),
+            cancel: CancellationToken::new(),
+            supervisor: None,
+            restart_count: Arc::new(AtomicU32::new(restart_count)),
         }
     }
 
@@ -1034,6 +1097,7 @@ impl SupervisedExtension {
             status: guard.status.clone(),
             confirmed_events: guard.confirmed_events.clone(),
             tools: guard.tools.clone(),
+            restart_count: self.restart_count.load(Ordering::Relaxed),
         }
     }
 
@@ -1250,6 +1314,22 @@ impl ExtensionHost {
     /// unconditionally.
     pub async fn is_empty(&self) -> bool {
         self.procs.read().await.is_empty()
+    }
+
+    /// Test-only: insert an already-built [`SupervisedExtension`] (typically
+    /// [`SupervisedExtension::fixed_for_test`]) under `plugin_id` without
+    /// going through [`Self::spawn_all`]'s real subprocess spawn (DT8) — lets
+    /// `plugins::doctor`/`api::extension_status_api` tests put a host into an
+    /// exact `Failed`/`Restarting`/`Running` state deterministically, instead
+    /// of racing a real supervisor's restart-with-backoff timing.
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(&self, plugin_id: &str, ext: SupervisedExtension) {
+        self.procs
+            .write()
+            .await
+            .entry(plugin_id.to_string())
+            .or_default()
+            .push(ext);
     }
 
     /// Gracefully stop every spawned extension across every plugin,
