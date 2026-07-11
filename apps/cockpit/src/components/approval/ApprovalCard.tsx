@@ -141,7 +141,9 @@ export function ApprovalCard({
 
   const resolve = (response: ApprovalResponse) => void resolveApproval(approval.requestId, response);
 
-  const isLastQuestion = step >= questions.length - 1;
+  const activeStep = questions.length === 0 ? 0 : Math.min(step, questions.length - 1);
+  const activeQuestion = questions[activeStep];
+  const isLastQuestion = activeStep >= questions.length - 1;
 
   const submitQuestions = () => {
     const merged: Record<string, string[]> = {};
@@ -220,30 +222,31 @@ export function ApprovalCard({
             <div className="text-[13px] text-muted-foreground">No questions were provided.</div>
           ) : (
             (() => {
-              const q = questions[step];
+              const q = activeQuestion;
+              if (q === undefined) return null;
               return (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11.5px] text-muted-foreground">
-                      Question {step + 1} of {questions.length}
+                      Question {activeStep + 1} of {questions.length}
                     </span>
                     <div
                       role="progressbar"
                       aria-label="Question progress"
-                      aria-valuenow={step + 1}
+                      aria-valuenow={activeStep + 1}
                       aria-valuemin={1}
                       aria-valuemax={questions.length}
                       className="flex items-center gap-1"
                     >
                       {questions.map((question, i) => (
-                        <span key={question.question} className={`h-1.5 w-4 rounded-full ${i <= step ? "bg-primary" : "bg-muted"}`} />
+                        <span key={question.question} className={`h-1.5 w-4 rounded-full ${i <= activeStep ? "bg-primary" : "bg-muted"}`} />
                       ))}
                     </div>
                   </div>
                   <div key={q.question} className="space-y-1.5">
                     <div className="flex items-center gap-2">
                       <Badge variant="outline">{q.header}</Badge>
-                      <span className="text-[13px]">{q.question}</span>
+                      <h3 className="text-[13px] font-normal">{q.question}</h3>
                     </div>
                     <div className="space-y-1">
                       {q.options.map((o) => {
@@ -331,8 +334,8 @@ export function ApprovalCard({
             </Button>
             {questions.length > 0 && (
               <>
-                {step > 0 && (
-                  <Button size="sm" variant="outline" onClick={() => setStep((s) => s - 1)}>
+                {activeStep > 0 && (
+                  <Button size="sm" variant="outline" onClick={() => setStep((s) => Math.max(s - 1, 0))}>
                     Back
                   </Button>
                 )}
@@ -341,7 +344,7 @@ export function ApprovalCard({
                     Submit
                   </Button>
                 ) : (
-                  <Button size="sm" onClick={() => setStep((s) => s + 1)}>
+                  <Button size="sm" onClick={() => setStep((s) => Math.min(s + 1, questions.length - 1))}>
                     Next
                   </Button>
                 )}

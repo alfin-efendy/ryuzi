@@ -20,6 +20,13 @@ const { useDiff } = await import("@/store-diff");
 const { useUi } = await import("@/store-ui");
 
 const APP_DIFF = ["diff --git a/src/app.ts b/src/app.ts", "--- a/src/app.ts", "+++ b/src/app.ts", "@@ -1 +1 @@", "-old", "+new"].join("\n");
+const FRESH_DIFF = [
+  "diff --git a/src/fresh.ts b/src/fresh.ts",
+  "--- a/src/fresh.ts",
+  "+++ b/src/fresh.ts",
+  "@@ -1 +1 @@",
+  "+const fresh = true;",
+].join("\n");
 
 beforeEach(() => {
   useNav.setState({ rightOpen: true, rightTab: "review", rightMaximized: false });
@@ -45,6 +52,39 @@ test("git session: Review fetches the diff as before", async () => {
   expect(screen.queryByText(/Not a git repository/)).toBeNull();
 });
 
+test("pending review target waits for its fresh fetch instead of consuming a stale diff", async () => {
+  let resolveDiff!: (result: Result<string, CmdError>) => void;
+  gitDiff.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveDiff = resolve;
+      }),
+  );
+  useDiff.setState({
+    bySession: {
+      s1: {
+        loading: false,
+        error: null,
+        files: [{ dir: "src/", name: "stale.ts", add: 1, del: 0, lines: [["add", 1, "const stale = true;"]] }],
+      },
+    },
+    pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" },
+  });
+
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith("s1"));
+  expect(useDiff.getState().pendingReview).toEqual({ sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" });
+
+  await act(async () => {
+    resolveDiff({ status: "ok", data: FRESH_DIFF });
+  });
+
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
+  expect(screen.getByTitle("src/fresh.ts").className).toContain("bg-accent");
+  expect(screen.getByText("const fresh = true;")).toBeTruthy();
+});
+
 test("completed diff selects and clears a pending transcript review target", async () => {
   gitDiff.mockImplementation(() => Promise.resolve({ status: "ok", data: APP_DIFF }));
   useDiff.setState({ pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
@@ -52,7 +92,7 @@ test("completed diff selects and clears a pending transcript review target", asy
   render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
 
   await waitFor(() => expect(screen.getByText("src/app.ts")).toBeTruthy());
-  expect(useDiff.getState().pendingReview).toBeNull();
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
 });
 
 test("completed diff clears an unmatched pending target", async () => {
@@ -62,30 +102,30 @@ test("completed diff clears an unmatched pending target", async () => {
   render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
 
   await waitFor(() => expect(useDiff.getState().bySession.s1?.loading).toBe(false));
-  expect(useDiff.getState().pendingReview).toBeNull();
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
   expect(screen.getByText("app.ts")).toBeTruthy();
 });
 
-test("pending review target stays pending while the diff fetch is still loading", async () => {
-  useDiff.setState({
-    bySession: { s1: { loading: true, error: null, files: [] } },
-    pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" },
-  });
+test("pending review target stays pending while its fresh diff fetch is still loading", async () => {
+  let resolveDiff!: (result: Result<string, CmdError>) => void;
+  gitDiff.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveDiff = resolve;
+      }),
+  );
+  useDiff.setState({ pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
 
-  render(<RightPanel sessionPk="s1" branch="main" running isGit />);
+  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
 
-  // Still loading — the pending target must not be cleared against the
-  // stale/empty file list while the fetch that should contain it is in flight.
+  await waitFor(() => expect(useDiff.getState().bySession.s1?.loading).toBe(true));
   expect(useDiff.getState().pendingReview).toEqual({ sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" });
 
-  act(() => {
-    useDiff.setState({
-      bySession: { s1: { loading: false, error: null, files: [{ dir: "src/", name: "app.ts", add: 1, del: 0, lines: [] }] } },
-    });
+  await act(async () => {
+    resolveDiff({ status: "ok", data: APP_DIFF });
   });
 
-  // Once loading settles with the matching file present, the target resolves.
-  expect(useDiff.getState().pendingReview).toBeNull();
+  await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
   expect(screen.getByText("app.ts")).toBeTruthy();
 });
 

@@ -162,6 +162,11 @@ function multiQuestionApproval(partial: Partial<PendingApproval> = {}) {
   });
 }
 
+test("question card exposes the active prompt as a heading", () => {
+  render(<ApprovalCard approval={multiQuestionApproval()} />);
+  expect(screen.getByRole("heading", { name: "Which DB?" })).toBeTruthy();
+});
+
 test("question card shows exactly one question at a time with N of M progress", () => {
   render(<ApprovalCard approval={multiQuestionApproval()} />);
   expect(screen.getByText("Question 1 of 2")).toBeTruthy();
@@ -277,6 +282,38 @@ test("question card hotkey advances through questions and submits on the last wi
   expect(calls.length).toBe(1);
   const [, resp] = calls[0] as [string, { payload: { answers: Record<string, string[]> } }];
   expect(resp.payload.answers).toEqual({ "Which DB?": [], "Which cache?": [] });
+});
+
+test("question card safely resets a later step when a new request has fewer questions", () => {
+  const { rerender } = render(<ApprovalCard approval={multiQuestionApproval({ requestId: "r1" })} />);
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(screen.getByText("Question 2 of 2")).toBeTruthy();
+
+  rerender(
+    <ApprovalCard
+      approval={approval({
+        requestId: "r2",
+        kind: "question",
+        tool: "askuserquestion",
+        input: {
+          questions: [
+            {
+              question: "Which queue?",
+              header: "Queue",
+              multiSelect: false,
+              options: [{ label: "SQS" }, { label: "RabbitMQ" }],
+            },
+          ],
+        },
+      })}
+    />,
+  );
+
+  expect(screen.getByText("Question 1 of 1")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Which queue?" })).toBeTruthy();
+  expect(screen.queryByText("Which cache?")).toBeNull();
+  expect(screen.getByRole("button", { name: /SQS/ }).getAttribute("aria-pressed")).toBe("false");
+  expect((screen.getByLabelText("Other answer for Queue") as HTMLInputElement).value).toBe("");
 });
 
 test("question card resets step, answers and Other text when approval.requestId changes", () => {

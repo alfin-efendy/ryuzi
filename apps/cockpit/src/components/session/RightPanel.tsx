@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Bot, ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
-import { useDiff, reviewFileIndex, EMPTY } from "@/store-diff";
+import { useDiff, reviewFileIndex, EMPTY, type PendingReview } from "@/store-diff";
 import { commands } from "@/bindings";
 import { diffLineStyle, type ReviewFile } from "@/lib/diff";
 import { basename, joinPath } from "@/lib/paths";
@@ -43,6 +43,8 @@ export function RightPanel({
   // Auto-refresh the file tree when a running turn ends — the agent may have
   // created or removed files while it was running.
   const prevRunning = useRef(running);
+  const [pendingFetch, setPendingFetch] = useState<PendingReview | null>(null);
+  const [pendingFetchReady, setPendingFetchReady] = useState<PendingReview | null>(null);
   useEffect(() => {
     if (prevRunning.current && !running) setTreeRefresh((n) => n + 1);
     prevRunning.current = running;
@@ -50,22 +52,38 @@ export function RightPanel({
 
   // Auto-fetch when the tab opens and when a running turn finishes.
   // Non-git projects have no diff to fetch (git_diff would just error).
+  // A transcript target gets its own fetch, recorded before it starts, so it
+  // can never be consumed from a pre-target diff list.
+  const pendingPath = pendingReview?.sessionPk === sessionPk ? pendingReview.path : null;
   useEffect(() => {
     if (!nav.rightOpen || nav.rightTab !== "review" || running || !isGit) return;
-    void fetchDiff(sessionPk);
-  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
+    if (pendingPath === null) {
+      void fetchDiff(sessionPk);
+      return;
+    }
+
+    const target = { sessionPk, path: pendingPath };
+    setPendingFetch(target);
+    setPendingFetchReady(null);
+    void fetchDiff(sessionPk).then(() => {
+      setPendingFetchReady(target);
+    });
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit, pendingPath]);
 
   // Consume a pending jump from a transcript edit card: select the file once
-  // the diff fetch that should contain it has finished, then clear the
+  // the fetch started for that exact target has finished, then clear the
   // intent either way. A pending jump for another session is left alone —
-  // its own panel consumes it. Waiting for `diff.loading` to settle avoids
-  // clearing the target against a stale (pre-fetch) file list.
+  // its own panel consumes it.
   useEffect(() => {
     if (pendingReview === null || pendingReview.sessionPk !== sessionPk || diff.loading) return;
+    if (pendingFetch?.sessionPk !== sessionPk || pendingFetch.path !== pendingReview.path) return;
+    if (pendingFetchReady?.sessionPk !== sessionPk || pendingFetchReady.path !== pendingReview.path) return;
     const idx = reviewFileIndex(diff.files, pendingReview.path);
     if (idx >= 0) setReviewFile(idx);
+    setPendingFetch(null);
+    setPendingFetchReady(null);
     setPendingReview(null);
-  }, [pendingReview, diff.files, diff.loading, setPendingReview, sessionPk]);
+  }, [pendingReview, diff.files, diff.loading, pendingFetch, pendingFetchReady, setPendingReview, sessionPk]);
 
   // A refresh may shrink the file list out from under a stale selected
   // index (e.g. commits amended away) — clamp it back into range.
