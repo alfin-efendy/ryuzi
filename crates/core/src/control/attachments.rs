@@ -50,6 +50,25 @@ impl ControlPlane {
         self.attachments_root().await.join(session_pk)
     }
 
+    /// The live `attachment_max_bytes` setting — the same cap
+    /// `prepare_attachments` (below) enforces when accepting a downloaded
+    /// attachment. `GET /attachments/{*rel}` (`serve.rs::get_attachment`)
+    /// reads this too, rather than a hardcoded constant, so raising the
+    /// setting doesn't strand an already-accepted attachment behind a
+    /// stale, lower read cap. Falls back to the field's own schema default
+    /// (25 MiB; see `settings::fields::GLOBAL_FIELDS`'s `attachment_max_bytes`
+    /// entry) when unset or unparsable.
+    pub async fn attachment_max_bytes(&self) -> u64 {
+        let settings = SettingsStore::new(Arc::clone(&self.store));
+        settings
+            .get("attachment_max_bytes")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(26_214_400)
+    }
+
     /// Materializes any Discord-supplied attachments into
     /// `.harness-attachments/{session_pk}` and folds the resulting manifest
     /// into the prompt, alongside any Anthropic vision blocks and display

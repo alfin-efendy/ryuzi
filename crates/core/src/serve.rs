@@ -102,13 +102,21 @@ async fn require_token(
     };
 
     let device_hash = crate::update::asset::sha256_hex(presented.as_bytes());
-    let device = state
+    let device = match state
         .cp
         .store()
         .find_device_by_token_hash(&device_hash)
         .await
-        .ok()
-        .flatten();
+    {
+        Ok(d) => d,
+        Err(e) => {
+            // Fail closed (same as a genuine "no matching device" result) —
+            // but a DB outage that silently locks out every paired device
+            // token should be visible in the logs, not invisible.
+            tracing::warn!("require_token: device-token lookup failed, failing closed: {e}");
+            None
+        }
+    };
 
     if authorize(
         peer.ip().is_loopback(),
@@ -507,12 +515,6 @@ async fn resolve_approval_route(
     Json(json!({ "resolved": resolved })).into_response()
 }
 
-/// Largest attachment file this route will read into memory before serving —
-/// matches `prepare_attachments`'s own default `attachment_max_bytes` cap (25
-/// MB; see `control/attachments.rs`), so anything that was ever accepted
-/// into `.harness-attachments` can still be served back through here.
-const MAX_ATTACHMENT_READ_BYTES: u64 = 26_214_400;
-
 /// `GET /attachments/{*rel}` — serves one file out of `attachments_root()`,
 /// remote-safe (this is how the cockpit previews a REMOTE runner's
 /// attachments, which never touch the cockpit's own disk — see
@@ -533,7 +535,12 @@ const MAX_ATTACHMENT_READ_BYTES: u64 = 26_214_400;
 /// flat 404 with the same body — deliberately indistinguishable, so a
 /// caller can't use the response to probe which failure occurred. An
 /// over-cap file is a distinct 400 (not a security-relevant signal — the
-/// size is already recorded in plain on the transcript row).
+/// size is already recorded in plain on the transcript row). The cap
+/// itself is the LIVE `attachment_max_bytes` setting
+/// (`ControlPlane::attachment_max_bytes`, the same read `prepare_attachments`
+/// does when accepting an attachment) rather than a hardcoded constant, so
+/// raising the setting doesn't strand an already-accepted attachment behind
+/// a stale, lower read cap.
 async fn get_attachment(
     State(state): State<ApiState>,
     Path(rel): Path<String>,
@@ -558,7 +565,8 @@ async fn get_attachment(
     if !meta.is_file() {
         return attachment_not_found();
     }
-    if meta.len() > MAX_ATTACHMENT_READ_BYTES {
+    let max_bytes = state.cp.attachment_max_bytes().await;
+    if meta.len() > max_bytes {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("attachment too large ({} bytes)", meta.len()) })),
@@ -1395,17 +1403,22 @@ mod tests {
         );
     }
 
-    /// A file over `MAX_ATTACHMENT_READ_BYTES` is rejected with a 400 before
-    /// its bytes are ever read into memory — distinct from the 404 family
-    /// above since size isn't a security signal (it's already visible on the
-    /// transcript row).
+    /// Default value of the `attachment_max_bytes` setting when unset —
+    /// mirrors `ControlPlane::attachment_max_bytes`'s own fallback. Used
+    /// only by the tests below, which don't otherwise set the setting.
+    const DEFAULT_ATTACHMENT_MAX_BYTES: u64 = 26_214_400;
+
+    /// A file over the (default, unset) `attachment_max_bytes` cap is
+    /// rejected with a 400 before its bytes are ever read into memory —
+    /// distinct from the 404 family above since size isn't a security
+    /// signal (it's already visible on the transcript row).
     #[tokio::test]
     async fn get_attachment_rejects_a_file_over_the_size_cap() {
         let cp = test_cp().await;
         let dir = tempfile::tempdir().unwrap();
         let root = set_attachments_root(&cp, dir.path()).await;
         std::fs::create_dir_all(root.join("sess-1")).unwrap();
-        let big = vec![0u8; (MAX_ATTACHMENT_READ_BYTES + 1) as usize];
+        let big = vec![0u8; (DEFAULT_ATTACHMENT_MAX_BYTES + 1) as usize];
         std::fs::write(root.join("sess-1").join("huge.bin"), &big).unwrap();
 
         let port = serve(state_for(cp), opts(0)).await.unwrap();
@@ -1418,5 +1431,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    /// P4-3: the size cap is the LIVE `attachment_max_bytes` setting, not a
+    /// hardcoded constant — proven here by lowering the setting well below
+    /// the schema default and confirming a small file that would pass the
+    /// old hardcoded 25 MB constant is now rejected.
+    #[tokio::test]
+    async fn get_attachment_honors_a_lowered_attachment_max_bytes_setting() {
+        let cp = test_cp().await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = set_attachments_root(&cp, dir.path()).await;
+        SettingsStore::new(cp.store().clone())
+            .set("attachment_max_bytes", "5")
+            .await
+            .unwrap();
+        std::fs::create_dir_all(root.join("sess-1")).unwrap();
+        std::fs::write(root.join("sess-1").join("small.bin"), b"123456").unwrap();
+
+        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/attachments/sess-1/small.bin"
+            ))
+            .bearer_auth(TEST_CONTROL_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    /// P4-3: an absolute/rooted `rel` (e.g. `C:\Windows\win.ini` on Windows,
+    /// `/etc/passwd` on Unix) must never be served, even when the target
+    /// exists — `Path::join` replaces the base entirely when the joined
+    /// component is itself absolute, so `root.join(rel)` can resolve OUTSIDE
+    /// `attachments_root()` without any `..` involved. This is the vector
+    /// the handler's doc comment claims the canonicalize+`starts_with` jail
+    /// also catches (not just dot-segment escapes, covered above) — proven
+    /// here with a real absolute path (an unrelated tempdir) rather than a
+    /// hardcoded OS path, so it's meaningful on any target.
+    #[tokio::test]
+    async fn get_attachment_rejects_an_absolute_rel_even_when_the_target_exists() {
+        let cp = test_cp().await;
+        let dir = tempfile::tempdir().unwrap();
+        set_attachments_root(&cp, dir.path()).await;
+
+        // Stands in for `C:\Windows\win.ini` / `/etc/passwd`: some absolute
+        // path elsewhere on disk, unrelated to the attachments root.
+        let outside = tempfile::tempdir().unwrap();
+        let secret_path = outside.path().join("win.ini");
+        std::fs::write(&secret_path, b"do not serve me either").unwrap();
+        assert!(
+            secret_path.is_absolute(),
+            "the whole point is that rel is itself absolute"
+        );
+
+        let state = state_for(cp);
+        let resp = get_attachment(
+            State(state),
+            Path(secret_path.to_str().unwrap().to_string()),
+        )
+        .await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body
+                .as_ref()
+                .windows(b"do not serve me either".len())
+                .any(|w| w == b"do not serve me either"),
+            "an absolute rel must never serve a file outside the attachments root"
+        );
     }
 }

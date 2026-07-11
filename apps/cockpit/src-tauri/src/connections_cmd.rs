@@ -8,7 +8,8 @@
 //! Behavior change from the pre-daemon version: `connect_oauth` /
 //! `reconnect_oauth` no longer take an `AppHandle` or open the system
 //! browser directly — the engine broadcasts `CoreEvent::OauthAuthorizeUrl`
-//! over SSE, and the bridge in `lib.rs` opens the browser on receipt.
+//! over SSE, and the per-runner bridge (`engine_manager::spawn_bridge`'s
+//! `oauthAuthorizeUrl` arm) opens the browser on receipt.
 //! `start_kiro_device_flow` / `start_device_flow` open the browser AFTER the
 //! RPC returns, using the verification URL in the returned `DeviceFlowInfo`.
 
@@ -353,10 +354,13 @@ pub async fn set_provider_account_route(
         .await
 }
 
-/// Drive the full interactive OAuth flow: binds a loopback listener, opens
-/// the provider's authorize URL in the system browser via
-/// `tauri-plugin-opener`, and awaits the callback (up to 5 minutes) before
-/// persisting the resulting connection.
+/// Drive the full interactive OAuth flow: a thin proxy to the daemon's
+/// `connect_oauth` RPC, which binds a loopback listener and awaits the
+/// callback (up to 5 minutes) before persisting the resulting connection.
+/// The provider's authorize URL is opened in the system browser
+/// client-side — by the per-runner SSE bridge
+/// (`engine_manager::spawn_bridge`'s `oauthAuthorizeUrl` arm) on receipt of
+/// `CoreEvent::OauthAuthorizeUrl` — not by this function directly.
 #[tauri::command]
 #[specta::specta]
 pub async fn connect_oauth(

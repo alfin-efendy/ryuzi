@@ -242,7 +242,7 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_28_keys_and_correct_flags() {
+    fn schema_has_29_keys_and_correct_flags() {
         let fields = all_fields();
         assert_eq!(fields.len(), 29); // 26 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();

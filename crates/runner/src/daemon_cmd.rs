@@ -9,6 +9,7 @@
 //! shutdown on SIGTERM/SIGINT, the canary probe/promote flow, and the
 //! production `UpdateManager` / apply+canary host wiring.
 
+use anyhow::Context;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,7 +150,8 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<Contro
         .flatten()
         .unwrap_or_else(|| std::net::Ipv4Addr::LOCALHOST.to_string());
 
-    let (addr, tls, scheme, fingerprint) = ryuzi_core::tls::resolve_bind(&listen_addr, dir)?;
+    let (addr, tls, scheme, fingerprint) = ryuzi_core::tls::resolve_bind(&listen_addr, dir)
+        .context("failed to build TLS material for non-loopback bind")?;
 
     let state = ryuzi_core::serve::ApiState {
         cp: daemon.cp.clone(),

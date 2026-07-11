@@ -412,7 +412,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_replay_from_13_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -3613,7 +3613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_23_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_replay_from_13_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then wind user_version back twelve so the
         // rewrite migration (13) AND every migration appended after it
@@ -3646,7 +3646,7 @@ mod tests {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v23 here, so `harness` was
+                    // The DB is fully migrated to v25 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
