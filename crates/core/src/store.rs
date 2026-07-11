@@ -412,7 +412,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_24_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -3593,7 +3593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_23_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_24_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then wind user_version back eleven so the
         // rewrite migration (13) AND every migration appended after it
@@ -3613,8 +3613,8 @@ mod tests {
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 23
-        // defined, wind back eleven.
+        // this test starts failing its assertions). With migrations through 24
+        // defined, wind back twelve.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
