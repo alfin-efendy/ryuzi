@@ -125,4 +125,51 @@ mod tests {
             .iter()
             .any(|t| t["rootId"].is_null())); // the root row
     }
+
+    /// The `orch_steer` RPC maps every `SteerOutcome` to its exact wire string —
+    /// this is a cross-layer contract (Cockpit's steer handler switches on
+    /// `"noOrchestration"|"noted"|"cancelled"`), so a transposed literal here
+    /// would silently misdirect the UI. Exercise all three arms.
+    #[tokio::test]
+    async fn orch_steer_maps_every_outcome_to_its_wire_string() {
+        let s = tests_support::state_with_project().await;
+        let project_id = s.cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        // No live orchestration bound to this home yet → "noOrchestration".
+        let out = crate::api::dispatch(
+            &s,
+            "orch_steer",
+            serde_json::json!({ "session_pk": "home-x", "text": "hi" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.as_str(), Some("noOrchestration"));
+        // Bind a live root (submit lands it at `waiting`) to that home chat.
+        crate::api::dispatch(
+            &s,
+            "orch_submit",
+            serde_json::json!({ "project_id": project_id, "goal": "do it", "decompose": false, "home_session_pk": "home-x" }),
+        )
+        .await
+        .unwrap();
+        // A typed message → "noted".
+        let out = crate::api::dispatch(
+            &s,
+            "orch_steer",
+            serde_json::json!({ "session_pk": "home-x", "text": "prefer rust" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.as_str(), Some("noted"));
+        // The exact cancel directive → "cancelled" (distinct from "noted").
+        let out = crate::api::dispatch(
+            &s,
+            "orch_steer",
+            serde_json::json!({ "session_pk": "home-x", "text": "/cancel" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.as_str(), Some("cancelled"));
+    }
 }
