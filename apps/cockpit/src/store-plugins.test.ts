@@ -1,6 +1,6 @@
 import { test, expect, spyOn } from "bun:test";
 import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll } from "./store-plugins";
-import { commands, type DoctorFinding, type PluginInfo } from "./bindings";
+import { commands, type CatalogStatus, type DoctorFinding, type PluginInfo } from "./bindings";
 
 function reset() {
   usePlugins.setState({
@@ -17,6 +17,15 @@ function reset() {
 // real Tauri IPC call throws outside a webview.
 function stubRestartRequired(value = false) {
   return spyOn(commands, "pluginsRestartRequired").mockResolvedValue({ status: "ok", data: value });
+}
+
+// Same reasoning as `stubRestartRequired`: `load()` also best-effort fetches
+// `catalog_status` for the Browse tab's status line.
+function stubCatalogStatus(status: CatalogStatus | null = null) {
+  return spyOn(commands, "catalogStatus").mockResolvedValue({
+    status: "ok",
+    data: status ?? { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
+  });
 }
 
 const builtin: PluginInfo = {
@@ -40,6 +49,9 @@ const builtin: PluginInfo = {
   installedAt: null,
   updatedAt: null,
   trustTier: null,
+  catalogSource: null,
+  catalogVersion: null,
+  blockedReason: null,
 };
 
 const github: PluginInfo = {
@@ -63,6 +75,9 @@ const github: PluginInfo = {
   installedAt: null,
   updatedAt: null,
   trustTier: null,
+  catalogSource: null,
+  catalogVersion: null,
+  blockedReason: null,
 };
 
 const skillPack: PluginInfo = {
@@ -85,34 +100,40 @@ test("load populates plugins from listPlugins", async () => {
   reset();
   const spy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [builtin, github] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
   await usePlugins.getState().load();
   expect(spy).toHaveBeenCalled();
   expect(usePlugins.getState().plugins.map((p) => p.id)).toEqual(["native", "github"]);
   expect(usePlugins.getState().loaded).toBe(true);
   spy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("load leaves plugins untouched and surfaces no crash on error", async () => {
   reset();
   const spy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "error", error: { message: "boom" } });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
   await usePlugins.getState().load();
   expect(usePlugins.getState().plugins).toEqual([]);
   expect(usePlugins.getState().loaded).toBe(false);
   spy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("load populates restartRequired from pluginsRestartRequired", async () => {
   reset();
   const spy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [] });
   const restartSpy = stubRestartRequired(true);
+  const catalogSpy = stubCatalogStatus();
   await usePlugins.getState().load();
   expect(restartSpy).toHaveBeenCalled();
   expect(usePlugins.getState().restartRequired).toBe(true);
   spy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("load leaves restartRequired untouched when pluginsRestartRequired errors", async () => {
@@ -123,10 +144,12 @@ test("load leaves restartRequired untouched when pluginsRestartRequired errors",
     status: "error",
     error: { message: "boom" },
   });
+  const catalogSpy = stubCatalogStatus();
   await usePlugins.getState().load();
   expect(usePlugins.getState().restartRequired).toBe(true);
   spy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("loadDoctor populates doctorFindings", async () => {
@@ -151,6 +174,7 @@ test("setEnabled optimistically flips the flag, calls the command, then reconcil
     data: [{ ...github, enabled: false }],
   });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   const p = usePlugins.getState().setEnabled("github", false);
   // Optimistic update lands synchronously before the awaited command resolves.
@@ -163,6 +187,7 @@ test("setEnabled optimistically flips the flag, calls the command, then reconcil
   setSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("setEnabled reloads (not crashes) when the command errors, so state reconciles with the server", async () => {
@@ -171,6 +196,7 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
   const setSpy = spyOn(commands, "setPluginEnabled").mockResolvedValue({ status: "error", error: { message: "denied" } });
   const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [github] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   await usePlugins.getState().setEnabled("github", false);
 
@@ -181,6 +207,7 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
   setSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("browsePlugins keeps only not-installed entries", () => {
@@ -223,6 +250,7 @@ test("update calls updatePlugin with force and reloads on an `updated` outcome",
   const updateSpy = spyOn(commands, "updatePlugin").mockResolvedValue({ status: "ok", data: { kind: "updated" } });
   const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [skillPack] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   await usePlugins.getState().update("acme", true);
 
@@ -231,6 +259,7 @@ test("update calls updatePlugin with force and reloads on an `updated` outcome",
   updateSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("update refreshes cached doctor findings when they were already loaded", async () => {
@@ -239,6 +268,7 @@ test("update refreshes cached doctor findings when they were already loaded", as
   const updateSpy = spyOn(commands, "updatePlugin").mockResolvedValue({ status: "ok", data: { kind: "alreadyCurrent" } });
   const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [skillPack] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
   const doctorSpy = spyOn(commands, "pluginDoctor").mockResolvedValue({ status: "ok", data: [] });
 
   await usePlugins.getState().update("acme", false);
@@ -247,6 +277,7 @@ test("update refreshes cached doctor findings when they were already loaded", as
   updateSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
   doctorSpy.mockRestore();
 });
 
@@ -256,6 +287,7 @@ test("update toasts the error and still reloads when updatePlugin itself errors"
   const updateSpy = spyOn(commands, "updatePlugin").mockResolvedValue({ status: "error", error: { message: "boom" } });
   const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [skillPack] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   await usePlugins.getState().update("acme", false);
 
@@ -263,6 +295,7 @@ test("update toasts the error and still reloads when updatePlugin itself errors"
   updateSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("pin optimistically flips the plugin's pinned flag, calls the command, then reconciles via reload", async () => {
@@ -271,6 +304,7 @@ test("pin optimistically flips the plugin's pinned flag, calls the command, then
   const pinSpy = spyOn(commands, "setPluginPin").mockResolvedValue({ status: "ok", data: null });
   const listSpy = spyOn(commands, "listPlugins");
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   listSpy.mockResolvedValueOnce({ status: "ok", data: [{ ...skillPack, pinned: true }] });
   const p = usePlugins.getState().pin("acme", true, "vendored fork");
@@ -292,6 +326,7 @@ test("pin optimistically flips the plugin's pinned flag, calls the command, then
   pinSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("pin failure toasts and reloads, reconciling the flag back to the server's (unchanged) value", async () => {
@@ -302,6 +337,7 @@ test("pin failure toasts and reloads, reconciling the flag back to the server's 
   const pinSpy = spyOn(commands, "setPluginPin").mockResolvedValue({ status: "error", error: { message: "denied" } });
   const listSpy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [skillPack] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   await usePlugins.getState().pin("acme", true);
 
@@ -309,6 +345,7 @@ test("pin failure toasts and reloads, reconciling the flag back to the server's 
   pinSpy.mockRestore();
   listSpy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("load carries a persisted pinned flag straight from the server — no pin() call needed for it to survive a reload", async () => {
@@ -322,6 +359,7 @@ test("load carries a persisted pinned flag straight from the server — no pin()
   };
   const spy = spyOn(commands, "listPlugins").mockResolvedValue({ status: "ok", data: [pinnedFixture] });
   const restartSpy = stubRestartRequired();
+  const catalogSpy = stubCatalogStatus();
 
   await usePlugins.getState().load();
 
@@ -332,6 +370,7 @@ test("load carries a persisted pinned flag straight from the server — no pin()
 
   spy.mockRestore();
   restartSpy.mockRestore();
+  catalogSpy.mockRestore();
 });
 
 test("summarizeUpdateAll counts updated/needsReack/failed outcomes", () => {

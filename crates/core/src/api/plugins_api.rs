@@ -39,7 +39,7 @@ use crate::plugins::providers;
 use crate::plugins::{CorePlugin, PluginSource};
 use crate::serve::ApiState;
 use crate::settings::SettingsStore;
-use crate::store::{PluginOauthClient, Store};
+use crate::store::{PluginOauthClient, RemoteCatalogRow, Store};
 use reqwest::Url;
 use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
 use serde::Deserialize;
@@ -295,7 +295,7 @@ async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutco
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Catalog => "catalog",
+        PluginSource::Catalog | PluginSource::RemoteCatalog => "catalog",
         PluginSource::SkillPack(_) => "skill-pack",
     }
 }
@@ -323,6 +323,18 @@ fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
         return Some("gateway");
     }
     Some("integration")
+}
+
+/// `PluginInfo.catalogSource` for a plugin's binding source: `embedded` for
+/// the compiled-in catalog, `remote` for a signed-feed entry that won a
+/// version-gated merge (`crate::plugins::catalog::merged_catalog_plugins`),
+/// `None` for builtins and skill packs — neither catalog ever produces them.
+fn catalog_source_label(source: &PluginSource) -> Option<String> {
+    match source {
+        PluginSource::Catalog => Some("embedded".to_string()),
+        PluginSource::RemoteCatalog => Some("remote".to_string()),
+        PluginSource::Builtin | PluginSource::SkillPack(_) => None,
+    }
 }
 
 /// Family head id for a provider plugin (`anthropic-oauth` → `anthropic`).
@@ -397,6 +409,7 @@ fn plugin_info(
     kind: &str,
     installed: bool,
     install: Option<&crate::store::PluginInstallRecord>,
+    remote: Option<&RemoteCatalogRow>,
 ) -> PluginInfo {
     let m = &plugin.manifest;
     let ledger = InstallLedgerFields::from_option(install);
@@ -425,6 +438,9 @@ fn plugin_info(
         installed_at: ledger.installed_at,
         updated_at: ledger.updated_at,
         trust_tier: ledger.trust_tier,
+        catalog_source: catalog_source_label(&plugin.source),
+        catalog_version: remote.map(|r| r.version.clone()),
+        blocked_reason: remote.and_then(|r| r.blocked_reason.clone()),
     }
 }
 
@@ -1125,10 +1141,23 @@ async fn install_ledger_index(
         .collect())
 }
 
+/// Fetch every cached `plugin_catalog_cache` row ONCE and index it by plugin
+/// id — mirrors [`install_ledger_index`]'s O(1)-round-trip shape, so list
+/// assembly never issues a per-plugin remote-catalog query.
+async fn remote_catalog_index(store: &Store) -> anyhow::Result<HashMap<String, RemoteCatalogRow>> {
+    Ok(store
+        .list_remote_catalog()
+        .await?
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect())
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let ctx = installed_ctx(cp.store()).await?;
     let installs = install_ledger_index(cp.store()).await?;
+    let remote = remote_catalog_index(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
         let Some(kind) = derive_kind(&plugin) else {
@@ -1147,8 +1176,9 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
         let installed =
             compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
         let record = installs.get(&plugin.manifest.id);
+        let remote_row = remote.get(&plugin.manifest.id);
         out.push(plugin_info(
-            &plugin, enabled, configured, kind, installed, record,
+            &plugin, enabled, configured, kind, installed, record, remote_row,
         ));
     }
     for pack in crate::skills_install::curated_skill_packs() {
@@ -1184,6 +1214,11 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             installed_at: ledger.installed_at,
             updated_at: ledger.updated_at,
             trust_tier: ledger.trust_tier,
+            // A synthesized curated pack is never sourced from either
+            // catalog (it resolves via git clone, not a manifest feed).
+            catalog_source: None,
+            catalog_version: None,
+            blocked_reason: None,
         });
     }
     Ok(out)
@@ -1211,6 +1246,12 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     // Single-plugin lookup is fine here — unlike `assemble_list`, there is
     // only ever one id to resolve for a detail view.
     let record = cp.store().get_plugin_install(id).await?;
+    let remote_row = cp
+        .store()
+        .list_remote_catalog()
+        .await?
+        .into_iter()
+        .find(|r| r.id == id);
 
     Ok(PluginDetail {
         info: plugin_info(
@@ -1220,6 +1261,7 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
             kind,
             installed,
             record.as_ref(),
+            remote_row.as_ref(),
         ),
         auth,
         settings: settings_info,
@@ -1811,7 +1853,7 @@ mod tests {
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false, "integration", false, None);
+        let info = plugin_info(&plugin, true, false, "integration", false, None, None);
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
@@ -1824,9 +1866,94 @@ mod tests {
         // No `plugin_installs` ledger row → ledger fields carry their defaults.
         assert!(!info.pinned);
         assert!(info.source_spec.is_none());
+        // Builtin source, no cached remote-catalog row → all three enrichment
+        // fields stay unset.
+        assert!(info.catalog_source.is_none());
+        assert!(info.catalog_version.is_none());
+        assert!(info.blocked_reason.is_none());
 
-        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None, None);
         assert!(!info_disabled.enabled);
+    }
+
+    // ---------- catalog_source_label ----------
+
+    #[test]
+    fn catalog_source_label_maps_catalog_sources_only() {
+        assert_eq!(
+            catalog_source_label(&PluginSource::Catalog).as_deref(),
+            Some("embedded")
+        );
+        assert_eq!(
+            catalog_source_label(&PluginSource::RemoteCatalog).as_deref(),
+            Some("remote")
+        );
+        assert!(catalog_source_label(&PluginSource::Builtin).is_none());
+        assert!(
+            catalog_source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x")))
+                .is_none()
+        );
+    }
+
+    // ---------- remote-catalog enrichment (assemble_list) ----------
+
+    // A plugin whose `CorePlugin.source` is `RemoteCatalog` (the merged-catalog
+    // path a real daemon boot takes via `catalog::merged_catalog_plugins`) must
+    // report `catalogSource: "remote"`, and a matching (blocked) cached row
+    // must surface as `catalogVersion`/`blockedReason` on the SAME list entry —
+    // exercising the `remote_catalog_index` lookup `assemble_list` builds once,
+    // not a per-plugin query.
+    #[tokio::test]
+    async fn assemble_list_enriches_remote_catalog_plugin_with_blocked_reason() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let mut regs = Registries::new();
+        let mut plugin = gateway_only("acme-remote");
+        plugin.source = PluginSource::RemoteCatalog;
+        regs.add_plugin(plugin);
+        let cp = ControlPlane::new(store, regs).await;
+
+        cp.store()
+            .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
+                id: "acme-remote".to_string(),
+                manifest_toml: String::new(),
+                version: "2.0.0".to_string(),
+                sequence: 1,
+                blocked: true,
+                blocked_reason: Some("revoked: CVE-2026-0001".to_string()),
+                fetched_at: 0,
+            }])
+            .await
+            .unwrap();
+
+        let list = assemble_list(&cp).await.unwrap();
+        let info = list
+            .iter()
+            .find(|p| p.id == "acme-remote")
+            .expect("acme-remote present in the list");
+        assert_eq!(info.catalog_source.as_deref(), Some("remote"));
+        assert_eq!(info.catalog_version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            info.blocked_reason.as_deref(),
+            Some("revoked: CVE-2026-0001")
+        );
+    }
+
+    // An embedded-catalog plugin with NO matching cached remote row must still
+    // report `catalogSource: "embedded"`, with the version/blocked fields left
+    // unset — the remote cache only ever adds detail, never required for the
+    // embedded label.
+    #[tokio::test]
+    async fn assemble_list_labels_embedded_catalog_plugin_without_remote_row() {
+        let cp = test_cp().await;
+        let list = assemble_list(&cp).await.unwrap();
+        // `test_cp` registers the embedded catalog via `install_builtins`;
+        // "notion" is a catalog-sourced integration (see
+        // `plugin_info_configured_for_oauth_requires_stored_token_without_reconnect`).
+        let notion = list.iter().find(|p| p.id == "notion").expect("notion");
+        assert_eq!(notion.catalog_source.as_deref(), Some("embedded"));
+        assert!(notion.catalog_version.is_none());
+        assert!(notion.blocked_reason.is_none());
     }
 
     // ---------- auth_kind_label / auth_configured ----------

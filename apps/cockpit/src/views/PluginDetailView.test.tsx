@@ -29,6 +29,9 @@ const githubDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
   },
   auth: {
     kind: "token",
@@ -70,6 +73,9 @@ const ollamaDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
   },
   auth: null,
   settings: [
@@ -110,6 +116,9 @@ const sandboxDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
   },
   auth: null,
   settings: [],
@@ -148,6 +157,9 @@ const skillPackDetail: PluginDetail = {
     installedAt: SKILL_PACK_INSTALLED_AT,
     updatedAt: SKILL_PACK_UPDATED_AT,
     trustTier: "acknowledged",
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
   },
   auth: null,
   settings: [],
@@ -179,6 +191,9 @@ const oauthDetail: PluginDetail = {
     installedAt: null,
     updatedAt: null,
     trustTier: null,
+    catalogSource: null,
+    catalogVersion: null,
+    blockedReason: null,
   },
   auth: {
     kind: "oauth",
@@ -228,6 +243,7 @@ const completePluginOauth = mock((_pluginId: string, _code: string, _stateToken:
 const disconnectPluginOauth = mock((_pluginId: string) => ok({ ...oauthDetail.auth, configured: false, oauthTokenStored: false }));
 const listPlugins = mock(() => ok([]));
 const pluginsRestartRequired = mock(() => ok(false));
+const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 let doctorFindingsFixture: DoctorFinding[] = [];
 const pluginDoctor = mock(() => ok(doctorFindingsFixture));
 const updatePlugin = mock((_id: string, _force: boolean) => ok({ kind: "updated" as const }));
@@ -267,6 +283,7 @@ mock.module("@/bindings", () => ({
     disconnectPluginOauth,
     listPlugins,
     pluginsRestartRequired,
+    catalogStatus,
     pluginDoctor,
     updatePlugin,
     setPluginPin,
@@ -293,6 +310,7 @@ beforeEach(() => {
   oauthCompletedListener = null;
   listPlugins.mockClear();
   pluginsRestartRequired.mockClear();
+  catalogStatus.mockClear();
   pluginDoctor.mockClear();
   updatePlugin.mockClear();
   setPluginPin.mockClear();

@@ -58,6 +58,9 @@ function detailFixture(
       installedAt: null,
       updatedAt: null,
       trustTier: null,
+      catalogSource: null,
+      catalogVersion: null,
+      blockedReason: null,
     },
     auth: overrides.auth ?? null,
     settings: overrides.settings ?? [],
@@ -106,6 +109,7 @@ const setPluginSetting = mock((_key: string, _value: string) => ok(null));
 const setPluginEnabled = mock((_id: string, _enabled: boolean) => ok(null));
 const listPlugins = mock(() => ok([]));
 const pluginsRestartRequired = mock(() => ok(false));
+const catalogStatus = mock(() => ok({ sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 }));
 const openUrl = mock(async (_url: string) => {});
 const toastError = mock((_message: string) => {});
 
@@ -132,6 +136,7 @@ mock.module("@/bindings", () => ({
     setPluginEnabled,
     listPlugins,
     pluginsRestartRequired,
+    catalogStatus,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -182,6 +187,7 @@ beforeEach(() => {
   setPluginEnabled.mockClear();
   listPlugins.mockClear();
   pluginsRestartRequired.mockClear();
+  catalogStatus.mockClear();
   openUrl.mockClear();
   toastError.mockClear();
   pluginOauthCompletedMsgListen.mockClear();
