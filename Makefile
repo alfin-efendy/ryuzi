@@ -30,12 +30,13 @@ doctor: ## Check the required toolchain is present
 	@echo "tauri: $$(cd apps/cockpit && bun run tauri --version 2>/dev/null || echo 'run `make install`')"
 
 ##@ Development
-.PHONY: dev cockpit cli
+.PHONY: dev cockpit runner cli
 dev: ## Run the Cockpit desktop app with HMR (tauri dev)
 	bun run cockpit:dev
 cockpit: dev ## Alias for `dev`
-cli: ## Run the ryuzi CLI (Rust) — pass flags via ARGS, e.g. make cli ARGS="status"
-	cargo run -p ryuzi-cli -- $(ARGS)
+runner: ## Run the ryuzi runner (Rust) — pass flags via ARGS, e.g. make runner ARGS="status"
+	cargo run -p ryuzi-runner -- $(ARGS)
+cli: runner ## Alias for `runner` (old name)
 
 ##@ Build
 .PHONY: build build-web run-release bundles

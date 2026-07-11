@@ -5,15 +5,15 @@ fn deps_for(
     db: &Path,
     out: Arc<std::sync::Mutex<Vec<String>>>,
     errs: Arc<std::sync::Mutex<Vec<String>>>,
-) -> ryuzi_cli::dispatch::Deps {
+) -> ryuzi_runner::dispatch::Deps {
     let o = out.clone();
     let e = errs.clone();
-    ryuzi_cli::dispatch::Deps {
+    ryuzi_runner::dispatch::Deps {
         db_path: db.to_path_buf(),
         out: Box::new(move |s| o.lock().unwrap().push(s.to_string())),
         err: Box::new(move |s| e.lock().unwrap().push(s.to_string())),
         prompt: Box::new(|_| String::new()),
-        detect_git: || ryuzi_cli::detect::Detected {
+        detect_git: || ryuzi_runner::detect::Detected {
             found: true,
             version: None,
         },
@@ -26,7 +26,7 @@ fn run(db: &Path, args: &[&str]) -> (u8, Vec<String>, Vec<String>) {
     let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut deps = deps_for(db, out.clone(), errs.clone());
     let code =
-        ryuzi_cli::dispatch::run_cli(args.iter().map(|s| s.to_string()).collect(), &mut deps);
+        ryuzi_runner::dispatch::run_cli(args.iter().map(|s| s.to_string()).collect(), &mut deps);
     let o = out.lock().unwrap().clone();
     let e = errs.lock().unwrap().clone();
     (code, o, e)

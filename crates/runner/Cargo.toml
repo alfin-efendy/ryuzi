@@ -1,11 +1,11 @@
 [package]
-name = "ryuzi-cli"
+name = "ryuzi-runner"
 version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "ryuzi_cli"
+name = "ryuzi_runner"
 path = "src/lib.rs"
 
 [[bin]]

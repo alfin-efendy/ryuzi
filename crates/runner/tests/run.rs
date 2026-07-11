@@ -101,15 +101,15 @@ fn deps_with_fake(
     db: &Path,
     out: Arc<std::sync::Mutex<Vec<String>>>,
     errs: Arc<std::sync::Mutex<Vec<String>>>,
-) -> ryuzi_cli::dispatch::Deps {
+) -> ryuzi_runner::dispatch::Deps {
     let o = out.clone();
     let e = errs.clone();
-    ryuzi_cli::dispatch::Deps {
+    ryuzi_runner::dispatch::Deps {
         db_path: db.to_path_buf(),
         out: Box::new(move |s| o.lock().unwrap().push(s.to_string())),
         err: Box::new(move |s| e.lock().unwrap().push(s.to_string())),
         prompt: Box::new(|_| "n".into()),
-        detect_git: || ryuzi_cli::detect::Detected {
+        detect_git: || ryuzi_runner::detect::Detected {
             found: true,
             version: None,
         },
@@ -141,7 +141,7 @@ fn run_happy_path_prints_text_and_done() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     let out = out.lock().unwrap();
     assert!(out.iter().any(|l| l == "all done"), "stdout: {out:?}");
@@ -156,7 +156,7 @@ fn run_rejects_removed_harness_flag_as_unknown_argument() {
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));
     let errs = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut deps = deps_with_fake(&tmp.path().join("ryuzi.sqlite"), out.clone(), errs.clone());
-    let code = ryuzi_cli::dispatch::run_cli(
+    let code = ryuzi_runner::dispatch::run_cli(
         vec![
             "run".into(),
             "--harness".into(),
@@ -186,7 +186,7 @@ fn run_usage_and_mode_validation() {
 
     let mut deps = deps_with_fake(&tmp.path().join("ryuzi.sqlite"), out.clone(), errs.clone());
     let code =
-        ryuzi_cli::dispatch::run_cli(vec!["run".into(), "--prompt".into(), "x".into()], &mut deps);
+        ryuzi_runner::dispatch::run_cli(vec!["run".into(), "--prompt".into(), "x".into()], &mut deps);
     assert_eq!(code, 1);
     assert_eq!(
         errs.lock().unwrap().last().map(String::as_str),
@@ -196,7 +196,7 @@ fn run_usage_and_mode_validation() {
     );
 
     let mut deps = deps_with_fake(&tmp.path().join("ryuzi.sqlite"), out.clone(), errs.clone());
-    let code = ryuzi_cli::dispatch::run_cli(
+    let code = ryuzi_runner::dispatch::run_cli(
         vec![
             "run".into(),
             "--dir".into(),
@@ -300,7 +300,7 @@ fn run_exits_when_session_demoted_even_without_terminal_event() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
     demoter.join().unwrap();
 
     assert_eq!(code, 0);
@@ -433,16 +433,16 @@ fn deps_with_approval_fake(
     input: serde_json::Value,
     prompts: Vec<&'static str>,
     resolved: Arc<std::sync::Mutex<Option<ApprovalResponse>>>,
-) -> ryuzi_cli::dispatch::Deps {
+) -> ryuzi_runner::dispatch::Deps {
     let o = out.clone();
     let e = errs.clone();
     let mut prompts = prompts.into_iter();
-    ryuzi_cli::dispatch::Deps {
+    ryuzi_runner::dispatch::Deps {
         db_path: db.to_path_buf(),
         out: Box::new(move |s| o.lock().unwrap().push(s.to_string())),
         err: Box::new(move |s| e.lock().unwrap().push(s.to_string())),
         prompt: Box::new(move |_| prompts.next().unwrap_or_default().to_string()),
-        detect_git: || ryuzi_cli::detect::Detected {
+        detect_git: || ryuzi_runner::detect::Detected {
             found: true,
             version: None,
         },
@@ -485,7 +485,7 @@ fn plan_review_approve_sends_accept_edits_payload() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -531,7 +531,7 @@ fn plan_review_reject_sends_feedback_payload() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -578,7 +578,7 @@ fn question_numeric_answer_maps_to_option_label() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -620,7 +620,7 @@ fn tool_approval_scripted_capital_n_persists_reject_always_project() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -659,7 +659,7 @@ fn tool_approval_scripted_lowercase_s_allows_always_session() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -703,7 +703,7 @@ fn question_free_text_answer_becomes_single_element_other() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -750,7 +750,7 @@ fn question_zero_is_not_a_valid_option() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -797,7 +797,7 @@ fn question_out_of_range_number_falls_back_to_free_text() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -844,7 +844,7 @@ fn question_mixed_valid_and_junk_falls_back_to_free_text() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved
@@ -892,7 +892,7 @@ fn question_multiple_numbers_map_to_labels() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let code = ryuzi_cli::dispatch::run_cli(args, &mut deps);
+    let code = ryuzi_runner::dispatch::run_cli(args, &mut deps);
 
     assert_eq!(code, 0, "errs: {:?}", errs.lock().unwrap());
     let response = resolved

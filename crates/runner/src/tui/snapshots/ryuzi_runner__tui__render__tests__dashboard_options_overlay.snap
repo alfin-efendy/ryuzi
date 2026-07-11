@@ -1,5 +1,5 @@
 ---
-source: crates/cli/src/tui/render.rs
+source: crates/runner/src/tui/render.rs
 expression: text
 ---
 
