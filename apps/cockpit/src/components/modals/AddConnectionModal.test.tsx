@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
+const listRuntimes = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 let oauthAuthorizeUrlListener: ((event: { payload: { provider: string; authorizeUrl: string } }) => void) | null = null;
 const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string; authorizeUrl: string } }) => void) => {
   oauthAuthorizeUrlListener = cb;
@@ -13,7 +14,7 @@ const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string;
 });
 
 mock.module("@/bindings", () => ({
-  commands: { addConnection, connectOauth },
+  commands: { addConnection, connectOauth, listRuntimes },
   events: { oauthAuthorizeUrlMsg: { listen: listenOauthAuthorizeUrl } },
 }));
 
