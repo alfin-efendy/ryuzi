@@ -324,8 +324,7 @@ test("renders identity, about, and category/status badges from the manifest deta
   await screen.findByText("GitHub");
 
   expect(pluginDetail).toHaveBeenCalledWith("github");
-  // "GitHub (official)" appears as both the header subtitle and (no ledger
-  // row) the Provenance card's publisher-fallback Source value.
+  // "GitHub (official)" appears as the header subtitle.
   expect(screen.getAllByText("GitHub (official)").length).toBeGreaterThanOrEqual(1);
   expect(screen.getByText(/Repos, issues, and pull requests/)).toBeTruthy();
   expect(screen.getByText("Verified")).toBeTruthy();
@@ -480,15 +479,19 @@ test("renders the Provenance block: source spec, short commit, and installed/upd
   expect(screen.getByText(new Date(SKILL_PACK_UPDATED_AT).toLocaleDateString())).toBeTruthy();
 });
 
-test("Provenance falls back to the publisher when a plugin has no install ledger row", async () => {
+test("Provenance card is hidden entirely for a plugin with no install ledger row", async () => {
   render(<PluginDetailView id="github" />);
   await screen.findByText("GitHub");
 
-  expect(screen.getByText("Provenance")).toBeTruthy();
-  // "GitHub (official)" also appears as the header's subtitle — the
-  // Provenance card's Source row falls back to the same publisher string, so
-  // two nodes now carry it.
-  expect(screen.getAllByText("GitHub (official)").length).toBeGreaterThanOrEqual(2);
+  // A plugin never installed via the tracked git-clone path has null
+  // sourceSpec/resolvedCommit/installedAt/updatedAt, so the whole Provenance
+  // card must not render (matching the Auth/Settings/MCP/Models sibling
+  // cards, which all guard the whole Card on their content). Previously the
+  // card rendered as an empty shell, and before that its Source row
+  // duplicated the DetailHeader subtitle by falling back to `publisher`.
+  expect(screen.queryByText("Provenance")).toBeNull();
+  expect(screen.queryByText("Source")).toBeNull();
+  expect(screen.getAllByText("GitHub (official)").length).toBe(1);
 });
 
 test("non-skill-pack plugins render no Update/Pin actions", async () => {

@@ -357,35 +357,37 @@ export function PluginDetailView({ id }: { id: string }) {
           ))}
         </div>
 
-        <Card className="mb-3">
-          <CardHeader>
-            <CardTitle>Provenance</CardTitle>
-          </CardHeader>
-          <CardRow>
-            <span className="w-[100px] shrink-0 text-[13px] font-medium">Source</span>
-            <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
-              {info.sourceSpec || detail.publisher || info.id}
-            </span>
-          </CardRow>
-          {info.resolvedCommit && (
-            <CardRow>
-              <span className="w-[100px] shrink-0 text-[13px] font-medium">Commit</span>
-              <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{shortCommit(info.resolvedCommit)}</span>
-            </CardRow>
-          )}
-          {info.installedAt != null && (
-            <CardRow>
-              <span className="w-[100px] shrink-0 text-[13px] font-medium">Installed</span>
-              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{formatLedgerTimestamp(info.installedAt)}</span>
-            </CardRow>
-          )}
-          {info.updatedAt != null && (
-            <CardRow>
-              <span className="w-[100px] shrink-0 text-[13px] font-medium">Updated</span>
-              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{formatLedgerTimestamp(info.updatedAt)}</span>
-            </CardRow>
-          )}
-        </Card>
+        {(info.sourceSpec || info.resolvedCommit || info.installedAt != null || info.updatedAt != null) && (
+          <Card className="mb-3">
+            <CardHeader>
+              <CardTitle>Provenance</CardTitle>
+            </CardHeader>
+            {info.sourceSpec && (
+              <CardRow>
+                <span className="w-[100px] shrink-0 text-[13px] font-medium">Source</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{info.sourceSpec}</span>
+              </CardRow>
+            )}
+            {info.resolvedCommit && (
+              <CardRow>
+                <span className="w-[100px] shrink-0 text-[13px] font-medium">Commit</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{shortCommit(info.resolvedCommit)}</span>
+              </CardRow>
+            )}
+            {info.installedAt != null && (
+              <CardRow>
+                <span className="w-[100px] shrink-0 text-[13px] font-medium">Installed</span>
+                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{formatLedgerTimestamp(info.installedAt)}</span>
+              </CardRow>
+            )}
+            {info.updatedAt != null && (
+              <CardRow>
+                <span className="w-[100px] shrink-0 text-[13px] font-medium">Updated</span>
+                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{formatLedgerTimestamp(info.updatedAt)}</span>
+              </CardRow>
+            )}
+          </Card>
+        )}
 
         {attachFailure && (
           <Card className="mb-3 flex items-start gap-3 px-[18px] py-3.5">
