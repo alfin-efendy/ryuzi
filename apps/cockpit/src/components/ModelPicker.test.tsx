@@ -29,11 +29,9 @@ const connection: ConnectionInfo = {
   label: "Anthropic",
   priority: 0,
   enabled: true,
-  baseUrl: null,
+  quotaCapability: null,
   models: ["claude-opus-4", "claude-sonnet-4"],
-  keyMasked: "sk-…3fk9",
   needsRelogin: false,
-  claudeCloaking: false,
 };
 
 const { ModelPicker } = await import("./ModelPicker");

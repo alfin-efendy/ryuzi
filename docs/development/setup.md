@@ -2,10 +2,10 @@
 
 This guide covers everything needed to build the monorepo from source across all platforms. The repo contains two stacks:
 
-- **Rust** (the `ryuzi` CLI + engine in `crates/`, and the Cockpit desktop shell) — requires **Rust**; Cockpit additionally needs a C++ toolchain + **WebView**
+- **Rust** (the `ryuzi` runner + engine in `crates/`, and the Cockpit desktop shell) — requires **Rust**; Cockpit additionally needs a C++ toolchain + **WebView**
 - **JS/TS** (Cockpit frontend in `apps/cockpit`, shared UI in `packages/ui`) — requires **Bun**
 
-If you only work on the CLI/engine, you only need Rust. If you touch Cockpit (`apps/cockpit`), you need the full stack below.
+If you only work on the runner/engine, you only need Rust. If you touch Cockpit (`apps/cockpit`), you need the full stack below.
 
 ---
 
@@ -200,10 +200,11 @@ make cockpit # start Cockpit in dev mode (HMR)
 The engine (`ryuzi-core`) runs as a single background daemon process that
 every surface talks to — there is no per-surface embedded engine anymore.
 
-- **Single host.** The daemon (`ryuzi __daemon` from the CLI, or Cockpit's
-  hidden `--engine-daemon` mode) is the one process that owns the scheduler,
-  the orchestrator loops, the gateways (Discord, etc.), and the
-  `RouterServer` LLM-proxy endpoint.
+- **Single host.** The daemon (`ryuzi start` from the runner — a
+  user-facing alias for the hidden `ryuzi __daemon` entry point, also used as
+  the updater/canary respawn target — or Cockpit's hidden `--engine-daemon`
+  mode) is the one process that owns the scheduler, the orchestrator loops,
+  the gateways (Discord, etc.), and the `RouterServer` LLM-proxy endpoint.
 - **Thin clients.** Cockpit attaches to an already-running daemon if it finds
   one, or auto-spawns `--engine-daemon` itself when none is running, then
   talks to it exclusively over the control API — it never opens the SQLite
@@ -218,10 +219,6 @@ every surface talks to — there is no per-surface embedded engine anymore.
 - **Singleton lock.** A `daemon.lock` file in the state dir enforces exactly
   one daemon per state dir — a second `__daemon` invocation exits immediately
   with an "already running" error instead of double-binding the store.
-- **`ryuzi serve` is unchanged.** It remains a legacy embedded, read-mostly
-  HTTP surface (`token: None`, no auth) for one-off/local use — it is not the
-  daemon and is not part of this phase. Consolidating it into the control API
-  is slated for a later phase.
 
 ---
 

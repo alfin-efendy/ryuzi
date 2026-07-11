@@ -219,6 +219,8 @@ pub(crate) async fn probe_model_with_ctx(
         conn: conn.clone(),
         desc,
         upstream_model: model.to_string(),
+        route_target_key: None,
+        request_compatibility_effort: None,
     };
     if connections::is_oauth(&target.conn) {
         if let Err(err) =
@@ -350,6 +352,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.2".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2")
             .unwrap()
@@ -382,6 +386,8 @@ mod tests {
             conn: mk_conn("c2", "mimo-free", "free", ConnectionData::default()),
             desc,
             upstream_model: "mimo-auto".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "mimo-auto")
             .unwrap()
@@ -620,6 +626,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-sonnet-4-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-sonnet-4-5")
             .unwrap()
@@ -706,6 +714,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-sonnet-5".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-sonnet-5")
             .unwrap()
@@ -735,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_probe_hits_responses_and_normalizes_suffixed_ids() {
+    async fn codex_probe_hits_responses_and_keeps_bare_effort_suffix_exact() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("openai-oauth").unwrap();
         let target = RouteTarget {
@@ -751,6 +761,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.2-codex-high".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2-codex-high")
             .unwrap()
@@ -774,7 +786,7 @@ mod tests {
         assert_eq!(req.headers().get("accept").unwrap(), "text/event-stream");
         assert_eq!(req.headers().get("chatgpt-account-id").unwrap(), "acct-1");
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(sent["model"], "gpt-5.2-codex");
+        assert_eq!(sent["model"], "gpt-5.2-codex-high");
         // The ChatGPT Codex backend rejects shorthand probes (verified live
         // 2026-07-10): a string `input` 400s with "Input must be a list",
         // `stream: false` 400s with "Stream must be set to true", and
@@ -811,6 +823,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.2-codex".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2-codex")
             .unwrap()
@@ -835,6 +849,8 @@ mod tests {
             ),
             desc,
             upstream_model: "gpt-5.4-review".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.4-review")
             .unwrap()
@@ -860,6 +876,8 @@ mod tests {
             ),
             desc,
             upstream_model: "claude-opus-4-8".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-opus-4-8")
             .unwrap()
@@ -878,15 +896,19 @@ mod tests {
             crate::llm_router::models::ANTHROPIC_OAUTH_BETA
         );
         let sent: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(sent["system"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
         assert_eq!(
-            sent["system"][0]["text"],
+            sent["system"][1]["text"],
             crate::llm_router::models::CLAUDE_CODE_SYSTEM_PROMPT
         );
         assert_eq!(sent["max_tokens"], 1);
     }
 
     #[tokio::test]
-    async fn anthropic_oauth_probe_applies_cloak_when_enabled() {
+    async fn anthropic_oauth_model_probe_uses_required_cloak() {
         let ctx = test_ctx().await;
         let desc = registry::descriptor("anthropic-oauth").unwrap();
         let target = RouteTarget {
@@ -896,12 +918,13 @@ mod tests {
                 "oauth",
                 ConnectionData {
                     access_token: Some("sk-ant-oat-test".into()),
-                    provider_specific: Some(json!({"claudeCloaking": true})),
                     ..Default::default()
                 },
             ),
             desc,
             upstream_model: "claude-opus-4-8".into(),
+            route_target_key: None,
+            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-opus-4-8")
             .unwrap()

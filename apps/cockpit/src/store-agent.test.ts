@@ -4,6 +4,17 @@ import { useAgent } from "./store-agent";
 import { NATIVE_AGENT } from "./constants";
 import { commands } from "./bindings";
 
+const selectable = (requestValue: string) => ({
+  kind: "concrete" as const,
+  requestValue,
+  displayName: requestValue,
+  preferenceKey: null,
+  supported: [],
+  configuredDefault: null,
+  resolvedDefault: null,
+  defaultSource: "none" as const,
+});
+
 function reset() {
   useAgent.setState({ models: [], model: null, permMode: null, loaded: false });
 }
@@ -20,12 +31,12 @@ test("load pulls settings and the selectable model list, and marks the store loa
   });
   const mSpy = spyOn(commands, "listSelectableModels").mockResolvedValue({
     status: "ok",
-    data: ["smart", "anthropic/claude-opus-4"],
+    data: [selectable("smart"), selectable("anthropic/claude-opus-4")],
   });
   await useAgent.getState().load();
   expect(useAgent.getState().model).toBe("anthropic/claude-opus-4");
   expect(useAgent.getState().permMode).toBe("edit");
-  expect(useAgent.getState().models).toEqual(["smart", "anthropic/claude-opus-4"]);
+  expect(useAgent.getState().models.map((entry) => entry.requestValue)).toEqual(["smart", "anthropic/claude-opus-4"]);
   expect(useAgent.getState().loaded).toBe(true);
   sSpy.mockRestore();
   mSpy.mockRestore();

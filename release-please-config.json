@@ -1,10 +1,10 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "packages": {
-    "crates/cli": {
+    "crates/runner": {
       "release-type": "rust",
       "package-name": "ryuzi",
-      "component": "cli",
+      "component": "runner",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true

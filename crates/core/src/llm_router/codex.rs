@@ -486,39 +486,46 @@ fn normalize_codex_tools(body: &mut Value) {
     });
 }
 
-/// The base model id Codex actually serves, with any `-review` / effort
-/// (`-low/-medium/-high/-xhigh/-none`) suffix removed. Used by routing so a
-/// picker entry like `gpt-5.5-high` still matches the connection's `gpt-5.5`.
+/// The base model id Codex actually serves for a canonical review identity.
+/// Legacy effort suffixes are parsed at the routing boundary, where provider
+/// identity and the connection's real model catalog are available.
 pub fn codex_base_model(model: &str) -> &str {
-    let base = model.strip_suffix("-review").unwrap_or(model);
-    for effort in ["-xhigh", "-high", "-medium", "-low", "-none"] {
-        if let Some(stripped) = base.strip_suffix(effort) {
-            return stripped;
-        }
-    }
-    base
+    model.strip_suffix("-review").unwrap_or(model)
 }
 
-pub fn codex_virtual_model_to_upstream(model: &str) -> (String, Option<&'static str>) {
-    let mut upstream = model.strip_suffix("-review").unwrap_or(model).to_string();
-    for effort in ["xhigh", "high", "medium", "low", "none"] {
-        let suffix = format!("-{effort}");
-        if upstream.ends_with(&suffix) {
-            let new_len = upstream.len() - suffix.len();
-            upstream.truncate(new_len);
-            return (upstream, Some(effort));
-        }
+/// Map the policy/UI effort identity to the Codex Responses wire value.
+/// This is deliberately a protocol adapter, not a capability list.
+pub fn reasoning_effort_for_request(effort: &str) -> &str {
+    if effort == "ultra" {
+        "max"
+    } else {
+        effort
     }
-    (upstream, None)
+}
+
+/// Apply an already-resolved native turn policy. Unlike shared Responses
+/// normalization, this intentionally overwrites any translated effort.
+pub(crate) fn apply_native_reasoning_effort(body: &mut Value, effort: &str) {
+    let wire_effort = json!(reasoning_effort_for_request(effort));
+    match body.get_mut("reasoning") {
+        Some(Value::Object(reasoning)) => {
+            reasoning.insert("effort".into(), wire_effort);
+        }
+        _ => body["reasoning"] = json!({"effort": wire_effort}),
+    }
+}
+
+fn usable_effort(value: Option<&str>) -> Option<&str> {
+    value.filter(|effort| !effort.trim().is_empty())
 }
 
 pub fn normalize_codex_responses_body(
     body: &mut Value,
     upstream_model: &str,
+    explicit_effort: Option<&str>,
     cache_key: Option<&str>,
 ) {
-    let (model, model_effort) = codex_virtual_model_to_upstream(upstream_model);
-    body["model"] = json!(model);
+    body["model"] = json!(codex_base_model(upstream_model));
     let input = body.get("input").cloned().unwrap_or(Value::Null);
     body["input"] = normalize_responses_input(input);
     convert_codex_system_items_to_developer(body);
@@ -542,19 +549,27 @@ pub fn normalize_codex_responses_body(
         }
     }
 
-    if body.get("reasoning").is_none() {
-        let effort = body
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .or(model_effort)
-            .unwrap_or("low");
-        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
-    } else if body
-        .get("reasoning")
-        .and_then(|r| r.get("summary"))
-        .is_none()
-    {
-        body["reasoning"]["summary"] = json!("auto");
+    let nested_effort = usable_effort(body.pointer("/reasoning/effort").and_then(Value::as_str));
+    let flat_effort = usable_effort(body.get("reasoning_effort").and_then(Value::as_str));
+    let fallback = if nested_effort.is_some() {
+        None
+    } else if let Some(effort) = flat_effort {
+        Some(effort.to_string())
+    } else {
+        usable_effort(explicit_effort)
+            .map(reasoning_effort_for_request)
+            .map(str::to_string)
+    };
+    if let Some(effort) = fallback {
+        match body.get_mut("reasoning") {
+            Some(Value::Object(reasoning)) => {
+                reasoning.insert("effort".into(), json!(effort));
+            }
+            _ => body["reasoning"] = json!({"effort": effort}),
+        }
+    }
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.entry("summary").or_insert_with(|| json!("auto"));
     }
     if body
         .get("reasoning")
@@ -820,7 +835,7 @@ mod tests {
             "stream": false
         });
 
-        normalize_codex_responses_body(&mut body, "gpt-5.3-codex-high", Some("session-1"));
+        normalize_codex_responses_body(&mut body, "gpt-5.3-codex", Some("high"), Some("session-1"));
 
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["stream"], true);
@@ -841,11 +856,119 @@ mod tests {
     }
 
     #[test]
-    fn codex_base_model_strips_effort_and_review() {
-        assert_eq!(codex_base_model("gpt-5.5-high"), "gpt-5.5");
-        assert_eq!(codex_base_model("gpt-5.2-codex-xhigh"), "gpt-5.2-codex");
+    fn codex_base_model_only_resolves_canonical_review_identity() {
+        assert_eq!(codex_base_model("gpt-5.5-high"), "gpt-5.5-high");
+        assert_eq!(
+            codex_base_model("gpt-5.2-codex-xhigh"),
+            "gpt-5.2-codex-xhigh"
+        );
         assert_eq!(codex_base_model("gpt-5.5-review"), "gpt-5.5");
         assert_eq!(codex_base_model("gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn bare_effort_suffix_remains_exact_without_injected_effort() {
+        let mut body = json!({"input": []});
+
+        normalize_codex_responses_body(&mut body, "gpt-known-high", None, None);
+
+        assert_eq!(body["model"], "gpt-known-high");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn codex_wire_maps_ultra_to_max_but_preserves_open_custom_values() {
+        let mut ultra = json!({"input": []});
+        normalize_codex_responses_body(&mut ultra, "gpt-5.5", Some("ultra"), None);
+        assert_eq!(ultra["reasoning"]["effort"], "max");
+
+        let mut custom = json!({"input": []});
+        normalize_codex_responses_body(&mut custom, "gpt-5.5", Some("provider-experimental"), None);
+        assert_eq!(custom["reasoning"]["effort"], "provider-experimental");
+    }
+
+    #[test]
+    fn external_caller_reasoning_effort_wins_over_route_compatibility() {
+        let mut body = json!({
+            "input": [],
+            "reasoning": {"effort": "low", "summary": "detailed"}
+        });
+
+        normalize_codex_responses_body(&mut body, "gpt-5.5", Some("ultra"), None);
+
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+
+        let mut flat = json!({"input": [], "reasoning_effort": "high"});
+        normalize_codex_responses_body(&mut flat, "gpt-5.5", Some("low"), None);
+        assert_eq!(flat["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn malformed_reasoning_shape_does_not_panic() {
+        let mut body = json!({"input": [], "reasoning": "malformed"});
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            normalize_codex_responses_body(&mut body, "gpt-5.5", Some("low"), None);
+        }));
+        assert!(result.is_ok());
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn external_effort_precedence_uses_usable_values_and_preserves_summary() {
+        let mut nested_explicit = json!({
+            "input": [],
+            "reasoning": {"effort": "ultra", "summary": "detailed"},
+            "reasoning_effort": "high"
+        });
+        normalize_codex_responses_body(&mut nested_explicit, "gpt-5.5", Some("low"), None);
+        assert_eq!(nested_explicit["reasoning"]["effort"], "ultra");
+        assert_eq!(nested_explicit["reasoning"]["summary"], "detailed");
+
+        let mut flat_fills_object = json!({
+            "input": [],
+            "reasoning": {"summary": "detailed"},
+            "reasoning_effort": "high"
+        });
+        normalize_codex_responses_body(&mut flat_fills_object, "gpt-5.5", Some("ultra"), None);
+        assert_eq!(flat_fills_object["reasoning"]["effort"], "high");
+        assert_eq!(flat_fills_object["reasoning"]["summary"], "detailed");
+        assert!(flat_fills_object.get("reasoning_effort").is_none());
+
+        let mut compatibility_fills_object =
+            json!({"input": [], "reasoning": {"summary": "detailed"}});
+        normalize_codex_responses_body(
+            &mut compatibility_fills_object,
+            "gpt-5.5",
+            Some("ultra"),
+            None,
+        );
+        assert_eq!(compatibility_fills_object["reasoning"]["effort"], "max");
+        assert_eq!(
+            compatibility_fills_object["reasoning"]["summary"],
+            "detailed"
+        );
+
+        let mut malformed_with_flat =
+            json!({"input": [], "reasoning": "bad", "reasoning_effort": "ultra"});
+        normalize_codex_responses_body(&mut malformed_with_flat, "gpt-5.5", Some("low"), None);
+        assert_eq!(malformed_with_flat["reasoning"]["effort"], "ultra");
+        assert_eq!(malformed_with_flat["reasoning"]["summary"], "auto");
+
+        let mut malformed_with_compat = json!({"input": [], "reasoning": ["bad"]});
+        normalize_codex_responses_body(&mut malformed_with_compat, "gpt-5.5", Some("ultra"), None);
+        assert_eq!(malformed_with_compat["reasoning"]["effort"], "max");
+        assert_eq!(malformed_with_compat["reasoning"]["summary"], "auto");
+
+        let mut no_usable_fallback = json!({
+            "input": [],
+            "reasoning": {"summary": "detailed"},
+            "reasoning_effort": 7
+        });
+        normalize_codex_responses_body(&mut no_usable_fallback, "gpt-5.5", None, None);
+        assert!(no_usable_fallback["reasoning"].get("effort").is_none());
+        assert_eq!(no_usable_fallback["reasoning"]["summary"], "detailed");
     }
 
     #[test]

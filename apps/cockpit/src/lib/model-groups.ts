@@ -12,18 +12,6 @@ import type { ModelTestStatus } from "./model-testing";
  *  synthetic effort/-review picker variants. Applying this to other
  *  families' ids (e.g. OpenRouter's `openai/o3-mini-high`) would truncate a
  *  real, distinct model id into the wrong verdict key. */
-function stripCodexVariant(model: string): string {
-  let base = model.endsWith("-review") ? model.slice(0, -"-review".length) : model;
-  for (const effort of ["xhigh", "high", "medium", "low", "none"]) {
-    const suffix = `-${effort}`;
-    if (base.endsWith(suffix)) {
-      base = base.slice(0, -suffix.length);
-      break;
-    }
-  }
-  return base;
-}
-
 /** Normalize a picker value to the `(family, bare model)` pair that
  *  `model_status` verdicts are keyed by. Handles `family::model`
  *  route-target keys, `family/model` runtime ids, and `entry-id/model`
@@ -37,7 +25,7 @@ export function modelStatusKey(value: string, catalog: CatalogEntry[]): { family
   if (sep > 0) {
     const family = value.slice(0, sep);
     const rawModel = value.slice(sep + 2);
-    return { family, model: family === "openai" ? stripCodexVariant(rawModel) : rawModel };
+    return { family, model: rawModel };
   }
   const slash = value.indexOf("/");
   if (slash <= 0) return null;
@@ -45,7 +33,7 @@ export function modelStatusKey(value: string, catalog: CatalogEntry[]): { family
   const entry = catalog.find((e) => e.family === prefix) ?? catalog.find((e) => e.id === prefix);
   if (!entry) return null;
   const rawModel = value.slice(slash + 1);
-  return { family: entry.family, model: entry.family === "openai" ? stripCodexVariant(rawModel) : rawModel };
+  return { family: entry.family, model: rawModel };
 }
 
 /** Group the composer's selectable model ids by provider family (PR #70
@@ -112,7 +100,7 @@ export function groupModelOptions(
     if (key !== null) return statuses[statusKey(key.family, key.model)];
     const family = familyByModel.get(m);
     if (family === undefined) return undefined;
-    return statuses[statusKey(family, family === "openai" ? stripCodexVariant(m) : m)];
+    return statuses[statusKey(family, m)];
   };
 
   const byFamily = new Map<string, ComboboxOption[]>();

@@ -157,6 +157,19 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<Session> {
+        self.start_chat_session_with_runtime(prompt, started_by, attachments, None, None, None)
+            .await
+    }
+
+    pub async fn start_chat_session_with_runtime(
+        self: &Arc<Self>,
+        prompt: TurnPrompt,
+        started_by: &str,
+        attachments: &[AttachmentRef],
+        model: Option<String>,
+        effort: Option<String>,
+        perm_mode: Option<PermMode>,
+    ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
@@ -177,13 +190,15 @@ impl ControlPlane {
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: false,
-            perm_mode: PermMode::Default,
+            perm_mode: perm_mode.unwrap_or(PermMode::Default),
             kind: SessionKind::Chat,
             speaker: None,
             agent: None,
             parent_session_pk: None,
         };
-        self.store.insert_session(session.clone()).await?;
+        self.store
+            .insert_chat_session_with_runtime(session.clone(), model, effort)
+            .await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
             session_pk: session_pk.clone(),
             project_id: None,
@@ -202,8 +217,14 @@ impl ControlPlane {
         // like a project session's startup.
         let me = Arc::clone(self);
         let attachments = attachments.to_vec();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.starting
+            .lock()
+            .unwrap()
+            .insert(session_pk.clone(), cancel.clone());
         tokio::spawn(async move {
-            me.run_chat_startup(session_pk, prompt, attachments).await;
+            me.run_chat_startup(session_pk, prompt, attachments, cancel)
+                .await;
         });
 
         Ok(session)
@@ -217,12 +238,8 @@ impl ControlPlane {
         session_pk: String,
         prompt: TurnPrompt,
         attachments: Vec<AttachmentRef>,
+        cancel: tokio_util::sync::CancellationToken,
     ) {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        self.starting
-            .lock()
-            .unwrap()
-            .insert(session_pk.clone(), cancel.clone());
         self.chat_startup_phases(&session_pk, prompt, attachments, &cancel)
             .await;
         self.starting.lock().unwrap().remove(&session_pk);
@@ -813,17 +830,21 @@ impl ControlPlane {
                     .flatten()
                     .unwrap_or_else(|| "default".to_string());
                 let perm_mode = PermMode::from_db(&default_perm_raw);
-                let model = crate::agent_settings::get(&self.store)
-                    .await
-                    .ok()
-                    .and_then(|a| a.model)
-                    .filter(|m| !m.trim().is_empty());
-                let effort = settings
+                let runtime = self.store.get_session_runtime_settings(session_pk).await?;
+                let model = runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.model.clone())
+                    .or(crate::agent_settings::get(&self.store)
+                        .await
+                        .ok()
+                        .and_then(|a| a.model)
+                        .filter(|m| !m.trim().is_empty()));
+                let effort = runtime.and_then(|runtime| runtime.effort).or(settings
                     .get("default_effort")
                     .await
                     .ok()
                     .flatten()
-                    .filter(|v| !v.trim().is_empty());
+                    .filter(|v| !v.trim().is_empty()));
                 (perm_mode, model, effort)
             }
         };

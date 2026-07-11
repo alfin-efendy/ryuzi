@@ -321,7 +321,7 @@ test("browse install routes an integration to the install wizard", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Install github" }));
 
-  expect(await screen.findByText("Install github", { selector: "span" })).toBeTruthy();
+  expect(await screen.findByText("Install github", { selector: "h2" })).toBeTruthy();
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("github"));
 });
 

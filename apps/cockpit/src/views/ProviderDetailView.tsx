@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronRight, Plus, RefreshCw, TestTube2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Pencil, Plus, RefreshCw, TestTube2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { commands, type ConnectionInfo, type ModelRouteStrategy, type UsageSeries } from "@/bindings";
+import { commands, type ConnectionInfo, type ModelRouteStrategy, type SelectableModelInfo, type UsageSeries } from "@/bindings";
 import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
@@ -18,10 +18,16 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
-import { Chip, Pill } from "@/components/common/bits";
+import { Chip } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
+import { useAgent } from "@/store-agent";
+import { useStore } from "@/store";
+import { AccountQuotaSummary } from "@/components/AccountQuotaSummary";
+import { usesDeviceSignin } from "@/components/modals/deviceSignin";
+import { RenameAccountModal } from "@/components/modals/RenameAccountModal";
+import { ConfirmAccountActionModal, type ConfirmAccountAction } from "@/components/modals/ConfirmAccountActionModal";
 
 function accountLabel(count: number): string {
   return `${count} account${count === 1 ? "" : "s"}`;
@@ -33,6 +39,47 @@ function modelLabel(count: number, prefix = ""): string {
 
 function strategyText(strategy: ModelRouteStrategy): string {
   return strategy === "round-robin" ? "Round robin" : "By order";
+}
+
+export function accountReconnectKind(conn: ConnectionInfo, entry: Parameters<typeof usesDeviceSignin>[0] | undefined) {
+  if (conn.authType !== "oauth") return null;
+  return entry && usesDeviceSignin(entry) ? "device" : "redirect";
+}
+
+export function modelEffortDefaultOptions(metadata: SelectableModelInfo) {
+  const inheritedLabel =
+    metadata.defaultSource === "variesByTarget" ? "Default: varies by target" : `Default: ${metadata.resolvedDefault ?? "provider"}`;
+  return [
+    { value: "__model_default__", label: inheritedLabel },
+    ...metadata.supported.map((option) => ({ value: option.value, label: option.label, description: option.description ?? undefined })),
+  ];
+}
+
+export function ModelEffortDefaultCombobox({
+  metadata,
+  onChange,
+}: {
+  metadata: SelectableModelInfo;
+  onChange: (key: NonNullable<SelectableModelInfo["preferenceKey"]>, effort: string | null) => void;
+}) {
+  const key = metadata.preferenceKey;
+  if (!key) return null;
+  const configuredLabel = metadata.supported.find((option) => option.value === metadata.configuredDefault)?.label;
+  const inheritedLabel = modelEffortDefaultOptions(metadata)[0].label;
+  return (
+    <Combobox
+      aria-label={`Default effort for ${metadata.displayName}`}
+      options={modelEffortDefaultOptions(metadata)}
+      value={metadata.configuredDefault ?? "__model_default__"}
+      onValueChange={(value) => onChange(key, value === "__model_default__" ? null : value)}
+      trigger={
+        <Button variant="outline" size="sm" className="w-[180px] justify-start">
+          {configuredLabel ? `Default: ${configuredLabel}` : inheritedLabel}
+        </Button>
+      }
+      className="w-[180px]"
+    />
+  );
 }
 
 function aggregateUsage(series: Array<UsageSeries | undefined>): UsageSeries | null {
@@ -56,14 +103,32 @@ function aggregateUsage(series: Array<UsageSeries | undefined>): UsageSeries | n
   };
 }
 
-function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: number; count: number }) {
-  const nav = useNav();
-  const update = useConnections((s) => s.update);
+function AccountRow({
+  conn,
+  index,
+  count,
+  deviceSignin,
+  onRename,
+  onDelete,
+  onResetCredit,
+  onDeviceReconnect,
+}: {
+  conn: ConnectionInfo;
+  index: number;
+  count: number;
+  deviceSignin: boolean;
+  onRename: () => void;
+  onDelete: (trigger: HTMLButtonElement) => void;
+  onResetCredit: (request: { accountName: string; onConfirm: () => Promise<boolean>; trigger: HTMLButtonElement }) => void;
+  onDeviceReconnect: () => void;
+}) {
+  const setEnabled = useConnections((s) => s.setEnabled);
   const move = useConnections((s) => s.move);
   const test = useConnections((s) => s.test);
+  const reconnectOauth = useConnections((s) => s.reconnectOauth);
   const [testing, setTesting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
 
-  const open = () => nav.navigate({ kind: "connectionDetail", id: conn.id });
   const name = conn.label || conn.providerName;
 
   const runTest = async () => {
@@ -76,65 +141,69 @@ function AccountRow({ conn, index, count }: { conn: ConnectionInfo; index: numbe
     }
   };
 
+  const reconnect = async () => {
+    if (deviceSignin) {
+      onDeviceReconnect();
+      return;
+    }
+    setReconnecting(true);
+    const ok = await reconnectOauth(conn.id);
+    setReconnecting(false);
+    if (ok) toast.success(`Reconnected ${name}`);
+  };
+
   return (
-    <div className="flex items-center gap-2 border-b border-border px-[18px] py-3.5 last:border-b-0">
-      <Chip initial={conn.initial} color={conn.color} size={34} onClick={open} />
-      <div className="flex shrink-0 items-center gap-1">
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={`Move ${name} up`}
-          title={`Move ${name} up`}
-          onClick={() => void move(conn.id, -1)}
-          disabled={index === 0}
-          className="text-muted-foreground"
-        >
-          <ArrowUp aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+    <div className="border-b border-border last:border-b-0">
+      <div className="flex items-center gap-2 px-[18px] py-3.5">
+        <Chip initial={conn.initial} color={conn.color} size={34} />
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Move ${name} up`}
+            title={`Move ${name} up`}
+            onClick={() => void move(conn.id, -1)}
+            disabled={index === 0}
+            className="text-muted-foreground"
+          >
+            <ArrowUp aria-hidden />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Move ${name} down`}
+            title={`Move ${name} down`}
+            onClick={() => void move(conn.id, 1)}
+            disabled={index === count - 1}
+            className="text-muted-foreground"
+          >
+            <ArrowDown aria-hidden />
+          </Button>
+        </div>
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="truncate text-sm font-semibold text-foreground">{name}</span>
+          <Button variant="ghost" size="icon-sm" aria-label={`Rename ${name}`} onClick={onRename} className="text-muted-foreground">
+            <Pencil aria-hidden />
+          </Button>
+          {conn.needsRelogin && <span className="text-xs text-destructive">Needs re-login</span>}
+        </div>
+        <Switch on={conn.enabled} onToggle={() => void setEnabled(conn.id, !conn.enabled)} label={`Enabled ${name}`} />
+        <Button aria-label={`Test ${name}`} variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
+          {testing ? "Testing..." : "Test"}
         </Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={`Move ${name} down`}
-          title={`Move ${name} down`}
-          onClick={() => void move(conn.id, 1)}
-          disabled={index === count - 1}
-          className="text-muted-foreground"
-        >
-          <ArrowDown aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+        {conn.authType === "oauth" && (
+          <Button aria-label={`Reconnect ${name}`} variant="outline" size="sm" onClick={() => void reconnect()} disabled={reconnecting}>
+            {reconnecting ? "Reconnecting…" : "Reconnect"}
+          </Button>
+        )}
+        <Button aria-label={`Delete ${name}`} variant="destructive" size="sm" onClick={(event) => onDelete(event.currentTarget)}>
+          <Trash2 aria-hidden data-icon="inline-start" />
+          Delete
         </Button>
       </div>
-      <Button
-        variant="ghost"
-        onClick={open}
-        className="h-auto min-w-0 flex-1 flex-col items-start gap-0 whitespace-normal p-0 text-left font-normal"
-      >
-        <span className="block text-sm font-semibold text-foreground">{name}</span>
-        <span className="block text-xs text-muted-foreground">
-          {conn.authType === "oauth" ? "Subscription" : conn.authType === "free" ? "Free" : "API key"} · {conn.keyMasked ?? "no key"} ·{" "}
-          {modelLabel(conn.models.length)}
-          {conn.needsRelogin ? " · needs re-login" : ""}
-        </span>
-      </Button>
-      <Switch
-        on={conn.enabled}
-        onToggle={() =>
-          void update(conn.id, {
-            label: conn.label,
-            enabled: !conn.enabled,
-            apiKey: null,
-            baseUrl: conn.baseUrl,
-            models: conn.models,
-            claudeCloaking: conn.provider === "anthropic-oauth" ? conn.claudeCloaking : null,
-          })
-        }
-        label="Enabled"
-      />
-      <Button variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
-        {testing ? "Testing..." : "Test"}
-      </Button>
-      <Button variant="ghost" size="icon-sm" title="Details" onClick={open} className="text-muted-foreground">
-        <ChevronRight aria-hidden size={14} strokeWidth={2} className="size-3.5" />
-      </Button>
+      {conn.quotaCapability && (
+        <AccountQuotaSummary connectionId={conn.id} accountName={name} capability={conn.quotaCapability} onRequestReset={onResetCredit} />
+      )}
     </div>
   );
 }
@@ -175,6 +244,9 @@ function ProviderModelsCard({
   const hideInvalid = useUi((s) => s.hideInvalidModels);
   const toggleHideInvalid = useUi((s) => s.toggleHideInvalidModels);
   const hydrate = useConnections((s) => s.hydrate);
+  const selectableModels = useAgent((s) => s.models);
+  const setModelEffortPreference = useStore((s) => s.setModelEffortPreference);
+  const refreshModelConfiguration = useStore((s) => s.refreshModelConfiguration);
   const models = useMemo(() => {
     const set = new Set<string>();
     for (const conn of connections) {
@@ -266,6 +338,7 @@ function ProviderModelsCard({
     setRefreshErrors(failures.map((item) => ({ connectionId: item.connectionId, message: item.message })));
     if (failures.length === 0) toast.success("Models refreshed");
     await hydrate();
+    await refreshModelConfiguration();
   };
 
   return (
@@ -294,11 +367,21 @@ function ProviderModelsCard({
       {visible.map((model) => {
         const entry = results.get(model);
         const testing = inFlight.has(model);
+        const metadata = selectableModels.find(
+          (candidate) =>
+            candidate.kind === "concrete" &&
+            candidate.preferenceKey?.family === family &&
+            candidate.preferenceKey.model === model &&
+            candidate.supported.length > 0,
+        );
         return (
           <div key={model} className="flex min-h-11 items-center gap-2 border-b border-border px-[18px] py-2.5 last:border-b-0">
             <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{model}</span>
             {entry && <StatusBadge entry={entry} />}
             <ModelCapabilityIcons model={model} compact />
+            {metadata?.preferenceKey ? (
+              <ModelEffortDefaultCombobox metadata={metadata} onChange={(key, effort) => void setModelEffortPreference(key, effort)} />
+            ) : null}
             <Button
               variant="outline"
               size="sm"
@@ -326,12 +409,14 @@ function ProviderModelsCard({
 
 export function ProviderDetailView({ provider }: { provider: string }) {
   const nav = useNav();
-  const { catalog, connections, loaded, hydrate } = useConnections();
+  const { catalog, connections, loaded, hydrate, rename, remove } = useConnections();
   const usageByConnection = useUsage((s) => s.byConnection);
   const loadUsage = useUsage((s) => s.loadConnection);
   const [addOpen, setAddOpen] = useState(false);
   const [accountStrategy, setAccountStrategy] = useState<ModelRouteStrategy>("fallback");
   const [savingStrategy, setSavingStrategy] = useState(false);
+  const [renameConnection, setRenameConnection] = useState<ConnectionInfo | null>(null);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAccountAction | null>(null);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -414,7 +499,6 @@ export function ProviderDetailView({ provider }: { provider: string }) {
           chip={<Chip initial={initial} color={color} size={44} />}
           title={name}
           sub={`${accountLabel(providerConnections.length)} · ${modelLabel(catalogModels.length, "catalog ")}`}
-          titleExtra={activeCount > 0 ? <Pill variant="primary">{activeCount} active</Pill> : undefined}
         />
 
         <Card>
@@ -437,13 +521,33 @@ export function ProviderDetailView({ provider }: { provider: string }) {
                 className="w-[140px]"
               />
               <Button onClick={() => setAddOpen(true)}>
-                <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+                <Plus aria-hidden data-icon="inline-start" />
                 Add account
               </Button>
             </div>
           </CardHeader>
           {providerConnections.map((conn, index) => (
-            <AccountRow key={conn.id} conn={conn} index={index} count={providerConnections.length} />
+            <AccountRow
+              key={conn.id}
+              conn={conn}
+              index={index}
+              count={providerConnections.length}
+              deviceSignin={(() => {
+                const entry = catalog.find((candidate) => candidate.id === conn.provider);
+                return accountReconnectKind(conn, entry) === "device";
+              })()}
+              onRename={() => setRenameConnection(conn)}
+              onDelete={(trigger) => {
+                setConfirmAction({
+                  kind: "delete",
+                  accountName: conn.label || conn.providerName,
+                  onConfirm: () => remove(conn.id),
+                  trigger,
+                });
+              }}
+              onResetCredit={(request) => setConfirmAction({ kind: "resetCredit", ...request })}
+              onDeviceReconnect={() => setAddOpen(true)}
+            />
           ))}
           {loaded && providerConnections.length === 0 && (
             <div className="px-[18px] py-8 text-center text-[13px] text-muted-foreground">
@@ -470,6 +574,19 @@ export function ProviderDetailView({ provider }: { provider: string }) {
         <ProviderModelsCard family={provider} connections={providerConnections} catalogModels={catalogModels} />
       </div>
       <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
+      <RenameAccountModal
+        open={renameConnection !== null}
+        connection={renameConnection}
+        onClose={() => setRenameConnection(null)}
+        onRename={(label) => (renameConnection ? rename(renameConnection.id, label) : Promise.resolve(false))}
+      />
+      <ConfirmAccountActionModal
+        open={confirmAction !== null}
+        action={confirmAction}
+        onClose={() => {
+          setConfirmAction(null);
+        }}
+      />
     </div>
   );
 }

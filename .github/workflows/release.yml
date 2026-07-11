@@ -9,14 +9,14 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    # One GitHub release per cycle: only crates/cli creates a release + tag
+    # One GitHub release per cycle: only crates/runner creates a release + tag
     # (vX.Y.Z). cockpit and core are skip-github-release packages — they keep
     # independent versions and changelogs in the same release PR, and the
-    # cockpit installers are uploaded onto the CLI release by the jobs below
+    # cockpit installers are uploaded onto the runner release by the jobs below
     # (skipped packages emit no action outputs, so nothing cockpit-* here).
     outputs:
-      release_created: ${{ steps.rp.outputs['crates/cli--release_created'] }}
-      tag_name: ${{ steps.rp.outputs['crates/cli--tag_name'] }}
+      release_created: ${{ steps.rp.outputs['crates/runner--release_created'] }}
+      tag_name: ${{ steps.rp.outputs['crates/runner--tag_name'] }}
     steps:
       # skip-github-release packages never get tags from release-please (tags
       # only come with GitHub releases), yet its fallback lookup for "last
