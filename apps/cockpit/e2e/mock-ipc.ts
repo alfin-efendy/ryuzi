@@ -109,6 +109,110 @@ const CONNECTIONS = [
   },
 ] satisfies ConnectionInfo[];
 
+export const ACCOUNT_CATALOG = [
+  {
+    id: "anthropic-oauth",
+    name: "Claude Code",
+    family: "anthropic",
+    color: "#D97757",
+    initial: "C",
+    category: "oauth",
+    format: "anthropic",
+    requiresBaseUrl: false,
+    models: ["claude-sonnet-4"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  },
+  {
+    id: "openai-oauth",
+    name: "Codex",
+    family: "openai",
+    color: "#10A37F",
+    initial: "O",
+    category: "oauth",
+    format: "openai",
+    requiresBaseUrl: false,
+    models: ["gpt-5.5"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  },
+  {
+    id: "kiro",
+    name: "Kiro",
+    family: "kiro",
+    color: "#7C3AED",
+    initial: "K",
+    category: "device",
+    format: "openai",
+    requiresBaseUrl: false,
+    models: ["kiro-auto"],
+    freeTier: true,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  },
+];
+
+export const ACCOUNT_CONNECTIONS = [
+  {
+    id: "claude-personal",
+    provider: "anthropic-oauth",
+    providerName: "Claude Code",
+    color: "#D97757",
+    initial: "C",
+    authType: "oauth",
+    label: "Claude Personal",
+    priority: 0,
+    enabled: true,
+    quotaCapability: "claude",
+    models: ["claude-sonnet-4"],
+    needsRelogin: true,
+  },
+  {
+    id: "codex-primary",
+    provider: "openai-oauth",
+    providerName: "Codex",
+    color: "#10A37F",
+    initial: "O",
+    authType: "oauth",
+    label: "Codex Primary",
+    priority: 0,
+    enabled: true,
+    quotaCapability: "codex",
+    models: ["gpt-5.5"],
+    needsRelogin: false,
+  },
+  {
+    id: "codex-backup",
+    provider: "openai-oauth",
+    providerName: "Codex",
+    color: "#10A37F",
+    initial: "O",
+    authType: "oauth",
+    label: "Codex Backup",
+    priority: 1,
+    enabled: true,
+    quotaCapability: "codex",
+    models: ["gpt-5.5"],
+    needsRelogin: false,
+  },
+  {
+    id: "kiro-device",
+    provider: "kiro",
+    providerName: "Kiro",
+    color: "#7C3AED",
+    initial: "K",
+    authType: "oauth",
+    label: "Kiro Device",
+    priority: 0,
+    enabled: true,
+    quotaCapability: null,
+    models: ["kiro-auto"],
+    needsRelogin: true,
+  },
+] satisfies ConnectionInfo[];
+
 const initialProjectRuntime = {
   projectId: PROJECT.projectId,
   model: null,
@@ -249,6 +353,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         ? (JSON.parse(stored) as DurableState)
         : { sessions: fixtures.list_sessions as (typeof SESSION)[], messages: [], route: null, routeRequests: 0 };
       let sessions = durable.sessions;
+      let connections = fixtures.list_connections as ConnectionInfo[];
+      const quotaAttempts = new Map<string, number>();
+      const pendingQuota = new Map<string, (value: unknown) => void>();
       let projectRuntime = fixtures.project_runtime_info as {
         projectId: string;
         model: string | null;
@@ -263,6 +370,27 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
       const eventHandlers = new Map<string, number[]>();
       const w = window as unknown as Record<string, unknown>;
       w.__mockCalls = calls;
+      w.__resolveMockQuota = (id: string) => {
+        pendingQuota.get(id)?.(quotaFor(id));
+        pendingQuota.delete(id);
+      };
+
+      const quotaFor = (id: string) => ({
+        provider: id.startsWith("claude") ? "anthropic-oauth" : "openai-oauth",
+        plan: id.startsWith("claude") ? "Claude Pro" : "ChatGPT Plus",
+        message: null,
+        limitReached: false,
+        reviewLimitReached: false,
+        resetCredits: id.startsWith("codex") ? { availableCount: 2, refreshAt: "2030-01-01T00:00:00Z" } : null,
+        quotas: [
+          {
+            label: id.startsWith("claude") ? "5 hour" : "Codex primary",
+            usedPercentage: id.endsWith("backup") ? 35 : 20,
+            remainingPercentage: id.endsWith("backup") ? 65 : 80,
+            resetAt: "2030-01-01T00:00:00Z",
+          },
+        ],
+      });
 
       const persist = () => {
         durable.sessions = sessions;
@@ -382,6 +510,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           if (cmd === "plugin:event|unlisten") return Promise.resolve(null);
           if (cmd.startsWith("plugin:")) return Promise.resolve(null);
           if (cmd === "list_sessions") return Promise.resolve(sessions);
+          if (cmd === "list_connections") return Promise.resolve(connections);
           if (cmd === "list_messages") return Promise.resolve(durable.messages);
           if (cmd === "start_session") {
             const session = fixtures.start_session as typeof SESSION;
@@ -419,6 +548,56 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
               modelInfo: modelInfo ?? null,
             };
             return Promise.resolve(projectRuntime);
+          }
+          if (cmd === "connection_provider_quota") {
+            const { id } = args as { id: string };
+            const attempts = (quotaAttempts.get(id) ?? 0) + 1;
+            quotaAttempts.set(id, attempts);
+            if (fixtures.quota_failure_once === id && attempts === 1) {
+              return Promise.reject({ message: "Provider quota unavailable" });
+            }
+            const delayKey = `ryuzi.e2e.delayed-quota.${id}`;
+            if (fixtures.delayed_quota === id && !localStorage.getItem(delayKey)) {
+              localStorage.setItem(delayKey, "pending");
+              return new Promise((resolve) => pendingQuota.set(id, resolve));
+            }
+            return Promise.resolve(quotaFor(id));
+          }
+          if (cmd === "reset_codex_credit") return Promise.resolve({ consumed: true, availableCount: 1 });
+          if (cmd === "rename_connection") {
+            const { id, label } = args as { id: string; label: string };
+            connections = connections.map((connection) => (connection.id === id ? { ...connection, label } : connection));
+            return Promise.resolve(connections);
+          }
+          if (cmd === "set_connection_enabled") {
+            const { id, enabled } = args as { id: string; enabled: boolean };
+            connections = connections.map((connection) => (connection.id === id ? { ...connection, enabled } : connection));
+            return Promise.resolve(connections);
+          }
+          if (cmd === "move_connection") {
+            const { id, dir } = args as { id: string; dir: number };
+            const from = connections.findIndex((connection) => connection.id === id);
+            const to = Math.max(0, Math.min(connections.length - 1, from + dir));
+            if (from >= 0 && from !== to) {
+              const next = [...connections];
+              const [moved] = next.splice(from, 1);
+              next.splice(to, 0, moved);
+              connections = next.map((connection, priority) => ({ ...connection, priority }));
+            }
+            return Promise.resolve(connections);
+          }
+          if (cmd === "remove_connection") {
+            const { id } = args as { id: string };
+            connections = connections.filter((connection) => connection.id !== id);
+            return Promise.resolve(connections);
+          }
+          if (cmd === "test_connection") return Promise.resolve({ ok: true, message: "Connection works" });
+          if (cmd === "reconnect_oauth") {
+            const { connectionId } = args as { connectionId: string };
+            connections = connections.map((connection) =>
+              connection.id === connectionId ? { ...connection, needsRelogin: false } : connection,
+            );
+            return Promise.resolve(connections);
           }
           if (cmd in fixtures) return Promise.resolve(fixtures[cmd]);
           console.warn("[mock-ipc] unmocked command:", cmd);
