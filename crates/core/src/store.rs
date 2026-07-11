@@ -1104,6 +1104,24 @@ impl Store {
         .await
     }
 
+    /// Update only the permission column. Runtime selection and harness
+    /// canonicalization have independent atomic persistence paths.
+    pub async fn update_project_perm_mode(
+        &self,
+        project_id: &str,
+        perm_mode: PermMode,
+    ) -> anyhow::Result<bool> {
+        let project_id = project_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE projects SET perm_mode=?2 WHERE project_id=?1",
+                params![project_id, perm_mode.as_str()],
+            )
+            .map(|changed| changed > 0)
+        })
+        .await
+    }
+
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
@@ -2337,6 +2355,59 @@ mod tests {
         assert_eq!(project.harness, "native");
         assert_eq!(project.model.as_deref(), Some("new-model"));
         assert_eq!(project.effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_permission_update_preserves_atomic_model_effort() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        store
+            .insert_project(Project {
+                project_id: "p-permission-race".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "native".into(),
+                model: Some("old-model".into()),
+                effort: Some("low".into()),
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let runtime_store = store.clone();
+        let runtime_barrier = barrier.clone();
+        let runtime = tokio::spawn(async move {
+            runtime_barrier.wait().await;
+            runtime_store
+                .update_project_runtime(
+                    "p-permission-race",
+                    Some("new-model".into()),
+                    Some("high".into()),
+                )
+                .await
+                .unwrap();
+        });
+        let permission_store = store.clone();
+        let permission = tokio::spawn(async move {
+            barrier.wait().await;
+            permission_store
+                .update_project_perm_mode("p-permission-race", PermMode::BypassPermissions)
+                .await
+                .unwrap();
+        });
+        runtime.await.unwrap();
+        permission.await.unwrap();
+        let project = store
+            .get_project("p-permission-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.model.as_deref(), Some("new-model"));
+        assert_eq!(project.effort.as_deref(), Some("high"));
+        assert_eq!(project.perm_mode, PermMode::BypassPermissions);
     }
 
     #[tokio::test]

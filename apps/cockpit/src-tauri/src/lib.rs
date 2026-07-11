@@ -278,6 +278,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::get_setting,
             commands::set_setting,
             commands::update_project,
+            commands::update_project_perm_mode,
             commands::set_model_effort_preference,
             commands::project_runtime_info,
             commands::update_project_runtime,

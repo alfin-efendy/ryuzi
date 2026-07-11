@@ -105,6 +105,16 @@ const projectRuntimeMutationGeneration = new Map<string, number>();
 const projectRuntimeActiveMutation = new Map<string, number>();
 const projectRuntimeLoadGeneration = new Map<string, number>();
 
+type ProjectRuntimeQueue = {
+  tail: Promise<void>;
+  pending: number;
+  latestIntent: number;
+  confirmedProject: Project;
+  confirmedRuntime: ProjectRuntimeInfo | undefined;
+};
+
+const projectRuntimeQueues = new Map<string, ProjectRuntimeQueue>();
+
 function nextGeneration(generations: Map<string, number>, projectId: string): number {
   const generation = (generations.get(projectId) ?? 0) + 1;
   generations.set(projectId, generation);
@@ -296,8 +306,20 @@ export const useStore = create<State>((set, get) => ({
   setProjectRuntime: async (projectId, model, effort) => {
     const project = get().projects.find((p) => p.projectId === projectId);
     if (!project) return false;
-    const previousProject = project;
     const previousRuntime = get().projectRuntimeById[projectId];
+    let queue = projectRuntimeQueues.get(projectId);
+    if (!queue) {
+      queue = {
+        tail: Promise.resolve(),
+        pending: 0,
+        latestIntent: 0,
+        confirmedProject: project,
+        confirmedRuntime: previousRuntime,
+      };
+      projectRuntimeQueues.set(projectId, queue);
+    }
+    const intent = ++queue.latestIntent;
+    queue.pending += 1;
     const mutationGeneration = nextGeneration(projectRuntimeMutationGeneration, projectId);
     projectRuntimeActiveMutation.set(projectId, mutationGeneration);
     const optimisticRuntime: ProjectRuntimeInfo = previousRuntime
@@ -316,29 +338,43 @@ export const useStore = create<State>((set, get) => ({
       projects: st.projects.map((p) => (p.projectId === projectId ? { ...p, model, effort } : p)),
       projectRuntimeById: { ...st.projectRuntimeById, [projectId]: optimisticRuntime },
     }));
-    const res = await commands.updateProjectRuntime(projectId, model, effort);
-    if (projectRuntimeMutationGeneration.get(projectId) !== mutationGeneration) {
-      return res.status === "ok";
-    }
-    projectRuntimeActiveMutation.delete(projectId);
-    if (res.status === "error") {
-      set((st) => {
-        const projectRuntimeById = { ...st.projectRuntimeById };
-        if (previousRuntime) projectRuntimeById[projectId] = previousRuntime;
-        else delete projectRuntimeById[projectId];
-        return {
-          projects: st.projects.map((p) => (p.projectId === projectId ? previousProject : p)),
-          projectRuntimeById,
-        };
-      });
-      toast.error("Couldn't set model and effort: " + res.error.message);
-      return false;
-    }
-    set((st) => ({
-      projects: st.projects.map((p) => (p.projectId === projectId ? { ...p, model: res.data.model, effort: res.data.storedEffort } : p)),
-      projectRuntimeById: { ...st.projectRuntimeById, [projectId]: res.data },
-    }));
-    return true;
+    let succeeded = false;
+    const execute = async () => {
+      try {
+        const res = await commands.updateProjectRuntime(projectId, model, effort);
+        succeeded = res.status === "ok";
+        if (res.status === "ok") {
+          queue.confirmedRuntime = res.data;
+          queue.confirmedProject = {
+            ...queue.confirmedProject,
+            model: res.data.model,
+            effort: res.data.storedEffort,
+          };
+        } else {
+          toast.error("Couldn't set model and effort: " + res.error.message);
+        }
+      } catch (error) {
+        toast.error("Couldn't set model and effort: " + String(error));
+      }
+      queue.pending -= 1;
+      if (intent === queue.latestIntent) {
+        projectRuntimeActiveMutation.delete(projectId);
+        set((st) => {
+          const projectRuntimeById = { ...st.projectRuntimeById };
+          if (queue.confirmedRuntime) projectRuntimeById[projectId] = queue.confirmedRuntime;
+          else delete projectRuntimeById[projectId];
+          return {
+            projects: st.projects.map((candidate) => (candidate.projectId === projectId ? queue.confirmedProject : candidate)),
+            projectRuntimeById,
+          };
+        });
+      }
+      if (queue.pending === 0) projectRuntimeQueues.delete(projectId);
+    };
+    const task = queue.pending === 1 ? execute() : queue.tail.then(execute);
+    queue.tail = task.catch(() => undefined);
+    await task;
+    return succeeded;
   },
   refreshModelConfiguration: async () => {
     const generation = ++modelConfigurationGeneration;
@@ -386,10 +422,10 @@ export const useStore = create<State>((set, get) => ({
     const project = get().projects.find((p) => p.projectId === projectId);
     if (!project || project.permMode === permMode) return;
     set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
-    const res = await commands.updateProject(projectId, project.model, permMode, project.harness);
+    const res = await commands.updateProjectPermMode(projectId, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
-      await get().refresh();
+      set({ projects: get().projects.map((p) => (p.projectId === projectId ? project : p)) });
     }
   },
 

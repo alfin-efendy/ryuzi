@@ -162,6 +162,14 @@ async updateProject(projectId: string, model: string | null, permMode: PermMode,
     else return { status: "error", error: e  as any };
 }
 },
+async updateProjectPermMode(projectId: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_perm_mode", { projectId, permMode }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async setModelEffortPreference(key: ModelPreferenceKey, effort: string | null) : Promise<Result<null, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_model_effort_preference", { key, effort }) };

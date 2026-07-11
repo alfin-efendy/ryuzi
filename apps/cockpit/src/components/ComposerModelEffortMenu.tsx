@@ -72,8 +72,16 @@ export function ComposerModelEffortMenu({ models, runtime, onChange, disabled, r
               {supported.length === 1 ? (
                 <fieldset disabled data-readonly className="px-2.5 py-2">
                   <legend className="sr-only">Effort</legend>
-                  <div className="font-medium">{supported[0].label}</div>
-                  {supported[0].description ? <div className="text-xs text-muted-foreground">{supported[0].description}</div> : null}
+                  <div className="font-medium">
+                    {stale ? modelDefaultLabel : unknown ? (runtime?.storedEffort ?? modelDefaultLabel) : supported[0].label}
+                  </div>
+                  {stale ? (
+                    <div className="text-xs text-destructive">{runtime?.storedEffort} is unsupported</div>
+                  ) : unknown ? (
+                    <div className="text-xs text-muted-foreground">Metadata unknown; stored value is preserved</div>
+                  ) : supported[0].description ? (
+                    <div className="text-xs text-muted-foreground">{supported[0].description}</div>
+                  ) : null}
                   <div className="pt-1 text-xs text-muted-foreground">Read-only effort</div>
                 </fieldset>
               ) : (

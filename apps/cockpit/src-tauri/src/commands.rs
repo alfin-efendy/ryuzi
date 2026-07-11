@@ -46,6 +46,26 @@ pub async fn update_project(
         })
 }
 
+#[tauri::command]
+#[specta::specta]
+pub async fn update_project_perm_mode(
+    cp: State<'_, Arc<ControlPlane>>,
+    project_id: String,
+    perm_mode: PermMode,
+) -> R<()> {
+    if cp
+        .store()
+        .update_project_perm_mode(&project_id, perm_mode)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(CmdError {
+            message: format!("unknown project: {project_id}"),
+        })
+    }
+}
+
 fn clean_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
