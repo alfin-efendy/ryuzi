@@ -74,6 +74,9 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 serial_test.workspace = true
 

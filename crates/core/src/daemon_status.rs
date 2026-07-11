@@ -59,7 +59,30 @@ pub fn is_alive(pid: i32) -> bool {
     {
         pid > 0 && unsafe { libc::kill(pid, 0) } == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // GetExitCodeProcess reports STILL_ACTIVE (259) for live processes.
+        // A process that exited with code 259 reads as alive — the standard
+        // Win32 caveat, harmless here (worst case: one takeover cycle).
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid <= 0 {
+            return false;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -73,7 +96,27 @@ pub fn send_sigterm(pid: i32) {
             libc::kill(pid, libc::SIGTERM);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // No SIGTERM on Windows; TerminateProcess is the takeover/stop path.
+        // The daemon keeps all durable state in SQLite and a stale status
+        // file is already handled by `derive_state` on a dead pid.
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        if pid <= 0 {
+            return;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
     }
@@ -151,7 +194,6 @@ mod tests {
         assert_eq!(read_status(dir.path()), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn is_alive_self_and_dead() {
         assert!(is_alive(std::process::id() as i32));
