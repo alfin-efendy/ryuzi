@@ -185,6 +185,13 @@ impl WriteOrigin {
         !matches!(self, WriteOrigin::User)
     }
 
+    /// True only for an interactive user turn — the inverse of
+    /// `is_autonomous`. The protected write APIs (settings, tool policies)
+    /// admit only this origin (Phase 6 §9.3 negative space).
+    pub fn is_user(self) -> bool {
+        matches!(self, WriteOrigin::User)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             WriteOrigin::User => "user",
@@ -193,13 +200,18 @@ impl WriteOrigin {
         }
     }
 
-    /// Total: an unrecognized db string falls back to the safest default,
-    /// `User`, rather than panicking.
+    /// Parse a persisted origin string. Fails CLOSED: any unrecognized value
+    /// decodes to the least-privileged `Agent`, never `User`, so a corrupt or
+    /// unknown persisted origin (e.g. a future variant read by an older build,
+    /// or a tampered audit row) can never be read back as a privileged
+    /// settings/policy write. `default()` remains `User` — that is the trusted
+    /// in-code default for interactive sessions, a distinct concern from
+    /// decoding untrusted persisted data.
     pub fn from_db(s: &str) -> Self {
         match s {
-            "agent" => WriteOrigin::Agent,
+            "user" => WriteOrigin::User,
             "background_review" => WriteOrigin::BackgroundReview,
-            _ => WriteOrigin::User,
+            _ => WriteOrigin::Agent,
         }
     }
 }
@@ -737,7 +749,9 @@ mod tests {
         ] {
             assert_eq!(WriteOrigin::from_db(o.as_str()), o);
         }
-        assert_eq!(WriteOrigin::from_db("nonsense"), WriteOrigin::User);
+        // Fails CLOSED: an unrecognized persisted origin decodes to the
+        // least-privileged `Agent`, never the privileged `User` (Phase 6 §9.3).
+        assert_eq!(WriteOrigin::from_db("nonsense"), WriteOrigin::Agent);
     }
 
     #[test]
@@ -746,6 +760,10 @@ mod tests {
         assert!(!WriteOrigin::User.is_autonomous());
         assert!(WriteOrigin::Agent.is_autonomous());
         assert!(WriteOrigin::BackgroundReview.is_autonomous());
+        // `is_user` is the exact inverse of `is_autonomous`.
+        assert!(WriteOrigin::User.is_user());
+        assert!(!WriteOrigin::Agent.is_user());
+        assert!(!WriteOrigin::BackgroundReview.is_user());
     }
 
     #[test]
