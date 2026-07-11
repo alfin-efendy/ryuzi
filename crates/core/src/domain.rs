@@ -467,6 +467,9 @@ pub struct Message {
     pub status: Option<String>,
     pub tool_kind: Option<String>,
     pub created_at: i64,
+    /// Group-chat attribution: the agent name for a labeled worker/orchestrator
+    /// bubble. `None` for ordinary user/assistant rows.
+    pub speaker: Option<String>,
 }
 
 /// Input to `Store::insert_message`; `seq` and `created_at` are assigned by the store.
@@ -479,6 +482,8 @@ pub struct NewMessage {
     pub tool_call_id: Option<String>,
     pub status: Option<String>,
     pub tool_kind: Option<String>,
+    /// Speaker label for a group-chat bubble (`None` for normal rows).
+    pub speaker: Option<String>,
 }
 
 impl NewMessage {
@@ -497,6 +502,28 @@ impl NewMessage {
             tool_call_id: None,
             status: None,
             tool_kind: None,
+            speaker: None,
+        }
+    }
+
+    /// A labeled display bubble (role `assistant`) attributed to `speaker`.
+    /// Used by the orchestrator to post worker start/status/report bubbles into
+    /// the home chat. A display row only — never a `provider_turns` entry.
+    pub fn speaker_block(
+        session_pk: &str,
+        speaker: &str,
+        block_type: &str,
+        payload: serde_json::Value,
+    ) -> Self {
+        NewMessage {
+            session_pk: session_pk.to_string(),
+            role: "assistant".to_string(),
+            block_type: block_type.to_string(),
+            payload,
+            tool_call_id: None,
+            status: None,
+            tool_kind: None,
+            speaker: Some(speaker.to_string()),
         }
     }
 }
@@ -570,6 +597,8 @@ pub enum CoreEvent {
         tool_call_id: Option<String>,
         status: Option<String>,
         tool_kind: Option<String>,
+        /// Speaker label for a group-chat bubble (`None` for normal rows).
+        speaker: Option<String>,
     },
     Result {
         session_pk: String,

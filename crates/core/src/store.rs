@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_28_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_29_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -988,6 +988,59 @@ fn migrations() -> Migrations<'static> {
                      log TEXT \
                  );",
             )?;
+            Ok(())
+        }),
+        // 29: group-chat orchestration. `messages.speaker` (Phase 2 added
+        // `speaker` only to `sessions`, never `messages`); `orch_tasks` gains
+        // its home-chat binding, per-child circuit-breaker counters, and the
+        // root's accumulated steer note. All additive columns — plain ALTERs,
+        // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
+        // this migration on a DB that already has the columns (e.g. the
+        // rewind-and-replay in `migrations_13_to_29_replay_is_idempotent_and_converges_native_only`,
+        // which re-runs every migration appended after 13) is a no-op
+        // instead of a "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_messages_speaker = tx
+                .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='speaker'")?
+                .exists([])?;
+            if !has_messages_speaker {
+                tx.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", [])?;
+            }
+            let has_home_session_pk = tx
+                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='home_session_pk'")?
+                .exists([])?;
+            if !has_home_session_pk {
+                tx.execute(
+                    "ALTER TABLE orch_tasks ADD COLUMN home_session_pk TEXT",
+                    [],
+                )?;
+            }
+            let has_consecutive_failures = tx
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='consecutive_failures'",
+                )?
+                .exists([])?;
+            if !has_consecutive_failures {
+                tx.execute(
+                    "ALTER TABLE orch_tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            let has_gave_up = tx
+                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='gave_up'")?
+                .exists([])?;
+            if !has_gave_up {
+                tx.execute(
+                    "ALTER TABLE orch_tasks ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            let has_steer_note = tx
+                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='steer_note'")?
+                .exists([])?;
+            if !has_steer_note {
+                tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+            }
             Ok(())
         }),
     ])
@@ -1932,12 +1985,12 @@ impl Store {
         let created = now_ms();
         self.with_conn(move |c| {
             c.query_row(
-                "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
-                 SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+                "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker) \
+                 SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
                  FROM messages WHERE session_pk=?1 \
                  RETURNING seq",
                 params![m.session_pk, m.role, m.block_type, payload,
-                        m.tool_call_id, m.status, m.tool_kind, created],
+                        m.tool_call_id, m.status, m.tool_kind, created, m.speaker],
                 |r| r.get::<_, i64>(0),
             )
         })
@@ -2041,6 +2094,7 @@ impl Store {
                         status: None,
                         tool_kind: None,
                         created_at,
+                        speaker: None,
                     })
                 })
                 .transpose()?;
@@ -2078,7 +2132,7 @@ impl Store {
         let session_pk = session_pk.to_string();
         self.with_conn(move |c| -> rusqlite::Result<Vec<Message>> {
             let mut stmt = c.prepare(
-                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at \
+                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker \
                  FROM messages WHERE session_pk=?1 ORDER BY seq",
             )?;
             let items = stmt
@@ -2096,6 +2150,7 @@ impl Store {
                         status: r.get(6)?,
                         tool_kind: r.get(7)?,
                         created_at: r.get(8)?,
+                        speaker: r.get(9)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4509,6 +4564,7 @@ mod tests {
                 tool_call_id: Some("tc-1".into()),
                 status: Some("pending".into()),
                 tool_kind: Some("execute".into()),
+                speaker: None,
             })
             .await
             .unwrap();
@@ -5228,7 +5284,34 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 28, "forward migration must land at v28");
+        assert_eq!(user_version, 29, "forward migration must land at v29");
+    }
+
+    #[tokio::test]
+    async fn migration_29_adds_speaker_and_orch_group_chat_columns() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // A speaker-labeled display row round-trips.
+        store
+            .insert_message(crate::domain::NewMessage::speaker_block(
+                "s1",
+                "build",
+                "text",
+                serde_json::json!({ "text": "worker report" }),
+            ))
+            .await
+            .unwrap();
+        let rows = store.list_messages("s1").await.unwrap();
+        assert_eq!(rows[0].speaker.as_deref(), Some("build"));
+        // A root task records its home chat + starts un-broken.
+        let root = crate::orch::insert_root(&store, "p1", "goal", "waiting", Some("home-1"))
+            .await
+            .unwrap();
+        let t = crate::orch::get_task(&store, &root).await.unwrap().unwrap();
+        assert_eq!(t.home_session_pk.as_deref(), Some("home-1"));
+        assert_eq!(t.consecutive_failures, 0);
+        assert!(!t.gave_up);
+        assert_eq!(t.steer_note, None);
     }
 
     #[tokio::test]
@@ -5369,7 +5452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_28_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_29_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -5386,19 +5469,20 @@ mod tests {
         // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
         // effort preferences + legacy normalization; 25 session_route_state;
         // 26 session_runtime_settings; 27 background_events + jobs.model_override;
-        // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs
-        // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
+        // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs;
+        // 29 messages.speaker + orch_tasks home/breaker/steer columns —
+        // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 28
-        // defined, wind back sixteen.
+        // this test starts failing its assertions). With migrations through 29
+        // defined, wind back seventeen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 16)
+            c.pragma_update(None, "user_version", v - 17)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5455,14 +5539,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back eight, and reopen so 21 (and the tail
-        // migrations 22–28) replay against it. Back EIGHT: the fully migrated
-        // tail is now v28, so rewinding to v20 is what makes migration 21
+        // wind user_version back nine, and reopen so 21 (and the tail
+        // migrations 22–29) replay against it. Back NINE: the fully migrated
+        // tail is now v29, so rewinding to v20 is what makes migration 21
         // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 8)
+            c.pragma_update(None, "user_version", v - 9)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5600,7 +5684,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 28, "forward migration must land at v28");
+        assert_eq!(uv, 29, "forward migration must land at v29");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -5626,7 +5710,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 28, "forward migration must land at v28");
+        assert_eq!(uv, 29, "forward migration must land at v29");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
@@ -5654,6 +5738,7 @@ mod tests {
                 tool_call_id: Some("t1".into()),
                 status: None,
                 tool_kind: Some("execute".into()),
+                speaker: None,
             })
             .await
             .unwrap();

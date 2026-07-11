@@ -1719,6 +1719,7 @@ async fn finish_tool_row_with_display(
                 tool_call_id: Some(tool_call_id.to_string()),
                 status: Some(status.to_string()),
                 tool_kind,
+                speaker: None,
             });
         }
         Err(e) => tracing::warn!("native: update_tool_call({tool_call_id}) failed: {e}"),
@@ -1783,6 +1784,7 @@ async fn emit_row(
         tool_call_id: tool_call_id.clone(),
         status: status.clone(),
         tool_kind: tool_kind.clone(),
+        speaker: None,
     };
     match deps.store.insert_message(msg).await {
         Ok(seq) => {
@@ -1795,6 +1797,7 @@ async fn emit_row(
                 tool_call_id,
                 status,
                 tool_kind,
+                speaker: None,
             });
         }
         Err(e) => tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}"),
@@ -1821,6 +1824,7 @@ async fn observe_route_selection(
                 tool_call_id: message.tool_call_id,
                 status: message.status,
                 tool_kind: message.tool_kind,
+                speaker: message.speaker,
             });
         }
         Ok(None) => {}

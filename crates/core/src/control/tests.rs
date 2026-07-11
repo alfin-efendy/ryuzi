@@ -102,6 +102,7 @@ impl HarnessSession for FakeSession {
                 tool_call_id: None,
                 status: None,
                 tool_kind: None,
+                speaker: None,
             });
         }
 

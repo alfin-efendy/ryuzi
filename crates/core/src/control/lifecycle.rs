@@ -473,6 +473,7 @@ impl ControlPlane {
                 tool_call_id: None,
                 status: None,
                 tool_kind: None,
+                speaker: None,
             });
         }
     }
@@ -492,6 +493,7 @@ impl ControlPlane {
                 tool_call_id: None,
                 status: None,
                 tool_kind: None,
+                speaker: None,
             });
         }
     }
@@ -1410,6 +1412,7 @@ impl ControlPlane {
                 tool_call_id: None,
                 status: None,
                 tool_kind: None,
+                speaker: None,
             });
         }
         Ok(())

@@ -40,6 +40,16 @@ pub struct OrchTask {
     pub error: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
+    /// The originating chat session (root only) — where worker bubbles post
+    /// and the aggregate outcome re-enters over the rail. `None` for goals
+    /// submitted without a home chat (CLI/tests).
+    pub home_session_pk: Option<String>,
+    /// Consecutive failed attempts for this child (circuit breaker input).
+    pub consecutive_failures: i64,
+    /// The breaker tripped: this child exhausted its retries and stays failed.
+    pub gave_up: bool,
+    /// Accumulated mid-run user guidance (root only), fed to the judge prompt.
+    pub steer_note: Option<String>,
 }
 
 /// One subtask planned by the decomposer, before insertion.
@@ -178,7 +188,8 @@ fn check_acyclic(tasks: &[PlannedTask]) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 const ORCH_COLS: &str =
-    "id,root_id,project_id,title,body,agent,status,session_pk,result,error,created_at,finished_at";
+    "id,root_id,project_id,title,body,agent,status,session_pk,result,error,created_at,finished_at,\
+     home_session_pk,consecutive_failures,gave_up,steer_note";
 
 fn task_from(r: &rusqlite::Row) -> rusqlite::Result<OrchTask> {
     Ok(OrchTask {
@@ -194,6 +205,10 @@ fn task_from(r: &rusqlite::Row) -> rusqlite::Result<OrchTask> {
         error: r.get(9)?,
         created_at: r.get(10)?,
         finished_at: r.get(11)?,
+        home_session_pk: r.get(12)?,
+        consecutive_failures: r.get(13)?,
+        gave_up: r.get::<_, i64>(14)? != 0,
+        steer_note: r.get(15)?,
     })
 }
 
@@ -207,22 +222,24 @@ pub async fn insert_root(
     project_id: &str,
     goal: &str,
     status: &str,
+    home_session_pk: Option<&str>,
 ) -> anyhow::Result<String> {
     let id = new_task_id();
     let title: String = goal.chars().take(80).collect();
-    let (id2, project_id, goal, status, now) = (
+    let (id2, project_id, goal, status, home, now) = (
         id.clone(),
         project_id.to_string(),
         goal.to_string(),
         status.to_string(),
+        home_session_pk.map(str::to_string),
         crate::paths::now_ms(),
     );
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO orch_tasks(id,root_id,project_id,title,body,agent,status,created_at) \
-                 VALUES (?1,NULL,?2,?3,?4,'',?5,?6)",
-                params![id2, project_id, title, goal, status, now],
+                "INSERT INTO orch_tasks(id,root_id,project_id,title,body,agent,status,created_at,home_session_pk) \
+                 VALUES (?1,NULL,?2,?3,?4,'',?5,?6,?7)",
+                params![id2, project_id, title, goal, status, now, home],
             )
             .map(|_| ())
         })
@@ -648,7 +665,7 @@ pub async fn submit(
     if !decompose {
         return submit_with_plan(cp, project_id, goal, single_task_plan(goal)).await;
     }
-    let root = insert_root(cp.store(), project_id, goal, "decomposing").await?;
+    let root = insert_root(cp.store(), project_id, goal, "decomposing", None).await?;
     emit_changed(cp, &root, None, "decomposing");
     let (cp2, root2, project_id, goal) = (
         cp.clone(),
@@ -694,7 +711,7 @@ pub async fn queue_goal(store: &Store, project_id: &str, goal: &str) -> anyhow::
     if store.get_project(project_id).await?.is_none() {
         anyhow::bail!("unknown project: {project_id}");
     }
-    let root = insert_root(store, project_id, goal, "waiting").await?;
+    let root = insert_root(store, project_id, goal, "waiting", None).await?;
     insert_children(store, &root, project_id, &single_task_plan(goal)).await?;
     Ok(root)
 }
@@ -707,7 +724,7 @@ pub async fn submit_with_plan(
     goal: &str,
     plan: Vec<PlannedTask>,
 ) -> anyhow::Result<String> {
-    let root = insert_root(cp.store(), project_id, goal, "waiting").await?;
+    let root = insert_root(cp.store(), project_id, goal, "waiting", None).await?;
     let ids = insert_children(cp.store(), &root, project_id, &plan).await?;
     emit_changed(cp, &root, None, "waiting");
     for id in &ids {
@@ -1147,7 +1164,9 @@ mod tests {
     #[tokio::test]
     async fn promotion_follows_dependencies() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "the goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "the goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1177,7 +1196,9 @@ mod tests {
     #[tokio::test]
     async fn claim_respects_concurrency_cap() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let plan: Vec<PlannedTask> = (0..4)
             .map(|i| PlannedTask {
                 title: format!("t{i}"),
@@ -1202,7 +1223,9 @@ mod tests {
     #[tokio::test]
     async fn judge_readiness_and_failure_digest() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1223,7 +1246,9 @@ mod tests {
         assert!(failed[0].1.contains("boom"), "{}", failed[0].1);
 
         // A fully-done tree instead becomes judge-ready.
-        let root2 = insert_root(&s, "p1", "goal2", "waiting").await.unwrap();
+        let root2 = insert_root(&s, "p1", "goal2", "waiting", None)
+            .await
+            .unwrap();
         let ids2 = insert_children(
             &s,
             &root2,
@@ -1260,7 +1285,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_tree_spares_finished_children_and_guards_races() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1312,6 +1339,7 @@ mod tests {
                     tool_call_id: None,
                     status: None,
                     tool_kind: None,
+                    speaker: None,
                 })
                 .await?;
             Ok(())
@@ -1536,7 +1564,9 @@ mod tests {
     #[tokio::test]
     async fn dead_roots_park_their_remaining_children() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1549,7 +1579,9 @@ mod tests {
     #[tokio::test]
     async fn retry_child_revives_failed_root_and_cancelled_siblings() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1577,12 +1609,16 @@ mod tests {
     async fn retry_root_requeues_failed_children_but_not_childless_roots() {
         let s = store().await;
         // Childless failed root (decomposition failure): nothing to re-run.
-        let bare = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let bare = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         fail_root(&s, &bare, "no plan").await.unwrap();
         assert!(!retry_task(&s, &bare).await.unwrap());
 
         // Root with failed children: everything re-queues.
-        let root = insert_root(&s, "p1", "goal2", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal2", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1604,7 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn attach_plan_inserts_nothing_for_a_cancelled_root() {
         let (cp, _repo) = cp_with_project().await;
-        let root = insert_root(cp.store(), "p1", "goal", "decomposing")
+        let root = insert_root(cp.store(), "p1", "goal", "decomposing", None)
             .await
             .unwrap();
         // Cancelled while the (simulated) LLM planning was in flight.
@@ -1622,7 +1658,9 @@ mod tests {
     #[tokio::test]
     async fn retry_requeues_only_failed_tasks() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
