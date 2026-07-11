@@ -22,8 +22,9 @@ fn lifecycle(entry: &str) {
     let home = tmp.path().to_path_buf();
 
     // Redirect ryuzi_core::paths::state_dir() (and thus db_path()) into the
-    // tempdir on both Linux (XDG_DATA_HOME) and macOS (HOME) — same pattern
-    // as crates/cli/tests/run.rs.
+    // tempdir on both Linux (XDG_DATA_HOME) and macOS (HOME) — same
+    // XDG_DATA_HOME/HOME redirection pattern used throughout this crate's
+    // integration tests (see e.g. crates/runner/tests/e2e_journey.rs).
     std::env::set_var("XDG_DATA_HOME", &data_home);
     std::env::set_var("HOME", &home);
 

@@ -89,7 +89,8 @@ fn list_shows_redaction_defaults_and_unset() {
 /// Regression test: `cmd_config` used to run settings get/set/list without
 /// ever populating the process-wide `plugin.*` fields registry (that table
 /// is normally populated as a side effect of `Registries::add_plugin`, which
-/// only `deps.build_registries` calls — and `ryuzi config` never calls it).
+/// `ryuzi config` never calls — it opens the settings store directly instead
+/// of building a full `Registries`).
 /// So `config set plugin.<id>.<key> ...` failed "unknown setting" for every
 /// real plugin field, and `config get` would report a registered secret as
 /// non-secret (empty table → `is_secret` false) and print it unredacted.

@@ -168,9 +168,9 @@ pub(crate) fn load_skill_pack_plugins_from(
     }
 }
 
-/// Toggle `id`'s enablement — the single source of truth shared by `ryuzi
-/// plugins enable/disable` (`crates/cli/src/plugins_cmd.rs`) and the Cockpit
-/// `set_plugin_enabled` command, so the write side can never drift from
+/// Toggle `id`'s enablement — the single source of truth behind Cockpit's
+/// `set_plugin_enabled` command (the only toggle surface; there is no CLI
+/// equivalent), so the write side can never drift from
 /// [`PluginHost::is_enabled`]'s read side:
 /// - unknown id → an error (`"unknown plugin: {id}"`)
 /// - harness-capable → an error (the native runtime is always enabled)

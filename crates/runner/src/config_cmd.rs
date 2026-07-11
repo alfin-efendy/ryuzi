@@ -21,9 +21,10 @@ pub fn cmd_config(args: &[String], deps: &mut Deps) -> u8 {
 }
 
 async fn config_inner(args: &[String], deps: &mut Deps) -> u8 {
-    // `ryuzi config` doesn't go through `deps.build_registries` (building the
-    // full registries is unnecessary just to read/write settings). Without
-    // this, the process-wide `plugin.*` settings registry stays empty here:
+    // `ryuzi config` opens the settings store directly — it never builds a
+    // full `Registries` (that would be unnecessary work just to read/write
+    // settings). Without this, the process-wide `plugin.*` settings registry
+    // stays empty here:
     // `config set plugin.<id>.<key> ...` would fail "unknown setting", and
     // `config get` would report `is_secret` as `false` for a real plugin
     // secret and print it unredacted.

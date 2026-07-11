@@ -99,10 +99,10 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
         // `discord` feature (see `gateway::discord::mod`'s doc on why the
         // gate can't live here: `#[cfg(feature = "discord")]` in THIS crate
-        // would check a feature `ryuzi-cli` doesn't declare, since its
+        // would check a feature `ryuzi-runner` doesn't declare, since its
         // `Cargo.toml` requests `ryuzi-core`'s `discord` feature directly
         // rather than exposing its own toggle). Empty under
-        // `not(feature = "discord")`; populated for every real `ryuzi-cli`
+        // `not(feature = "discord")`; populated for every real `ryuzi-runner`
         // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         harness_factory: None,
