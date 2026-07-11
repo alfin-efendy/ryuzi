@@ -2,8 +2,8 @@ import { useRef, useState } from "react";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 export type ConfirmAccountAction =
-  | { kind: "delete"; accountName: string; onConfirm: () => Promise<boolean> }
-  | { kind: "resetCredit"; accountName: string; onConfirm: () => Promise<boolean> };
+  | { kind: "delete"; accountName: string; onConfirm: () => Promise<boolean>; trigger: HTMLButtonElement }
+  | { kind: "resetCredit"; accountName: string; onConfirm: () => Promise<boolean>; trigger: HTMLButtonElement };
 
 export function ConfirmAccountActionModal({
   open,
@@ -16,8 +16,10 @@ export function ConfirmAccountActionModal({
 }) {
   const [busy, setBusy] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const finalFocusRef = useRef<HTMLElement | null>(action?.trigger ?? null);
 
   if (!open || !action) return null;
+  finalFocusRef.current = action.trigger;
 
   const deleting = action.kind === "delete";
   const confirm = async () => {
@@ -29,7 +31,7 @@ export function ConfirmAccountActionModal({
   };
 
   return (
-    <Modal onClose={onClose} width={420} busy={busy} initialFocus={cancelRef}>
+    <Modal onClose={onClose} width={420} busy={busy} initialFocus={cancelRef} finalFocus={finalFocusRef}>
       <ModalHeader title={deleting ? "Delete account?" : "Reset credit?"} />
       <ModalBody>
         <p className="text-[13px] leading-5 text-muted-foreground">

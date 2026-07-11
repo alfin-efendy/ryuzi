@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { CatalogEntry, ConnectionInfo, EndpointKeyInfo, EndpointStatusInfo, ModelRouteInfo, UsageSeries } from "@/bindings";
+import type {
+  CatalogEntry,
+  CmdError,
+  CodexResetCreditResult,
+  ConnectionInfo,
+  EndpointKeyInfo,
+  EndpointStatusInfo,
+  ModelRouteInfo,
+  Result,
+  UsageSeries,
+} from "@/bindings";
 
 const status: EndpointStatusInfo = {
   running: true,
@@ -182,11 +192,12 @@ const setConnectionEnabled = mock((_id: string, enabled: boolean) =>
 );
 const removeConnection = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [secondConnection] }));
 const reconnectOauth = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [claudeConnection] }));
-const resetCodexCredit = mock((_id: string) =>
-  Promise.resolve({
-    status: "ok" as const,
-    data: { reset: true, code: null, windowsReset: 1, message: null, redeemRequestId: null },
-  }),
+const resetCodexCredit = mock(
+  (_id: string): Promise<Result<CodexResetCreditResult, CmdError>> =>
+    Promise.resolve({
+      status: "ok" as const,
+      data: { reset: true, code: null, windowsReset: 1, message: null, redeemRequestId: null },
+    }),
 );
 
 // Mock the Tauri IPC boundary before the component (and the stores it uses) load.
@@ -398,17 +409,20 @@ test("provider detail shows accounts for the selected provider", async () => {
   render(<ProviderDetailView provider="openai" />);
 
   expect(screen.getByRole("heading", { level: 2, name: "OpenAI" })).toBeTruthy();
-  expect(await screen.findByText("2 accounts · 2 active · By order")).toBeTruthy();
+  expect(await screen.findByText("2 active · By order")).toBeTruthy();
   expect(screen.getByText("Accounts")).toBeTruthy();
   expect(screen.getByText("Account routing")).toBeTruthy();
   expect(screen.getByRole("combobox", { name: "Account routing" })).toBeTruthy();
   expect(screen.getByText("Work OpenAI")).toBeTruthy();
   expect(screen.getByText("Personal OpenAI")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Rename Work OpenAI" })).toBeTruthy();
-  expect(screen.getAllByRole("switch", { name: "Enabled" })).toHaveLength(2);
+  expect(screen.getByRole("switch", { name: "Enabled Work OpenAI" })).toBeTruthy();
+  expect(screen.getByRole("switch", { name: "Enabled Personal OpenAI" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Add account" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Move Work OpenAI down" })).toBeTruthy();
-  expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(2);
+  expect(screen.getByRole("button", { name: "Test Work OpenAI" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Delete Work OpenAI" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Delete Personal OpenAI" })).toBeTruthy();
   expect(screen.queryByTitle("Details")).toBeNull();
   expect(screen.queryByText(/sk-…3fk9/)).toBeNull();
   expect(screen.getByText("Usage")).toBeTruthy();
@@ -420,11 +434,11 @@ test("changing account routing opens a listbox and persists the picked strategy"
   useConnections.setState({ catalog, connections: [connection, secondConnection], loaded: true });
   render(<ProviderDetailView provider="openai" />);
 
-  await screen.findByText("2 accounts · 2 active · By order");
+  await screen.findByText("2 active · By order");
   fireEvent.click(screen.getByRole("combobox", { name: "Account routing" }));
   fireEvent.click(await screen.findByRole("option", { name: "Round robin" }));
 
-  expect(await screen.findByText("2 accounts · 2 active · Round robin")).toBeTruthy();
+  expect(await screen.findByText("2 active · Round robin")).toBeTruthy();
 });
 
 test("Refresh models surfaces per-connection failures inline", async () => {
@@ -468,14 +482,14 @@ test("enabled switch uses the dedicated account command", async () => {
   setConnectionEnabled.mockClear();
   useConnections.setState({ catalog, connections: [connection], loaded: true });
   render(<ProviderDetailView provider="openai" />);
-  fireEvent.click(screen.getByRole("switch", { name: "Enabled" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Enabled Work OpenAI" }));
   await waitFor(() => expect(setConnectionEnabled).toHaveBeenCalledWith("c1", false));
 });
 
 test("delete uses confirmation and restores focus to the invoking Delete button when cancelled", async () => {
   useConnections.setState({ catalog, connections: [connection], loaded: true });
   render(<ProviderDetailView provider="openai" />);
-  const trigger = screen.getByRole("button", { name: "Delete" });
+  const trigger = screen.getByRole("button", { name: "Delete Work OpenAI" });
   trigger.focus();
   fireEvent.click(trigger);
   expect(screen.getByRole("dialog", { name: "Delete account?" })).toBeTruthy();
@@ -491,9 +505,9 @@ test("redirect OAuth reconnects in place while device sign-in reopens Add accoun
   const redirect = { ...claudeConnection, needsRelogin: true };
   useConnections.setState({ catalog, connections: [redirect], loaded: true });
   const { unmount } = render(<ProviderDetailView provider="anthropic" />);
-  fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  fireEvent.click(screen.getByRole("button", { name: "Reconnect Claude subscription" }));
   await waitFor(() => expect(reconnectOauth).toHaveBeenCalledWith("c3"));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Reconnect" })).toBeTruthy());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Reconnect Claude subscription" })).toBeTruthy());
   unmount();
 
   const deviceCatalog: CatalogEntry[] = [
@@ -515,7 +529,7 @@ test("redirect OAuth reconnects in place while device sign-in reopens Add accoun
   const device = { ...connection, id: "kiro-1", provider: "kiro", providerName: "Kiro", authType: "oauth", label: "Kiro" };
   useConnections.setState({ catalog: deviceCatalog, connections: [device], loaded: true });
   render(<ProviderDetailView provider="kiro" />);
-  fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  fireEvent.click(screen.getByRole("button", { name: "Reconnect Kiro" }));
   expect(screen.getByRole("dialog", { name: "Add account" })).toBeTruthy();
   await act(async () => {
     await Promise.resolve();
@@ -531,6 +545,34 @@ test("quota renders only from capability and Codex reset uses the shared confirm
   const dialog = screen.getByRole("dialog", { name: "Reset credit?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "Reset credit" }));
   await waitFor(() => expect(resetCodexCredit).toHaveBeenCalledWith("c1"));
+});
+
+test("pointer-opened reset confirmation restores focus to the exact reset button on Cancel", async () => {
+  const codex = { ...connection, authType: "oauth", quotaCapability: "codex" as const };
+  useConnections.setState({ catalog, connections: [codex], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
+  const trigger = await screen.findByRole("button", { name: "Reset credit for Work OpenAI" });
+  fireEvent.click(trigger);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(trigger));
+});
+
+test("programmatic reset open retains account context after false confirm and restores its trigger on Cancel", async () => {
+  resetCodexCredit.mockClear();
+  resetCodexCredit.mockImplementationOnce(async () => ({ status: "error", error: { message: "No credit" } }));
+  const codex = { ...connection, authType: "oauth", quotaCapability: "codex" as const };
+  useConnections.setState({ catalog, connections: [codex], loaded: true });
+  render(<ProviderDetailView provider="openai" />);
+  const trigger = await screen.findByRole("button", { name: "Reset credit for Work OpenAI" });
+  act(() => trigger.click());
+
+  const dialog = await screen.findByRole("dialog", { name: "Reset credit?" });
+  expect(dialog.textContent).toContain("Work OpenAI");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Reset credit" }));
+  await waitFor(() => expect(resetCodexCredit).toHaveBeenCalledWith("c1"));
+  expect(screen.getByRole("dialog", { name: "Reset credit?" }).textContent).toContain("Work OpenAI");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(trigger));
 });
 
 test("Route tab lists model route aliases and their ordered targets", async () => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, Pencil, Plus, RefreshCw, TestTube2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { commands, type ConnectionInfo, type ModelRouteStrategy, type SelectableModelInfo, type UsageSeries } from "@/bindings";
@@ -119,7 +119,7 @@ function AccountRow({
   deviceSignin: boolean;
   onRename: () => void;
   onDelete: (trigger: HTMLButtonElement) => void;
-  onResetCredit: (request: { accountName: string; onConfirm: () => Promise<boolean> }) => void;
+  onResetCredit: (request: { accountName: string; onConfirm: () => Promise<boolean>; trigger: HTMLButtonElement }) => void;
   onDeviceReconnect: () => void;
 }) {
   const setEnabled = useConnections((s) => s.setEnabled);
@@ -187,16 +187,16 @@ function AccountRow({
           </Button>
           {conn.needsRelogin && <span className="text-xs text-destructive">Needs re-login</span>}
         </div>
-        <Switch on={conn.enabled} onToggle={() => void setEnabled(conn.id, !conn.enabled)} label="Enabled" />
-        <Button variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
+        <Switch on={conn.enabled} onToggle={() => void setEnabled(conn.id, !conn.enabled)} label={`Enabled ${name}`} />
+        <Button aria-label={`Test ${name}`} variant="outline" size="sm" onClick={() => void runTest()} disabled={testing}>
           {testing ? "Testing..." : "Test"}
         </Button>
         {conn.authType === "oauth" && (
-          <Button variant="outline" size="sm" onClick={() => void reconnect()} disabled={reconnecting}>
+          <Button aria-label={`Reconnect ${name}`} variant="outline" size="sm" onClick={() => void reconnect()} disabled={reconnecting}>
             {reconnecting ? "Reconnecting…" : "Reconnect"}
           </Button>
         )}
-        <Button variant="destructive" size="sm" onClick={(event) => onDelete(event.currentTarget)}>
+        <Button aria-label={`Delete ${name}`} variant="destructive" size="sm" onClick={(event) => onDelete(event.currentTarget)}>
           <Trash2 aria-hidden data-icon="inline-start" />
           Delete
         </Button>
@@ -417,7 +417,6 @@ export function ProviderDetailView({ provider }: { provider: string }) {
   const [savingStrategy, setSavingStrategy] = useState(false);
   const [renameConnection, setRenameConnection] = useState<ConnectionInfo | null>(null);
   const [confirmAction, setConfirmAction] = useState<ConfirmAccountAction | null>(null);
-  const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -506,9 +505,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
           <CardHeader className="flex-wrap">
             <CardTitle>Accounts</CardTitle>
             <CardHint>
-              {providerConnections.length > 0
-                ? `${accountLabel(providerConnections.length)} · ${activeCount} active · ${strategyText(accountStrategy)}`
-                : "No accounts connected"}
+              {providerConnections.length > 0 ? `${activeCount} active · ${strategyText(accountStrategy)}` : "No accounts connected"}
             </CardHint>
             <div className="ml-auto flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground">Account routing</span>
@@ -541,17 +538,14 @@ export function ProviderDetailView({ provider }: { provider: string }) {
               })()}
               onRename={() => setRenameConnection(conn)}
               onDelete={(trigger) => {
-                confirmTriggerRef.current = trigger;
                 setConfirmAction({
                   kind: "delete",
                   accountName: conn.label || conn.providerName,
                   onConfirm: () => remove(conn.id),
+                  trigger,
                 });
               }}
-              onResetCredit={(request) => {
-                confirmTriggerRef.current = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
-                setConfirmAction({ kind: "resetCredit", ...request });
-              }}
+              onResetCredit={(request) => setConfirmAction({ kind: "resetCredit", ...request })}
               onDeviceReconnect={() => setAddOpen(true)}
             />
           ))}
@@ -591,7 +585,6 @@ export function ProviderDetailView({ provider }: { provider: string }) {
         action={confirmAction}
         onClose={() => {
           setConfirmAction(null);
-          confirmTriggerRef.current?.focus();
         }}
       />
     </div>

@@ -82,8 +82,9 @@ test("renders a compact accessible row per quota window with account identity", 
     fireEvent.click(screen.getByRole("button", { name: "Refresh quota for Personal Codex" }));
   });
   expect(connectionProviderQuota).toHaveBeenCalledTimes(2);
-  fireEvent.click(screen.getByRole("button", { name: "Reset credit for Personal Codex" }));
-  expect(onRequestReset).toHaveBeenCalledWith({ accountName: "Personal Codex", onConfirm: expect.any(Function) });
+  const resetTrigger = screen.getByRole("button", { name: "Reset credit for Personal Codex" });
+  fireEvent.click(resetTrigger);
+  expect(onRequestReset).toHaveBeenCalledWith({ accountName: "Personal Codex", onConfirm: expect.any(Function), trigger: resetTrigger });
 });
 
 test("shows loading state and quota-unavailable retry state", async () => {

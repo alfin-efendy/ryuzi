@@ -14,6 +14,7 @@ type ModalProps = {
   busy?: boolean;
   className?: string;
   initialFocus?: React.RefObject<HTMLElement | null>;
+  finalFocus?: React.RefObject<HTMLElement | null>;
   children: React.ReactNode;
 };
 
@@ -24,11 +25,18 @@ function ModalInitialFocus({ target, children }: { target?: React.RefObject<HTML
   return children;
 }
 
-function Modal({ onClose, width, busy = false, className, initialFocus, children }: ModalProps) {
-  const finalFocus = React.useRef<HTMLElement | null>(null);
+function Modal({ onClose, width, busy = false, className, initialFocus, finalFocus, children }: ModalProps) {
+  const capturedFinalFocus = React.useRef<HTMLElement | null>(null);
   React.useLayoutEffect(() => {
-    finalFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  }, []);
+    if (!finalFocus) capturedFinalFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }, [finalFocus]);
+  React.useLayoutEffect(
+    () => () => {
+      const target = (finalFocus ?? capturedFinalFocus).current;
+      if (target?.isConnected) target.focus();
+    },
+    [finalFocus],
+  );
 
   return (
     <Dialog.Root
@@ -44,7 +52,7 @@ function Modal({ onClose, width, busy = false, className, initialFocus, children
             <Dialog.Popup
               data-slot="modal"
               initialFocus={initialFocus}
-              finalFocus={finalFocus}
+              finalFocus={finalFocus ?? capturedFinalFocus}
               aria-busy={busy || undefined}
               className={cn(
                 "max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-border bg-popover p-[22px] text-popover-foreground shadow-2xl outline-none",

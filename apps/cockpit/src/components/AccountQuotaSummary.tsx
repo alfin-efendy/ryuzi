@@ -8,7 +8,7 @@ export type AccountQuotaSummaryProps = {
   connectionId: string;
   accountName: string;
   capability: ProviderQuotaCapability;
-  onRequestReset: (request: { accountName: string; onConfirm: () => Promise<boolean> }) => void;
+  onRequestReset: (request: { accountName: string; onConfirm: () => Promise<boolean>; trigger: HTMLButtonElement }) => void;
 };
 
 const percent = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
@@ -75,7 +75,7 @@ export function AccountQuotaSummary({ connectionId, accountName, capability, onR
           {capability === "codex" && (
             <Button
               aria-label={`Reset credit for ${accountName}`}
-              onClick={() => onRequestReset({ accountName, onConfirm: resetCredit })}
+              onClick={(event) => onRequestReset({ accountName, onConfirm: resetCredit, trigger: event.currentTarget })}
               size="sm"
               variant="outline"
               disabled={resetting}

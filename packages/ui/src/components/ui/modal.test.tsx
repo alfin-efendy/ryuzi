@@ -5,14 +5,30 @@ import { Button, Combobox, Input, MenuPanel, MenuPanelItem, Modal, ModalBody, Mo
 
 afterEach(cleanup);
 
-function DialogFixture({ busy = false, initialOpen = true }: { busy?: boolean; initialOpen?: boolean }) {
+function DialogFixture({
+  busy = false,
+  initialOpen = true,
+  explicitFinalFocus = false,
+}: {
+  busy?: boolean;
+  initialOpen?: boolean;
+  explicitFinalFocus?: boolean;
+}) {
   const [open, setOpen] = useState(initialOpen);
   const firstInput = useRef<HTMLInputElement>(null);
+  const returnTarget = useRef<HTMLButtonElement>(null);
   return (
     <>
       <Button onClick={() => setOpen(true)}>Open fixture</Button>
+      <Button ref={returnTarget}>Explicit return</Button>
       {open && (
-        <Modal onClose={() => setOpen(false)} width={420} busy={busy} initialFocus={firstInput}>
+        <Modal
+          onClose={() => setOpen(false)}
+          width={420}
+          busy={busy}
+          initialFocus={firstInput}
+          finalFocus={explicitFinalFocus ? returnTarget : undefined}
+        >
           <ModalHeader title="Fixture title" description="Fixture description" />
           <ModalBody>
             <Input ref={firstInput} aria-label="Fixture input" />
@@ -44,6 +60,12 @@ test("focus starts at initialFocus and returns to the opener", async () => {
   await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Fixture input" })));
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
   await waitFor(() => expect(document.activeElement).toBe(opener));
+});
+
+test("an explicit finalFocus target wins when opening was programmatic", async () => {
+  render(<DialogFixture explicitFinalFocus />);
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Explicit return" })));
 });
 
 test("busy dialog keeps X, Escape, and backdrop from closing", async () => {

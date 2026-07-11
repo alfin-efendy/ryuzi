@@ -54,6 +54,16 @@ test("setEnabled uses the dedicated command and reports failure without refreshi
   command.mockRestore();
 });
 
+test("setEnabled success updates accounts and refreshes structured model configuration exactly once", async () => {
+  const disabled = { ...connection, enabled: false };
+  const command = spyOn(commands, "setConnectionEnabled").mockResolvedValue({ status: "ok", data: [disabled] });
+
+  expect(await useConnections.getState().setEnabled(connection.id, false)).toBe(true);
+  expect(useConnections.getState().connections).toEqual([disabled]);
+  expect(refreshModelConfiguration).toHaveBeenCalledTimes(1);
+  command.mockRestore();
+});
+
 test("remove returns true only after the dedicated command succeeds and refreshes once", async () => {
   const command = spyOn(commands, "removeConnection").mockResolvedValue({ status: "ok", data: [] });
 

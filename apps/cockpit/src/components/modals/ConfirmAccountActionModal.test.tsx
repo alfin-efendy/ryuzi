@@ -10,8 +10,10 @@ function renderAction(action: ConfirmAccountAction) {
   return onClose;
 }
 
+const trigger = () => document.createElement("button");
+
 test("delete is destructive, explains permanence, and initially focuses Cancel", async () => {
-  renderAction({ kind: "delete", accountName: "Work", onConfirm: async () => true });
+  renderAction({ kind: "delete", accountName: "Work", onConfirm: async () => true, trigger: trigger() });
   expect(screen.getByRole("dialog", { name: "Delete account?" }).textContent).toContain("cannot be undone");
   expect(screen.getByRole("button", { name: "Delete account" }).getAttribute("data-variant")).toBe("destructive");
   await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" })));
@@ -19,7 +21,7 @@ test("delete is destructive, explains permanence, and initially focuses Cancel",
 
 test("reset credit is a normal confirmation and closes only on true", async () => {
   const onConfirm = mock(async () => false);
-  const onClose = renderAction({ kind: "resetCredit", accountName: "Personal", onConfirm });
+  const onClose = renderAction({ kind: "resetCredit", accountName: "Personal", onConfirm, trigger: trigger() });
   const confirm = screen.getByRole("button", { name: "Reset credit" });
   expect(confirm.getAttribute("data-variant")).not.toBe("destructive");
   fireEvent.click(confirm);
@@ -33,6 +35,7 @@ test("busy confirmation disables X and Cancel until the action settles", async (
     kind: "delete",
     accountName: "Work",
     onConfirm: () => new Promise((done) => (resolve = done)),
+    trigger: trigger(),
   });
   fireEvent.click(screen.getByRole("button", { name: "Delete account" }));
   await waitFor(() => expect(screen.getByRole("dialog", { name: "Delete account?" }).getAttribute("aria-busy")).toBe("true"));
