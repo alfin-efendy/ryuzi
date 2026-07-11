@@ -3128,3 +3128,16 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Ended);
 }
+
+#[tokio::test]
+#[serial]
+async fn control_plane_exposes_a_shared_background_registry() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let cp = ControlPlane::new(store, registries(false)).await;
+    // The same registry the sessions receive is reachable off the control plane.
+    assert_eq!(cp.background().active(), 0);
+    let _r = cp.background().try_reserve(1, "s1").unwrap();
+    assert_eq!(cp.background().active(), 1);
+}

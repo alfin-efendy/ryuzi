@@ -183,6 +183,7 @@ impl Harness for NativeHarness {
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
+                background: ctx.background,
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
@@ -360,6 +361,7 @@ mod tests {
             extra_skill_dirs: vec![],
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            background: super::background::BackgroundRegistry::new(),
             store,
         }
     }

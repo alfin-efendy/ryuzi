@@ -87,6 +87,8 @@ pub struct RunnerDeps {
     /// turns: `refresh_turn_model` clones the whole `RunnerDeps` per turn, but
     /// `SteerBuffer`'s clone shares the underlying `Arc<Mutex<Vec<_>>>`.
     pub steer: SteerBuffer,
+    /// Shared async-delegation capacity gate (spec §6.2), from `SessionCtx`.
+    pub background: Arc<super::background::BackgroundRegistry>,
 }
 
 impl RunnerDeps {
@@ -1833,6 +1835,7 @@ mod tests {
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
+            background: super::super::background::BackgroundRegistry::new(),
         }
     }
 

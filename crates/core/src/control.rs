@@ -68,6 +68,9 @@ pub struct ControlPlane {
     /// before the task is spawned, decremented by `TurnGuard`'s `Drop` inside
     /// the task) — polled by `drain` to know when it's safe to stop waiting.
     active_turns: std::sync::atomic::AtomicUsize,
+    /// Shared async-delegation capacity gate (spec §6.2) — one per daemon,
+    /// handed to every session's `SessionCtx` so the `n` cap is process-wide.
+    background: Arc<crate::harness::native::background::BackgroundRegistry>,
 }
 
 impl ControlPlane {
@@ -113,6 +116,7 @@ impl ControlPlane {
             attachment_fetcher,
             draining: std::sync::atomic::AtomicBool::new(false),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
+            background: crate::harness::native::background::BackgroundRegistry::new(),
         })
     }
 
@@ -121,6 +125,11 @@ impl ControlPlane {
     /// command layer. Returns a borrow; callers that need ownership clone.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// The shared background-delegation registry (capacity + cancellation).
+    pub fn background(&self) -> &Arc<crate::harness::native::background::BackgroundRegistry> {
+        &self.background
     }
 
     /// The plugin host — every installed plugin's manifest, capabilities, and

@@ -863,6 +863,7 @@ impl ControlPlane {
             extra_skill_dirs,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
+            background: self.background.clone(),
             store: self.store.clone(),
         };
 
