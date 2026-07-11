@@ -9,6 +9,12 @@ export type ConnectionQuotaState =
 
 const idleState: ConnectionQuotaState = { status: "idle", quota: null, error: null };
 
+type QuotaContext = { connectionId: string | null; capability: ProviderQuotaCapability | null };
+
+function sameContext(left: QuotaContext, right: QuotaContext) {
+  return left.connectionId === right.connectionId && left.capability === right.capability;
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Quota unavailable";
 }
@@ -19,56 +25,50 @@ export function useConnectionQuota(connectionId: string | null, capability: Prov
   const mountedRef = useRef(false);
   const generationRef = useRef(0);
   const resettingRef = useRef(false);
+  const resetGenerationRef = useRef(0);
   const contextRef = useRef({ connectionId, capability });
-  const stateRef = useRef<ConnectionQuotaState>(idleState);
+  const stateRef = useRef({ context: { connectionId, capability }, state: idleState });
   contextRef.current = { connectionId, capability };
 
-  const commit = useCallback(
-    (generation: number, requestConnectionId: string, requestCapability: ProviderQuotaCapability, next: ConnectionQuotaState) => {
-      const current = contextRef.current;
-      if (
-        !mountedRef.current ||
-        generation !== generationRef.current ||
-        current.connectionId !== requestConnectionId ||
-        current.capability !== requestCapability
-      ) {
-        return false;
-      }
-      stateRef.current = next;
-      setState(next);
-      return true;
-    },
-    [],
-  );
+  const commit = useCallback((generation: number, requestContext: QuotaContext, next: ConnectionQuotaState) => {
+    const current = contextRef.current;
+    if (!mountedRef.current || generation !== generationRef.current || !sameContext(current, requestContext)) {
+      return false;
+    }
+    stateRef.current = { context: requestContext, state: next };
+    setState(next);
+    return true;
+  }, []);
 
   const refreshFor = useCallback(
     async (requestConnectionId: string | null, requestCapability: ProviderQuotaCapability | null) => {
+      const requestContext = { connectionId: requestConnectionId, capability: requestCapability };
       if (!requestConnectionId || !requestCapability) {
         generationRef.current += 1;
-        if (mountedRef.current) {
-          stateRef.current = idleState;
+        if (mountedRef.current && sameContext(contextRef.current, requestContext)) {
+          stateRef.current = { context: requestContext, state: idleState };
           setState(idleState);
         }
         return;
       }
 
       const generation = ++generationRef.current;
-      const priorQuota = stateRef.current.quota;
-      commit(generation, requestConnectionId, requestCapability, { status: "loading", quota: priorQuota, error: null });
+      const priorQuota = sameContext(stateRef.current.context, requestContext) ? stateRef.current.state.quota : null;
+      commit(generation, requestContext, { status: "loading", quota: priorQuota, error: null });
 
       try {
         const result = await commands.connectionProviderQuota(requestConnectionId);
         if (result.status === "ok") {
-          commit(generation, requestConnectionId, requestCapability, { status: "loaded", quota: result.data, error: null });
+          commit(generation, requestContext, { status: "loaded", quota: result.data, error: null });
           return;
         }
-        commit(generation, requestConnectionId, requestCapability, {
+        commit(generation, requestContext, {
           status: "error",
           quota: priorQuota,
           error: result.error.message,
         });
       } catch (error) {
-        commit(generation, requestConnectionId, requestCapability, {
+        commit(generation, requestContext, {
           status: "error",
           quota: priorQuota,
           error: errorMessage(error),
@@ -87,6 +87,8 @@ export function useConnectionQuota(connectionId: string | null, capability: Prov
     const { connectionId: requestConnectionId, capability: requestCapability } = contextRef.current;
     if (!requestConnectionId || requestCapability !== "codex" || resettingRef.current) return false;
 
+    const requestContext = { connectionId: requestConnectionId, capability: requestCapability };
+    const resetGeneration = ++resetGenerationRef.current;
     resettingRef.current = true;
     if (mountedRef.current) setResetting(true);
     try {
@@ -94,22 +96,32 @@ export function useConnectionQuota(connectionId: string | null, capability: Prov
       if (result.status !== "ok") return false;
 
       const current = contextRef.current;
-      if (mountedRef.current && current.connectionId === requestConnectionId && current.capability === requestCapability) {
+      if (mountedRef.current && sameContext(current, requestContext)) {
         await refreshFor(requestConnectionId, requestCapability);
       }
       return true;
     } catch {
       return false;
     } finally {
-      resettingRef.current = false;
-      const current = contextRef.current;
-      if (mountedRef.current && current.connectionId === requestConnectionId && current.capability === requestCapability) {
-        setResetting(false);
+      if (resetGeneration === resetGenerationRef.current) {
+        resettingRef.current = false;
+        const current = contextRef.current;
+        if (mountedRef.current && sameContext(current, requestContext)) {
+          setResetting(false);
+        }
       }
     }
   }, [refreshFor]);
 
   useEffect(() => {
+    const effectContext = { connectionId, capability };
+    if (!sameContext(stateRef.current.context, effectContext)) {
+      stateRef.current = { context: effectContext, state: idleState };
+      setState(idleState);
+      resetGenerationRef.current += 1;
+      resettingRef.current = false;
+      setResetting(false);
+    }
     mountedRef.current = true;
     void refreshFor(connectionId, capability);
     return () => {

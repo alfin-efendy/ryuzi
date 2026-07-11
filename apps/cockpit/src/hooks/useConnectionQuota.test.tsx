@@ -125,40 +125,60 @@ test("keeps only the newest manual refresh generation", async () => {
   expect(result.current.state).toEqual({ status: "loaded", quota: quota("Newest"), error: null });
 });
 
-test("ignores an old connection completion after the connection changes or is deleted", async () => {
-  const oldRequest = deferred<ReturnType<typeof ok>>();
-  const newRequest = deferred<ReturnType<typeof ok>>();
-  connectionProviderQuota.mockReturnValueOnce(oldRequest.promise).mockReturnValueOnce(newRequest.promise);
+test("does not carry quota from one connection into another connection's error", async () => {
+  const accountB = deferred<ReturnType<typeof error>>();
+  connectionProviderQuota.mockResolvedValueOnce(ok(quota("Account A"))).mockReturnValueOnce(accountB.promise);
   const { result, rerender } = renderHook(({ id, capability }) => useConnectionQuota(id, capability), {
     initialProps: { id: "account-a" as string | null, capability: "claude" as "claude" | null },
   });
 
-  await waitFor(() => expect(connectionProviderQuota).toHaveBeenCalledWith("account-a"));
+  await waitFor(() => expect(result.current.state).toEqual({ status: "loaded", quota: quota("Account A"), error: null }));
   rerender({ id: "account-b", capability: "claude" });
   await waitFor(() => expect(connectionProviderQuota).toHaveBeenCalledWith("account-b"));
+  expect(result.current.state).toEqual({ status: "loading", quota: null, error: null });
   await act(async () => {
-    oldRequest.resolve(ok(quota("Old account")));
-    newRequest.resolve(ok(quota("New account")));
-    await Promise.all([oldRequest.promise, newRequest.promise]);
+    accountB.resolve(error("Account B unavailable"));
+    await accountB.promise;
   });
-  expect(result.current.state).toEqual({ status: "loaded", quota: quota("New account"), error: null });
+  expect(result.current.state).toEqual({ status: "error", quota: null, error: "Account B unavailable" });
+});
+
+test("ignores a late completion after a connection is deleted", async () => {
+  const lateRequest = deferred<ReturnType<typeof ok>>();
+  connectionProviderQuota.mockResolvedValueOnce(ok(quota("Account A"))).mockReturnValueOnce(lateRequest.promise);
+  const { result, rerender } = renderHook(({ id, capability }) => useConnectionQuota(id, capability), {
+    initialProps: { id: "account-a" as string | null, capability: "claude" as "claude" | null },
+  });
+
+  await waitFor(() => expect(result.current.state).toEqual({ status: "loaded", quota: quota("Account A"), error: null }));
+  act(() => {
+    void result.current.refresh();
+  });
+  await waitFor(() => expect(result.current.state.status).toBe("loading"));
 
   rerender({ id: null, capability: null });
   expect(result.current.state).toEqual({ status: "idle", quota: null, error: null });
+  await act(async () => {
+    lateRequest.resolve(ok(quota("Late account A")));
+    await lateRequest.promise;
+  });
+  expect(result.current.state).toEqual({ status: "idle", quota: null, error: null });
 });
 
-test("ignores late quota completion after unmount", async () => {
+test("does not commit a late quota completion after unmount", async () => {
   const request = deferred<ReturnType<typeof ok>>();
   connectionProviderQuota.mockReturnValueOnce(request.promise);
-  const { unmount } = renderHook(() => useConnectionQuota("account-a", "claude"));
+  const { result, unmount } = renderHook(() => useConnectionQuota("account-a", "claude"));
 
   await waitFor(() => expect(connectionProviderQuota).toHaveBeenCalledTimes(1));
+  expect(result.current.state).toEqual({ status: "loading", quota: null, error: null });
   unmount();
   await act(async () => {
     request.resolve(ok(quota("Late")));
     await request.promise;
   });
   expect(connectionProviderQuota).toHaveBeenCalledTimes(1);
+  expect(result.current.state).toEqual({ status: "loading", quota: null, error: null });
 });
 
 test("resets a Codex credit and refreshes exactly once", async () => {
@@ -200,5 +220,33 @@ test("returns true after a successful reset even when its refresh fails and reta
     expect(await result.current.resetCredit()).toBe(true);
   });
   expect(result.current.state).toEqual({ status: "error", quota: quota("Before"), error: "Quota unavailable" });
+  expect(connectionProviderQuota).toHaveBeenCalledTimes(2);
+});
+
+test("clears reset state when its account changes before the reset completes", async () => {
+  const reset = deferred<{ status: "ok"; data: { reset: true } }>();
+  connectionProviderQuota.mockResolvedValueOnce(ok(quota("Account A"))).mockResolvedValueOnce(ok(quota("Account B")));
+  resetCodexCredit.mockReturnValueOnce(reset.promise);
+  const { result, rerender } = renderHook(({ id }) => useConnectionQuota(id, "codex"), {
+    initialProps: { id: "account-a" },
+  });
+
+  await waitFor(() => expect(result.current.state).toEqual({ status: "loaded", quota: quota("Account A"), error: null }));
+  let pendingReset!: Promise<boolean>;
+  act(() => {
+    pendingReset = result.current.resetCredit();
+  });
+  await waitFor(() => expect(result.current.resetting).toBe(true));
+
+  rerender({ id: "account-b" });
+  await waitFor(() => expect(result.current.state).toEqual({ status: "loaded", quota: quota("Account B"), error: null }));
+  expect(result.current.resetting).toBe(false);
+
+  await act(async () => {
+    reset.resolve({ status: "ok", data: { reset: true } });
+    expect(await pendingReset).toBe(true);
+  });
+  expect(result.current.state).toEqual({ status: "loaded", quota: quota("Account B"), error: null });
+  expect(result.current.resetting).toBe(false);
   expect(connectionProviderQuota).toHaveBeenCalledTimes(2);
 });
