@@ -18,6 +18,12 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     kind: "integration",
     installed: false,
     family: null,
+    pinned: false,
+    sourceSpec: null,
+    resolvedCommit: null,
+    installedAt: null,
+    updatedAt: null,
+    trustTier: null,
     ...over,
   };
 }
@@ -55,6 +61,7 @@ const githubApp: AppInfo = {
 // before rendering instead of seeding store state directly.
 let appsFixture: AppInfo[] = [];
 let pluginsFixture: PluginInfo[] = [github, notion];
+let doctorFindingsFixture: { pluginId: string; severity: string; kind: string; message: string; suggestedAction: string }[] = [];
 
 const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
 const addApp = mock(async (_input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
@@ -62,6 +69,44 @@ const listPlugins = mock(async () => ({ status: "ok" as const, data: pluginsFixt
 const uninstallPlugin = mock(async (id: string) => ({
   status: "ok" as const,
   data: pluginsFixture.filter((p) => p.id !== id),
+}));
+const pluginsRestartRequired = mock(async () => ({ status: "ok" as const, data: false }));
+const pluginDoctor = mock(async () => ({ status: "ok" as const, data: doctorFindingsFixture }));
+const updatePlugin = mock(async (_id: string, _force: boolean) => ({ status: "ok" as const, data: { kind: "updated" as const } }));
+const updateAllPlugins = mock(async () => ({ status: "ok" as const, data: [] as { id: string; outcome: { kind: string } }[] }));
+// Mutates the fixture list that `listPlugins` reads from, so `pin()`'s
+// internal reload comes back with the real persisted flag — the same
+// authoritative-reload behavior being exercised, not a session-only mock.
+const setPluginPin = mock(async (id: string, pinned: boolean, _reason: string | null) => {
+  pluginsFixture = pluginsFixture.map((p) => (p.id === id ? { ...p, pinned } : p));
+  return { status: "ok" as const, data: null };
+});
+
+const beginSkillInstall = mock(async (_source: string) => ({
+  status: "ok" as const,
+  data: {
+    completed: true,
+    trust: null,
+    plugin: {
+      id: "superpowers",
+      name: "Superpowers",
+      source: "superpowers",
+      pluginId: null,
+      installedAt: "2026-07-08T10:00:00Z",
+      skills: [{ id: "superpowers:brainstorming", name: "brainstorming" }],
+    },
+  },
+}));
+const confirmSkillInstall = mock(async (_token: string) => ({
+  status: "ok" as const,
+  data: {
+    id: "superpowers",
+    name: "Superpowers",
+    source: "superpowers",
+    pluginId: null,
+    installedAt: "2026-07-08T10:00:00Z",
+    skills: [] as { id: string; name: string }[],
+  },
 }));
 
 const listSkills = mock(async () => ({
@@ -75,37 +120,6 @@ const listSkills = mock(async () => ({
     skillCount: number;
   }[],
 }));
-
-type InstallSkillResponse =
-  | {
-      status: "ok";
-      data: {
-        id: string;
-        name: string;
-        source: string;
-        pluginId: null;
-        installedAt: string;
-        skills: { id: string; name: string }[];
-      };
-    }
-  | {
-      status: "error";
-      error: string;
-    };
-
-const installSkill = mock(
-  async (_source: string): Promise<InstallSkillResponse> => ({
-    status: "ok" as const,
-    data: {
-      id: "superpowers",
-      name: "Superpowers",
-      source: "superpowers",
-      pluginId: null,
-      installedAt: "2026-07-08T10:00:00Z",
-      skills: [{ id: "superpowers:brainstorming", name: "brainstorming" }],
-    },
-  }),
-);
 
 const removeSkill = mock(async (_id: string) => ({
   status: "ok" as const,
@@ -178,8 +192,14 @@ mock.module("@/bindings", () => ({
     addApp,
     listPlugins,
     uninstallPlugin,
+    pluginsRestartRequired,
+    pluginDoctor,
+    updatePlugin,
+    updateAllPlugins,
+    setPluginPin,
+    beginSkillInstall,
+    confirmSkillInstall,
     listSkills,
-    installSkill,
     removeSkill,
     refreshSkill,
     pluginDetail,
@@ -202,22 +222,39 @@ const { filterByCategory, PluginsView } = await import("./PluginsView");
 const all = [plugin("github", ["vcs", "issues"]), plugin("notion", ["docs", "wiki", "productivity"]), plugin("ollama", ["model-provider"])];
 
 // Render and flush the mount-effect fetches (apps via `hydrate`, plugins via
-// `load`, skills refresh) inside act so their setState calls do not fire
-// mid-assertion.
+// `load`, doctor via `loadDoctor`, skills refresh) inside act so their
+// setState calls do not fire mid-assertion.
 async function renderView() {
   render(<PluginsView />);
   await act(async () => {});
 }
 
+function resetPluginsStore() {
+  usePlugins.setState({
+    plugins: [],
+    loaded: false,
+    restartRequired: false,
+    doctorFindings: [],
+    doctorLoaded: false,
+  });
+}
+
 beforeEach(() => {
   appsFixture = [];
   pluginsFixture = [github, notion];
+  doctorFindingsFixture = [];
   listApps.mockClear();
   addApp.mockClear();
   listPlugins.mockClear();
   uninstallPlugin.mockClear();
+  pluginsRestartRequired.mockClear();
+  pluginDoctor.mockClear();
+  updatePlugin.mockClear();
+  updateAllPlugins.mockClear();
+  setPluginPin.mockClear();
+  beginSkillInstall.mockClear();
+  confirmSkillInstall.mockClear();
   listSkills.mockClear();
-  installSkill.mockClear();
   removeSkill.mockClear();
   refreshSkill.mockClear();
   pluginDetail.mockClear();
@@ -230,7 +267,7 @@ beforeEach(() => {
   pluginOauthCompletedMsgListen.mockClear();
   oauthAuthorizeUrlMsgListen.mockClear();
   useApps.setState({ apps: [], loaded: false, probing: null });
-  usePlugins.setState({ plugins: [], loaded: false });
+  resetPluginsStore();
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
   useNav.setState({ history: { back: [], current: { kind: "plugins" }, forward: [] } });
   useSkills.setState({ skills: [], loading: false, error: null });
@@ -241,7 +278,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   useApps.setState({ apps: [], loaded: false, probing: null });
-  usePlugins.setState({ plugins: [], loaded: false });
+  resetPluginsStore();
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
   useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] } });
   useSkills.setState({ skills: [], loading: false, error: null });
@@ -300,7 +337,7 @@ test("browse install routes a provider to the connection modal", async () => {
   expect((await screen.findAllByText("Add account")).length).toBeGreaterThan(0);
 });
 
-test("browse install routes a skill pack to installSource", async () => {
+test("browse install routes a skill pack through the two-phase trust flow (beginSkillInstall)", async () => {
   pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
@@ -309,42 +346,19 @@ test("browse install routes a skill pack to installSource", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
 
-  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
+  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith("superpowers"));
+  // Curated packs resolve `completed: true` — no trust step, no old
+  // `install_skill` one-phase command involved.
+  await waitFor(() => expect(listPlugins.mock.calls.length).toBeGreaterThan(1));
 });
 
-test("browse skill-pack install is guarded while skills are loading", async () => {
-  pluginsFixture = [github, anthropic, superpowers];
+test("Add skill source opens the manual source-entry step of the trust-gated install flow", async () => {
   await renderView();
 
-  // A skills install is already in flight: installSource sets loading:true
-  // synchronously at the start, so a rapid second click must be a no-op.
-  act(() => {
-    useSkills.setState({ loading: true });
-  });
+  fireEvent.click(screen.getByRole("button", { name: "Add skill source" }));
 
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("superpowers");
-
-  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
-
-  await act(async () => {});
-  expect(installSkill).not.toHaveBeenCalled();
-});
-
-test("browse skill-pack install fires when skills are not loading", async () => {
-  pluginsFixture = [github, anthropic, superpowers];
-  await renderView();
-
-  act(() => {
-    useSkills.setState({ loading: false });
-  });
-
-  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
-  await screen.findByText("superpowers");
-
-  fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
-
-  await waitFor(() => expect(installSkill).toHaveBeenCalledWith("superpowers"));
+  expect(await screen.findByLabelText("Skill source")).toBeTruthy();
+  expect(beginSkillInstall).not.toHaveBeenCalled();
 });
 
 test("installed aggregates apps and installed plugins with uninstall", async () => {
@@ -400,6 +414,95 @@ test("empty installed state points at browse", async () => {
   await renderView();
 
   expect(await screen.findByText("Nothing installed yet. Browse plugins or add an MCP server by hand.")).toBeTruthy();
+});
+
+test("an installed skill pack shows Update/Pin actions, which call the store's commands", async () => {
+  const installedPack = { ...superpowers, installed: true };
+  pluginsFixture = [installedPack];
+  await renderView();
+
+  fireEvent.click(screen.getByRole("button", { name: "Update superpowers" }));
+  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith("superpowers", false));
+
+  fireEvent.click(screen.getByRole("button", { name: "Pin superpowers" }));
+  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith("superpowers", true, "Pinned from Cockpit"));
+
+  expect(await screen.findByText("Pinned")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();
+});
+
+test("a pinned skill pack's Pinned pill/button reflects info.pinned straight from listPlugins — no pin() call, so it survives a reload", async () => {
+  // Simulates the persisted ledger state coming back on a fresh load (e.g.
+  // after an app restart) rather than through this session's `pin()` call.
+  const pinnedPack = { ...superpowers, installed: true, pinned: true };
+  pluginsFixture = [pinnedPack];
+  await renderView();
+
+  expect(await screen.findByText("Pinned")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();
+  expect(setPluginPin).not.toHaveBeenCalled();
+
+  // A second reload (`usePlugins.load()`, same fixture) keeps it pinned.
+  await act(async () => {
+    await usePlugins.getState().load();
+  });
+  expect(screen.getByText("Pinned")).toBeTruthy();
+});
+
+test("a non-skill-pack installed plugin shows no Update/Pin actions", async () => {
+  pluginsFixture = [notion];
+  await renderView();
+
+  expect(await screen.findByText("notion")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /^Update notion$/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /^Pin notion$/ })).toBeNull();
+});
+
+test("an installed plugin with an attach-failed doctor finding shows the Attach failed pill", async () => {
+  pluginsFixture = [notion];
+  doctorFindingsFixture = [
+    { pluginId: "notion", severity: "warn", kind: "attach-failed", message: "notion failed to attach", suggestedAction: "Check notion" },
+  ];
+  await renderView();
+
+  expect(await screen.findByText("Attach failed")).toBeTruthy();
+});
+
+test("the doctor chip reflects the finding count and opens the doctor panel", async () => {
+  doctorFindingsFixture = [
+    { pluginId: "notion", severity: "warn", kind: "attach-failed", message: "notion failed to attach", suggestedAction: "Check notion" },
+  ];
+  await renderView();
+
+  expect(await screen.findByRole("button", { name: "1 issue" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "1 issue" }));
+  expect(await screen.findByText("Plugin doctor")).toBeTruthy();
+  expect(screen.getAllByText("notion failed to attach").length).toBeGreaterThan(0);
+});
+
+test("the doctor chip reads Doctor: OK when there are no findings", async () => {
+  await renderView();
+  expect(await screen.findByRole("button", { name: "Doctor: OK" })).toBeTruthy();
+});
+
+test("Update all is disabled with no installed skill packs, and calls updateAllPlugins when enabled", async () => {
+  pluginsFixture = [notion];
+  await renderView();
+
+  const updateAllBtn = (await screen.findByRole("button", { name: "Update all" })) as HTMLButtonElement;
+  expect(updateAllBtn.disabled).toBe(true);
+
+  pluginsFixture = [notion, { ...superpowers, installed: true }];
+  await act(async () => {
+    await usePlugins.getState().load();
+  });
+
+  const enabled = screen.getByRole("button", { name: "Update all" }) as HTMLButtonElement;
+  expect(enabled.disabled).toBe(false);
+
+  fireEvent.click(enabled);
+  await waitFor(() => expect(updateAllPlugins).toHaveBeenCalled());
 });
 
 test("filterByCategory passes every plugin through for the default all category", () => {

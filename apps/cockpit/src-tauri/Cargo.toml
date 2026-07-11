@@ -19,6 +19,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # the repo-root .cargo/config.toml: `cargo gen-bindings`.
 gen-bindings = []
 
+# Forwards to `ryuzi-core`'s `discord` feature so this crate's own
+# `#[cfg(feature = "discord")]` test gates (see `plugins_cmd.rs`) can see
+# when the live serenity-backed `GatewayFactory` is available — a plain
+# `--features ryuzi-core/discord` enables ryuzi-core's feature build-wide but
+# does not set a cfg flag for *this* crate's own compilation.
+discord = ["ryuzi-core/discord"]
+
 # Explicit [[bin]] so the required-features gate applies; tauri-cli's
 # get_binaries honors required-features in both [[bin]] and src/bin
 # auto-discovery paths, dropping the bin from bundling on every platform.

@@ -3,8 +3,8 @@
 Ryuzi's extension points — model providers, the Discord gateway, and
 third-party integrations (GitHub, Notion, Slack, memory backends,
 sandboxes, deploy platforms...) — are all **plugins**: one manifest
-each, surfaced identically through `ryuzi plugins`, `GET /plugins`, and
-Cockpit's Plugins hub.
+each, surfaced identically through `ryuzi plugins`, the daemon's
+`list_plugins` RPC, and Cockpit's Plugins hub.
 
 This guide covers the manifest format, how to author and install your own
 plugin, and how the built-in fleet is organized. It documents what is
@@ -69,19 +69,53 @@ process startup, installing or refreshing a skill pack requires restarting
 
 Cockpit's plugin UI now lives under the dedicated **Plugins** screen
 (`apps/cockpit/src/views/PluginsView.tsx`) plus the per-plugin detail screen
-(`PluginDetailView.tsx`), not the old Apps-only catalog flow. The screen is
-split into four tabs backed by thin Tauri commands:
+(`PluginDetailView.tsx`), not the old Apps-only catalog flow. Plugin
+management — install, update, pin, uninstall, doctor — is Cockpit- and
+daemon-only; there is no CLI surface for any of it. The screen is split into
+two tabs (`Segmented`), backed by thin Tauri commands:
 
 - **Installed** — DB-backed MCP apps already added to the local machine
-  (`apps_cmd.rs` / `useApps`).
-- **Access** — whether the agent is allowed to use each installed app.
+  (`apps_cmd.rs` / `useApps`), plus every installed plugin the ledger and
+  registries know about (providers, gateways, catalog connectors, and skill
+  packs) via `usePlugins`/the `list_plugins` RPC. Every installed card exposes
+  Uninstall; skill-pack cards additionally show Update and Pin/Unpin, and a
+  "Pinned" pill plus an "Attach failed" pill (from the doctor findings)
+  surface inline. A separate "Skill sources" card lists any git-installed
+  skill that isn't tied to a plugin id. Above the tabs, an **Update all** button batches
+  the `update_all_plugins` RPC across every installed pack (skipping pinned
+  ones) and a **doctor** chip shows the current `plugin_doctor` issue count
+  (opens `DoctorPanel`, a read-only findings list grouped by severity).
 - **Browse** — a pure grid of the embedded **catalog** manifests with a
-  category filter. The old MCP-registry browser (`registry_cmd.rs` /
+  category filter, plus any curated skill pack (e.g. Superpowers) offered as
+  an installable card. The old MCP-registry browser (`registry_cmd.rs` /
   `registry_search`) has been removed entirely; MCP-server apps installed
   through it keep working as ordinary Apps rows. Hand-adding an MCP server
-  stays available via **Add MCP server** (AddAppModal).
-- **Skills** — Ryuzi-native skill-pack install / refresh / removal
-  (`skills_cmd.rs`, backed by `crates/core/src/skills_install.rs`).
+  stays available via **Add MCP server** (AddAppModal), and hand-adding a
+  skill source via **Add skill source** (`SkillInstallModal`).
+
+There is no remote/community catalog beyond the embedded one — "Browse"
+only ever lists the 24 manifests baked into the binary plus the curated
+skill packs baked into `skills_install.rs`; a hosted plugin registry is a
+future track, not shipped behavior.
+
+Installing a skill pack (Browse card or "Add skill source") goes through the
+two-phase tiered trust gate described in
+[Installing skill packs](#installing-skill-packs) below: a curated source
+installs immediately, while an arbitrary source stops at a trust-confirmation
+step in `SkillInstallModal` before anything touches the live install
+directory. Any successful install, update, uninstall, or confirm sets an
+in-memory "restart required" flag Cockpit polls via
+the `plugins_restart_required` RPC (and the `restartRequired` derived from
+`list_plugins`) — a banner ("Restart Cockpit to apply plugin changes.")
+appears above the main view (`App.tsx`) until the app is restarted, since
+registries are only built once at process startup.
+
+The plugin detail screen (`PluginDetailView.tsx`) additionally renders a
+**Provenance** card (source spec, resolved commit prefix, install/update
+timestamps — from the `plugin_installs` ledger row) and, when the doctor
+has an `attach-failed` finding for this plugin, an **Attach failed** banner
+with the recorded reason and a "Configure" shortcut that scrolls to the
+Authentication/Settings section.
 
 Catalog plugins are installed through the **Install wizard**: clicking
 Install runs `begin_plugin_install`, which routes by the manifest's
@@ -115,7 +149,7 @@ Every field (`ryuzi_plugin_sdk::manifest::PluginManifest`):
 | `name` | string | *(required)* | Display name; must be non-empty. |
 | `version` | string | `""` | Free-form; not validated. |
 | `publisher` | string | `""` | `"ryuzi"` for first-party; a vendor or maintainer name otherwise. |
-| `description` | string | `""` | Shown in `ryuzi plugins info`, `GET /plugins`, and the Cockpit catalog card. |
+| `description` | string | `""` | Shown in `ryuzi plugins info`, the `list_plugins` RPC, and the Cockpit catalog card. |
 | `homepage` | string \| null | `None` | |
 | `icon` | string \| null | `None` | A lucide icon name. Cockpit maps a small explicit set (`message-circle`, `terminal`, `cpu`, `globe`, `database`, `search`, `cloud`, `server`, `webhook`, `key`, `mail`, `bot`) and falls back to a generic puzzle icon for everything else — including brand-name icons like `github`, `slack`, or `figma`, since `lucide-react` dropped brand/logo icons (see `apps/cockpit/src/lib/plugin-icons.ts`). |
 | `categories` | string[] | `[]` | See the vocabulary table below. Unknown labels are a non-fatal warning (`PluginManifest::warnings()`), never a validation error. |
@@ -234,7 +268,7 @@ mcp: github transport=Http target=https://api.githubcopilot.com/mcp/
 
 ## Category vocabulary
 
-`ryuzi_plugin_sdk::categories::KNOWN` — 21 standard labels. Unrecognized
+`ryuzi_plugin_sdk::categories::KNOWN` — 22 standard labels. Unrecognized
 categories are a warning, not a validation error, so the vocabulary can grow
 without breaking existing manifests.
 
@@ -260,6 +294,7 @@ without breaking existing manifests.
 | `tunnel` | Network tunnels (`cloudflare`, `ngrok`) |
 | `deploy` | Deployment platforms (`vercel`, `render`, `netlify`) |
 | `communication` | Chat/messaging (`slack`, `telegram`) |
+| `skills` | Reserved for skill-pack plugins; no shipped catalog or generated skill-pack manifest sets it yet (`generated_plugin_manifest` always emits `categories = []`) |
 
 `model-provider`/`api-key`/`oauth`/`free` are provider-only labels generated
 by `providers.rs`, not something a third-party integration manifest needs —
@@ -468,7 +503,9 @@ directories without guessing.
 
 Hand-authored user plugins are no longer loaded — the only supported way
 to get a plugin directory under `~/.config/ryuzi/plugins/` is the skills
-installer (Cockpit's Plugins → Skills tab, or the same core path in
+installer (Cockpit's Plugins hub — the Browse tab's per-card Install button
+for curated packs, or the header's **Add skill source** button for an
+arbitrary `owner/repo` — backed by the same core path in
 `crates/core/src/skills_install.rs`). `install_plugin_pack` writes:
 
 - the pack repo to `~/.config/ryuzi/plugins/<plugin-id>/` (including its
@@ -496,6 +533,216 @@ and skipped without blocking its siblings; an `id` colliding with any
 built-in or embedded-catalog plugin loses (first registration wins); skill
 packs are disabled by default like catalog plugins; discovery happens once
 at process startup.
+
+The `.ryuzi-skill.json` stamp above is still exactly what the loader checks
+at startup — that has not changed. What *is* new (this section) is a
+separate SQLite ledger that makes an installed pack's origin, freshness, and
+trust state queryable and manageable without re-deriving them from the
+filesystem, plus the machinery (atomic staged installs, update/pin, a
+two-phase trust gate, attach-status + doctor) built on top of it.
+
+### The install ledger
+
+Every skill/plugin-pack install or update writes one row to a `plugin_installs`
+table in the same SQLite database as the rest of Ryuzi's state (see the
+migration in `crates/core/src/store.rs`, and `PluginInstallRecord`):
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `plugin_id` | TEXT, primary key | |
+| `kind` | TEXT | `"plugin_pack"` or `"single_skill"` |
+| `source_spec` | TEXT | The install source as given (`owner/repo`, a full GitHub URL, or a curated alias) |
+| `resolved_commit` | TEXT, nullable | The git HEAD SHA captured at clone time; `NULL` for rows created by the one-time backfill (the original clone is long gone) |
+| `fingerprint` | TEXT | A content hash of the installed tree (excludes `.git` and the `.ryuzi-skill.json` stamp itself) — the local-edit guard's baseline |
+| `installed_at` / `updated_at` | INTEGER | Unix ms; `installed_at` is preserved across updates, `updated_at` bumps on every successful reinstall |
+| `pinned` | INTEGER (bool) | See [pin](#update-pin-and-the-local-edit-guard) below |
+| `pin_reason` | TEXT, nullable | Free-form, set by the pin caller |
+| `trust_tier` | TEXT | `"curated"` or `"acknowledged"` today; `"blocked"` is reserved for a future remote-catalog verdict feed (not implemented — see [Two-phase tiered trust gate](#two-phase-tiered-trust-gate)) |
+| `trust_ack_at` / `trust_ack_summary` | INTEGER / TEXT, nullable | When and what the user acknowledged (a JSON snapshot of the `TrustPrompt` they saw); `NULL` for curated installs and backfilled rows |
+
+The ledger is **the record of record** for install management (what to show
+in the UI, what `update`/`pin`/`uninstall` operate on) — the on-disk
+`.ryuzi-skill.json` stamp remains the loader's own provenance gate and is
+untouched by any of this. The two can, in principle, drift (e.g. someone
+hand-deletes the ledger's SQLite file); nothing here reconciles that beyond
+the one-time backfill described next.
+
+`backfill_install_records` runs once per `ControlPlane` construction (daemon
+and Cockpit both go through it) and creates a ledger row for every on-disk
+pack that doesn't have one yet — installs made before this ledger existed.
+It's idempotent (skips any `plugin_id` already recorded) and best-effort: a
+backfill failure is logged and never blocks startup. Backfilled rows have no
+`resolved_commit` and get a fresh `installed_at`/`updated_at` timestamp, and
+their `trust_tier` is inferred the same way a fresh install's is — `"curated"`
+for a `CURATED_SKILL_SOURCES` repo, `"acknowledged"` otherwise.
+
+### Atomic staged install
+
+Every install/update/confirm — single skill or plugin pack — writes into a
+staging directory first and only swaps it into the live location once
+everything for that call has succeeded. For a plugin pack (`install_plugin_pack`
+in `skills_install.rs`) this is a multi-directory atomic swap (`DirSwap`): the
+plugin directory and every one of its bundled skills' materialized copies are
+each staged as siblings of their final target, then `DirSwap::commit` moves
+every pre-existing target aside to a backup, renames each staging directory
+into place, and — if *any* rename in the batch fails — restores every backup
+it had already displaced and removes the half-written staging directories.
+Stale-artifact removal (deleting a skill that a pack update no longer
+bundles) only runs after a successful commit, so a failed install or update
+never deletes still-valid pre-existing files. Net effect: an install that's
+interrupted midway (process killed, disk full, a bad git clone) never leaves
+an existing pack partially overwritten or missing.
+
+### Update, pin, and the local-edit guard
+
+`update_installed_pack(id, force)` re-resolves the pack's *recorded*
+`source_spec` (not whatever is currently on disk) into a fresh temp clone and
+walks a fixed decision order — see `UpdateOutcome`:
+
+1. No ledger record for `id` → `Failed("no install record for {id}")`.
+2. `pinned` → `SkippedPinned`. Pinning is an unconditional choice; `force`
+   does not override it.
+3. The on-disk fingerprint no longer matches the recorded one (the user
+   hand-edited the installed files) → `LocalEdits`, unless `force` is set.
+4. The freshly re-cloned commit equals the recorded `resolved_commit` →
+   `AlreadyCurrent`, unless `force` is set.
+5. The re-clone bundles a hook script the recorded `trust_ack_summary`
+   doesn't already cover → `NeedsReack(TrustPrompt)`. This check runs
+   **regardless of `force`** — hook scripts execute code on every matching
+   tool call, so `force` is not allowed to skip re-acknowledging them. The
+   caller resolves this the same way as a fresh install: pass the prompt's
+   `token` to `confirm_install`.
+6. Otherwise: reinstall via the same staged `DirSwap` path as a fresh
+   install, clean up any artifacts the update no longer produces, and
+   rewrite the ledger row with the new `resolved_commit`/`fingerprint`/
+   `updated_at` (preserving `installed_at`, `pinned`, `pin_reason`, and the
+   existing trust fields from the old row) → `Updated`.
+
+`update_all_packs` runs this for every ledger row, skipping pinned ones, and
+never fails as a whole — one pack's error becomes an `UpdateOutcome::Failed`
+entry in its result list so the rest of the batch still completes.
+
+`set_pack_pin(id, pinned, reason)` is a thin passthrough that flips
+`plugin_installs.pinned`/`pin_reason` — the ledger row is the single source
+of truth `update_installed_pack` checks; pinning doesn't touch anything on
+disk or require a restart.
+
+### Two-phase tiered trust gate
+
+Installing (or updating into) an **arbitrary** source never touches the live
+install directory in one step. `begin_install(source)` classifies the source
+first:
+
+- **Curated** (today: Superpowers, `obra/superpowers` / its GitHub URL, via
+  `CURATED_SKILL_SOURCES`) — installs immediately and records
+  `trust_tier = "curated"`. An explicit `ryuzi`/Cockpit-driven install of a
+  curated pack *is* the trust decision; there's no extra prompt.
+- **Everything else** — clones into a temp directory, discovers what it would
+  install (skills, bundled `.ryuzi/hooks/<event>/<script>` files, total byte
+  size), and returns `BeginInstall::NeedsConfirmation(TrustPrompt)` instead of
+  writing anything live. The clone is held in a process-global staging map
+  keyed by a random `token`, good for **10 minutes** — an expired or replayed
+  token makes `confirm_install` fail with "install session expired".
+
+`TrustPrompt` — the payload shown to the user before they can proceed —
+carries: `token`, `sourceSpec`, `ownerRepo`, `resolvedCommit`, the discovered
+`skills` list, the `hookScripts` list (`<event>/<script>`, sorted), and
+`totalBytes`. Cockpit's `SkillInstallModal` renders exactly this: source,
+repo, commit, size, the skill list, and — called out with a warning style —
+any bundled hook scripts, since those "run automatically when triggered."
+The user must click "Trust & Install" (which calls `confirm_install(token)`)
+before anything is written; there's no way to skip the prompt for a
+non-curated source.
+
+`confirm_install` is single-use (the token is removed from the staging map up
+front) and completes the install from the *staged* clone — via the same
+atomic `DirSwap` path — recording `trust_tier = "acknowledged"`,
+`trust_ack_at = now`, and `trust_ack_summary` = a JSON snapshot of what was
+shown (source, repo, commit, skills, hook scripts). That snapshot is what
+later update calls diff against for re-ack-on-hook (step 5 above): a hook
+script already listed in `trust_ack_summary.hookScripts` doesn't re-trigger
+the prompt, but a genuinely new one does — including for a curated or
+backfilled pack, whose `trust_ack_summary` is `None` (nothing acknowledged),
+so *any* hook script found on its next update trips the gate once.
+
+A third tier, `"blocked"`, is reserved in the `trust_tier` column for a
+future remote-catalog verdict feed — nothing in this milestone sets it, and
+there is no remote/community catalog shipped to source a verdict from.
+
+### Attach status and doctor
+
+Session start (`control::lifecycle::attach_plugin_mcp_servers`) records one
+`plugin_attach_status` row per connector-capable, enabled plugin it attempts
+to attach — `plugin_id`, `last_attach_at`, `outcome` (`"ok"` /
+`"failed"`), and a secret-free `reason` (the same friendly text `ensure_auth`
+already produces, e.g. `"configure {id}: see {help_url}"` — never a raw
+credential or unresolved-placeholder parse error). This is the same table
+`doctor.rs` reads for its `attach-failed` finding and what Cockpit's plugin
+detail screen shows as the "Attach failed" banner.
+
+`crate::plugins::doctor::plugin_doctor` (`crates/core/src/plugins/doctor.rs`)
+is a **read-only** aggregation — it never mutates settings, the store, or
+plugin state — over every plugin the host knows about, producing a flat
+`Vec<DoctorFinding>` (`plugin_id`, `severity` = `"warn"`/`"error"`, `kind`,
+`message`, `suggested_action`):
+
+| `kind` | Severity | Trigger |
+| --- | --- | --- |
+| `missing-binary` | error | An enabled connector's `[[mcp]]` stdio `command` isn't on `PATH` |
+| `reconnect-required` | warn | A stored OAuth token is flagged `reconnect_required` |
+| `attach-failed` | warn | The plugin's last recorded `plugin_attach_status` row has `outcome = "failed"` |
+
+Every `message`/`suggested_action` is verified secret-free by tests (no
+`refresh_token`/`client_secret` substrings can appear). Cockpit surfaces this
+via a "Doctor: OK" / "N issues" chip on the Plugins hub (opens `DoctorPanel`,
+findings grouped errors-first) and, per-plugin, as the attach-failure banner
+on the detail screen.
+
+### Daemon RPC methods (`POST /rpc/{method}`)
+
+The engine daemon (`ryuzi serve` / `--engine-daemon`) exposes plugin
+management as RPC methods, dispatched by `crate::api::plugins_api::dispatch`
+(routed from `crate::api::dispatch` in `crates/core/src/api/mod.rs`). Cockpit
+calls each through a thin `EngineClient::rpc` proxy in
+`apps/cockpit/src-tauri/src/plugins_cmd.rs` — there are no REST plugin routes
+on the HTTP router anymore; `serve.rs` only owns `/rpc/{method}`, `/events`,
+and `/approvals`. Every method's params object uses the Rust snake_case
+parameter names; the Tauri command name matches the RPC method name 1:1.
+
+| Method | Params | Result | Notes |
+| --- | --- | --- | --- |
+| `list_plugins` | — | `PluginInfo[]` | Every plugin as a compact summary, enriched with its ledger fields (see below) |
+| `plugin_detail` | `{ id }` | `PluginDetail` | The plugin's full manifest plus `enabled`/`source` and the same ledger enrichment |
+| `plugin_doctor` | — | `DoctorFinding[]` | `plugin_doctor`'s findings array |
+| `begin_skill_install` | `{ source }` | `SkillInstallBegin` | Phase 1 of the trust gate — curated sources install immediately (sets restart-required), arbitrary sources return `{ completed: false, trust: TrustPrompt }` |
+| `confirm_skill_install` | `{ token }` | `InstalledSkillPack` | Phase 2 — completes a staged install/update after acknowledgment; sets restart-required |
+| `update_plugin` | `{ id, force }` | `UpdateOutcomeDto` | Runs `update_installed_pack`; only an `Updated` outcome sets restart-required |
+| `update_all_plugins` | — | `UpdateOutcomeEntry[]` | Runs `update_all_packs`; sets restart-required if at least one pack actually reinstalled |
+| `set_plugin_pin` | `{ id, pinned, reason? }` | — | Flips the ledger's pin state; never sets restart-required (pin doesn't change what's on disk or loaded) |
+| `uninstall_plugin` | `{ id }` | `PluginInfo[]` | Uninstalls a recorded pack via the recorded remove path: removes it from disk and deletes its `plugin_installs`/`plugin_attach_status` rows; sets restart-required; returns the refreshed list |
+| `plugins_restart_required` | — | `boolean` | Reads the in-memory restart-required latch (see below) |
+
+`list_plugins` and `plugin_detail` merge in, when a `plugin_installs` row
+exists for that id: `sourceSpec`, `resolvedCommit`, `pinned`, `installedAt`,
+`updatedAt`, and `trustTier` (see `install_ledger_index` /
+`InstallLedgerFields` in `plugins_api.rs`) — note `sourceSpec` is deliberately
+a distinct key from the existing `source` field, which stays the stable
+`"builtin" | "catalog" | "skill-pack"` enum label. `list_plugins` fetches the
+ledger once (`store.list_plugin_installs`) and indexes it by id so list
+assembly never does a per-plugin store round-trip; `plugin_detail` uses the
+single-id `store.get_plugin_install`.
+
+`restartRequired` is a single in-memory flag on the daemon's `ControlPlane`
+(`mark_plugins_restart_required`/`plugins_restart_required`), not persisted —
+it's set by any install/update/uninstall that actually changed what's on
+disk or should be loaded, and read back via the `plugins_restart_required`
+RPC. It exists because plugin registries (`Registries`) are built exactly
+once at process startup (see [the wiring note above](#two-layers-manifest-vs-coreplugin));
+there is no hot-reload, so a fresh install genuinely isn't live until the
+daemon restarts. Nothing today clears the flag except a daemon restart —
+Cockpit is a thin client, so the flag lives on the daemon (the actual plugin
+host), and a daemon restart naturally starts a new process with it reset to
+`false`.
 
 ---
 
@@ -582,9 +829,15 @@ MCP server) use hook scripts, not the manifest — see
 ```
 
 one executable per file, run in filename-sorted order, receiving the event
-payload as JSON on stdin. `tool.before` is a gating event: a non-zero exit
-denies the action and the script's stdout becomes the shown reason;
-`tool.after` and `session.start` are observational only. A missing hooks
+payload as JSON on stdin. Only one event actually fires today: `tool.before`,
+a gating event dispatched from the native runner (`harness::native::runner`)
+before every tool call — a non-zero exit denies the action and the script's
+stdout becomes the shown reason. The `hooks::run` helper is event-name-generic
+(it would run any `.ryuzi/hooks/<event>/` directory's scripts), and
+`session.start`/`tool.after` event names exist in earlier design notes, but
+nothing in the native runner currently calls `hooks::run` for them — do not
+document them as observational hooks that fire; treat this as a future
+gap, not shipped behavior, until a call site exists. A missing hooks
 directory, or a script that isn't executable, is treated as "allow" — never
 a hard failure.
 
@@ -600,9 +853,12 @@ loaded (no installer provenance → skipped). To author a plugin:
    (see [Catalog contribution guidelines](#catalog-contribution-guidelines)).
 2. **Skill pack** — publish a GitHub repo the skills installer
    understands (a `.codex-plugin/plugin.json` pack or a repo of leaf
-   `SKILL.md` directories) and install it from Cockpit's Skills tab; the
-   installer materializes `ryuzi-plugin.toml` and the provenance stamp
-   for you.
+   `SKILL.md` directories) and install it from Cockpit's Plugins hub (the
+   header's **Add skill source** button, or a curated pack's Install button
+   on the Browse tab); the installer materializes `ryuzi-plugin.toml` and
+   the provenance stamp for you, subject to the same
+   [two-phase trust gate](#two-phase-tiered-trust-gate) as any other
+   skill-pack install.
 
    Minimal example — no `.codex-plugin/plugin.json`, just a `skills/`
    directory of leaf `SKILL.md` dirs:
@@ -614,8 +870,8 @@ loaded (no installer provenance → skipped). To author a plugin:
            └── SKILL.md
    ```
 
-   Paste `owner/my-skills-repo` (or the full GitHub URL) into the Skills
-   tab's **Install source** field. `discover_install_target` finds no
+   Paste `owner/my-skills-repo` (or the full GitHub URL) into the
+   **Add skill source** modal's source field. `discover_install_target` finds no
    `plugin.json` or top-level `SKILL.md`, scans `skills/*/SKILL.md`, and
    generates `~/.config/ryuzi/plugins/my-skills-repo/ryuzi-plugin.toml`
    with `id = "my-skills-repo"` and one `[[skills]]` entry

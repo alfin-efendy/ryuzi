@@ -1,8 +1,11 @@
 import { useEffect } from "react";
+import { MonitorUp } from "lucide-react";
+import { SettingsCard as Card } from "@ryuzi/ui";
 import { useStore } from "./store";
 import { useAgent } from "./store-agent";
 import { useModelStatuses } from "./store-model-statuses";
 import { useNav } from "./store-nav";
+import { usePlugins } from "./store-plugins";
 import { useDisableContextMenu } from "./lib/contextMenu";
 import { TitleBar } from "./components/shell/TitleBar";
 import { Sidebar } from "./components/shell/Sidebar";
@@ -60,15 +63,23 @@ function MainView() {
   }
 }
 
+const WARN = "#F59E0B";
+
 export default function App() {
   const init = useStore((s) => s.init);
   const loadAgent = useAgent((s) => s.load);
   const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
+  const restartRequired = usePlugins((s) => s.restartRequired);
   useDisableContextMenu();
   useEffect(() => {
     init();
     void loadAgent();
     void hydrateModelStatuses();
+    // Read the store directly (not via the reactive selector above) so this
+    // mount-time fetch runs exactly once, guarded the same way every other
+    // domain store's `load()` is — visiting the Plugins hub first is not a
+    // precondition for the restart banner below to be accurate.
+    if (!usePlugins.getState().loaded) void usePlugins.getState().load();
   }, [init, loadAgent, hydrateModelStatuses]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
@@ -80,6 +91,12 @@ export default function App() {
       <div className="relative z-10 flex min-h-0 flex-1">
         <Sidebar />
         <main className="acrylic-main mx-2.5 mb-2.5 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border shadow-sm">
+          {restartRequired && (
+            <Card className="m-2.5 mb-0 flex shrink-0 items-center gap-2.5 px-[18px] py-2.5 text-[12.5px]">
+              <MonitorUp aria-hidden size={15} strokeWidth={2} className="shrink-0" style={{ color: WARN }} />
+              <span className="min-w-0 flex-1">Restart Cockpit to apply plugin changes.</span>
+            </Card>
+          )}
           <MainView />
         </main>
       </div>

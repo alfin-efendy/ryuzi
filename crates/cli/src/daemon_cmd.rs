@@ -254,6 +254,13 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
 /// failure path that reaches here without having rolled back itself.
 async fn build_and_start(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let daemon = build_daemon(opts).await?;
+    // Real daemon startup: run the one-time install-ledger backfill +
+    // crash-leftover sweep here — NOT inside `build_daemon`, which
+    // `ryuzi-core`'s own daemon unit tests call (and which don't set a
+    // hermetic config root), so wiring maintenance there would make those
+    // tests touch/delete the developer's real `$HOME`. See
+    // `ControlPlane::run_startup_maintenance`.
+    daemon.cp.run_startup_maintenance().await;
     if let Err(e) = daemon.start().await {
         daemon.stop().await;
         return Err(e);
@@ -641,6 +648,9 @@ impl CanaryHost for ProdCanaryHost {
             .take()
             .expect("open_db called once");
         let daemon = build_daemon(opts).await?;
+        // Real (canary) daemon startup — same one-time maintenance as
+        // `build_and_start`, kept out of `build_daemon` for the same reason.
+        daemon.cp.run_startup_maintenance().await;
         *self.daemon.lock().await = Some(daemon);
         Ok(())
     }

@@ -24,7 +24,8 @@ struct IdP {
     id: String,
 }
 
-pub(crate) async fn dispatch(_state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
+pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
+    let cp = &state.cp;
     match method {
         "list_skills" => ok(
             crate::skills_install::list_installed_skills().map_err(|message| ApiError {
@@ -34,32 +35,46 @@ pub(crate) async fn dispatch(_state: &ApiState, method: &str, p: Value) -> Resul
         ),
         "install_skill" => {
             let a: SourceP = params(p)?;
-            ok(crate::skills_install::install_skill_source(&a.source)
+            let pack = crate::skills_install::install_skill_source(&a.source)
                 .await
                 .map_err(|message| ApiError {
                     status: 500,
                     message: message.to_string(),
-                })?)
+                })?;
+            cp.mark_plugins_restart_required();
+            ok(pack)
         }
+        // Ledger-aware remove: `remove_installed_skill_recorded` also deletes
+        // the pack's `plugin_installs`/`plugin_attach_status` rows so a
+        // reinstall starts from a clean ledger state instead of resurrecting
+        // stale trust/pin metadata. Marks a restart — an uninstall changes
+        // what's on disk.
         "remove_skill" => {
             let a: IdP = params(p)?;
-            ok(
-                crate::skills_install::remove_installed_skill(&a.id).map_err(|message| {
-                    ApiError {
-                        status: 500,
-                        message: message.to_string(),
-                    }
-                })?,
-            )
-        }
-        "refresh_skill" => {
-            let a: IdP = params(p)?;
-            ok(crate::skills_install::refresh_installed_skill(&a.id)
+            crate::skills_install::remove_installed_skill_recorded(&a.id, cp.store())
                 .await
                 .map_err(|message| ApiError {
                     status: 500,
                     message: message.to_string(),
-                })?)
+                })?;
+            cp.mark_plugins_restart_required();
+            ok(())
+        }
+        // Ledger-aware refresh: `refresh_installed_skill_recorded` keeps the
+        // pack's `plugin_installs` fingerprint in sync so a bare refresh
+        // doesn't leave the ledger's fingerprint stale (which would otherwise
+        // false-positive a `LocalEdits` result on the next update). Marks a
+        // restart, since a refresh reinstalls fresh content.
+        "refresh_skill" => {
+            let a: IdP = params(p)?;
+            let pack = crate::skills_install::refresh_installed_skill_recorded(&a.id, cp.store())
+                .await
+                .map_err(|message| ApiError {
+                    status: 500,
+                    message: message.to_string(),
+                })?;
+            cp.mark_plugins_restart_required();
+            ok(pack)
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }

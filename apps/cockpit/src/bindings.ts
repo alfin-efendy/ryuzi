@@ -1012,6 +1012,94 @@ async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise
 }
 },
 /**
+ * Phase 1 of the two-phase tiered trust gate: curated sources install
+ * immediately (`completed: true`); arbitrary sources stop at a
+ * `TrustPromptDto` the wizard must show before `confirm_skill_install` can
+ * proceed.
+ */
+async beginSkillInstall(source: string) : Promise<Result<SkillInstallBegin, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("begin_skill_install", { source }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Phase 2: complete a staged install (or update) after the user has
+ * acknowledged its `TrustPromptDto`. The token is single-use.
+ */
+async confirmSkillInstall(token: string) : Promise<Result<InstalledSkillPack, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("confirm_skill_install", { token }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Update one installed pack. `force` overrides the local-edits guard but
+ * never the pinned guard or the hook-script re-ack gate.
+ */
+async updatePlugin(id: string, force: boolean) : Promise<Result<UpdateOutcomeDto, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_plugin", { id, force }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Update every installed pack (skipping pinned ones); never fails as a whole
+ * — a single pack's error surfaces as that pack's `UpdateOutcomeDto::Failed`
+ * entry.
+ */
+async updateAllPlugins() : Promise<Result<UpdateOutcomeEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_all_plugins") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pin (or unpin) an installed pack against future updates.
+ */
+async setPluginPin(id: string, pinned: boolean, reason: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_pin", { id, pinned, reason }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read-only plugin health aggregation — see the daemon's
+ * `plugins::doctor::plugin_doctor` for the full list of checks. Never mutates
+ * state.
+ */
+async pluginDoctor() : Promise<Result<DoctorFinding[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_doctor") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Whether a plugin install/update since the daemon's last start requires a
+ * restart to take effect (in-memory flag on the daemon's `ControlPlane`,
+ * cleared only by a daemon restart).
+ */
+async pluginsRestartRequired() : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugins_restart_required") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -1311,6 +1399,20 @@ export type CoreEventMsg = { event: CoreEvent }
  */
 export type DeviceFlowInfo = { flowId: string; userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number; interval: number }
 export type DirEntryInfo = { name: string; dir: boolean }
+/**
+ * Mirror of `crate::plugins::doctor::DoctorFinding`. Already secret-free at
+ * the source (see that module's doc comment) — this DTO adds no new fields,
+ * just the specta `Type` the core struct doesn't derive.
+ */
+export type DoctorFinding = { pluginId: string; 
+/**
+ * `warn` | `error`.
+ */
+severity: string; 
+/**
+ * `reconnect-required` | `missing-binary` | `attach-failed`.
+ */
+kind: string; message: string; suggestedAction: string }
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 export type GatewayEventInfo = { at: number; level: string; text: string }
@@ -1439,7 +1541,20 @@ installed: boolean;
  * Provider family head id (providers only) — the Models `providerDetail`
  * navigation target. `None` for other kinds.
  */
-family: string | null }
+family: string | null; 
+/**
+ * Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
+ * plugin has no `plugin_installs` ledger row (never installed via the
+ * tracked git-clone path, e.g. builtins/catalog integrations with no
+ * skill-pack install).
+ */
+pinned: boolean; 
+/**
+ * The ledger row's git origin (`PluginInstallRecord.source_spec`).
+ * Distinct from `source` (the stable builtin/catalog/skill-pack enum
+ * label) — the Provenance card in Cockpit renders it only when present.
+ */
+sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null }
 export type PluginInstallBeginResult = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.
@@ -1545,6 +1660,13 @@ parentSessionPk: string | null }
  */
 export type SessionKind = "project" | "chat" | "worker" | "review"
 export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
+/**
+ * Mirror of `crate::skills_install::BeginInstall`, flattened into a single
+ * `{completed, trust?, plugin?}` shape the wizard can branch on without a
+ * tagged-union match in TS. `trust` is set for `NeedsConfirmation`, `plugin`
+ * for `Completed` — exactly one is ever `Some`.
+ */
+export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 
 /**
@@ -1567,6 +1689,27 @@ export type ToolInfo = { name: string; desc: string; perm: string }
  * One persisted "don't ask again" rule (Settings → Permissions).
  */
 export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
+/**
+ * Mirror of `crate::skills_install::TrustPrompt`. `total_bytes` stays a
+ * `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's
+ * byte count — `export_bindings`'s `BigIntExportBehavior::Number` already
+ * renders any bigint-sized field as a plain TS `number`, so there's no
+ * bindings-shape cost to keeping the wider type.
+ */
+export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number }
+/**
+ * Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
+ * `#[serde(tag = "kind", content = "detail")]` shape so the discriminated
+ * union round-trips identically to the core enum.
+ */
+export type UpdateOutcomeDto = { kind: "updated" } | { kind: "alreadyCurrent" } | { kind: "skippedPinned" } | { kind: "localEdits" } | { kind: "failed"; detail: string } | { kind: "needsReack"; detail: TrustPromptDto }
+/**
+ * One pack's outcome from `update_all_plugins` —
+ * `crate::skills_install::update_all_packs` returns
+ * `Vec<(String, UpdateOutcome)>`; specta can't name a bare tuple usefully in
+ * the generated TS, so this wraps it in a named struct.
+ */
+export type UpdateOutcomeEntry = { id: string; outcome: UpdateOutcomeDto }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
 export type WorktreeState = { 
