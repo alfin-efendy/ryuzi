@@ -2982,6 +2982,7 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
         homepage: None,
         icon: None,
         categories: vec![],
+        slot: None,
         verified: false,
         experimental: false,
         auth: Some(AuthSpec {

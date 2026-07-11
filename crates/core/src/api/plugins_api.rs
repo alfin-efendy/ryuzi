@@ -404,23 +404,37 @@ impl InstallLedgerFields {
     }
 }
 
+/// Enrichment inputs `plugin_info` needs beyond the plugin itself: the
+/// install ledger row, the cached remote-catalog row, and whether this
+/// plugin currently owns its manifest-claimed `slot` (Feature C2). Bundled
+/// into one struct so `plugin_info` doesn't creep past clippy's
+/// too-many-arguments lint as fields get added over time.
+struct PluginInfoContext<'a> {
+    install: Option<&'a crate::store::PluginInstallRecord>,
+    remote: Option<&'a RemoteCatalogRow>,
+    owns_slot: bool,
+}
+
 fn plugin_info(
     plugin: &CorePlugin,
     enabled: bool,
     configured: bool,
     kind: &str,
     installed: bool,
-    install: Option<&crate::store::PluginInstallRecord>,
-    remote: Option<&RemoteCatalogRow>,
+    ctx: PluginInfoContext<'_>,
 ) -> PluginInfo {
     let m = &plugin.manifest;
-    let ledger = InstallLedgerFields::from_option(install);
+    let ledger = InstallLedgerFields::from_option(ctx.install);
+    let remote = ctx.remote;
+    let owns_slot = ctx.owns_slot;
     PluginInfo {
         id: m.id.clone(),
         name: m.name.clone(),
         description: m.description.clone(),
         icon: m.icon.clone(),
         categories: m.categories.clone(),
+        slot: m.slot.clone(),
+        owns_slot,
         verified: m.verified,
         experimental: m.experimental,
         enabled,
@@ -1192,8 +1206,22 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
         let record = installs.get(&plugin.manifest.id);
         let remote_row = remote.get(&plugin.manifest.id);
+        let owns_slot = plugin
+            .manifest
+            .slot
+            .as_deref()
+            .is_some_and(|s| cp.plugins().slot_owner(s) == Some(plugin.manifest.id.as_str()));
         out.push(plugin_info(
-            &plugin, enabled, configured, kind, installed, record, remote_row,
+            &plugin,
+            enabled,
+            configured,
+            kind,
+            installed,
+            PluginInfoContext {
+                install: record,
+                remote: remote_row,
+                owns_slot,
+            },
         ));
     }
     for pack in crate::skills_install::curated_skill_packs() {
@@ -1211,6 +1239,9 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             description: pack.description.to_string(),
             icon: Some("sparkles".to_string()),
             categories: vec!["skills".to_string()],
+            // A synthesized curated pack has no manifest to declare a slot.
+            slot: None,
+            owns_slot: false,
             verified: true,
             experimental: false,
             // A synthesized pack isn't a registered plugin, so `enabled` /
@@ -1268,6 +1299,11 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
         .into_iter()
         .find(|r| r.id == id);
 
+    let owns_slot = m
+        .slot
+        .as_deref()
+        .is_some_and(|s| cp.plugins().slot_owner(s) == Some(id));
+
     Ok(PluginDetail {
         info: plugin_info(
             &plugin,
@@ -1275,8 +1311,11 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
             configured,
             kind,
             installed,
-            record.as_ref(),
-            remote_row.as_ref(),
+            PluginInfoContext {
+                install: record.as_ref(),
+                remote: remote_row.as_ref(),
+                owns_slot,
+            },
         ),
         auth,
         settings: settings_info,
@@ -1641,6 +1680,7 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
@@ -1865,10 +1905,18 @@ mod tests {
 
     // ---------- plugin_info ----------
 
+    fn no_ctx(owns_slot: bool) -> PluginInfoContext<'static> {
+        PluginInfoContext {
+            install: None,
+            remote: None,
+            owns_slot,
+        }
+    }
+
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false, "integration", false, None, None);
+        let info = plugin_info(&plugin, true, false, "integration", false, no_ctx(false));
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
@@ -1886,9 +1934,34 @@ mod tests {
         assert!(info.catalog_source.is_none());
         assert!(info.catalog_version.is_none());
         assert!(info.blocked_reason.is_none());
+        // No manifest `slot` claim → neither field is set.
+        assert!(info.slot.is_none());
+        assert!(!info.owns_slot);
 
-        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None, None);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false, no_ctx(false));
         assert!(!info_disabled.enabled);
+    }
+
+    #[test]
+    fn plugin_info_reports_slot_and_owns_slot() {
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                slot: Some("memory".to_string()),
+                ..manifest("mem0")
+            },
+            ..harness_only("mem0")
+        };
+        let owner = plugin_info(&plugin, true, false, "integration", false, no_ctx(true));
+        assert_eq!(owner.slot.as_deref(), Some("memory"));
+        assert!(owner.owns_slot);
+
+        let loser = plugin_info(&plugin, true, false, "integration", false, no_ctx(false));
+        assert_eq!(
+            loser.slot.as_deref(),
+            Some("memory"),
+            "the claim itself is still reported even when the plugin lost arbitration"
+        );
+        assert!(!loser.owns_slot);
     }
 
     // ---------- catalog_source_label ----------

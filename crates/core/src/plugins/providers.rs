@@ -90,6 +90,7 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
                 "model-provider".to_string(),
                 category_label(d.category).to_string(),
             ],
+            slot: None,
             verified: true,
             experimental: false,
             auth: Some(auth_spec(d.auth)),

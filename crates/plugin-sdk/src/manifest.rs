@@ -34,6 +34,18 @@ pub struct PluginManifest {
     pub icon: Option<String>,
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Optional exclusive capability claim: "I am THE provider of the
+    /// `<slot>` capability" (e.g. `slot = "memory"` for a Hermes memory
+    /// backend). Distinct from `categories` — a category is a free-form
+    /// cosmetic tag any number of plugins may share; a slot is arbitrated
+    /// by `ryuzi_core`'s `PluginHost` (first registration wins, see
+    /// `PluginHost::slot_owner`), and a losing claim is surfaced as a
+    /// `plugin_doctor` `"slot-conflict"` finding rather than silently
+    /// dropped. An unknown slot name is a non-fatal `warnings()` entry,
+    /// matching `categories`' warn-not-reject discipline — it is never a
+    /// `validate()` error.
+    #[serde(default)]
+    pub slot: Option<String>,
     #[serde(default)]
     pub verified: bool,
     #[serde(default)]
@@ -285,14 +297,23 @@ impl PluginManifest {
     }
 
     /// Non-fatal feedback: categories outside the standard vocabulary
-    /// (`categories::KNOWN`). Unlike `validate()`, this never rejects a
-    /// manifest — new categories should not break the loader.
+    /// (`categories::KNOWN`), plus a claimed `slot` outside
+    /// `categories::KNOWN_SLOTS` (if any). Unlike `validate()`, this never
+    /// rejects a manifest — new categories/slots should not break the
+    /// loader.
     pub fn warnings(&self) -> Vec<String> {
-        self.categories
+        let mut warnings: Vec<String> = self
+            .categories
             .iter()
             .filter(|category| !categories::KNOWN.contains(&category.as_str()))
             .cloned()
-            .collect()
+            .collect();
+        if let Some(slot) = &self.slot {
+            if !categories::KNOWN_SLOTS.contains(&slot.as_str()) {
+                warnings.push(slot.clone());
+            }
+        }
+        warnings
     }
 }
 
@@ -753,6 +774,53 @@ options = ["1", "2", "3"]
             .expect_err("options with a non-string kind should fail validation");
         assert!(
             matches!(err, ManifestError::SettingOptionsRequireStringKind(key) if key == "plugin.acme.retries")
+        );
+    }
+
+    // ---------- slot (Feature C2) ----------
+
+    #[test]
+    fn slot_defaults_to_none_when_omitted() {
+        let toml_str = minimal_manifest("");
+        let manifest = PluginManifest::from_toml(&toml_str).expect("should parse");
+        assert_eq!(manifest.slot, None);
+        assert!(manifest.warnings().is_empty());
+    }
+
+    #[test]
+    fn known_slot_parses_with_no_warning() {
+        let toml_str = minimal_manifest(r#"slot = "memory""#);
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("known slot should parse and validate");
+        assert_eq!(manifest.slot.as_deref(), Some("memory"));
+        assert!(manifest.warnings().is_empty());
+    }
+
+    #[test]
+    fn unknown_slot_is_a_warning_not_an_error() {
+        let toml_str = minimal_manifest(r#"slot = "not-a-real-slot""#);
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("unknown slot should still parse");
+        assert_eq!(manifest.slot.as_deref(), Some("not-a-real-slot"));
+        assert_eq!(manifest.warnings(), vec!["not-a-real-slot".to_string()]);
+    }
+
+    #[test]
+    fn unknown_category_and_unknown_slot_both_surface_as_warnings() {
+        let toml_str = minimal_manifest(
+            r#"
+categories = ["not-a-real-category"]
+slot = "not-a-real-slot"
+"#,
+        );
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("unknown category+slot should still parse");
+        assert_eq!(
+            manifest.warnings(),
+            vec![
+                "not-a-real-category".to_string(),
+                "not-a-real-slot".to_string()
+            ]
         );
     }
 }

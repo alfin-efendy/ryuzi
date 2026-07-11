@@ -1628,7 +1628,22 @@ options: string[];
  * a persisted credential.
  */
 default: string | null }
-export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; verified: boolean; experimental: boolean; enabled: boolean; 
+export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; 
+/**
+ * The exclusive capability slot this plugin's manifest claims (e.g.
+ * `"memory"`), mirroring `ryuzi_plugin_sdk::PluginManifest::slot`.
+ * `None` when the manifest declares no slot.
+ */
+slot: string | null; 
+/**
+ * Whether this plugin currently WON its `slot` claim
+ * (first-registration-wins — see `crate::plugins::PluginHost::
+ * slot_owner`). Always `false` when `slot` is `None`. A plugin whose
+ * claim lost still has `slot` set (its own manifest is unaffected) but
+ * `owns_slot: false`; see `plugin_doctor`'s `"slot-conflict"` finding
+ * for the observable signal naming both the winner and the loser.
+ */
+ownsSlot: boolean; verified: boolean; experimental: boolean; enabled: boolean; 
 /**
  * Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
  * !reconnect_required; else a persisted `auth.setting` row or `auth.env`

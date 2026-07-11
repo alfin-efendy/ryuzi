@@ -9,6 +9,8 @@ function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}
     description: "",
     icon: null,
     categories,
+    slot: null,
+    ownsSlot: false,
     verified: true,
     experimental: false,
     enabled: false,

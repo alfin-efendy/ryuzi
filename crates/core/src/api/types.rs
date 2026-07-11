@@ -490,6 +490,17 @@ pub struct PluginInfo {
     pub description: String,
     pub icon: Option<String>,
     pub categories: Vec<String>,
+    /// The exclusive capability slot this plugin's manifest claims (e.g.
+    /// `"memory"`), mirroring `ryuzi_plugin_sdk::PluginManifest::slot`.
+    /// `None` when the manifest declares no slot.
+    pub slot: Option<String>,
+    /// Whether this plugin currently WON its `slot` claim
+    /// (first-registration-wins — see `crate::plugins::PluginHost::
+    /// slot_owner`). Always `false` when `slot` is `None`. A plugin whose
+    /// claim lost still has `slot` set (its own manifest is unaffected) but
+    /// `owns_slot: false`; see `plugin_doctor`'s `"slot-conflict"` finding
+    /// for the observable signal naming both the winner and the loser.
+    pub owns_slot: bool,
     pub verified: bool,
     pub experimental: bool,
     pub enabled: bool,

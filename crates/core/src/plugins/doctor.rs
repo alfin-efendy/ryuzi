@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct DoctorFinding {
     pub plugin_id: String,
     pub severity: String, // "warn" | "error"
-    pub kind: String,     // "reconnect-required" | "missing-binary" | "attach-failed" | "blocked"
+    pub kind: String, // "reconnect-required" | "missing-binary" | "attach-failed" | "blocked" | "slot-conflict"
     pub message: String,
     pub suggested_action: String,
 }
@@ -26,6 +26,27 @@ pub async fn plugin_doctor(cp: &ControlPlane) -> anyhow::Result<Vec<DoctorFindin
     let settings = SettingsStore::new(cp.store().clone());
     let mut findings = Vec::new();
     let attach = cp.store().list_plugin_attach().await.unwrap_or_default();
+
+    // Exclusive capability slot conflicts (Feature C2): a later claimant for
+    // an already-owned `slot` never became owner (`PluginHost::add` — first
+    // registration wins), but the arbitration should be observable rather
+    // than silent. One finding per recorded conflict, attributed to the
+    // losing plugin.
+    for conflict in cp.plugins().slot_conflicts() {
+        findings.push(DoctorFinding {
+            plugin_id: conflict.loser_id.clone(),
+            severity: "warn".into(),
+            kind: "slot-conflict".into(),
+            message: format!(
+                "{} claims the `{}` slot, but {} already owns it — {}'s claim was ignored",
+                conflict.loser_id, conflict.slot, conflict.winner_id, conflict.loser_id
+            ),
+            suggested_action: format!(
+                "Uninstall/disable {} or {}, or change one plugin's manifest `slot`",
+                conflict.winner_id, conflict.loser_id
+            ),
+        });
+    }
 
     for plugin in cp.plugins().list() {
         let id = &plugin.manifest.id;
@@ -140,6 +161,74 @@ pub(crate) mod tests {
         let mut regs = Registries::new();
         crate::plugins::install_builtins(&mut regs);
         ControlPlane::new(store, regs).await
+    }
+
+    /// A manifest-only plugin (no harness/gateway/connector capability)
+    /// claiming `slot`, for exercising slot arbitration end to end through
+    /// `plugin_doctor`.
+    fn manifest_only_with_slot(id: &str, slot: &str) -> crate::plugins::CorePlugin {
+        crate::plugins::CorePlugin {
+            manifest: ryuzi_plugin_sdk::PluginManifest {
+                contract: 1,
+                id: id.to_string(),
+                name: id.to_string(),
+                version: String::new(),
+                publisher: String::new(),
+                description: String::new(),
+                homepage: None,
+                icon: None,
+                categories: vec![],
+                slot: Some(slot.to_string()),
+                verified: false,
+                experimental: false,
+                auth: None,
+                settings: vec![],
+                mcp: vec![],
+                skills: vec![],
+                provider: None,
+            },
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: crate::plugins::PluginSource::Builtin,
+        }
+    }
+
+    /// A control plane wired with two plugins that both claim the `memory`
+    /// slot (no `install_builtins` noise — the embedded catalog's own
+    /// `["memory"]`-categorized plugins never claim the slot, so a real
+    /// conflict has to come from synthetic plugins like these two).
+    async fn test_cp_with_slot_conflict() -> std::sync::Arc<ControlPlane> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let mut regs = Registries::new();
+        regs.add_plugin(manifest_only_with_slot("mem0", "memory"));
+        regs.add_plugin(manifest_only_with_slot("cavemem", "memory"));
+        ControlPlane::new(store, regs).await
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_exactly_one_slot_conflict_finding_naming_winner_and_loser() {
+        let cp = test_cp_with_slot_conflict().await;
+
+        let findings = plugin_doctor(&cp).await.unwrap();
+        let slot_findings: Vec<&DoctorFinding> = findings
+            .iter()
+            .filter(|f| f.kind == "slot-conflict")
+            .collect();
+        assert_eq!(
+            slot_findings.len(),
+            1,
+            "exactly one slot-conflict finding, got: {findings:?}"
+        );
+
+        let finding = slot_findings[0];
+        assert_eq!(finding.plugin_id, "cavemem", "attributed to the loser");
+        assert_eq!(finding.severity, "warn");
+        assert!(finding.message.contains("mem0"), "{}", finding.message);
+        assert!(finding.message.contains("cavemem"), "{}", finding.message);
+        assert!(finding.message.contains("memory"), "{}", finding.message);
+        assert!(!finding.suggested_action.is_empty());
     }
 
     #[tokio::test]

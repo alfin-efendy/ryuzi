@@ -1534,6 +1534,7 @@ fn generated_plugin_manifest(
         homepage,
         icon: None,
         categories: vec![],
+        slot: None,
         verified: false,
         experimental: false,
         auth: None,

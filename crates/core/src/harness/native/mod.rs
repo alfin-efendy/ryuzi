@@ -347,6 +347,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             homepage: None,
             icon: Some("cpu".to_string()),
             categories: vec!["runtime".to_string()],
+            slot: None,
             verified: true,
             experimental: false,
             auth: None,

@@ -420,6 +420,7 @@ mod toggle_enabled_tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,

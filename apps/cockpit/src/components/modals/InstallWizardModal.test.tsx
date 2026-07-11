@@ -54,6 +54,8 @@ function detailFixture(
       description: "Notion MCP",
       icon: null,
       categories: ["docs"],
+      slot: null,
+      ownsSlot: false,
       verified: true,
       experimental: overrides.experimental ?? false,
       enabled: false,

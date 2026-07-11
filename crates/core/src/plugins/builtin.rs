@@ -56,6 +56,7 @@ pub fn discord_plugin() -> CorePlugin {
             homepage: None,
             icon: Some("message-circle".to_string()),
             categories: vec!["chat-gateway".to_string()],
+            slot: None,
             verified: true,
             experimental: false,
             auth: None,

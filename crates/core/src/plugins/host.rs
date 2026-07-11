@@ -187,11 +187,30 @@ impl CorePlugin {
     }
 }
 
+/// A losing claim for an already-owned [`PluginManifest::slot`]: `winner_id`
+/// registered first and owns `slot`; `loser_id` claimed the same slot later
+/// and was NOT registered as owner (it is still installed as a normal
+/// plugin — only its slot claim lost). Surfaced by
+/// `crate::plugins::doctor::plugin_doctor` as a `"slot-conflict"` finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotConflict {
+    pub slot: String,
+    pub winner_id: String,
+    pub loser_id: String,
+}
+
 /// Every installed plugin, keyed by `manifest.id`, kept in insertion order.
+/// Also arbitrates [`PluginManifest::slot`] claims: `slots` records the
+/// first plugin to claim each named slot (first-registration-wins, the same
+/// rule `add` itself uses for duplicate ids), and `slot_conflicts` records
+/// every later claimant for an already-owned slot instead of silently
+/// dropping it.
 #[derive(Default)]
 pub struct PluginHost {
     order: Vec<Arc<CorePlugin>>,
     by_id: HashMap<String, usize>,
+    slots: HashMap<String, String>,
+    slot_conflicts: Vec<SlotConflict>,
 }
 
 impl PluginHost {
@@ -202,6 +221,12 @@ impl PluginHost {
     /// Register a plugin. Returns `false` (and logs a warning) without
     /// installing it if `manifest.id` is already taken — the first
     /// registration for an id wins.
+    ///
+    /// If the manifest claims a `slot`, arbitrate it the same way: the first
+    /// plugin to claim a given slot name wins ([`PluginHost::slot_owner`]);
+    /// a later claimant is still registered as a normal plugin (its manifest
+    /// is unaffected), but the claim itself is recorded as a
+    /// [`SlotConflict`] rather than silently overwriting the owner.
     pub fn add(&mut self, plugin: CorePlugin) -> bool {
         if self.by_id.contains_key(&plugin.manifest.id) {
             tracing::warn!(
@@ -211,10 +236,41 @@ impl PluginHost {
             return false;
         }
         register_plugin_fields(&plugin.manifest);
+        if let Some(slot) = &plugin.manifest.slot {
+            match self.slots.get(slot) {
+                None => {
+                    self.slots.insert(slot.clone(), plugin.manifest.id.clone());
+                }
+                Some(winner_id) => {
+                    tracing::warn!(
+                        "plugin `{}` claims slot `{slot}`, already owned by `{winner_id}` — recording a slot conflict",
+                        plugin.manifest.id
+                    );
+                    self.slot_conflicts.push(SlotConflict {
+                        slot: slot.clone(),
+                        winner_id: winner_id.clone(),
+                        loser_id: plugin.manifest.id.clone(),
+                    });
+                }
+            }
+        }
         self.by_id
             .insert(plugin.manifest.id.clone(), self.order.len());
         self.order.push(Arc::new(plugin));
         true
+    }
+
+    /// The plugin id that won a named slot's arbitration (first
+    /// registration wins), or `None` if no installed plugin has claimed
+    /// `slot`.
+    pub fn slot_owner(&self, slot: &str) -> Option<&str> {
+        self.slots.get(slot).map(String::as_str)
+    }
+
+    /// Every losing slot claim recorded by [`PluginHost::add`], in the
+    /// order the conflicting plugin was registered.
+    pub fn slot_conflicts(&self) -> &[SlotConflict] {
+        &self.slot_conflicts
     }
 
     /// Look up an installed plugin by id.
@@ -447,6 +503,7 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
@@ -497,6 +554,19 @@ mod tests {
         }
     }
 
+    fn manifest_only_with_slot(id: &str, slot: &str) -> CorePlugin {
+        CorePlugin {
+            manifest: PluginManifest {
+                slot: Some(slot.to_string()),
+                ..manifest(id)
+            },
+            harness: None,
+            gateway: None,
+            connector: None,
+            source: PluginSource::Builtin,
+        }
+    }
+
     async fn open_settings() -> (Arc<Store>, SettingsStore, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -533,6 +603,69 @@ mod tests {
         assert!(kept.harness.is_some(), "the FIRST registration must win");
         assert!(kept.gateway.is_none());
         assert_eq!(host.list().len(), 1);
+    }
+
+    // ---------- slot arbitration (Feature C2) ----------
+
+    #[test]
+    fn first_plugin_to_claim_a_slot_becomes_its_owner() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only_with_slot("hermes-native", "memory")));
+
+        assert_eq!(host.slot_owner("memory"), Some("hermes-native"));
+        assert!(host.slot_conflicts().is_empty());
+    }
+
+    #[test]
+    fn slot_owner_is_none_for_an_unclaimed_slot() {
+        let host = PluginHost::new();
+        assert_eq!(host.slot_owner("memory"), None);
+    }
+
+    #[test]
+    fn second_claimant_for_an_owned_slot_is_recorded_as_a_conflict_not_owner() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only_with_slot("mem0", "memory")));
+        assert!(
+            host.add(manifest_only_with_slot("cavemem", "memory")),
+            "a losing slot claim must not block normal plugin registration"
+        );
+
+        // First registration still owns the slot.
+        assert_eq!(host.slot_owner("memory"), Some("mem0"));
+
+        // The loser is recorded as a conflict, not registered as owner.
+        let conflicts = host.slot_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].slot, "memory");
+        assert_eq!(conflicts[0].winner_id, "mem0");
+        assert_eq!(conflicts[0].loser_id, "cavemem");
+
+        // The loser is still installed as a normal plugin — only its slot
+        // claim lost, its own registration did not.
+        assert!(host.get("cavemem").is_some());
+        assert_eq!(host.list().len(), 2);
+    }
+
+    #[test]
+    fn distinct_slots_have_independent_owners() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only_with_slot("mem0", "memory")));
+        assert!(host.add(manifest_only_with_slot("graphiti", "knowledge-graph")));
+
+        assert_eq!(host.slot_owner("memory"), Some("mem0"));
+        assert_eq!(host.slot_owner("knowledge-graph"), Some("graphiti"));
+        assert!(host.slot_conflicts().is_empty());
+    }
+
+    #[test]
+    fn plugins_without_a_slot_claim_never_produce_a_conflict() {
+        let mut host = PluginHost::new();
+        assert!(host.add(manifest_only("a")));
+        assert!(host.add(manifest_only("b")));
+
+        assert!(host.slot_conflicts().is_empty());
+        assert_eq!(host.slot_owner("memory"), None);
     }
 
     // ---------- Registries::add_plugin ----------
