@@ -862,7 +862,11 @@ async fn send_json(
                 provider: target.conn.provider.clone(),
                 message: msg.to_string(),
                 status: Some(status.as_u16()),
-                transport: false,
+                category: crate::llm_router::provenance::classify_failure(
+                    Some(status.as_u16()),
+                    false,
+                    msg,
+                ),
             },
         ));
     }

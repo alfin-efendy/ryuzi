@@ -14,6 +14,7 @@ pub mod model_meta;
 pub mod models;
 pub mod oauth;
 pub mod probe;
+pub mod provenance;
 pub mod quota;
 pub mod registry;
 pub mod responses;

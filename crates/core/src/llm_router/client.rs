@@ -14,6 +14,8 @@
 //! `(event_name, event_json)` pairs regardless of the upstream provider's
 //! native wire format.
 
+pub use crate::llm_router::provenance::AnthropicEvent;
+use crate::llm_router::provenance::{classify_failure, RouteFailureCategory};
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
 use crate::llm_router::{
     capabilities, claude_cloak, connections, mimo, model_effort, model_meta, oauth, routes,
@@ -1283,20 +1285,18 @@ pub(crate) struct UpstreamAttemptFailure {
     pub(crate) provider: String,
     pub(crate) message: String,
     pub(crate) status: Option<u16>,
-    /// Failure below (or without) an HTTP status: DNS/TLS/connect errors,
-    /// resets, and pre-content stream errors. Always worth trying the next
-    /// target — a different account/endpoint may well be reachable.
-    pub(crate) transport: bool,
+    pub(crate) category: RouteFailureCategory,
 }
 
 impl UpstreamAttemptFailure {
     /// Build a transport-class failure (no HTTP status, always retryable).
     pub(crate) fn transport(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             provider: provider.into(),
-            message: message.into(),
+            category: classify_failure(None, true, &message),
+            message,
             status: None,
-            transport: true,
         }
     }
 
@@ -1306,7 +1306,13 @@ impl UpstreamAttemptFailure {
 }
 
 pub(crate) fn should_try_next_target(failure: &UpstreamAttemptFailure) -> bool {
-    if failure.transport {
+    if matches!(
+        failure.category,
+        RouteFailureCategory::Transport
+            | RouteFailureCategory::Authentication
+            | RouteFailureCategory::Quota
+            | RouteFailureCategory::RateLimit
+    ) {
         return true;
     }
     let status_retryable = matches!(
@@ -1369,7 +1375,7 @@ pub(crate) async fn ensure_fresh_for_attempt(
                 target.conn.provider
             ),
             status: Some(401),
-            transport: false,
+            category: RouteFailureCategory::Authentication,
         });
     }
     Ok(())
@@ -1388,9 +1394,9 @@ pub(crate) async fn upstream_status_failure(
     let message = extract_upstream_error_message(&body);
     UpstreamAttemptFailure {
         provider,
+        category: classify_failure(Some(status), false, &message),
         message,
         status: Some(status),
-        transport: false,
     }
 }
 
@@ -1425,11 +1431,6 @@ fn extract_upstream_error_message(body: &str) -> String {
 // ---------------------------------------------------------------------------
 // In-process streaming seam
 // ---------------------------------------------------------------------------
-
-/// One Anthropic-format SSE event: `(event_name, event_json)`. For example
-/// `("content_block_delta", {"type":"content_block_delta","index":0,
-/// "delta":{"type":"text_delta","text":"hi"}})`.
-pub type AnthropicEvent = (String, Value);
 
 /// A decoded Anthropic streaming event. The native runner matches on this
 /// instead of string-matching event names + poking at `Value`.
@@ -2713,7 +2714,7 @@ mod tests {
             provider: "anthropic".into(),
             message: "invalid request".into(),
             status: Some(400),
-            transport: false,
+            category: RouteFailureCategory::Unavailable,
         };
         assert!(!should_try_next_target(&bad_request));
     }
