@@ -502,6 +502,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_write_key_allow_always_persists_and_is_honored() {
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                approvals.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::AllowAlways,
+                        scope: Some(ApprovalScope::Project),
+                        payload: None,
+                    },
+                );
+            }
+        });
+        // First call prompts, user picks Always-in-project → row persists.
+        let d = evaluate(
+            &spec("jobs.write"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, Some("p1")),
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert_eq!(
+            f.store
+                .get_tool_policy("p1", "jobs.write")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("allowAlways")
+        );
+        // Second call auto-allows from the persisted grant — no prompt.
+        let d2 = evaluate(
+            &spec("jobs.write"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, Some("p1")),
+        )
+        .await;
+        assert_eq!(d2, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
     async fn prompt_event_carries_kind_and_input() {
         let f = Fixture::new().await;
         let approvals = f.approvals.clone();
