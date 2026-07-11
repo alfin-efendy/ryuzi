@@ -71,6 +71,8 @@ test("structured model effort choices follow the selected execution surface", as
   await expect(page.getByText("High", { exact: true })).toBeVisible();
   await expect(page.getByText("Read-only effort", { exact: true })).toBeVisible();
   await expect(page.getByText("Light", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Medium", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Extra high", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Ultra", { exact: true })).toHaveCount(0);
 });
 
@@ -87,6 +89,15 @@ test("project effort override can return to the model default", async ({ page })
   await expect
     .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_project_runtime").at(-1)?.args)
     .toMatchObject({ projectId: "p-demo", model: "fixture/model-alpha", effort: null });
+
+  const readsBeforeRemount = (await mockCalls(page)).filter((call) => call.cmd === "project_runtime_info").length;
+  await page.getByText("Models", { exact: true }).first().click();
+  await page.getByText("New session", { exact: true }).first().click();
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "project_runtime_info").length)
+    .toBeGreaterThan(readsBeforeRemount);
+  await expect(trigger).toContainText("Model Alpha");
+  await expect(trigger).toContainText("Model default");
 });
 
 test("provider screen writes the global default for a concrete model", async ({ page }) => {
