@@ -726,10 +726,10 @@ pub fn single_task_plan(goal: &str) -> Vec<PlannedTask> {
 /// project, insert a `waiting` root plus the single-task plan. Used by the
 /// CLI, whose daemonless process has no event bus; a running daemon host's
 /// dispatcher picks the rows up on its next tick. `home_session_pk` is
-/// threaded straight to `insert_root` — today's only caller (the CLI) always
-/// passes `None`, since a daemonless process has no chat to bind a home
-/// session to, but the parameter exists so a future caller with a real chat
-/// doesn't need a signature change.
+/// threaded straight to `insert_root`. No in-tree caller passes a home today
+/// (a daemonless enqueue has no chat to bind a home session to), but the
+/// parameter exists so a future caller with a real chat doesn't need a
+/// signature change.
 pub async fn queue_goal(
     store: &Store,
     project_id: &str,
