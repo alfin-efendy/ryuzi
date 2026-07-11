@@ -654,6 +654,33 @@ fn migrations() -> Migrations<'static> {
             ALTER TABLE sessions_new RENAME TO sessions;
             "#,
         ),
+        // Migration 23 — Phase 3 background rail (spec §4/§6): durable
+        // re-entry channel + jobs.model_override (#105 dropped jobs.agent in
+        // migration 21). One migration step (single vec element → user_version
+        // 23). Every statement is existence-guarded so the rewind-and-replay
+        // migration test's replay on an already-migrated DB is a no-op.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS background_events (\
+                    id TEXT PRIMARY KEY NOT NULL,\
+                    target_session_pk TEXT NOT NULL,\
+                    kind TEXT NOT NULL,\
+                    payload TEXT NOT NULL,\
+                    created_at INTEGER NOT NULL,\
+                    claimed_by TEXT,\
+                    delivered_at INTEGER\
+                );\
+                CREATE INDEX IF NOT EXISTS idx_background_events_target \
+                    ON background_events(target_session_pk, delivered_at);",
+            )?;
+            let has_override = tx
+                .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                .exists([])?;
+            if !has_override {
+                tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -3048,7 +3075,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 22, "forward migration must land at v22");
+        assert_eq!(user_version, 23, "forward migration must land at v23");
     }
 
     #[tokio::test]
@@ -3191,7 +3218,7 @@ mod tests {
     #[tokio::test]
     async fn migrations_13_to_21_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back ten so the
+        // DB, seed the old values, then wind user_version back eleven so the
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
@@ -3202,23 +3229,24 @@ mod tests {
         // branch_owned; 21 native-only cleanup — fully existence-guarded;
         // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
         // parent_session_pk, copies every existing column forward including
-        // perm_mode; all no-ops on replay) re-run on the next open.
+        // perm_mode; 23 background_events + jobs.model_override — fully
+        // existence-guarded; all no-ops on replay) re-run on the next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 22
-        // defined, wind back ten.
+        // this test starts failing its assertions). With migrations through 23
+        // defined, wind back eleven.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 10)
+            c.pragma_update(None, "user_version", v - 11)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v22 here, so `harness` was
+                    // The DB is fully migrated to v23 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -3269,12 +3297,12 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back two, and reopen so 21 (and the tail migration
-        // 22 sessions rebuild) replay against it.
+        // wind user_version back three, and reopen so 21 (and the tail
+        // migrations 22 + 23) replay against it.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 2)
+            c.pragma_update(None, "user_version", v - 3)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -3381,6 +3409,30 @@ mod tests {
             Some("user-chose-this"),
             "replay on an already-migrated DB must be a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_23_adds_background_events_and_job_model_override() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (uv, has_bg, has_override) = store
+            .with_conn(|c| {
+                let uv: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let has_bg = c
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                    )?
+                    .exists([])?;
+                let has_override = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='model_override'")?
+                    .exists([])?;
+                Ok((uv, has_bg, has_override))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uv, 23, "forward migration must land at v23");
+        assert!(has_bg, "background_events table must exist");
+        assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
