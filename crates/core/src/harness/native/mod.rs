@@ -147,9 +147,11 @@ impl Harness for NativeHarness {
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
         let agent = agents.default_agent();
         // Plugin hooks: observational — a `session.start` hook is notified but
-        // cannot block startup (only `tool.before` gates).
-        let _ = hooks::run(
+        // cannot block startup (only `tool.before` gates). Fires to both the
+        // on-disk script sink and (Track D) any subscribed extensions.
+        let _ = hooks::fire_hook(
             &ctx.work_dir,
+            ctx.extension_events.as_ref(),
             hooks::HookEvent::SessionStart,
             &json!({
                 "session": ctx.session_pk.clone(),
@@ -202,6 +204,7 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
+                extension_events: ctx.extension_events,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
                 meta,
@@ -275,9 +278,11 @@ impl HarnessSession for NativeSession {
         // exactly one place — `ControlPlane::end_session`'s teardown, the
         // sole path that removes the live handle from `running` — so this
         // fires once per real session end, never on a `stop_session`
-        // interrupt (which cancels but does not `end()`).
-        let _ = hooks::run(
+        // interrupt (which cancels but does not `end()`). Fires to both the
+        // on-disk script sink and (Track D) any subscribed extensions.
+        let _ = hooks::fire_hook(
             &self.deps.work_dir,
+            self.deps.extension_events.as_ref(),
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
@@ -410,6 +415,7 @@ mod tests {
             mcp_servers: vec![],
             mcp_principals: std::collections::HashMap::new(),
             extra_skill_dirs: vec![],
+            extension_events: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),

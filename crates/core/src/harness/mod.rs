@@ -49,6 +49,15 @@ pub struct SessionCtx {
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), on top of the
     /// native runtime's usual worktree/global skill dirs.
     pub extra_skill_dirs: Vec<PathBuf>,
+    /// Live handle to the daemon's extension host (Track D) — every hook
+    /// fire site (`harness::native::hooks::fire_hook`) dispatches to it
+    /// alongside the on-disk script sink. `None` when the daemon has no
+    /// extension-capable plugins spawned (the common case, and every bare
+    /// test `SessionCtx`): every fire site then behaves exactly as it did
+    /// before Track D existed — see `ControlPlane::start_harness_session`
+    /// and `plugins::extension::ExtensionHost::is_empty`. A live handle, not
+    /// config, so it is never serialized.
+    pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -186,6 +195,7 @@ mod tests {
             mcp_servers: vec![],
             mcp_principals: HashMap::new(),
             extra_skill_dirs: vec![],
+            extension_events: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: crate::harness::native::background::BackgroundRegistry::new(),

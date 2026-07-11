@@ -61,6 +61,11 @@ pub struct RunnerDeps {
     /// Plugin-bundled skill directories folded in beside the worktree/global
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
+    /// Live handle to the daemon's extension host (Track D), threaded
+    /// straight from `SessionCtx::extension_events` at session start — see
+    /// that field's doc. `None` in the common case (no extensions spawned)
+    /// and in every bare test `RunnerDeps`.
+    pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
     pub model: Option<String>,
     /// Immutable effort/capability snapshot for the current turn.
     pub turn_effort_policy: Arc<TurnEffortPolicy>,
@@ -1305,9 +1310,11 @@ async fn run_tool_call(
     }
     insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
 
-    // Plugin hooks: a `tool.before` hook may deny the call.
-    let hook = super::hooks::run(
+    // Plugin hooks: a `tool.before` hook (script or extension) may deny the
+    // call — see `hooks::fire_hook`'s combine contract.
+    let hook = super::hooks::fire_hook(
         &deps.work_dir,
+        deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolBefore,
         &json!({ "tool": t.name, "input": input }),
     )
@@ -1423,8 +1430,9 @@ async fn run_tool_call(
     };
     // Observational: never gates, result ignored. Fires for both Ok and Err
     // outcomes now that the `ToolOutput` (or its error) has resolved.
-    let _ = super::hooks::run(
+    let _ = super::hooks::fire_hook(
         &deps.work_dir,
+        deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolAfter,
         &json!({ "tool": t.name, "input": hook_input, "result": after_summary }),
     )
@@ -2168,6 +2176,7 @@ mod tests {
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
+            extension_events: None,
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {
@@ -2241,6 +2250,68 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("route"));
+    }
+
+    /// A fixed [`crate::plugins::extension::ExtensionEvents`] fake that
+    /// denies exactly one `HookEvent` with a fixed reason and allows
+    /// everything else — enough to prove `RunnerDeps::extension_events` is
+    /// actually wired through the real `run_tool_call` fire site (Track D,
+    /// DT5), not just that `hooks::fire_hook`'s combine contract is correct
+    /// in isolation (that's covered by `hooks.rs`'s own unit tests).
+    struct FixedExtensionEvents {
+        deny_event: crate::harness::native::hooks::HookEvent,
+        reason: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::plugins::extension::ExtensionEvents for FixedExtensionEvents {
+        async fn dispatch(
+            &self,
+            event: crate::harness::native::hooks::HookEvent,
+            _payload: &Value,
+        ) -> crate::harness::native::hooks::HookResult {
+            if event == self.deny_event {
+                crate::harness::native::hooks::HookResult {
+                    allowed: false,
+                    message: Some(self.reason.to_string()),
+                }
+            } else {
+                crate::harness::native::hooks::HookResult::allow()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_before_extension_deny_blocks_the_real_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection = route_selection("a", "Primary");
+        // Two scripted turns, exactly like `tool_after_hook_fires_once_...`:
+        // the tool call, then the follow-up response the agent loop makes
+        // once the (denied) tool_result is appended to history.
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.extension_events = Some(Arc::new(FixedExtensionEvents {
+            deny_event: crate::harness::native::hooks::HookEvent::ToolBefore,
+            reason: "blocked by policy extension",
+        }));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let tool_call = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("a tool_call row must exist");
+        assert_eq!(tool_call.payload["output"], "blocked by policy extension");
     }
 
     #[tokio::test]

@@ -35,8 +35,8 @@ use crate::store::Store;
 
 pub use doctor::{plugin_doctor, DoctorFinding};
 pub use extension::{
-    ExtensionCtx, ExtensionFactory, ExtensionHost, ExtensionProc, ExtensionSnapshot, ExtensionSpec,
-    ExtensionStatus,
+    ExtensionCtx, ExtensionEvents, ExtensionFactory, ExtensionHost, ExtensionProc,
+    ExtensionSnapshot, ExtensionSpec, ExtensionStatus,
 };
 pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
 

@@ -9,11 +9,10 @@
 //! logic can be exercised without spawning a process.
 //!
 //! DT3 wired `initialize`/`shutdown`. DT4 adds `ping` (health supervision —
-//! [`ping_request`]/[`parse_ping_response`]). The `event/<name>`
-//! notification family (DT5 dispatch) is still reserved here as a
-//! method-name-prefix constant only — no request/response shape or dispatch
-//! logic for it exists yet, so that later slice doesn't have to renegotiate
-//! the wire vocabulary.
+//! [`ping_request`]/[`parse_ping_response`]). DT5 adds `event/<name>`
+//! ([`event_request`]/[`parse_event_response`]) — the host's dispatch of a
+//! `HookEvent` to a subscribed extension, per `plugins::extension::events`'s
+//! module doc.
 
 use serde_json::{json, Value};
 
@@ -40,8 +39,8 @@ pub const METHOD_SHUTDOWN: &str = "extension/shutdown";
 pub const METHOD_PING: &str = "extension/ping";
 
 /// Host -> extension event notification method prefix — DT5 dispatch fires
-/// `"event/<HookEvent::as_str()>"` (e.g. `"event/tool.before"`). Reserved
-/// here; not sent by this slice.
+/// `"event/<HookEvent::as_str()>"` (e.g. `"event/tool.before"`), built by
+/// [`event_request`].
 pub const METHOD_EVENT_PREFIX: &str = "event/";
 
 /// Build the `extension/initialize` request. `events` is the wire form
@@ -83,6 +82,56 @@ pub fn ping_request(id: i64) -> Value {
 /// count as healthy.
 pub fn parse_ping_response(resp: &Value) -> bool {
     resp.get("error").is_none()
+}
+
+/// Build an `event/<name>` request: the host asks a subscribed extension to
+/// react to `event`, carrying `payload` verbatim as `params` (the exact same
+/// JSON the on-disk script sink — `harness::native::hooks::run` — receives
+/// on stdin). Gating dispatch awaits the response up to the manifest's
+/// per-event `timeout_ms`; observational dispatch sends this identical
+/// request but does not await it on the caller's hot path — see
+/// `plugins::extension::events`'s module doc.
+pub fn event_request(id: i64, event: &str, payload: &Value) -> Value {
+    stdio_jsonrpc::build_request(
+        id,
+        &format!("{METHOD_EVENT_PREFIX}{event}"),
+        Some(payload.clone()),
+    )
+}
+
+/// An extension's response to an `event/<name>` dispatch: whether it wants
+/// to deny the (gating) action, and why. Observational dispatch parses this
+/// too but ignores it — only a gating event's caller inspects `deny`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EventAck {
+    pub deny: bool,
+    pub reason: Option<String>,
+}
+
+/// Parse an `event/<name>` response. Deliberately permissive like
+/// [`parse_ping_response`], not strict like [`parse_initialize_response`]:
+/// anything that is not an explicit `{"result":{"deny":true,...}}` —
+/// including a JSON-RPC `error` object, a missing `result`, or `deny`
+/// absent/false — parses as "does not deny." A timeout or transport error
+/// (which this function never sees; the caller handles those separately) is
+/// the ONLY thing that triggers the fail-open policy — an extension that
+/// responds with something merely unexpected is treated exactly like one
+/// that explicitly allows, never like a crash.
+pub fn parse_event_response(resp: &Value) -> EventAck {
+    let deny = resp
+        .get("result")
+        .and_then(|r| r.get("deny"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !deny {
+        return EventAck::default();
+    }
+    let reason = resp
+        .get("result")
+        .and_then(|r| r.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    EventAck { deny, reason }
 }
 
 /// The extension's validated `extension/initialize` response.
@@ -298,5 +347,59 @@ mod tests {
         let ack = parse_initialize_response(&resp).unwrap();
         assert_eq!(ack.tools.len(), 1);
         assert_eq!(ack.tools[0]["name"], "lint");
+    }
+
+    // ---------- event_request / parse_event_response (DT5) ----------
+
+    #[test]
+    fn event_request_shape_carries_the_prefixed_method_and_payload() {
+        let payload = json!({ "tool": "bash", "input": { "command": "ls" } });
+        let req = event_request(7, "tool.before", &payload);
+        assert_eq!(req["method"], "event/tool.before");
+        assert_eq!(req["id"], 7);
+        assert_eq!(req["params"], payload);
+    }
+
+    #[test]
+    fn parse_event_response_reports_deny_with_reason() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "deny": true, "reason": "blocked by linter" }
+        });
+        let ack = parse_event_response(&resp);
+        assert!(ack.deny);
+        assert_eq!(ack.reason.as_deref(), Some("blocked by linter"));
+    }
+
+    #[test]
+    fn parse_event_response_treats_deny_false_as_not_denying() {
+        let resp = json!({ "jsonrpc": "2.0", "id": 1, "result": { "deny": false } });
+        assert_eq!(parse_event_response(&resp), EventAck::default());
+    }
+
+    #[test]
+    fn parse_event_response_treats_a_missing_result_as_not_denying() {
+        let resp = json!({ "jsonrpc": "2.0", "id": 1, "result": {} });
+        assert_eq!(parse_event_response(&resp), EventAck::default());
+    }
+
+    #[test]
+    fn parse_event_response_treats_an_error_object_as_not_denying() {
+        // The caller (proc::dispatch_event) never even reaches this parser on
+        // a transport failure — but an extension that replies with a
+        // well-formed JSON-RPC `error` (rather than crashing/timing out) is
+        // deliberately treated the same as an explicit allow, not folded
+        // into the transport-failure fail-open path.
+        let resp = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -1, "message": "boom" } });
+        assert_eq!(parse_event_response(&resp), EventAck::default());
+    }
+
+    #[test]
+    fn parse_event_response_ignores_a_reason_when_not_denying() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "deny": false, "reason": "irrelevant" }
+        });
+        assert_eq!(parse_event_response(&resp), EventAck::default());
     }
 }

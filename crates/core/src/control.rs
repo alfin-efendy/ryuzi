@@ -4,7 +4,9 @@ use crate::domain::{
     ApprovalResponse, CoreEvent, Message, PermMode, Project, Session, ToolPolicyRow,
 };
 use crate::harness::HarnessSession;
+use crate::plugins::extension::{ExtensionCtx, ExtensionHost, SHUTDOWN_GRACE};
 use crate::plugins::Registries;
+use crate::settings::SettingsStore;
 use crate::store::Store;
 use crate::telemetry::{NoopTelemetry, Telemetry};
 use std::collections::HashMap;
@@ -79,6 +81,13 @@ pub struct ControlPlane {
     /// every startup, so a stale `true` surviving a restart would be
     /// meaningless).
     plugins_restart_required: std::sync::atomic::AtomicBool,
+    /// Track D's extension host — constructed empty here (no real subprocess
+    /// spawn; see [`Self::spawn_extensions`]'s hermeticity doc) and shared
+    /// as a single `Arc` between the daemon entry (which calls
+    /// `spawn_extensions`/`shutdown_extensions`) and every session's
+    /// `SessionCtx.extension_events` (threaded in
+    /// `lifecycle::start_harness_session`).
+    extension_host: Arc<ExtensionHost>,
 }
 
 impl ControlPlane {
@@ -139,6 +148,7 @@ impl ControlPlane {
             active_turns: std::sync::atomic::AtomicUsize::new(0),
             background: crate::harness::native::background::BackgroundRegistry::new(),
             plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
+            extension_host: Arc::new(ExtensionHost::new()),
         })
     }
 
@@ -166,6 +176,48 @@ impl ControlPlane {
         if let Err(e) = crate::skills_install::sweep_stale_install_leftovers() {
             tracing::warn!("plugin install-leftover sweep failed: {e}");
         }
+    }
+
+    /// Track D's extension host — every spawned extension subprocess across
+    /// every plugin (see [`crate::plugins::extension::ExtensionHost`]).
+    /// Empty until [`Self::spawn_extensions`] is called.
+    pub fn extension_host(&self) -> &Arc<ExtensionHost> {
+        &self.extension_host
+    }
+
+    /// Spawn every enabled extension-capable plugin's subprocess(es) (Track
+    /// D) and start their supervision. Call this EXACTLY ONCE, from a real
+    /// long-running host's daemon entry, AFTER the daemon has genuinely
+    /// started — never from `build_daemon`/`new_full` (every crate's
+    /// `test_cp()` helper calls those) and never from a unit test, so
+    /// `cargo test` stays hermetic: constructing a `ControlPlane` never
+    /// spawns a real subprocess. Mirrors [`Self::run_startup_maintenance`]'s
+    /// hermeticity discipline — see that method's doc.
+    ///
+    /// Each extension's handshake can take up to
+    /// `plugins::extension::proc::INIT_HANDSHAKE_TIMEOUT` (25s), and
+    /// `ExtensionHost::spawn_all` spawns them one at a time — callers MUST
+    /// run this as a detached background task (`tokio::spawn`), never awaited
+    /// inline on a startup-latency-sensitive path, so a slow/hanging
+    /// extension can never delay "daemon: running" or consume the connect
+    /// timeout budget the daemon entry races `build_daemon`/`Daemon::start`
+    /// against.
+    pub async fn spawn_extensions(&self) {
+        let ctx = ExtensionCtx {
+            settings: SettingsStore::new(self.store.clone()),
+        };
+        self.extension_host.spawn_all(self.plugins(), &ctx).await;
+    }
+
+    /// Gracefully stop every spawned extension subprocess (Track D). Called
+    /// from [`crate::daemon::Daemon::stop`] so extension shutdown always
+    /// rides along with the rest of daemon teardown. Safe to call even when
+    /// nothing was ever spawned (every test `ControlPlane`, or a daemon that
+    /// never reached [`Self::spawn_extensions`]) —
+    /// `ExtensionHost::shutdown_all` on an empty host is an immediate no-op,
+    /// not a hermeticity violation.
+    pub async fn shutdown_extensions(&self) {
+        self.extension_host.shutdown_all(SHUTDOWN_GRACE).await;
     }
 
     /// Shared handle to the persistence layer — used by daemon wiring,

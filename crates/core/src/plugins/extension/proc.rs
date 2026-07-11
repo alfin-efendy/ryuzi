@@ -668,6 +668,75 @@ async fn ping_once(state: &Arc<Mutex<ExtensionProc>>, ping_timeout: Duration) ->
     }
 }
 
+/// The result of one [`dispatch_event`] attempt against a single supervised
+/// extension (DT5).
+#[derive(Debug)]
+pub(crate) enum EventDispatchOutcome {
+    /// Not currently `Running`, or `Running` but not subscribed to this
+    /// event (`confirmed_events` doesn't include it) — the caller must not
+    /// count this as having contacted the extension at all (no deny, no
+    /// warning, nothing sent over the wire).
+    Skipped,
+    /// The extension responded without denying
+    /// (`protocol::parse_event_response`'s default).
+    Allowed,
+    /// The extension denied via `{"deny": true, "reason": "..."}`.
+    Denied(Option<String>),
+    /// No response arrived within `timeout`, or the transport failed/closed
+    /// (e.g. the process crashed mid-dispatch). The caller (DT5's gating
+    /// dispatch, in `events`) treats this as fail-open (allow) plus a
+    /// warning — a broken extension must never brick the agent. See
+    /// `events`'s module doc.
+    Unreachable,
+}
+
+/// Dispatch one `event/<name>` request to the extension behind `state`,
+/// bounded by `timeout` — DT5's per-extension primitive, structured exactly
+/// like [`ping_once`]: a brief lock only to clone the current
+/// `Arc<ExtensionIo>` (or bail out `Skipped` without ever touching the
+/// transport if the proc isn't `Running` or hasn't confirmed this event),
+/// then the actual round trip happens WITHOUT holding the `ExtensionProc`
+/// mutex — a slow/hung extension's event dispatch can never stall a
+/// concurrent `status()`/`shutdown()`/ping call against the SAME proc, and
+/// vice versa.
+pub(crate) async fn dispatch_event(
+    state: &Arc<Mutex<ExtensionProc>>,
+    timeout: Duration,
+    event: HookEvent,
+    payload: &Value,
+) -> EventDispatchOutcome {
+    let io = {
+        let guard = state.lock().await;
+        if !matches!(guard.status, ExtensionStatus::Running) {
+            return EventDispatchOutcome::Skipped;
+        }
+        if !guard
+            .confirmed_events
+            .iter()
+            .any(|e| e.as_str() == event.as_str())
+        {
+            return EventDispatchOutcome::Skipped;
+        }
+        match &guard.io {
+            Some(io) => io.clone(),
+            None => return EventDispatchOutcome::Skipped,
+        }
+    };
+    let id = io.alloc_id();
+    let req = protocol::event_request(id, event.as_str(), payload);
+    match io.request(id, req, timeout).await {
+        Ok(resp) => {
+            let ack = protocol::parse_event_response(&resp);
+            if ack.deny {
+                EventDispatchOutcome::Denied(ack.reason)
+            } else {
+                EventDispatchOutcome::Allowed
+            }
+        }
+        Err(_) => EventDispatchOutcome::Unreachable,
+    }
+}
+
 /// The DT4 supervisor: one instance per [`SupervisedExtension`], spawned by
 /// [`SupervisedExtension::spawn`] and cancelled by
 /// [`SupervisedExtension::shutdown`]. See this module's "Supervision" doc
@@ -770,6 +839,35 @@ pub struct ExtensionSnapshot {
     pub tools: Vec<Value>,
 }
 
+/// A cheap, `'static`, cloned-out handle to one supervised extension's live
+/// dispatch state (DT5) — everything [`dispatch_event`] needs (the shared
+/// `Arc<Mutex<ExtensionProc>>`, the manifest's per-event timeout, and the
+/// extension's name for logging) WITHOUT borrowing the owning
+/// `SupervisedExtension`/`ExtensionHost`. This is what lets an OBSERVATIONAL
+/// dispatch (DT5's `events` module) hand one off to a detached
+/// `tokio::spawn` task per extension — a spawned future must be `'static`,
+/// so it cannot hold a borrow from `ExtensionHost::dispatch_handles`'s
+/// caller. Cloning is cheap: an `Arc` clone, a `String` clone, and a `Copy`
+/// `Duration`.
+#[derive(Clone)]
+pub(crate) struct DispatchHandle {
+    name: String,
+    state: Arc<Mutex<ExtensionProc>>,
+    timeout: Duration,
+}
+
+impl DispatchHandle {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Dispatch `event` to this one extension — forwards to
+    /// [`dispatch_event`] against this handle's own `state`/`timeout`.
+    pub(crate) async fn dispatch(&self, event: HookEvent, payload: &Value) -> EventDispatchOutcome {
+        dispatch_event(&self.state, self.timeout, event, payload).await
+    }
+}
+
 /// One extension subprocess UNDER SUPERVISION: the live [`ExtensionProc`]
 /// behind a lock (replaced in place by [`supervise`] on every restart
 /// attempt/give-up) plus the machinery to start and, crucially, cleanly stop
@@ -837,6 +935,16 @@ impl SupervisedExtension {
         }
     }
 
+    /// A cheap [`DispatchHandle`] snapshot of this entry's live dispatch
+    /// state (DT5) — see that type's doc.
+    pub(crate) fn dispatch_handle(&self) -> DispatchHandle {
+        DispatchHandle {
+            name: self.spec.name.clone(),
+            state: self.state.clone(),
+            timeout: self.spec.timeout,
+        }
+    }
+
     /// Stop supervision, then gracefully shut down whatever subprocess is
     /// currently live (there may be none, mid-backoff, or after a give-up).
     /// Cancels and joins the supervisor task BEFORE touching `child`/`io` —
@@ -871,14 +979,44 @@ impl Drop for SupervisedExtension {
     }
 }
 
+/// Caps concurrently in-flight OBSERVATIONAL event sends (DT5, see
+/// `events`'s module doc) across every extension in one [`ExtensionHost`].
+/// Gating dispatch is not bounded by this at all — it's awaited
+/// synchronously, once, by its single caller, already bounded by each
+/// extension's own per-event `timeout`.
+const MAX_INFLIGHT_OBSERVATIONAL_SENDS: usize = 32;
+
 /// Owns every spawned extension subprocess, keyed by the plugin id that
 /// declared it. Each is independently [`SupervisedExtension`]-supervised
 /// (DT4) — one extension restarting, backing off, or giving up never
-/// touches any other entry, any other plugin, or the daemon. Event dispatch
-/// (DT5) builds on this next.
-#[derive(Default)]
+/// touches any other entry, any other plugin, or the daemon.
+///
+/// `procs` lives behind a [`tokio::sync::RwLock`] (not a bare `HashMap`) so
+/// every method here — including the mutating `spawn_all`/`shutdown_all` —
+/// takes `&self`: the whole host is meant to be a single `Arc<ExtensionHost>`
+/// shared between the daemon entry (which calls `spawn_all` once at startup
+/// and `shutdown_all` once at stop) and every concurrently-running session's
+/// `SessionCtx.extension_events` (which only ever calls the read-only
+/// `dispatch` — see `events`'s module doc). Reads (`get`, and DT5's
+/// `dispatch_handles`) only ever hold the lock briefly to clone out what
+/// they need; the actual subprocess I/O (handshakes, event round trips,
+/// graceful shutdown) always happens OUTSIDE the lock, so a slow extension
+/// can never stall an unrelated `get`/dispatch call against a different
+/// entry.
 pub struct ExtensionHost {
-    procs: HashMap<String, Vec<SupervisedExtension>>,
+    procs: tokio::sync::RwLock<HashMap<String, Vec<SupervisedExtension>>>,
+    observational_permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for ExtensionHost {
+    fn default() -> ExtensionHost {
+        ExtensionHost {
+            procs: tokio::sync::RwLock::new(HashMap::new()),
+            observational_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_INFLIGHT_OBSERVATIONAL_SENDS,
+            )),
+        }
+    }
 }
 
 impl ExtensionHost {
@@ -899,11 +1037,13 @@ impl ExtensionHost {
     /// fatal to this sweep or any other extension.
     ///
     /// Callers: intended for the daemon's entry path only (real subprocess
-    /// spawn). `daemon::build_daemon` does NOT call this in this slice, so
-    /// constructing a `Registries`/`Daemon` for tests stays hermetic (no
-    /// real subprocess spawn) — DT5 wires the daemon-entry call once event
-    /// dispatch gives spawned extensions something to do.
-    pub async fn spawn_all(&mut self, host: &PluginHost, ctx: &ExtensionCtx) {
+    /// spawn). `daemon::build_daemon` does NOT call this, so constructing a
+    /// `Registries`/`Daemon` for tests stays hermetic (no real subprocess
+    /// spawn) — `crates/runner/src/daemon_cmd.rs` calls it once, as a
+    /// detached background task, after the daemon has genuinely started
+    /// (see `ControlPlane::spawn_extensions`'s doc for why it must never be
+    /// awaited inline on a startup-latency-sensitive path).
+    pub async fn spawn_all(&self, host: &PluginHost, ctx: &ExtensionCtx) {
         for plugin in host.list() {
             let Some(factory) = plugin.extension.clone() else {
                 continue;
@@ -930,7 +1070,10 @@ impl ExtensionHost {
             for spec in specs {
                 procs.push(SupervisedExtension::spawn(spec).await);
             }
-            self.procs.insert(plugin.manifest.id.clone(), procs);
+            self.procs
+                .write()
+                .await
+                .insert(plugin.manifest.id.clone(), procs);
         }
     }
 
@@ -939,14 +1082,27 @@ impl ExtensionHost {
     /// extension capability). Async (unlike DT3's `get`) because status is
     /// now DT4-supervised state behind a lock — see [`SupervisedExtension::snapshot`].
     pub async fn get(&self, plugin_id: &str) -> Vec<ExtensionSnapshot> {
-        let Some(procs) = self.procs.get(plugin_id) else {
+        let procs = self.procs.read().await;
+        let Some(list) = procs.get(plugin_id) else {
             return Vec::new();
         };
-        let mut out = Vec::with_capacity(procs.len());
-        for proc in procs {
+        let mut out = Vec::with_capacity(list.len());
+        for proc in list {
             out.push(proc.snapshot().await);
         }
         out
+    }
+
+    /// Whether this host has NO spawned entry for ANY plugin — used by
+    /// `ControlPlane::start_harness_session` to decide whether a session's
+    /// `SessionCtx.extension_events` should be threaded at all: `None` when
+    /// nothing was ever spawned keeps every hook fire site's dispatch a true
+    /// no-op (see `SessionCtx::extension_events`'s doc), not just an
+    /// always-allow round trip through an empty host. Every test
+    /// `ControlPlane` (which never calls `spawn_all`) satisfies this
+    /// unconditionally.
+    pub async fn is_empty(&self) -> bool {
+        self.procs.read().await.is_empty()
     }
 
     /// Gracefully stop every spawned extension across every plugin,
@@ -955,9 +1111,39 @@ impl ExtensionHost {
     /// latency is bounded by the single slowest shutdown, not `N × grace`.
     /// Each [`SupervisedExtension::shutdown`] call stops that entry's
     /// supervisor before its subprocess, so no restart races this shutdown.
-    pub async fn shutdown_all(&mut self, grace: Duration) {
-        let all = self.procs.values_mut().flat_map(|procs| procs.iter_mut());
+    /// Safe to call on a host nothing was ever spawned into (every test
+    /// `ControlPlane`, or a daemon that never reached `spawn_all`) — the
+    /// write lock is taken and released immediately with nothing to iterate.
+    pub async fn shutdown_all(&self, grace: Duration) {
+        let mut procs = self.procs.write().await;
+        let all = procs.values_mut().flat_map(|list| list.iter_mut());
         futures::future::join_all(all.map(|proc| proc.shutdown(grace))).await;
+    }
+
+    /// Try to reserve one of [`MAX_INFLIGHT_OBSERVATIONAL_SENDS`] slots for
+    /// an observational dispatch (DT5's `events` module) — `None` means the
+    /// cap is already saturated (a burst of slow/misbehaving extensions),
+    /// telling the caller to drop this one send rather than queue behind it:
+    /// observational dispatch must never grow an unbounded backlog against a
+    /// live agent.
+    pub(crate) fn try_acquire_observational_permit(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.observational_permits.clone().try_acquire_owned().ok()
+    }
+
+    /// A cheap, owned [`DispatchHandle`] for every currently-spawned
+    /// extension across every plugin, in no particular order — DT5's
+    /// `events` module snapshots these under a brief read lock, then issues
+    /// every actual `event/<name>` round trip OUTSIDE the lock (see this
+    /// struct's own doc).
+    pub(crate) async fn dispatch_handles(&self) -> Vec<DispatchHandle> {
+        self.procs
+            .read()
+            .await
+            .values()
+            .flat_map(|list| list.iter().map(SupervisedExtension::dispatch_handle))
+            .collect()
     }
 }
 
@@ -1390,7 +1576,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ext_host = ExtensionHost::new();
+        let ext_host = ExtensionHost::new();
         ext_host.spawn_all(&host, &ctx).await;
 
         assert!(
@@ -1829,7 +2015,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ext_host = ExtensionHost::new();
+        let ext_host = ExtensionHost::new();
         ext_host.spawn_all(&host, &ctx).await;
 
         // Checked immediately (no wait): the broken extension's own
@@ -1887,7 +2073,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ext_host = ExtensionHost::new();
+        let ext_host = ExtensionHost::new();
         ext_host.spawn_all(&host, &ctx).await;
         for snap in ext_host.get("multi").await {
             assert_eq!(snap.status, ExtensionStatus::Running);

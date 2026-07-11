@@ -25,22 +25,32 @@
 //!   up (`ExtensionStatus::Failed("restart-exhausted: ...")`) after too many
 //!   restarts in a sliding window. See `proc`'s module doc for the exact
 //!   consts and the shutdown-vs-restart race fix.
-//! - **DT5 (event dispatch)**: `event/<name>` notifications
-//!   ([`protocol::METHOD_EVENT_PREFIX`]) fanned out to every `ExtensionProc`
-//!   whose `confirmed_events` includes the firing `HookEvent`, using the
-//!   proc's already-open, concurrency-safe transport (`proc::ExtensionIo`'s
-//!   private `request(...)` — a demultiplexing JSON-RPC client, NOT raw
+//! - **DT5 (event dispatch, implemented)**: `event/<name>` requests
+//!   ([`protocol::event_request`]) fanned out to every `ExtensionProc` whose
+//!   `confirmed_events` includes the firing `HookEvent`, using the proc's
+//!   already-open, concurrency-safe transport (`proc::ExtensionIo`'s private
+//!   `request(...)` — a demultiplexing JSON-RPC client, NOT raw
 //!   stdin/reader access, so a ping and an event dispatch can safely be in
 //!   flight on the same proc at the same time); `ExtensionSpec::timeout` is
-//!   the per-event budget that dispatch enforces. `ExtensionIo`'s reader
-//!   loop also has a documented seam for routing JSON-RPC notifications
-//!   (lines with no `id`) once this slice needs to push something
-//!   host-ward outside of a request/response — see `proc::reader_loop`.
+//!   the per-event budget that dispatch enforces. [`events::ExtensionEvents`]
+//!   is the trait `harness::native::hooks::fire_hook` dispatches through;
+//!   see that module's doc for the gating-fail-open /
+//!   observational-fire-and-forget policy. `ExtensionHost::procs` moved
+//!   behind a `tokio::sync::RwLock` this slice so `spawn_all`/`get`/
+//!   `shutdown_all`/dispatch can all take `&self` — the whole host is a
+//!   single `Arc<ExtensionHost>` shared between the daemon entry (which
+//!   calls the mutating `spawn_all`/`shutdown_all`) and every session's
+//!   `SessionCtx.extension_events` (which only ever calls the read-only
+//!   `dispatch`). `ExtensionIo`'s reader loop still has a documented seam
+//!   for routing JSON-RPC notifications (lines with no `id`) if a future
+//!   slice needs the extension to push something host-ward outside of a
+//!   request/response — see `proc::reader_loop`.
 //! - **DT6 (tool provision)**: wraps `ExtensionProc::tools` (raw `Value`s
 //!   from `protocol::InitializeAck::tools`) into an `ExtensionTool: Tool`
 //!   dispatching `tool/call` over the same pipe, the same way `McpTool`
 //!   wraps `McpConnection`.
 
+pub mod events;
 pub mod proc;
 pub mod protocol;
 
@@ -51,7 +61,8 @@ use async_trait::async_trait;
 use crate::harness::native::hooks::HookEvent;
 use crate::settings::SettingsStore;
 
-pub use proc::{ExtensionHost, ExtensionProc, ExtensionSnapshot};
+pub use events::ExtensionEvents;
+pub use proc::{ExtensionHost, ExtensionProc, ExtensionSnapshot, SHUTDOWN_GRACE};
 pub use protocol::PROTOCOL_VERSION;
 
 /// Per-event dispatch budget an `[[extension]]` manifest entry gets when it

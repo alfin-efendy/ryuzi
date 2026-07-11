@@ -865,6 +865,17 @@ impl ControlPlane {
             .attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
             .await;
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        // Track D: thread the daemon's extension host in only when it has
+        // something spawned — `None` keeps every hook fire site a true
+        // no-op (zero extra dispatch/await) for the common case, and for
+        // every test `ControlPlane` (which never calls `spawn_extensions`).
+        let extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>> =
+            if self.extension_host.is_empty().await {
+                None
+            } else {
+                Some(self.extension_host.clone()
+                    as Arc<dyn crate::plugins::extension::ExtensionEvents>)
+            };
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
         // cold-resume, crash-resume) has already inserted the row before
@@ -903,6 +914,7 @@ impl ControlPlane {
             mcp_servers,
             mcp_principals,
             extra_skill_dirs,
+            extension_events,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             background: self.background.clone(),
