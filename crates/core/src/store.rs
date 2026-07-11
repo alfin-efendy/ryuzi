@@ -1084,6 +1084,26 @@ impl Store {
         self.get_project(id).await
     }
 
+    /// Canonicalize only the legacy harness column. This deliberately does
+    /// not read or write model/effort, so a concurrent atomic runtime update
+    /// cannot be lost to a stale whole-project write.
+    pub async fn update_project_harness(
+        &self,
+        project_id: &str,
+        harness: &str,
+    ) -> anyhow::Result<bool> {
+        let project_id = project_id.to_string();
+        let harness = harness.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE projects SET harness=?2 WHERE project_id=?1",
+                params![project_id, harness],
+            )
+            .map(|changed| changed > 0)
+        })
+        .await
+    }
+
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
@@ -2266,6 +2286,57 @@ mod tests {
             created_at: Some(123),
             is_git: false,
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_harness_canonicalization_preserves_atomic_model_effort() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        store
+            .insert_project(Project {
+                project_id: "p-harness-race".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                harness: "claude-code".into(),
+                model: Some("old-model".into()),
+                effort: Some("low".into()),
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let runtime_store = store.clone();
+        let runtime_barrier = barrier.clone();
+        let runtime = tokio::spawn(async move {
+            runtime_barrier.wait().await;
+            runtime_store
+                .update_project_runtime(
+                    "p-harness-race",
+                    Some("new-model".into()),
+                    Some("high".into()),
+                )
+                .await
+                .unwrap();
+        });
+        let harness_store = store.clone();
+        let harness = tokio::spawn(async move {
+            barrier.wait().await;
+            harness_store
+                .update_project_harness("p-harness-race", "native")
+                .await
+                .unwrap();
+        });
+        runtime.await.unwrap();
+        harness.await.unwrap();
+
+        let project = store.get_project("p-harness-race").await.unwrap().unwrap();
+        assert_eq!(project.harness, "native");
+        assert_eq!(project.model.as_deref(), Some("new-model"));
+        assert_eq!(project.effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]

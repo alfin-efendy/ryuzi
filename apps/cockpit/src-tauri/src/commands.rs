@@ -345,20 +345,17 @@ async fn apply_runtime_choice(
         Some(runtime_id) => harness_for_runtime(runtime_id)?,
         None => "",
     };
-    let Some(project) = cp.store().get_project(project_id).await? else {
+    if harness.is_empty() {
+        return Ok(());
+    }
+    if !cp
+        .store()
+        .update_project_harness(project_id, harness)
+        .await?
+    {
         return Err(CmdError {
             message: format!("unknown project: {project_id}"),
         });
-    };
-    let next_harness = if harness.is_empty() {
-        project.harness.as_str()
-    } else {
-        harness
-    };
-    if project.harness != next_harness {
-        cp.store()
-            .update_project(project_id, project.model, project.perm_mode, next_harness)
-            .await?;
     }
     Ok(())
 }
@@ -726,7 +723,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The composer always sends runtimeId "native"; model may be null.
+        // Chat canonicalizes only the legacy harness column.
         apply_runtime_choice(&cp, "p1", Some("native"))
             .await
             .unwrap();

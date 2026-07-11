@@ -101,6 +101,15 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
 }
 
 let modelConfigurationGeneration = 0;
+const projectRuntimeMutationGeneration = new Map<string, number>();
+const projectRuntimeActiveMutation = new Map<string, number>();
+const projectRuntimeLoadGeneration = new Map<string, number>();
+
+function nextGeneration(generations: Map<string, number>, projectId: string): number {
+  const generation = (generations.get(projectId) ?? 0) + 1;
+  generations.set(projectId, generation);
+  return generation;
+}
 
 export const useStore = create<State>((set, get) => ({
   projects: [],
@@ -270,14 +279,27 @@ export const useStore = create<State>((set, get) => ({
   },
 
   loadProjectRuntime: async (projectId) => {
+    const mutationGeneration = projectRuntimeMutationGeneration.get(projectId) ?? 0;
+    const startedDuringMutation = projectRuntimeActiveMutation.has(projectId);
+    const loadGeneration = nextGeneration(projectRuntimeLoadGeneration, projectId);
     const res = await commands.projectRuntimeInfo(projectId);
-    if (res.status === "ok") set((st) => ({ projectRuntimeById: { ...st.projectRuntimeById, [projectId]: res.data } }));
+    if (
+      res.status === "ok" &&
+      !startedDuringMutation &&
+      !projectRuntimeActiveMutation.has(projectId) &&
+      (projectRuntimeMutationGeneration.get(projectId) ?? 0) === mutationGeneration &&
+      projectRuntimeLoadGeneration.get(projectId) === loadGeneration
+    ) {
+      set((st) => ({ projectRuntimeById: { ...st.projectRuntimeById, [projectId]: res.data } }));
+    }
   },
   setProjectRuntime: async (projectId, model, effort) => {
     const project = get().projects.find((p) => p.projectId === projectId);
     if (!project) return false;
     const previousProject = project;
     const previousRuntime = get().projectRuntimeById[projectId];
+    const mutationGeneration = nextGeneration(projectRuntimeMutationGeneration, projectId);
+    projectRuntimeActiveMutation.set(projectId, mutationGeneration);
     const optimisticRuntime: ProjectRuntimeInfo = previousRuntime
       ? { ...previousRuntime, model, storedEffort: effort }
       : {
@@ -295,6 +317,10 @@ export const useStore = create<State>((set, get) => ({
       projectRuntimeById: { ...st.projectRuntimeById, [projectId]: optimisticRuntime },
     }));
     const res = await commands.updateProjectRuntime(projectId, model, effort);
+    if (projectRuntimeMutationGeneration.get(projectId) !== mutationGeneration) {
+      return res.status === "ok";
+    }
+    projectRuntimeActiveMutation.delete(projectId);
     if (res.status === "error") {
       set((st) => {
         const projectRuntimeById = { ...st.projectRuntimeById };
@@ -316,13 +342,34 @@ export const useStore = create<State>((set, get) => ({
   },
   refreshModelConfiguration: async () => {
     const generation = ++modelConfigurationGeneration;
-    await useRuntimes.getState().reloadList();
+    const runtimes = await useRuntimes.getState().fetchList();
     const projectIds = Object.keys(get().projectRuntimeById);
+    const projectMutationSnapshots = new Map(
+      projectIds.map((id) => [
+        id,
+        {
+          generation: projectRuntimeMutationGeneration.get(id) ?? 0,
+          active: projectRuntimeActiveMutation.has(id),
+        },
+      ]),
+    );
     const entries = await Promise.all(projectIds.map(async (id) => [id, await commands.projectRuntimeInfo(id)] as const));
     if (generation !== modelConfigurationGeneration) return;
+    if (runtimes) useRuntimes.setState({ runtimes });
     set((st) => {
       const next = { ...st.projectRuntimeById };
-      for (const [id, result] of entries) if (result.status === "ok") next[id] = result.data;
+      for (const [id, result] of entries) {
+        const snapshot = projectMutationSnapshots.get(id);
+        if (
+          result.status === "ok" &&
+          snapshot &&
+          !snapshot.active &&
+          !projectRuntimeActiveMutation.has(id) &&
+          (projectRuntimeMutationGeneration.get(id) ?? 0) === snapshot.generation
+        ) {
+          next[id] = result.data;
+        }
+      }
       return { projectRuntimeById: next };
     });
   },

@@ -18,11 +18,17 @@ const models = [
     defaultSource: "provider" as const,
   },
 ];
+const anthropicModel = {
+  ...models[0],
+  requestValue: "anthropic/claude-opus-4",
+  displayName: "Claude Opus",
+  preferenceKey: { family: "anthropic", model: "claude-opus-4" },
+};
 
 test("renders_model_and_dynamic_effort_rows_without_advanced_or_speed", () => {
   render(
     <ComposerModelEffortMenu
-      models={models}
+      models={[anthropicModel, ...models]}
       runtime={{
         projectId: "p1",
         model: "openai/gpt-5",
@@ -39,6 +45,14 @@ test("renders_model_and_dynamic_effort_rows_without_advanced_or_speed", () => {
   fireEvent.click(screen.getByRole("button", { name: /model and effort/i }));
   expect(screen.getAllByText("GPT-5").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Custom").length).toBeGreaterThan(0);
+  expect(screen.getByText("Fast responses")).toBeTruthy();
+  expect(screen.getByText("Deeper reasoning")).toBeTruthy();
+  const claude = screen.getByText("Claude Opus");
+  const gptMatches = screen.getAllByText("GPT-5");
+  const gpt = gptMatches[gptMatches.length - 1];
+  expect(claude.compareDocumentPosition(gpt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  const customMatches = screen.getAllByText("Custom");
+  expect(customMatches[customMatches.length - 1]?.closest("button")?.querySelector("svg")).toBeTruthy();
   expect(screen.queryByText("Advanced")).toBeNull();
   expect(screen.queryByText("Speed")).toBeNull();
 });
@@ -48,6 +62,7 @@ test("hides_zero_option_effort_and_marks_one_option_read_only", () => {
   fireEvent.click(screen.getByRole("button", { name: /model and effort/i }));
   expect(screen.queryByText("Effort")).toBeNull();
   first.unmount();
+  const onChange = mock(() => undefined);
   render(
     <ComposerModelEffortMenu
       models={[{ ...models[0], supported: [models[0].supported[0]] }]}
@@ -61,11 +76,16 @@ test("hides_zero_option_effort_and_marks_one_option_read_only", () => {
         storedEffortStatus: "valid",
         modelInfo: { ...models[0], supported: [models[0].supported[0]] },
       }}
-      onChange={() => undefined}
+      onChange={onChange}
     />,
   );
   fireEvent.click(screen.getByRole("button", { name: /model and effort/i }));
   expect(screen.getByText(/read.only/i)).toBeTruthy();
+  const readOnly = screen.getByText(/read.only/i).closest("fieldset:disabled[data-readonly]");
+  expect(readOnly).toBeTruthy();
+  fireEvent.click(screen.getByText("Low"));
+  fireEvent.keyDown(screen.getByText("Low"), { key: "Enter" });
+  expect(onChange).not.toHaveBeenCalled();
 });
 
 test("stale_effort_uses_effective_default_and_shows_compact_warning", () => {

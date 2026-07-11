@@ -46,6 +46,33 @@ export function modelEffortDefaultOptions(metadata: SelectableModelInfo) {
   ];
 }
 
+export function ModelEffortDefaultCombobox({
+  metadata,
+  onChange,
+}: {
+  metadata: SelectableModelInfo;
+  onChange: (key: NonNullable<SelectableModelInfo["preferenceKey"]>, effort: string | null) => void;
+}) {
+  const key = metadata.preferenceKey;
+  if (!key) return null;
+  const configuredLabel = metadata.supported.find((option) => option.value === metadata.configuredDefault)?.label;
+  const inheritedLabel = modelEffortDefaultOptions(metadata)[0].label;
+  return (
+    <Combobox
+      aria-label={`Default effort for ${metadata.displayName}`}
+      options={modelEffortDefaultOptions(metadata)}
+      value={metadata.configuredDefault ?? "__model_default__"}
+      onValueChange={(value) => onChange(key, value === "__model_default__" ? null : value)}
+      trigger={
+        <Button variant="outline" size="sm" className="w-[180px] justify-start">
+          {configuredLabel ? `Default: ${configuredLabel}` : inheritedLabel}
+        </Button>
+      }
+      className="w-[180px]"
+    />
+  );
+}
+
 function aggregateUsage(series: Array<UsageSeries | undefined>): UsageSeries | null {
   const present = series.filter((item): item is UsageSeries => !!item);
   if (present.length === 0) return null;
@@ -322,15 +349,7 @@ function ProviderModelsCard({
             {entry && <StatusBadge entry={entry} />}
             <ModelCapabilityIcons model={model} compact />
             {metadata?.preferenceKey ? (
-              <Combobox
-                aria-label={`Default effort for ${model}`}
-                options={modelEffortDefaultOptions(metadata)}
-                value={metadata.configuredDefault ?? "__model_default__"}
-                onValueChange={(value) =>
-                  void setModelEffortPreference(metadata.preferenceKey!, value === "__model_default__" ? null : value)
-                }
-                className="w-[180px]"
-              />
+              <ModelEffortDefaultCombobox metadata={metadata} onChange={(key, effort) => void setModelEffortPreference(key, effort)} />
             ) : null}
             <Button
               variant="outline"

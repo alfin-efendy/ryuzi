@@ -71,7 +71,7 @@ test("failed_runtime_save_rolls_back_both_snapshots", async () => {
 test("global_preference_and_metadata_refresh_refetch_loaded_project_runtime_status", async () => {
   reset();
   useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
-  const reload = spyOn(useRuntimes.getState(), "reloadList").mockResolvedValue(undefined);
+  const reload = spyOn(useRuntimes.getState(), "fetchList").mockResolvedValue(null);
   const fresh = { ...runtimeSnapshot, storedEffortStatus: "unsupported" as const, effectiveEffort: "medium" };
   const info = spyOn(commands, "projectRuntimeInfo").mockResolvedValue({ status: "ok", data: fresh });
   await useStore.getState().refreshModelConfiguration();
@@ -89,9 +89,12 @@ test("older_model_configuration_refresh_cannot_overwrite_newer_state", async () 
   const olderGate = new Promise<void>((resolve) => {
     releaseOlder = resolve;
   });
-  const reload = spyOn(useRuntimes.getState(), "reloadList")
-    .mockImplementationOnce(() => olderGate)
-    .mockResolvedValueOnce(undefined);
+  const reload = spyOn(useRuntimes.getState(), "fetchList")
+    .mockImplementationOnce(async () => {
+      await olderGate;
+      return null;
+    })
+    .mockResolvedValueOnce(null);
   const newer = { ...runtimeSnapshot, effectiveEffort: "medium" };
   const older = { ...runtimeSnapshot, effectiveEffort: "low" };
   const info = spyOn(commands, "projectRuntimeInfo")
@@ -105,6 +108,199 @@ test("older_model_configuration_refresh_cannot_overwrite_newer_state", async () 
   expect(useStore.getState().projectRuntimeById.p1.effectiveEffort).toBe("medium");
   reload.mockRestore();
   info.mockRestore();
+});
+
+test("configuration_refresh_started_before_mutation_cannot_overwrite_mutation", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  const fetchList = spyOn(useRuntimes.getState(), "fetchList").mockResolvedValue(null);
+  let resolveRefresh!: (value: unknown) => void;
+  const info = spyOn(commands, "projectRuntimeInfo").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveRefresh = resolve;
+      }) as never,
+  );
+  const refresh = useStore.getState().refreshModelConfiguration();
+  await Promise.resolve();
+  const update = spyOn(commands, "updateProjectRuntime").mockResolvedValue({
+    status: "ok",
+    data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" },
+  });
+  await useStore.getState().setProjectRuntime("p1", "newest", "high");
+  resolveRefresh({ status: "ok", data: { ...runtimeSnapshot, model: "stale-refresh" } });
+  await refresh;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  fetchList.mockRestore();
+  info.mockRestore();
+  update.mockRestore();
+});
+
+test("older_runtime_success_cannot_overwrite_newer_success", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  let resolveOld!: (value: unknown) => void;
+  let resolveNew!: (value: unknown) => void;
+  const oldPromise = new Promise((resolve) => {
+    resolveOld = resolve;
+  });
+  const newPromise = new Promise((resolve) => {
+    resolveNew = resolve;
+  });
+  const update = spyOn(commands, "updateProjectRuntime")
+    .mockImplementationOnce(() => oldPromise as never)
+    .mockImplementationOnce(() => newPromise as never);
+  const old = useStore.getState().setProjectRuntime("p1", "old-next", "medium");
+  const newer = useStore.getState().setProjectRuntime("p1", "newest", "high");
+  resolveNew({ status: "ok", data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" } });
+  await newer;
+  resolveOld({ status: "ok", data: { ...runtimeSnapshot, model: "old-next", storedEffort: "medium" } });
+  await old;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  expect(useStore.getState().projects[0].model).toBe("newest");
+  update.mockRestore();
+});
+
+test("older_runtime_failure_cannot_roll_back_newer_success", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  let rejectOld!: (value: unknown) => void;
+  let resolveNew!: (value: unknown) => void;
+  const oldPromise = new Promise((resolve) => {
+    rejectOld = resolve;
+  });
+  const newPromise = new Promise((resolve) => {
+    resolveNew = resolve;
+  });
+  const update = spyOn(commands, "updateProjectRuntime")
+    .mockImplementationOnce(() => oldPromise as never)
+    .mockImplementationOnce(() => newPromise as never);
+  const old = useStore.getState().setProjectRuntime("p1", "old-next", "medium");
+  const newer = useStore.getState().setProjectRuntime("p1", "newest", "high");
+  resolveNew({ status: "ok", data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" } });
+  await newer;
+  rejectOld({ status: "error", error: { message: "late failure" } });
+  await old;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  expect(useStore.getState().projects[0].model).toBe("newest");
+  update.mockRestore();
+});
+
+test("load_resolving_during_or_after_mutation_cannot_overwrite_it", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  let resolveLoad!: (value: unknown) => void;
+  let resolveMutation!: (value: unknown) => void;
+  const load = spyOn(commands, "projectRuntimeInfo").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveLoad = resolve;
+      }) as never,
+  );
+  const update = spyOn(commands, "updateProjectRuntime").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveMutation = resolve;
+      }) as never,
+  );
+  const loading = useStore.getState().loadProjectRuntime("p1");
+  const mutation = useStore.getState().setProjectRuntime("p1", "newest", "high");
+  resolveMutation({ status: "ok", data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" } });
+  await mutation;
+  resolveLoad({ status: "ok", data: { ...runtimeSnapshot, model: "stale-load", storedEffort: "low" } });
+  await loading;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  load.mockRestore();
+  update.mockRestore();
+});
+
+test("load_started_and_resolved_during_mutation_cannot_replace_optimistic_state", async () => {
+  reset();
+  const project = {
+    projectId: "p1",
+    name: "demo",
+    workdir: "C:/demo",
+    source: null,
+    harness: "native",
+    model: "old",
+    effort: "low",
+    permMode: "default" as const,
+    createdAt: null,
+    isGit: true,
+  };
+  useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
+  let resolveLoad!: (value: unknown) => void;
+  let resolveMutation!: (value: unknown) => void;
+  const update = spyOn(commands, "updateProjectRuntime").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveMutation = resolve;
+      }) as never,
+  );
+  const load = spyOn(commands, "projectRuntimeInfo").mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveLoad = resolve;
+      }) as never,
+  );
+  const mutation = useStore.getState().setProjectRuntime("p1", "newest", "high");
+  const loading = useStore.getState().loadProjectRuntime("p1");
+  resolveLoad({ status: "ok", data: { ...runtimeSnapshot, model: "stale-load" } });
+  await loading;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  resolveMutation({ status: "ok", data: { ...runtimeSnapshot, model: "newest", storedEffort: "high" } });
+  await mutation;
+  expect(useStore.getState().projectRuntimeById.p1.model).toBe("newest");
+  load.mockRestore();
+  update.mockRestore();
 });
 
 test("selectProject sets the selected project and clears the focused session", () => {

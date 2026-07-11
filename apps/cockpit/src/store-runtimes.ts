@@ -21,6 +21,8 @@ type RuntimesState = {
   refresh: () => Promise<void>;
   /** Silently re-fetch the runtime list (fresh `agent.models`) without probing binaries/npm. */
   reloadList: () => Promise<void>;
+  /** Fetch the structured list without committing it, for generation-guarded callers. */
+  fetchList: () => Promise<RuntimeInfo[] | null>;
   update: (id: string, patch: RuntimePatch) => Promise<void>;
   setTier: (id: string, tierId: string, value: string | null, combo?: boolean) => Promise<void>;
   setDefault: (id: string) => Promise<void>;
@@ -63,8 +65,13 @@ export const useRuntimes = create<RuntimesState>((set, get) => ({
   },
 
   reloadList: async () => {
+    const runtimes = await get().fetchList();
+    if (runtimes) set({ runtimes });
+  },
+
+  fetchList: async () => {
     const res = await commands.listRuntimes();
-    if (res.status === "ok") set({ runtimes: res.data });
+    return res.status === "ok" ? res.data : null;
   },
 
   update: async (id, patch) => {
