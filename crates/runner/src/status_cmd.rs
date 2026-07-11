@@ -83,6 +83,9 @@ mod tests {
                 last_error: None,
                 version: Some("0.6.0".into()),
                 port: Some(4483),
+                scheme: None,
+                host: None,
+                fingerprint: None,
             },
         )
         .unwrap();
@@ -106,6 +109,9 @@ mod tests {
                 last_error: None,
                 version: None,
                 port: None,
+                scheme: None,
+                host: None,
+                fingerprint: None,
             },
         )
         .unwrap();

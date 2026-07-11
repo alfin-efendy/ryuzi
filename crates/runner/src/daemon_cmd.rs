@@ -109,13 +109,30 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     }
 }
 
+/// The bound control-API port plus the scheme/host/fingerprint metadata
+/// [`start_control_api`]'s two callers (`run_daemon`, the canary's
+/// `promote()`) write into `daemon.json`'s `Running` status — see
+/// [`ryuzi_core::daemon_status::DaemonStatusFile`]. Kept as one struct
+/// (rather than a 4-tuple) so both call sites read the same field names.
+struct ControlApiBinding {
+    port: u16,
+    scheme: String,
+    host: String,
+    fingerprint: Option<String>,
+}
+
 /// Bring up the control API for a started daemon: resolve the bearer token
 /// (reused across same-port restarts, or freshly generated — see
 /// [`ryuzi_core::control_token::write_token`]), read `control_port` (default
-/// [`DEFAULT_CONTROL_PORT`]), and serve. Returns the BOUND port. Shared by
+/// [`DEFAULT_CONTROL_PORT`]) and `listen_addr` (schema default loopback —
+/// see the `listen_addr` `ConfigField`), resolve the bind IP / TLS material /
+/// scheme / fingerprint via [`ryuzi_core::tls::resolve_bind`] — which
+/// refuses (`Err`) a non-loopback address whose TLS material can't be built,
+/// so this never silently serves plaintext on a public interface — and
+/// serve. Returns the bound port plus scheme/host/fingerprint. Shared by
 /// `run_daemon` and the canary's `promote()` so the two entry points cannot
 /// drift.
-async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<u16> {
+async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<ControlApiBinding> {
     let token = ryuzi_core::control_token::write_token(dir)?;
     let settings = SettingsStore::new(daemon.store.clone());
     let control_port: u16 = settings
@@ -125,19 +142,32 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<u16> {
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_CONTROL_PORT);
+    let listen_addr = settings
+        .get("listen_addr")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| std::net::Ipv4Addr::LOCALHOST.to_string());
+
+    let (addr, tls, scheme, fingerprint) = ryuzi_core::tls::resolve_bind(&listen_addr, dir)?;
+
     let state = ryuzi_core::serve::ApiState {
         cp: daemon.cp.clone(),
         router_server: daemon.router_server.clone(),
         control_token: token,
     };
-    // TODO(P2-7/P2-8): loopback-only for now — wire real TLS + the
-    // non-loopback-requires-TLS enforcement once the caller-side pieces land.
     let opts = ryuzi_core::serve::ServeOpts {
-        addr: std::net::Ipv4Addr::LOCALHOST.into(),
+        addr,
         port: control_port,
-        tls: None,
+        tls,
     };
-    ryuzi_core::serve::serve(state, opts).await
+    let port = ryuzi_core::serve::serve(state, opts).await?;
+    Ok(ControlApiBinding {
+        port,
+        scheme: scheme.to_string(),
+        host: addr.to_string(),
+        fingerprint,
+    })
 }
 
 async fn run_daemon(deps: &mut Deps) -> u8 {
@@ -171,6 +201,9 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
             last_error: None,
             version: version.clone(),
             port: None,
+            scheme: None,
+            host: None,
+            fingerprint: None,
         },
     );
 
@@ -188,6 +221,9 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
                     last_error: Some(e.to_string()),
                     version,
                     port: None,
+                    scheme: None,
+                    host: None,
+                    fingerprint: None,
                 },
             );
             (deps.err)(&format!("daemon: failed to start: {e}"));
@@ -215,6 +251,9 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
                     last_error: Some(e.to_string()),
                     version,
                     port: None,
+                    scheme: None,
+                    host: None,
+                    fingerprint: None,
                 },
             );
             (deps.err)(&format!("daemon: control api failed to bind: {e}"));
@@ -230,7 +269,10 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
             started_at,
             last_error: None,
             version,
-            port: Some(bound),
+            port: Some(bound.port),
+            scheme: Some(bound.scheme),
+            host: Some(bound.host),
+            fingerprint: bound.fingerprint,
         },
     );
     (deps.out)("daemon: running");
@@ -510,6 +552,9 @@ fn write_update_failure_status(dir: &Path, message: &str) {
             last_error: Some(message.to_string()),
             version: Some(crate::meta::version().to_string()),
             port: None,
+            scheme: None,
+            host: None,
+            fingerprint: None,
         },
     );
 }
@@ -684,7 +729,10 @@ impl CanaryHost for ProdCanaryHost {
                 started_at: ryuzi_core::paths::now_ms(),
                 last_error: None,
                 version: Some(self.version.clone()),
-                port: Some(bound),
+                port: Some(bound.port),
+                scheme: Some(bound.scheme),
+                host: Some(bound.host),
+                fingerprint: bound.fingerprint,
             },
         );
         Ok(())
@@ -851,6 +899,9 @@ mod tests {
                 last_error: None,
                 version: None,
                 port: None,
+                scheme: None,
+                host: None,
+                fingerprint: None,
             },
         )
         .unwrap();

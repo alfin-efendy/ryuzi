@@ -109,28 +109,95 @@ pub fn load_or_generate(dir: &Path) -> anyhow::Result<TlsMaterial> {
     })
 }
 
-/// Whether `cert_der` + `key_der` form a usable TLS server identity — the
-/// exact check is "can we build a rustls `ServerConfig` from them", since
-/// that's the operation a real consumer performs. Explicit ring provider to
-/// stay ring-only (see module docs).
-fn pair_is_valid(cert_der: &[u8], key_der: &[u8]) -> bool {
-    let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
-    let key = match rustls::pki_types::PrivateKeyDer::try_from(key_der.to_vec()) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-    let builder = match rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+/// Build a ring-provider rustls `ServerConfig` from `material`'s cert/key,
+/// with ALPN protocols set to `h2` + `http/1.1`.
+///
+/// The single place the ring `ServerConfig` is actually constructed for a
+/// real TLS listener — [`pair_is_valid`] and `daemon_cmd::start_control_api`
+/// (P2-7) both funnel through this rather than duplicating the
+/// `builder_with_provider(...).with_safe_default_protocol_versions()...`
+/// dance.
+///
+/// ALPN matters because `axum_server`'s `RustlsConfig::from_config` serves
+/// whatever protocols are negotiated — without `alpn_protocols` set, some
+/// HTTP/2-capable clients fail to negotiate a protocol at all. rustls 0.23's
+/// builder finalizes the config before ALPN can be supplied to it, so this
+/// sets `alpn_protocols` on the built `ServerConfig` afterward (it's a plain
+/// public field, not part of the builder chain).
+pub(crate) fn server_config(
+    material: &TlsMaterial,
+) -> anyhow::Result<std::sync::Arc<rustls::ServerConfig>> {
+    let cert = rustls::pki_types::CertificateDer::from(material.cert_der.clone());
+    let key = rustls::pki_types::PrivateKeyDer::try_from(material.key_der.clone())
+        .map_err(|e| anyhow::anyhow!("tls: invalid private key DER: {e}"))?;
+    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
-    {
-        Ok(b) => b,
-        Err(_) => return false,
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert], key)?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+/// Whether `cert_der` + `key_der` form a usable TLS server identity — the
+/// exact check is "can we build a rustls `ServerConfig` from them", since
+/// that's the operation a real consumer performs. Delegates to
+/// [`server_config`] so the ring-`ServerConfig`-build logic lives in one
+/// place.
+fn pair_is_valid(cert_der: &[u8], key_der: &[u8]) -> bool {
+    let material = TlsMaterial {
+        cert_der: cert_der.to_vec(),
+        key_der: key_der.to_vec(),
+        fingerprint: String::new(),
     };
-    builder
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .is_ok()
+    server_config(&material).is_ok()
+}
+
+/// `resolve_bind`'s return shape: bind IP, optional TLS server config, URL
+/// scheme, and cert fingerprint (if any). Factored into a named alias
+/// (rather than an inline 4-tuple type) to satisfy clippy's
+/// `type_complexity` lint.
+pub type ResolvedBind = (
+    std::net::IpAddr,
+    Option<std::sync::Arc<rustls::ServerConfig>>,
+    &'static str,
+    Option<String>,
+);
+
+/// The pure listen-address decision behind `ryuzi-runner`'s
+/// `daemon_cmd::start_control_api` (P2-7): given the raw `listen_addr`
+/// setting value and the control directory, resolve the bind IP, an
+/// optional TLS server config, the URL scheme, and the cert fingerprint (if
+/// any). `pub` (not `pub(crate)`, unlike [`server_config`]) because the
+/// runner crate — not `ryuzi-core` itself — is the one that calls this while
+/// bringing up the control API.
+///
+/// - An unparsable `listen_addr` falls back to loopback (`127.0.0.1`) +
+///   `http`, logging a warning — a bad setting value must never accidentally
+///   widen the bind surface.
+/// - A loopback address returns `tls: None`, scheme `"http"`, no
+///   fingerprint — today's Cockpit-local behavior, unchanged.
+/// - A non-loopback address loads/generates TLS material from `dir` (stable
+///   across restarts — see [`load_or_generate`]) and builds a ring
+///   `ServerConfig` via [`server_config`]; returns `"https"` and
+///   `Some(fingerprint)`. If EITHER step fails, this returns `Err` — the
+///   safety property this whole function exists to make testable is that
+///   the caller must then refuse to start rather than silently falling back
+///   to plaintext on a public interface.
+pub fn resolve_bind(listen_addr: &str, dir: &Path) -> anyhow::Result<ResolvedBind> {
+    let addr: std::net::IpAddr = listen_addr.parse().unwrap_or_else(|_| {
+        tracing::warn!("daemon: invalid listen_addr {listen_addr:?}, defaulting to 127.0.0.1");
+        std::net::Ipv4Addr::LOCALHOST.into()
+    });
+
+    if addr.is_loopback() {
+        return Ok((addr, None, "http", None));
+    }
+
+    let material = load_or_generate(dir)?;
+    let cfg = server_config(&material)?;
+    Ok((addr, Some(cfg), "https", Some(material.fingerprint)))
 }
 
 /// Write the private key PEM 0600 on unix (same rationale as
@@ -247,6 +314,67 @@ mod tests {
         assert_eq!(regenerated.fingerprint, third.fingerprint);
         assert_eq!(regenerated.cert_der, third.cert_der);
         assert_eq!(regenerated.key_der, third.key_der);
+    }
+
+    #[test]
+    fn server_config_builds_ok_with_h2_and_http11_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let material = load_or_generate(dir.path()).unwrap();
+        let cfg = server_config(&material).unwrap();
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    // ---- resolve_bind: the non-loopback-requires-TLS decision (P2-7) ----
+
+    #[test]
+    fn resolve_bind_loopback_is_plain_http_with_no_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, tls, scheme, fp) = resolve_bind("127.0.0.1", dir.path()).unwrap();
+        assert_eq!(addr, std::net::Ipv4Addr::LOCALHOST);
+        assert!(tls.is_none());
+        assert_eq!(scheme, "http");
+        assert_eq!(fp, None);
+        // Loopback must never touch the control dir for TLS material.
+        assert!(!dir.path().join("tls_cert.pem").exists());
+    }
+
+    #[test]
+    fn resolve_bind_ipv6_loopback_is_plain_http_with_no_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, tls, scheme, fp) = resolve_bind("::1", dir.path()).unwrap();
+        assert!(addr.is_loopback());
+        assert!(tls.is_none());
+        assert_eq!(scheme, "http");
+        assert_eq!(fp, None);
+    }
+
+    #[test]
+    fn resolve_bind_non_loopback_builds_tls_and_returns_https_plus_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, tls, scheme, fp) = resolve_bind("0.0.0.0", dir.path()).unwrap();
+        assert_eq!(addr, std::net::Ipv4Addr::UNSPECIFIED);
+        assert!(tls.is_some(), "non-loopback bind must carry a TLS config");
+        assert_eq!(scheme, "https");
+        let fp = fp.expect("non-loopback bind must carry a fingerprint");
+        assert!(!fp.is_empty());
+        // Same fingerprint the persisted material carries (stable identity).
+        let material = load_or_generate(dir.path()).unwrap();
+        assert_eq!(fp, material.fingerprint);
+    }
+
+    #[test]
+    fn resolve_bind_unparsable_addr_defaults_to_loopback_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, tls, scheme, fp) = resolve_bind("not-an-ip", dir.path()).unwrap();
+        assert_eq!(addr, std::net::Ipv4Addr::LOCALHOST);
+        assert!(tls.is_none());
+        assert_eq!(scheme, "http");
+        assert_eq!(fp, None);
+        // The parse-failure fallback must not silently touch TLS material.
+        assert!(!dir.path().join("tls_cert.pem").exists());
     }
 
     #[cfg(unix)]
