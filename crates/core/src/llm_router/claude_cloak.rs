@@ -1,4 +1,3 @@
-use crate::llm_router::connections::ConnectionData;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -33,34 +32,8 @@ const CC_DECOY_TOOL_NAMES: &[&str] = &[
     "ExitPlanMode",
 ];
 
-pub fn enabled(data: &ConnectionData) -> bool {
-    data.provider_specific
-        .as_ref()
-        .and_then(|v| v.get(LEGACY_CLAUDE_CLOAKING_KEY))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 pub fn required_for_provider(provider: &str) -> bool {
     provider == "anthropic-oauth"
-}
-
-pub fn set_enabled(data: &mut ConnectionData, enabled: bool) {
-    let mut obj = data
-        .provider_specific
-        .take()
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    if enabled {
-        obj.insert(LEGACY_CLAUDE_CLOAKING_KEY.to_string(), Value::Bool(true));
-    } else {
-        obj.remove(LEGACY_CLAUDE_CLOAKING_KEY);
-    }
-    data.provider_specific = if obj.is_empty() {
-        None
-    } else {
-        Some(Value::Object(obj))
-    };
 }
 
 pub fn apply_request_cloak(body: &mut Value, access_token: &str, session_id: &str) -> ToolNameMap {
@@ -306,36 +279,25 @@ fn stainless_arch() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::llm_router::connections::ConnectionData;
     use serde_json::json;
 
     #[test]
-    fn unrelated_provider_ignores_legacy_true_cloak_key() {
-        let data = ConnectionData {
-            provider_specific: Some(json!({"claudeCloaking": true})),
-            ..Default::default()
-        };
+    fn unrelated_provider_does_not_cloak_tool_names() {
         let body = json!({
             "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
         });
 
-        assert!(super::enabled(&data));
         let map = super::tool_name_map_for("custom-anthropic", &body);
 
         assert!(map.is_empty());
     }
 
     #[test]
-    fn anthropic_oauth_ignores_legacy_false_cloak_key() {
-        let data = ConnectionData {
-            provider_specific: Some(json!({"claudeCloaking": false})),
-            ..Default::default()
-        };
+    fn anthropic_oauth_always_cloaks_tool_names() {
         let body = json!({
             "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
         });
 
-        assert!(!super::enabled(&data));
         let map = super::tool_name_map_for("anthropic-oauth", &body);
 
         assert_eq!(map.get("lookup_ide").map(String::as_str), Some("lookup"));

@@ -1,7 +1,6 @@
 //! Providers tab commands: catalog + credentialed connections CRUD + test.
 use crate::error::CmdError;
 use crate::events::OauthAuthorizeUrlMsg;
-use ryuzi_core::llm_router::claude_cloak;
 use ryuzi_core::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use ryuzi_core::llm_router::models;
 use ryuzi_core::llm_router::oauth;
@@ -58,15 +57,10 @@ pub struct ConnectionInfo {
     pub priority: i32,
     pub enabled: bool,
     pub quota_capability: Option<ProviderQuotaCapability>,
-    pub base_url: Option<String>,
     pub models: Vec<String>,
-    /// e.g. "sk-…3fk9" — full key never leaves the backend after creation.
-    pub key_masked: Option<String>,
     /// OAuth connections only: true once refresh has failed terminally and
     /// the user needs to reconnect via the browser/paste flow again.
     pub needs_relogin: bool,
-    /// Anthropic OAuth only: enable full Claude Code-style request cloaking.
-    pub claude_cloaking: bool,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -178,25 +172,6 @@ fn grant_flows() -> &'static Mutex<HashMap<String, GrantFlowState>> {
     GRANT_FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Mask a secret for display: first 3 + last 4 chars, elided in between.
-/// Defensive for short keys: the brief's naive head(3)/tail(4) slicing
-/// overlaps (and can echo the *entire* key back) once `key.len() < 7`, so
-/// short/empty keys get a fixed placeholder instead of being echoed.
-fn mask(key: &str) -> String {
-    if key.chars().count() < 7 {
-        return "••••".to_string();
-    }
-    let tail: String = key
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("{}…{tail}", key.chars().take(3).collect::<String>())
-}
-
 fn to_info(row: &ConnectionRow) -> ConnectionInfo {
     let desc = registry::descriptor(&row.provider);
     ConnectionInfo {
@@ -216,13 +191,10 @@ fn to_info(row: &ConnectionRow) -> ConnectionInfo {
         priority: row.priority as i32,
         enabled: row.enabled,
         quota_capability: quota::capability(row),
-        base_url: desc.and_then(|d| connections::effective_base_url(d, row)),
         models: desc
             .map(|d| connections::effective_models(d, row))
             .unwrap_or_default(),
-        key_masked: row.data.api_key.as_deref().map(mask),
         needs_relogin: row.data.needs_relogin.unwrap_or(false),
-        claude_cloaking: row.provider == "anthropic-oauth" && claude_cloak::enabled(&row.data),
     }
 }
 
@@ -422,50 +394,6 @@ pub async fn add_connection(
     };
     connections::add_connection(cp.store(), row.clone()).await?;
     refresh_models_best_effort(&cp, &mut row).await;
-    Ok(assemble(&cp).await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn update_connection(
-    cp: State<'_, Arc<ControlPlane>>,
-    id: String,
-    label: String,
-    enabled: bool,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    models: Vec<String>,
-    claude_cloaking: Option<bool>,
-) -> R<Vec<ConnectionInfo>> {
-    let mut row = connections::get_connection(cp.store(), &id)
-        .await?
-        .ok_or_else(|| CmdError {
-            message: format!("unknown connection: {id}"),
-        })?;
-    row.label = label;
-    row.enabled = enabled;
-    if let Some(k) = api_key {
-        // Empty string = keep existing key; UI sends null to keep too.
-        if !k.is_empty() {
-            row.data.api_key = Some(k);
-        }
-    }
-    row.data.base_url_override = base_url.filter(|s| !s.is_empty());
-    row.data.models_override = if models.is_empty() {
-        None
-    } else {
-        Some(models)
-    };
-    if row.provider == "anthropic-oauth" {
-        if let Some(value) = claude_cloaking {
-            claude_cloak::set_enabled(&mut row.data, value);
-        }
-    }
-    row.updated_at = ryuzi_core::paths::now_ms();
-    connections::update_connection(cp.store(), row.clone()).await?;
-    if row.data.models_override.is_none() {
-        refresh_models_best_effort(&cp, &mut row).await;
-    }
     Ok(assemble(&cp).await?)
 }
 
@@ -1026,28 +954,6 @@ mod tests {
         let r = probe_outcome(Err("connection refused".into()));
         assert!(!r.ok);
         assert_eq!(r.message, "Network error: connection refused");
-    }
-
-    #[test]
-    fn connection_info_exposes_claude_cloaking_for_anthropic_oauth_only() {
-        let mut row = ConnectionRow {
-            id: "c1".into(),
-            provider: "anthropic-oauth".into(),
-            auth_type: "oauth".into(),
-            label: "Claude Code".into(),
-            priority: 0,
-            enabled: true,
-            data: ConnectionData {
-                provider_specific: Some(serde_json::json!({"claudeCloaking": true})),
-                ..Default::default()
-            },
-            created_at: 0,
-            updated_at: 0,
-        };
-        assert!(to_info(&row).claude_cloaking);
-
-        row.provider = "openai-oauth".into();
-        assert!(!to_info(&row).claude_cloaking);
     }
 
     #[test]

@@ -33,11 +33,8 @@ const connection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   quotaCapability: null,
-  baseUrl: null,
   models: ["gpt-4.1", "o3"],
-  keyMasked: "sk-…3fk9",
   needsRelogin: false,
-  claudeCloaking: false,
 };
 
 const secondConnection: ConnectionInfo = {
@@ -45,7 +42,6 @@ const secondConnection: ConnectionInfo = {
   id: "c2",
   label: "Personal OpenAI",
   priority: 1,
-  keyMasked: "sk-…zz99",
   models: ["gpt-4.1"],
 };
 
@@ -60,11 +56,8 @@ const claudeConnection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   quotaCapability: "claude",
-  baseUrl: null,
   models: ["claude-opus-4-8"],
-  keyMasked: null,
   needsRelogin: false,
-  claudeCloaking: true,
 };
 
 // Cloudflare Workers AI ids carry slashes ("@cf/meta/llama-3.1-8b-instruct")
@@ -81,11 +74,8 @@ const cloudflareConnection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   quotaCapability: null,
-  baseUrl: null,
   models: ["@cf/meta/llama-3.1-8b-instruct"],
-  keyMasked: "sk-…abcd",
   needsRelogin: false,
-  claudeCloaking: false,
 };
 
 const anthropicApiConnection: ConnectionInfo = {
@@ -99,11 +89,8 @@ const anthropicApiConnection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   quotaCapability: null,
-  baseUrl: null,
   models: ["claude-sonnet-4-5"],
-  keyMasked: "sk-…9f21",
   needsRelogin: false,
-  claudeCloaking: false,
 };
 
 const catalog: CatalogEntry[] = [

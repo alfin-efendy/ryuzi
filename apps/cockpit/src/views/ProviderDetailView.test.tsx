@@ -14,11 +14,8 @@ const account = {
   priority: 0,
   enabled: true,
   quotaCapability: null,
-  baseUrl: null,
   models: [],
-  keyMasked: null,
   needsRelogin: false,
-  claudeCloaking: false,
 } satisfies ConnectionInfo;
 
 const catalogEntry = {

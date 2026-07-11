@@ -24,11 +24,8 @@ const connection: ConnectionInfo = {
   priority: 0,
   enabled: true,
   quotaCapability: null,
-  baseUrl: null,
   models: ["gpt-5"],
-  keyMasked: "sk-…",
   needsRelogin: false,
-  claudeCloaking: false,
 };
 
 function reset() {

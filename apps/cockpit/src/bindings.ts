@@ -670,14 +670,6 @@ async addConnection(provider: string, label: string, apiKey: string, baseUrl: st
     else return { status: "error", error: e  as any };
 }
 },
-async updateConnection(id: string, label: string, enabled: boolean, apiKey: string | null, baseUrl: string | null, models: string[], claudeCloaking: boolean | null) : Promise<Result<ConnectionInfo[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_connection", { id, label, enabled, apiKey, baseUrl, models, claudeCloaking }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async renameConnection(id: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("rename_connection", { id, label }) };
@@ -1280,20 +1272,12 @@ export type CodexResetCreditInfo = { status: string; grantedAt: string | null; e
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null }
-export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; baseUrl: string | null; models: string[]; 
-/**
- * e.g. "sk-…3fk9" — full key never leaves the backend after creation.
- */
-keyMasked: string | null; 
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[]; 
 /**
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
  */
-needsRelogin: boolean; 
-/**
- * Anthropic OAuth only: enable full Claude Code-style request cloaking.
- */
-claudeCloaking: boolean }
+needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */

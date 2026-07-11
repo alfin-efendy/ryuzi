@@ -338,7 +338,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::list_provider_catalog,
             connections_cmd::list_connections,
             connections_cmd::add_connection,
-            connections_cmd::update_connection,
             connections_cmd::rename_connection,
             connections_cmd::set_connection_enabled,
             connections_cmd::remove_connection,

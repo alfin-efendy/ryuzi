@@ -27,11 +27,8 @@ const conn = (provider: string, models: string[], enabled = true): ConnectionInf
     priority: 0,
     enabled,
     quotaCapability: null,
-    baseUrl: null,
     models,
-    keyMasked: null,
     needsRelogin: false,
-    claudeCloaking: false,
   }) as ConnectionInfo;
 
 const catalog = [

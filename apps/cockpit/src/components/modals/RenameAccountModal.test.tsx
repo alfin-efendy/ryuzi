@@ -14,11 +14,8 @@ const connection = {
   priority: 0,
   enabled: true,
   quotaCapability: "codex",
-  baseUrl: null,
   models: [],
-  keyMasked: null,
   needsRelogin: false,
-  claudeCloaking: false,
 } satisfies ConnectionInfo;
 
 afterEach(cleanup);
