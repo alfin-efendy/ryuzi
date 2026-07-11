@@ -1,6 +1,6 @@
 use crate::domain::{
-    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
-    Surface, ToolPolicyRow,
+    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionKind,
+    SessionStatus, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -412,7 +412,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_22_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -609,14 +609,59 @@ fn migrations() -> Migrations<'static> {
             )?;
             Ok(())
         }),
-        // Migration 22 — Plugin install ledger. `plugin_installs` is the
+        // Migration 22 — Chat-first sessions (design: docs/superpowers/specs/
+        // 2026-07-11-chat-first-sessions-design.md, Phase 2 Task A1):
+        // sessions.project_id becomes nullable (chat/worker/review sessions
+        // aren't bound to a project) and gains `kind` + `speaker`/`agent`/
+        // `parent_session_pk` lineage columns. SQLite can't drop a NOT NULL
+        // constraint in place, so rebuild the table: create the new shape,
+        // copy every existing column, drop, rename. Existing rows all get
+        // kind='project' with null lineage columns — correct, they were all
+        // project sessions before this migration. Appended as the tail (after
+        // migration 20 perm_mode and migration 21 native-only, neither of which
+        // adds or removes a sessions column beyond perm_mode), so `sessions`
+        // carries exactly the original 12 columns + perm_mode here: sessions_new
+        // must include perm_mode and copy it forward, or the rebuild would
+        // silently drop the column migration 20 added.
+        M::up(
+            r#"
+            CREATE TABLE sessions_new (
+                session_pk TEXT PRIMARY KEY,
+                project_id TEXT,
+                agent_session_id TEXT,
+                worktree_path TEXT,
+                branch TEXT,
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'idle',
+                created_at INTEGER,
+                last_active INTEGER,
+                started_by TEXT,
+                resume_attempts INTEGER NOT NULL DEFAULT 0,
+                branch_owned INTEGER NOT NULL DEFAULT 1,
+                perm_mode TEXT NOT NULL DEFAULT 'default',
+                kind TEXT NOT NULL DEFAULT 'project',
+                speaker TEXT,
+                agent TEXT,
+                parent_session_pk TEXT
+            );
+            INSERT INTO sessions_new
+                (session_pk, project_id, agent_session_id, worktree_path, branch, title,
+                 status, created_at, last_active, started_by, resume_attempts, branch_owned, perm_mode)
+            SELECT session_pk, project_id, agent_session_id, worktree_path, branch, title,
+                   status, created_at, last_active, started_by, resume_attempts, branch_owned, perm_mode
+            FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_new RENAME TO sessions;
+            "#,
+        ),
+        // Migration 23 — Plugin install ledger. `plugin_installs` is the
         // authoritative record of every installed skill pack / single skill
         // (source, resolved commit, content fingerprint, pin, trust
         // acknowledgment); the on-disk .ryuzi-skill.json stamp remains the
         // loader's trust gate but is no longer the record of record.
         // `plugin_attach_status` holds the last session-attach outcome per
-        // plugin for the doctor surface. Renumbered from 20 to 22 in the merge
-        // with main (batch-3 perm_mode took slot 20, native-only took 21); it
+        // plugin for the doctor surface. Renumbered to slot 23 across merges
+        // with main (20 perm_mode, 21 native-only, 22 chat-first sessions); it
         // is now the tail. IF NOT EXISTS: the rewind-and-replay migration tests
         // re-run this on an already-migrated DB, so it must be a no-op on replay.
         M::up(
@@ -1133,12 +1178,13 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str()
+                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
                 ],
             )
         })
@@ -1207,6 +1253,21 @@ impl Store {
                 .query_map(params![status], row_to_session)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// List sessions of a given `kind` (`"project"|"chat"|"worker"|"review"`),
+    /// most-recently-created first — used by chat-first surfaces that only
+    /// care about one session kind at a time.
+    pub async fn list_sessions_by_kind(&self, kind: &str) -> anyhow::Result<Vec<Session>> {
+        let kind = kind.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE kind=?1 ORDER BY created_at DESC"
+            ))?;
+            let rows = stmt.query_map([kind], row_to_session)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
     }
@@ -2283,10 +2344,11 @@ impl Store {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
+    let kind: String = r.get(13)?;
     Ok(Session {
         session_pk: r.get(0)?,
         project_id: r.get(1)?,
@@ -2304,6 +2366,10 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
             let pm: String = r.get(12)?;
             PermMode::from_db(&pm)
         },
+        kind: SessionKind::from_db(&kind),
+        speaker: r.get(14)?,
+        agent: r.get(15)?,
+        parent_session_pk: r.get(16)?,
     })
 }
 
@@ -2424,7 +2490,7 @@ mod tests {
     fn sample_session() -> Session {
         Session {
             session_pk: "s1".into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: Some("/tmp/wt".into()),
             branch: Some("harness/abcdef01".into()),
@@ -2436,6 +2502,10 @@ mod tests {
             resume_attempts: 0,
             branch_owned: true,
             perm_mode: PermMode::Default,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         }
     }
 
@@ -2659,6 +2729,51 @@ mod tests {
             !got.branch_owned,
             "user-named branches persist as not-owned"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_session_persists_with_null_project() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: "chat-1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("hello".into()),
+                status: crate::domain::SessionStatus::Idle,
+                started_by: Some("cockpit".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let got = store.get_session("chat-1").await.unwrap().unwrap();
+        assert_eq!(got.project_id, None);
+        assert_eq!(got.kind, crate::domain::SessionKind::Chat);
+        // list_sessions(None) still returns it; project filter excludes it.
+        assert!(store
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_pk == "chat-1"));
+        assert!(store
+            .list_sessions_by_kind("chat")
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_pk == "chat-1"));
     }
 
     #[tokio::test]
@@ -3160,6 +3275,21 @@ mod tests {
                 .as_deref(),
             Some("discord")
         );
+        // Phase 2 migration 20 (sessions rebuild: nullable project_id +
+        // kind/speaker/agent/parent_session_pk) must also fire on this
+        // ancient-DB replay. A row that pre-dates the `kind` column entirely
+        // (inserted here under the raw v4 shape) has to land as kind='project'
+        // — the rebuild's `DEFAULT 'project'` on `sessions_new`, verified end
+        // to end via a genuine forward migration rather than a fresh store.
+        // (A chat session's own insert/read-back round-trip is covered
+        // separately by `chat_session_persists_with_null_project` below.)
+        assert_eq!(s.kind, crate::domain::SessionKind::Project);
+        assert_eq!(s.project_id.as_deref(), Some("p1"));
+        let user_version: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(user_version, 23, "forward migration must land at v23");
     }
 
     #[tokio::test]
@@ -3300,7 +3430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_22_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_23_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then wind user_version back ten so the
         // rewrite migration (13) AND every migration appended after it
@@ -3311,23 +3441,26 @@ mod tests {
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
         // copy-drop-rename; 20 sessions.perm_mode — hook-guarded, like
         // branch_owned; 21 native-only cleanup — fully existence-guarded;
-        // 22 plugin_installs + plugin_attach_status — CREATE TABLE IF NOT
-        // EXISTS; all no-ops on replay) re-run on the next open. `Migrations`
-        // always fast-forwards to the latest defined version, so there is no
-        // way to replay 13 alone once something is appended after it. NOTE:
-        // this constant must stay in lockstep with the total migration count —
-        // it winds back to right before migration 13, so a new migration
-        // appended at the end means bumping this by one too.
+        // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
+        // parent_session_pk, copies every existing column forward including
+        // perm_mode; 23 plugin_installs + plugin_attach_status — CREATE TABLE
+        // IF NOT EXISTS; all no-ops on replay) re-run on the next open.
+        // `Migrations` always fast-forwards to the latest defined version, so
+        // there is no way to replay 13 alone once something is appended after
+        // it. Bump this offset by one for every migration appended after 13 —
+        // a stale offset silently skips migration 13 (the DB opens fine, but
+        // this test starts failing its assertions). With migrations through 23
+        // defined, wind back eleven.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 10)
+            c.pragma_update(None, "user_version", v - 11)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v22 here, so `harness` was
+                    // The DB is fully migrated to v23 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -3378,14 +3511,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back two, and reopen so 21 replays against it.
-        // Back TWO (not one): the merge with main appended the plugin-install
-        // ledger as migration 22, so the fully migrated tail is now v22 —
+        // wind user_version back three, and reopen so 21 (and the tail
+        // migrations 22 sessions rebuild + 23 plugin-install ledger) replay
+        // against it. Back THREE: the fully migrated tail is now v23, so
         // rewinding to v20 is what makes migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 2)
+            c.pragma_update(None, "user_version", v - 3)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();

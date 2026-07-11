@@ -781,9 +781,10 @@ pub async fn decompose_goal(
     roster: &[String],
 ) -> anyhow::Result<Vec<PlannedTask>> {
     use crate::llm_router::client::{self, MessageStreamEvent};
-    let model = client::default_model(store)
+    let default_model = client::default_model(store)
         .await
         .ok_or_else(|| anyhow::anyhow!("no default model configured for decomposition"))?;
+    let model = crate::harness::native::llm::aux_model(store, "decompose", &default_model).await;
     let ctx = client::UpstreamCtx::new(store.clone());
     let body = serde_json::json!({
         "model": model,

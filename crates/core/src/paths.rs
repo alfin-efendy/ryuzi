@@ -15,6 +15,12 @@ pub fn worktree_path_for(project_id: &str, session_pk: &str) -> PathBuf {
     state_dir().join("worktrees").join(project_id).join(short)
 }
 
+/// Managed scratch working directory for a project-less `chat` session.
+/// Lives under the state dir (never `$HOME`), created on first resolve.
+pub fn chat_scratch_dir(session_pk: &str) -> PathBuf {
+    state_dir().join("chat").join(session_pk)
+}
+
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }

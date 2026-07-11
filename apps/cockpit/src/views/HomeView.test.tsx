@@ -37,6 +37,10 @@ const startSession = mock(
         lastActive: 1,
         resumeAttempts: 0,
         branchOwned: false,
+        kind: "project",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
       },
     }),
 );

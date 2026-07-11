@@ -439,7 +439,7 @@ export function SessionView() {
           sessionPk={session.sessionPk}
           branch={session.branch ?? null}
           running={running}
-          isGit={project?.isGit ?? true}
+          isGit={project?.isGit ?? false}
         />
       )}
     </div>

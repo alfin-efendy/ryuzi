@@ -294,6 +294,10 @@ const runningSession = (pk: string) => ({
   startedBy: null,
   resumeAttempts: 0,
   branchOwned: true,
+  kind: "project" as const,
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
 });
 
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
@@ -436,6 +440,10 @@ test("start forwards chat options so composer model, context, and attachments re
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
@@ -479,6 +487,10 @@ test("start forwards composer git options to IPC", async () => {
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: false,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
@@ -519,6 +531,10 @@ test("start resolves and focuses the session without waiting for refresh", async
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   // refresh() must not gate start(): these never resolve during the test.
@@ -547,6 +563,64 @@ test("start returns false and does not focus on backend error", async () => {
   expect(ok).toBe(false);
   expect(useStore.getState().focusedSessionPk).toBeNull();
   start.mockRestore();
+});
+
+test("startChat calls start_chat_session (no projectId) and seeds/focuses the returned session", async () => {
+  reset();
+  const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "c1",
+      projectId: null,
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "hey",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: false,
+      permMode: "default",
+      kind: "chat",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
+    },
+  });
+  // refresh() must not gate startChat(): these never resolve during the test.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  const ok = await useStore.getState().startChat("hey", { model: "fable" });
+
+  expect(startChat).toHaveBeenCalledWith("hey", {
+    model: "fable",
+    permMode: null,
+    context: null,
+    attachments: [],
+    git: null,
+  });
+  expect(ok).toBe(true);
+  expect(useStore.getState().focusedSessionPk).toBe("c1");
+  expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("c1");
+
+  startChat.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("startChat returns false and does not focus on backend error", async () => {
+  reset();
+  const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  const ok = await useStore.getState().startChat("hey", null);
+  expect(ok).toBe(false);
+  expect(useStore.getState().focusedSessionPk).toBeNull();
+  startChat.mockRestore();
 });
 
 test("cloneProject clones via IPC and refreshes on success", async () => {
@@ -644,6 +718,42 @@ test("send resolves true on success and false on backend error (drives composer 
   listSessions.mockRestore();
 });
 
+test("send steers a RUNNING session instead of starting a new turn via continue", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hold on", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith("s1", "hold on");
+  expect(cont).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("send falls back to continue for a session that is not running", async () => {
+  reset();
+  useStore.setState({ sessions: [{ ...runningSession("s1"), status: "idle" as const }] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "go", null)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalled();
+  expect(steer).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
 test("setFocused marks the previously-focused session read up to its lastActive", () => {
   useUi.setState({ readAt: {} });
   useStore.setState({
@@ -663,6 +773,10 @@ test("setFocused marks the previously-focused session read up to its lastActive"
         resumeAttempts: 0,
         branchOwned: false,
         permMode: "default",
+        kind: "project",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
       },
     ],
     loaded: { s1: true, s2: true },

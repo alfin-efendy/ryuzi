@@ -38,7 +38,7 @@ pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry
 pub use control::{ControlPlane, ProvisionProjectRequest, ProvisionSettings};
 pub use domain::{
     Actor, ApprovalDecision, ApprovalRequest, CoreEvent, McpServerSpec, McpTransport, Message,
-    PermMode, Project, Session, SessionGitOptions, SessionStatus, Surface,
+    PermMode, Project, Session, SessionGitOptions, SessionKind, SessionStatus, Surface,
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
 pub use harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};

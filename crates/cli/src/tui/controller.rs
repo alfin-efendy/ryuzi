@@ -162,7 +162,9 @@ impl AppController {
             .into_iter()
             .map(|s| SessionRow {
                 session_pk: s.session_pk,
-                project_id: s.project_id,
+                // Chat-first sessions (Phase 2) have no bound project; the
+                // TUI dashboard is project-centric today, so render "-".
+                project_id: s.project_id.unwrap_or_else(|| "-".to_string()),
                 status: s.status.as_str().to_string(),
                 title: s.title,
                 started_by: s.started_by,

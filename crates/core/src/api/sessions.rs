@@ -25,7 +25,9 @@ pub(crate) const HANDLES: &[&str] = &[
     "clone_project",
     "list_branches",
     "start_session",
+    "start_chat_session",
     "continue_session",
+    "steer",
     "stop_session",
     "end_session",
     "list_messages",
@@ -83,6 +85,11 @@ struct StartP {
     options: Option<ChatRequestOptions>,
 }
 #[derive(Deserialize)]
+struct StartChatP {
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+}
+#[derive(Deserialize)]
 struct ContinueP {
     session_pk: String,
     prompt: String,
@@ -91,6 +98,11 @@ struct ContinueP {
 #[derive(Deserialize)]
 struct SessionPkP {
     session_pk: String,
+}
+#[derive(Deserialize)]
+struct SteerP {
+    session_pk: String,
+    text: String,
 }
 #[derive(Deserialize)]
 struct StageP {
@@ -154,9 +166,35 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: StartP = params(p)?;
             ok(start_session(state, &a.project_id, &a.prompt, a.options).await?)
         }
+        "start_chat_session" => {
+            let a: StartChatP = params(p)?;
+            let attachments = attachment_refs_from_paths(
+                &a.options
+                    .as_ref()
+                    .map(|o| o.attachments.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
+            let agent_prompt = chat_agent_prompt(
+                &a.prompt,
+                a.options.as_ref().and_then(|o| o.context.as_ref()),
+            );
+            ok(state
+                .cp
+                .start_chat_session(
+                    TurnPrompt::text(agent_prompt, a.prompt),
+                    "cockpit",
+                    &attachments,
+                )
+                .await?)
+        }
         "continue_session" => {
             let a: ContinueP = params(p)?;
             ok(continue_session(state, &a.session_pk, &a.prompt, a.options).await?)
+        }
+        "steer" => {
+            let a: SteerP = params(p)?;
+            ok(cp.steer_session(&a.session_pk, &a.text).await?)
         }
         "stop_session" => {
             let a: SessionPkP = params(p)?;
@@ -348,6 +386,43 @@ async fn stage_attachment(
 mod tests {
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn start_chat_session_dispatches() {
+        let s = crate::api::tests_support::state_with_fake_native().await;
+        let out = dispatch(
+            &s,
+            "start_chat_session",
+            json!({"prompt": "hi", "options": null}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["projectId"], serde_json::Value::Null);
+        assert_eq!(out["kind"], "chat");
+    }
+
+    #[tokio::test]
+    async fn steer_on_an_unknown_session_errors_like_continue_session() {
+        // No live handle AND no session row at all: `steer` dispatches through
+        // to `ControlPlane::steer_session`'s fallback, which — like
+        // `continue_session` — must fail cleanly on an unknown session_pk
+        // rather than panic or silently succeed. (The "live handle received
+        // it" / "fell back to a new turn" branching itself is covered by
+        // `control::tests::steer_session_*`, which can synchronize on the
+        // background-started live handle that this dispatch-only layer
+        // cannot.)
+        let s = state().await;
+        let err = dispatch(
+            &s,
+            "steer",
+            json!({"session_pk": "no-such-session", "text": "hi"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 500);
+    }
 
     #[tokio::test]
     async fn settings_round_trip_via_rpc() {
