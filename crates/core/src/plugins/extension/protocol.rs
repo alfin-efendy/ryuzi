@@ -99,6 +99,38 @@ pub fn event_request(id: i64, event: &str, payload: &Value) -> Value {
     )
 }
 
+/// Host -> extension: invoke one tool this extension declared via
+/// `provides_tools` at `extension/initialize` (DT6). Distinct from the
+/// `extension/*` lifecycle namespace and from [`METHOD_EVENT_PREFIX`] — this
+/// travels over the same JSON-RPC transport but isn't a lifecycle method.
+/// Mirrors MCP's own `tools/call` shape (`mcp_client::build_call_request`),
+/// singular here because one dispatch always addresses exactly one tool.
+pub const METHOD_TOOL_CALL: &str = "tool/call";
+
+/// Build a `tool/call` request: `{ name: <tool>, arguments: <input> }` —
+/// identical shape to `mcp_client::build_call_request`, so DT6's
+/// `ExtensionTool::execute` (harness::native::tools) can reuse
+/// `mcp_client::render_tool_result` verbatim to flatten the reply.
+pub fn tool_call_request(id: i64, tool: &str, arguments: &Value) -> Value {
+    stdio_jsonrpc::build_request(
+        id,
+        METHOD_TOOL_CALL,
+        Some(json!({ "name": tool, "arguments": arguments })),
+    )
+}
+
+/// Parse a `tool/call` response: a JSON-RPC `error` object becomes `Err`
+/// (its body stringified — the caller, `proc::call_tool`, wraps this as
+/// `ToolCallError::Rejected`); otherwise the `result` value is returned
+/// (`Value::Null` if the extension omitted one entirely) — mirrors
+/// `mcp_client::McpConnection::call`'s own extraction exactly.
+pub fn parse_tool_call_response(resp: &Value) -> Result<Value, String> {
+    if let Some(err) = resp.get("error") {
+        return Err(err.to_string());
+    }
+    Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
 /// An extension's response to an `event/<name>` dispatch: whether it wants
 /// to deny the (gating) action, and why. Observational dispatch parses this
 /// too but ignores it — only a gating event's caller inspects `deny`.
@@ -401,5 +433,43 @@ mod tests {
             "result": { "deny": false, "reason": "irrelevant" }
         });
         assert_eq!(parse_event_response(&resp), EventAck::default());
+    }
+
+    // ---------- tool_call_request / parse_tool_call_response (DT6) ----------
+
+    #[test]
+    fn tool_call_request_shape_carries_the_tool_name_and_arguments() {
+        let args = json!({ "path": "src/main.rs" });
+        let req = tool_call_request(9, "lint", &args);
+        assert_eq!(req["method"], METHOD_TOOL_CALL);
+        assert_eq!(req["id"], 9);
+        assert_eq!(req["params"]["name"], "lint");
+        assert_eq!(req["params"]["arguments"], args);
+    }
+
+    #[test]
+    fn parse_tool_call_response_returns_the_result_value() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "content": [{"type": "text", "text": "ok"}] }
+        });
+        let result = parse_tool_call_response(&resp).unwrap();
+        assert_eq!(result["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn parse_tool_call_response_defaults_to_null_when_result_is_missing() {
+        let resp = json!({ "jsonrpc": "2.0", "id": 1 });
+        assert_eq!(parse_tool_call_response(&resp).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn parse_tool_call_response_rejects_an_error_object() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -1, "message": "unknown tool" }
+        });
+        let err = parse_tool_call_response(&resp).expect_err("a JSON-RPC error must be Err");
+        assert!(err.contains("unknown tool"));
     }
 }

@@ -45,14 +45,25 @@
 //!   for routing JSON-RPC notifications (lines with no `id`) if a future
 //!   slice needs the extension to push something host-ward outside of a
 //!   request/response — see `proc::reader_loop`.
-//! - **DT6 (tool provision)**: wraps `ExtensionProc::tools` (raw `Value`s
-//!   from `protocol::InitializeAck::tools`) into an `ExtensionTool: Tool`
-//!   dispatching `tool/call` over the same pipe, the same way `McpTool`
-//!   wraps `McpConnection`.
+//! - **DT6 (tool provision, implemented)**: `tools::parse_tool_def` gives
+//!   `ExtensionProc::tools` (raw `Value`s from `protocol::InitializeAck::tools`)
+//!   a type ([`tools::ExtensionToolDef`]), skipping malformed entries;
+//!   [`tools::ExtensionTools::session_tools`] (implemented by `ExtensionHost`,
+//!   `SessionCtx.extension_tools`'s sibling accessor to `extension_events`)
+//!   gathers one [`tools::ExtensionToolBinding`] per tool from every
+//!   `Running`, `provides_tools` extension, each carrying the owning
+//!   plugin's [`crate::domain::Principal`] (resolved once at `spawn_all`,
+//!   see `proc::ExtensionHost`'s `principals` field) and a
+//!   `proc::ExtensionCaller` handle. `harness::native::tools::extension::ExtensionTool`
+//!   wraps each binding as a native `Tool` named `ext__<extension>__<tool>`,
+//!   dispatching `protocol::METHOD_TOOL_CALL` (`"tool/call"`) over the same
+//!   demux transport DT4's ping and DT5's event dispatch already share, the
+//!   same way `harness::native::tools::mcp::McpTool` wraps an MCP connection.
 
 pub mod events;
 pub mod proc;
 pub mod protocol;
+pub mod tools;
 
 use std::time::Duration;
 
@@ -62,8 +73,10 @@ use crate::harness::native::hooks::HookEvent;
 use crate::settings::SettingsStore;
 
 pub use events::ExtensionEvents;
+pub(crate) use proc::ExtensionCaller;
 pub use proc::{ExtensionHost, ExtensionProc, ExtensionSnapshot, SHUTDOWN_GRACE};
 pub use protocol::PROTOCOL_VERSION;
+pub use tools::{ExtensionToolBinding, ExtensionToolDef, ExtensionTools};
 
 /// Per-event dispatch budget an `[[extension]]` manifest entry gets when it
 /// omits `timeout_ms`. Distinct from [`proc::INIT_HANDSHAKE_TIMEOUT`] — that

@@ -112,6 +112,28 @@ async fn connect_mcp_tools(
     extra
 }
 
+/// Gather every currently-provided extension tool (Track D, DT6) from the
+/// daemon-global extension host and wrap each as a native `Tool` — the
+/// extension analogue of `connect_mcp_tools`, called at the same session-
+/// start point. `None` (the common case: no extensions spawned, and every
+/// bare test `SessionCtx`) is a true zero-cost no-op — no await, no extra
+/// tools — mirroring how `ctx.extension_events: None` keeps every hook fire
+/// site inert.
+async fn connect_extension_tools(
+    extension_tools: Option<&Arc<dyn crate::plugins::extension::ExtensionTools>>,
+) -> Vec<Arc<dyn tools::Tool>> {
+    let Some(host) = extension_tools else {
+        return Vec::new();
+    };
+    host.session_tools()
+        .await
+        .into_iter()
+        .map(|binding| {
+            Arc::new(tools::extension::ExtensionTool::from_binding(binding)) as Arc<dyn tools::Tool>
+        })
+        .collect()
+}
+
 async fn resolve_native_model(
     store: &crate::store::Store,
     configured: Option<String>,
@@ -163,8 +185,13 @@ impl Harness for NativeHarness {
         .await;
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
-        let mcp_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
-        let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
+        let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
+        // Track D, DT6: fold in every currently-provided extension tool
+        // alongside the MCP ones — both flow into the SAME registry, so the
+        // runner dispatches either through the identical `deps.tools.get(name)`
+        // path with no special-casing.
+        extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
+        let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
         let project_id = ctx.project_id.clone();
         let model_name = model.as_deref().unwrap_or("");
         let mut effort_policy = if let Some(project_id) = project_id.as_deref() {
@@ -416,6 +443,7 @@ mod tests {
             mcp_principals: std::collections::HashMap::new(),
             extra_skill_dirs: vec![],
             extension_events: None,
+            extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
@@ -1035,5 +1063,120 @@ mod tests {
         ];
         let tools = connect_mcp_tools(&specs, &std::collections::HashMap::new()).await;
         assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_extension_tools_is_a_no_op_with_no_host() {
+        assert!(connect_extension_tools(None).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_extension_tools_wraps_a_running_provides_tools_extension_and_executes_it() {
+        // Track D, DT6 end-to-end: a real (hermetic `sh -c`) fake extension
+        // declares `provides_tools` and hands back one tool def at init;
+        // `connect_extension_tools` must wrap it as a native `Tool` named
+        // `ext__<extension>__<tool>`, and calling `execute` on it must
+        // dispatch `tool/call` over the real subprocess pipe and render the
+        // reply exactly like an MCP tool would.
+        use crate::plugins::extension::{
+            ExtensionCtx as ExtCtx, ExtensionFactory, ExtensionHost, ExtensionSpec, ExtensionTools,
+        };
+        use crate::plugins::host::PluginHost;
+        use crate::settings::SettingsStore;
+        use std::time::Duration;
+
+        struct FakeExtFactory {
+            spec: ExtensionSpec,
+        }
+        #[async_trait]
+        impl ExtensionFactory for FakeExtFactory {
+            async fn extensions(&self, _ctx: &ExtCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
+                Ok(vec![self.spec.clone()])
+            }
+        }
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: "linter-plugin".into(),
+            name: "Linter Plugin".into(),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            extensions: vec![],
+            skills: vec![],
+            provider: None,
+        };
+
+        // Reads the `extension/initialize` request, acks it with one tool
+        // def ("lint"), then reads the follow-up `tool/call` request and
+        // replies with an MCP-shaped result — proving `render_tool_result`'s
+        // content flattening is reused end to end.
+        let body = "IFS= read -r line; \
+             id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
+             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true,\"events\":[],\"tools\":[{\"name\":\"lint\",\"description\":\"lint code\"}]}}\\n' \"$id\"; \
+             IFS= read -r line2; \
+             id2=$(printf '%s' \"$line2\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
+             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"0 problems\"}]}}\\n' \"$id2\"";
+
+        let spec = ExtensionSpec {
+            name: "linter".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), body.into()],
+            events: vec![],
+            provides_tools: true,
+            timeout: Duration::from_millis(500),
+            env: vec![],
+        };
+
+        let mut plugin_host = PluginHost::new();
+        plugin_host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: Some(Arc::new(FakeExtFactory { spec })),
+            source: PluginSource::Builtin,
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        store
+            .set_setting_raw("plugin.linter-plugin.enabled", "true")
+            .await
+            .unwrap();
+        let settings = SettingsStore::new(store.clone());
+
+        let ext_host = Arc::new(ExtensionHost::new());
+        ext_host.spawn_all(&plugin_host, &ExtCtx { settings }).await;
+
+        let extension_tools = Some(ext_host.clone() as Arc<dyn ExtensionTools>);
+        let wrapped = connect_extension_tools(extension_tools.as_ref()).await;
+        assert_eq!(
+            wrapped.len(),
+            1,
+            "one provides_tools extension tool must be wrapped"
+        );
+        assert_eq!(wrapped[0].name(), "ext__linter__lint");
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool_ctx = tools::testutil::ctx_at(dir.path()).await;
+        let out = wrapped[0]
+            .execute(&tool_ctx, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.for_model, "0 problems");
+
+        ext_host.shutdown_all(Duration::from_millis(200)).await;
     }
 }

@@ -128,6 +128,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, BufReader, Lines};
 use tokio::process::Child;
@@ -135,6 +136,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::domain::Principal;
 use crate::harness::native::hooks::HookEvent;
 use crate::plugins::host::PluginHost;
 use crate::stdio_jsonrpc;
@@ -737,6 +739,106 @@ pub(crate) async fn dispatch_event(
     }
 }
 
+/// Why a DT6 `tool/call` dispatch failed. Every variant becomes a plain
+/// tool-result ERROR at `ExtensionTool::execute` (harness::native::tools) —
+/// never a panic or a hang, mirroring [`EventDispatchOutcome::Unreachable`]'s
+/// "a broken extension must never brick the agent" discipline, just for a
+/// tool call instead of a hook event.
+#[derive(Debug)]
+pub(crate) enum ToolCallError {
+    /// Not currently `Running`, the transport closed, or the child already
+    /// exited — covers "was never runnable" and "died mid-call" uniformly.
+    Closed,
+    /// No response arrived within the extension's per-call timeout budget
+    /// (reuses [`ExtensionSpec::timeout`], the same per-event budget DT5's
+    /// gating dispatch enforces).
+    Timeout,
+    /// Writing the request to the extension's stdin failed.
+    Io(String),
+    /// The extension replied with a JSON-RPC `error` object
+    /// (`protocol::parse_tool_call_response`'s stringified body) —
+    /// extension-supplied text, so callers must not assume it's secret-free,
+    /// unlike [`sanitize_init_error`]'s collapsed per-stage messages.
+    Rejected(String),
+}
+
+impl std::fmt::Display for ToolCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolCallError::Closed => {
+                write!(f, "extension is not running or its transport closed")
+            }
+            ToolCallError::Timeout => write!(f, "tool call timed out"),
+            ToolCallError::Io(e) => write!(f, "transport error: {e}"),
+            ToolCallError::Rejected(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolCallError {}
+
+/// Dispatch one `tool/call` to the extension behind `state`, bounded by
+/// `timeout` — DT6's per-extension primitive, structured exactly like
+/// [`dispatch_event`]/[`ping_once`]: a brief lock only to clone the current
+/// `Arc<ExtensionIo>` (bailing out immediately, without ever touching the
+/// transport, if the proc isn't `Running`), then the actual round trip
+/// happens WITHOUT holding the `ExtensionProc` mutex — a slow/hung tool call
+/// can never stall a concurrent ping/event-dispatch/shutdown against the SAME
+/// proc, and vice versa.
+pub(crate) async fn call_tool(
+    state: &Arc<Mutex<ExtensionProc>>,
+    timeout: Duration,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value, ToolCallError> {
+    let io = {
+        let guard = state.lock().await;
+        match (&guard.status, &guard.io) {
+            (ExtensionStatus::Running, Some(io)) => io.clone(),
+            _ => return Err(ToolCallError::Closed),
+        }
+    };
+    let id = io.alloc_id();
+    let req = protocol::tool_call_request(id, tool, &arguments);
+    let resp = io.request(id, req, timeout).await.map_err(|e| match e {
+        TransportError::Closed => ToolCallError::Closed,
+        TransportError::Io(msg) => ToolCallError::Io(msg),
+        TransportError::Timeout => ToolCallError::Timeout,
+    })?;
+    protocol::parse_tool_call_response(&resp).map_err(ToolCallError::Rejected)
+}
+
+/// What a wrapped extension tool (`ExtensionTool`, `harness::native::tools::extension`)
+/// calls to dispatch `tool/call` — mirrors `mcp_client::McpCaller`'s shape
+/// exactly (`async fn call(&self, tool, arguments) -> anyhow::Result<Value>`)
+/// so the two `Tool` impls can share the same `execute`/`render_tool_result`
+/// pattern. Defined here rather than reusing `McpCaller` directly so the
+/// extension protocol's own error semantics ([`ToolCallError`]) stay
+/// independent of MCP's — an extension is not an MCP server, even though the
+/// wire shape happens to rhyme.
+#[async_trait]
+pub(crate) trait ExtensionCaller: Send + Sync {
+    async fn call(&self, tool: &str, arguments: Value) -> anyhow::Result<Value>;
+}
+
+/// A cheap, `'static`, cloned-out handle to one supervised extension's live
+/// dispatch state (DT6) — the tool-call analogue of [`DispatchHandle`].
+#[derive(Clone)]
+pub(crate) struct ToolCallHandle {
+    name: String,
+    state: Arc<Mutex<ExtensionProc>>,
+    timeout: Duration,
+}
+
+#[async_trait]
+impl ExtensionCaller for ToolCallHandle {
+    async fn call(&self, tool: &str, arguments: Value) -> anyhow::Result<Value> {
+        call_tool(&self.state, self.timeout, tool, arguments)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: {e}", self.name))
+    }
+}
+
 /// The DT4 supervisor: one instance per [`SupervisedExtension`], spawned by
 /// [`SupervisedExtension::spawn`] and cancelled by
 /// [`SupervisedExtension::shutdown`]. See this module's "Supervision" doc
@@ -945,6 +1047,26 @@ impl SupervisedExtension {
         }
     }
 
+    /// Whether this extension's manifest declared `provides_tools` (DT6) —
+    /// `tools::ExtensionTools::session_tools` gates gathering on this so an
+    /// extension that never opted in contributes zero tools regardless of
+    /// what (if anything) it happened to return at init.
+    pub(crate) fn provides_tools(&self) -> bool {
+        self.spec.provides_tools
+    }
+
+    /// A cheap [`ExtensionCaller`] handle for dispatching `tool/call` to this
+    /// entry (DT6) — the tool-call analogue of [`Self::dispatch_handle`].
+    /// Reuses [`ExtensionSpec::timeout`] as the per-call budget, the same
+    /// manifest knob DT5's gating event dispatch enforces.
+    pub(crate) fn tool_caller(&self) -> Arc<dyn ExtensionCaller> {
+        Arc::new(ToolCallHandle {
+            name: self.spec.name.clone(),
+            state: self.state.clone(),
+            timeout: self.spec.timeout,
+        })
+    }
+
     /// Stop supervision, then gracefully shut down whatever subprocess is
     /// currently live (there may be none, mid-backoff, or after a give-up).
     /// Cancels and joins the supervisor task BEFORE touching `child`/`io` —
@@ -996,15 +1118,26 @@ const MAX_INFLIGHT_OBSERVATIONAL_SENDS: usize = 32;
 /// takes `&self`: the whole host is meant to be a single `Arc<ExtensionHost>`
 /// shared between the daemon entry (which calls `spawn_all` once at startup
 /// and `shutdown_all` once at stop) and every concurrently-running session's
-/// `SessionCtx.extension_events` (which only ever calls the read-only
-/// `dispatch` — see `events`'s module doc). Reads (`get`, and DT5's
-/// `dispatch_handles`) only ever hold the lock briefly to clone out what
-/// they need; the actual subprocess I/O (handshakes, event round trips,
-/// graceful shutdown) always happens OUTSIDE the lock, so a slow extension
-/// can never stall an unrelated `get`/dispatch call against a different
-/// entry.
+/// `SessionCtx.extension_events`/`SessionCtx.extension_tools` (which only
+/// ever call the read-only `dispatch`/`session_tools` — see `events`'s and
+/// `tools`'s module docs). Reads (`get`, DT5's `dispatch_handles`, DT6's
+/// `tool_provision_entries`) only ever hold the lock briefly to clone out
+/// what they need; the actual subprocess I/O (handshakes, event round trips,
+/// tool calls, graceful shutdown) always happens OUTSIDE the lock, so a slow
+/// extension can never stall an unrelated `get`/dispatch call against a
+/// different entry.
 pub struct ExtensionHost {
     procs: tokio::sync::RwLock<HashMap<String, Vec<SupervisedExtension>>>,
+    /// Plugin id -> resolved [`Principal`] for every plugin `spawn_all` has
+    /// ever swept, populated alongside `procs` at spawn time (the only place
+    /// a `CorePlugin`'s `manifest.id`/`manifest.name` are definitively known
+    /// for a given entry — see `spawn_all`). DT6's `tool_provision_entries`
+    /// reads this to attribute each gathered tool binding to its owning
+    /// plugin WITHOUT ever parsing an extension/tool name string. A separate
+    /// lock from `procs` (not folded into its value type) so every existing
+    /// `procs`-only accessor (`get`, `dispatch_handles`, `shutdown_all`)
+    /// stays untouched by this slice.
+    principals: tokio::sync::RwLock<HashMap<String, Principal>>,
     observational_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -1012,6 +1145,7 @@ impl Default for ExtensionHost {
     fn default() -> ExtensionHost {
         ExtensionHost {
             procs: tokio::sync::RwLock::new(HashMap::new()),
+            principals: tokio::sync::RwLock::new(HashMap::new()),
             observational_permits: Arc::new(tokio::sync::Semaphore::new(
                 MAX_INFLIGHT_OBSERVATIONAL_SENDS,
             )),
@@ -1070,6 +1204,19 @@ impl ExtensionHost {
             for spec in specs {
                 procs.push(SupervisedExtension::spawn(spec).await);
             }
+            // Resolve this plugin's Principal HERE — the only place a
+            // spawned entry's owning `CorePlugin.manifest.id`/`.name` are
+            // definitively known (mirrors `ControlPlane::attach_plugin_mcp_servers`'s
+            // own resolution site) — and record it BEFORE the `procs` entry
+            // so a concurrent `tool_provision_entries` read can never observe
+            // a plugin id in `procs` with no matching `principals` entry yet.
+            self.principals.write().await.insert(
+                plugin.manifest.id.clone(),
+                Principal {
+                    plugin_id: plugin.manifest.id.clone(),
+                    plugin_name: plugin.manifest.name.clone(),
+                },
+            );
             self.procs
                 .write()
                 .await
@@ -1145,6 +1292,54 @@ impl ExtensionHost {
             .flat_map(|list| list.iter().map(SupervisedExtension::dispatch_handle))
             .collect()
     }
+
+    /// A read-only snapshot of every spawned extension's DT6-relevant state,
+    /// each carrying its owning plugin's resolved [`Principal`] (from
+    /// `principals`, populated once per plugin in [`Self::spawn_all`]) —
+    /// `tools::ExtensionTools::session_tools`'s gathering point, mirroring
+    /// [`Self::dispatch_handles`]'s read-briefly-then-release-the-lock
+    /// discipline (both locks are only ever held long enough to clone out
+    /// what's needed; no subprocess I/O happens under either). A plugin
+    /// entry in `procs` with no matching `principals` entry yet (the narrow
+    /// window mid-`spawn_all`, between two separate lock acquisitions) is
+    /// skipped rather than panicking — its tools simply appear on the NEXT
+    /// `session_tools()` call once `spawn_all` catches up.
+    pub(crate) async fn tool_provision_entries(&self) -> Vec<ToolProvisionEntry> {
+        let procs = self.procs.read().await;
+        let principals = self.principals.read().await;
+        let mut out = Vec::new();
+        for (plugin_id, list) in procs.iter() {
+            let Some(principal) = principals.get(plugin_id) else {
+                continue;
+            };
+            for ext in list {
+                let snap = ext.snapshot().await;
+                out.push(ToolProvisionEntry {
+                    principal: principal.clone(),
+                    name: snap.name,
+                    provides_tools: ext.provides_tools(),
+                    status: snap.status,
+                    tools: snap.tools,
+                    caller: ext.tool_caller(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// One spawned extension's DT6-relevant state — everything
+/// `tools::ExtensionTools::session_tools` needs to decide whether/how to
+/// contribute tools, without exposing [`SupervisedExtension`]/[`ExtensionProc`]
+/// internals to the `tools` module. Produced by
+/// [`ExtensionHost::tool_provision_entries`].
+pub(crate) struct ToolProvisionEntry {
+    pub(crate) principal: Principal,
+    pub(crate) name: String,
+    pub(crate) provides_tools: bool,
+    pub(crate) status: ExtensionStatus,
+    pub(crate) tools: Vec<Value>,
+    pub(crate) caller: Arc<dyn ExtensionCaller>,
 }
 
 #[cfg(test)]

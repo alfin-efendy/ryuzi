@@ -869,12 +869,24 @@ impl ControlPlane {
         // something spawned — `None` keeps every hook fire site a true
         // no-op (zero extra dispatch/await) for the common case, and for
         // every test `ControlPlane` (which never calls `spawn_extensions`).
+        let extension_host_empty = self.extension_host.is_empty().await;
         let extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>> =
-            if self.extension_host.is_empty().await {
+            if extension_host_empty {
                 None
             } else {
                 Some(self.extension_host.clone()
                     as Arc<dyn crate::plugins::extension::ExtensionEvents>)
+            };
+        // DT6: the tool-provision sibling to `extension_events` above — same
+        // guard, same source (`self.extension_host`), so a daemon with no
+        // extensions spawned pays nothing extra building either the hook
+        // dispatch path or the session's tool registry.
+        let extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>> =
+            if extension_host_empty {
+                None
+            } else {
+                Some(self.extension_host.clone()
+                    as Arc<dyn crate::plugins::extension::ExtensionTools>)
             };
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
@@ -915,6 +927,7 @@ impl ControlPlane {
             mcp_principals,
             extra_skill_dirs,
             extension_events,
+            extension_tools,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             background: self.background.clone(),

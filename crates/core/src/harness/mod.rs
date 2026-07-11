@@ -58,6 +58,16 @@ pub struct SessionCtx {
     /// and `plugins::extension::ExtensionHost::is_empty`. A live handle, not
     /// config, so it is never serialized.
     pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
+    /// Sibling accessor to `extension_events`, threaded from the SAME
+    /// daemon-global extension host (Track D, DT6) — `None` under the exact
+    /// same condition (`ExtensionHost::is_empty`), so a session with no
+    /// extensions spawned builds its tool registry with zero extra work,
+    /// exactly like `extension_events: None` keeps every hook fire site a
+    /// true no-op. The native runtime's session start (mirroring
+    /// `connect_mcp_tools`) calls `session_tools()` through this to gather
+    /// every `Running`, `provides_tools` extension's tools and wrap them as
+    /// native `Tool`s via `harness::native::tools::extension::ExtensionTool`.
+    pub extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -196,6 +206,7 @@ mod tests {
             mcp_principals: HashMap::new(),
             extra_skill_dirs: vec![],
             extension_events: None,
+            extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: crate::harness::native::background::BackgroundRegistry::new(),
