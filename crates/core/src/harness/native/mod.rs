@@ -9,6 +9,7 @@
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
 pub mod agents;
+pub mod background;
 pub mod commands;
 pub mod context;
 pub mod context_manager;
