@@ -293,6 +293,34 @@ test("the live last turn stays uncollapsed while running", () => {
   expect(blocks.map((b) => b.type)).toEqual(["user", "thought", "activity", "agent"]);
 });
 
+test("live startup activity renders after the initial user bubble", () => {
+  const startupRows: Row[] = [
+    row({ seq: 1, role: "system", blockType: "status", text: "Creating worktree…", createdAt: 1 }),
+    row({ seq: 2, role: "system", blockType: "status", text: "Created and checked out branch harness/s1", createdAt: 2 }),
+    row({ seq: 3, role: "system", blockType: "status", text: "Connecting tools…", createdAt: 3 }),
+    row({ seq: 4, role: "user", blockType: "text", text: "Fix the issue", createdAt: 4 }),
+  ];
+
+  const blocks = buildTranscript(startupRows, true);
+
+  expect(blocks.map((block) => block.type)).toEqual(["user", "activity"]);
+  const activity = blocks[1] as Extract<TurnBlock, { type: "activity" }>;
+  expect(activity.items).toEqual([
+    { type: "status", key: "s1", text: "Creating worktree…" },
+    { type: "status", key: "s2", text: "Created and checked out branch harness/s1" },
+    { type: "status", key: "s3", text: "Connecting tools…" },
+  ]);
+});
+
+test("live activity that already follows a user bubble keeps its order", () => {
+  const rows: Row[] = [
+    row({ seq: 1, role: "user", blockType: "text", text: "Fix the issue", createdAt: 1 }),
+    row({ seq: 2, role: "system", blockType: "status", text: "Connecting tools…", createdAt: 2 }),
+  ];
+
+  expect(buildTranscript(rows, true).map((block) => block.type)).toEqual(["user", "activity"]);
+});
+
 test("earlier turns collapse even while a later turn runs", () => {
   const second = [
     row({ seq: 5, role: "user", blockType: "text", text: "more", createdAt: 40000 }),
