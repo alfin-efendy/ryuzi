@@ -37,6 +37,13 @@ const MAX_PER_TICK: usize = 8;
 /// it without sleeping.
 pub async fn tick(cp: &Arc<ControlPlane>) {
     let store = cp.store();
+    // Rows that failed delivery THIS tick are kept CLAIMED for the rest of the
+    // tick so the next claim (which filters `claimed_by IS NULL`) skips them and
+    // reaches a different target's pending work — then released below so a later
+    // tick retries them. This bounds a permanently-broken target to one delivery
+    // attempt per tick (never MAX_PER_TICK re-attempts of the same oldest row)
+    // and stops it starving every other target within the tick.
+    let mut failed_this_tick: Vec<String> = Vec::new();
     for _ in 0..MAX_PER_TICK {
         let event = match store.claim_deliverable_background_event("drainer").await {
             Ok(Some(event)) => event,
@@ -61,15 +68,19 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                 let _ = store.mark_background_delivered(&event.id).await;
             }
             Err(e) => {
-                // Target vanished, harness couldn't start, daemon draining,
-                // etc. — release the claim so a later tick retries this row
-                // instead of losing it or leaving it claimed forever. Keep
-                // draining the rest of the batch: one broken row must not
-                // starve other targets' pending work.
+                // Target vanished / harness couldn't start / daemon draining.
+                // Keep the row claimed for now (released after the loop) so the
+                // next claim reaches other targets instead of re-picking this
+                // same oldest row.
                 tracing::warn!("background_rail: delivery of {} failed: {e}", event.id);
-                let _ = store.release_background_claim(&event.id).await;
+                failed_this_tick.push(event.id);
             }
         }
+    }
+    // Release this tick's failures so a future tick re-claims and retries them
+    // (once per tick — never lost, never left claimed forever under normal run).
+    for id in failed_this_tick {
+        let _ = store.release_background_claim(&id).await;
     }
 }
 
@@ -174,6 +185,44 @@ mod tests {
     impl HarnessFactory for FailingHarnessFactory {
         fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
             anyhow::bail!("boom: harness intentionally fails to start")
+        }
+    }
+
+    /// A harness whose `start_session` fails only for a configured set of
+    /// session pks and otherwise behaves like `FakeHarness` — models "this
+    /// one target is permanently broken" without blocking every other
+    /// target, for the anti-starvation regression test below.
+    /// `registries.harness.create()` runs fresh per session start (see
+    /// `ControlPlane::start_harness_session`), so keying the failure inside
+    /// `start_session` on `ctx.session_pk` is enough; no cross-session state
+    /// is needed in the factory itself.
+    struct SelectiveFailHarness {
+        fail_for: std::collections::HashSet<String>,
+    }
+    #[async_trait]
+    impl Harness for SelectiveFailHarness {
+        async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            if self.fail_for.contains(&ctx.session_pk) {
+                anyhow::bail!(
+                    "boom: harness intentionally fails to start for {}",
+                    ctx.session_pk
+                );
+            }
+            Ok(Box::new(FakeSession {
+                store: ctx.store.clone(),
+                session_pk: ctx.session_pk.clone(),
+            }))
+        }
+    }
+
+    struct SelectiveFailHarnessFactory {
+        fail_for: std::collections::HashSet<String>,
+    }
+    impl HarnessFactory for SelectiveFailHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(SelectiveFailHarness {
+                fail_for: self.fail_for.clone(),
+            }))
         }
     }
 
@@ -339,6 +388,74 @@ mod tests {
             reclaimed.map(|e| e.id),
             Some(id),
             "a released row must be claimable again"
+        );
+    }
+
+    /// Pins the anti-starvation fix: a permanently-failing OLDEST row must
+    /// not monopolize every claim slot in the tick and starve a newer
+    /// target's row.
+    ///
+    /// `claim_deliverable_background_event` always returns the globally
+    /// oldest eligible row. Under the pre-fix code (release-on-failure
+    /// INSIDE the loop), the failing older row (`chat-a`) would be released
+    /// and immediately re-claimed on every remaining loop iteration — it is
+    /// still the oldest — so the newer row (`chat-b`) would never be reached
+    /// within this tick and `wait_for_message` below would time out and
+    /// panic. With the fix, `chat-a`'s claim is deferred to the end of the
+    /// tick, so the very next claim in the loop skips it and reaches
+    /// `chat-b`.
+    #[tokio::test]
+    #[serial]
+    async fn tick_does_not_let_a_broken_oldest_target_starve_a_newer_one() {
+        let _guard = StateDirGuard::new();
+        let mut fail_for = std::collections::HashSet::new();
+        fail_for.insert("chat-a".to_string());
+        let (cp, _db) =
+            control_plane_with(Arc::new(SelectiveFailHarnessFactory { fail_for })).await;
+        idle_chat(&cp, "chat-a").await;
+        idle_chat(&cp, "chat-b").await;
+
+        // `chat-a` is enqueued FIRST, so it holds the older `created_at` and
+        // is the row `claim_deliverable_background_event` picks first.
+        let id_a = cp
+            .store()
+            .enqueue_background_event("chat-a", "delegation", "A")
+            .await
+            .unwrap();
+        // `created_at` has millisecond resolution — sleep past a tick so
+        // `chat-b`'s row is unambiguously newer than `chat-a`'s.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        cp.store()
+            .enqueue_background_event("chat-b", "delegation", "B")
+            .await
+            .unwrap();
+
+        tick(&cp).await;
+
+        // The newer target (`chat-b`) was delivered within the SAME tick —
+        // proving the still-claimed `chat-a` row wasn't re-picked ahead of
+        // it.
+        wait_for_message(cp.store(), "chat-b", |m| {
+            m.role == "user" && m.payload["text"] == "B"
+        })
+        .await;
+
+        // `chat-a`'s row is released at tick end (deferred, not lost) and
+        // still pending — a later tick gets exactly one more attempt at it.
+        assert_eq!(
+            cp.store().pending_background_count().await.unwrap(),
+            1,
+            "chat-a's row must still be pending (undelivered), not lost"
+        );
+        let reclaimed = cp
+            .store()
+            .claim_deliverable_background_event("retry")
+            .await
+            .unwrap();
+        assert_eq!(
+            reclaimed.map(|e| e.id),
+            Some(id_a),
+            "chat-a's released row must be re-claimable by a later tick"
         );
     }
 }
