@@ -3,13 +3,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type {
   BranchList,
   CatalogEntry,
+  ChatRequestOptions,
   CmdError,
   CommandInfo,
   ConnectionInfo,
   Project,
   ProjectRuntimeInfo,
   Result,
-  RuntimeInfo,
+  Session,
 } from "@/bindings";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
@@ -27,9 +28,39 @@ const runtimeInfo: ProjectRuntimeInfo = {
   modelInfo: null,
 };
 const projectRuntimeInfo = mock(() => Promise.resolve({ status: "ok" as const, data: runtimeInfo }));
+// start() (via useStore.start) calls these three IPC commands — mocked here
+// so the permission-picker test can drive the real store's start() and
+// inspect what startSession actually received.
+const startSession = mock(
+  (_projectId: string, _prompt: string, _options: ChatRequestOptions | null): Promise<Result<Session, CmdError>> =>
+    Promise.resolve({
+      status: "ok",
+      data: {
+        sessionPk: "s1",
+        projectId: "p1",
+        agentSessionId: null,
+        worktreePath: null,
+        branch: null,
+        title: "ship it",
+        status: "running",
+        permMode: "bypassPermissions",
+        startedBy: "cockpit",
+        createdAt: 1,
+        lastActive: 1,
+        resumeAttempts: 0,
+        branchOwned: false,
+        kind: "project",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
+      },
+    }),
+);
+const listProjects = mock((): Promise<Result<Project[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+const listSessions = mock((): Promise<Result<Session[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo },
+  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo, startSession, listProjects, listSessions },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount.
@@ -41,7 +72,7 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { useRuntimes } = await import("@/store-runtimes");
+const { useAgent } = await import("@/store-agent");
 const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
 
@@ -51,7 +82,6 @@ function project(overrides: Partial<Project> = {}): Project {
     name: "demo",
     workdir: "C:\\code\\demo",
     source: null,
-    harness: "native",
     model: null,
     effort: null,
     permMode: "default",
@@ -61,47 +91,16 @@ function project(overrides: Partial<Project> = {}): Project {
   };
 }
 
-const nativeRuntime: RuntimeInfo = {
-  id: "native",
-  name: "Ryuzi",
-  color: "#8B5CF6",
-  initial: "R",
-  connection: "In-process",
-  binaryPath: "in-process",
-  installedVersion: "0.5.0",
-  latestVersion: null,
-  npmPackage: null,
-  models: ["anthropic/claude-opus-4", "anthropic/claude-sonnet-4"],
-  selectableModels: [
-    {
-      kind: "concrete",
-      requestValue: "anthropic/claude-opus-4",
-      displayName: "claude-opus-4",
-      preferenceKey: { family: "anthropic", model: "claude-opus-4" },
-      supported: [],
-      configuredDefault: null,
-      resolvedDefault: null,
-      defaultSource: "none",
-    },
-    {
-      kind: "concrete",
-      requestValue: "anthropic/claude-sonnet-4",
-      displayName: "claude-sonnet-4",
-      preferenceKey: { family: "anthropic", model: "claude-sonnet-4" },
-      supported: [],
-      configuredDefault: null,
-      resolvedDefault: null,
-      defaultSource: "none",
-    },
-  ],
-  enabled: true,
-  model: "",
-  permMode: "ask",
-  flags: "",
-  tiers: [],
-  isDefault: true,
-  runnable: true,
-};
+const selectable = (requestValue: string) => ({
+  kind: "concrete" as const,
+  requestValue,
+  displayName: requestValue.split("/").pop() ?? requestValue,
+  preferenceKey: null,
+  supported: [],
+  configuredDefault: null,
+  resolvedDefault: null,
+  defaultSource: "none" as const,
+});
 
 const catalogEntries: CatalogEntry[] = [
   {
@@ -139,12 +138,19 @@ beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1", projectRuntimeById: { p1: runtimeInfo } });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
-  useRuntimes.setState({ runtimes: [nativeRuntime], loaded: true });
+  useAgent.setState({
+    models: [selectable("anthropic/claude-opus-4"), selectable("anthropic/claude-sonnet-4")],
+    model: null,
+    permMode: "ask",
+  });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
   useNav.setState({ composerBranch: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
+  startSession.mockClear();
+  listProjects.mockClear();
+  listSessions.mockClear();
 });
 
 // Reset the shared zustand singletons so later test files in the same bun
@@ -152,7 +158,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   useConnections.setState({ catalog: [], connections: [], loaded: false });
-  useRuntimes.setState({ runtimes: [], loaded: false });
+  useAgent.setState({ models: [], model: null, permMode: null });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
 });
@@ -201,6 +207,33 @@ test("composer model chip opens the structured model and effort menu", async () 
   expect(await screen.findByText("claude-opus-4")).toBeTruthy();
 });
 
+test("chat-first composer keeps model and effort in durable nav state", async () => {
+  useStore.setState({ selectedProjectId: null, projectRuntimeById: {} });
+  useAgent.setState({
+    models: [
+      {
+        ...selectable("anthropic/claude-opus-4"),
+        supported: [
+          { value: "medium", label: "Medium", description: null },
+          { value: "high", label: "High", description: null },
+        ],
+        resolvedDefault: "medium",
+        defaultSource: "provider",
+      },
+    ],
+    model: null,
+    permMode: "ask",
+  });
+  useNav.setState({ composerModel: null, composerEffort: null });
+  render(<HomeView />);
+
+  const trigger = screen.getByRole("button", { name: "Model and effort" });
+  fireEvent.click(trigger);
+  fireEvent.click(await screen.findByText("claude-opus-4"));
+  fireEvent.click(await screen.findByText("High"));
+  expect(useNav.getState()).toMatchObject({ composerModel: "anthropic/claude-opus-4", composerEffort: "high" });
+});
+
 test("structured composer model list comes from native metadata", async () => {
   useModelStatuses.setState({ byKey: { [statusKey("anthropic", "claude-sonnet-4")]: "invalid" } });
   useUi.setState({ hideInvalidModels: true });
@@ -208,4 +241,25 @@ test("structured composer model list comes from native metadata", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Model and effort" }));
   expect(await screen.findByText("claude-opus-4")).toBeTruthy();
   expect(screen.getByText("claude-sonnet-4")).toBeTruthy();
+});
+
+test("permission picker seeds the new session's mode", async () => {
+  render(<HomeView />);
+
+  // Default label reflects the project's own default mode ("ask").
+  const trigger = screen.getByRole("combobox", { name: "Permission mode" });
+  expect(trigger.textContent).toContain("Ask");
+
+  fireEvent.click(trigger);
+  fireEvent.click(await screen.findByRole("option", { name: /Full/ }));
+  // The trigger label updates to reflect the picked mode.
+  await waitFor(() => expect(trigger.textContent).toContain("Full"));
+
+  const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(box, { target: { value: "ship it" } });
+  fireEvent.keyDown(box, { key: "Enter" });
+
+  await waitFor(() => expect(startSession).toHaveBeenCalled());
+  const [, , options] = startSession.mock.calls[0];
+  expect(options?.permMode).toBe("bypassPermissions");
 });

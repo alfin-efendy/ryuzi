@@ -1,10 +1,8 @@
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, McpServerSpec, PermMode};
-use crate::registry::Registry;
+use crate::domain::{CoreEvent, McpServerSpec, PermMode, SessionKind};
 use crate::store::Store;
 use async_trait::async_trait;
 
-pub mod acp;
 pub mod native;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +12,23 @@ use tokio::sync::broadcast;
 /// (Spec 3 wiring) and passed to `Harness::start_session`.
 pub struct SessionCtx {
     pub session_pk: String,
+    /// The owning project, if any — `None` for a chat-first (project-less)
+    /// session. Mirrors `Session.project_id`; harness backends key
+    /// project-scoped features (e.g. the native runtime's persistent memory
+    /// and tool-policy lookups) off this rather than re-querying the store.
+    pub project_id: Option<String>,
+    /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
+    /// `Session.kind`.
+    pub kind: SessionKind,
+    /// Which agent persona/config is driving this session, if any. Mirrors
+    /// `Session.agent`; unused for `Project` sessions today.
+    pub agent: Option<String>,
     pub work_dir: PathBuf,
+    /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
+    /// — a second read root the native runtime's `read` tool tries when the
+    /// worktree jail rejects a path. `None` when the harness doesn't
+    /// materialize attachments to disk (or in bare test contexts).
+    pub attachments_dir: Option<PathBuf>,
     pub perm_mode: PermMode,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -34,7 +48,9 @@ pub struct SessionCtx {
     pub store: Arc<Store>,
 }
 
-/// A registered agent runtime (e.g. Claude Code via ACP in Spec 3).
+/// A registered agent runtime. `NativeHarness` (see `harness::native`) is the
+/// only production implementation; the trait boundary otherwise exists so
+/// tests can substitute fakes.
 #[async_trait]
 pub trait Harness: Send + Sync {
     /// Begin (or resume) a session; returns a live handle for its lifetime.
@@ -59,7 +75,7 @@ pub struct TurnPrompt {
     pub display: String,
     /// Anthropic content blocks prepended before the text block in the user
     /// turn (today: base64 image blocks built from attachments). Consumed by
-    /// the native runner; the ACP harness ignores them.
+    /// the native runner.
     pub blocks: Vec<serde_json::Value>,
     /// Display metadata persisted on the user transcript row —
     /// `[{name, path, contentType, size}]` per saved attachment.
@@ -85,20 +101,23 @@ pub trait HarnessSession: Send + Sync {
     async fn end(&self) -> anyhow::Result<()>;
     fn agent_session_id(&self) -> Option<String>;
 
-    /// Update the live permission mode for subsequent turns. Default no-op:
-    /// the ACP harness delegates permission to the external agent, so only the
-    /// in-process native session overrides this (see its `RunnerDeps`).
+    /// Update the live permission mode for subsequent turns. Default no-op;
+    /// the native session overrides this (see its `RunnerDeps`).
     fn set_perm_mode(&self, _mode: PermMode) {}
+
+    /// Buffer a message sent while a turn is already running, for injection
+    /// into that turn's next tool-result batch (Task B3). Default no-op: only
+    /// the in-process native runtime has an in-flight loop to steer — the ACP
+    /// harness delegates the whole turn to an external agent process with no
+    /// such mid-turn channel, so a steer call on it is silently dropped.
+    fn steer(&self, _text: String) {}
 }
 
-/// Builds a `Harness`. The factory instance carries host-injected config
-/// (e.g. the ACP adapter path in Spec 3), so `create` takes no arguments.
+/// Builds a `Harness`. The factory instance carries host-injected config,
+/// so `create` takes no arguments.
 pub trait HarnessFactory: Send + Sync {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>>;
 }
-
-/// name → `HarnessFactory`. Keyed by `Project.harness`.
-pub type HarnessRegistry = Registry<dyn HarnessFactory>;
 
 #[cfg(test)]
 mod tests {
@@ -142,7 +161,11 @@ mod tests {
         let (events, _rx) = broadcast::channel(16);
         SessionCtx {
             session_pk: "s1".into(),
+            project_id: None,
+            kind: SessionKind::Chat,
+            agent: None,
             work_dir: PathBuf::from("/tmp"),
+            attachments_dir: None,
             perm_mode: PermMode::Default,
             model: None,
             effort: None,
@@ -153,19 +176,6 @@ mod tests {
             approvals: Arc::new(ApprovalHub::new()),
             store,
         }
-    }
-
-    #[test]
-    fn registry_resolves_harness_factory_by_name() {
-        let mut reg: HarnessRegistry = HarnessRegistry::new();
-        reg.register("claude-code", Arc::new(FakeHarnessFactory));
-        reg.register("codex", Arc::new(FakeHarnessFactory));
-        assert!(reg.get("claude-code").is_some());
-        assert!(reg.get("unknown").is_none());
-        assert_eq!(
-            reg.names(),
-            vec!["claude-code".to_string(), "codex".to_string()]
-        );
     }
 
     #[tokio::test]

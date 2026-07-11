@@ -115,6 +115,22 @@ impl ContextManager {
         self.ledger.append_assistant(content).await
     }
 
+    /// Append a plain-text user turn (a single text block). Thin wrapper for
+    /// aux flows that have no image/tool blocks to carry — e.g. the
+    /// budget-exhausted nudge (spec Task B2).
+    pub async fn append_user_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.append_user(serde_json::json!([{ "type": "text", "text": text }]))
+            .await
+    }
+
+    /// Append a plain-text assistant turn (a single text block). Thin
+    /// wrapper for aux one-shot calls whose response is never a tool_use —
+    /// e.g. the post-exhaustion summary call (spec Task B2).
+    pub async fn append_assistant_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.append_assistant(serde_json::json!([{ "type": "text", "text": text }]))
+            .await
+    }
+
     /// Append tool_result blocks as one user turn, truncating each result's
     /// string content to the ingestion budget first (spec §6.2). The ledger
     /// stores the truncated form — exactly what the model sees.
@@ -194,6 +210,16 @@ impl ContextManager {
         self.tokens.last_output
     }
 
+    /// The last committed response's non-cached input token count (server truth).
+    pub fn last_input(&self) -> u64 {
+        self.tokens.last_input
+    }
+
+    /// The last committed response's cache-creation token count (server truth).
+    pub fn last_cache_creation(&self) -> u64 {
+        self.tokens.cache_creation
+    }
+
     /// On a context-overflow error: pin the indicator to 0% so the next
     /// turn's pre-check deterministically compacts (spec §12).
     pub fn mark_full(&mut self) {
@@ -267,6 +293,10 @@ mod tests {
             display_name: None,
             reasoning_efforts: vec![],
             default_reasoning_effort: None,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         }
     }
 

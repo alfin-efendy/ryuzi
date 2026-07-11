@@ -2,27 +2,31 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
-import { commands } from "@/bindings";
-import { useStore } from "@/store";
+import { commands, type SessionRuntimeInfo } from "@/bindings";
+import { useStore, type ChatOptions } from "@/store";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { useAgent } from "@/store-agent";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { headerAgentLine } from "@/lib/session-header";
+import { sessionRuntimeScope } from "@/lib/session-runtime";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
+import { NATIVE_AGENT, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
 import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { Transcript } from "@/components/transcript/Transcript";
+import { TranscriptFileContext } from "@/components/transcript/TranscriptFileContext";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
+import { SessionCostPanel } from "@/components/session/SessionCostPanel";
+import { QueuedMessages } from "@/components/session/QueuedMessages";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -40,9 +44,12 @@ export function SessionView() {
     setProjectRuntime,
     projectRuntimeById,
     loadProjectRuntime,
-    setProjectPermMode,
-    contextUsage,
+    sessionRuntimeById,
+    loadSessionRuntime,
+    setSessionPermMode,
+    setSessionRuntime,
   } = useStore();
+  const enqueueMessage = useStore((s) => s.enqueueMessage);
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
@@ -66,13 +73,14 @@ export function SessionView() {
 
   const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
   const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
-  const runtimes = useRuntimes((s) => s.runtimes);
-  const project = projects.find((p) => p.projectId === session?.projectId);
-  const projectId = project?.projectId;
-  // Ryuzi-only: every session runs the native runtime. Tolerant by
+  // Ryuzi-only: every session runs the native agent. Tolerant by
   // construction — legacy rows still saying "claude-code" (restored DBs)
   // are simply treated as native.
-  const agent = runtimeById(runtimes, "native");
+  const agentModel = useAgent((s) => s.model);
+  const agentModels = useAgent((s) => s.models);
+  const project = projects.find((p) => p.projectId === session?.projectId);
+  const projectId = project?.projectId;
+  const runtimeScope = sessionRuntimeScope(session?.kind, projectId ?? null);
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
@@ -86,6 +94,10 @@ export function SessionView() {
   useEffect(() => {
     if (projectId) void loadProjectRuntime(projectId);
   }, [projectId, loadProjectRuntime]);
+
+  useEffect(() => {
+    if (session?.sessionPk && runtimeScope === "session") void loadSessionRuntime(session.sessionPk);
+  }, [runtimeScope, session?.sessionPk, loadSessionRuntime]);
 
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
@@ -102,6 +114,27 @@ export function SessionView() {
     }
     prevSessionRunning.current = sessionRunning;
   }, [sessionRunning, session?.sessionPk, fetchDiff]);
+
+  // Session working directory, used to linkify workspace file paths in the
+  // transcript's markdown (see TranscriptFileContext).
+  const [workdir, setWorkdir] = useState<string | null>(null);
+  useEffect(() => {
+    setWorkdir(null);
+    if (!session?.sessionPk) return;
+    let alive = true;
+    void commands.sessionWorkdir(session.sessionPk).then((res) => {
+      if (alive && res.status === "ok") setWorkdir(res.data);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [session?.sessionPk]);
+  // Provider value for TranscriptFileContext — memoized so the Transcript's
+  // WorkspacePathCode instances don't all re-render on every SessionView render.
+  const transcriptFileCtx = useMemo(
+    () => (workdir && session?.sessionPk ? { sessionPk: session.sessionPk, workdir } : null),
+    [session?.sessionPk, workdir],
+  );
 
   // ArrowUp/Down history over this session's sent messages. A ref (not state)
   // holds the navigation cursor — it never drives rendering.
@@ -154,6 +187,35 @@ export function SessionView() {
     };
   }, [projectId, contextQueryText]);
 
+  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
+  const agentModelInfo = agentModels.find((model) => model.requestValue === agentModel) ?? null;
+  const readOnlyRuntime: SessionRuntimeInfo | null = session
+    ? {
+        sessionPk: session.sessionPk,
+        model: agentModel,
+        storedEffort: null,
+        effectiveEffort: agentModelInfo?.resolvedDefault ?? null,
+        effectiveEffortLabel:
+          agentModelInfo?.supported.find((option) => option.value === agentModelInfo.resolvedDefault)?.label ??
+          agentModelInfo?.resolvedDefault ??
+          null,
+        effectiveSource:
+          agentModelInfo?.defaultSource === "configured"
+            ? "configured"
+            : agentModelInfo?.defaultSource === "provider"
+              ? "provider"
+              : "none",
+        storedEffortStatus: "valid",
+        modelInfo: agentModelInfo,
+      }
+    : null;
+  const runtime =
+    runtimeScope === "project"
+      ? projectRuntime
+      : runtimeScope === "session" && session
+        ? (sessionRuntimeById[session.sessionPk] ?? null)
+        : readOnlyRuntime;
+
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center text-[13px] text-muted-foreground">Select a session from the sidebar.</div>
@@ -162,29 +224,30 @@ export function SessionView() {
 
   const meta = statusMeta(session.status);
   const running = session.status === "running";
-  const usage = contextUsage[session.sessionPk];
   const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
-  const permUi = corePermToUi(project?.permMode ?? "default");
+  const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
-  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
-  const modelOptions = agent?.selectableModels ?? [];
 
   const submit = () => {
-    if (running) return;
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
     const typed = draft;
-    // Clear optimistically; a rejected send puts the text back (unless the
-    // user already started typing something new — restoreDraft is a no-op then).
+    const options: ChatOptions = {
+      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+      attachments: composerFiles.attachments,
+    };
+    // Clear optimistically; a rejected *send* puts the text back. Enqueue never
+    // fails, so no restore path there.
     useNav.getState().clearDraft(key);
     historyRef.current = HISTORY_IDLE;
     composerFiles.clear();
     setContextRefs([]);
-    void send(key, t, {
-      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments: composerFiles.attachments,
-    }).then((ok) => {
+    if (running) {
+      enqueueMessage(key, { id: crypto.randomUUID(), text: t, options });
+      return;
+    }
+    void send(key, t, options).then((ok) => {
       if (!ok) useNav.getState().restoreDraft(key, typed);
     });
   };
@@ -227,7 +290,7 @@ export function SessionView() {
           <div className="min-w-0">
             <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
             <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-              <span>{headerAgentLine(agent, project)}</span>
+              <span>{headerAgentLine(project, agentModel)}</span>
               {session.branch && (
                 <span className="inline-flex items-center gap-1">
                   <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -259,26 +322,30 @@ export function SessionView() {
           </Button>
         </div>
 
-        {/* Native runtime plan (todowrite) */}
-        <TodoPanel sessionPk={session.sessionPk} running={running} />
-
-        {/* Transcript */}
-        <Transcript
-          sessionPk={session.sessionPk}
-          rows={rows}
-          agentName={agent?.name ?? "Agent"}
-          agentColor={agent?.color ?? "var(--muted-foreground)"}
-          running={running}
-        >
-          {pendingForSession.map((a, i) => (
-            <div key={a.requestId} className="px-4 pb-2">
-              <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
-            </div>
-          ))}
-        </Transcript>
+        {/* Transcript, with the floating plan panel overlaying it */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <TranscriptFileContext.Provider value={transcriptFileCtx}>
+            <Transcript
+              sessionPk={session.sessionPk}
+              rows={rows}
+              agentName={NATIVE_AGENT.name}
+              agentColor={NATIVE_AGENT.color}
+              running={running}
+            >
+              {pendingForSession.map((a, i) => (
+                <div key={a.requestId} className="px-4 pb-2">
+                  <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
+                </div>
+              ))}
+            </Transcript>
+          </TranscriptFileContext.Provider>
+          {/* Agent plan (todowrite) — floating rounded panel */}
+          <TodoPanel sessionPk={session.sessionPk} running={running} />
+        </div>
 
         {/* Session composer */}
         <div className="shrink-0 px-6 pb-4 pt-3">
+          <QueuedMessages sessionPk={session.sessionPk} />
           <div
             className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
           >
@@ -308,7 +375,7 @@ export function SessionView() {
                 }
               }}
               onPaste={composerFiles.onPaste}
-              placeholder="Ask for follow-up changes"
+              placeholder={running ? "Enter to queue" : "Ask for follow-up changes"}
               className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
             />
             {slashMatches.length > 0 && (
@@ -348,7 +415,7 @@ export function SessionView() {
                 options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
                 value={permUi}
                 onValueChange={(mode) => {
-                  if (projectId) void setProjectPermMode(projectId, uiPermToCore(mode as UiPermMode));
+                  void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
                 }}
                 trigger={
                   <Button
@@ -365,21 +432,15 @@ export function SessionView() {
                 }
               />
               <div className="flex-1" />
-              {usage && (
-                <span
-                  className="w-32 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground"
-                  title={`~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
-                >
-                  {usage.percentLeft}% context left
-                </span>
-              )}
+              <SessionCostPanel sessionPk={session.sessionPk} />
               <ComposerModelEffortMenu
-                models={modelOptions}
-                runtime={projectRuntime}
+                models={agentModels}
+                runtime={runtime}
                 onChange={(model, effort) => {
-                  if (projectId) void setProjectRuntime(projectId, model, effort);
+                  if (runtimeScope === "project" && projectId) void setProjectRuntime(projectId, model, effort);
+                  else if (runtimeScope === "session") void setSessionRuntime(session.sessionPk, model, effort);
                 }}
-                disabled={modelOptions.length === 0}
+                disabled={agentModels.length === 0 || runtimeScope === null}
                 running={running}
               />
               <Button
@@ -436,7 +497,7 @@ export function SessionView() {
           sessionPk={session.sessionPk}
           branch={session.branch ?? null}
           running={running}
-          isGit={project?.isGit ?? true}
+          isGit={project?.isGit ?? false}
         />
       )}
     </div>

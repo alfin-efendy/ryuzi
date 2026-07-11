@@ -1,422 +1,372 @@
+use crate::engine::EngineClient;
 use crate::error::CmdError;
 use ryuzi_core::branches::BranchList;
-use ryuzi_core::domain::{AttachmentRef, ToolPolicyRow};
-use ryuzi_core::llm_router::model_effort::{
-    EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
-    StoredEffortStatus,
-};
-use ryuzi_core::{
-    ControlPlane, Message, PermMode, Project, Session, SessionGitOptions, TurnPrompt,
-};
-use serde::{Deserialize, Serialize};
-use specta::Type;
+use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
+use ryuzi_core::llm_router::model_effort::{ModelPreferenceKey, ProjectRuntimeInfo};
+use ryuzi_core::{Message, PermMode, Project, Session};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
+// Cockpit's DTOs for these now live in `ryuzi_core::api::types`; only
+// `ChatRequestOptions` is referenced by name here (as a command param), but
+// specta's TS generation walks the type graph from every collected command,
+// so `ChatContextArg`/`GitOptions` are still emitted to `bindings.ts` as
+// fields of `ChatRequestOptions` without needing a local import.
+pub use ryuzi_core::api::types::ChatRequestOptions;
+pub use ryuzi_core::api::types::SessionRuntimeInfo;
+
 type R<T> = Result<T, CmdError>;
+// The old in-process `ControlPlane` state extractor is gone: every engine
+// command below is a thin proxy over the daemon's HTTP control API instead.
+type Engine<'a> = State<'a, Arc<EngineClient>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn get_setting(cp: State<'_, Arc<ControlPlane>>, key: String) -> R<Option<String>> {
-    Ok(cp.store().get_setting(&key).await?)
+pub async fn get_setting(engine: Engine<'_>, key: String) -> R<Option<String>> {
+    engine
+        .rpc("get_setting", serde_json::json!({ "key": key }))
+        .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_setting(cp: State<'_, Arc<ControlPlane>>, key: String, value: String) -> R<()> {
-    Ok(cp.store().set_setting(&key, &value).await?)
+pub async fn set_setting(engine: Engine<'_>, key: String, value: String) -> R<()> {
+    engine
+        .rpc(
+            "set_setting",
+            serde_json::json!({ "key": key, "value": value }),
+        )
+        .await
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn update_project(
-    cp: State<'_, Arc<ControlPlane>>,
+    engine: Engine<'_>,
     project_id: String,
     model: Option<String>,
     perm_mode: PermMode,
-    harness: String,
 ) -> R<Project> {
-    cp.store()
-        .update_project(&project_id, model, perm_mode, &harness)
-        .await?
-        .ok_or_else(|| CmdError {
-            message: format!("unknown project: {project_id}"),
-        })
+    engine
+        .rpc(
+            "update_project",
+            serde_json::json!({
+                "project_id": project_id, "model": model,
+                "perm_mode": perm_mode,
+            }),
+        )
+        .await
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn update_project_perm_mode(
-    cp: State<'_, Arc<ControlPlane>>,
+    engine: Engine<'_>,
     project_id: String,
     perm_mode: PermMode,
 ) -> R<()> {
-    if cp
-        .store()
-        .update_project_perm_mode(&project_id, perm_mode)
-        .await?
-    {
-        Ok(())
-    } else {
-        Err(CmdError {
-            message: format!("unknown project: {project_id}"),
-        })
-    }
-}
-
-fn clean_optional(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-async fn project_runtime_info_inner(
-    cp: &ControlPlane,
-    project_id: String,
-) -> R<ProjectRuntimeInfo> {
-    let project_id = project_id.trim().to_string();
-    let project = cp
-        .store()
-        .get_project(&project_id)
-        .await?
-        .ok_or_else(|| CmdError {
-            message: format!("unknown project: {project_id}"),
-        })?;
-    let model_info = match project.model.as_deref() {
-        Some(model) => ryuzi_core::llm_router::client::selectable_native_models(cp.store())
-            .await?
-            .into_iter()
-            .find(|candidate| candidate.request_value == model),
-        None => None,
-    };
-    let stored_effort_status = match (project.effort.as_deref(), model_info.as_ref()) {
-        (None, _) => StoredEffortStatus::Valid,
-        (Some(_), None) => StoredEffortStatus::UnknownMetadata,
-        (Some(_), Some(info)) if info.supported.is_empty() => StoredEffortStatus::UnknownMetadata,
-        (Some(effort), Some(info))
-            if info.supported.iter().any(|option| option.value == effort) =>
-        {
-            StoredEffortStatus::Valid
-        }
-        (Some(_), Some(_)) => StoredEffortStatus::Unsupported,
-    };
-    let project_effort = project.effort.as_ref().filter(|effort| {
-        model_info
-            .as_ref()
-            .is_some_and(|info| info.supported.iter().any(|option| &option.value == *effort))
-    });
-    let route_compatibility = match (project.model.as_deref(), model_info.as_ref()) {
-        (Some(model), Some(info)) => {
-            ryuzi_core::llm_router::client::named_route_compatibility_default(
-                cp.store(),
-                model,
-                &info.supported,
-            )
-            .await?
-        }
-        _ => None,
-    };
-    let (effective_effort, effective_source) = if let Some(effort) = project_effort {
-        (Some(effort.clone()), EffectiveEffortSource::Project)
-    } else if let Some(effort) = route_compatibility {
-        (Some(effort), EffectiveEffortSource::RouteCompatibility)
-    } else if let Some(info) = &model_info {
-        let source = match info.default_source {
-            ModelDefaultSource::Configured => EffectiveEffortSource::Configured,
-            ModelDefaultSource::Provider => EffectiveEffortSource::Provider,
-            ModelDefaultSource::VariesByTarget | ModelDefaultSource::None => {
-                EffectiveEffortSource::None
-            }
-        };
-        (info.resolved_default.clone(), source)
-    } else {
-        (None, EffectiveEffortSource::None)
-    };
-    let effective_effort_label = effective_effort.as_ref().and_then(|value| {
-        model_info.as_ref().and_then(|info| {
-            info.supported
-                .iter()
-                .find(|option| &option.value == value)
-                .map(|option| option.label.clone())
-        })
-    });
-    Ok(ProjectRuntimeInfo {
-        project_id,
-        model: project.model,
-        stored_effort: project.effort,
-        effective_effort,
-        effective_effort_label,
-        effective_source,
-        stored_effort_status,
-        model_info,
-    })
-}
-
-async fn update_project_runtime_inner(
-    cp: &ControlPlane,
-    project_id: String,
-    model: Option<String>,
-    effort: Option<String>,
-) -> R<ProjectRuntimeInfo> {
-    let project_id = project_id.trim().to_string();
-    let model = clean_optional(model);
-    let effort = match effort {
-        Some(value) if value.trim().is_empty() => {
-            return Err(CmdError {
-                message: "effort cannot be empty".into(),
-            });
-        }
-        value => clean_optional(value),
-    };
-    if cp.store().get_project(&project_id).await?.is_none() {
-        return Err(CmdError {
-            message: format!("unknown project: {project_id}"),
-        });
-    }
-    if let Some(value) = effort.as_deref() {
-        let selected = ryuzi_core::llm_router::client::selectable_native_models(cp.store())
-            .await?
-            .into_iter()
-            .find(|candidate| model.as_deref() == Some(candidate.request_value.as_str()));
-        if !selected.is_some_and(|selected| {
-            selected
-                .supported
-                .iter()
-                .any(|option| option.value == value)
-        }) {
-            return Err(CmdError {
-                message: format!("effort {value:?} is not supported for the selected model"),
-            });
-        }
-    }
-    cp.store()
-        .update_project_runtime(&project_id, model, effort)
-        .await?;
-    project_runtime_info_inner(cp, project_id).await
+    engine
+        .rpc(
+            "update_project_perm_mode",
+            serde_json::json!({ "project_id": project_id, "perm_mode": perm_mode }),
+        )
+        .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn set_model_effort_preference(
-    cp: State<'_, Arc<ControlPlane>>,
-    key: ModelPreferenceKey,
-    effort: Option<String>,
-) -> R<()> {
-    let key = ModelPreferenceKey {
-        family: key.family.trim().to_string(),
-        model: key.model.trim().to_string(),
-    };
-    let effort = match effort {
-        Some(value) if value.trim().is_empty() => {
-            return Err(CmdError {
-                message: "effort cannot be empty".into(),
-            });
-        }
-        value => clean_optional(value),
-    };
-    Ok(
-        ryuzi_core::llm_router::model_effort::set_preference(cp.store(), &key, effort.as_deref())
-            .await?,
-    )
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn project_runtime_info(
-    cp: State<'_, Arc<ControlPlane>>,
-    project_id: String,
-) -> R<ProjectRuntimeInfo> {
-    project_runtime_info_inner(&cp, project_id).await
+pub async fn project_runtime_info(engine: Engine<'_>, project_id: String) -> R<ProjectRuntimeInfo> {
+    engine
+        .rpc(
+            "project_runtime_info",
+            serde_json::json!({ "project_id": project_id }),
+        )
+        .await
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn update_project_runtime(
-    cp: State<'_, Arc<ControlPlane>>,
+    engine: Engine<'_>,
     project_id: String,
     model: Option<String>,
     effort: Option<String>,
 ) -> R<ProjectRuntimeInfo> {
-    update_project_runtime_inner(&cp, project_id, model, effort).await
+    engine
+        .rpc(
+            "update_project_runtime",
+            serde_json::json!({
+                "project_id": project_id, "model": model, "effort": effort,
+            }),
+        )
+        .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_projects(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<Project>> {
-    Ok(cp.list_projects().await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn list_sessions(
-    cp: State<'_, Arc<ControlPlane>>,
-    project_id: Option<String>,
-) -> R<Vec<Session>> {
-    Ok(cp.list_sessions(project_id.as_deref()).await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn connect_project(
-    cp: State<'_, Arc<ControlPlane>>,
-    workdir: String,
-    name: String,
-) -> R<Project> {
-    Ok(cp
-        .connect_project(std::path::Path::new(&workdir), &name)
-        .await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn clone_project(
-    cp: State<'_, Arc<ControlPlane>>,
-    url: String,
-    dest_parent: String,
-) -> R<Project> {
-    Ok(cp
-        .clone_project(&url, std::path::Path::new(&dest_parent))
-        .await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn list_branches(cp: State<'_, Arc<ControlPlane>>, project_id: String) -> R<BranchList> {
-    let project = cp
-        .store()
-        .get_project(&project_id)
-        .await?
-        .ok_or_else(|| CmdError {
-            message: format!("unknown project: {project_id}"),
-        })?;
-    // git2 is blocking; keep it off the async runtime's worker thread.
-    let list = tokio::task::spawn_blocking(move || {
-        ryuzi_core::branches::list_branches(Path::new(&project.workdir))
-    })
-    .await
-    .map_err(|e| CmdError {
-        message: format!("list_branches task failed: {e}"),
-    })??;
-    Ok(list)
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatContextArg {
-    pub branch: Option<String>,
-    pub voice_transcript: Option<String>,
-    #[serde(default)]
-    pub references: Vec<String>,
-}
-
-/// Per-start git controls from the composer (behavior matrix, workstream B).
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct GitOptions {
-    pub use_worktree: bool,
-    pub create_branch: bool,
-    pub branch_name: Option<String>,
-    pub base_branch: Option<String>,
-}
-
-impl From<GitOptions> for SessionGitOptions {
-    fn from(g: GitOptions) -> Self {
-        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        SessionGitOptions {
-            use_worktree: g.use_worktree,
-            create_branch: g.create_branch,
-            branch_name: clean(g.branch_name),
-            base_branch: clean(g.base_branch),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatRequestOptions {
-    pub runtime_id: Option<String>,
-    pub context: Option<ChatContextArg>,
-    #[serde(default)]
-    pub attachments: Vec<String>,
-    /// None => engine default (worktree ON, new engine-named branch from HEAD).
-    pub git: Option<GitOptions>,
-}
-
-/// Ryuzi-only sessions: every runtime id resolves to the native harness.
-/// Legacy ids ("claude", "native") and anything else are accepted so old
-/// frontends or queued payloads can never error here; the Result shape is
-/// kept so call sites stay `?`-compatible.
-fn harness_for_runtime(_runtime_id: &str) -> Result<&'static str, CmdError> {
-    Ok("native")
-}
-
-async fn apply_runtime_choice(
-    cp: &ControlPlane,
-    project_id: &str,
-    runtime_id: Option<&str>,
+pub async fn set_model_effort_preference(
+    engine: Engine<'_>,
+    key: ModelPreferenceKey,
+    effort: Option<String>,
 ) -> R<()> {
-    let runtime_id = runtime_id.filter(|v| !v.trim().is_empty());
-    if runtime_id.is_none() {
-        return Ok(());
-    };
-    let harness = match runtime_id {
-        Some(runtime_id) => harness_for_runtime(runtime_id)?,
-        None => "",
-    };
-    if harness.is_empty() {
-        return Ok(());
-    }
-    if !cp
-        .store()
-        .update_project_harness(project_id, harness)
-        .await?
-    {
+    engine
+        .rpc(
+            "set_model_effort_preference",
+            serde_json::json!({ "key": key, "effort": effort }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn session_runtime_info(engine: Engine<'_>, session_pk: String) -> R<SessionRuntimeInfo> {
+    engine
+        .rpc(
+            "session_runtime_info",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_session_runtime(
+    engine: Engine<'_>,
+    session_pk: String,
+    model: Option<String>,
+    effort: Option<String>,
+) -> R<SessionRuntimeInfo> {
+    engine
+        .rpc(
+            "update_session_runtime",
+            serde_json::json!({ "session_pk": session_pk, "model": model, "effort": effort }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_session_perm_mode(
+    engine: Engine<'_>,
+    session_pk: String,
+    perm_mode: PermMode,
+) -> R<()> {
+    engine
+        .rpc(
+            "update_session_perm_mode",
+            serde_json::json!({ "session_pk": session_pk, "perm_mode": perm_mode }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_projects(engine: Engine<'_>) -> R<Vec<Project>> {
+    engine.rpc("list_projects", serde_json::json!({})).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_sessions(engine: Engine<'_>, project_id: Option<String>) -> R<Vec<Session>> {
+    engine
+        .rpc(
+            "list_sessions",
+            serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn connect_project(engine: Engine<'_>, workdir: String, name: String) -> R<Project> {
+    engine
+        .rpc(
+            "connect_project",
+            serde_json::json!({ "workdir": workdir, "name": name }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn clone_project(engine: Engine<'_>, url: String, dest_parent: String) -> R<Project> {
+    engine
+        .rpc(
+            "clone_project",
+            serde_json::json!({ "url": url, "dest_parent": dest_parent }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_branches(engine: Engine<'_>, project_id: String) -> R<BranchList> {
+    engine
+        .rpc(
+            "list_branches",
+            serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn start_session(
+    engine: Engine<'_>,
+    project_id: String,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+) -> R<Session> {
+    engine
+        .rpc(
+            "start_session",
+            serde_json::json!({
+                "project_id": project_id, "prompt": prompt, "options": options,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn start_chat_session(
+    engine: Engine<'_>,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+) -> R<Session> {
+    engine
+        .rpc(
+            "start_chat_session",
+            serde_json::json!({ "prompt": prompt, "options": options }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn continue_session(
+    engine: Engine<'_>,
+    session_pk: String,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+) -> R<()> {
+    engine
+        .rpc(
+            "continue_session",
+            serde_json::json!({
+                "session_pk": session_pk, "prompt": prompt, "options": options,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn steer_session(engine: Engine<'_>, session_pk: String, text: String) -> R<bool> {
+    engine
+        .rpc(
+            "steer",
+            serde_json::json!({ "session_pk": session_pk, "text": text }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn stop_session(engine: Engine<'_>, session_pk: String) -> R<()> {
+    engine
+        .rpc(
+            "stop_session",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn end_session(engine: Engine<'_>, session_pk: String) -> R<()> {
+    engine
+        .rpc(
+            "end_session",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_tool_policies(engine: Engine<'_>) -> R<Vec<ToolPolicyRow>> {
+    engine
+        .rpc("list_tool_policies", serde_json::json!({}))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_tool_policy(engine: Engine<'_>, project_id: String, tool: String) -> R<()> {
+    engine
+        .rpc(
+            "delete_tool_policy",
+            serde_json::json!({ "project_id": project_id, "tool": tool }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn resolve_approval(
+    engine: Engine<'_>,
+    request_id: String,
+    response: ApprovalResponse,
+) -> bool {
+    // Tauri requires async commands that take a reference input (`State<'_,
+    // _>` included) to return `Result` — `bool` doesn't qualify, so this stays
+    // sync (bindings-stable: specta emits `Promise<boolean>` either way) and
+    // bridges into the async engine call via `block_in_place` + `block_on`,
+    // which is safe here because command handlers already run on a blocking
+    // thread of the tauri async runtime.
+    tokio::task::block_in_place(|| {
+        tauri::async_runtime::block_on(engine.resolve_approval(&request_id, response))
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_messages(engine: Engine<'_>, session_pk: String) -> R<Vec<Message>> {
+    engine
+        .rpc(
+            "list_messages",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+/// Largest file the viewer will load into memory.
+const MAX_READ_BYTES: u64 = 2 * 1024 * 1024; // 2 MB cap
+
+/// Reject reads past the viewer's size cap before touching file contents; the
+/// error carries the offending size.
+fn check_read_size(len: u64) -> Result<(), CmdError> {
+    if len > MAX_READ_BYTES {
         return Err(CmdError {
-            message: format!("unknown project: {project_id}"),
+            message: format!("file too large ({len} bytes)"),
         });
     }
     Ok(())
 }
 
-fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
-    let Some(context) = context else {
-        return prompt.to_string();
-    };
-    let mut lines = Vec::new();
-    if let Some(branch) = context
-        .branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        lines.push(format!("- Branch: {branch}"));
-    }
-    if let Some(voice) = context
-        .voice_transcript
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        lines.push(format!("- Voice transcript: {voice}"));
-    }
-    for reference in context
-        .references
-        .iter()
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-    {
-        lines.push(format!("- Referenced file: {reference}"));
-    }
-    if lines.is_empty() {
-        prompt.to_string()
-    } else if prompt.trim().is_empty() {
-        format!("[Chat context]\n{}", lines.join("\n"))
-    } else {
-        format!("{prompt}\n\n[Chat context]\n{}", lines.join("\n"))
-    }
+#[tauri::command]
+#[specta::specta]
+pub async fn read_file(path: String) -> R<String> {
+    let meta = tokio::fs::metadata(&path).await?;
+    check_read_size(meta.len())?;
+    Ok(tokio::fs::read_to_string(&path).await?)
 }
+
+/// Largest media file inlined as a composer preview.
+const MAX_MEDIA_READ_BYTES: u64 = 8 * 1024 * 1024;
 
 fn content_type_for_path(path: &Path) -> Option<String> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
@@ -443,194 +393,21 @@ fn content_type_for_path(path: &Path) -> Option<String> {
     }
 }
 
-async fn attachment_refs_from_paths(paths: &[String]) -> R<Vec<AttachmentRef>> {
-    let mut out = Vec::new();
-    for raw in paths {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let path = tokio::fs::canonicalize(raw).await?;
-        let meta = tokio::fs::metadata(&path).await?;
-        if !meta.is_file() {
-            return Err(CmdError {
-                message: format!("attachment is not a file: {}", path.display()),
-            });
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_string());
-        out.push(AttachmentRef {
-            name,
-            url: ryuzi_core::attachments::file_url_for_path(&path)?.to_string(),
-            content_type: content_type_for_path(&path),
-            size: meta.len(),
-        });
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn start_session(
-    cp: State<'_, Arc<ControlPlane>>,
-    project_id: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
-) -> R<Session> {
-    let options = options.unwrap_or_default();
-    apply_runtime_choice(&cp, &project_id, options.runtime_id.as_deref()).await?;
-    let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
-    let attachments = attachment_refs_from_paths(&options.attachments).await?;
-    let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
-    // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
-    Ok(cp
-        .inner()
-        .start_session_with_prompt(
-            &project_id,
-            TurnPrompt::text(agent_prompt, prompt),
-            "cockpit",
-            &attachments,
-            git,
-        )
-        .await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn continue_session(
-    cp: State<'_, Arc<ControlPlane>>,
-    session_pk: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
-) -> R<()> {
-    let options = options.unwrap_or_default();
-    let attachments = attachment_refs_from_paths(&options.attachments).await?;
-    let agent_prompt = chat_agent_prompt(&prompt, options.context.as_ref());
-    // `.inner()` -> &Arc<ControlPlane>: start/continue_session take `self: &Arc<Self>`.
-    Ok(cp
-        .inner()
-        .continue_session_with_prompt(
-            &session_pk,
-            TurnPrompt::text(agent_prompt, prompt),
-            &attachments,
-        )
-        .await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn stop_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<()> {
-    Ok(cp.stop_session(&session_pk).await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn end_session(cp: State<'_, Arc<ControlPlane>>, session_pk: String) -> R<()> {
-    Ok(cp.end_session(&session_pk).await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn list_tool_policies(cp: State<'_, Arc<ControlPlane>>) -> R<Vec<ToolPolicyRow>> {
-    Ok(cp.list_tool_policies().await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn delete_tool_policy(
-    cp: State<'_, Arc<ControlPlane>>,
-    project_id: String,
-    tool: String,
-) -> R<()> {
-    Ok(cp.delete_tool_policy(&project_id, &tool).await?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub fn resolve_approval(
-    cp: State<'_, Arc<ControlPlane>>,
-    request_id: String,
-    response: ryuzi_core::domain::ApprovalResponse,
-) -> bool {
-    cp.resolve_approval(&request_id, response)
-}
-
-/// Largest file the viewer will load into memory.
-const MAX_READ_BYTES: u64 = 2 * 1024 * 1024; // 2 MB cap
-
-/// Reject reads past the viewer's size cap before touching file contents; the
-/// error carries the offending size.
-fn check_read_size(len: u64) -> Result<(), CmdError> {
-    if len > MAX_READ_BYTES {
-        return Err(CmdError {
-            message: format!("file too large ({len} bytes)"),
-        });
-    }
-    Ok(())
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn read_file(path: String) -> R<String> {
-    let meta = tokio::fs::metadata(&path).await?;
-    check_read_size(meta.len())?;
-    Ok(tokio::fs::read_to_string(&path).await?)
-}
-
-/// Largest pasted attachment accepted from the webview (decoded size).
-const MAX_STAGE_BYTES: usize = 25 * 1024 * 1024;
-/// Largest media file inlined as a composer preview.
-const MAX_MEDIA_READ_BYTES: u64 = 8 * 1024 * 1024;
-
-/// Keep only the final path segment and strip characters unsafe in a file name.
-fn sanitize_file_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("file");
-    let cleaned: String = base
-        .chars()
-        .filter(|c| !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// Write pasted bytes into the attachments staging area and return the
 /// absolute path — from there the file flows through the normal attachment
 /// pipeline on send. Staging is wiped on app start (see lib.rs setup).
 #[tauri::command]
 #[specta::specta]
-pub async fn stage_attachment(
-    cp: State<'_, Arc<ControlPlane>>,
-    name: String,
-    data_base64: String,
-) -> R<String> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_base64.as_bytes())
-        .map_err(|e| CmdError {
-            message: format!("invalid attachment data: {e}"),
-        })?;
-    if bytes.len() > MAX_STAGE_BYTES {
-        return Err(CmdError {
-            message: format!("attachment too large ({} bytes)", bytes.len()),
-        });
-    }
-    let dir = cp
-        .attachments_root()
+pub async fn stage_attachment(engine: Engine<'_>, name: String, data_base64: String) -> R<String> {
+    engine
+        .rpc(
+            "stage_attachment",
+            serde_json::json!({ "name": name, "data_base64": data_base64 }),
+        )
         .await
-        .join("staging")
-        .join(ryuzi_core::paths::new_id());
-    tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(sanitize_file_name(&name));
-    tokio::fs::write(&path, &bytes).await?;
-    Ok(path.to_string_lossy().into_owned())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaFile {
     pub data_base64: String,
@@ -681,15 +458,6 @@ pub async fn pick_files(app: tauri::AppHandle) -> Vec<String> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_messages(
-    cp: State<'_, Arc<ControlPlane>>,
-    session_pk: String,
-) -> R<Vec<Message>> {
-    Ok(cp.list_messages(&session_pk).await?)
-}
-
-#[tauri::command]
-#[specta::specta]
 pub fn backdrop_capability(
     state: State<'_, crate::backdrop::BackdropState>,
 ) -> crate::backdrop::BackdropCapability {
@@ -710,269 +478,6 @@ mod tests {
     fn sizes_over_the_cap_are_rejected_with_the_size() {
         let err = check_read_size(MAX_READ_BYTES + 1).unwrap_err();
         assert_eq!(err.message, "file too large (2097153 bytes)");
-    }
-
-    #[test]
-    fn harness_for_runtime_always_resolves_native() {
-        // Ryuzi-only sessions: any id — current, legacy, or unknown —
-        // resolves to the native harness instead of erroring.
-        assert_eq!(harness_for_runtime("native").unwrap(), "native");
-        assert_eq!(harness_for_runtime("claude").unwrap(), "native");
-        assert_eq!(harness_for_runtime("codex").unwrap(), "native");
-        assert_eq!(harness_for_runtime("anything-legacy").unwrap(), "native");
-    }
-
-    #[tokio::test]
-    async fn chat_submission_contains_no_model_and_cannot_overwrite_atomic_runtime_state() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
-        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
-        cp.store()
-            .insert_project(Project {
-                project_id: "p1".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
-                source: None,
-                harness: "claude-code".into(),
-                model: Some("openrouter/qwen3:free".into()),
-                effort: Some("high".into()),
-                perm_mode: PermMode::Default,
-                created_at: None,
-                is_git: false,
-            })
-            .await
-            .unwrap();
-
-        // Chat canonicalizes only the legacy harness column.
-        apply_runtime_choice(&cp, "p1", Some("native"))
-            .await
-            .unwrap();
-
-        let got = cp.store().get_project("p1").await.unwrap().unwrap();
-        assert_eq!(
-            got.harness, "native",
-            "legacy harness migrates on next start"
-        );
-        assert_eq!(
-            got.model.as_deref(),
-            Some("openrouter/qwen3:free"),
-            "chat runtime canonicalization must not change the committed model"
-        );
-        assert_eq!(got.effort.as_deref(), Some("high"));
-    }
-
-    #[tokio::test]
-    async fn model_effort_commands_trim_values_and_reject_empty_explicit_effort() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
-        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
-        cp.store()
-            .insert_project(Project {
-                project_id: "p1".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
-                source: None,
-                harness: "native".into(),
-                model: None,
-                effort: None,
-                perm_mode: PermMode::Default,
-                created_at: None,
-                is_git: false,
-            })
-            .await
-            .unwrap();
-
-        let error = update_project_runtime_inner(
-            &cp,
-            " p1 ".into(),
-            Some(" model ".into()),
-            Some("   ".into()),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.message.contains("effort cannot be empty"));
-
-        let info = update_project_runtime_inner(&cp, " p1 ".into(), None, None)
-            .await
-            .unwrap();
-        assert_eq!(info.project_id, "p1");
-        assert_eq!(
-            info.stored_effort_status,
-            ryuzi_core::llm_router::model_effort::StoredEffortStatus::Valid
-        );
-    }
-
-    #[tokio::test]
-    async fn project_runtime_info_reports_named_route_compatibility_and_project_precedence() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
-        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
-        let metadata = ryuzi_core::llm_router::model_effort::DiscoveredModelMeta {
-            display_name: Some("GPT X".into()),
-            effort_options: Some(vec![
-                ryuzi_core::llm_router::model_effort::ReasoningEffortOption {
-                    value: "medium".into(),
-                    label: "Medium".into(),
-                    description: None,
-                },
-                ryuzi_core::llm_router::model_effort::ReasoningEffortOption {
-                    value: "high".into(),
-                    label: "High".into(),
-                    description: None,
-                },
-            ]),
-            default_effort_advertised: true,
-            default_effort: Some("medium".into()),
-        };
-        ryuzi_core::llm_router::connections::add_connection(
-            cp.store(),
-            ryuzi_core::llm_router::connections::ConnectionRow {
-                id: "codex".into(),
-                provider: "openai-oauth".into(),
-                auth_type: "oauth".into(),
-                label: "Codex".into(),
-                priority: 0,
-                enabled: true,
-                data: ryuzi_core::llm_router::connections::ConnectionData {
-                    access_token: Some("at".into()),
-                    models_override: Some(vec!["gpt-x".into()]),
-                    model_meta_overrides: Some([("gpt-x".into(), metadata)].into()),
-                    ..Default::default()
-                },
-                created_at: 1,
-                updated_at: 1,
-            },
-        )
-        .await
-        .unwrap();
-        cp.store()
-            .insert_project(Project {
-                project_id: "p1".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
-                source: None,
-                harness: "native".into(),
-                model: Some("safe".into()),
-                effort: None,
-                perm_mode: PermMode::Default,
-                created_at: None,
-                is_git: false,
-            })
-            .await
-            .unwrap();
-        cp.store()
-            .set_setting(
-                "llm_model_routes",
-                r#"[{"id":"r1","name":"safe","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"gpt-x","effort":"high"}],"createdAt":1,"updatedAt":1}]"#,
-            )
-            .await
-            .unwrap();
-
-        let compatibility = project_runtime_info_inner(&cp, "p1".into()).await.unwrap();
-        assert_eq!(compatibility.effective_effort.as_deref(), Some("high"));
-        assert_eq!(
-            compatibility.effective_source,
-            EffectiveEffortSource::RouteCompatibility
-        );
-        assert_eq!(
-            compatibility.stored_effort_status,
-            StoredEffortStatus::Valid
-        );
-
-        cp.store()
-            .update_project_runtime("p1", Some("safe".into()), Some("medium".into()))
-            .await
-            .unwrap();
-        let project = project_runtime_info_inner(&cp, "p1".into()).await.unwrap();
-        assert_eq!(project.effective_effort.as_deref(), Some("medium"));
-        assert_eq!(project.effective_source, EffectiveEffortSource::Project);
-        assert_eq!(project.stored_effort_status, StoredEffortStatus::Valid);
-    }
-
-    #[test]
-    fn chat_request_options_ignore_legacy_model_field() {
-        let raw = serde_json::json!({"runtimeId": "native", "model": "fable"});
-        let opts: ChatRequestOptions = serde_json::from_value(raw).unwrap();
-        assert_eq!(opts.runtime_id.as_deref(), Some("native"));
-        let serialized = serde_json::to_value(opts).unwrap();
-        assert!(serialized.get("model").is_none());
-    }
-
-    #[test]
-    fn chat_agent_prompt_appends_context_without_changing_display_text() {
-        let out = chat_agent_prompt(
-            "/review auth",
-            Some(&ChatContextArg {
-                branch: Some("feature/auth".into()),
-                voice_transcript: Some("review the auth changes".into()),
-                references: vec![],
-            }),
-        );
-        assert!(out.starts_with("/review auth\n\n[Chat context]"));
-        assert!(out.contains("- Branch: feature/auth"));
-        assert!(out.contains("- Voice transcript: review the auth changes"));
-    }
-
-    #[test]
-    fn chat_agent_prompt_appends_referenced_files_from_context_mentions() {
-        let out = chat_agent_prompt(
-            "explain this",
-            Some(&ChatContextArg {
-                references: vec!["src/main.rs".into(), "crates/core/src/lib.rs".into()],
-                ..Default::default()
-            }),
-        );
-        assert!(out.contains("- Referenced file: src/main.rs"));
-        assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
-    }
-
-    #[test]
-    fn chat_request_options_git_defaults_to_none_and_deserializes() {
-        // Old payloads (no `git` key) keep parsing.
-        let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
-                .unwrap();
-        assert!(opts.git.is_none());
-
-        let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({
-            "git": {
-                "useWorktree": false,
-                "createBranch": true,
-                "branchName": "feat/x",
-                "baseBranch": null
-            }
-        }))
-        .unwrap();
-        let git = opts.git.unwrap();
-        assert!(!git.use_worktree);
-        assert!(git.create_branch);
-        assert_eq!(git.branch_name.as_deref(), Some("feat/x"));
-        assert_eq!(git.base_branch, None);
-    }
-
-    #[test]
-    fn git_options_convert_to_session_git_options_trimming_blanks() {
-        let core: ryuzi_core::SessionGitOptions = GitOptions {
-            use_worktree: true,
-            create_branch: false,
-            branch_name: Some("   ".into()),
-            base_branch: Some(" develop ".into()),
-        }
-        .into();
-        assert!(core.use_worktree);
-        assert!(!core.create_branch);
-        assert_eq!(core.branch_name, None, "blank names collapse to None");
-        assert_eq!(core.base_branch.as_deref(), Some("develop"));
-    }
-
-    #[test]
-    fn sanitize_file_name_strips_directories_and_unsafe_chars() {
-        assert_eq!(sanitize_file_name("shot.png"), "shot.png");
-        // rsplit keeps only the last path segment — traversal collapses away.
-        assert_eq!(sanitize_file_name("..\\..\\evil.exe"), "evil.exe");
-        assert_eq!(sanitize_file_name("a/b/c.png"), "c.png");
-        assert_eq!(sanitize_file_name("we|ird?.png"), "weird.png");
-        assert_eq!(sanitize_file_name("   "), "file");
     }
 
     #[test]

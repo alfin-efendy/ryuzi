@@ -11,7 +11,6 @@ export const PROJECT = {
   name: "demo",
   workdir: "/tmp/demo",
   source: null,
-  harness: "claude",
   model: null,
   effort: null,
   permMode: "default",
@@ -224,6 +223,17 @@ const initialProjectRuntime = {
   modelInfo: null,
 };
 
+const initialSessionRuntime = {
+  sessionPk: "c-1",
+  model: null,
+  storedEffort: null,
+  effectiveEffort: null,
+  effectiveEffortLabel: null,
+  effectiveSource: "none",
+  storedEffortStatus: "valid",
+  modelInfo: null,
+};
+
 export const SESSION = {
   sessionPk: "s-1",
   projectId: "p-demo",
@@ -236,6 +246,21 @@ export const SESSION = {
   createdAt: 0,
   lastActive: 0,
   resumeAttempts: 0,
+  branchOwned: false,
+  permMode: "default",
+  kind: "project",
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
+};
+
+/** A project-less chat session (kind "chat"), returned by start_chat_session. */
+export const CHAT_SESSION = {
+  ...SESSION,
+  sessionPk: "c-1",
+  projectId: null,
+  branch: null,
+  kind: "chat",
 };
 
 export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
@@ -287,12 +312,23 @@ const FIXTURES: Record<string, unknown> = {
   list_providers: [],
   list_provider_catalog: PROVIDER_CATALOG,
   list_connections: CONNECTIONS,
+  get_agent_settings: { model: null, permMode: "ask" },
+  list_selectable_models: NATIVE_RUNTIME.selectableModels,
   list_runtimes: [NATIVE_RUNTIME],
   refresh_runtimes: [NATIVE_RUNTIME],
   list_gateways: [],
   probe_gateways: [],
   list_jobs: [],
   list_apps: [],
+  // Plugin-distribution commands invoked on the Plugins view mount. Without
+  // these, the fallback returns `null` for the non-`list_`-prefixed ones
+  // (`plugin_doctor`, `plugins_restart_required`), and the store then renders
+  // `doctorFindings`/`restartRequired` from `null` — crashing the view and
+  // wedging sidebar navigation.
+  list_plugins: [],
+  list_skills: [],
+  plugin_doctor: [],
+  plugins_restart_required: false,
   get_setting: null,
   backdrop_capability: "none",
   system_accent_color: null,
@@ -304,6 +340,9 @@ const FIXTURES: Record<string, unknown> = {
   list_all_model_statuses: [],
   connection_usage: null,
   set_model_effort_preference: null,
+  start_chat_session: CHAT_SESSION,
+  session_runtime_info: initialSessionRuntime,
+  update_session_runtime: initialSessionRuntime,
 };
 
 /**
@@ -365,6 +404,32 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         effectiveSource: string;
         storedEffortStatus: string;
         modelInfo: (typeof SELECTABLE_MODELS)[number] | null;
+      };
+      let sessionRuntime = fixtures.session_runtime_info as {
+        sessionPk: string;
+        model: string | null;
+        storedEffort: string | null;
+        effectiveEffort: string | null;
+        effectiveEffortLabel: string | null;
+        effectiveSource: string;
+        storedEffortStatus: string;
+        modelInfo: (typeof SELECTABLE_MODELS)[number] | null;
+      };
+
+      const resolveRuntime = (owner: { projectId: string } | { sessionPk: string }, model: string | null, effort: string | null) => {
+        const modelInfo = (fixtures.list_selectable_models as typeof SELECTABLE_MODELS).find((entry) => entry.requestValue === model);
+        const fallback = modelInfo?.supported.find((option) => option.value === modelInfo.resolvedDefault) ?? null;
+        const selected = modelInfo?.supported.find((option) => option.value === effort) ?? fallback;
+        return {
+          ...owner,
+          model,
+          storedEffort: effort,
+          effectiveEffort: selected?.value ?? null,
+          effectiveEffortLabel: selected?.label ?? null,
+          effectiveSource: effort ? "project" : modelInfo ? "provider" : "none",
+          storedEffortStatus: "valid",
+          modelInfo: modelInfo ?? null,
+        };
       };
       let cbId = 1;
       const eventHandlers = new Map<string, number[]>();
@@ -519,6 +584,15 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             observeRoute(session.sessionPk);
             return Promise.resolve(session);
           }
+          if (cmd === "start_chat_session") {
+            const session = fixtures.start_chat_session as typeof CHAT_SESSION;
+            const options = (args as { options?: { model?: string | null; effort?: string | null } }).options;
+            sessionRuntime = resolveRuntime({ sessionPk: session.sessionPk }, options?.model ?? null, options?.effort ?? null);
+            sessions = [session];
+            persist();
+            observeRoute(session.sessionPk);
+            return Promise.resolve(session);
+          }
           if (cmd === "continue_session") {
             observeRoute((args as { sessionPk: string }).sessionPk);
             return Promise.resolve(null);
@@ -548,6 +622,12 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
               modelInfo: modelInfo ?? null,
             };
             return Promise.resolve(projectRuntime);
+          }
+          if (cmd === "session_runtime_info") return Promise.resolve(sessionRuntime);
+          if (cmd === "update_session_runtime") {
+            const update = args as { sessionPk: string; model: string | null; effort: string | null };
+            sessionRuntime = resolveRuntime({ sessionPk: update.sessionPk }, update.model, update.effort);
+            return Promise.resolve(sessionRuntime);
           }
           if (cmd === "connection_provider_quota") {
             const { id } = args as { id: string };

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Button, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
-import { newBranchNameError } from "@/lib/composer-git";
+import { newBranchNameError, normalizeBranchName } from "@/lib/composer-git";
 
 /** Names a new branch for the composer. On Create it only hands the name to
  *  the caller (pending create intent) — no git command runs here. */
@@ -24,7 +24,9 @@ export function BranchNameModal({
 
   if (!open) return null;
 
-  const trimmed = name.trim();
+  // Live normalization can leave leading/trailing dashes (e.g. pasted
+  // "  feat/login " becomes "-feat/login-"); strip them for validation/submit.
+  const trimmed = name.trim().replace(/^-+|-+$/g, "");
   const error = newBranchNameError(trimmed, existingBranches);
   const submit = () => {
     if (error !== null) return;
@@ -40,9 +42,9 @@ export function BranchNameModal({
           <Input
             ref={inputRef}
             value={name}
-            onChange={(event) => setName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") submit();
+            onChange={(e) => setName(normalizeBranchName(e.target.value))}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
             }}
             placeholder="feat/my-change"
             className="font-mono text-[12.5px]"

@@ -251,8 +251,8 @@ test("model_change_clears_unsupported_project_effort", () => {
   expect(onChange).toHaveBeenCalledWith("openai/gpt-5-mini", null);
 });
 
-test("running_change_announces_project_next_turns", () => {
+test("running_change_announces_next_turns", () => {
   render(<ComposerModelEffortMenu models={models} runtime={null} onChange={() => undefined} running />);
   fireEvent.click(screen.getByRole("button", { name: /model and effort/i }));
-  expect(screen.getByText(/project.*next turns/i)).toBeTruthy();
+  expect(screen.getByText(/changes apply to the next turns/i)).toBeTruthy();
 });

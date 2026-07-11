@@ -49,6 +49,18 @@ impl LlmStreamFactory for RouterLlmStreamFactory {
     }
 }
 
+/// Resolve the model for a secondary (auxiliary) call — session-title
+/// generation, context compaction, orchestrator goal-decompose — from the
+/// raw-KV setting `auxiliary.<task>.model`. Falls back to `fallback` (the
+/// session/default model) when the setting is unset, unreadable, or blank.
+pub async fn aux_model(store: &Store, task: &str, fallback: &str) -> String {
+    let key = format!("auxiliary.{task}.model");
+    match store.get_setting(&key).await {
+        Ok(Some(value)) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
 /// Stream a request and concatenate its text deltas. A stream `Error` event
 /// or transport error becomes `Err`. Shared by title generation and
 /// compaction summarization.
@@ -112,5 +124,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn aux_model_prefers_setting_then_falls_back() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // unset → falls back to the provided default
+        assert_eq!(aux_model(&store, "title", "sess/model").await, "sess/model");
+        store
+            .set_setting("auxiliary.title.model", "cheap/haiku")
+            .await
+            .unwrap();
+        assert_eq!(
+            aux_model(&store, "title", "sess/model").await,
+            "cheap/haiku"
+        );
     }
 }

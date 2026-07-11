@@ -1,8 +1,10 @@
 import { test, expect, mock, spyOn } from "bun:test";
-import { useStore } from "./store";
+import { useStore, markFocusedSessionReadOnEvent, drainQueueOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
-import { useRuntimes } from "./store-runtimes";
+import { useAgent } from "./store-agent";
+import { useUi } from "./store-ui";
+import type { QueuedMessage } from "./lib/queue";
 
 function reset() {
   useStore.setState({
@@ -16,6 +18,9 @@ function reset() {
     loaded: {},
     contextUsage: {},
     projectRuntimeById: {},
+    sessionRuntimeById: {},
+    sessionCost: {},
+    queued: {},
   });
 }
 
@@ -23,15 +28,6 @@ test("composer_model_has_one_project_runtime_source", () => {
   const state = useStore.getState() as unknown as Record<string, unknown>;
   expect(state.setProjectModel).toBeUndefined();
   expect(state.setProjectRuntime).toBeFunction();
-});
-
-test("chat_submission_contains_no_model_and_cannot_overwrite_atomic_runtime_state", async () => {
-  reset();
-  const start = spyOn(commands, "startSession").mockResolvedValue({ status: "error", error: { message: "stop" } });
-  await useStore.getState().start("p1", "hello", { runtimeId: "native" });
-  const payload = start.mock.calls[0]?.[2] as unknown as Record<string, unknown>;
-  expect(payload).not.toHaveProperty("model");
-  start.mockRestore();
 });
 
 const runtimeSnapshot = {
@@ -162,85 +158,6 @@ test("runtime_queues_for_different_projects_proceed_independently", async () => 
   update.mockRestore();
 });
 
-test("permission_mode_uses_column_only_command", async () => {
-  reset();
-  useStore.setState({ projects: [projectSnapshot()] });
-  const legacy = spyOn(commands, "updateProject").mockResolvedValue({ status: "error", error: { message: "must not call" } });
-  const columnOnly = spyOn(
-    commands as typeof commands & { updateProjectPermMode: (id: string, mode: string) => Promise<unknown> },
-    "updateProjectPermMode",
-  ).mockResolvedValue({ status: "ok", data: null });
-  await useStore.getState().setProjectPermMode("p1", "bypassPermissions");
-  expect(columnOnly).toHaveBeenCalledWith("p1", "bypassPermissions");
-  expect(legacy).not.toHaveBeenCalled();
-  columnOnly.mockRestore();
-  legacy.mockRestore();
-});
-
-test("runtime_success_merges_model_effort_after_concurrent_permission_success", async () => {
-  reset();
-  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
-  const runtime = deferredResult();
-  const persisted = { model: "old", effort: "low", permMode: "default" };
-  const updateRuntime = spyOn(commands, "updateProjectRuntime").mockImplementation(async () => {
-    const result = (await runtime.promise) as { status: "ok"; data: typeof runtimeSnapshot };
-    persisted.model = result.data.model ?? "";
-    persisted.effort = result.data.storedEffort ?? "";
-    return result;
-  });
-  const updatePerm = spyOn(commands, "updateProjectPermMode").mockImplementation(async (_id, mode) => {
-    persisted.permMode = mode;
-    return { status: "ok", data: null };
-  });
-  const runtimeSave = useStore.getState().setProjectRuntime("p1", "new-model", "high");
-  await useStore.getState().setProjectPermMode("p1", "bypassPermissions");
-  runtime.resolve({ status: "ok", data: { ...runtimeSnapshot, model: "new-model", storedEffort: "high" } });
-  await runtimeSave;
-  expect(useStore.getState().projects[0]).toMatchObject({ model: "new-model", effort: "high", permMode: "bypassPermissions" });
-  expect(useStore.getState().projectRuntimeById.p1).toMatchObject({ model: "new-model", storedEffort: "high" });
-  expect(persisted).toEqual({ model: "new-model", effort: "high", permMode: "bypassPermissions" });
-  updateRuntime.mockRestore();
-  updatePerm.mockRestore();
-});
-
-test("permission_failure_restores_only_perm_mode_after_concurrent_runtime_success", async () => {
-  reset();
-  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
-  const permission = deferredResult();
-  const persisted = { model: "old", effort: "low", permMode: "default" };
-  const updatePerm = spyOn(commands, "updateProjectPermMode").mockImplementation(() => permission.promise as never);
-  const updateRuntime = spyOn(commands, "updateProjectRuntime").mockImplementation(async () => {
-    persisted.model = "new-model";
-    persisted.effort = "high";
-    return { status: "ok", data: { ...runtimeSnapshot, model: "new-model", storedEffort: "high" } };
-  });
-  const permissionSave = useStore.getState().setProjectPermMode("p1", "bypassPermissions");
-  await useStore.getState().setProjectRuntime("p1", "new-model", "high");
-  permission.resolve({ status: "error", error: { message: "denied" } });
-  await permissionSave;
-  expect(useStore.getState().projects[0]).toMatchObject({ model: "new-model", effort: "high", permMode: "default" });
-  expect(useStore.getState().projectRuntimeById.p1).toMatchObject({ model: "new-model", storedEffort: "high" });
-  expect(persisted).toEqual({ model: "new-model", effort: "high", permMode: "default" });
-  updateRuntime.mockRestore();
-  updatePerm.mockRestore();
-});
-
-test("runtime_failure_rolls_back_only_model_effort_after_permission_success", async () => {
-  reset();
-  useStore.setState({ projects: [projectSnapshot()], projectRuntimeById: { p1: runtimeSnapshot } });
-  const runtime = deferredResult();
-  const updateRuntime = spyOn(commands, "updateProjectRuntime").mockImplementation(() => runtime.promise as never);
-  const updatePerm = spyOn(commands, "updateProjectPermMode").mockResolvedValue({ status: "ok", data: null });
-  const runtimeSave = useStore.getState().setProjectRuntime("p1", "new-model", "high");
-  await useStore.getState().setProjectPermMode("p1", "bypassPermissions");
-  runtime.resolve({ status: "error", error: { message: "runtime denied" } });
-  await runtimeSave;
-  expect(useStore.getState().projects[0]).toMatchObject({ model: "old", effort: "low", permMode: "bypassPermissions" });
-  expect(useStore.getState().projectRuntimeById.p1).toEqual(runtimeSnapshot);
-  updateRuntime.mockRestore();
-  updatePerm.mockRestore();
-});
-
 test("failed_runtime_save_rolls_back_both_snapshots", async () => {
   reset();
   const project = {
@@ -267,7 +184,7 @@ test("failed_runtime_save_rolls_back_both_snapshots", async () => {
 test("global_preference_and_metadata_refresh_refetch_loaded_project_runtime_status", async () => {
   reset();
   useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
-  const reload = spyOn(useRuntimes.getState(), "fetchList").mockResolvedValue(null);
+  const reload = spyOn(useAgent.getState(), "load").mockResolvedValue(undefined);
   const fresh = { ...runtimeSnapshot, storedEffortStatus: "unsupported" as const, effectiveEffort: "medium" };
   const info = spyOn(commands, "projectRuntimeInfo").mockResolvedValue({ status: "ok", data: fresh });
   await useStore.getState().refreshModelConfiguration();
@@ -285,12 +202,12 @@ test("older_model_configuration_refresh_cannot_overwrite_newer_state", async () 
   const olderGate = new Promise<void>((resolve) => {
     releaseOlder = resolve;
   });
-  const reload = spyOn(useRuntimes.getState(), "fetchList")
+  const reload = spyOn(useAgent.getState(), "load")
     .mockImplementationOnce(async () => {
       await olderGate;
-      return null;
+      return undefined;
     })
-    .mockResolvedValueOnce(null);
+    .mockResolvedValueOnce(undefined);
   const newer = { ...runtimeSnapshot, effectiveEffort: "medium" };
   const older = { ...runtimeSnapshot, effectiveEffort: "low" };
   const info = spyOn(commands, "projectRuntimeInfo")
@@ -321,7 +238,7 @@ test("configuration_refresh_started_before_mutation_cannot_overwrite_mutation", 
     isGit: true,
   };
   useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
-  const fetchList = spyOn(useRuntimes.getState(), "fetchList").mockResolvedValue(null);
+  const fetchList = spyOn(useAgent.getState(), "load").mockResolvedValue(undefined);
   let resolveRefresh!: (value: unknown) => void;
   const info = spyOn(commands, "projectRuntimeInfo").mockImplementation(
     () =>
@@ -740,11 +657,16 @@ const runningSession = (pk: string) => ({
   branch: null,
   title: null,
   status: "running" as const,
+  permMode: "default" as const,
   createdAt: null,
   lastActive: null,
   startedBy: null,
   resumeAttempts: 0,
   branchOwned: true,
+  kind: "project" as const,
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
 });
 
 test("result event flips the session status back to idle (so the composer leaves Stop mode)", () => {
@@ -869,7 +791,7 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
-test("start forwards chat options without a model override", async () => {
+test("start forwards chat options so composer model, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
@@ -881,27 +803,34 @@ test("start forwards chat options without a model override", async () => {
       branch: "harness/s1",
       title: "/review",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
 
   await useStore.getState().start("p1", "/review", {
-    runtimeId: "native",
+    model: "fable",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
   });
 
   expect(start).toHaveBeenCalledWith("p1", "/review", {
-    runtimeId: "native",
+    model: "fable",
+    effort: null,
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
+    permMode: null,
   });
   expect(useStore.getState().focusedSessionPk).toBe("s1");
 
@@ -922,11 +851,16 @@ test("start forwards composer git options to IPC", async () => {
       branch: "feat/login",
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: false,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
@@ -937,10 +871,12 @@ test("start forwards composer git options to IPC", async () => {
   });
 
   expect(start).toHaveBeenCalledWith("p1", "go", {
-    runtimeId: null,
+    model: null,
+    effort: null,
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
+    permMode: null,
   });
 
   start.mockRestore();
@@ -960,11 +896,16 @@ test("start resolves and focuses the session without waiting for refresh", async
       branch: null,
       title: "go",
       status: "running",
+      permMode: "default",
       startedBy: "cockpit",
       createdAt: 1,
       lastActive: 1,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   // refresh() must not gate start(): these never resolve during the test.
@@ -995,6 +936,98 @@ test("start returns false and does not focus on backend error", async () => {
   start.mockRestore();
 });
 
+test("startChat calls start_chat_session (no projectId) and seeds/focuses the returned session", async () => {
+  reset();
+  const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
+    status: "ok",
+    data: {
+      sessionPk: "c1",
+      projectId: null,
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "hey",
+      status: "running",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 1,
+      resumeAttempts: 0,
+      branchOwned: false,
+      permMode: "default",
+      kind: "chat",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
+    },
+  });
+  // refresh() must not gate startChat(): these never resolve during the test.
+  const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
+  const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
+
+  const ok = await useStore.getState().startChat("hey", { model: "fable", effort: "high" });
+
+  expect(startChat).toHaveBeenCalledWith("hey", {
+    model: "fable",
+    effort: "high",
+    permMode: null,
+    context: null,
+    attachments: [],
+    git: null,
+  });
+  expect(ok).toBe(true);
+  expect(useStore.getState().focusedSessionPk).toBe("c1");
+  expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("c1");
+
+  startChat.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("projectless session runtime loads and updates independently", async () => {
+  reset();
+  const initial = {
+    sessionPk: "c1",
+    model: "fixture/model-alpha",
+    storedEffort: "medium",
+    effectiveEffort: "medium",
+    effectiveEffortLabel: "Medium",
+    effectiveSource: "session" as const,
+    storedEffortStatus: "valid" as const,
+    modelInfo: null,
+  };
+  const runtimeCommands = commands as typeof commands & {
+    sessionRuntimeInfo: typeof commands.projectRuntimeInfo;
+    updateSessionRuntime: typeof commands.updateProjectRuntime;
+  };
+  const sessionInfo = mock(async () => ({ status: "ok" as const, data: initial }));
+  const update = mock(async () => ({
+    status: "ok" as const,
+    data: { ...initial, model: "fixture/model-beta", storedEffort: "ultra" },
+  }));
+  Object.assign(runtimeCommands, { sessionRuntimeInfo: sessionInfo, updateSessionRuntime: update });
+
+  await useStore.getState().loadSessionRuntime("c1");
+  expect(useStore.getState().sessionRuntimeById.c1).toEqual(initial);
+  await useStore.getState().setSessionRuntime("c1", "fixture/model-beta", "ultra");
+  expect(update).toHaveBeenCalledWith("c1", "fixture/model-beta", "ultra");
+  expect(useStore.getState().sessionRuntimeById.c1).toMatchObject({ model: "fixture/model-beta", storedEffort: "ultra" });
+
+  delete (runtimeCommands as Partial<typeof runtimeCommands>).sessionRuntimeInfo;
+  delete (runtimeCommands as Partial<typeof runtimeCommands>).updateSessionRuntime;
+});
+
+test("startChat returns false and does not focus on backend error", async () => {
+  reset();
+  const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
+    status: "error",
+    error: { message: "boom" },
+  });
+  const ok = await useStore.getState().startChat("hey", null);
+  expect(ok).toBe(false);
+  expect(useStore.getState().focusedSessionPk).toBeNull();
+  startChat.mockRestore();
+});
+
 test("cloneProject clones via IPC and refreshes on success", async () => {
   reset();
   const clone = spyOn(commands, "cloneProject").mockResolvedValue({
@@ -1004,7 +1037,6 @@ test("cloneProject clones via IPC and refreshes on success", async () => {
       name: "repo",
       workdir: "C:\\proj\\repo",
       source: "https://github.com/user/repo.git",
-      harness: "native",
       model: null,
       effort: null,
       permMode: "default",
@@ -1089,4 +1121,170 @@ test("send resolves true on success and false on backend error (drives composer 
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+});
+
+test("send steers a RUNNING session instead of starting a new turn via continue", async () => {
+  reset();
+  useStore.setState({ sessions: [runningSession("s1")] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "hold on", null)).resolves.toBe(true);
+  expect(steer).toHaveBeenCalledWith("s1", "hold on");
+  expect(cont).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("send falls back to continue for a session that is not running", async () => {
+  reset();
+  useStore.setState({ sessions: [{ ...runningSession("s1"), status: "idle" as const }] });
+  const steer = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+
+  await expect(useStore.getState().send("s1", "go", null)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalled();
+  expect(steer).not.toHaveBeenCalled();
+
+  steer.mockRestore();
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+});
+
+test("setFocused marks the previously-focused session read up to its lastActive", () => {
+  useUi.setState({ readAt: {} });
+  useStore.setState({
+    focusedSessionPk: "s1",
+    sessions: [
+      {
+        sessionPk: "s1",
+        projectId: "p",
+        agentSessionId: null,
+        worktreePath: null,
+        branch: null,
+        title: "s1",
+        status: "idle",
+        startedBy: null,
+        createdAt: 0,
+        lastActive: 4200,
+        resumeAttempts: 0,
+        branchOwned: false,
+        permMode: "default",
+        kind: "project",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
+      },
+    ],
+    loaded: { s1: true, s2: true },
+  });
+  useStore.getState().setFocused("s2");
+  expect(useUi.getState().readAt.s1).toBe(4200);
+  expect(useStore.getState().focusedSessionPk).toBe("s2");
+});
+
+// markFocusedSessionReadOnEvent is the extracted decision the init() coreEventMsg
+// listener runs on every live event; it's exercised directly here since driving the
+// real Tauri event subscription isn't practical in this harness.
+test("markFocusedSessionReadOnEvent marks the focused session read as live activity streams in", () => {
+  useUi.setState({ readAt: {} });
+  const before = Date.now();
+  markFocusedSessionReadOnEvent(
+    {
+      kind: "message",
+      session_pk: "s1",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    "s1",
+  );
+  expect(useUi.getState().readAt.s1).toBeGreaterThanOrEqual(before);
+});
+
+test("markFocusedSessionReadOnEvent leaves read state untouched for events on a non-focused session", () => {
+  useUi.setState({ readAt: {} });
+  markFocusedSessionReadOnEvent(
+    {
+      kind: "message",
+      session_pk: "s2",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "hi" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+    },
+    "s1",
+  );
+  expect(useUi.getState().readAt.s2).toBeUndefined();
+});
+
+const qmsg = (id: string, text = id): QueuedMessage => ({ id, text, options: null });
+
+test("enqueueMessage appends per session; removeQueued removes by id", () => {
+  useStore.setState({ queued: {} });
+  useStore.getState().enqueueMessage("s1", qmsg("a"));
+  useStore.getState().enqueueMessage("s1", qmsg("b"));
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a", "b"]);
+  useStore.getState().removeQueued("s1", "a");
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+});
+
+test("sendNextQueued sends the head and removes it on success", async () => {
+  const calls: Array<[string, string]> = [];
+  useStore.setState({
+    queued: { s1: [qmsg("a", "hello"), qmsg("b", "world")] },
+    send: async (pk, text) => {
+      calls.push([pk, text]);
+      return true;
+    },
+  });
+  await useStore.getState().sendNextQueued("s1");
+  expect(calls).toEqual([["s1", "hello"]]);
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["b"]);
+});
+
+test("sendNextQueued unshifts the head back when send fails", async () => {
+  useStore.setState({
+    queued: { s1: [qmsg("a", "hello")] },
+    send: async () => false,
+  });
+  await useStore.getState().sendNextQueued("s1");
+  expect(useStore.getState().queued.s1.map((m) => m.id)).toEqual(["a"]); // still queued
+});
+
+test("sendNextQueued on an empty queue does not call send", async () => {
+  let called = false;
+  useStore.setState({
+    queued: {},
+    send: async () => {
+      called = true;
+      return true;
+    },
+  });
+  await useStore.getState().sendNextQueued("s1");
+  expect(called).toBe(false);
+});
+
+test("drainQueueOnEvent drains on result but not on error", () => {
+  const drained: string[] = [];
+  useStore.setState({ sendNextQueued: async (pk) => void drained.push(pk) });
+  drainQueueOnEvent({ kind: "error", session_pk: "s1" } as never);
+  expect(drained).toEqual([]);
+  drainQueueOnEvent({ kind: "result", session_pk: "s1" } as never);
+  expect(drained).toEqual(["s1"]);
 });

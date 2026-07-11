@@ -77,7 +77,6 @@ export function toInput(j: JobInfo): JobInput {
     cron: j.cron,
     projectId: j.projectId,
     branch: j.branch,
-    agent: j.agent,
     gateway: j.gateway,
     prompt: j.prompt,
     notifySuccess: j.notifySuccess,

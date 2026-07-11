@@ -11,6 +11,9 @@ pub struct DaemonStatusFile {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Bound control-API port (None while connecting / for pre-API daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -56,7 +59,30 @@ pub fn is_alive(pid: i32) -> bool {
     {
         pid > 0 && unsafe { libc::kill(pid, 0) } == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // GetExitCodeProcess reports STILL_ACTIVE (259) for live processes.
+        // A process that exited with code 259 reads as alive — the standard
+        // Win32 caveat, harmless here (worst case: one takeover cycle).
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid <= 0 {
+            return false;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -70,7 +96,27 @@ pub fn send_sigterm(pid: i32) {
             libc::kill(pid, libc::SIGTERM);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // No SIGTERM on Windows; TerminateProcess is the takeover/stop path.
+        // The daemon keeps all durable state in SQLite and a stale status
+        // file is already handled by `derive_state` on a dead pid.
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        if pid <= 0 {
+            return;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
     }
@@ -116,6 +162,7 @@ mod tests {
             started_at: 1,
             last_error: None,
             version: Some("0.0.0".into()),
+            port: None,
         };
         write_status(dir.path(), &s).unwrap();
         let raw = std::fs::read_to_string(status_path(dir.path())).unwrap();
@@ -128,13 +175,25 @@ mod tests {
     }
 
     #[test]
+    fn old_status_files_without_port_still_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            status_path(dir.path()),
+            r#"{"pid":42,"state":"running","startedAt":1}"#,
+        )
+        .unwrap();
+        let s = read_status(dir.path()).unwrap();
+        assert_eq!(s.port, None);
+        assert_eq!(s.pid, 42);
+    }
+
+    #[test]
     fn read_status_none_on_garbage() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(status_path(dir.path()), "not json").unwrap();
         assert_eq!(read_status(dir.path()), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn is_alive_self_and_dead() {
         assert!(is_alive(std::process::id() as i32));
@@ -151,6 +210,7 @@ mod tests {
             started_at: 7,
             last_error: last_error.map(String::from),
             version: None,
+            port: None,
         };
         assert_eq!(derive_state(None, &alive), DaemonState::default());
         let e = derive_state(Some(&f(DaemonFileState::Error, -1, Some("boom"))), &alive);

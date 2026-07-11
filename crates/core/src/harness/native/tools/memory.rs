@@ -173,6 +173,7 @@ impl Tool for MemoryTool {
             .join("; ");
         Ok(ToolOutput {
             for_model: format!("memory updated ({summary})"),
+            model_blocks: None,
             display: Some(json!({ "summary": format!("memory: {summary}") })),
             is_error: false,
         })

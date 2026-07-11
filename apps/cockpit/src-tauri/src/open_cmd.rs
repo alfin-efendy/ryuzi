@@ -1,8 +1,8 @@
 //! "Open in…" targets: detect installed editors/terminals/file managers once
 //! per app run and launch them detached on the session workdir.
 
+use crate::engine::EngineClient;
 use crate::error::CmdError;
-use ryuzi_core::ControlPlane;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::path::PathBuf;
@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use tauri::State;
 
 type R<T> = Result<T, CmdError>;
+type Engine<'a> = State<'a, Arc<EngineClient>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +29,8 @@ struct ResolvedTarget {
     program: PathBuf,
     /// Arguments with `{dir}` substituted by the target directory.
     args: &'static [&'static str],
+    /// True when the target intentionally opens an interactive terminal.
+    console: bool,
 }
 
 /// PATH lookup honoring PATHEXT on Windows.
@@ -74,6 +77,7 @@ fn resolve_targets(
             name,
             program: PathBuf::from(program),
             args,
+            console: false,
         }
     }
     let mut out = Vec::new();
@@ -91,6 +95,7 @@ fn resolve_targets(
                 name: "Terminal",
                 program: p,
                 args: &["-d", "{dir}"],
+                console: true,
             });
         }
         let code_fallback = local_app_data().join("Programs/Microsoft VS Code/bin/code.cmd");
@@ -102,6 +107,7 @@ fn resolve_targets(
                 name: "Visual Studio Code",
                 program: p,
                 args: &["{dir}"],
+                console: false,
             });
         }
         let cursor_fallback = local_app_data().join("Programs/cursor/resources/app/bin/cursor.cmd");
@@ -113,6 +119,7 @@ fn resolve_targets(
                 name: "Cursor",
                 program: p,
                 args: &["{dir}"],
+                console: false,
             });
         }
         for base in [
@@ -126,6 +133,7 @@ fn resolve_targets(
                     name: "Git Bash",
                     program: p,
                     args: &["--cd={dir}"],
+                    console: true,
                 });
                 break;
             }
@@ -136,16 +144,18 @@ fn resolve_targets(
                 name: "WSL",
                 program: p,
                 args: &["--cd", "{dir}"],
+                console: true,
             });
         }
     } else if cfg!(target_os = "macos") {
         out.push(builtin("finder", "Finder", "open", &["{dir}"]));
-        out.push(builtin(
-            "terminal",
-            "Terminal",
-            "open",
-            &["-a", "Terminal", "{dir}"],
-        ));
+        out.push(ResolvedTarget {
+            id: "terminal",
+            name: "Terminal",
+            program: PathBuf::from("open"),
+            args: &["-a", "Terminal", "{dir}"],
+            console: true,
+        });
         if exists(&PathBuf::from("/Applications/Visual Studio Code.app"))
             || lookup("code").is_some()
         {
@@ -172,6 +182,7 @@ fn resolve_targets(
                 name: "Visual Studio Code",
                 program: p,
                 args: &["{dir}"],
+                console: false,
             });
         }
         if let Some(p) = lookup("cursor") {
@@ -180,6 +191,7 @@ fn resolve_targets(
                 name: "Cursor",
                 program: p,
                 args: &["{dir}"],
+                console: false,
             });
         }
         for term in ["x-terminal-emulator", "gnome-terminal", "konsole"] {
@@ -189,6 +201,7 @@ fn resolve_targets(
                     name: "Terminal",
                     program: p,
                     args: &["--working-directory={dir}"],
+                    console: true,
                 });
                 break;
             }
@@ -217,13 +230,13 @@ pub fn list_open_targets() -> Vec<OpenTarget> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn open_in(
-    cp: State<'_, Arc<ControlPlane>>,
-    session_pk: String,
-    target_id: String,
-) -> R<()> {
-    let root = crate::fsview_cmd::session_root(&cp, &session_pk).await?;
-    let dir = root.to_string_lossy().into_owned();
+pub async fn open_in(engine: Engine<'_>, session_pk: String, target_id: String) -> R<()> {
+    let dir: String = engine
+        .rpc(
+            "session_workdir",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await?;
     let target = targets()
         .iter()
         .find(|t| t.id == target_id)
@@ -236,13 +249,16 @@ pub async fn open_in(
         .iter()
         .map(|a| a.replace("{dir}", &dir))
         .collect();
-    // Detached fire-and-forget: the spawned app outlives any turn.
-    std::process::Command::new(&target.program)
-        .args(&args)
-        .spawn()
-        .map_err(|e| CmdError {
-            message: format!("couldn't launch {}: {e}", target.name),
-        })?;
+    // Detached fire-and-forget: the spawned app outlives any turn. Hide the
+    // console for file managers and editor shims; terminal targets stay visible.
+    let mut cmd = std::process::Command::new(&target.program);
+    cmd.args(&args);
+    if !target.console {
+        ryuzi_core::process_util::no_window_std(&mut cmd);
+    }
+    cmd.spawn().map_err(|e| CmdError {
+        message: format!("couldn't launch {}: {e}", target.name),
+    })?;
     Ok(())
 }
 
@@ -258,7 +274,7 @@ mod tests {
         let exists = |_: &PathBuf| false;
         let targets = resolve_targets(&lookup, &exists);
         // Every OS branch has a builtin file manager plus the faked VS Code.
-        assert!(targets.iter().any(|t| t.id == "vscode"));
+        assert!(targets.iter().any(|t| t.id == "vscode" && !t.console));
         assert!(targets
             .iter()
             .any(|t| matches!(t.id, "explorer" | "finder" | "files")));
@@ -272,6 +288,7 @@ mod tests {
             name: "X",
             program: PathBuf::from("x"),
             args: &["--cd", "{dir}"],
+            console: false,
         };
         let args: Vec<String> = t
             .args

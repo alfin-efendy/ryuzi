@@ -1,7 +1,6 @@
 //! Native MCP client: a persistent stdio JSON-RPC connection that can
 //! `initialize`, `tools/list`, and `tools/call`, so the native runtime can
-//! execute MCP tools itself (the ACP harness only forwards server specs to the
-//! external agent).
+//! execute MCP tools itself.
 
 use crate::domain::{McpServerSpec, McpTransport};
 use async_trait::async_trait;
@@ -91,6 +90,7 @@ impl McpConnection {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        crate::process_util::no_window(&mut cmd);
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");

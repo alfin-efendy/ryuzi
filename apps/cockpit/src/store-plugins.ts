@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type PluginInfo } from "./bindings";
+import { commands, type DoctorFinding, type PluginInfo } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
@@ -9,18 +9,55 @@ import { commands, type PluginInfo } from "./bindings";
 type PluginsState = {
   plugins: PluginInfo[];
   loaded: boolean;
+  /** Whether an install/update since app start needs a restart to apply. */
+  restartRequired: boolean;
+  /** `plugin_doctor` findings, cached so the Installed grid, the plugin
+   *  detail attach-failure banner, and `DoctorPanel` all read the same
+   *  snapshot instead of triggering their own redundant fetches. */
+  doctorFindings: DoctorFinding[];
+  doctorLoaded: boolean;
   load: () => Promise<void>;
+  loadDoctor: () => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
+  uninstall: (id: string) => Promise<boolean>;
+  update: (id: string, force: boolean) => Promise<void>;
+  pin: (id: string, pinned: boolean, reason?: string) => Promise<void>;
 };
+
+/** `update_all_plugins`'s outcome summary, shared so the store action and any
+ *  ad hoc caller (Update-all button) report the same counts. */
+export function summarizeUpdateAll(entries: { id: string; outcome: { kind: string; detail?: unknown } }[]): string {
+  const updated = entries.filter((e) => e.outcome.kind === "updated").length;
+  const failed = entries.filter((e) => e.outcome.kind === "failed").length;
+  const needsReack = entries.filter((e) => e.outcome.kind === "needsReack").length;
+  const parts = [`${updated} updated`];
+  if (needsReack > 0) parts.push(`${needsReack} need re-review`);
+  if (failed > 0) parts.push(`${failed} failed`);
+  return parts.join(", ");
+}
 
 export const usePlugins = create<PluginsState>((set, get) => ({
   plugins: [],
   loaded: false,
+  restartRequired: false,
+  doctorFindings: [],
+  doctorLoaded: false,
 
   load: async () => {
     const res = await commands.listPlugins();
     if (res.status === "ok") set({ plugins: res.data, loaded: true });
     else toast.error(`Plugin list failed: ${res.error.message}`);
+
+    // Best-effort: a failure here shouldn't block the plugin list itself, so
+    // it's silently skipped (the restart banner just stays as it was).
+    const restartRes = await commands.pluginsRestartRequired();
+    if (restartRes.status === "ok") set({ restartRequired: restartRes.data });
+  },
+
+  loadDoctor: async () => {
+    const res = await commands.pluginDoctor();
+    if (res.status === "ok") set({ doctorFindings: res.data, doctorLoaded: true });
+    else toast.error(`Doctor check failed: ${res.error.message}`);
   },
 
   setEnabled: async (id, on) => {
@@ -32,18 +69,71 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     if (res.status === "error") toast.error(`Plugin update failed: ${res.error.message}`);
     await get().load();
   },
+
+  uninstall: async (id) => {
+    const res = await commands.uninstallPlugin(id);
+    if (res.status === "error") {
+      toast.error(`Uninstall failed: ${res.error.message}`);
+      return false;
+    }
+    set({ plugins: res.data, loaded: true });
+    return true;
+  },
+
+  update: async (id, force) => {
+    const res = await commands.updatePlugin(id, force);
+    if (res.status === "error") {
+      toast.error(`Update failed: ${res.error.message}`);
+    } else {
+      switch (res.data.kind) {
+        case "updated":
+          toast.success("Plugin updated");
+          break;
+        case "alreadyCurrent":
+          toast.info("Already up to date");
+          break;
+        case "skippedPinned":
+          toast.info("Skipped — plugin is pinned");
+          break;
+        case "localEdits":
+          toast.warning("Skipped — local edits detected on disk");
+          break;
+        case "failed":
+          toast.error(`Update failed: ${res.data.detail}`);
+          break;
+        case "needsReack":
+          toast.warning("This update adds hook scripts — reinstall the source to review and accept them.");
+          break;
+      }
+    }
+    await get().load();
+    if (get().doctorLoaded) await get().loadDoctor();
+  },
+
+  pin: async (id, pinned, reason) => {
+    // Optimistic paint (mirrors `setEnabled`) so the toggle feels instant;
+    // the reload below reconciles with the engine's persisted
+    // `plugin_installs.pinned` ledger flag either way — success or error —
+    // so a failed write never leaves a stale optimistic pin behind.
+    set({ plugins: get().plugins.map((p) => (p.id === id ? { ...p, pinned } : p)) });
+    const res = await commands.setPluginPin(id, pinned, reason ?? null);
+    if (res.status === "error") toast.error(`Pin update failed: ${res.error.message}`);
+    else toast.success(pinned ? "Pinned" : "Unpinned");
+    await get().load();
+  },
 }));
 
 export function pluginById(plugins: PluginInfo[], id: string): PluginInfo | undefined {
   return plugins.find((p) => p.id === id);
 }
 
-/**
- * Plugins the Plugins hub's Browse tab lists: every embedded-catalog
- * entry, enabled or not. Skill packs (`source === "skill-pack"`) surface
- * in the Skills tab instead; core builtins keep their own dedicated
- * screens.
- */
-export function catalogPlugins(plugins: PluginInfo[]): PluginInfo[] {
-  return plugins.filter((p) => p.source === "catalog");
+/** Browse tab: only entries not yet installed — installing removes the card. */
+export function browsePlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => !p.installed);
+}
+
+/** Installed tab: providers, gateways, and skill packs that are set up.
+ *  MCP apps render from `useApps` separately. */
+export function installedPlugins(plugins: PluginInfo[]): PluginInfo[] {
+  return plugins.filter((p) => p.installed);
 }

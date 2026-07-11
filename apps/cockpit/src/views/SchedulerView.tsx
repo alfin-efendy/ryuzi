@@ -1,6 +1,6 @@
 import { ChevronRight, Clock, Folder, Plus } from "lucide-react";
 import { useEffect } from "react";
-import { runtimeById, useRuntimes } from "@/store-runtimes";
+import { NATIVE_AGENT } from "@/constants";
 import { formatNextRun, formatStarted, useScheduler } from "@/store-scheduler";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
@@ -12,7 +12,6 @@ const RUN_COLORS: Record<string, string> = { success: "#22C55E", failed: "#EF444
 export function SchedulerView() {
   const { jobs, loaded, hydrate, toggle } = useScheduler();
   const { gateways, loaded: gwLoaded, hydrate: hydrateGw } = useGateways();
-  const runtimes = useRuntimes((s) => s.runtimes);
   const nav = useNav();
 
   useEffect(() => {
@@ -76,7 +75,6 @@ export function SchedulerView() {
                 </div>
                 {groupJobs.map((j) => {
                   const open = () => nav.navigate({ kind: "jobDetail", id: j.id });
-                  const agent = runtimeById(runtimes, j.agent);
                   return (
                     <Card key={j.id} className="flex items-center gap-3.5 px-[18px] py-[15px]">
                       <Button
@@ -98,7 +96,7 @@ export function SchedulerView() {
                             <Folder aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
                             <span>{j.projectName}</span>
                             <span className="opacity-40">·</span>
-                            <span>{agent?.name ?? j.agent}</span>
+                            <span>{NATIVE_AGENT.name}</span>
                           </span>
                           {j.history.length > 0 && (
                             <span className="mt-[7px] flex items-center gap-[5px]">

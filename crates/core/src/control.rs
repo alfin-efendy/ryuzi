@@ -38,12 +38,11 @@ pub(crate) fn basename_of(path: &str) -> String {
 
 pub struct ControlPlane {
     store: Arc<Store>,
-    /// Extension registries (harness/gateway/connector). `Project.harness` is
-    /// resolved against `registries.harness`.
+    /// Extension registries (harness slot/gateway/connector/plugins).
     registries: Registries,
     events: broadcast::Sender<CoreEvent>,
-    /// Shared approval hub — handed to each `SessionCtx` so the ACP permission
-    /// bridge can route tool-permission prompts back to the UI.
+    /// Shared approval hub — handed to each `SessionCtx` so the permission
+    /// gate can route tool-permission prompts back to the UI.
     approvals: Arc<ApprovalHub>,
     /// Live sessions keyed by `session_pk`. Each value is the harness session
     /// handle returned by `Harness::start_session`, used to drive prompts and to
@@ -69,6 +68,14 @@ pub struct ControlPlane {
     /// before the task is spawned, decremented by `TurnGuard`'s `Drop` inside
     /// the task) — polled by `drain` to know when it's safe to stop waiting.
     active_turns: std::sync::atomic::AtomicUsize,
+    /// One-way in-memory latch: set once a plugin/skill install, update, or
+    /// uninstall has mutated on-disk state that the already-constructed
+    /// `registries` above cannot pick up without a process restart. Reset
+    /// only by restarting the daemon (deliberately not persisted — the
+    /// underlying `Registries` snapshot is also rebuilt from scratch on
+    /// every startup, so a stale `true` surviving a restart would be
+    /// meaningless).
+    plugins_restart_required: std::sync::atomic::AtomicBool,
 }
 
 impl ControlPlane {
@@ -103,6 +110,19 @@ impl ControlPlane {
         attachment_fetcher: Arc<dyn AttachmentFetcher>,
     ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
+
+        // Startup maintenance (install-ledger backfill + crash-leftover
+        // sweep) deliberately does NOT run here. Both touch the operator's
+        // real `$HOME/.config/ryuzi/{skills,plugins}` via
+        // `InstallRoots::for_user()`, and the sweep is destructive
+        // (`remove_dir_all`). This constructor is called by every crate's
+        // `test_cp()` helper — including `ryuzi-cockpit`'s, where `ryuzi-core`
+        // is compiled WITHOUT `test` cfg, so a `#[cfg(test)]` no-op guard
+        // here would not fire and tests would delete real user files. Instead
+        // the real long-running hosts call `run_startup_maintenance()`
+        // explicitly after construction; no test path ever does. See that
+        // method's doc comment.
+
         Arc::new(ControlPlane {
             store,
             registries,
@@ -114,7 +134,34 @@ impl ControlPlane {
             attachment_fetcher,
             draining: std::sync::atomic::AtomicBool::new(false),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
+            plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// One-time, best-effort startup maintenance for the install ledger and
+    /// on-disk skill/plugin trees. Call this EXACTLY ONCE, from a real
+    /// long-running host, AFTER the `ControlPlane` is built — never from
+    /// `new`/`new_full` (which every crate's `test_cp()` helper calls) and
+    /// never from a unit test. Both steps read (and the sweep deletes) files
+    /// under the operator's real `$HOME/.config/ryuzi/{skills,plugins}` via
+    /// `InstallRoots::for_user()`, so running it from a constructor would let
+    /// `cargo test` (in particular `ryuzi-cockpit`'s test binary, where
+    /// `ryuzi-core` is a non-`test`-cfg dependency) touch and delete real
+    /// user files.
+    ///
+    /// Steps, each best-effort (warn-and-continue — a maintenance failure
+    /// must never block startup):
+    /// 1. Backfill `plugin_installs` rows for any on-disk pack installed
+    ///    before the ledger existed (idempotent; read + insert only).
+    /// 2. Sweep `.stage-`/`.backup-`/`.tmp-` crash leftovers from an
+    ///    interrupted install/update (destructive `remove_dir_all`).
+    pub async fn run_startup_maintenance(&self) {
+        if let Err(e) = crate::skills_install::backfill_install_records(&self.store).await {
+            tracing::warn!("plugin install-ledger backfill failed: {e}");
+        }
+        if let Err(e) = crate::skills_install::sweep_stale_install_leftovers() {
+            tracing::warn!("plugin install-leftover sweep failed: {e}");
+        }
     }
 
     /// Shared handle to the persistence layer — used by daemon wiring,
@@ -153,6 +200,24 @@ impl ControlPlane {
         }
     }
 
+    /// Set the in-memory restart-required latch. Called by plugin/skill
+    /// install, update, and uninstall paths (Task 9) once they mutate
+    /// on-disk state that `self.registries` — built once at startup — cannot
+    /// reflect until the process restarts. Idempotent and safe to call from
+    /// any number of concurrent mutation paths.
+    pub fn mark_plugins_restart_required(&self) {
+        self.plugins_restart_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a plugin/skill mutation since this process started requires a
+    /// restart before it takes effect. Read by the daemon's plugins routes
+    /// and Cockpit surfaces to show a "restart required" indicator.
+    pub fn plugins_restart_required(&self) -> bool {
+        self.plugins_restart_required
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Public event injection — used by `UpdateManager`'s notify path to
     /// broadcast update-lifecycle events through the same channel as
     /// session events.
@@ -187,6 +252,16 @@ impl ControlPlane {
     /// fan-out timeout/deny paths).
     pub fn resolve_approval_bool(&self, request_id: &str, allow: bool) -> bool {
         self.resolve_approval(request_id, ApprovalResponse::once(allow))
+    }
+
+    /// Test-only: park a fake approval and return its receiver.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn approvals_for_test_register(
+        &self,
+        request_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<crate::domain::ApprovalResponse> {
+        self.approvals.register(request_id.to_string())
     }
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {

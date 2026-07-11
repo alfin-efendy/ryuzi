@@ -12,7 +12,6 @@ pub const KNOWN: &[&str] = &[
     "oauth",
     "free",
     "runtime",
-    "cli-agent",
     "chat-gateway",
     "vcs",
     "issues",
@@ -28,6 +27,7 @@ pub const KNOWN: &[&str] = &[
     "tunnel",
     "deploy",
     "communication",
+    "skills",
 ];
 
 #[cfg(test)]

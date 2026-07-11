@@ -352,3 +352,14 @@ test("every option carries title={label} for hover-reveal of truncated ids", asy
   await openCombobox("Fruit");
   expect(screen.getByRole("option", { name: /Apple/ }).getAttribute("title")).toBe("Apple");
 });
+
+test("popup height adapts to the viewport (available-height cap, shrinkable list)", async () => {
+  render(<Combobox aria-label="Fruit" options={fruits} value={null} onValueChange={() => {}} />);
+  await openCombobox("Fruit");
+  const popup = document.querySelector('[data-slot="combobox-popup"]');
+  expect(popup?.className).toContain("max-h-[var(--available-height)]");
+  expect(popup?.className).toContain("flex-col");
+  const list = document.querySelector('[data-slot="combobox-list"]');
+  expect(list?.className).toContain("min-h-0");
+  expect(list?.className).toContain("max-h-[380px]");
+});

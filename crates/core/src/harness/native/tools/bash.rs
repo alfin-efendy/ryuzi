@@ -103,13 +103,9 @@ impl Tool for Bash {
                 }
             }
         }
-        // Repo-wide Windows spawn convention (see crate::mcp, crate::runtimes):
+        // Repo-wide Windows spawn convention (see crate::process_util):
         // never flash a console window when the Cockpit GUI runs a tool call.
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        crate::process_util::no_window(&mut cmd);
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -153,6 +149,7 @@ impl Tool for Bash {
         let text = truncate(&text, &ctx.caps);
         Ok(ToolOutput {
             for_model: text,
+            model_blocks: None,
             display: exit_display(output.status.code()),
             is_error,
         })
@@ -173,8 +170,7 @@ fn exit_display(code: Option<i32>) -> Option<Value> {
 ///
 /// Order (first hit wins):
 /// 1. `ryuzi_shell` (the `RYUZI_SHELL` env override), honored only when it
-///    points at an existing file; a stale override falls through. Same
-///    env-override spirit as `RYUZI_ACP_PATH` in `crate::sidecar`.
+///    points at an existing file; a stale override falls through.
 /// 2. `sh.exe` found in a `PATH` directory (Git Bash sessions, MSYS2).
 /// 3. Git for Windows discovery: a `PATH` directory containing `git.exe`
 ///    (`Git\cmd` and `Git\bin` are both direct children of the install

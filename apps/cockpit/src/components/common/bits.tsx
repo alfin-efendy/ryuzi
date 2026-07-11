@@ -118,6 +118,33 @@ export function StatusDot({
   );
 }
 
+const guideColor = "color-mix(in srgb, var(--sidebar-foreground) 20%, var(--sidebar))";
+
+// Tree connector in front of session rows: a rounded elbow into the row, plus
+// a vertical rail continuing to the next sibling. `reach` extends the lines
+// past the row edges to bridge the 1px gaps between rows.
+export function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
+  return (
+    <span aria-hidden className="relative w-6 shrink-0 self-stretch">
+      <span
+        className="absolute left-3.5 box-border w-[9px] rounded-bl-[7px]"
+        style={{
+          top: -reach,
+          height: `calc(50% + ${reach}px)`,
+          borderLeft: `1.5px solid ${guideColor}`,
+          borderBottom: `1.5px solid ${guideColor}`,
+        }}
+      />
+      {tail && (
+        <span
+          className="absolute left-3.5 box-border w-[9px]"
+          style={{ top: -reach, bottom: -reach, borderLeft: `1.5px solid ${guideColor}` }}
+        />
+      )}
+    </span>
+  );
+}
+
 export function QuotaTrack({ pct, color, height = 4 }: { pct: number; color: string; height?: number }) {
   return (
     <span className="block overflow-hidden rounded-full bg-muted" style={{ height }}>

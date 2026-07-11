@@ -14,11 +14,16 @@ import {
   type ApprovalResponse,
   type ModelPreferenceKey,
   type ProjectRuntimeInfo,
+  type SessionRuntimeInfo,
+  type ModelCost,
 } from "./bindings";
 import { basename } from "./lib/paths";
-import { useRuntimes } from "./store-runtimes";
 import { useNative } from "./store-native";
+import { useAgent } from "./store-agent";
+import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
+import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
+import { enqueue, dequeue, removeById, type QueuedMessage } from "@/lib/queue";
 
 export type PendingApproval = {
   sessionPk: string;
@@ -29,7 +34,8 @@ export type PendingApproval = {
   input: unknown;
 };
 export type ChatOptions = {
-  runtimeId?: string | null;
+  model?: string | null;
+  effort?: string | null;
   context?: {
     branch?: string | null;
     voiceTranscript?: string | null;
@@ -37,6 +43,7 @@ export type ChatOptions = {
   } | null;
   attachments?: string[];
   git?: GitOptions | null;
+  permMode?: PermMode | null;
 };
 
 type State = {
@@ -49,8 +56,27 @@ type State = {
   lastSeq: Record<string, number>;
   loaded: Record<string, boolean>;
   /** Per-session context-window usage from the latest `contextUsage` event. */
-  contextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
+  contextUsage: Record<
+    string,
+    {
+      activeTokens: number;
+      usableWindow: number;
+      percentLeft: number;
+      contextWindow: number;
+      cacheReadTokens: number;
+      outputTokens: number;
+    }
+  >;
   projectRuntimeById: Record<string, ProjectRuntimeInfo>;
+  sessionRuntimeById: Record<string, SessionRuntimeInfo>;
+  /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
+  sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
+  /** Per-session in-memory type-ahead queue (messages typed while running). */
+  queued: Record<string, QueuedMessage[]>;
+  enqueueMessage: (sessionPk: string, msg: QueuedMessage) => void;
+  removeQueued: (sessionPk: string, id: string) => void;
+  /** Send the head of a session's queue; on send-failure re-queue it at the front. */
+  sendNextQueued: (sessionPk: string) => Promise<void>;
   applyCoreEvent: (e: CoreEvent) => void;
   clearApproval: (requestId: string) => void;
   setFocused: (pk: string | null) => void;
@@ -64,11 +90,16 @@ type State = {
   setProjectRuntime: (projectId: string, model: string | null, effort: string | null) => Promise<boolean>;
   setModelEffortPreference: (key: ModelPreferenceKey, effort: string | null) => Promise<boolean>;
   refreshModelConfiguration: () => Promise<void>;
-  /** Change the permission mode future turns of this project run under. */
-  setProjectPermMode: (projectId: string, permMode: PermMode) => Promise<void>;
+  loadSessionRuntime: (sessionPk: string) => Promise<void>;
+  setSessionRuntime: (sessionPk: string, model: string | null, effort: string | null) => Promise<boolean>;
+  /** Change the permission mode this session (only this session) runs under. */
+  setSessionPermMode: (sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. */
   start: (projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
+  /** Same shape as `start`, but for a chat-first session with no project
+   *  (`start_chat_session`) — Home's default when no project is attached. */
+  startChat: (prompt: string, options?: ChatOptions | null) => Promise<boolean>;
   /** Resolves true when the backend accepted the prompt — false lets the
    *  composer restore its optimistically-cleared draft. */
   send: (sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
@@ -87,7 +118,8 @@ function append(map: Record<string, Row[]>, pk: string, row: Row): Record<string
 function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
   if (!options) return null;
   return {
-    runtimeId: options.runtimeId ?? null,
+    model: options.model ?? null,
+    effort: options.effort ?? null,
     context: options.context
       ? {
           branch: options.context.branch ?? null,
@@ -97,6 +129,7 @@ function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions 
       : null,
     attachments: options.attachments ?? [],
     git: options.git ?? null,
+    permMode: options.permMode ?? null,
   };
 }
 
@@ -105,16 +138,18 @@ const projectRuntimeMutationGeneration = new Map<string, number>();
 const projectRuntimeActiveMutation = new Map<string, number>();
 const projectRuntimeLoadGeneration = new Map<string, number>();
 
-type ProjectRuntimeQueue = {
+type RuntimeQueue<T> = {
   tail: Promise<void>;
   pending: number;
   latestIntent: number;
   confirmedModel: string | null;
   confirmedEffort: string | null;
-  confirmedRuntime: ProjectRuntimeInfo | undefined;
+  confirmedRuntime: T | undefined;
 };
 
-const projectRuntimeQueues = new Map<string, ProjectRuntimeQueue>();
+const projectRuntimeQueues = new Map<string, RuntimeQueue<ProjectRuntimeInfo>>();
+const sessionRuntimeLoadGeneration = new Map<string, number>();
+const sessionRuntimeQueues = new Map<string, RuntimeQueue<SessionRuntimeInfo>>();
 
 function nextGeneration(generations: Map<string, number>, projectId: string): number {
   const generation = (generations.get(projectId) ?? 0) + 1;
@@ -127,12 +162,15 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   transcripts: {},
   pendingApprovals: [],
+  queued: {},
   focusedSessionPk: null,
   selectedProjectId: null,
   lastSeq: {},
   loaded: {},
   contextUsage: {},
   projectRuntimeById: {},
+  sessionRuntimeById: {},
+  sessionCost: {},
 
   applyCoreEvent: (e) =>
     set((st) => {
@@ -214,7 +252,17 @@ export const useStore = create<State>((set, get) => ({
                 activeTokens: e.active_tokens,
                 usableWindow: e.usable_window,
                 percentLeft: e.percent_left,
+                contextWindow: e.context_window,
+                cacheReadTokens: e.cache_read_tokens,
+                outputTokens: e.output_tokens,
               },
+            },
+          };
+        case "sessionCost":
+          return {
+            sessionCost: {
+              ...st.sessionCost,
+              [e.session_pk]: { totalUsd: e.total_usd, models: e.models },
             },
           };
         case "contextCompacted":
@@ -229,7 +277,13 @@ export const useStore = create<State>((set, get) => ({
   clearApproval: (requestId) => set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
 
   setFocused: (pk) => {
+    const prev = get().focusedSessionPk;
+    if (prev && prev !== pk) {
+      const prevSession = get().sessions.find((s) => s.sessionPk === prev);
+      if (prevSession) useUi.getState().markRead(prev, prevSession.lastActive ?? 0);
+    }
     set({ focusedSessionPk: pk });
+    if (pk) notifier.cancelSettle(pk);
     if (pk && !get().loaded[pk]) void get().hydrateTranscript(pk);
   },
 
@@ -263,7 +317,10 @@ export const useStore = create<State>((set, get) => ({
     const projects = await commands.listProjects();
     const sessions = await commands.listSessions(null);
     if (projects.status === "ok") set({ projects: projects.data });
-    if (sessions.status === "ok") set({ sessions: sessions.data });
+    if (sessions.status === "ok") {
+      set({ sessions: sessions.data });
+      useUi.getState().seedReadState(sessions.data);
+    }
   },
 
   addProject: async () => {
@@ -379,7 +436,7 @@ export const useStore = create<State>((set, get) => ({
   },
   refreshModelConfiguration: async () => {
     const generation = ++modelConfigurationGeneration;
-    const runtimes = await useRuntimes.getState().fetchList();
+    await useAgent.getState().load();
     const projectIds = Object.keys(get().projectRuntimeById);
     const projectMutationSnapshots = new Map(
       projectIds.map((id) => [
@@ -392,7 +449,6 @@ export const useStore = create<State>((set, get) => ({
     );
     const entries = await Promise.all(projectIds.map(async (id) => [id, await commands.projectRuntimeInfo(id)] as const));
     if (generation !== modelConfigurationGeneration) return;
-    if (runtimes) useRuntimes.setState({ runtimes });
     set((st) => {
       const next = { ...st.projectRuntimeById };
       for (const [id, result] of entries) {
@@ -419,15 +475,88 @@ export const useStore = create<State>((set, get) => ({
     await get().refreshModelConfiguration();
     return true;
   },
-  setProjectPermMode: async (projectId, permMode) => {
-    const project = get().projects.find((p) => p.projectId === projectId);
-    if (!project || project.permMode === permMode) return;
-    const previousPermMode = project.permMode;
-    set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode } : p)) });
-    const res = await commands.updateProjectPermMode(projectId, permMode);
+  loadSessionRuntime: async (sessionPk) => {
+    const loadGeneration = nextGeneration(sessionRuntimeLoadGeneration, sessionPk);
+    const queue = sessionRuntimeQueues.get(sessionPk);
+    const intent = queue?.latestIntent ?? 0;
+    const res = await commands.sessionRuntimeInfo(sessionPk);
+    if (
+      res.status === "ok" &&
+      sessionRuntimeLoadGeneration.get(sessionPk) === loadGeneration &&
+      (sessionRuntimeQueues.get(sessionPk)?.latestIntent ?? 0) === intent
+    ) {
+      set((st) => ({ sessionRuntimeById: { ...st.sessionRuntimeById, [sessionPk]: res.data } }));
+    }
+  },
+  setSessionRuntime: async (sessionPk, model, effort) => {
+    const previousRuntime = get().sessionRuntimeById[sessionPk];
+    let queue = sessionRuntimeQueues.get(sessionPk);
+    if (!queue) {
+      queue = {
+        tail: Promise.resolve(),
+        pending: 0,
+        latestIntent: 0,
+        confirmedModel: previousRuntime?.model ?? null,
+        confirmedEffort: previousRuntime?.storedEffort ?? null,
+        confirmedRuntime: previousRuntime,
+      };
+      sessionRuntimeQueues.set(sessionPk, queue);
+    }
+    const intent = ++queue.latestIntent;
+    queue.pending += 1;
+    const optimistic: SessionRuntimeInfo = previousRuntime
+      ? { ...previousRuntime, model, storedEffort: effort }
+      : {
+          sessionPk,
+          model,
+          storedEffort: effort,
+          effectiveEffort: effort,
+          effectiveEffortLabel: effort,
+          effectiveSource: effort ? "project" : "none",
+          storedEffortStatus: "valid",
+          modelInfo: null,
+        };
+    set((st) => ({ sessionRuntimeById: { ...st.sessionRuntimeById, [sessionPk]: optimistic } }));
+    let succeeded = false;
+    const execute = async () => {
+      try {
+        const res = await commands.updateSessionRuntime(sessionPk, model, effort);
+        succeeded = res.status === "ok";
+        if (res.status === "ok") {
+          queue.confirmedRuntime = res.data;
+          queue.confirmedModel = res.data.model;
+          queue.confirmedEffort = res.data.storedEffort;
+        } else {
+          toast.error("Couldn't set chat model and effort: " + res.error.message);
+        }
+      } catch (error) {
+        toast.error("Couldn't set chat model and effort: " + String(error));
+      }
+      queue.pending -= 1;
+      if (intent === queue.latestIntent) {
+        const confirmed = queue.confirmedRuntime;
+        set((st) => {
+          const next = { ...st.sessionRuntimeById };
+          if (confirmed) next[sessionPk] = { ...confirmed, sessionPk };
+          else delete next[sessionPk];
+          return { sessionRuntimeById: next };
+        });
+      }
+      if (queue.pending === 0) sessionRuntimeQueues.delete(sessionPk);
+    };
+    const task = queue.pending === 1 ? execute() : queue.tail.then(execute);
+    queue.tail = task.catch(() => undefined);
+    await task;
+    return succeeded;
+  },
+  setSessionPermMode: async (sessionPk, permMode) => {
+    const session = get().sessions.find((s) => s.sessionPk === sessionPk);
+    if (!session || session.permMode === permMode) return;
+    set({ sessions: get().sessions.map((s) => (s.sessionPk === sessionPk ? { ...s, permMode } : s)) });
+    const res = await commands.updateSessionPermMode(sessionPk, permMode);
     if (res.status === "error") {
       toast.error("Couldn't set permission mode: " + res.error.message);
-      set({ projects: get().projects.map((p) => (p.projectId === projectId ? { ...p, permMode: previousPermMode } : p)) });
+      await get().refresh();
     }
   },
 
@@ -444,13 +573,45 @@ export const useStore = create<State>((set, get) => ({
     void get().refresh();
     return true;
   },
+  startChat: async (prompt, options) => {
+    const res = await commands.startChatSession(prompt, toChatRequestOptions(options));
+    if (res.status === "error") {
+      toast.error("Couldn't start chat: " + res.error.message);
+      return false;
+    }
+    // Same optimistic-navigation seed as start(): focus the returned row
+    // immediately, then let the background refresh catch up.
+    set({ focusedSessionPk: res.data.sessionPk, sessions: [...get().sessions, res.data] });
+    void get().refresh();
+    return true;
+  },
   send: async (sessionPk, prompt, options) => {
-    const res = await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));
+    // A session already RUNNING a turn gets steered — the message is
+    // injected into that turn's next tool-result batch instead of racing a
+    // whole new turn onto the session. Any other status (idle, interrupted,
+    // ended) starts a normal continue.
+    const isRunning = get().sessions.find((s) => s.sessionPk === sessionPk)?.status === "running";
+    const res = isRunning
+      ? await commands.steerSession(sessionPk, prompt)
+      : await commands.continueSession(sessionPk, prompt, toChatRequestOptions(options));
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);
     }
     await get().refresh();
     return res.status === "ok";
+  },
+  enqueueMessage: (sessionPk, msg) => set((st) => ({ queued: { ...st.queued, [sessionPk]: enqueue(st.queued[sessionPk], msg) } })),
+  removeQueued: (sessionPk, id) => set((st) => ({ queued: { ...st.queued, [sessionPk]: removeById(st.queued[sessionPk], id) } })),
+  sendNextQueued: async (sessionPk) => {
+    const { head, rest } = dequeue(get().queued[sessionPk]);
+    if (!head) return;
+    // Remove the head BEFORE awaiting so a second `result` can't re-send it.
+    set((st) => ({ queued: { ...st.queued, [sessionPk]: rest } }));
+    const ok = await get().send(sessionPk, head.text, head.options);
+    if (!ok) {
+      // Command-level rejection: put it back at the front so it stays visible.
+      set((st) => ({ queued: { ...st.queued, [sessionPk]: [head, ...(st.queued[sessionPk] ?? [])] } }));
+    }
   },
   stop: async (sessionPk) => {
     const res = await commands.stopSession(sessionPk);
@@ -482,11 +643,47 @@ export const useStore = create<State>((set, get) => ({
     await events.coreEventMsg.listen((e) => {
       const event = e.payload.event;
       get().applyCoreEvent(event);
+      // Keep the actively-viewed session marked read as its activity streams in.
+      markFocusedSessionReadOnEvent(event, get().focusedSessionPk);
+      // OS notification for attention events (suppressed while focused).
+      const intent = notifyIntentForEvent(event, get().focusedSessionPk, isWindowFocused());
+      const evtPk = (event as { session_pk?: string }).session_pk;
+      if (evtPk) notifier.cancelSettle(evtPk); // any activity supersedes a pending settle
+      if (intent)
+        notifier.handle(
+          intent,
+          get().sessions.find((s) => s.sessionPk === intent.sessionPk),
+        );
+      drainQueueOnEvent(event);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
-      else if (event.kind === "runtimeUpdateLog") useRuntimes.getState().onUpdateLog(event.runtime_id, event.line);
-      else if (event.kind === "runtimeUpdateDone") useRuntimes.getState().onUpdateDone(event.runtime_id, event.ok, event.message);
     });
   },
 }));
+
+/**
+ * A core event for the session currently focused in the UI counts as the
+ * user having "seen" it as it streams in — mark that session read so its
+ * unread dot never lags behind what's already on screen. Extracted from the
+ * `init()` listener so the decision is testable without driving a real Tauri
+ * event subscription.
+ */
+export function markFocusedSessionReadOnEvent(event: CoreEvent, focusedSessionPk: string | null): void {
+  const activePk = (event as { session_pk?: string }).session_pk;
+  if (activePk && activePk === focusedSessionPk) {
+    useUi.getState().markRead(activePk, Date.now());
+  }
+}
+
+/**
+ * Drain one queued message when a session's turn finishes *successfully*.
+ * Keyed on `result` only: an `error` turn emits no `result`, so the queue
+ * stays put (structural pause). Extracted so the decision is testable without
+ * a real Tauri event subscription.
+ */
+export function drainQueueOnEvent(event: CoreEvent): void {
+  if (event.kind !== "result") return;
+  const pk = (event as { session_pk?: string }).session_pk;
+  if (pk) void useStore.getState().sendNextQueued(pk);
+}

@@ -23,6 +23,11 @@ async function openProvider(page: import("@playwright/test").Page, name: string)
   await page.getByRole("button", { name: new RegExp(`^${name} \\d+ accounts?`) }).click();
 }
 
+async function selectDemoProject(page: import("@playwright/test").Page) {
+  await page.getByRole("combobox", { name: "Project" }).click();
+  await page.getByRole("option", { name: /demo/ }).click();
+}
+
 test("boots to Home with the project loaded", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: /What should we build/ })).toBeVisible();
@@ -50,7 +55,7 @@ test("sidebar navigation leaves the Home view", async ({ page }) => {
   await page.goto("/");
   const homeHeading = page.getByRole("heading", { name: /What should we build/ });
   await expect(homeHeading).toBeVisible();
-  for (const label of ["Models", "Runtime", "Scheduler", "Plugins", "Settings"]) {
+  for (const label of ["Models", "Scheduler", "Plugins", "Settings"]) {
     await page.getByText(label, { exact: true }).first().click();
     await expect(homeHeading).toHaveCount(0);
     // back to Home for the next iteration
@@ -59,8 +64,49 @@ test("sidebar navigation leaves the Home view", async ({ page }) => {
   }
 });
 
-test("composer Enter starts a session and navigates to it", async ({ page }) => {
+test("composer Enter with no project starts a chat session and navigates to it", async ({ page }) => {
   await page.goto("/");
+  // Home is chat-first: with no project selected (the default), Enter starts a
+  // project-less chat session.
+  const composer = page.getByPlaceholder("Do anything");
+  await composer.fill("build me a test");
+  await composer.press("Enter");
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
+  await expect(page.getByRole("heading", { name: /What should we build/ })).toHaveCount(0);
+  const start = (await mockCalls(page)).find((c) => c.cmd === "start_chat_session");
+  expect(start?.args).toMatchObject({ prompt: "build me a test" });
+});
+
+test("projectless chat persists model and effort from Home and can change them in Session", async ({ page }) => {
+  await page.goto("/");
+  const homeTrigger = page.getByRole("button", { name: "Model and effort" });
+  await homeTrigger.click();
+  await page.getByText("Model Alpha", { exact: true }).click();
+  await page.getByText("High", { exact: true }).click();
+
+  const composer = page.getByPlaceholder("Do anything");
+  await composer.fill("chat with explicit effort");
+  await composer.press("Enter");
+  await expect
+    .poll(async () => (await mockCalls(page)).find((call) => call.cmd === "start_chat_session")?.args)
+    .toMatchObject({ options: { model: "fixture/model-alpha", effort: "high" } });
+
+  const sessionTrigger = page.getByRole("button", { name: "Model and effort" });
+  await expect(sessionTrigger).toContainText("Model Alpha");
+  await expect(sessionTrigger).toContainText("High");
+  await sessionTrigger.click();
+  await page.getByText("Model Beta", { exact: true }).click();
+  await page.getByText("Ultra", { exact: true }).click();
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_session_runtime").at(-1)?.args)
+    .toMatchObject({ sessionPk: "c-1", model: "fixture/model-beta", effort: "ultra" });
+});
+
+test("composer Enter with a project selected starts a project session", async ({ page }) => {
+  await page.goto("/");
+  // Home defaults to no project, so select the demo project first; then Enter
+  // starts a project session bound to it.
+  await selectDemoProject(page);
   const composer = page.getByPlaceholder("Do anything");
   await composer.fill("build me a test");
   await composer.press("Enter");
@@ -75,6 +121,7 @@ test("composer Enter starts a session and navigates to it", async ({ page }) => 
 
 test("structured model effort choices follow the selected execution surface", async ({ page }) => {
   await page.goto("/");
+  await selectDemoProject(page);
 
   const trigger = page.getByRole("button", { name: "Model and effort" });
   await trigger.click();
@@ -111,6 +158,7 @@ test("structured model effort choices follow the selected execution surface", as
 
 test("project effort override can return to the model default", async ({ page }) => {
   await page.goto("/");
+  await selectDemoProject(page);
   const trigger = page.getByRole("button", { name: "Model and effort" });
   await trigger.click();
   await page.getByText("Model Alpha", { exact: true }).click();
@@ -147,6 +195,7 @@ test("provider screen writes the global default for a concrete model", async ({ 
 
 test("running session effort changes are marked for the next turn", async ({ page }) => {
   await page.goto("/");
+  await selectDemoProject(page);
   const homeTrigger = page.getByRole("button", { name: "Model and effort" });
   await homeTrigger.click();
   await page.getByText("Model Beta", { exact: true }).click();
@@ -155,7 +204,7 @@ test("running session effort changes are marked for the next turn", async ({ pag
 
   const sessionTrigger = page.getByRole("button", { name: "Model and effort" });
   await sessionTrigger.click();
-  await expect(page.getByText("Changes apply to this project’s next turns.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Changes apply to the next turns.", { exact: true })).toBeVisible();
   await page.getByText("Ultra", { exact: true }).click();
   await expect
     .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_project_runtime").at(-1)?.args)
@@ -164,6 +213,7 @@ test("running session effort changes are marked for the next turn", async ({ pag
 
 test("route switch notices render live once and survive reload", async ({ page }) => {
   await page.goto("/");
+  await selectDemoProject(page);
 
   const homeTrigger = page.getByRole("button", { name: "Model and effort" });
   await homeTrigger.click();

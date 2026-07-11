@@ -25,6 +25,21 @@ export function fileBadge(path: string): string {
   return BADGES[ext] ?? ext.slice(0, 4).toUpperCase();
 }
 
+/** Parse a backticked chat token that looks like a file path (`src/a.ts`,
+ *  `crates\core\lib.rs:42`, `C:\w\p\a.ts:10:5`). Requires a separator and a
+ *  dotted final segment; strips an optional :line[:col] suffix. Returns null
+ *  for URLs, tokens with whitespace, and everything else non-path-like. */
+export function parsePathToken(token: string): { path: string; line: number | null } | null {
+  if (/\s/.test(token) || token.includes("://")) return null;
+  const m = token.match(/^(.+?)(?::(\d+)(?::\d+)?)?$/);
+  if (!m) return null;
+  const path = m[1];
+  if (!/[\\/]/.test(path)) return null;
+  const last = basename(path);
+  if (!/\.[A-Za-z0-9]{1,8}$/.test(last)) return null;
+  return { path, line: m[2] ? Number(m[2]) : null };
+}
+
 /** Join a workdir and a repo-relative posix path using the workdir's separator. */
 export function joinPath(workdir: string, rel: string): string {
   const sep = workdir.includes("\\") ? "\\" : "/";
@@ -38,4 +53,41 @@ export function toRepoRelative(path: string, workdir: string): string {
   const norm = path.replace(/\\/g, "/");
   const root = workdir.replace(/\\/g, "/").replace(/\/+$/, "");
   return root && norm.toLowerCase().startsWith(`${root.toLowerCase()}/`) ? norm.slice(root.length + 1) : norm;
+}
+
+function hasUnsafeSegments(rel: string): boolean {
+  return rel.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
+}
+
+/** Heuristic: does an inline code span look like a repo-relative file path?
+ *  Rejects absolutes, URLs, query/fragment strings, command-like text
+ *  (whitespace before the first slash), and unsafe segments. Spaces INSIDE
+ *  a segment are allowed ("docs/Design Notes.md"). */
+export function looksLikeWorkspaceFilePath(text: string): boolean {
+  if (!text) return false;
+  if (text.startsWith("/")) return false;
+  if (text.includes("://")) return false;
+  if (text.includes("?") || text.includes("#")) return false;
+  const slash = text.indexOf("/");
+  if (slash <= 0) return false;
+  if (/\s/.test(text.slice(0, slash))) return false;
+  return !hasUnsafeSegments(text);
+}
+
+/** Resolve `text` to a clean workdir-relative posix path, or null when it
+ *  cannot be a workspace file: URLs/query/fragment, absolute paths outside
+ *  (or equal to) the workdir, and unsafe segments are rejected. Relative
+ *  inputs pass through when their segments are safe. */
+export function toWorkspaceRelativePath(text: string, workdir: string): string | null {
+  if (!text || text.includes("://") || text.includes("?") || text.includes("#")) return null;
+  const norm = text.replace(/\\/g, "/");
+  const root = workdir.replace(/\\/g, "/").replace(/\/+$/, "");
+  const absolute = norm.startsWith("/") || /^[A-Za-z]:\//.test(norm);
+  if (absolute) {
+    if (!root) return null;
+    if (!norm.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return null;
+    const rel = norm.slice(root.length + 1);
+    return rel && !hasUnsafeSegments(rel) ? rel : null;
+  }
+  return !hasUnsafeSegments(norm) ? norm : null;
 }

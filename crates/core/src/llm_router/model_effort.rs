@@ -64,6 +64,7 @@ pub enum StoredEffortStatus {
 #[serde(rename_all = "camelCase")]
 pub enum EffectiveEffortSource {
     Project,
+    Session,
     RouteCompatibility,
     Configured,
     Provider,
@@ -481,6 +482,18 @@ pub async fn build_turn_effort_policy(
     build_effort_policy(store, project_override, requested_model).await
 }
 
+pub async fn build_session_effort_policy(
+    store: &Store,
+    session_pk: &str,
+    requested_model: &str,
+) -> anyhow::Result<TurnEffortPolicy> {
+    let session_override = store
+        .get_session_runtime_settings(session_pk)
+        .await?
+        .and_then(|runtime| runtime.effort);
+    build_effort_policy(store, session_override, requested_model).await
+}
+
 pub async fn build_utility_effort_policy(
     store: &Store,
     requested_model: &str,
@@ -813,6 +826,7 @@ mod tests {
             display_name: Some("Fallback".into()),
             reasoning_efforts: vec![option("low", "Low", None), option("high", "High", None)],
             default_reasoning_effort: Some("high".into()),
+            ..crate::llm_router::model_meta::FALLBACK.clone()
         };
         let missing = DiscoveredModelMeta::default();
         assert_eq!(
@@ -952,5 +966,48 @@ mod tests {
         assert_eq!(resolved.display_name.as_deref(), Some("Surface GPT"));
         assert!(resolved.reasoning_efforts.is_empty());
         assert_eq!(resolved.context_window, 64_000);
+    }
+
+    #[tokio::test]
+    async fn session_effort_policy_uses_the_durable_chat_override() {
+        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "chat-effort".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .update_session_runtime_settings(
+                "chat-effort",
+                Some("openai/gpt-5.5".into()),
+                Some("high".into()),
+            )
+            .await
+            .unwrap();
+
+        let policy = build_session_effort_policy(&store, "chat-effort", "openai/gpt-5.5")
+            .await
+            .unwrap();
+        assert_eq!(policy.project_override.as_deref(), Some("high"));
     }
 }

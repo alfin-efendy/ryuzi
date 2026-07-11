@@ -1,12 +1,10 @@
 //! Native agent runtime.
 //!
-//! Unlike the ACP harness ([`super::acp`]), which delegates all reasoning and
-//! tool execution to an external Claude Code adapter process, the native
-//! runtime runs the agentic loop in-process: it calls LLMs through
+//! The native runtime runs the agentic loop in-process: it calls LLMs through
 //! [`crate::llm_router::client`], executes its own built-in tools
 //! ([`tools`]), enforces permissions ([`permission`]), and persists a
-//! provider-turn ledger ([`ledger`]) — registered under the harness id
-//! `"native"` beside `"claude-code"`.
+//! provider-turn ledger ([`ledger`]). It is the engine's only session
+//! harness, held as the single factory slot in [`crate::plugins::Registries`].
 //!
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
@@ -14,8 +12,10 @@ pub mod agents;
 pub mod commands;
 pub mod context;
 pub mod context_manager;
+pub mod cost;
 pub mod format;
 pub mod hooks;
+pub mod iteration_budget;
 pub mod ledger;
 pub mod llm;
 pub mod lsp;
@@ -25,6 +25,7 @@ pub mod permission;
 pub mod runner;
 pub mod skills;
 pub mod snapshot;
+pub mod steer;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
@@ -34,7 +35,7 @@ use ryuzi_plugin_sdk::PluginManifest;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-/// The native runtime harness id, stored in `projects.harness`.
+/// The native runtime harness id — the sole in-process agent runtime.
 pub const NATIVE_ID: &str = "native";
 
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
@@ -137,11 +138,7 @@ impl Harness for NativeHarness {
         // connections alive for the session's lifetime.
         let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
         let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
-        // Persistent memory and tool-policy lookups key off the session's
-        // project; without a session row (bare tests) both features are
-        // simply off, keeping runs hermetic.
-        let session_row = ctx.store.get_session(&ctx.session_pk).await.ok().flatten();
-        let project_id = session_row.as_ref().map(|s| s.project_id.clone());
+        let project_id = ctx.project_id.clone();
         let model_name = model.as_deref().unwrap_or("");
         let mut effort_policy = if let Some(project_id) = project_id.as_deref() {
             crate::llm_router::model_effort::build_turn_effort_policy(
@@ -155,14 +152,30 @@ impl Harness for NativeHarness {
         if project_id.is_none() {
             effort_policy.project_override = ctx.effort;
         }
-        let memory_store = project_id
-            .as_deref()
-            .map(|pid| Arc::new(memory::MemoryStore::at_default(Some(pid))));
+        // Persistent memory is unconditional: a chat (project-less) session
+        // still gets GLOBAL memory, while a project session gets global +
+        // project scope. `at_default(None)` sets the global path and leaves
+        // the project path unset — global memory works, project-scope ops
+        // error cleanly — so previously skipping `MemoryStore` entirely for
+        // `project_id: None` needlessly denied chat sessions memory. Tool-
+        // policy lookups (below, via `RunnerDeps::project_id`) stay
+        // project-scoped and off without a project — chat sessions have no
+        // project to scope a `tool_policies` row to.
+        let project_id = ctx.project_id.clone();
+        let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
+            project_id.as_deref(),
+        )));
+        // One buffer for the session's whole lifetime: cloned into
+        // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
+        // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
+        let steer = steer::SteerBuffer::new();
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
+            steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 work_dir: ctx.work_dir,
+                attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
@@ -180,6 +193,7 @@ impl Harness for NativeHarness {
                 commands,
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                steer,
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
@@ -199,6 +213,10 @@ pub struct NativeSession {
     /// ledger's user/assistant alternation — and its tool_use/tool_result
     /// pairing — breaks durably.
     turn_lock: tokio::sync::Mutex<()>,
+    /// Mid-turn steering buffer (Task B3) — the SAME buffer cloned into
+    /// `deps.steer`, so a `steer()` call here is visible to whatever turn is
+    /// currently running in `send_prompt`/`drive()`.
+    steer: steer::SteerBuffer,
 }
 
 #[async_trait]
@@ -240,6 +258,12 @@ impl HarnessSession for NativeSession {
         // The native runtime owns its own history (the provider_turns ledger),
         // so the session_pk is a stable, always-present resume id.
         Some(self.session_pk.clone())
+    }
+
+    fn steer(&self, text: String) {
+        // Never touches turn_lock/live_cancel: this queues for whatever turn
+        // is (or will be) running, it does not interrupt or race it.
+        self.steer.push(text);
     }
 }
 
@@ -301,7 +325,6 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             mcp: vec![],
             skills: vec![],
             provider: None,
-            runtime: None,
         },
         harness: Some(Arc::new(NativeHarnessFactory::with_llm_factory(
             llm_factory,
@@ -335,7 +358,11 @@ mod tests {
         let (events, _rx) = broadcast::channel(64);
         SessionCtx {
             session_pk: "sess".into(),
+            project_id: None,
+            kind: crate::domain::SessionKind::Chat,
+            agent: None,
             work_dir,
+            attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,
             model: Some("test/model".into()),
             effort: None,
@@ -352,8 +379,8 @@ mod tests {
     fn native_plugin_registers_under_native_id() {
         let mut regs = crate::plugins::Registries::new();
         regs.add_plugin(native_plugin());
-        assert!(regs.harness.get("native").is_some());
-        assert!(regs.gateway.get("native").is_none());
+        assert!(regs.plugins.get(NATIVE_ID).is_some());
+        assert!(regs.gateway.get(NATIVE_ID).is_none());
     }
 
     #[test]
@@ -372,8 +399,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn session_runs_a_turn_and_exposes_stable_resume_id() {
         use runner::testutil::{message_delta, message_stop, text_delta};
+        let _guard = StateDirGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -409,10 +438,88 @@ mod tests {
         session.end().await.unwrap();
     }
 
+    /// Redirect `dirs::home_dir()`/`dirs::data_dir()` into a tempdir for the
+    /// duration of a test — `MemoryStore::at_default` resolves under
+    /// `~/.config/ryuzi/memory`, so a test that exercises it for real must
+    /// not touch the developer's actual home directory. Process-global env,
+    /// so every test using this needs `#[serial]` (mirrors
+    /// `control::tests::StateDirGuard`).
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
+
+    /// The actual wiring bug this task fixes: a chat (project-less) session
+    /// previously skipped `MemoryStore` construction entirely (`project_id:
+    /// None` short-circuited it in `NativeHarness::start_session`), so a
+    /// fact saved by one chat session was invisible to the next. Seed the
+    /// GLOBAL memory file `at_default(None)` resolves to, start a session
+    /// through the real `Harness` trait with `ctx.project_id: None` (as
+    /// `ctx_for` now sets), and confirm the seeded entry reaches the first
+    /// request's system prompt exactly like `memory_snapshot_reaches_
+    /// primary_system_but_not_subagents` proves it does for a project
+    /// session in `runner.rs`.
     #[tokio::test]
+    #[serial_test::serial]
+    async fn chat_session_without_a_project_still_gets_global_memory() {
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+        let _guard = StateDirGuard::new();
+        memory::MemoryStore::at_default(None)
+            .add(
+                memory::MemoryScope::Global,
+                "the deploy key lives in 1Password",
+            )
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+
+        let llm = Arc::new(RecordingLlm::new(vec![vec![
+            text_delta("ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ]]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let plugin = native_plugin_with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
+        let harness = plugin.harness.unwrap().create().unwrap();
+        // ctx_for's SessionCtx carries project_id: None — the chat-session shape.
+        let session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+        session
+            .send_prompt(TurnPrompt::text("hi", "hi"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let system = bodies[0]["system"].as_str().unwrap_or_default();
+        assert!(
+            system.contains("the deploy key lives in 1Password"),
+            "{system}"
+        );
+        assert!(system.contains("# Persistent memory (global)"), "{system}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn concurrent_prompts_on_one_session_are_serialized() {
         use runner::testutil::{message_delta, message_stop, text_delta};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let _guard = StateDirGuard::new();
 
         /// Holds each provider stream open ~100ms and records how many
         /// streams were ever active at once: >1 means two turns interleaved
@@ -562,7 +669,6 @@ mod tests {
                 name: "p".into(),
                 workdir: dir.path().to_string_lossy().into_owned(),
                 source: None,
-                harness: "native".into(),
                 model: Some("anthropic/model-a".into()),
                 effort: Some("low".into()),
                 perm_mode: PermMode::BypassPermissions,
@@ -574,17 +680,22 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "sess".into(),
-                project_id: "p".into(),
+                project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
                 title: Some("titled".into()),
                 status: SessionStatus::Running,
+                perm_mode: PermMode::BypassPermissions,
                 started_by: None,
                 created_at: Some(0),
                 last_active: Some(0),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: crate::domain::SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -596,6 +707,8 @@ mod tests {
         let plugin = native_plugin_with_llm_factory(Arc::new(SnapshotFactory(llm.clone())));
         let harness = plugin.harness.unwrap().create().unwrap();
         let mut ctx = ctx_for(store.clone(), dir.path().to_path_buf()).await;
+        ctx.project_id = Some("p".into());
+        ctx.kind = crate::domain::SessionKind::Project;
         ctx.model = Some("anthropic/model-a".into());
         ctx.effort = Some("low".into());
         let session = harness.start_session(ctx).await.unwrap();

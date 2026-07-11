@@ -1,6 +1,7 @@
 use super::*;
 use crate::domain::{
-    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionStatus,
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionKind,
+    SessionStatus,
 };
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;
@@ -56,6 +57,9 @@ struct FakeSession {
     /// Every prompt text driven on this (or a sibling) fake session, in
     /// order — lets resume tests assert the exact nudge text sent.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// Every `steer()` call observed on this (or a sibling) fake session, in
+    /// order — lets steer tests assert the live handle actually received it.
+    steered: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
@@ -127,6 +131,10 @@ impl HarnessSession for FakeSession {
     fn agent_session_id(&self) -> Option<String> {
         Some("agent-1".to_string())
     }
+
+    fn steer(&self, text: String) {
+        self.steered.lock().unwrap().push(text);
+    }
 }
 
 /// Shared counters so tests can observe the harness/session lifecycle across
@@ -141,6 +149,8 @@ struct Counters {
     ended: Arc<AtomicBool>,
     /// Prompts observed by `send_prompt` across every produced session, in order.
     prompts: Arc<Mutex<Vec<String>>>,
+    /// `steer()` calls observed across every produced session, in order.
+    steered: Arc<Mutex<Vec<String>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -166,6 +176,7 @@ impl Harness for FakeHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -206,6 +217,7 @@ impl Harness for GatedHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -251,6 +263,7 @@ impl Harness for LatchGatedHarness {
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
+            steered: self.counters.steered.clone(),
         }))
     }
 }
@@ -278,13 +291,10 @@ fn registries(block_until_cancel: bool) -> Registries {
 /// times the harness started a session / drove a prompt / ended.
 fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(FakeHarnessFactory {
-            block_until_cancel,
-            counters,
-        }),
-    );
+    regs.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel,
+        counters,
+    });
     regs
 }
 
@@ -315,24 +325,19 @@ fn commit_file(repo_dir: &std::path::Path, name: &str, content: &str) {
         .unwrap();
 }
 
-/// A ControlPlane whose fake harness is registered under BOTH runnable
-/// harness ids, so these tests don't care which default `connect_project`
-/// assigns.
+/// A ControlPlane whose fake harness IS the only harness (the single
+/// `Registries.harness` slot), so these tests don't care which harness id
+/// `connect_project` assigns.
 async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile)
 {
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
     let mut regs = Registries::new();
-    for id in ["native", "claude-code"] {
-        regs.harness.register(
-            id,
-            Arc::new(FakeHarnessFactory {
-                block_until_cancel: false,
-                counters: counters.clone(),
-            }),
-        );
-    }
+    regs.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel: false,
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -573,8 +578,7 @@ async fn control_plane_with_failing_factory(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness
-        .register("native", Arc::new(FailingHarnessFactory));
+    regs.harness = Arc::new(FailingHarnessFactory);
     let cp = ControlPlane::new(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -589,7 +593,6 @@ async fn seed_project(store: &Store, project_id: &str) {
             name: "demo".into(),
             workdir: "/tmp/demo".into(),
             source: None,
-            harness: "native".into(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
@@ -613,17 +616,22 @@ async fn seed_session(
     store
         .insert_session(Session {
             session_pk: session_pk.to_string(),
-            project_id: project_id.to_string(),
+            project_id: Some(project_id.to_string()),
             agent_session_id: agent_session_id.map(|s| s.to_string()),
             worktree_path: None,
             branch: None,
             title: Some("seed".into()),
             status,
+            perm_mode: PermMode::Default,
             started_by: Some("test".into()),
             created_at: Some(now),
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: true,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         })
         .await
         .unwrap();
@@ -699,37 +707,6 @@ async fn wait_for_session_ctx(counters: &Counters) -> Vec<crate::domain::McpServ
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("timed out waiting for the harness SessionCtx");
-}
-
-#[tokio::test]
-#[serial]
-async fn unknown_harness_errors_cleanly() {
-    let _guard = StateDirGuard::new();
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    // Empty registry → no harness registered under "native".
-    let cp = ControlPlane::new(store, Registries::new()).await;
-    let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
-    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-
-    let err = cp
-        .start_session(&project.project_id, "go", "test", &[])
-        .await
-        .expect_err("start_session should fail without a registered harness");
-    assert!(
-        err.to_string().contains("unknown harness"),
-        "expected a clear unknown-harness error, got: {err}"
-    );
-}
-
-#[tokio::test]
-async fn connect_project_defaults_to_the_native_harness() {
-    let (cp, _store, _log, _db_guard) = fake_control_plane().await;
-    let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
-    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-    assert_eq!(project.harness, "native");
 }
 
 #[tokio::test]
@@ -969,6 +946,107 @@ async fn continue_cold_resumes_when_handle_absent() {
     assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+#[serial]
+async fn steer_session_reaches_the_live_handle_without_starting_a_new_turn() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    let handle_before = wait_for_running_handle(&cp, &session.session_pk).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let received = cp
+        .steer_session(&session.session_pk, "stop and check the tests first")
+        .await
+        .unwrap();
+    assert!(received, "a live handle must report it received the steer");
+
+    // The SAME live handle observed the steer — no new turn/session started.
+    assert_eq!(
+        counters.steered.lock().unwrap().as_slice(),
+        ["stop and check the tests first"]
+    );
+    assert_eq!(
+        counters.starts.load(Ordering::SeqCst),
+        1,
+        "steer must not start a new harness session"
+    );
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        1,
+        "steer must not itself drive a new turn — only the original send_prompt ran"
+    );
+    let handle_after = cp
+        .running
+        .lock()
+        .unwrap()
+        .get(&session.session_pk)
+        .cloned()
+        .unwrap();
+    assert!(Arc::ptr_eq(&handle_before, &handle_after));
+}
+
+#[tokio::test]
+#[serial]
+async fn steer_session_falls_back_to_a_new_turn_when_no_live_handle() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Simulate the handle being gone (app restart) — no in-flight turn exists
+    // to steer into.
+    cp.running.lock().unwrap().remove(&session.session_pk);
+
+    let received = cp
+        .steer_session(&session.session_pk, "second, but as a fresh turn")
+        .await
+        .unwrap();
+    assert!(
+        !received,
+        "no live handle: the text must fall back to a normal continue, not report as steered"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // No steer() call was ever recorded — it went through continue_session's
+    // ordinary cold-resume + send_prompt path instead.
+    assert!(counters.steered.lock().unwrap().is_empty());
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        2,
+        "the fallback must have driven a real turn with the steer text"
+    );
+    assert_eq!(
+        counters.prompts.lock().unwrap().last().map(String::as_str),
+        Some("second, but as a fresh turn")
+    );
+    assert!(
+        cp.running.lock().unwrap().contains_key(&session.session_pk),
+        "the fallback's cold resume must re-register a live handle"
+    );
+}
+
 /// Factory that works for the first session but fails every later create —
 /// models "the adapter can't come back up" for cold-resume paths.
 struct FailingResumeFactory {
@@ -993,12 +1071,9 @@ async fn failed_cold_resume_rolls_back_the_running_status() {
     let store = crate::store::Store::open(db.path()).await.unwrap();
     let counters = Counters::default();
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(FailingResumeFactory {
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(FailingResumeFactory {
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1149,6 +1224,133 @@ async fn start_session_streams_events_and_records_agent_id() {
 
 #[tokio::test]
 #[serial]
+async fn start_chat_session_runs_without_a_project() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    assert_eq!(session.project_id, None);
+    assert_eq!(session.kind, SessionKind::Chat);
+    // startup ran in the scratch dir (no worktree)
+    assert!(session.worktree_path.is_none());
+
+    // Background startup creates the scratch dir and starts the harness in
+    // it (no git prep, no project).
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let scratch = crate::paths::chat_scratch_dir(&session.session_pk);
+    assert!(scratch.exists(), "expected the scratch dir to be created");
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.project_id, None);
+    assert_eq!(stored.worktree_path, None);
+    assert_eq!(stored.branch, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn chat_startup_marker_is_registered_before_start_returns() {
+    let _guard = StateDirGuard::new();
+    let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    assert!(
+        cp.starting
+            .lock()
+            .unwrap()
+            .contains_key(&session.session_pk),
+        "an immediate lifecycle action must observe startup in progress"
+    );
+    cp.stop_session(&session.session_pk).await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn end_chat_session_removes_the_scratch_dir() {
+    let _guard = StateDirGuard::new();
+    let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    wait_for_running_handle(&cp, &session.session_pk).await;
+    let scratch = crate::paths::chat_scratch_dir(&session.session_pk);
+    assert!(scratch.exists());
+
+    cp.end_session(&session.session_pk).await.unwrap();
+
+    assert!(
+        !scratch.exists(),
+        "end_session must remove a chat session's scratch dir"
+    );
+    let stored = cp.list_sessions(None).await.unwrap();
+    let stored = stored
+        .iter()
+        .find(|s| s.session_pk == session.session_pk)
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Ended);
+}
+
+#[tokio::test]
+#[serial]
+async fn resume_session_resumes_a_chat_session() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
+
+    let now = now_ms();
+    store
+        .insert_session(Session {
+            session_pk: "chat-1".to_string(),
+            project_id: None,
+            agent_session_id: Some("agent-1".to_string()),
+            worktree_path: None,
+            branch: None,
+            title: Some("chat".into()),
+            status: SessionStatus::Running,
+            started_by: Some("test".into()),
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            perm_mode: PermMode::Default,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        })
+        .await
+        .unwrap();
+
+    cp.resume_session("chat-1", "restart").await.unwrap();
+    wait_for_prompts(&prompt_log, 1).await;
+
+    assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+    let scratch = crate::paths::chat_scratch_dir("chat-1");
+    assert!(
+        scratch.exists(),
+        "resume must (re)create the chat session's scratch dir"
+    );
+    let mut s = store.get_session("chat-1").await.unwrap().unwrap();
+    for _ in 0..400 {
+        if s.status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s = store.get_session("chat-1").await.unwrap().unwrap();
+    }
+    assert_eq!(s.status, SessionStatus::Idle);
+}
+
+#[tokio::test]
+#[serial]
 async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
     let _guard = StateDirGuard::new();
     let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
@@ -1222,6 +1424,7 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
             "test",
             &[],
             Some(git_opts(false, true, None, None)),
+            None,
         )
         .await
         .expect("start must succeed; git errors surface in the transcript");
@@ -1275,13 +1478,10 @@ async fn stop_during_startup_cancels_cleanly() {
     let counters = Counters::default();
     let release = Arc::new(tokio::sync::Notify::new());
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(GatedHarnessFactory {
-            release: release.clone(),
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(GatedHarnessFactory {
+        release: release.clone(),
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
@@ -1367,17 +1567,22 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     let session_pk = crate::paths::new_id();
     let session = Session {
         session_pk: session_pk.clone(),
-        project_id: project.project_id.clone(),
+        project_id: Some(project.project_id.clone()),
         agent_session_id: None,
         worktree_path: None,
         branch: None,
         title: Some("go".to_string()),
         status: SessionStatus::Running,
+        perm_mode: PermMode::Default,
         started_by: Some("test".to_string()),
         created_at: Some(now_ms()),
         last_active: Some(now_ms()),
         resume_attempts: 0,
         branch_owned: false,
+        kind: SessionKind::Project,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
     };
     store.insert_session(session).await.unwrap();
 
@@ -1415,13 +1620,10 @@ async fn end_during_startup_waits_for_the_startup_task_and_cleans_the_worktree()
     let counters = Counters::default();
     let release = Arc::new(tokio::sync::Notify::new());
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(GatedHarnessFactory {
-            release: release.clone(),
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(GatedHarnessFactory {
+        release: release.clone(),
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
@@ -1491,13 +1693,10 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
     let counters = Counters::default();
     let open = Arc::new(AtomicBool::new(false));
     let mut regs = Registries::new();
-    regs.harness.register(
-        "native",
-        Arc::new(LatchGatedHarnessFactory {
-            open: open.clone(),
-            counters: counters.clone(),
-        }),
-    );
+    regs.harness = Arc::new(LatchGatedHarnessFactory {
+        open: open.clone(),
+        counters: counters.clone(),
+    });
     let cp = ControlPlane::new(store, regs).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1703,8 +1902,7 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     let (_db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness
-        .register("native", Arc::new(ErrSendHarnessFactory));
+    regs.harness = Arc::new(ErrSendHarnessFactory);
     let cp = ControlPlane::new(store, regs).await;
     seed_project(&cp.store, "p1").await;
     seed_session(
@@ -1812,7 +2010,7 @@ async fn attachments_manifest_is_appended_to_the_prompt_the_harness_receives() {
         .join(&session.session_pk)
         .join("notes.txt");
     let expected_manifest = format!(
-        "[User attached 1 file — saved to disk, use the Read tool to open them:]\n- {} (text/plain, 5 B)",
+        "[User attached 1 file:]\n- notes.txt (text/plain, 5 B) — saved to disk; open it with the Read tool: {}",
         dest.display()
     );
     assert_eq!(
@@ -2220,7 +2418,6 @@ async fn provision_project_name_flow_creates_a_real_repo_with_head_and_binds_it(
 
     assert_eq!(project.name, "demo");
     assert_eq!(project.workdir, root.path().join("demo").to_string_lossy());
-    assert_eq!(project.harness, "native");
     assert_eq!(project.perm_mode, crate::domain::PermMode::Default);
 
     // A real repo with a HEAD commit (worktrees need one).
@@ -2363,7 +2560,6 @@ async fn clone_project_derives_name_records_source_and_needs_no_settings() {
 
     assert_eq!(project.name, "upstream-repo");
     assert_eq!(project.source.as_deref(), Some(git_url.as_str()));
-    assert_eq!(project.harness, "native");
     assert!(project.is_git);
     assert_eq!(
         project.workdir,
@@ -2476,7 +2672,6 @@ async fn provision_project_drops_unsupported_legacy_default_effort() {
     req.name = Some("defaulted".to_string());
     let project = cp.provision_project(req).await.unwrap();
 
-    assert_eq!(project.harness, "native");
     assert_eq!(project.model.as_deref(), Some("opus"));
     assert_eq!(project.effort, None);
 }
@@ -2610,14 +2805,22 @@ async fn provision_project_explicit_settings_override_defaults() {
 
     let mut req = provision_req("fake", "ws1", "u1");
     req.name = Some("overridden".to_string());
-    req.settings.harness = Some("other-harness".to_string());
     req.settings.model = Some("sonnet".to_string());
     req.settings.effort = Some("low".to_string());
     let project = cp.provision_project(req).await.unwrap();
 
-    assert_eq!(project.harness, "other-harness");
     assert_eq!(project.model.as_deref(), Some("sonnet"));
     assert_eq!(project.effort.as_deref(), Some("low"));
+}
+
+#[tokio::test]
+async fn restart_required_flag_defaults_false_and_latches_true() {
+    let (_db, path) = temp_db_path();
+    let store = Store::open(&path).await.unwrap();
+    let cp = ControlPlane::new(store, Registries::new()).await;
+    assert!(!cp.plugins_restart_required());
+    cp.mark_plugins_restart_required();
+    assert!(cp.plugins_restart_required());
 }
 
 #[tokio::test]
@@ -2737,7 +2940,6 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
         }],
         skills: vec![],
         provider: None,
-        runtime: None,
     };
     crate::plugins::declarative::declarative_plugin(manifest, crate::plugins::PluginSource::Builtin)
         .expect("test manifest must validate")
@@ -2945,6 +3147,7 @@ async fn user_named_branch_survives_end_session() {
             "test",
             &[],
             Some(git_opts(true, true, Some("keep/me"), None)),
+            None,
         )
         .await
         .unwrap();
@@ -2988,6 +3191,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
             "test",
             &[],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3029,6 +3233,7 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
             "test",
             &[],
             Some(git_opts(false, false, None, None)),
+            None,
         )
         .await
         .unwrap();
@@ -3066,4 +3271,46 @@ async fn no_worktree_session_runs_in_place_and_teardown_leaves_checkout_alone() 
         .unwrap()
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Ended);
+}
+
+#[tokio::test]
+#[serial]
+async fn worktree_dir_setting_overrides_the_default_worktree_root() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _db) = fake_control_plane_any_harness().await;
+
+    let custom_root = tempfile::tempdir().unwrap();
+    store
+        .set_setting("worktree_dir", custom_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    let session = cp
+        .start_session(&project.project_id, "go", "test", &[])
+        .await
+        .unwrap();
+    wait_for_message(&store, &session.session_pk, |m| {
+        m.block_type == "status"
+            && m.payload["summary"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("Created and checked out branch "))
+    })
+    .await;
+
+    let wt = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .worktree_path
+        .expect("git prep backfilled the worktree path");
+    assert!(
+        std::path::Path::new(&wt).starts_with(custom_root.path()),
+        "worktree {wt} must live under the configured worktree_dir {}",
+        custom_root.path().display()
+    );
 }

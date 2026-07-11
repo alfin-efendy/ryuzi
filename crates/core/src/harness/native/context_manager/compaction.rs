@@ -239,6 +239,10 @@ mod tests {
             display_name: None,
             reasoning_efforts: vec![],
             default_reasoning_effort: None,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         }
     }
 
@@ -400,6 +404,10 @@ mod tests {
             display_name: None,
             reasoning_efforts: vec![],
             default_reasoning_effort: None,
+            cost_input: 0.0,
+            cost_output: 0.0,
+            cost_cache_read: 0.0,
+            cost_cache_write: 0.0,
         };
         let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(tiny_meta));
         cm.append_user(json!([{"type":"text","text":"start task"}]))

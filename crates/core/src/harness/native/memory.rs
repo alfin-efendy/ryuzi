@@ -393,4 +393,19 @@ mod tests {
         assert_eq!(MemoryScope::parse("project").unwrap(), MemoryScope::Project);
         assert!(MemoryScope::parse("user").is_err());
     }
+
+    /// A chat (project-less) session must still get a usable `MemoryStore`:
+    /// the global path is always set, and a `None` project id simply leaves
+    /// the project path unset (which correctly errors on project-scoped
+    /// ops) rather than the caller skipping `MemoryStore` construction
+    /// altogether — that skip was the actual bug, fixed in
+    /// `native::mod::NativeHarness::start_session`. No filesystem I/O
+    /// happens here (only path construction), so this needs no
+    /// `StateDirGuard`/`#[serial]`.
+    #[test]
+    fn at_default_none_gives_global_only() {
+        let store = MemoryStore::at_default(None);
+        assert!(store.path_for(MemoryScope::Global).is_ok());
+        assert!(store.path_for(MemoryScope::Project).is_err());
+    }
 }

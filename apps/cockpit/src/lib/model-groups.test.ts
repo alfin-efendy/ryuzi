@@ -92,7 +92,7 @@ test("unknown prefix lands in Other with the full id as label", () => {
 });
 
 test("catalog-entry-id prefix resolves to its family with a trimmed label", () => {
-  // RuntimeDetailView's endpoint card builds `${connection.provider}/${model}`
+  // A connection-scoped picker can build `${connection.provider}/${model}`
   // ids, where provider is a catalog ENTRY id (anthropic-oauth), not a family.
   const groups = groupModelOptions(["anthropic-oauth/claude-opus-4-8"], catalog, []);
   expect(groups).toEqual([

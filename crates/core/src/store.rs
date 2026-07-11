@@ -1,6 +1,6 @@
 use crate::domain::{
-    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionStatus,
-    Surface, ToolPolicyRow,
+    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionKind,
+    SessionStatus, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::path::{Path, PathBuf};
 
-fn migration_20_codex_models(
+fn migration_24_codex_models(
     tx: &rusqlite::Transaction<'_>,
 ) -> rusqlite::Result<std::collections::HashSet<String>> {
     let mut models: std::collections::HashSet<String> =
@@ -48,14 +48,14 @@ fn migration_20_codex_models(
     Ok(models)
 }
 
-fn migration_20_known_codex_model(known: &std::collections::HashSet<String>, model: &str) -> bool {
+fn migration_24_known_codex_model(known: &std::collections::HashSet<String>, model: &str) -> bool {
     known.contains(model)
         || model
             .strip_suffix("-review")
             .is_some_and(|base| known.contains(base))
 }
 
-fn migration_20_parse_prefixed(
+fn migration_24_parse_prefixed(
     value: &str,
     known: &std::collections::HashSet<String>,
 ) -> Option<(String, String, String)> {
@@ -63,16 +63,16 @@ fn migration_20_parse_prefixed(
     if !matches!(prefix, "openai" | "openai-oauth") {
         return None;
     }
-    if original_model.contains('/') || migration_20_known_codex_model(known, original_model) {
+    if original_model.contains('/') || migration_24_known_codex_model(known, original_model) {
         return None;
     }
     let (parsed, effort) = crate::llm_router::model_effort::parse_legacy_codex_selection(value)?;
     let model = parsed.split_once('/')?.1.to_string();
     let canonical = format!("openai/{model}");
-    migration_20_known_codex_model(known, &model).then_some((canonical, model, effort))
+    migration_24_known_codex_model(known, &model).then_some((canonical, model, effort))
 }
 
-fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration::HookResult {
+fn migration_24_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration::HookResult {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS model_effort_preferences (\
             family TEXT NOT NULL,\
@@ -81,7 +81,7 @@ fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration:
             PRIMARY KEY (family, model)\
         );",
     )?;
-    let known = migration_20_codex_models(tx)?;
+    let known = migration_24_codex_models(tx)?;
 
     let projects = {
         let mut stmt =
@@ -98,7 +98,7 @@ fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration:
         rows
     };
     for (id, model, existing_effort) in projects {
-        if let Some((canonical, _, suffix_effort)) = migration_20_parse_prefixed(&model, &known) {
+        if let Some((canonical, _, suffix_effort)) = migration_24_parse_prefixed(&model, &known) {
             let effort = existing_effort.or(Some(suffix_effort));
             tx.execute(
                 "UPDATE projects SET model=?2, effort=?3 WHERE project_id=?1",
@@ -116,7 +116,7 @@ fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration:
         .optional()?;
     if let Some(default_model) = default_model {
         if let Some((canonical, model, suffix_effort)) =
-            migration_20_parse_prefixed(&default_model, &known)
+            migration_24_parse_prefixed(&default_model, &known)
         {
             tx.execute(
                 "UPDATE settings SET value=?1 WHERE key='default_model'",
@@ -159,7 +159,7 @@ fn migration_20_normalize(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration:
                 }
                 let prefixed = format!("openai/{}", target.model);
                 if let Some((canonical, _, suffix_effort)) =
-                    migration_20_parse_prefixed(&prefixed, &known)
+                    migration_24_parse_prefixed(&prefixed, &known)
                 {
                     target.model = canonical.split_once('/').unwrap().1.to_string();
                     if target
@@ -528,10 +528,18 @@ fn migrations() -> Migrations<'static> {
         // one pass. The claude-code harness itself STAYS registered so an
         // unrewritten row (restored DB) still resolves at session start.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
-            tx.execute(
-                "UPDATE projects SET harness='native' WHERE harness='claude-code'",
-                [],
-            )?;
+            // Guarded: migration 21 drops projects.harness, and the
+            // rewind-and-replay migration test re-runs THIS hook on a post-21
+            // schema (where the column no longer exists).
+            let has_harness = tx
+                .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='harness'")?
+                .exists([])?;
+            if has_harness {
+                tx.execute(
+                    "UPDATE projects SET harness='native' WHERE harness='claude-code'",
+                    [],
+                )?;
+            }
             tx.execute(
                 "UPDATE settings SET value='native' WHERE key='default_runtime' AND value='claude-code'",
                 [],
@@ -576,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migration_13_rewrites_claude_code_defaults_to_native`,
+        // rewind-and-replay in `migrations_13_to_23_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -684,11 +692,178 @@ fn migrations() -> Migrations<'static> {
             DROP TABLE plugin_oauth_clients;\
             ALTER TABLE plugin_oauth_clients_rebuild RENAME TO plugin_oauth_clients;",
         ),
-        // Typed model-effort preferences and normalization of legacy Codex
-        // virtual model suffixes. The hook is one SQLite transaction: a bad
-        // route JSON value aborts without partially rewriting projects or
-        // defaults. Every write converges, so rewind/replay is safe.
-        M::up_with_hook("", migration_20_normalize),
+        // Migration 20 — Per-session permission mode (batch-3 design): sessions
+        // previously shared the project's mode; now each session carries its
+        // own, seeded from the owning project. Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) like branch_owned above: the rewind-and-replay
+        // test re-runs every migration appended after 13 on a DB that already
+        // has this column, so a plain ALTER would fail with "duplicate column".
+        // This batch-3 migration shipped to main first, so it keeps slot 20 and
+        // runs BEFORE the native-only migration on upgrade.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let exists = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='perm_mode'")?
+                .exists([])?;
+            if !exists {
+                tx.execute(
+                    "ALTER TABLE sessions ADD COLUMN perm_mode TEXT NOT NULL DEFAULT 'default'",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE sessions SET perm_mode = COALESCE(\
+                         (SELECT p.perm_mode FROM projects p WHERE p.project_id = sessions.project_id),\
+                         'default')",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
+        // Migration 21 — Native-only runtime (design:
+        // docs/design/2026-07-10-native-only-runtime-design.md §5): the runtime
+        // concept dies. Renumbered from 20 to 21 in integration merge #2 because
+        // batch-3's per-session perm_mode migration (above) shipped to main
+        // first and takes slot 20; this native-only migration is now the tail.
+        // Drop the legacy per-project harness and per-job agent columns
+        // (SQLite >= 3.35 DROP COLUMN; bundled 3.45), copy the native agents-row
+        // model/perm_mode into the agent_model / agent_perm_mode settings KV
+        // (only when the KV key is absent), drop the agents/agent_tiers tables,
+        // delete the dead settings keys, and prune non-native mcp_agent_access
+        // rows. Every statement is existence-guarded so the rewind-and-replay
+        // migration test's re-run on an already-migrated DB is a no-op. Ordering
+        // is safe: batch-3's migration 20 only touches sessions.perm_mode (a
+        // column this migration never removes), so running it first is inert
+        // with respect to the harness/agents/settings artifacts dropped here.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let col_exists = |table: &str, col: &str| -> rusqlite::Result<bool> {
+                tx.prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'"
+                ))?
+                .exists([])
+            };
+            let table_exists = |name: &str| -> rusqlite::Result<bool> {
+                tx.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+                    .exists([name])
+            };
+            if col_exists("projects", "harness")? {
+                tx.execute("ALTER TABLE projects DROP COLUMN harness", [])?;
+            }
+            if col_exists("jobs", "agent")? {
+                tx.execute("ALTER TABLE jobs DROP COLUMN agent", [])?;
+            }
+            if table_exists("agents")? {
+                // Preserve the user's native model/perm-mode choices in settings
+                // KV — but never clobber a value the new Settings UI already wrote.
+                tx.execute(
+                    "INSERT INTO settings(key, value) \
+                     SELECT 'agent_model', model FROM agents \
+                     WHERE id='native' AND model IS NOT NULL AND trim(model) != '' \
+                     AND NOT EXISTS (SELECT 1 FROM settings WHERE key='agent_model')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO settings(key, value) \
+                     SELECT 'agent_perm_mode', perm_mode FROM agents \
+                     WHERE id='native' AND trim(perm_mode) != '' \
+                     AND NOT EXISTS (SELECT 1 FROM settings WHERE key='agent_perm_mode')",
+                    [],
+                )?;
+                tx.execute("DROP TABLE agents", [])?;
+            }
+            tx.execute("DROP TABLE IF EXISTS agent_tiers", [])?;
+            tx.execute(
+                "DELETE FROM settings WHERE key IN \
+                 ('enabled_runtimes','default_runtime','default_agent','agents_snapshot')",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM mcp_agent_access WHERE agent_id != 'native'",
+                [],
+            )?;
+            Ok(())
+        }),
+        // Migration 22 — Chat-first sessions (design: docs/superpowers/specs/
+        // 2026-07-11-chat-first-sessions-design.md, Phase 2 Task A1):
+        // sessions.project_id becomes nullable (chat/worker/review sessions
+        // aren't bound to a project) and gains `kind` + `speaker`/`agent`/
+        // `parent_session_pk` lineage columns. SQLite can't drop a NOT NULL
+        // constraint in place, so rebuild the table: create the new shape,
+        // copy every existing column, drop, rename. Existing rows all get
+        // kind='project' with null lineage columns — correct, they were all
+        // project sessions before this migration. Appended as the tail (after
+        // migration 20 perm_mode and migration 21 native-only, neither of which
+        // adds or removes a sessions column beyond perm_mode), so `sessions`
+        // carries exactly the original 12 columns + perm_mode here: sessions_new
+        // must include perm_mode and copy it forward, or the rebuild would
+        // silently drop the column migration 20 added.
+        M::up(
+            r#"
+            CREATE TABLE sessions_new (
+                session_pk TEXT PRIMARY KEY,
+                project_id TEXT,
+                agent_session_id TEXT,
+                worktree_path TEXT,
+                branch TEXT,
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'idle',
+                created_at INTEGER,
+                last_active INTEGER,
+                started_by TEXT,
+                resume_attempts INTEGER NOT NULL DEFAULT 0,
+                branch_owned INTEGER NOT NULL DEFAULT 1,
+                perm_mode TEXT NOT NULL DEFAULT 'default',
+                kind TEXT NOT NULL DEFAULT 'project',
+                speaker TEXT,
+                agent TEXT,
+                parent_session_pk TEXT
+            );
+            INSERT INTO sessions_new
+                (session_pk, project_id, agent_session_id, worktree_path, branch, title,
+                 status, created_at, last_active, started_by, resume_attempts, branch_owned, perm_mode)
+            SELECT session_pk, project_id, agent_session_id, worktree_path, branch, title,
+                   status, created_at, last_active, started_by, resume_attempts, branch_owned, perm_mode
+            FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_new RENAME TO sessions;
+            "#,
+        ),
+        // Migration 23 — Plugin install ledger. `plugin_installs` is the
+        // authoritative record of every installed skill pack / single skill
+        // (source, resolved commit, content fingerprint, pin, trust
+        // acknowledgment); the on-disk .ryuzi-skill.json stamp remains the
+        // loader's trust gate but is no longer the record of record.
+        // `plugin_attach_status` holds the last session-attach outcome per
+        // plugin for the doctor surface. Renumbered to slot 23 across merges
+        // with main (20 perm_mode, 21 native-only, 22 chat-first sessions); it
+        // is now the tail. IF NOT EXISTS: the rewind-and-replay migration tests
+        // re-run this on an already-migrated DB, so it must be a no-op on replay.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_installs (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                kind TEXT NOT NULL,\
+                source_spec TEXT NOT NULL,\
+                resolved_commit TEXT,\
+                fingerprint TEXT NOT NULL,\
+                installed_at INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                pinned INTEGER NOT NULL DEFAULT 0,\
+                pin_reason TEXT,\
+                trust_tier TEXT NOT NULL,\
+                trust_ack_at INTEGER,\
+                trust_ack_summary TEXT\
+            );\
+            CREATE TABLE IF NOT EXISTS plugin_attach_status (\
+                plugin_id TEXT PRIMARY KEY NOT NULL,\
+                last_attach_at INTEGER NOT NULL,\
+                outcome TEXT NOT NULL,\
+                reason TEXT\
+            );",
+        ),
+        // Migration 24 — Typed model-effort preferences and normalization of
+        // legacy Codex virtual model suffixes. Kept after main's migrations
+        // 20–23 so existing released user_version slots retain their meaning.
+        // The hook is transactional and convergent, so rewind/replay is safe.
+        M::up_with_hook("", migration_24_normalize),
+        // Migration 25 — Durable route-selection identity for switch notices.
         M::up(
             "CREATE TABLE IF NOT EXISTS session_route_state (\
                 session_pk TEXT PRIMARY KEY NOT NULL,\
@@ -701,11 +876,26 @@ fn migrations() -> Migrations<'static> {
                 updated_at INTEGER NOT NULL\
             )",
         ),
+        // Migration 26 — user-owned runtime selection for project-less chats.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_runtime_settings (\
+                session_pk TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,\
+                model TEXT,\
+                effort TEXT,\
+                updated_at INTEGER NOT NULL\
+            )",
+        ),
     ])
 }
 
 pub struct Store {
     pool: Pool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRuntimeSettings {
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// One durable compaction checkpoint: the replacement history that stands in
@@ -718,7 +908,7 @@ pub struct ContextCheckpoint {
 }
 
 fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
-    let perm: String = r.get(7)?;
+    let perm: String = r.get(6)?;
     let workdir: String = r.get(2)?;
     Ok(Project {
         project_id: r.get(0)?,
@@ -728,16 +918,14 @@ fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
         is_git: git2::Repository::open(&workdir).is_ok(),
         workdir,
         source: r.get(3)?,
-        harness: r.get(4)?,
-        model: r.get(5)?,
-        effort: r.get(6)?,
+        model: r.get(4)?,
+        effort: r.get(5)?,
         perm_mode: PermMode::from_db(&perm),
-        created_at: r.get(8)?,
+        created_at: r.get(7)?,
     })
 }
 
-const PROJECT_COLS: &str =
-    "project_id,name,workdir,source,harness,model,effort,perm_mode,created_at";
+const PROJECT_COLS: &str = "project_id,name,workdir,source,model,effort,perm_mode,created_at";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRecord {
@@ -798,6 +986,32 @@ fn from_sql_json_error(
 
 fn to_sql_json_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(err.into())
+}
+
+fn map_plugin_install_row(r: &Row) -> rusqlite::Result<PluginInstallRecord> {
+    Ok(PluginInstallRecord {
+        plugin_id: r.get(0)?,
+        kind: r.get(1)?,
+        source_spec: r.get(2)?,
+        resolved_commit: r.get(3)?,
+        fingerprint: r.get(4)?,
+        installed_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        pinned: r.get::<_, i64>(7)? != 0,
+        pin_reason: r.get(8)?,
+        trust_tier: r.get(9)?,
+        trust_ack_at: r.get(10)?,
+        trust_ack_summary: r.get(11)?,
+    })
+}
+
+fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
+    Ok(PluginAttachStatus {
+        plugin_id: r.get(0)?,
+        last_attach_at: r.get(1)?,
+        outcome: r.get(2)?,
+        reason: r.get(3)?,
+    })
 }
 
 fn parse_plugin_oauth_token_json(raw: &str) -> anyhow::Result<Map<String, Value>> {
@@ -910,6 +1124,39 @@ pub struct PluginOauthClient {
     pub client_id: Option<String>,
 }
 
+/// One row of `plugin_installs`: the authoritative record of an installed
+/// skill pack or single skill. `kind` is `"plugin_pack"` or `"single_skill"`.
+/// `resolved_commit` is the git HEAD captured at install/update (`None` for
+/// backfilled rows). `fingerprint` is a content hash of the installed tree
+/// (excludes `.git` and the `.ryuzi-skill.json` stamp). `trust_tier` is
+/// `"curated"` | `"acknowledged"` (`"blocked"` reserved for the future feed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInstallRecord {
+    pub plugin_id: String,
+    pub kind: String,
+    pub source_spec: String,
+    pub resolved_commit: Option<String>,
+    pub fingerprint: String,
+    pub installed_at: i64,
+    pub updated_at: i64,
+    pub pinned: bool,
+    pub pin_reason: Option<String>,
+    pub trust_tier: String,
+    pub trust_ack_at: Option<i64>,
+    pub trust_ack_summary: Option<String>,
+}
+
+/// One row of `plugin_attach_status`: the last time a plugin's connector was
+/// attached to a session and whether it succeeded. `reason` is a secret-free
+/// message (e.g. the `ensure_auth` "configure {id}: ..." text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAttachStatus {
+    pub plugin_id: String,
+    pub last_attach_at: i64,
+    pub outcome: String,
+    pub reason: Option<String>,
+}
+
 /// Check out a pooled connection and run `f` on its dedicated blocking
 /// thread. Pool checkout errors, interact-layer failures (panicked or aborted
 /// closure), and the closure's own error all surface as one `anyhow::Result`.
@@ -921,13 +1168,14 @@ where
 {
     let conn = pool.get().await?;
     let out = conn
-        .interact(move |c| {
+        .interact(move |c| -> anyhow::Result<T> {
             // Pooled connections + WAL still return SQLITE_BUSY immediately on
             // write contention (e.g. a request's read racing a detached
             // usage-record / prune write). A busy_timeout makes them wait
             // instead of erroring — otherwise concurrent load surfaces as a 500.
             let _ = c.busy_timeout(std::time::Duration::from_secs(5));
-            f(c)
+            c.pragma_update(None, "foreign_keys", "ON")?;
+            Ok(f(c)?)
         })
         .await
         .map_err(|e| anyhow::anyhow!("db interact failed: {e}"))??;
@@ -955,9 +1203,7 @@ impl Store {
         .await?;
         interact_on(&pool, |c| {
             c.execute_batch(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_runtimes', 'native');\
-                 INSERT OR IGNORE INTO settings(key, value) VALUES ('default_runtime', 'native');",
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');",
             )
         })
         .await?;
@@ -1081,39 +1327,17 @@ impl Store {
         id: &str,
         model: Option<String>,
         perm_mode: PermMode,
-        harness: &str,
     ) -> anyhow::Result<Option<Project>> {
         let id_owned = id.to_string();
-        let harness = harness.to_string();
         self.with_conn(move |c| {
             c.execute(
-                "UPDATE projects SET model=?2, perm_mode=?3, harness=?4 WHERE project_id=?1",
-                params![id_owned, model, perm_mode.as_str(), harness],
+                "UPDATE projects SET model=?2, perm_mode=?3 WHERE project_id=?1",
+                params![id_owned, model, perm_mode.as_str()],
             )
             .map(|_| ())
         })
         .await?;
         self.get_project(id).await
-    }
-
-    /// Canonicalize only the legacy harness column. This deliberately does
-    /// not read or write model/effort, so a concurrent atomic runtime update
-    /// cannot be lost to a stale whole-project write.
-    pub async fn update_project_harness(
-        &self,
-        project_id: &str,
-        harness: &str,
-    ) -> anyhow::Result<bool> {
-        let project_id = project_id.to_string();
-        let harness = harness.to_string();
-        self.with_conn(move |c| {
-            c.execute(
-                "UPDATE projects SET harness=?2 WHERE project_id=?1",
-                params![project_id, harness],
-            )
-            .map(|changed| changed > 0)
-        })
-        .await
     }
 
     /// Update only the permission column. Runtime selection and harness
@@ -1137,10 +1361,10 @@ impl Store {
     pub async fn insert_project(&self, p: Project) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO projects(project_id,name,workdir,source,harness,model,effort,perm_mode,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO projects(project_id,name,workdir,source,model,effort,perm_mode,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
-                    p.project_id, p.name, p.workdir, p.source, p.harness,
+                    p.project_id, p.name, p.workdir, p.source,
                     p.model, p.effort, p.perm_mode.as_str(), p.created_at
                 ],
             )
@@ -1178,17 +1402,47 @@ impl Store {
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
-                    s.started_by, s.resume_attempts, s.branch_owned
+                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
                 ],
             )
         })
         .await?;
         Ok(())
+    }
+
+    pub async fn insert_chat_session_with_runtime(
+        &self,
+        s: Session,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        let updated_at = now_ms();
+        let session_pk = s.session_pk.clone();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![
+                    s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
+                    s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
+                    s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO session_runtime_settings(session_pk,model,effort,updated_at) VALUES(?1,?2,?3,?4)",
+                params![session_pk, model, effort, updated_at],
+            )?;
+            tx.commit()
+        })
+        .await
     }
 
     pub async fn get_session(&self, pk: &str) -> anyhow::Result<Option<Session>> {
@@ -1218,6 +1472,25 @@ impl Store {
         Ok(())
     }
 
+    /// Set one session's permission mode (per-session override; the project
+    /// row is only the default seed for NEW sessions).
+    pub async fn update_session_perm_mode(&self, pk: &str, mode: PermMode) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let pk_for_err = pk.clone();
+        let rows = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE sessions SET perm_mode=?2 WHERE session_pk=?1",
+                    params![pk, mode.as_str()],
+                )
+            })
+            .await?;
+        if rows == 0 {
+            anyhow::bail!("update_session_perm_mode: unknown session {pk_for_err}");
+        }
+        Ok(())
+    }
+
     /// List sessions in a given status, oldest-first — used by `reconcile` on
     /// daemon boot to find sessions a dead process left in `Running`.
     pub async fn list_sessions_by_status(
@@ -1233,6 +1506,21 @@ impl Store {
                 .query_map(params![status], row_to_session)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// List sessions of a given `kind` (`"project"|"chat"|"worker"|"review"`),
+    /// most-recently-created first — used by chat-first surfaces that only
+    /// care about one session kind at a time.
+    pub async fn list_sessions_by_kind(&self, kind: &str) -> anyhow::Result<Vec<Session>> {
+        let kind = kind.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE kind=?1 ORDER BY created_at DESC"
+            ))?;
+            let rows = stmt.query_map([kind], row_to_session)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await
     }
@@ -1498,6 +1786,46 @@ impl Store {
                         m.tool_call_id, m.status, m.tool_kind, created],
                 |r| r.get::<_, i64>(0),
             )
+        })
+        .await
+    }
+
+    pub async fn get_session_runtime_settings(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<SessionRuntimeSettings>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT model,effort FROM session_runtime_settings WHERE session_pk=?1",
+                params![session_pk],
+                |r| {
+                    Ok(SessionRuntimeSettings {
+                        model: r.get(0)?,
+                        effort: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn update_session_runtime_settings(
+        &self,
+        session_pk: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> anyhow::Result<()> {
+        let session_pk = session_pk.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO session_runtime_settings(session_pk,model,effort,updated_at) VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(session_pk) DO UPDATE SET model=excluded.model,effort=excluded.effort,updated_at=excluded.updated_at",
+                params![session_pk, model, effort, updated_at],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1940,6 +2268,14 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a settings row. A missing key is a no-op.
+    pub async fn delete_setting_raw(&self, key: &str) -> anyhow::Result<()> {
+        let key = key.to_string();
+        self.with_conn(move |c| c.execute("DELETE FROM settings WHERE key = ?1", params![key]))
+            .await?;
+        Ok(())
+    }
+
     /// List all persisted settings rows.
     pub async fn list_settings(&self) -> anyhow::Result<Vec<(String, String)>> {
         self.with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {
@@ -2329,13 +2665,164 @@ impl Store {
         })
         .await
     }
+
+    pub async fn upsert_plugin_install(&self, rec: &PluginInstallRecord) -> anyhow::Result<()> {
+        let rec = rec.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_installs(plugin_id, kind, source_spec, resolved_commit, \
+                     fingerprint, installed_at, updated_at, pinned, pin_reason, trust_tier, \
+                     trust_ack_at, trust_ack_summary) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 ON CONFLICT(plugin_id) DO UPDATE SET \
+                   kind=excluded.kind, source_spec=excluded.source_spec, \
+                   resolved_commit=excluded.resolved_commit, fingerprint=excluded.fingerprint, \
+                   installed_at=excluded.installed_at, updated_at=excluded.updated_at, \
+                   pinned=excluded.pinned, pin_reason=excluded.pin_reason, \
+                   trust_tier=excluded.trust_tier, trust_ack_at=excluded.trust_ack_at, \
+                   trust_ack_summary=excluded.trust_ack_summary",
+                params![
+                    rec.plugin_id,
+                    rec.kind,
+                    rec.source_spec,
+                    rec.resolved_commit,
+                    rec.fingerprint,
+                    rec.installed_at,
+                    rec.updated_at,
+                    rec.pinned as i64,
+                    rec.pin_reason,
+                    rec.trust_tier,
+                    rec.trust_ack_at,
+                    rec.trust_ack_summary,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_install(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginInstallRecord>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, kind, source_spec, resolved_commit, fingerprint, \
+                     installed_at, updated_at, pinned, pin_reason, trust_tier, trust_ack_at, \
+                     trust_ack_summary FROM plugin_installs WHERE plugin_id=?1",
+                params![plugin_id],
+                map_plugin_install_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_plugin_installs(&self) -> anyhow::Result<Vec<PluginInstallRecord>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT plugin_id, kind, source_spec, resolved_commit, fingerprint, \
+                     installed_at, updated_at, pinned, pin_reason, trust_tier, trust_ack_at, \
+                     trust_ack_summary FROM plugin_installs ORDER BY plugin_id",
+            )?;
+            let rows = stmt
+                .query_map([], map_plugin_install_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn delete_plugin_install(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_installs WHERE plugin_id=?1",
+                params![plugin_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn set_plugin_install_pin(
+        &self,
+        plugin_id: &str,
+        pinned: bool,
+        reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let reason = reason.map(str::to_string);
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE plugin_installs SET pinned=?2, pin_reason=?3 WHERE plugin_id=?1",
+                params![plugin_id, pinned as i64, reason],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn record_plugin_attach(&self, status: &PluginAttachStatus) -> anyhow::Result<()> {
+        let status = status.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_attach_status(plugin_id, last_attach_at, outcome, reason) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(plugin_id) DO UPDATE SET \
+                   last_attach_at=excluded.last_attach_at, outcome=excluded.outcome, \
+                   reason=excluded.reason",
+                params![
+                    status.plugin_id,
+                    status.last_attach_at,
+                    status.outcome,
+                    status.reason
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_attach(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<PluginAttachStatus>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, last_attach_at, outcome, reason FROM plugin_attach_status \
+                 WHERE plugin_id=?1",
+                params![plugin_id],
+                map_plugin_attach_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_plugin_attach(&self) -> anyhow::Result<Vec<PluginAttachStatus>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT plugin_id, last_attach_at, outcome, reason FROM plugin_attach_status \
+                 ORDER BY plugin_id",
+            )?;
+            let rows = stmt
+                .query_map([], map_plugin_attach_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let status: String = r.get(6)?;
+    let kind: String = r.get(13)?;
     Ok(Session {
         session_pk: r.get(0)?,
         project_id: r.get(1)?,
@@ -2349,6 +2836,14 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         started_by: r.get(9)?,
         resume_attempts: r.get(10)?,
         branch_owned: r.get(11)?,
+        perm_mode: {
+            let pm: String = r.get(12)?;
+            PermMode::from_db(&pm)
+        },
+        kind: SessionKind::from_db(&kind),
+        speaker: r.get(14)?,
+        agent: r.get(15)?,
+        parent_session_pk: r.get(16)?,
     })
 }
 
@@ -2402,64 +2897,12 @@ mod tests {
             name: "demo".into(),
             workdir: "/tmp/demo".into(),
             source: None,
-            harness: "claude-code".into(),
             model: None,
             effort: None,
             perm_mode: PermMode::Default,
             created_at: Some(123),
             is_git: false,
         }
-    }
-
-    #[tokio::test]
-    async fn concurrent_harness_canonicalization_preserves_atomic_model_effort() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
-        store
-            .insert_project(Project {
-                project_id: "p-harness-race".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
-                source: None,
-                harness: "claude-code".into(),
-                model: Some("old-model".into()),
-                effort: Some("low".into()),
-                perm_mode: PermMode::Default,
-                created_at: None,
-                is_git: false,
-            })
-            .await
-            .unwrap();
-
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-        let runtime_store = store.clone();
-        let runtime_barrier = barrier.clone();
-        let runtime = tokio::spawn(async move {
-            runtime_barrier.wait().await;
-            runtime_store
-                .update_project_runtime(
-                    "p-harness-race",
-                    Some("new-model".into()),
-                    Some("high".into()),
-                )
-                .await
-                .unwrap();
-        });
-        let harness_store = store.clone();
-        let harness = tokio::spawn(async move {
-            barrier.wait().await;
-            harness_store
-                .update_project_harness("p-harness-race", "native")
-                .await
-                .unwrap();
-        });
-        runtime.await.unwrap();
-        harness.await.unwrap();
-
-        let project = store.get_project("p-harness-race").await.unwrap().unwrap();
-        assert_eq!(project.harness, "native");
-        assert_eq!(project.model.as_deref(), Some("new-model"));
-        assert_eq!(project.effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]
@@ -2472,7 +2915,6 @@ mod tests {
                 name: "demo".into(),
                 workdir: "/tmp/demo".into(),
                 source: None,
-                harness: "native".into(),
                 model: Some("old-model".into()),
                 effort: Some("low".into()),
                 perm_mode: PermMode::Default,
@@ -2513,6 +2955,20 @@ mod tests {
         assert_eq!(project.model.as_deref(), Some("new-model"));
         assert_eq!(project.effort.as_deref(), Some("high"));
         assert_eq!(project.perm_mode, PermMode::BypassPermissions);
+    }
+
+    #[tokio::test]
+    async fn delete_setting_raw_removes_the_row_and_tolerates_missing_keys() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .set_setting_raw("discord.token", "secret")
+            .await
+            .unwrap();
+        store.delete_setting_raw("discord.token").await.unwrap();
+        assert_eq!(store.get_setting_raw("discord.token").await.unwrap(), None);
+        // Deleting a key that doesn't exist is a no-op, not an error.
+        store.delete_setting_raw("discord.token").await.unwrap();
     }
 
     #[tokio::test]
@@ -2563,7 +3019,7 @@ mod tests {
     fn sample_session() -> Session {
         Session {
             session_pk: "s1".into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: Some("/tmp/wt".into()),
             branch: Some("harness/abcdef01".into()),
@@ -2574,6 +3030,11 @@ mod tests {
             last_active: Some(1),
             resume_attempts: 0,
             branch_owned: true,
+            perm_mode: PermMode::Default,
+            kind: SessionKind::Project,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         }
     }
 
@@ -2593,7 +3054,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_21_creates_session_route_state_idempotently() {
+    async fn migration_25_creates_session_route_state_idempotently() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -2623,7 +3084,7 @@ mod tests {
                 ]
             );
             store
-                .with_conn(|c| c.pragma_update(None, "user_version", 20))
+                .with_conn(|c| c.pragma_update(None, "user_version", 24))
                 .await
                 .unwrap();
         }
@@ -2640,6 +3101,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn session_runtime_settings_round_trip_independently_from_route_observation() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let mut session = sample_session();
+        session.kind = SessionKind::Chat;
+        session.project_id = None;
+        store.insert_session(session).await.unwrap();
+        store
+            .update_session_runtime_settings(
+                "s1",
+                Some("openai/gpt-5.5".into()),
+                Some("high".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_runtime_settings("s1").await.unwrap(),
+            Some(SessionRuntimeSettings {
+                model: Some("openai/gpt-5.5".into()),
+                effort: Some("high".into()),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_runtime_foreign_key_rejects_orphans_and_cascades() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store
+            .update_session_runtime_settings("missing", Some("m".into()), None)
+            .await
+            .is_err());
+
+        let mut session = sample_session();
+        session.kind = SessionKind::Chat;
+        session.project_id = None;
+        store
+            .insert_chat_session_with_runtime(session, Some("m".into()), Some("high".into()))
+            .await
+            .unwrap();
+        store
+            .with_conn(|c| c.execute("DELETE FROM sessions WHERE session_pk='s1'", []))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session_runtime_settings("s1").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_and_runtime_insert_roll_back_together() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER reject_runtime BEFORE INSERT ON session_runtime_settings \
+                     BEGIN SELECT RAISE(ABORT, 'reject runtime'); END;",
+                )
+            })
+            .await
+            .unwrap();
+        let mut session = sample_session();
+        session.kind = SessionKind::Chat;
+        session.project_id = None;
+        assert!(store
+            .insert_chat_session_with_runtime(session, Some("m".into()), None)
+            .await
+            .is_err());
+        assert!(store.get_session("s1").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3106,6 +3641,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_session_persists_with_null_project() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: "chat-1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("hello".into()),
+                status: crate::domain::SessionStatus::Idle,
+                started_by: Some("cockpit".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let got = store.get_session("chat-1").await.unwrap().unwrap();
+        assert_eq!(got.project_id, None);
+        assert_eq!(got.kind, crate::domain::SessionKind::Chat);
+        // list_sessions(None) still returns it; project filter excludes it.
+        assert!(store
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_pk == "chat-1"));
+        assert!(store
+            .list_sessions_by_kind("chat")
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.session_pk == "chat-1"));
+    }
+
+    #[tokio::test]
+    async fn session_perm_mode_roundtrips_and_updates() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        let mut s = sample_session();
+        s.perm_mode = PermMode::Plan;
+        store.insert_session(s).await.unwrap();
+
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.perm_mode, PermMode::Plan);
+
+        store
+            .update_session_perm_mode("s1", PermMode::AcceptEdits)
+            .await
+            .unwrap();
+        let got = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(got.perm_mode, PermMode::AcceptEdits);
+    }
+
+    #[tokio::test]
+    async fn update_session_perm_mode_on_unknown_session_is_an_error() {
+        // The UPDATE previously matched zero rows and silently no-opped —
+        // a caller could believe the mode persisted when it never did.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let err = store
+            .update_session_perm_mode("does-not-exist", PermMode::AcceptEdits)
+            .await
+            .expect_err("updating a missing session must surface an error");
+        assert!(err.to_string().contains("does-not-exist"), "{err}");
+    }
+
+    #[tokio::test]
     async fn provider_turns_get_monotonic_seq_and_list_in_order() {
         use crate::domain::NewProviderTurn;
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -3353,12 +3966,7 @@ mod tests {
         store.insert_project(sample_project()).await.unwrap();
 
         let updated = store
-            .update_project(
-                "p1",
-                Some("claude-opus-4-5".into()),
-                PermMode::AcceptEdits,
-                "claude-code",
-            )
+            .update_project("p1", Some("claude-opus-4-5".into()), PermMode::AcceptEdits)
             .await
             .unwrap()
             .unwrap();
@@ -3367,7 +3975,7 @@ mod tests {
 
         // Unknown project → Ok(None), not an error.
         assert!(store
-            .update_project("missing", None, PermMode::Default, "claude-code")
+            .update_project("missing", None, PermMode::Default)
             .await
             .unwrap()
             .is_none());
@@ -3491,7 +4099,6 @@ mod tests {
                 name: "runtime".into(),
                 workdir: "/tmp/runtime".into(),
                 source: None,
-                harness: "native".into(),
                 model: Some("old-model".into()),
                 effort: Some("high".into()),
                 perm_mode: PermMode::Default,
@@ -3527,17 +4134,17 @@ mod tests {
                 .with_conn(|c| {
                     c.execute_batch(
                         r#"DROP TABLE model_effort_preferences;
-                           INSERT INTO projects(project_id,name,workdir,harness,model,effort)
-                             VALUES ('p1','p1','/p1','native','openai/gpt-5.2-codex-high',NULL),
-                                    ('p2','p2','/p2','native','openai/gpt-5.2-codex-review-high','ultra'),
-                                    ('oauthprefix','oauthprefix','/oauth','native','openai-oauth/gpt-5.2-codex-high',NULL),
-                                    ('alias','alias','/alias','native','fast-high',NULL),
-                                    ('unknown','unknown','/unknown','native','openai/not-cataloged-high',NULL);
+                           INSERT INTO projects(project_id,name,workdir,model,effort)
+                             VALUES ('p1','p1','/p1','openai/gpt-5.2-codex-high',NULL),
+                                    ('p2','p2','/p2','openai/gpt-5.2-codex-review-high','ultra'),
+                                    ('oauthprefix','oauthprefix','/oauth','openai-oauth/gpt-5.2-codex-high',NULL),
+                                    ('alias','alias','/alias','fast-high',NULL),
+                                    ('unknown','unknown','/unknown','openai/not-cataloged-high',NULL);
                            INSERT OR REPLACE INTO settings(key,value) VALUES
                              ('default_model','openai/gpt-5.2-codex-high-review'),
                              ('default_effort',''),
                              ('llm_model_routes','[{"id":"r1","name":"route","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"gpt-5.2-codex-review-high"},{"provider":"anthropic","model":"claude-high"}],"createdAt":1,"updatedAt":1}]');
-                           PRAGMA user_version=19;"#,
+                           PRAGMA user_version=23;"#,
                     )
                 })
                 .await
@@ -3606,7 +4213,7 @@ mod tests {
 
         let before = store.list_model_effort_preferences().await.unwrap();
         store
-            .with_conn(|c| c.pragma_update(None, "user_version", 19))
+            .with_conn(|c| c.pragma_update(None, "user_version", 23))
             .await
             .unwrap();
         drop(store);
@@ -3627,12 +4234,12 @@ mod tests {
                         r#"DROP TABLE model_effort_preferences;
                            INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at)
                              VALUES ('exact-codex','openai-oauth','oauth','exact',0,1,'{"modelsOverride":["foo","foo-high"]}',1,1);
-                           INSERT INTO projects(project_id,name,workdir,harness,model,effort)
-                             VALUES ('exact-project','exact','/exact','native','openai/foo-high',NULL);
+                           INSERT INTO projects(project_id,name,workdir,model,effort)
+                             VALUES ('exact-project','exact','/exact','openai/foo-high',NULL);
                            INSERT OR REPLACE INTO settings(key,value) VALUES
                              ('default_model','openai/foo-high'),
                              ('default_effort','');
-                           PRAGMA user_version=19;"#,
+                           PRAGMA user_version=23;"#,
                     )?;
                     c.execute(
                         "INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes',?1)",
@@ -3680,12 +4287,12 @@ mod tests {
                         r#"DROP TABLE model_effort_preferences;
                            INSERT INTO provider_connections(id,provider,auth_type,label,priority,enabled,data,created_at,updated_at)
                              VALUES ('nested-codex','openai-oauth','oauth','nested',0,1,'{"modelsOverride":["org/model","org/model-high"]}',1,1);
-                           INSERT INTO projects(project_id,name,workdir,harness,model,effort)
-                             VALUES ('nested-project','nested','/nested','native','openai/org/model-high',NULL);
+                           INSERT INTO projects(project_id,name,workdir,model,effort)
+                             VALUES ('nested-project','nested','/nested','openai/org/model-high',NULL);
                            INSERT OR REPLACE INTO settings(key,value) VALUES
                              ('default_model','openai/org/model-high'),
                              ('default_effort','');
-                           PRAGMA user_version=19;"#,
+                           PRAGMA user_version=23;"#,
                     )?;
                     c.execute(
                         "INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes',?1)",
@@ -3727,9 +4334,9 @@ mod tests {
             let store = Store::open(tmp.path()).await.unwrap();
             store.with_conn(|c| c.execute_batch(
                 "DROP TABLE model_effort_preferences;
-                 INSERT INTO projects(project_id,name,workdir,harness,model) VALUES ('p','p','/p','native','openai/gpt-5.2-codex-high');
+                 INSERT INTO projects(project_id,name,workdir,model) VALUES ('p','p','/p','openai/gpt-5.2-codex-high');
                  INSERT OR REPLACE INTO settings(key,value) VALUES ('llm_model_routes','{malformed');
-                 PRAGMA user_version=19;"
+                 PRAGMA user_version=23;"
             )).await.unwrap();
         }
 
@@ -3738,7 +4345,7 @@ mod tests {
         let version: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 23);
         let model: String = c
             .query_row("SELECT model FROM projects WHERE project_id='p'", [], |r| {
                 r.get(0)
@@ -3762,7 +4369,7 @@ mod tests {
                  INSERT OR REPLACE INTO settings(key,value) VALUES
                    ('default_model','openai/gpt-5.5-review-high'),
                    ('default_effort','ultra');
-                 PRAGMA user_version=19;",
+                 PRAGMA user_version=23;",
                     )
                 })
                 .await
@@ -3823,22 +4430,6 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("discord")
-        );
-        assert_eq!(
-            store
-                .get_setting_raw("enabled_runtimes")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native")
-        );
-        assert_eq!(
-            store
-                .get_setting_raw("default_runtime")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native")
         );
         // Upsert + empty string is a real value:
         store
@@ -3904,12 +4495,16 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
-            // Minimal v4 shape: the 4 old tables + user_version 4.
+            // Minimal v4 shape: the 4 old tables + user_version 4. The project
+            // row carries a non-default perm_mode so the later
+            // sessions.perm_mode migration's backfill (Task 3) has something
+            // real to copy from 'old1'.
             conn.execute_batch(
                 "CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT, workdir TEXT NOT NULL, source TEXT, harness TEXT NOT NULL DEFAULT 'claude-code', model TEXT, effort TEXT, perm_mode TEXT NOT NULL DEFAULT 'default', created_at INTEGER);
                  CREATE TABLE sessions (session_pk TEXT PRIMARY KEY, project_id TEXT NOT NULL, agent_session_id TEXT, worktree_path TEXT, branch TEXT, title TEXT, status TEXT NOT NULL DEFAULT 'idle', created_at INTEGER, last_active INTEGER);
                  CREATE TABLE messages (session_pk TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL, block_type TEXT NOT NULL, payload TEXT NOT NULL, tool_call_id TEXT, status TEXT, tool_kind TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (session_pk, seq));
                  CREATE TABLE tool_policies (project_id TEXT NOT NULL, tool TEXT NOT NULL, decision TEXT NOT NULL, PRIMARY KEY (project_id, tool));
+                 INSERT INTO projects(project_id, name, workdir, perm_mode) VALUES ('p1', 'old', '/w', 'acceptEdits');
                  INSERT INTO sessions(session_pk, project_id) VALUES ('old1', 'p1');
                  PRAGMA user_version = 4;",
             )
@@ -3920,6 +4515,11 @@ mod tests {
         assert_eq!(s.resume_attempts, 0); // ALTER default applied
         assert_eq!(s.started_by, None);
         assert_eq!(
+            s.perm_mode,
+            PermMode::AcceptEdits,
+            "sessions.perm_mode backfills from the owning project"
+        );
+        assert_eq!(
             store
                 .get_setting_raw("enabled_gateways")
                 .await
@@ -3927,6 +4527,21 @@ mod tests {
                 .as_deref(),
             Some("discord")
         );
+        // Phase 2 migration 20 (sessions rebuild: nullable project_id +
+        // kind/speaker/agent/parent_session_pk) must also fire on this
+        // ancient-DB replay. A row that pre-dates the `kind` column entirely
+        // (inserted here under the raw v4 shape) has to land as kind='project'
+        // — the rebuild's `DEFAULT 'project'` on `sessions_new`, verified end
+        // to end via a genuine forward migration rather than a fresh store.
+        // (A chat session's own insert/read-back round-trip is covered
+        // separately by `chat_session_persists_with_null_project` below.)
+        assert_eq!(s.kind, crate::domain::SessionKind::Project);
+        assert_eq!(s.project_id.as_deref(), Some("p1"));
+        let user_version: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(user_version, 26, "forward migration must land at v26");
     }
 
     #[tokio::test]
@@ -4067,34 +4682,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_13_rewrites_claude_code_defaults_to_native() {
+    async fn migrations_13_to_26_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
-        // DB, seed the old values, then wind user_version back nine so the
+        // DB, seed the old values, then rewind far enough that migration 13
+        // and every later migration run again.
         // rewrite migration (13) AND every migration appended after it
         // (14 sessions.branch_owned — hook-guarded; 15 model_status —
         // CREATE TABLE IF NOT EXISTS; 16 plugin_oauth_tokens + model_status —
         // CREATE TABLE IF NOT EXISTS; 17 context_checkpoints + session_context —
         // CREATE TABLE IF NOT EXISTS; 18 plugin_oauth_clients — CREATE TABLE
         // IF NOT EXISTS; 19 plugin_oauth_clients rebuild — idempotent
-        // copy-drop-rename; 20 model_effort_preferences + legacy normalization —
-        // convergent and CREATE TABLE IF NOT EXISTS; 21 session_route_state —
-        // CREATE TABLE IF NOT EXISTS; all no-ops on replay)
-        // re-run on the next open.
-        // `Migrations` always fast-forwards to the latest defined version,
-        // so there is no way to replay 13 alone once something is appended
-        // after it.
+        // copy-drop-rename; 20 sessions.perm_mode — hook-guarded, like
+        // branch_owned; 21 native-only cleanup — fully existence-guarded;
+        // 22 sessions rebuild — nullable project_id + kind/speaker/agent/
+        // parent_session_pk, copies every existing column forward including
+        // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
+        // effort preferences + legacy normalization; 25 session_route_state;
+        // 26 session_runtime_settings —
+        // all convergent or CREATE TABLE IF NOT EXISTS) re-run on next open.
+        // `Migrations` always fast-forwards to the latest defined version, so
+        // there is no way to replay 13 alone once something is appended after
+        // it. Bump this offset by one for every migration appended after 13 —
+        // a stale offset silently skips migration 13 (the DB opens fine, but
+        // this test starts failing its assertions). With migrations through 26
+        // defined, wind back fourteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 9)
+            c.pragma_update(None, "user_version", v - 14)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
+                    // The DB is fully migrated to v26 here, so `harness` was
+                    // already dropped: re-add it (and rows) so migration 13's
+                    // guarded UPDATE and migration 21's guarded DROP both run
+                    // their real paths on replay.
                     c.execute_batch(
-                        "INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-old', 'old', '/w', 'claude-code');
-                         INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p-new', 'new', '/w2', 'native');
+                        "ALTER TABLE projects ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude-code';
+                         INSERT INTO projects(project_id, name, workdir) VALUES ('p-old', 'old', '/w');
+                         INSERT INTO projects(project_id, name, workdir) VALUES ('p-new', 'new', '/w2');
                          UPDATE settings SET value='claude-code' WHERE key='default_runtime';
                          UPDATE settings SET value='claude-code,codex' WHERE key='enabled_runtimes';
                          INSERT INTO settings(key, value) VALUES ('default_agent', 'claude');",
@@ -4106,53 +4734,151 @@ mod tests {
         }
 
         let store = Store::open(tmp.path()).await.unwrap();
-        assert_eq!(
-            store.get_project("p-old").await.unwrap().unwrap().harness,
-            "native",
-            "claude-code project rows must be rewritten to native"
-        );
-        assert_eq!(
-            store.get_project("p-new").await.unwrap().unwrap().harness,
-            "native"
-        );
-        assert_eq!(
-            store
-                .get_setting("default_runtime")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native")
-        );
-        assert_eq!(
-            store.get_setting("default_agent").await.unwrap().as_deref(),
-            Some("native")
-        );
-        // CSV: claude-code swapped for native, other entries preserved.
-        assert_eq!(
-            store
-                .get_setting("enabled_runtimes")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native,codex")
-        );
+        // Migration 13 rewrote the legacy values; migration 21 then deleted the
+        // runtime-era keys and the harness column outright.
+        assert!(store
+            .get_setting("default_runtime")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_setting("default_agent").await.unwrap().is_none());
+        assert!(store
+            .get_setting("enabled_runtimes")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_project("p-old").await.unwrap().is_some());
+        assert!(store.get_project("p-new").await.unwrap().is_some());
 
-        // Idempotent: winding back and re-running must not change anything
-        // (e.g. it must not duplicate 'native' in the CSV).
+        // Idempotent: winding back and re-running must not error or resurrect keys.
+        store.with_conn(rewind).await.unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store
+            .get_setting("enabled_runtimes")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_project("p-old").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn migration_21_drops_the_runtime_concept() {
+        // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
+        // manually re-create every legacy artifact migration 21 handles,
+        // wind user_version back six, and reopen so 21 (and the tail
+        // migrations 22–26) replay against it. Back SIX: the fully migrated
+        // tail is now v26, so
+        // rewinding to v20 is what makes migration 21 (native-only) replay.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            c.pragma_update(None, "user_version", v - 6)
+        };
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(move |c| {
+                    c.execute_batch(
+                        "ALTER TABLE projects ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude-code';
+                         INSERT INTO projects(project_id, name, workdir, harness) VALUES ('p1', 'legacy', '/w', 'claude-code');
+                         ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude';
+                         INSERT INTO jobs(id, name, cron, project_id, prompt, agent) VALUES ('j1', 'audit', '0 2 * * *', 'p1', 'run it', 'claude');
+                         CREATE TABLE agents (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, model TEXT, perm_mode TEXT NOT NULL DEFAULT 'ask', flags TEXT NOT NULL DEFAULT '');
+                         INSERT INTO agents(id, enabled, model, perm_mode) VALUES ('native', 1, 'openrouter/qwen3:free', 'edit');
+                         INSERT INTO agents(id, enabled, model, perm_mode) VALUES ('claude', 1, 'claude-opus-4-5', 'ask');
+                         CREATE TABLE agent_tiers (agent_id TEXT NOT NULL, tier_id TEXT NOT NULL, value TEXT, combo INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (agent_id, tier_id));
+                         INSERT INTO agent_tiers(agent_id, tier_id, value) VALUES ('claude', 'fast', 'claude-haiku-4-5');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('enabled_runtimes', 'native,codex');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('default_runtime', 'native');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('default_agent', 'native');
+                         INSERT OR REPLACE INTO settings(key, value) VALUES ('agents_snapshot', '[]');
+                         INSERT INTO mcp_agent_access(server_id, agent_id, allowed) VALUES ('srv1', 'native', 1);
+                         INSERT INTO mcp_agent_access(server_id, agent_id, allowed) VALUES ('srv1', 'claude', 1);
+                         INSERT INTO mcp_agent_access(server_id, agent_id, allowed) VALUES ('srv1', 'codex', 0);",
+                    )?;
+                    rewind(c)
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        // Columns gone.
+        let (has_harness, has_agent, has_agents_table) = store
+            .with_conn(|c| {
+                let h = c
+                    .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='harness'")?
+                    .exists([])?;
+                let a = c
+                    .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='agent'")?
+                    .exists([])?;
+                let t = c
+                    .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('agents','agent_tiers')")?
+                    .exists([])?;
+                Ok((h, a, t))
+            })
+            .await
+            .unwrap();
+        assert!(!has_harness, "projects.harness must be dropped");
+        assert!(!has_agent, "jobs.agent must be dropped");
+        assert!(!has_agents_table, "agents/agent_tiers must be dropped");
+        // Rows survive the column drops and still load through the new readers.
+        assert_eq!(
+            store.get_project("p1").await.unwrap().unwrap().name,
+            "legacy"
+        );
+        assert_eq!(
+            crate::scheduler::get_job(&store, "j1")
+                .await
+                .unwrap()
+                .unwrap()
+                .prompt,
+            "run it"
+        );
+        // Native prefs copied into KV; dead settings keys deleted.
+        assert_eq!(
+            store.get_setting("agent_model").await.unwrap().as_deref(),
+            Some("openrouter/qwen3:free")
+        );
+        assert_eq!(
+            store
+                .get_setting("agent_perm_mode")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("edit")
+        );
+        for key in [
+            "enabled_runtimes",
+            "default_runtime",
+            "default_agent",
+            "agents_snapshot",
+        ] {
+            assert!(
+                store.get_setting(key).await.unwrap().is_none(),
+                "{key} must be deleted"
+            );
+        }
+        // Only the native mcp_agent_access row survives.
+        let rows: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM mcp_agent_access", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        // KV-absent rule: a pre-existing agent_model must NOT be clobbered on replay.
+        store
+            .set_setting("agent_model", "user-chose-this")
+            .await
+            .unwrap();
         store.with_conn(rewind).await.unwrap();
         drop(store);
         let store = Store::open(tmp.path()).await.unwrap();
         assert_eq!(
-            store
-                .get_setting("enabled_runtimes")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("native,codex")
-        );
-        assert_eq!(
-            store.get_project("p-old").await.unwrap().unwrap().harness,
-            "native"
+            store.get_setting("agent_model").await.unwrap().as_deref(),
+            Some("user-chose-this"),
+            "replay on an already-migrated DB must be a no-op"
         );
         let route_state_exists: bool = store
             .with_conn(|c| {
@@ -4535,5 +5261,92 @@ mod tests {
             .unwrap();
         let ctx = store.get_session_context("s1").await.unwrap().unwrap();
         assert_eq!(ctx["percent_left"], 17);
+    }
+
+    #[tokio::test]
+    async fn migration_23_creates_plugin_install_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let counts = store
+            .with_conn(|c| {
+                let installs: i64 =
+                    c.query_row("SELECT count(*) FROM plugin_installs", [], |r| r.get(0))?;
+                let attach: i64 =
+                    c.query_row("SELECT count(*) FROM plugin_attach_status", [], |r| {
+                        r.get(0)
+                    })?;
+                Ok((installs, attach))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn plugin_install_upsert_roundtrips_and_pins() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let rec = PluginInstallRecord {
+            plugin_id: "acme".into(),
+            kind: "plugin_pack".into(),
+            source_spec: "https://github.com/acme/pack".into(),
+            resolved_commit: Some("abc123".into()),
+            fingerprint: "fp-1".into(),
+            installed_at: 1000,
+            updated_at: 1000,
+            pinned: false,
+            pin_reason: None,
+            trust_tier: "acknowledged".into(),
+            trust_ack_at: Some(1000),
+            trust_ack_summary: Some("{\"hooks\":[]}".into()),
+        };
+        store.upsert_plugin_install(&rec).await.unwrap();
+        let got = store.get_plugin_install("acme").await.unwrap().unwrap();
+        assert_eq!(got.resolved_commit.as_deref(), Some("abc123"));
+        assert_eq!(got.trust_tier, "acknowledged");
+
+        store
+            .set_plugin_install_pin("acme", true, Some("frozen for demo"))
+            .await
+            .unwrap();
+        let pinned = store.get_plugin_install("acme").await.unwrap().unwrap();
+        assert!(pinned.pinned);
+        assert_eq!(pinned.pin_reason.as_deref(), Some("frozen for demo"));
+        // upsert preserves pin (COALESCE on pinned/pin_reason left out — upsert
+        // overwrites all columns, so the recorder must read-modify-write; assert
+        // that a re-upsert of the ORIGINAL rec would clear the pin, documenting
+        // that pin is managed only via set_plugin_install_pin).
+        assert_eq!(store.list_plugin_installs().await.unwrap().len(), 1);
+
+        store.delete_plugin_install("acme").await.unwrap();
+        assert!(store.get_plugin_install("acme").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn plugin_attach_status_records_latest() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .record_plugin_attach(&PluginAttachStatus {
+                plugin_id: "acme".into(),
+                last_attach_at: 5,
+                outcome: "failed".into(),
+                reason: Some("configure acme: missing credentials".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .record_plugin_attach(&PluginAttachStatus {
+                plugin_id: "acme".into(),
+                last_attach_at: 9,
+                outcome: "ok".into(),
+                reason: None,
+            })
+            .await
+            .unwrap();
+        let got = store.get_plugin_attach("acme").await.unwrap().unwrap();
+        assert_eq!(got.outcome, "ok");
+        assert_eq!(got.last_attach_at, 9);
+        assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
     }
 }

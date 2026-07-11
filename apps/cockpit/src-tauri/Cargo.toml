@@ -19,6 +19,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # the repo-root .cargo/config.toml: `cargo gen-bindings`.
 gen-bindings = []
 
+# Forwards to `ryuzi-core`'s `discord` feature so this crate's own
+# `#[cfg(feature = "discord")]` test gates (see `plugins_cmd.rs`) can see
+# when the live serenity-backed `GatewayFactory` is available — a plain
+# `--features ryuzi-core/discord` enables ryuzi-core's feature build-wide but
+# does not set a cfg flag for *this* crate's own compilation.
+discord = ["ryuzi-core/discord"]
+
 # Explicit [[bin]] so the required-features gate applies; tauri-cli's
 # get_binaries honors required-features in both [[bin]] and src/bin
 # auto-discovery paths, dropping the bin from bundling on every platform.
@@ -34,22 +41,23 @@ workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-ryuzi-core = { path = "../../../crates/core" }
+ryuzi-core = { path = "../../../crates/core", features = ["discord"] }
 ryuzi-plugin-sdk = { path = "../../../crates/plugin-sdk" }
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+tokio = { workspace = true, features = ["signal"] }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+futures.workspace = true
 portable-pty.workspace = true
 specta = { workspace = true, features = ["derive"] }
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "0.0.9"
 anyhow.workspace = true
-dirs.workspace = true
 chrono.workspace = true
 base64 = "0.22"
 

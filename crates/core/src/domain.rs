@@ -64,7 +64,6 @@ pub struct Project {
     pub name: String,
     pub workdir: String,
     pub source: Option<String>,
-    pub harness: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: PermMode,
@@ -74,16 +73,54 @@ pub struct Project {
     pub is_git: bool,
 }
 
+/// What a session represents. `Project` is the pre-Phase-2 default (bound to
+/// a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds
+/// added in Phase 2 — `project_id` is `None` for all three, and `Worker`/
+/// `Review` additionally carry `parent_session_pk` lineage back to the chat
+/// or project session that spawned them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    Project,
+    Chat,
+    Worker,
+    Review,
+}
+
+impl SessionKind {
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "chat" => SessionKind::Chat,
+            "worker" => SessionKind::Worker,
+            "review" => SessionKind::Review,
+            _ => SessionKind::Project,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionKind::Project => "project",
+            SessionKind::Chat => "chat",
+            SessionKind::Worker => "worker",
+            SessionKind::Review => "review",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub session_pk: String,
-    pub project_id: String,
+    /// `None` for chat-first sessions (`kind != Project`); a project-bound
+    /// session always has this set.
+    pub project_id: Option<String>,
     pub agent_session_id: Option<String>,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub title: Option<String>,
     pub status: SessionStatus,
+    /// Per-session permission mode. Copied from the project (or the new-chat
+    /// picker) at creation; changing it affects THIS session only.
+    pub perm_mode: PermMode,
     pub started_by: Option<String>,
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
@@ -92,6 +129,15 @@ pub struct Session {
     /// `end_session` deletes the branch ONLY when this is set; user-named and
     /// pre-existing branches survive teardown.
     pub branch_owned: bool,
+    pub kind: SessionKind,
+    /// Who is speaking in this session (chat-first; e.g. a Discord user id
+    /// or `"cockpit"`). Unused for `Project` sessions.
+    pub speaker: Option<String>,
+    /// Which agent persona/config is driving this session. Unused for
+    /// `Project` sessions.
+    pub agent: Option<String>,
+    /// The session this one was spawned from (`Worker`/`Review` lineage).
+    pub parent_session_pk: Option<String>,
 }
 
 /// How a new session's git workspace is prepared (branch controls).
@@ -120,7 +166,7 @@ impl Default for SessionGitOptions {
     }
 }
 
-/// An MCP server the agent can use as tools (attached to an ACP session in Spec 3).
+/// An MCP server the native agent can use as tools (attached to a harness session).
 ///
 /// After plugin `${auth}`/setting substitution, a resolved `McpServerSpec`'s
 /// `transport` carries RESOLVED SECRETS in `Stdio::env`/`Http::headers` (API
@@ -198,7 +244,8 @@ pub struct ApprovalRequest {
     pub timeout_ms: Option<u64>,
 }
 
-/// The user's decision on a tool-approval request. Mirrors ACP permission kinds.
+/// The user's decision on a tool-approval request from the native runtime's
+/// permission gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ApprovalDecision {
@@ -275,7 +322,7 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
-/// A persisted transcript entry. Forward-compatible with ACP session/update blocks.
+/// A persisted transcript entry, one row per native-runtime event block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -359,13 +406,28 @@ impl NewProviderTurn {
     }
 }
 
+/// One model's accumulated billed tokens + computed dollar cost within a
+/// session. Token fields are the durable truth; `usd` is derived from the
+/// current price table at emit time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCost {
+    pub model: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    pub usd: f64,
+}
+
 /// Public event broadcast to consumers (the Tauri layer re-emits these).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CoreEvent {
     SessionCreated {
         session_pk: String,
-        project_id: String,
+        /// `None` for a project-less (chat-first) session.
+        project_id: Option<String>,
     },
     Message {
         session_pk: String,
@@ -419,17 +481,6 @@ pub enum CoreEvent {
         root_id: Option<String>,
         status: String,
     },
-    /// A runtime npm install/update produced an output line.
-    RuntimeUpdateLog {
-        runtime_id: String,
-        line: String,
-    },
-    /// A runtime npm install/update finished (ok=false → message has detail).
-    RuntimeUpdateDone {
-        runtime_id: String,
-        ok: bool,
-        message: Option<String>,
-    },
     /// Per-response context usage for a native session (drives the
     /// "% context left" indicator).
     ContextUsage {
@@ -449,6 +500,32 @@ pub enum CoreEvent {
         before_tokens: u64,
         after_tokens: u64,
         window_number: u32,
+    },
+    /// A provider OAuth flow produced its authorize URL. Surfaces open it
+    /// (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
+    OauthAuthorizeUrl {
+        provider: String,
+        authorize_url: String,
+    },
+    /// Same for a plugin OAuth flow.
+    PluginOauthAuthorizeUrl {
+        plugin_id: String,
+        authorize_url: String,
+    },
+    /// Per-session accumulated cost: total USD and a per-model token+dollar
+    /// breakdown. Emitted alongside `ContextUsage`.
+    ///
+    /// Like its sibling context-telemetry variants above, this variant's own
+    /// fields stay snake_case (`session_pk`, `total_usd`): the enum-level
+    /// `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
+    /// value, not each variant's field names (see `ContextUsage`'s
+    /// `session_pk`). The nested `ModelCost` struct carries its own
+    /// `rename_all = "camelCase"`, so its fields (e.g. `cache_read` →
+    /// `cacheRead`) are camelCased independently.
+    SessionCost {
+        session_pk: String,
+        total_usd: f64,
+        models: Vec<ModelCost>,
     },
 }
 
@@ -501,12 +578,20 @@ mod tests {
     fn core_event_serializes_with_camel_tag_and_snake_fields() {
         let e = CoreEvent::SessionCreated {
             session_pk: "s1".into(),
-            project_id: "p1".into(),
+            project_id: Some("p1".into()),
         };
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "sessionCreated");
         assert_eq!(j["session_pk"], "s1");
         assert_eq!(j["project_id"], "p1");
+
+        // A chat (project-less) session serializes project_id as null.
+        let e = CoreEvent::SessionCreated {
+            session_pk: "s2".into(),
+            project_id: None,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["project_id"], serde_json::Value::Null);
     }
 
     #[test]
@@ -545,5 +630,52 @@ mod tests {
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "contextCompacted");
         assert_eq!(j["window_number"], 2);
+    }
+
+    #[test]
+    fn oauth_authorize_url_event_serializes_with_kind_tag() {
+        let e = CoreEvent::OauthAuthorizeUrl {
+            provider: "anthropic-oauth".into(),
+            authorize_url: "https://x".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "oauthAuthorizeUrl");
+        assert_eq!(v["authorize_url"], "https://x");
+    }
+
+    #[test]
+    fn plugin_oauth_authorize_url_event_serializes_with_kind_tag() {
+        let e = CoreEvent::PluginOauthAuthorizeUrl {
+            plugin_id: "acme".into(),
+            authorize_url: "https://y".into(),
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "pluginOauthAuthorizeUrl");
+        assert_eq!(v["plugin_id"], "acme");
+        assert_eq!(v["authorize_url"], "https://y");
+    }
+
+    #[test]
+    fn session_cost_serializes_snake_variant_camel_nested() {
+        let e = CoreEvent::SessionCost {
+            session_pk: "s1".into(),
+            total_usd: 0.1234,
+            models: vec![ModelCost {
+                model: "claude-sonnet-4".into(),
+                input: 100,
+                output: 40,
+                cache_read: 20,
+                cache_creation: 5,
+                usd: 0.1234,
+            }],
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "sessionCost");
+        assert_eq!(v["session_pk"], "s1");
+        assert_eq!(v["total_usd"], 0.1234);
+        assert_eq!(v["models"][0]["model"], "claude-sonnet-4");
+        assert_eq!(v["models"][0]["cacheRead"], 20);
+        assert_eq!(v["models"][0]["cacheCreation"], 5);
+        assert_eq!(v["models"][0]["usd"], 0.1234);
     }
 }

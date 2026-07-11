@@ -1,8 +1,5 @@
 import { create } from "zustand";
 
-// Agent ids come from the engine's agent catalog (see store-runtimes).
-export type AgentId = string;
-
 // View router for the Relay v3 shell. Session focus itself stays in the main
 // store (focusedSessionPk); this store only decides which screen is showing.
 export type View =
@@ -11,8 +8,6 @@ export type View =
   | { kind: "session" }
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }
-  | { kind: "runtime" }
-  | { kind: "runtimeDetail"; id: AgentId }
   | { kind: "scheduler" }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }
@@ -23,7 +18,7 @@ export type View =
   | { kind: "pluginDetail"; id: string }
   | { kind: "settings" };
 
-export type RightTab = "review" | "file";
+export type RightTab = "review" | "file" | "agents";
 
 export type NavHistory = { back: View[]; current: View; forward: View[] };
 
@@ -69,7 +64,7 @@ export function clampPanelSize(px: number, viewport: number, b: { min: number; m
 
 /** Legacy persisted values ("term") and garbage collapse to "review". */
 export function sanitizeRightTab(raw: string | null): RightTab {
-  return raw === "file" ? "file" : "review";
+  return raw === "file" ? "file" : raw === "agents" ? "agents" : "review";
 }
 
 /** Parse a persisted panel size and clamp it to the current viewport. A size
@@ -135,7 +130,11 @@ type NavState = {
   composerBranch: string | null;
   /** Run the session in an isolated git worktree (matrix column 1). */
   composerUseWorktree: boolean;
-  /** Model the next composed session should run on; null = project/runtime default. */
+  /** Model the next composed session should run on; null = fall back to the
+   *  project's pinned model, then the agent's default model (see HomeView). */
+  composerModel: string | null;
+  /** Chat-only effort override paired with composerModel; project composers use project runtime state. */
+  composerEffort: string | null;
   /** Unsent composer text keyed by composer identity: a sessionPk (SessionView)
    *  or `home:{projectId}` (HomeView). Persisted so drafts survive restarts. */
   drafts: Record<string, string>;
@@ -155,6 +154,8 @@ type NavState = {
   setSearchQuery: (q: string) => void;
   setComposerBranch: (b: string | null) => void;
   setComposerUseWorktree: (v: boolean) => void;
+  setComposerModel: (model: string | null) => void;
+  setComposerEffort: (effort: string | null) => void;
   setDraft: (key: string, text: string) => void;
   clearDraft: (key: string) => void;
   /** Refill a draft after a failed send — no-op if the user already typed anew. */
@@ -178,6 +179,8 @@ export const useNav = create<NavState>((set, get) => ({
   searchQuery: "",
   composerBranch: null,
   composerUseWorktree: true,
+  composerModel: null,
+  composerEffort: null,
   drafts: readDrafts(readStored(KEY_DRAFTS)),
   projectSettingsFor: null,
 
@@ -224,6 +227,8 @@ export const useNav = create<NavState>((set, get) => ({
   setSearchQuery: (q) => set({ searchQuery: q }),
   setComposerBranch: (b) => set({ composerBranch: b }),
   setComposerUseWorktree: (v) => set({ composerUseWorktree: v }),
+  setComposerModel: (model) => set({ composerModel: model }),
+  setComposerEffort: (effort) => set({ composerEffort: effort }),
   setDraft: (key, text) =>
     set((s) => {
       const drafts = upsertDraft(s.drafts, key, text);

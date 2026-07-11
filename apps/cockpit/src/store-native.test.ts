@@ -82,11 +82,16 @@ test("importSession reports success", async () => {
       branch: null,
       title: "Imported",
       status: "ended",
+      permMode: "default",
       startedBy: "import",
       createdAt: 0,
       lastActive: 0,
       resumeAttempts: 0,
       branchOwned: true,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
     },
   });
   const ok = await useNative.getState().importSession("p1", '{"version":1}');

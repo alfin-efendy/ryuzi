@@ -13,7 +13,7 @@ import {
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { Chip, StatusDot } from "@/components/common/bits";
 import { agentAllowed, appById, useApps } from "@/store-apps";
-import { useRuntimes } from "@/store-runtimes";
+import { NATIVE_AGENT } from "@/constants";
 import { useGateways } from "@/store-gateways";
 import { useNav } from "@/store-nav";
 
@@ -22,7 +22,6 @@ const rowLabel = "w-[120px] shrink-0 text-[13px] font-medium";
 export function AppDetailView({ id }: { id: string }) {
   const nav = useNav();
   const { apps, loaded, hydrate, probing, probe, remove, setScope, setToolPerm, toggleAgent } = useApps();
-  const runtimes = useRuntimes((s) => s.runtimes);
   const gateways = useGateways((s) => s.gateways);
   const goApps = () => nav.navigate({ kind: "plugins" });
 
@@ -170,22 +169,16 @@ export function AppDetailView({ id }: { id: string }) {
         <Card>
           <CardHeader>
             <CardTitle>Agent access</CardTitle>
-            <CardHint>Which agents may call this plugin</CardHint>
+            <CardHint>Whether the agent may call this plugin</CardHint>
           </CardHeader>
-          {runtimes.map((agent) => (
-            <div key={agent.id} className="flex items-center gap-3 border-b border-border px-[18px] py-[11px] last:border-b-0">
-              <StatusDot color={agent.color} size={8} />
-              <span className="min-w-0 flex-1">
-                <span className="block text-[13px] font-medium">{agent.name}</span>
-                <span className="block text-[11px] text-muted-foreground">{agent.model || agent.connection}</span>
-              </span>
-              <Switch
-                on={agentAllowed(app, agent.id)}
-                onToggle={() => void toggleAgent(app.id, agent.id, !agentAllowed(app, agent.id))}
-                label={`${agent.name} access`}
-              />
-            </div>
-          ))}
+          <div className="flex items-center gap-3 px-[18px] py-[11px]">
+            <StatusDot color={NATIVE_AGENT.color} size={8} />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[13px] font-medium">Allow the agent to use this app</span>
+              <span className="block text-[11px] text-muted-foreground">{NATIVE_AGENT.name} · applies to every session</span>
+            </span>
+            <Switch on={agentAllowed(app)} onToggle={() => void toggleAgent(app.id, !agentAllowed(app))} label="Agent access" />
+          </div>
         </Card>
       </div>
     </div>

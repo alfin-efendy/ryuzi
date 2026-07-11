@@ -197,7 +197,6 @@ mock.module("@/bindings", () => ({
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
-    listRuntimes: () => Promise.resolve({ status: "ok", data: [] }),
     projectRuntimeInfo: (projectId: string) =>
       Promise.resolve({
         status: "ok" as const,
@@ -212,6 +211,8 @@ mock.module("@/bindings", () => ({
           modelInfo: null,
         },
       }),
+    getAgentSettings: () => Promise.resolve({ status: "ok", data: { model: null, permMode: null } }),
+    listSelectableModels: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
     deleteModelRoute,
@@ -257,6 +258,7 @@ const { useConnections } = await import("@/store-connections");
 const { useModelRoutes } = await import("@/store-model-routes");
 const { useUsage } = await import("@/store-usage");
 const { useNav } = await import("@/store-nav");
+const { useAgent } = await import("@/store-agent");
 
 // The zustand singletons are shared across test files in one bun process, so
 // reset BEFORE each test too — an earlier file's hydration (with its own
@@ -267,6 +269,7 @@ function resetStores() {
   useModelRoutes.setState({ routes: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
+  useAgent.setState({ models: [], model: null, permMode: null, loaded: false });
 }
 
 beforeEach(() => {
@@ -436,6 +439,31 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("Usage")).toBeTruthy();
   expect(screen.getAllByText("Models").length).toBeGreaterThan(0);
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
+});
+
+test("provider detail reads dynamic effort metadata from the agent store", async () => {
+  useConnections.setState({ catalog, connections: [connection], loaded: true });
+  useAgent.setState({
+    models: [
+      {
+        kind: "concrete",
+        requestValue: "openai/gpt-4.1",
+        displayName: "GPT-4.1",
+        preferenceKey: { family: "openai", model: "gpt-4.1" },
+        supported: [
+          { value: "low", label: "Low", description: null },
+          { value: "high", label: "High", description: null },
+        ],
+        configuredDefault: null,
+        resolvedDefault: "high",
+        defaultSource: "provider",
+      },
+    ],
+    loaded: true,
+  });
+  render(<ProviderDetailView provider="openai" />);
+
+  expect(await screen.findByRole("combobox", { name: "Default effort for GPT-4.1" })).toBeTruthy();
 });
 
 test("changing account routing opens a listbox and persists the picked strategy", async () => {

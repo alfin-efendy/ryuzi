@@ -87,8 +87,6 @@ export function JobNewView() {
       // Branchless for non-git projects — the scheduler runner never reads
       // job.branch when starting a run (scheduler.rs:536, no git options).
       branch: isGit ? (branch ?? "main") : "",
-      // Ryuzi-only sessions: jobs always run the native runtime.
-      agent: "native",
       gateway,
       prompt: prompt.trim(),
       notifySuccess,
@@ -139,6 +137,7 @@ export function JobNewView() {
             {isGit && (
               <Combobox
                 aria-label="Branch"
+                popupClassName="w-64 max-w-[var(--available-width)]"
                 options={(branchList?.branches ?? []).map((b) => ({ value: b, label: b, mono: true }))}
                 value={branch}
                 onValueChange={setBranch}

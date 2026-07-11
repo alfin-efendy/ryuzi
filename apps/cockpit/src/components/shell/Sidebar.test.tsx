@@ -21,7 +21,6 @@ const project: Project = {
   name: "Ryuzi",
   workdir: "C:\\code\\ryuzi",
   source: null,
-  harness: "native",
   model: null,
   effort: null,
   permMode: "default",
@@ -42,6 +41,11 @@ const session: Session = {
   lastActive: 2,
   resumeAttempts: 0,
   branchOwned: true,
+  permMode: "default",
+  kind: "project",
+  speaker: null,
+  agent: null,
+  parentSessionPk: null,
 };
 
 const endSession = mock((_sessionPk: string): Promise<boolean> => Promise.resolve(true));
@@ -115,4 +119,42 @@ test("busy archive locks every dismissal path until teardown settles", async () 
   await act(async () => resolveClose?.({ status: "ok", data: null }));
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Archive session?" })).toBeNull());
   expect(endSession).toHaveBeenCalledWith("s1");
+});
+
+function sessionFixture(pk: string, lastActive: number): Session {
+  return {
+    ...session,
+    sessionPk: pk,
+    projectId: "p1",
+    title: pk,
+    lastActive,
+    worktreePath: null,
+    branch: null,
+    branchOwned: false,
+  };
+}
+
+test("renders an unread dot for an unread, non-focused session", () => {
+  useUi.setState({ readAt: { s1: 100, s2: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useStore.setState({
+    projects: [project],
+    sessions: [sessionFixture("s1", 500), sessionFixture("s2", 50)],
+    focusedSessionPk: null,
+    pendingApprovals: [],
+  });
+  render(<Sidebar />);
+  expect(screen.getByTestId("unread-dot-s1")).toBeTruthy();
+  expect(screen.queryByTestId("unread-dot-s2")).toBeNull();
+});
+
+test("does not show an unread dot for the focused session even if unseen", () => {
+  useUi.setState({ readAt: { s1: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useStore.setState({
+    projects: [project],
+    sessions: [sessionFixture("s1", 500)],
+    focusedSessionPk: "s1",
+    pendingApprovals: [],
+  });
+  render(<Sidebar />);
+  expect(screen.queryByTestId("unread-dot-s1")).toBeNull();
 });

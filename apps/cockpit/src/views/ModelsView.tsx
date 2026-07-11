@@ -106,9 +106,8 @@ function buildProviderRows(catalog: CatalogEntry[], connections: ConnectionInfo[
   });
 }
 
-// Matches the warning-banner convention used elsewhere (e.g. RuntimeDetailView's
-// endpoint/no-models banners): a bordered row tinted amber for a mild warning,
-// red for a stronger one.
+// The shared warning-banner convention: a bordered row tinted amber for a
+// mild warning, red for a stronger one.
 const WARN = "#F59E0B";
 const DANGER = "#EF4444";
 

@@ -73,10 +73,12 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
 });
 
-test("composer_model_has_one_project_runtime_source", () => {
+test("composer nav keeps durable chat-only model and effort state", () => {
   const nav = useNav.getState() as unknown as Record<string, unknown>;
-  expect(nav.composerModel).toBeUndefined();
-  expect(nav.setComposerModel).toBeUndefined();
+  expect(nav.composerModel).toBeNull();
+  expect(typeof nav.setComposerModel).toBe("function");
+  expect(nav.composerEffort).toBeNull();
+  expect(typeof nav.setComposerEffort).toBe("function");
 });
 
 test("composer git controls default to worktree ON, no branch until the list loads", () => {
@@ -139,4 +141,12 @@ test("setDraft persists the map to localStorage", () => {
   useNav.getState().clearDraft("s9");
   expect(JSON.parse(localStorage.getItem("cockpit.composer.drafts") ?? "{}")).toEqual({});
   useNav.setState({ drafts: {} });
+});
+
+test("sanitizeRightTab accepts agents, keeps file/review, falls back on unknown", () => {
+  expect(sanitizeRightTab("agents")).toBe("agents");
+  expect(sanitizeRightTab("file")).toBe("file");
+  expect(sanitizeRightTab("review")).toBe("review");
+  expect(sanitizeRightTab("bogus")).toBe("review");
+  expect(sanitizeRightTab(null)).toBe("review");
 });

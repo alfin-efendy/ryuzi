@@ -308,30 +308,6 @@ pub async fn servers_for_session(
     Ok(out)
 }
 
-/// Convert an engine spec into the ACP wire type for `session/new`.
-pub fn to_acp(spec: &McpServerSpec) -> agent_client_protocol_schema::v1::McpServer {
-    use agent_client_protocol_schema::v1 as acp;
-    match &spec.transport {
-        McpTransport::Stdio { command, args, env } => acp::McpServer::Stdio(
-            acp::McpServerStdio::new(spec.name.clone(), command.clone())
-                .args(args.clone())
-                .env(
-                    env.iter()
-                        .map(|(k, v)| acp::EnvVariable::new(k.clone(), v.clone()))
-                        .collect(),
-                ),
-        ),
-        McpTransport::Http { url, headers } => acp::McpServer::Http(
-            acp::McpServerHttp::new(spec.name.clone(), url.clone()).headers(
-                headers
-                    .iter()
-                    .map(|(k, v)| acp::HttpHeader::new(k.clone(), v.clone()))
-                    .collect(),
-            ),
-        ),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tool-permission bridge (`mcp__<server>__<tool>` names)
 // ---------------------------------------------------------------------------
@@ -453,11 +429,7 @@ async fn probe_stdio_inner(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::process_util::no_window(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

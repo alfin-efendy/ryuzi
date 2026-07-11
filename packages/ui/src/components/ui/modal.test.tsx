@@ -119,3 +119,17 @@ test("Escape closes a nested MenuPanel before the dialog", async () => {
   expect(onClose).not.toHaveBeenCalled();
   expect(screen.getByRole("dialog", { name: "Nested menu" })).toBeTruthy();
 });
+
+test("modal portals to document.body so the scrim escapes containing blocks", () => {
+  render(
+    <div data-testid="host">
+      <Modal onClose={() => {}} width={300}>
+        <div>content</div>
+      </Modal>
+    </div>,
+  );
+  const dialog = screen.getByRole("dialog");
+  // Portaled: the dialog escapes the containing host and is mounted under body.
+  expect(document.body.contains(dialog)).toBe(true);
+  expect(screen.getByTestId("host").contains(dialog)).toBe(false);
+});

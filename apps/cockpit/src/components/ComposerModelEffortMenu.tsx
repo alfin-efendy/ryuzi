@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { Button, MenuPanel, MenuPanelItem, MenuPanelSection, MenuPanelSeparator } from "@ryuzi/ui";
-import type { ProjectRuntimeInfo, SelectableModelInfo } from "@/bindings";
+import type { ProjectRuntimeInfo, SelectableModelInfo, SessionRuntimeInfo } from "@/bindings";
 
 type Props = {
   models: SelectableModelInfo[];
-  runtime: ProjectRuntimeInfo | null;
+  runtime: ProjectRuntimeInfo | SessionRuntimeInfo | null;
   onChange: (model: string | null, effort: string | null) => void;
   disabled?: boolean;
   running?: boolean;
@@ -114,7 +114,7 @@ export function ComposerModelEffortMenu({ models, runtime, onChange, disabled, r
           ) : unknown ? (
             <div className="px-2.5 py-2 text-xs text-muted-foreground">Metadata unknown; stored value is preserved</div>
           ) : null}
-          {running ? <div className="px-2.5 py-2 text-xs text-muted-foreground">Changes apply to this project’s next turns.</div> : null}
+          {running ? <div className="px-2.5 py-2 text-xs text-muted-foreground">Changes apply to the next turns.</div> : null}
         </MenuPanel>
       ) : null}
     </div>

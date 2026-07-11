@@ -21,7 +21,6 @@ pub struct JobRow {
     pub natural_text: String,
     pub project_id: String,
     pub branch: String,
-    pub agent: String,
     pub gateway: String,
     pub enabled: bool,
     pub prompt: String,
@@ -176,7 +175,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
 // ---------------------------------------------------------------------------
 
 const JOB_COLS: &str =
-    "id,name,cron,mode,natural_text,project_id,branch,agent,gateway,enabled,prompt,notify_success,notify_fail,pre_check";
+    "id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check";
 
 fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -187,13 +186,12 @@ fn job_from(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         natural_text: r.get(4)?,
         project_id: r.get(5)?,
         branch: r.get(6)?,
-        agent: r.get(7)?,
-        gateway: r.get(8)?,
-        enabled: r.get::<_, i64>(9)? != 0,
-        prompt: r.get(10)?,
-        notify_success: r.get::<_, i64>(11)? != 0,
-        notify_fail: r.get::<_, i64>(12)? != 0,
-        pre_check: r.get(13)?,
+        gateway: r.get(7)?,
+        enabled: r.get::<_, i64>(8)? != 0,
+        prompt: r.get(9)?,
+        notify_success: r.get::<_, i64>(10)? != 0,
+        notify_fail: r.get::<_, i64>(11)? != 0,
+        pre_check: r.get(12)?,
     })
 }
 
@@ -230,18 +228,18 @@ pub async fn upsert_job(store: &Store, job: JobRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,agent,gateway,enabled,prompt,notify_success,notify_fail,pre_check,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
+                "INSERT INTO jobs(id,name,cron,mode,natural_text,project_id,branch,gateway,enabled,prompt,notify_success,notify_fail,pre_check,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, cron=excluded.cron, mode=excluded.mode, \
                    natural_text=excluded.natural_text, project_id=excluded.project_id, \
-                   branch=excluded.branch, agent=excluded.agent, gateway=excluded.gateway, \
+                   branch=excluded.branch, gateway=excluded.gateway, \
                    enabled=excluded.enabled, prompt=excluded.prompt, \
                    notify_success=excluded.notify_success, notify_fail=excluded.notify_fail, \
                    pre_check=excluded.pre_check",
                 params![
                     job.id, job.name, job.cron, job.mode, job.natural_text, job.project_id,
-                    job.branch, job.agent, job.gateway, job.enabled as i64, job.prompt,
+                    job.branch, job.gateway, job.enabled as i64, job.prompt,
                     job.notify_success as i64, job.notify_fail as i64, job.pre_check, now
                 ],
             )
@@ -437,6 +435,7 @@ pub async fn run_pre_check(cmd: &str, workdir: Option<&str>) -> PreCheckOutcome 
     // A timed-out future is dropped: without kill_on_drop the child would
     // keep running detached (the spawn convention everywhere else in core).
     c.kill_on_drop(true);
+    crate::process_util::no_window(&mut c);
     match tokio::time::timeout(Duration::from_secs(60), c.output()).await {
         Err(_) => PreCheckOutcome::Skip("pre-check timed out after 60s".into()),
         Ok(Err(e)) => PreCheckOutcome::Skip(format!("pre-check failed to spawn: {e}")),
@@ -460,11 +459,10 @@ pub async fn run_pre_check(cmd: &str, workdir: Option<&str>) -> PreCheckOutcome 
 
 /// Sum of `git diff --numstat HEAD` in `workdir` → (added, deleted).
 pub async fn diff_totals(workdir: &str) -> Option<(i64, i64)> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", workdir, "diff", "--numstat", "HEAD"])
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["-C", workdir, "diff", "--numstat", "HEAD"]);
+    crate::process_util::no_window(&mut cmd);
+    let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -893,7 +891,6 @@ mod tests {
             natural_text: "every day at 2am".into(),
             project_id: "p1".into(),
             branch: "main".into(),
-            agent: "claude".into(),
             gateway: "local".into(),
             enabled: true,
             prompt: "Run npm audit".into(),

@@ -8,6 +8,10 @@ type Meta = {
   display_name?: string;
   reasoning_efforts?: Array<{ value: string; label: string; description?: string }>;
   default_reasoning_effort?: string;
+  cost_input: number;
+  cost_output: number;
+  cost_cache_read: number;
+  cost_cache_write: number;
 };
 
 const api = (await (await fetch("https://models.dev/api.json")).json()) as Record<string, { models?: Record<string, any> }>;
@@ -22,6 +26,10 @@ for (const [providerId, provider] of Object.entries(api)) {
       supports_prompt_cache: m.cost?.cache_read != null,
       supports_reasoning: m.reasoning === true,
       ...(typeof m.name === "string" ? { display_name: m.name } : {}),
+      cost_input: m.cost?.input ?? 0,
+      cost_output: m.cost?.output ?? 0,
+      cost_cache_read: m.cost?.cache_read ?? 0,
+      cost_cache_write: m.cost?.cache_write ?? 0,
     };
     out[exactKey(providerId, id)] = meta;
     const generic = genericKey(id);
@@ -44,12 +52,17 @@ const codex = (await Bun.file("scripts/models-meta/codex-effort-source.json").js
 for (const model of codex.models ?? []) {
   const generic = out[genericKey(model.slug)];
   const codexExactKey = exactKey("openai-oauth", model.slug);
-  const existing = out[codexExactKey] ?? generic ?? {
-    context_window: 128_000,
-    max_output_tokens: 8_192,
-    supports_prompt_cache: false,
-    supports_reasoning: true,
-  };
+  const existing = out[codexExactKey] ??
+    generic ?? {
+      context_window: 128_000,
+      max_output_tokens: 8_192,
+      supports_prompt_cache: false,
+      supports_reasoning: true,
+      cost_input: 0,
+      cost_output: 0,
+      cost_cache_read: 0,
+      cost_cache_write: 0,
+    };
   out[codexExactKey] = {
     ...existing,
     ...(model.display_name ? { display_name: model.display_name } : {}),
@@ -59,9 +72,7 @@ for (const model of codex.models ?? []) {
       label: option.effort,
       ...(option.description ? { description: option.description } : {}),
     })),
-    ...(typeof model.default_reasoning_level === "string"
-      ? { default_reasoning_effort: model.default_reasoning_level }
-      : {}),
+    ...(typeof model.default_reasoning_level === "string" ? { default_reasoning_effort: model.default_reasoning_level } : {}),
   };
 }
 const sorted = Object.fromEntries(Object.entries(out).sort(([a], [b]) => a.localeCompare(b)));

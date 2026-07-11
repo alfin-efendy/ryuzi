@@ -1,4 +1,4 @@
-//! ConfigField schema: the 27 global settings fields. Keys, labels, help
+//! ConfigField schema: the 25 global settings fields. Keys, labels, help
 //! text, and defaults are user-visible contracts — settings stored under
 //! these keys must keep resolving across releases.
 
@@ -38,7 +38,7 @@ pub const BASE: ConfigField = ConfigField {
     default: None,
 };
 
-/// The 27 global settings fields.
+/// The 25 global settings fields.
 pub static GLOBAL_FIELDS: &[ConfigField] = &[
     ConfigField {
         key: "workdir_root",
@@ -198,20 +198,6 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         ..BASE
     },
     ConfigField {
-        key: "enabled_runtimes",
-        label: "Enabled runtimes",
-        control: true,
-        help: "(managed by the Providers picker)",
-        ..BASE
-    },
-    ConfigField {
-        key: "default_runtime",
-        label: "Default runtime",
-        control: true,
-        help: "(managed by the Providers picker)",
-        ..BASE
-    },
-    ConfigField {
         key: "context.auto_compact_percent",
         label: "Auto-compact threshold (%)",
         field_type: FieldType::Int,
@@ -248,15 +234,15 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_30_keys_and_correct_flags() {
+    fn schema_has_28_keys_and_correct_flags() {
         let fields = all_fields();
-        assert_eq!(fields.len(), 30); // 27 global + 3 discord
+        assert_eq!(fields.len(), 28); // 25 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
         // list order: globals first, then discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
         assert_eq!(
-            &keys[27..],
+            &keys[25..],
             &["discord.token", "discord.app_id", "discord.guild_id"]
         );
         // the only required global is workdir_root; all 3 discord fields required; token is the only secret

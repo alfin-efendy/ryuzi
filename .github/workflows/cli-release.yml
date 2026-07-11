@@ -33,15 +33,6 @@ jobs:
         with:
           version: 0.13.0
       - run: cargo install --locked cargo-zigbuild
-      - name: Embed the release sidecar manifest (pins adapter version + sha256 into the binaries)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
-            --pattern manifest.json --output crates/core/sidecar.manifest.json --clobber
-          cat crates/core/sidecar.manifest.json
-      - name: Validate the injected manifest parses (same serde path the binary uses)
-        run: cargo test -p ryuzi-core sidecar
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser

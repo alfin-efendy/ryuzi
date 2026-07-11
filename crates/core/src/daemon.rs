@@ -11,10 +11,10 @@
 use crate::control::ControlPlane;
 use crate::domain::{ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Surface};
 use crate::gateway::{Gateway, GatewayFactory};
-use crate::harness::acp::{claude_code_plugin, AcpAdapterDescriptor};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
 use crate::llm_router::secrets;
+use crate::llm_router::server::RouterServer;
 use crate::plugins::Registries;
 use crate::policy;
 use crate::router::Router;
@@ -34,32 +34,15 @@ use tokio::task::{JoinHandle, JoinSet};
 pub struct BuildDaemonOpts {
     /// Path to the sqlite database (created/migrated by `Store::open`).
     pub db_path: PathBuf,
-    /// Lazily resolves the ACP adapter descriptor (e.g. locates/downloads the
-    /// bundled sidecar). This is called AT MOST ONCE, and only if
-    /// `enabled_runtimes` (a persisted setting) includes `"claude-code"` — a
-    /// gateway-only daemon with no runtime enabled never pays the cost of
-    /// resolving (or downloading) the sidecar. The caller (CLI: the sidecar
-    /// resolver) owns any I/O this closure performs.
-    pub adapter: Box<dyn FnOnce() -> anyhow::Result<AcpAdapterDescriptor> + Send>,
     /// Override the telemetry backend (used by tests). `None` selects
-    /// Console, or OTLP-behind-a-feature-flag once `otel_endpoint` is set and
-    /// Task 6 lands; see [`build_daemon`]'s doc for the current fallback.
+    /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
     /// Gateway factories available to wire, keyed by the id an entry in the
-    /// `enabled_gateways` setting names (e.g. `"discord"`). 4D-b registers
-    /// its gateway(s) here (directly, or via a plugin's `add_plugin`).
+    /// `enabled_gateways` setting names (e.g. `"discord"`).
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
-    /// Harness factories to register directly (keyed by `Project.harness`),
-    /// alongside whatever the `claude_code_plugin` installs under
-    /// `"claude-code"` when `enabled_runtimes` calls for it. Registered
-    /// unconditionally (registration is cheap — a `HarnessFactory` isn't
-    /// instantiated until a session actually starts), and installed AFTER
-    /// the `claude_code_plugin` step so an entry here can override it.
-    /// Empty in production today; exists so tests can wire a fake harness
-    /// through the real `build_daemon` composition (e.g. to exercise the
-    /// real spawned approval fan-out end-to-end) without spinning up an
-    /// actual ACP sidecar.
-    pub extra_harness_factories: Vec<(String, Arc<dyn HarnessFactory>)>,
+    /// Test seam: replace the single native harness factory with a fake.
+    /// `None` (production) uses the real native runtime.
+    pub harness_factory: Option<Arc<dyn HarnessFactory>>,
 }
 
 /// A fully wired daemon: control plane, shared store handle, and the
@@ -70,6 +53,13 @@ pub struct Daemon {
     pub cp: Arc<ControlPlane>,
     pub store: Arc<Store>,
     pub gateways: Vec<Arc<dyn Gateway>>,
+    /// The local Anthropic/OpenAI-compatible endpoint server. The daemon
+    /// always constructs it (cheap — it does not bind a port until
+    /// `start()`'s autostart branch, or an explicit RPC, calls
+    /// `RouterServer::start`), so any consumer (e.g. the HTTP control API's
+    /// `ApiState`) can share this one instance instead of standing up its
+    /// own.
+    pub router_server: Arc<RouterServer>,
     telemetry: Arc<dyn Telemetry>,
     stopped: AtomicBool,
     /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
@@ -82,6 +72,17 @@ pub struct Daemon {
     /// per-approval `handle_approval` races (see `spawn_approval_fanout`),
     /// so no race started before `stop()` survives it either.
     fanout_handle: JoinHandle<()>,
+    /// The cron scheduler's background loop (`scheduler::spawn_runner`).
+    /// The daemon is the single always-on engine host now, so this is the
+    /// only place this loop is ever spawned — its `job_last_fired` anchor
+    /// (see `scheduler::tick`) is single-host-only, and a second spawn
+    /// elsewhere (e.g. Cockpit, which used to host this loop) would race
+    /// the same anchor and double-fire or skip jobs. Tracked so `stop()`
+    /// can abort it, same as `router_handle`/`fanout_handle`.
+    scheduler_handle: JoinHandle<()>,
+    /// The orch dispatcher's background loop (`orch::spawn_runner`), tracked
+    /// for the same reason as `scheduler_handle`.
+    orch_handle: JoinHandle<()>,
 }
 
 impl Daemon {
@@ -91,12 +92,12 @@ impl Daemon {
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
-    /// same as `stop()`), the router/fan-out handles are aborted, and the
-    /// daemon is marked stopped (reusing the same idempotency flag `stop()`
-    /// checks) before the error is returned. Marking it stopped here means a
-    /// caller's own best-effort `stop()` on a `start()` error (e.g.
-    /// `daemon_cmd::build_and_start`) is a safe no-op instead of re-stopping
-    /// gateway 0..N-1 a second time.
+    /// same as `stop()`), the router/fan-out/scheduler/orch handles are
+    /// aborted, and the daemon is marked stopped (reusing the same
+    /// idempotency flag `stop()` checks) before the error is returned.
+    /// Marking it stopped here means a caller's own best-effort `stop()` on
+    /// a `start()` error (e.g. `daemon_cmd::build_and_start`) is a safe
+    /// no-op instead of re-stopping gateway 0..N-1 a second time.
     ///
     /// This task is deliberately left UNTRACKED (unlike `router_handle` /
     /// `fanout_handle`): boot does not await or hold onto its reconcile
@@ -106,6 +107,14 @@ impl Daemon {
     /// nothing here for `stop()` to meaningfully cancel — this handle only
     /// covers the `reconcile()` scan itself, which is expected to finish
     /// quickly regardless of `Daemon`'s lifecycle.
+    ///
+    /// After reconcile is kicked off, endpoint autostart runs: if the
+    /// persisted `endpoint_autostart` setting is `"1"`, `router_server` is
+    /// started on the persisted `endpoint_port` (default 21128) — the same
+    /// autostart Cockpit's setup hook used to perform. A failure here is
+    /// logged and swallowed rather than propagated: a broken endpoint
+    /// server must not prevent the rest of the daemon (gateways, sessions)
+    /// from coming up.
     pub async fn start(&self) -> anyhow::Result<()> {
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
@@ -115,6 +124,8 @@ impl Daemon {
                     }
                     self.router_handle.abort();
                     self.fanout_handle.abort();
+                    self.scheduler_handle.abort();
+                    self.orch_handle.abort();
                 }
                 return Err(e);
             }
@@ -123,6 +134,28 @@ impl Daemon {
         tokio::spawn(async move {
             let _ = cp.reconcile().await;
         });
+
+        // Endpoint autostart (moved from Cockpit's setup hook).
+        let settings = crate::settings::SettingsStore::new(Arc::clone(&self.store));
+        if settings
+            .get("endpoint_autostart")
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1")
+        {
+            let port: u16 = settings
+                .get("endpoint_port")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(21128);
+            if let Err(e) = self.router_server.start(port).await {
+                eprintln!("[ryuzi] endpoint autostart failed: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -130,8 +163,8 @@ impl Daemon {
     /// failing gateway can't block the rest of the shutdown),
     /// abort the router and approval fan-out broadcast-consumer loops (which
     /// also aborts any in-flight per-approval races the fan-out spawned —
-    /// see `spawn_approval_fanout`), then flush telemetry. A second call is
-    /// a no-op.
+    /// see `spawn_approval_fanout`), abort the scheduler and orch loops, stop
+    /// the endpoint server, then flush telemetry. A second call is a no-op.
     pub async fn stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
@@ -141,6 +174,9 @@ impl Daemon {
         }
         self.router_handle.abort();
         self.fanout_handle.abort();
+        self.scheduler_handle.abort();
+        self.orch_handle.abort();
+        self.router_server.stop().await;
         self.telemetry.shutdown();
     }
 }
@@ -190,15 +226,20 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 }
 
 /// Build order (each stage depends on the previous one):
-/// `Store::open` → settings → telemetry select → `Registries` (installs
-/// `claude_code_plugin` iff `enabled_runtimes` contains `"claude-code"`,
-/// then `opts.extra_harness_factories`) → `ControlPlane::new_with_telemetry`
+/// `Store::open` → settings → telemetry select → `Registries` (always
+/// installs the native plugin, then `install_builtins`, then applies
+/// `opts.harness_factory` if set) → `ControlPlane::new_with_telemetry`
 /// → gateways (from `enabled_gateways` + `extra_gateway_factories` + the
 /// provider catalog) → the outbound `Router` spawned on one `cp.subscribe()`
 /// → a second, inbound-only `Router` handed to every gateway via
 /// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
-/// instances) → the approval fan-out spawned on another `cp.subscribe()`.
-/// One `Arc<Store>` is opened once and cloned throughout — no
+/// instances) → the approval fan-out spawned on another `cp.subscribe()`
+/// → the cron scheduler (`scheduler::spawn_runner`) and orch dispatcher
+/// (`orch::spawn_runner`) loops, spawned here because the daemon is the
+/// single always-on engine host for them (see `Daemon`'s `scheduler_handle`
+/// doc) → the local endpoint server (`RouterServer::new`), constructed but
+/// not started — `Daemon::start()` starts it only if `endpoint_autostart`
+/// is set. One `Arc<Store>` is opened once and cloned throughout — no
 /// `Arc::try_unwrap` reclaiming.
 ///
 /// Telemetry selection: an explicit `opts.telemetry` override always wins;
@@ -229,21 +270,11 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     };
 
     let mut registries = Registries::new();
-    {
-        let settings = SettingsStore::new(Arc::clone(&store));
-        let enabled_runtimes = csv(settings.get("enabled_runtimes").await?.as_deref());
-        if enabled_runtimes.iter().any(|r| r == "claude-code") {
-            let descriptor = (opts.adapter)()?;
-            registries.add_plugin(claude_code_plugin(descriptor));
-        }
-        if enabled_runtimes.iter().any(|r| r == "native") {
-            registries.add_plugin(native_plugin());
-        }
-    }
+    registries.add_plugin(native_plugin());
     crate::plugins::install_builtins(&mut registries);
     crate::plugins::load_skill_pack_plugins(&mut registries);
-    for (id, factory) in opts.extra_harness_factories {
-        registries.harness.register(id, factory);
+    if let Some(factory) = opts.harness_factory {
+        registries.harness = factory;
     }
 
     let cp =
@@ -290,14 +321,24 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let fanout_handle =
         spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), gateways.clone());
 
+    // The daemon is the single always-on engine host: cron scheduler and
+    // orch dispatcher live HERE (moved out of Cockpit). The scheduler's
+    // job_last_fired anchor is single-host-only — never spawn a second one.
+    let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
+    let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
+    let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
+
     Ok(Daemon {
         cp,
         store,
         gateways,
+        router_server,
         telemetry,
         stopped: AtomicBool::new(false),
         router_handle,
         fanout_handle,
+        scheduler_handle,
+        orch_handle,
     })
 }
 
@@ -522,7 +563,7 @@ pub(crate) async fn handle_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project, Session, SessionStatus};
+    use crate::domain::{NewMessage, PermMode, Project, Session, SessionKind, SessionStatus};
     use crate::gateway::MessageRef;
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::telemetry::NoopTelemetry;
@@ -576,7 +617,6 @@ mod tests {
                 name: "demo".into(),
                 workdir: "/tmp/demo".into(),
                 source: None,
-                harness: "claude-code".into(),
                 model: None,
                 effort: None,
                 perm_mode: PermMode::Default,
@@ -597,17 +637,22 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: session_pk.to_string(),
-                project_id: project_id.to_string(),
+                project_id: Some(project_id.to_string()),
                 agent_session_id: None,
                 worktree_path: None,
                 branch: None,
                 title: Some("seed".into()),
                 status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
                 started_by: started_by.map(|s| s.to_string()),
                 created_at: Some(now),
                 last_active: Some(now),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
@@ -769,10 +814,9 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
-            extra_harness_factories: vec![],
+            harness_factory: None,
         })
         .await
         .unwrap();
@@ -961,8 +1005,9 @@ mod tests {
         let gw_b = FakeGateway::new_failing_start("gw-b");
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw_a), Arc::new(gw_b)];
 
-        // Long-running "loops" standing in for the real router/fan-out tasks,
-        // so this test can assert that a failed `start()` aborts them too.
+        // Long-running "loops" standing in for the real router/fan-out/
+        // scheduler/orch tasks, so this test can assert that a failed
+        // `start()` aborts them too.
         let router_handle = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -973,15 +1018,28 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
+        let scheduler_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let orch_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
-            store,
+            store: store.clone(),
             gateways,
+            router_server: Arc::new(RouterServer::new(store)),
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle,
             fanout_handle,
+            scheduler_handle,
+            orch_handle,
         };
 
         let err = daemon.start().await.unwrap_err();
@@ -1004,6 +1062,14 @@ mod tests {
         assert!(
             daemon.fanout_handle.is_finished(),
             "start()'s rollback must abort the fan-out loop"
+        );
+        assert!(
+            daemon.scheduler_handle.is_finished(),
+            "start()'s rollback must abort the scheduler loop"
+        );
+        assert!(
+            daemon.orch_handle.is_finished(),
+            "start()'s rollback must abort the orch loop"
         );
 
         // A later explicit stop() (as `build_and_start` performs on a start
@@ -1099,8 +1165,7 @@ mod tests {
         let (_db_guard, db_path) = temp_db_path();
         let store = Store::open(&db_path).await.unwrap();
         let mut regs = Registries::new();
-        regs.harness
-            .register("native", Arc::new(PermFakeHarnessFactory));
+        regs.harness = Arc::new(PermFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1256,8 +1321,7 @@ mod tests {
         let store = Store::open(&db_path).await.unwrap();
 
         let mut regs = Registries::new();
-        regs.harness
-            .register("native", Arc::new(PlanFakeHarnessFactory));
+        regs.harness = Arc::new(PlanFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1365,12 +1429,9 @@ mod tests {
         let store = Store::open(&db_path).await.unwrap();
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let mut regs = Registries::new();
-        regs.harness.register(
-            "claude-code",
-            Arc::new(ResumeFakeHarnessFactory {
-                prompts: prompts.clone(),
-            }),
-        );
+        regs.harness = Arc::new(ResumeFakeHarnessFactory {
+            prompts: prompts.clone(),
+        });
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
         let store = cp.store().clone();
@@ -1379,29 +1440,37 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                project_id: "p1".into(),
+                project_id: Some("p1".into()),
                 agent_session_id: Some("acp-123".into()),
                 worktree_path: None,
                 branch: None,
                 title: Some("seed".into()),
                 status: SessionStatus::Running,
+                perm_mode: PermMode::Default,
                 started_by: Some("test".into()),
                 created_at: Some(now),
                 last_active: Some(now),
                 resume_attempts: 0,
                 branch_owned: true,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
             })
             .await
             .unwrap();
 
         let daemon = Daemon {
             cp,
-            store,
+            store: store.clone(),
             gateways: vec![],
+            router_server: Arc::new(RouterServer::new(store)),
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            orch_handle: tokio::spawn(async {}),
         };
 
         daemon.start().await.unwrap();
@@ -1437,8 +1506,9 @@ mod tests {
         let stops = gw.stops.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        // Long-running "loops" standing in for the real router/fan-out
-        // tasks, so this test can assert `stop()` actually aborts them.
+        // Long-running "loops" standing in for the real router/fan-out/
+        // scheduler/orch tasks, so this test can assert `stop()` actually
+        // aborts them.
         let router_handle = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -1449,15 +1519,28 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
+        let scheduler_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let orch_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
 
         let daemon = Daemon {
             cp,
-            store,
+            store: store.clone(),
             gateways,
+            router_server: Arc::new(RouterServer::new(store)),
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle,
             fanout_handle,
+            scheduler_handle,
+            orch_handle,
         };
 
         daemon.stop().await;
@@ -1468,7 +1551,7 @@ mod tests {
             1,
             "a second stop() must not re-invoke gateway.stop()"
         );
-        // Give the abort a moment to actually land, then assert both
+        // Give the abort a moment to actually land, then assert all four
         // tracked loops are gone — stop() must not leave them running.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -1478,6 +1561,14 @@ mod tests {
         assert!(
             daemon.fanout_handle.is_finished(),
             "stop() must abort the approval fan-out loop"
+        );
+        assert!(
+            daemon.scheduler_handle.is_finished(),
+            "stop() must abort the scheduler loop"
+        );
+        assert!(
+            daemon.orch_handle.is_finished(),
+            "stop() must abort the orch loop"
         );
     }
 
@@ -1554,10 +1645,9 @@ mod tests {
         // Console silently and still build successfully end-to-end.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: None,
             extra_gateway_factories: vec![],
-            extra_harness_factories: vec![],
+            harness_factory: None,
         })
         .await
         .unwrap();
@@ -1589,10 +1679,9 @@ mod tests {
         // here would be awkward/flaky.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: None,
             extra_gateway_factories: vec![],
-            extra_harness_factories: vec![],
+            harness_factory: None,
         })
         .await
         .unwrap();
@@ -1621,13 +1710,9 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
-            extra_harness_factories: vec![(
-                "claude-code".to_string(),
-                Arc::new(PermFakeHarnessFactory) as Arc<dyn HarnessFactory>,
-            )],
+            harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
         })
         .await
         .unwrap();
@@ -1692,13 +1777,9 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            adapter: Box::new(|| Ok(AcpAdapterDescriptor::default())),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
-            extra_harness_factories: vec![(
-                "claude-code".to_string(),
-                Arc::new(PermFakeHarnessFactory) as Arc<dyn HarnessFactory>,
-            )],
+            harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
         })
         .await
         .unwrap();
@@ -1751,6 +1832,38 @@ mod tests {
                 .any(|m| m.role == "assistant" && m.payload["text"] == "done"),
             "the post-approval assistant row must never appear since nothing resolved the \
              approval: got {msgs:?}"
+        );
+    }
+
+    // ---------- (j) daemon hosts scheduler + orch loops (Task 10) ----------
+
+    #[tokio::test]
+    async fn daemon_hosts_and_stop_aborts_scheduler_and_orch_loops() {
+        let (_guard, db_path) = temp_db_path();
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !daemon.scheduler_handle.is_finished(),
+            "scheduler loop must be live"
+        );
+        assert!(!daemon.orch_handle.is_finished(), "orch loop must be live");
+
+        daemon.stop().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            daemon.scheduler_handle.is_finished(),
+            "stop() must abort the scheduler loop"
+        );
+        assert!(
+            daemon.orch_handle.is_finished(),
+            "stop() must abort the orch loop"
         );
     }
 }

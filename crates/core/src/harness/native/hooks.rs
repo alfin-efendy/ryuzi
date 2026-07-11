@@ -48,13 +48,13 @@ fn hook_scripts(work_dir: &Path, event: &str) -> Vec<PathBuf> {
 pub async fn run(work_dir: &Path, event: &str, payload: &Value) -> HookResult {
     let input = serde_json::to_vec(payload).unwrap_or_default();
     for script in hook_scripts(work_dir, event) {
-        let mut child = match tokio::process::Command::new(&script)
-            .current_dir(work_dir)
+        let mut cmd = tokio::process::Command::new(&script);
+        cmd.current_dir(work_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        crate::process_util::no_window(&mut cmd);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(_) => continue, // not executable / not runnable — skip
         };
