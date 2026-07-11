@@ -45,6 +45,7 @@ pub use domain::{
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
 pub use harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
+pub use orch::OrchTask;
 pub use plugins::{CorePlugin, PluginHost, PluginSource, Registries};
 pub use registry::Registry;
 pub use router::{chunk, ConnectOpts, ConnectOutcome, Router};

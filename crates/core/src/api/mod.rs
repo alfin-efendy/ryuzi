@@ -11,6 +11,7 @@ pub mod fsview_api;
 pub mod gateways_api;
 pub mod learning_api;
 pub mod native_api;
+pub mod orch_api;
 pub mod plugins_api;
 pub mod scheduler_api;
 pub mod session_io_api;
@@ -86,6 +87,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
         m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
+        m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
@@ -115,6 +117,28 @@ pub(crate) mod tests_support {
             cp,
             token: Some("t".into()),
         }
+    }
+
+    /// Like `state()`, but with one connected project (`"p1"`) already in the
+    /// store — for command families (orch, scheduler, ...) whose calls need a
+    /// real `project_id` to validate against.
+    pub(crate) async fn state_with_project() -> ApiState {
+        let s = state().await;
+        s.cp.store()
+            .insert_project(crate::domain::Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        s
     }
 
     /// A no-op `HarnessSession` — the RPC tests that use

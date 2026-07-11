@@ -23,7 +23,8 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// One row of the orchestrated task graph.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct OrchTask {
     pub id: String,
     /// `None` for a root (goal) task.
@@ -714,6 +715,13 @@ fn emit_changed(cp: &Arc<ControlPlane>, task_id: &str, root_id: Option<String>, 
         root_id,
         status: status.to_string(),
     });
+}
+
+/// Emit the `cancelled` changed-event for a root after [`cancel_tree`]. A
+/// thin public wrapper so the orch RPC family (spec §8) can notify Cockpit
+/// without reaching into [`emit_changed`]'s private signature.
+pub fn emit_root_cancelled(cp: &Arc<ControlPlane>, root_id: &str) {
+    emit_changed(cp, root_id, None, "cancelled");
 }
 
 /// What a typed home-chat message did to a live orchestration (spec §8:
