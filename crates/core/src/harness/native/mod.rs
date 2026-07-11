@@ -361,6 +361,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         },

@@ -267,6 +267,7 @@ mod tests {
                 default: None,
             }],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };
@@ -356,6 +357,7 @@ mod tests {
                 default: None,
             }],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };
@@ -467,6 +469,7 @@ mod tests {
                 },
             ],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };

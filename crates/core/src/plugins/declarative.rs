@@ -1241,6 +1241,7 @@ name = "Meta Only"
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         };

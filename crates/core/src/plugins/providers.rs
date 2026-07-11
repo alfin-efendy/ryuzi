@@ -96,6 +96,7 @@ fn provider_plugin(d: &ProviderDescriptor) -> CorePlugin {
             auth: Some(auth_spec(d.auth)),
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: Some(ProviderMeta {
                 format: format_label(d.format).to_string(),

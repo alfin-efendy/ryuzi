@@ -1686,6 +1686,7 @@ mod tests {
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         }

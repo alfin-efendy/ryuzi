@@ -3019,6 +3019,7 @@ fn declarative_test_plugin(id: &str, server_name: &str) -> crate::plugins::CoreP
             url: None,
             headers: std::collections::BTreeMap::new(),
         }],
+        extensions: vec![],
         skills: vec![],
         provider: None,
     };

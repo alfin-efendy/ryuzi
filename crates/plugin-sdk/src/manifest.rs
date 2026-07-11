@@ -56,6 +56,19 @@ pub struct PluginManifest {
     pub settings: Vec<SettingField>,
     #[serde(default)]
     pub mcp: Vec<McpServerDef>,
+    /// Supervised subprocess "code plugin" extensions (Track D). The TOML
+    /// table is the singular `[[extension]]` (matching the design doc and
+    /// the `[[mcp]]`/`[auth]` singular-noun convention), hence the
+    /// `rename`; the Rust field stays plural per `Vec` naming convention.
+    /// Extension names are validated for uniqueness in their own
+    /// namespace, deliberately separate from `mcp` server names: an
+    /// extension and an MCP server are different capability axes wired
+    /// independently by `ryuzi-core`'s `PluginHost`, so a name collision
+    /// between them is not ambiguous and not rejected (mirrors how
+    /// `settings` keys already live in a namespace separate from `mcp`
+    /// names).
+    #[serde(default, rename = "extension")]
+    pub extensions: Vec<ExtensionDef>,
     #[serde(default)]
     pub skills: Vec<SkillDef>,
     #[serde(default)]
@@ -154,6 +167,58 @@ pub enum McpTransportDef {
     Http,
 }
 
+/// The hook events an `[[extension]]` may name in its `events[]` list —
+/// the SDK's own copy of Track C's hook-event vocabulary. The SDK cannot
+/// depend on `ryuzi-core` (see module docs), so this is a hand-kept
+/// duplicate of `ryuzi_core::harness::native::hooks::HookEvent::as_str()`.
+/// **Keep these two lists in sync**: if `HookEvent` gains, renames, or
+/// removes a variant, update this constant in the same change, or
+/// extension manifests will wrongly reject a real event (or silently
+/// accept a dead one that never fires).
+pub const KNOWN_HOOK_EVENTS: &[&str] =
+    &["session.start", "tool.before", "tool.after", "session.end"];
+
+/// Ceiling for `ExtensionDef::timeout_ms`. A gating extension (subscribed
+/// to `tool.before`) blocks the agent for up to this long before the host's
+/// fail-open policy kicks in (Track D runtime, not this slice); anything
+/// larger is almost certainly a manifest typo, not an intentional budget.
+/// Keep in sync with the number in `ManifestError::ExtensionTimeoutOutOfRange`'s
+/// message.
+pub const MAX_EXTENSION_TIMEOUT_MS: u64 = 60_000;
+
+/// One supervised subprocess "code plugin" extension (Track D). Declarative
+/// only in this slice — DT1 adds manifest parsing and validation; the
+/// `ExtensionHost` that actually spawns, supervises, and dispatches
+/// `events[]` to this command is a later Track D slice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionDef {
+    /// Unique within the manifest's `extensions` list (see the field doc on
+    /// `PluginManifest::extensions` for why this namespace is separate from
+    /// `mcp` server names).
+    pub name: String,
+    /// The stdio binary to spawn, or a `${...}` placeholder (`${auth}`,
+    /// `${setting:KEY}`) resolved the same way `McpServerDef::command` is.
+    /// Required and must be non-empty.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Hook events this extension subscribes to. Every entry must be a
+    /// member of [`KNOWN_HOOK_EVENTS`] — unlike unknown `categories`/`slot`
+    /// values (which only warn), an unknown event is a hard `validate()`
+    /// error, because a typo'd event silently never fires rather than
+    /// merely showing an odd label.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// If true, the host queries this extension for tool definitions at
+    /// init and wires them into the session's tool registry.
+    #[serde(default)]
+    pub provides_tools: bool,
+    /// Per-event response budget in milliseconds. When present, must be
+    /// `> 0` and `<= MAX_EXTENSION_TIMEOUT_MS`.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillDef {
     pub name: String,
@@ -207,6 +272,16 @@ pub enum ManifestError {
     SettingOptionsRequireStringKind(String),
     #[error("settings field \"{0}\"'s `default` is not a member of its `options`")]
     SettingDefaultNotInOptions(String),
+    #[error("duplicate extension name: {0}")]
+    DuplicateExtensionName(String),
+    #[error("extension \"{0}\" has an empty command")]
+    ExtensionEmptyCommand(String),
+    #[error("extension \"{0}\" subscribes to unknown hook event \"{1}\"")]
+    ExtensionUnknownEvent(String, String),
+    #[error("extension \"{0}\"'s timeout_ms must be > 0 and <= 60000 (got {1})")]
+    ExtensionTimeoutOutOfRange(String, u64),
+    #[error("extension \"{0}\" references ${{auth}} but the manifest has no [auth] block")]
+    ExtensionAuthPlaceholderWithoutAuth(String),
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -227,6 +302,12 @@ fn contains_auth_placeholder(server: &McpServerDef) -> bool {
             .url
             .as_deref()
             .is_some_and(|u| u.contains(PLACEHOLDER))
+}
+
+fn extension_contains_auth_placeholder(extension: &ExtensionDef) -> bool {
+    const PLACEHOLDER: &str = "${auth}";
+    extension.command.contains(PLACEHOLDER)
+        || extension.args.iter().any(|a| a.contains(PLACEHOLDER))
 }
 
 impl PluginManifest {
@@ -289,6 +370,39 @@ impl PluginManifest {
             if contains_auth_placeholder(server) && self.auth.is_none() {
                 return Err(ManifestError::AuthPlaceholderWithoutAuth(
                     server.name.clone(),
+                ));
+            }
+        }
+
+        let mut seen_extension_names: HashSet<&str> = HashSet::new();
+        for extension in &self.extensions {
+            if !seen_extension_names.insert(extension.name.as_str()) {
+                return Err(ManifestError::DuplicateExtensionName(
+                    extension.name.clone(),
+                ));
+            }
+            if extension.command.trim().is_empty() {
+                return Err(ManifestError::ExtensionEmptyCommand(extension.name.clone()));
+            }
+            for event in &extension.events {
+                if !KNOWN_HOOK_EVENTS.contains(&event.as_str()) {
+                    return Err(ManifestError::ExtensionUnknownEvent(
+                        extension.name.clone(),
+                        event.clone(),
+                    ));
+                }
+            }
+            if let Some(timeout_ms) = extension.timeout_ms {
+                if timeout_ms == 0 || timeout_ms > MAX_EXTENSION_TIMEOUT_MS {
+                    return Err(ManifestError::ExtensionTimeoutOutOfRange(
+                        extension.name.clone(),
+                        timeout_ms,
+                    ));
+                }
+            }
+            if extension_contains_auth_placeholder(extension) && self.auth.is_none() {
+                return Err(ManifestError::ExtensionAuthPlaceholderWithoutAuth(
+                    extension.name.clone(),
                 ));
             }
         }
@@ -822,5 +936,223 @@ slot = "not-a-real-slot"
                 "not-a-real-slot".to_string()
             ]
         );
+    }
+
+    // ---------- extension (Track D, Slice DT1) ----------
+
+    #[test]
+    fn parses_a_valid_extension_declaration() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "my-linter"
+command = "my-linter-ext"
+args = ["--serve"]
+events = ["tool.before", "tool.after"]
+provides_tools = true
+timeout_ms = 5000
+"#,
+        );
+        let manifest = PluginManifest::from_toml(&toml_str).expect("valid extension should parse");
+
+        assert_eq!(manifest.extensions.len(), 1);
+        let extension = &manifest.extensions[0];
+        assert_eq!(extension.name, "my-linter");
+        assert_eq!(extension.command, "my-linter-ext");
+        assert_eq!(extension.args, vec!["--serve".to_string()]);
+        assert_eq!(
+            extension.events,
+            vec!["tool.before".to_string(), "tool.after".to_string()]
+        );
+        assert!(extension.provides_tools);
+        assert_eq!(extension.timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn extension_optional_fields_default_when_omitted() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "bare"
+command = "bare-ext"
+"#,
+        );
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("minimal extension should parse");
+
+        let extension = &manifest.extensions[0];
+        assert!(extension.args.is_empty());
+        assert!(extension.events.is_empty());
+        assert!(!extension.provides_tools);
+        assert_eq!(extension.timeout_ms, None);
+    }
+
+    #[test]
+    fn manifest_without_extensions_still_validates() {
+        let toml_str = minimal_manifest("");
+        let manifest =
+            PluginManifest::from_toml(&toml_str).expect("no extensions should still validate");
+        assert!(manifest.extensions.is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_extension_names() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "dup"
+command = "one"
+
+[[extension]]
+name = "dup"
+command = "two"
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("duplicate extension names should fail validation");
+        assert!(matches!(err, ManifestError::DuplicateExtensionName(name) if name == "dup"));
+    }
+
+    #[test]
+    fn extension_name_may_collide_with_an_mcp_server_name() {
+        // Extensions and MCP servers are separate capability axes wired
+        // independently by ryuzi-core's PluginHost, so they occupy separate
+        // name namespaces within one manifest.
+        let toml_str = minimal_manifest(
+            r#"
+[[mcp]]
+name = "shared"
+transport = "stdio"
+command = "npx"
+
+[[extension]]
+name = "shared"
+command = "shared-ext"
+"#,
+        );
+        let manifest = PluginManifest::from_toml(&toml_str)
+            .expect("extension and mcp server may share a name");
+        assert_eq!(manifest.mcp[0].name, "shared");
+        assert_eq!(manifest.extensions[0].name, "shared");
+    }
+
+    #[test]
+    fn rejects_extension_with_empty_command() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "no-command"
+command = ""
+"#,
+        );
+        let err =
+            PluginManifest::from_toml(&toml_str).expect_err("empty command should fail validation");
+        assert!(matches!(err, ManifestError::ExtensionEmptyCommand(name) if name == "no-command"));
+    }
+
+    #[test]
+    fn rejects_extension_with_unknown_event() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "typo-event"
+command = "ext"
+events = ["tool.before", "tool.beforee"]
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("unknown hook event should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::ExtensionUnknownEvent(name, event)
+                if name == "typo-event" && event == "tool.beforee"
+        ));
+    }
+
+    #[test]
+    fn rejects_extension_timeout_ms_of_zero() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "zero-timeout"
+command = "ext"
+timeout_ms = 0
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("zero timeout_ms should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::ExtensionTimeoutOutOfRange(name, timeout_ms)
+                if name == "zero-timeout" && timeout_ms == 0
+        ));
+    }
+
+    #[test]
+    fn rejects_extension_timeout_ms_above_cap() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "huge-timeout"
+command = "ext"
+timeout_ms = 60001
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("timeout_ms above the cap should fail validation");
+        assert!(matches!(
+            err,
+            ManifestError::ExtensionTimeoutOutOfRange(name, timeout_ms)
+                if name == "huge-timeout" && timeout_ms == 60001
+        ));
+    }
+
+    #[test]
+    fn extension_timeout_ms_at_cap_is_allowed() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "at-cap"
+command = "ext"
+timeout_ms = 60000
+"#,
+        );
+        let manifest = PluginManifest::from_toml(&toml_str)
+            .expect("timeout_ms exactly at the cap should validate");
+        assert_eq!(manifest.extensions[0].timeout_ms, Some(60000));
+    }
+
+    #[test]
+    fn rejects_extension_auth_placeholder_without_auth_block() {
+        let toml_str = minimal_manifest(
+            r#"
+[[extension]]
+name = "needs-auth"
+command = "ext"
+args = ["${auth}"]
+"#,
+        );
+        let err = PluginManifest::from_toml(&toml_str)
+            .expect_err("${auth} without [auth] should fail validation");
+        assert!(
+            matches!(err, ManifestError::ExtensionAuthPlaceholderWithoutAuth(name) if name == "needs-auth")
+        );
+    }
+
+    #[test]
+    fn extension_auth_placeholder_with_auth_block_parses() {
+        let toml_str = minimal_manifest(
+            r#"
+[auth]
+kind = "token"
+
+[[extension]]
+name = "has-auth"
+command = "${auth}"
+"#,
+        );
+        let manifest = PluginManifest::from_toml(&toml_str)
+            .expect("${auth} with an [auth] block should validate");
+        assert_eq!(manifest.extensions[0].command, "${auth}");
     }
 }

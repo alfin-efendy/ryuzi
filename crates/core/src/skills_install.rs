@@ -1540,6 +1540,7 @@ fn generated_plugin_manifest(
         auth: None,
         settings: vec![],
         mcp: vec![],
+        extensions: vec![],
         skills,
         provider: None,
     };

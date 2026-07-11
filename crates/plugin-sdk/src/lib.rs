@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod subst;
 
 pub use manifest::{
-    AuthKind, AuthSpec, FieldKind, ManifestError, McpServerDef, McpTransportDef, ModelDef,
-    PluginManifest, ProviderMeta, SettingField, SkillDef, CONTRACT_VERSION,
+    AuthKind, AuthSpec, ExtensionDef, FieldKind, ManifestError, McpServerDef, McpTransportDef,
+    ModelDef, PluginManifest, ProviderMeta, SettingField, SkillDef, CONTRACT_VERSION,
+    KNOWN_HOOK_EVENTS, MAX_EXTENSION_TIMEOUT_MS,
 };
