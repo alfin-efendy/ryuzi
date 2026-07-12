@@ -13,6 +13,9 @@ use tokio::sync::broadcast;
 /// (Spec 3 wiring) and passed to `Harness::start_session`.
 pub struct SessionCtx {
     pub session_pk: String,
+    /// Temporary Plan 2 identity seam. Plan 4 replaces default selection with
+    /// the session's persisted owner while retaining this boundary.
+    pub main_agent_id: String,
     /// The owning project, if any — `None` for a chat-first (project-less)
     /// session. Mirrors `Session.project_id`; harness backends key
     /// project-scoped features (e.g. the native runtime's persistent memory
@@ -198,6 +201,7 @@ mod tests {
         let (events, _rx) = broadcast::channel(16);
         SessionCtx {
             session_pk: "s1".into(),
+            main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: SessionKind::Chat,
             agent: None,

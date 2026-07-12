@@ -1003,8 +1003,14 @@ impl ControlPlane {
             SessionKind::Project | SessionKind::Chat => Some(self.build_app_control()),
             SessionKind::Worker | SessionKind::Review => None,
         };
+        let main_agent_id = crate::agents::registry::AgentRegistry::default_agent_id_or_builtin(
+            crate::paths::config_dir(),
+            self.store.clone(),
+        )
+        .await;
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
+            main_agent_id,
             project_id: project.map(|p| p.project_id.clone()),
             kind,
             agent,
@@ -1400,7 +1406,6 @@ impl ControlPlane {
         use crate::harness::native::agents::AgentRegistry;
         use crate::harness::native::commands::CommandRegistry;
         use crate::harness::native::context_manager::{ContextConfig, ContextManager};
-        use crate::harness::native::memory::MemoryStore;
         use crate::harness::native::runner::{self, LearningPayload, NudgeState, RunnerDeps};
         use crate::harness::native::steer::SteerBuffer;
         use crate::harness::native::tools::ToolRegistry;
@@ -1470,6 +1475,7 @@ impl ControlPlane {
 
         let deps = RunnerDeps {
             session_pk: review_pk.clone(),
+            main_agent_id: "ryuzi".into(),
             kind: SessionKind::Review,
             work_dir,
             attachments_dir: None,
@@ -1493,7 +1499,7 @@ impl ControlPlane {
             agent: runner::review_agent(payload.system.clone()),
             agents: Arc::new(AgentRegistry::builtin()),
             commands: Arc::new(CommandRegistry::builtin()),
-            memory: Some(Arc::new(MemoryStore::at_default(project_id.as_deref()))),
+            memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
             background: self.background.clone(),

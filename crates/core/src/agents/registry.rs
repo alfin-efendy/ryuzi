@@ -207,6 +207,24 @@ impl AgentRegistry {
         })
     }
 
+    pub async fn default_agent_id(&self) -> String {
+        self.state.read().await.index.default_agent_id.clone()
+    }
+
+    /// Temporary Plan 2 identity seam: the registry's current default agent
+    /// id, falling back to the built-in `ryuzi` id when no registry has been
+    /// bootstrapped yet (fresh installs, bare test states). Plan 4 replaces
+    /// this default selection with the session's persisted owner.
+    pub async fn default_agent_id_or_builtin(
+        config_root: std::path::PathBuf,
+        store: Arc<crate::store::Store>,
+    ) -> String {
+        match AgentRegistry::load(config_root, store).await {
+            Ok(registry) => registry.default_agent_id().await,
+            Err(_) => "ryuzi".to_owned(),
+        }
+    }
+
     pub async fn snapshot(&self) -> AgentRegistrySnapshot {
         let state = self.state.read().await.clone();
         snapshot_from_state(&state)

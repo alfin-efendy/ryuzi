@@ -265,9 +265,13 @@ impl Harness for NativeHarness {
         // without a project — chat sessions have no project to scope a
         // `tool_policies` row to.
         let project_id = ctx.project_id.clone();
-        let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
+        let memory_store = Some(Arc::new(memory::MemoryStore::for_agent(
+            Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+                crate::paths::config_dir(),
+            )),
+            &ctx.main_agent_id,
             project_id.as_deref(),
-        )));
+        )?));
         // One buffer for the session's whole lifetime: cloned into
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
@@ -278,6 +282,7 @@ impl Harness for NativeHarness {
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
+                main_agent_id: ctx.main_agent_id,
                 kind: ctx.kind,
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
@@ -512,6 +517,7 @@ mod tests {
         let (events, _rx) = broadcast::channel(64);
         SessionCtx {
             session_pk: "sess".into(),
+            main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: crate::domain::SessionKind::Chat,
             agent: None,
@@ -683,10 +689,9 @@ mod tests {
     }
 
     /// Redirect `dirs::home_dir()`/`dirs::data_dir()` into a tempdir for the
-    /// duration of a test — `MemoryStore::at_default` resolves under
-    /// `~/.config/ryuzi/memory`, so a test that exercises it for real must
-    /// not touch the developer's actual home directory. Process-global env,
-    /// so every test using this needs `#[serial]` (mirrors
+    /// duration of a test so the agent knowledge bundle resolved below cannot
+    /// touch the developer's actual config directory. Process-global env, so
+    /// every test using this needs `#[serial]` (mirrors
     /// `control::tests::StateDirGuard`).
     struct StateDirGuard {
         _dir: tempfile::TempDir,
@@ -716,13 +721,22 @@ mod tests {
     async fn chat_session_without_a_project_still_gets_global_and_user_memory() {
         use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
         let _guard = StateDirGuard::new();
-        let mem = memory::MemoryStore::at_default(None);
+        let mem = memory::MemoryStore::for_agent(
+            Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+                crate::paths::config_dir(),
+            )),
+            "ryuzi",
+            None,
+        )
+        .unwrap();
         mem.add(
             memory::MemoryScope::Global,
             "the deploy key lives in 1Password",
         )
+        .await
         .unwrap();
         mem.add(memory::MemoryScope::User, "prefers terse answers")
+            .await
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();

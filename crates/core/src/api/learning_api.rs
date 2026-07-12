@@ -6,12 +6,15 @@
 //! (`build_learning_graph`) over their outputs — no new SQL.
 
 use super::{ok, params, ApiError};
+use crate::agents::knowledge::AgentKnowledgeStore;
+use crate::agents::registry::AgentRegistry;
 use crate::api::types::{CuratorStatus, LearningGraph, LearningGraphEdge, LearningGraphNode};
 use crate::domain::SkillUsage;
 use crate::harness::native::memory::{MemoryScope, MemoryStore};
 use crate::serve::ApiState;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub(crate) const HANDLES: &[&str] = &[
     "read_memory",
@@ -62,13 +65,26 @@ struct SetPinnedP {
     pinned: bool,
 }
 
+async fn default_memory(state: &ApiState) -> anyhow::Result<MemoryStore> {
+    let agent_id = AgentRegistry::default_agent_id_or_builtin(
+        crate::paths::config_dir(),
+        state.cp.store().clone(),
+    )
+    .await;
+    MemoryStore::for_agent(
+        Arc::new(AgentKnowledgeStore::new(crate::paths::config_dir())),
+        &agent_id,
+        None,
+    )
+}
+
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
     match method {
         "read_memory" => {
             let a: ScopeP = params(p)?;
             let scope = MemoryScope::parse(&a.scope)?;
-            ok(MemoryStore::at_default(None).load(scope))
+            ok(default_memory(state).await?.load(scope).await?)
         }
         // User-driven edit (the Learning panel, operated by the human) — the
         // storage layer accepts this directly with no `WriteOrigin` gate;
@@ -76,13 +92,13 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "write_memory" => {
             let a: WriteMemoryP = params(p)?;
             let scope = MemoryScope::parse(&a.scope)?;
-            let store = MemoryStore::at_default(None);
+            let store = default_memory(state).await?;
             let text = a.text.as_deref().unwrap_or("");
             let matcher = a.r#match.as_deref().unwrap_or("");
             match a.action.as_str() {
-                "add" => store.add(scope, text)?,
-                "replace" => store.replace(scope, matcher, text)?,
-                "remove" => store.remove(scope, matcher)?,
+                "add" => store.add(scope, text).await?,
+                "replace" => store.replace(scope, matcher, text).await?,
+                "remove" => store.remove(scope, matcher).await?,
                 other => {
                     return Err(ApiError::bad_request(format!(
                         "write_memory: unknown action `{other}` (add|replace|remove)"
@@ -102,9 +118,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "learning_graph" => {
             let skills = cp.store().list_skill_usage().await?;
-            let mem = MemoryStore::at_default(None);
-            let global = mem.load(MemoryScope::Global);
-            let user = mem.load(MemoryScope::User);
+            let mem = default_memory(state).await?;
+            let global = mem.load(MemoryScope::Global).await?;
+            let user = mem.load(MemoryScope::User).await?;
             ok(build_learning_graph(
                 &skills,
                 &[("global", &global), ("user", &user)],
