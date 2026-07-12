@@ -94,6 +94,18 @@ pub struct KnowledgeScan {
     pub invalid: Vec<InvalidKnowledgeConcept>,
 }
 
+/// The file mutations one learning event produces, computed under the
+/// per-agent knowledge lock by [`KnowledgeStore::apply_learning_event`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LearningEventWrites {
+    /// `(relative_path, rendered OKF markdown)` — every document must parse
+    /// and carry the applying event's `event_id` in frontmatter.
+    pub writes: Vec<(String, String)>,
+    /// Concept files to delete; already-missing paths are skipped so a
+    /// replayed event converges instead of failing.
+    pub removes: Vec<String>,
+}
+
 /// Factory handing out per-agent [`KnowledgeStore`]s that share one write
 /// lock per agent id, so all writers created from the same factory
 /// serialize their bundle mutations.
@@ -362,6 +374,71 @@ impl KnowledgeStore {
         let _guard = self.write_lock.lock().await;
         ensure_bundle_at(&self.root)?;
         self.regenerate_indexes_locked()
+    }
+
+    /// Applies one learning event's mutations while holding the per-agent
+    /// lock across the recorded-event-ID check, the write/remove
+    /// application, index regeneration, and the log append. Returns `false`
+    /// (leaving the bundle untouched) when any valid concept already records
+    /// `event_id` in frontmatter — the idempotent replay path. The `plan`
+    /// closure sees the current scan and returns the rendered documents to
+    /// write (each of which must reparse and carry `event_id`) plus the
+    /// concept files to remove.
+    pub async fn apply_learning_event<F>(&self, event_id: &str, plan: F) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&KnowledgeScan) -> anyhow::Result<LearningEventWrites>,
+    {
+        if event_id.trim().is_empty() {
+            bail!("learning event id must not be blank");
+        }
+        let _guard = self.write_lock.lock().await;
+        ensure_bundle_at(&self.root)?;
+        let scan = scan_bundle(&self.root)?;
+        if scan
+            .valid
+            .iter()
+            .any(|concept| concept.event_id.as_deref() == Some(event_id))
+        {
+            return Ok(false);
+        }
+        let writes = plan(&scan)?;
+        for (relative_path, content) in &writes.writes {
+            validate_concept_relative_path(relative_path)?;
+            let concept = parse_concept(relative_path, content)
+                .with_context(|| format!("learning write `{relative_path}` failed to reparse"))?;
+            if concept.event_id.as_deref() != Some(event_id) {
+                bail!("learning write `{relative_path}` does not record event `{event_id}`");
+            }
+        }
+        for relative_path in &writes.removes {
+            validate_concept_relative_path(relative_path)?;
+        }
+        for (relative_path, content) in &writes.writes {
+            let target = self.safe_target(relative_path)?;
+            atomic_write(&target, content.as_bytes())?;
+        }
+        for relative_path in &writes.removes {
+            // A replayed remove converges: an already-missing target is fine.
+            if let Ok(target) = self.safe_existing_path(relative_path) {
+                fs::remove_file(target)?;
+            }
+        }
+        self.regenerate_indexes_locked()?;
+        for (relative_path, _) in &writes.writes {
+            self.append_log(
+                "learning-apply",
+                &concept_id_of(relative_path),
+                relative_path,
+            )?;
+        }
+        for relative_path in &writes.removes {
+            self.append_log(
+                "learning-remove",
+                &concept_id_of(relative_path),
+                relative_path,
+            )?;
+        }
+        Ok(true)
     }
 
     /// Applies every operation or none: the bundle is copied into a staging

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::agents::knowledge::{AgentKnowledgeStore, KnowledgeOperation, KnowledgeStore};
 use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
@@ -14,7 +15,8 @@ pub const BUDGET: usize = 6000;
 /// Display delimiter retained from the original memory prompt contract.
 const DELIM: &str = "\n§\n";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MemoryScope {
     Global,
     User,
@@ -40,7 +42,8 @@ impl MemoryScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum MemoryOperation {
     Add {
         scope: MemoryScope,
