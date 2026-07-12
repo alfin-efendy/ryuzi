@@ -110,7 +110,11 @@ pub async fn save_provider_account_route(
     }
     routes.sort_by_key(|r| r.provider.clone());
     store
-        .set_setting(ACCOUNT_ROUTE_SETTING_KEY, &serde_json::to_string(&routes)?)
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            ACCOUNT_ROUTE_SETTING_KEY,
+            &serde_json::to_string(&routes)?,
+        )
         .await?;
     Ok(next)
 }
@@ -146,7 +150,9 @@ pub(crate) async fn ordered_provider_connection_ids_with_strategy(
         .unwrap_or(0)
         % ids.len();
     let next = (start + 1) % ids.len();
-    store.set_setting(&key, &next.to_string()).await?;
+    store
+        .set_setting(crate::domain::WriteOrigin::User, &key, &next.to_string())
+        .await?;
 
     Ok((
         ids[start..]
@@ -260,7 +266,9 @@ pub async fn ordered_targets(
         .unwrap_or(0)
         % route.targets.len();
     let next = (start + 1) % route.targets.len();
-    store.set_setting(&key, &next.to_string()).await?;
+    store
+        .set_setting(crate::domain::WriteOrigin::User, &key, &next.to_string())
+        .await?;
 
     Ok(route.targets[start..]
         .iter()
@@ -315,7 +323,11 @@ pub(crate) async fn ordered_indexed_targets(
         .unwrap_or(0)
         % indexed.len();
     store
-        .set_setting(&key, &((start + 1) % indexed.len()).to_string())
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            &key,
+            &((start + 1) % indexed.len()).to_string(),
+        )
         .await?;
     Ok(indexed[start..]
         .iter()
@@ -328,7 +340,11 @@ async fn persist_routes(store: &Store, routes: &[ModelRouteInfo]) -> anyhow::Res
     let mut ordered = routes.to_vec();
     ordered.sort_by_key(|r| (r.created_at, r.name.clone()));
     store
-        .set_setting(SETTING_KEY, &serde_json::to_string(&ordered)?)
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            SETTING_KEY,
+            &serde_json::to_string(&ordered)?,
+        )
         .await
 }
 
@@ -416,7 +432,10 @@ mod tests {
     async fn save_preserves_only_matching_stored_compatibility_effort() {
         let store = mem_store().await;
         let raw = r#"[{"id":"r1","name":"smart","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"m1","effort":"high"},{"provider":"openai","model":"m1","effort":"low"}],"createdAt":1,"updatedAt":1}]"#;
-        store.set_setting(SETTING_KEY, raw).await.unwrap();
+        store
+            .set_setting(crate::domain::WriteOrigin::User, SETTING_KEY, raw)
+            .await
+            .unwrap();
 
         let mut incoming = route("smart");
         incoming.targets = vec![

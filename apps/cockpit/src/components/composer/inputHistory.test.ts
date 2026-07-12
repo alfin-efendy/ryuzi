@@ -21,6 +21,8 @@ function row(overrides: Partial<Row>): Row {
     toolExitCode: null,
     toolSummary: null,
     toolSubagent: null,
+    speaker: null,
+    taskId: null,
     ...overrides,
   };
 }

@@ -11,6 +11,14 @@ const SAFE_TOOLS: &[&str] = &[
     // never needs to ask — and they must work inside Plan mode.
     "ExitPlanMode",
     "AskUserQuestion",
+    // App-control reads + clarify (Phase 6): reads are side-effect-free and
+    // Plan-safe; `clarify` blocks on the user's answer, so its execution IS
+    // the prompt (like AskUserQuestion). App-control *writes* stay off this
+    // list so they prompt in Default and can persist an allowAlways grant.
+    "jobs.read",
+    "orch.read",
+    "projects.read",
+    "clarify",
 ];
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
@@ -224,6 +232,36 @@ mod tests {
             decide_tool_permission(PermMode::Default, None, "Bash"),
             PolicyOutcome::Prompt
         );
+    }
+
+    #[test]
+    fn app_read_and_clarify_keys_auto_allow_writes_prompt() {
+        // Reads + clarify auto-allow in Default AND survive Plan mode.
+        for tool in ["jobs.read", "orch.read", "projects.read", "clarify"] {
+            assert_eq!(
+                decide_tool_permission(PermMode::Default, None, tool),
+                PolicyOutcome::AutoAllow,
+                "read/clarify key {tool} must auto-allow"
+            );
+            assert_eq!(
+                decide_tool_permission(PermMode::Plan, None, tool),
+                PolicyOutcome::AutoAllow,
+                "read/clarify key {tool} must be Plan-safe"
+            );
+        }
+        // Writes prompt in Default.
+        for tool in ["jobs.write", "orch.write", "projects.write"] {
+            assert_eq!(
+                decide_tool_permission(PermMode::Default, None, tool),
+                PolicyOutcome::Prompt,
+                "write key {tool} must prompt"
+            );
+            // …and an allowAlways row punches through to AutoAllow next time.
+            assert_eq!(
+                decide_tool_permission(PermMode::Default, Some("allowAlways"), tool),
+                PolicyOutcome::AutoAllow
+            );
+        }
     }
 
     #[test]

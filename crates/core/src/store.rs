@@ -1,6 +1,6 @@
 use crate::domain::{
-    Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session, SessionKind,
-    SessionStatus, Surface, ToolPolicyRow,
+    CuratorRun, Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session,
+    SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -913,12 +913,14 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
-        // Migration 28 — Remote catalog cache. `plugin_catalog_cache` holds the
+        // Migration 28 — Remote catalog cache (origin/main #113).
+        // to the tail here since Phase 4/5/6 also appended #28/#29/#30).
+        // `plugin_catalog_cache` holds the
         // entries of the last verified signed feed (id, manifest TOML, semver,
         // feed sequence, blocked flag+reason); `catalog_feed_state` is a single
         // KV row tracking the last-accepted sequence + fetch outcome for
-        // anti-rollback and status. Appended as the tail after main's migration
-        // 27 (background rail). IF NOT EXISTS: the rewind-and-replay test re-runs
+        // anti-rollback and status. Appended as the tail after migration 30
+        // (Phase 6 audit columns). IF NOT EXISTS: the rewind-and-replay test re-runs
         // this on an already-migrated DB, so it must be a no-op on replay.
         M::up(
             "CREATE TABLE IF NOT EXISTS plugin_catalog_cache (\
@@ -983,6 +985,162 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // Migration 31 — Phase 4 self-learning (spec §4/§7): cross-session
+        // recall (messages_fts + sync triggers), skill telemetry, and curator
+        // lifecycle state. All statements existence-guarded so the
+        // rewind-and-replay migration tests re-run this as a no-op.
+        // messages_fts is a standalone (not external-content) FTS5 table:
+        // `messages` has a COMPOSITE PK (session_pk, seq) and no stable integer
+        // rowid, so triggers key on that pair and store it UNINDEXED.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            // NOTE: this string uses Rust backslash line-continuation, which
+            // deletes both the newline AND the following indentation — the
+            // whole statement list becomes ONE line with no embedded `\n`.
+            // Every continued line therefore ends with an explicit trailing
+            // space (so keywords/identifiers never fuse, e.g. `messages` +
+            // `WHEN` would otherwise merge into `messagesWHEN`), and any
+            // explanatory text uses `/* */` block comments rather than `--`
+            // line comments — a `--` comment has no real newline to stop at
+            // here, so it would silently swallow every statement after it.
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5( \
+                    text, \
+                    session_pk UNINDEXED, \
+                    seq UNINDEXED, \
+                    tokenize = 'porter unicode61' \
+                 ); \
+                 /* Only user/assistant TEXT blocks are searchable; tool calls, \
+                    results, notices, and thinking are excluded. payload is a \
+                    JSON string, so pull the body with json_extract (JSON1 is \
+                    in the bundled amalgamation). */ \
+                 CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages \
+                 WHEN new.role IN ('user','assistant') AND new.block_type='text' \
+                      AND json_extract(new.payload,'$.text') IS NOT NULL \
+                 BEGIN \
+                     INSERT INTO messages_fts(text, session_pk, seq) \
+                     VALUES (json_extract(new.payload,'$.text'), new.session_pk, new.seq); \
+                 END; \
+                 /* messages text is immutable once written (append-only \
+                    ledger; only status/tool_kind mutate, never text), so no \
+                    AFTER UPDATE trigger is needed. DELETE keeps the index \
+                    consistent when a session is purged. */ \
+                 CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages \
+                 BEGIN \
+                     DELETE FROM messages_fts \
+                     WHERE session_pk = old.session_pk AND seq = old.seq; \
+                 END; \
+                 CREATE TABLE IF NOT EXISTS skill_usage ( \
+                     name TEXT PRIMARY KEY NOT NULL, \
+                     created_by TEXT, \
+                     use_count INTEGER NOT NULL DEFAULT 0, \
+                     view_count INTEGER NOT NULL DEFAULT 0, \
+                     patch_count INTEGER NOT NULL DEFAULT 0, \
+                     last_used_at INTEGER, \
+                     last_viewed_at INTEGER, \
+                     last_patched_at INTEGER, \
+                     state TEXT NOT NULL DEFAULT 'active', \
+                     pinned INTEGER NOT NULL DEFAULT 0, \
+                     archived_at INTEGER, \
+                     created_at INTEGER NOT NULL \
+                 ); \
+                 CREATE TABLE IF NOT EXISTS curator_state ( \
+                     id INTEGER PRIMARY KEY CHECK (id = 1), \
+                     last_run_at INTEGER, \
+                     last_run_id TEXT \
+                 ); \
+                 CREATE TABLE IF NOT EXISTS curator_runs ( \
+                     id TEXT PRIMARY KEY NOT NULL, \
+                     started_at INTEGER NOT NULL, \
+                     finished_at INTEGER, \
+                     status TEXT NOT NULL, \
+                     transitioned INTEGER NOT NULL DEFAULT 0, \
+                     consolidated INTEGER NOT NULL DEFAULT 0, \
+                     snapshot_path TEXT, \
+                     error TEXT, \
+                     log TEXT \
+                 );",
+            )?;
+            Ok(())
+        }),
+        // 32: group-chat orchestration. `messages.speaker` (Phase 2 added
+        // `speaker` only to `sessions`, never `messages`); `orch_tasks` gains
+        // its home-chat binding, per-child circuit-breaker counters, and the
+        // root's accumulated steer note. All additive columns — plain ALTERs,
+        // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
+        // this migration on a DB that already has the columns (e.g. the
+        // rewind-and-replay in `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
+        // which re-runs every migration appended after 13) is a no-op
+        // instead of a "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_messages_speaker = tx
+                .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='speaker'")?
+                .exists([])?;
+            if !has_messages_speaker {
+                tx.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", [])?;
+            }
+            let has_home_session_pk = tx
+                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='home_session_pk'")?
+                .exists([])?;
+            if !has_home_session_pk {
+                tx.execute(
+                    "ALTER TABLE orch_tasks ADD COLUMN home_session_pk TEXT",
+                    [],
+                )?;
+            }
+            let has_consecutive_failures = tx
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='consecutive_failures'",
+                )?
+                .exists([])?;
+            if !has_consecutive_failures {
+                tx.execute(
+                    "ALTER TABLE orch_tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            let has_gave_up = tx
+                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='gave_up'")?
+                .exists([])?;
+            if !has_gave_up {
+                tx.execute(
+                    "ALTER TABLE orch_tasks ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            let has_steer_note = tx
+                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='steer_note'")?
+                .exists([])?;
+            if !has_steer_note {
+                tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+            }
+            Ok(())
+        }),
+        // 33: app-control audit needs to record the initiating session and
+        // the WriteOrigin. The `audit` table has existed (writerless) since
+        // an early migration; these two nullable columns let Phase 6 write
+        // app-control rows without overloading the gateway-oriented
+        // `gateway`/`conversation_id` columns. Additive columns — plain
+        // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
+        // replaying this migration on a DB that already has the columns
+        // (e.g. the rewind-and-replay in
+        // `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
+        // which re-runs every migration appended after 13) is a no-op
+        // instead of a "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_session_pk = tx
+                .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name='session_pk'")?
+                .exists([])?;
+            if !has_session_pk {
+                tx.execute("ALTER TABLE audit ADD COLUMN session_pk TEXT", [])?;
+            }
+            let has_origin = tx
+                .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name='origin'")?
+                .exists([])?;
+            if !has_origin {
+                tx.execute("ALTER TABLE audit ADD COLUMN origin TEXT", [])?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -994,6 +1152,21 @@ pub struct Store {
 pub struct SessionRuntimeSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+/// One `messages_fts` match, joined against its owning session — the unit
+/// the `session_search` native tool's DISCOVERY action returns, and (Task
+/// 11) the `search_sessions` RPC method's response for the Cockpit Learning
+/// panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FtsHit {
+    pub session_pk: String,
+    pub seq: i64,
+    pub snippet: String,
+    pub title: Option<String>,
+    pub kind: String,
+    pub created_at: i64,
 }
 
 /// One durable compaction checkpoint: the replacement history that stands in
@@ -1109,6 +1282,40 @@ fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
         last_attach_at: r.get(1)?,
         outcome: r.get(2)?,
         reason: r.get(3)?,
+    })
+}
+
+const SKILL_USAGE_COLS: &str = "name, created_by, use_count, view_count, patch_count, \
+     last_used_at, last_viewed_at, last_patched_at, state, pinned, archived_at, created_at";
+
+fn map_skill_usage_row(r: &Row) -> rusqlite::Result<SkillUsage> {
+    Ok(SkillUsage {
+        name: r.get(0)?,
+        created_by: r.get(1)?,
+        use_count: r.get(2)?,
+        view_count: r.get(3)?,
+        patch_count: r.get(4)?,
+        last_used_at: r.get(5)?,
+        last_viewed_at: r.get(6)?,
+        last_patched_at: r.get(7)?,
+        state: r.get(8)?,
+        pinned: r.get::<_, i64>(9)? != 0,
+        archived_at: r.get(10)?,
+        created_at: r.get(11)?,
+    })
+}
+
+fn map_curator_run_row(r: &Row) -> rusqlite::Result<CuratorRun> {
+    Ok(CuratorRun {
+        id: r.get(0)?,
+        started_at: r.get(1)?,
+        finished_at: r.get(2)?,
+        status: r.get(3)?,
+        transitioned: r.get(4)?,
+        consolidated: r.get::<_, i64>(5)? != 0,
+        snapshot_path: r.get(6)?,
+        error: r.get(7)?,
+        log: r.get(8)?,
     })
 }
 
@@ -1319,6 +1526,26 @@ where
     Ok(out)
 }
 
+/// Refuse a protected write from a non-user origin. This is the storage-layer
+/// half of Phase 6's negative space (spec §9.3): the curated app-control
+/// surface never exposes these writes, and this guard stops any tool that
+/// reaches `Store` directly from performing them.
+///
+/// `rusqlite::Error::UserFunctionError`/`ModuleError` need the `functions`/
+/// `vtab` features this workspace doesn't enable, so — like
+/// `to_sql_json_error` above — this reuses `ToSqlConversionFailure` (always
+/// available, and `String` already satisfies its boxed-error bound) purely
+/// as a carrier for an app-level message.
+fn ensure_user_origin(origin: crate::domain::WriteOrigin, what: &str) -> rusqlite::Result<()> {
+    if !origin.is_user() {
+        return Err(to_sql_json_error(format!(
+            "write to {what} is not permitted for {} origin (app-control negative space)",
+            origin.as_str()
+        )));
+    }
+    Ok(())
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Store> {
         if let Some(parent) = path.parent() {
@@ -1371,10 +1598,16 @@ impl Store {
         .await
     }
 
-    pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+    pub async fn set_setting(
+        &self,
+        origin: crate::domain::WriteOrigin,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
         let key = key.to_string();
         let value = value.to_string();
         self.with_conn(move |c| {
+            ensure_user_origin(origin, "settings")?;
             c.execute(
                 "INSERT INTO settings(key, value) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1893,6 +2126,24 @@ impl Store {
         .await
     }
 
+    /// Bind a session to a project — the persistence half of `app_projects`'s
+    /// "attach" action (Phase 6 spec §9.1). Only the `project_id` column
+    /// changes; workspace/branch/worktree are left as-is (a chat session has
+    /// none, and a live session's already-built `RunnerDeps.project_id` does
+    /// not hot-reload — this only affects a fresh start/resume).
+    pub async fn set_session_project(&self, pk: &str, project_id: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        let project_id = project_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET project_id=?2 WHERE session_pk=?1",
+                params![pk, project_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     pub async fn update_agent_session_id(
         &self,
         pk: &str,
@@ -1915,12 +2166,12 @@ impl Store {
         let created = now_ms();
         self.with_conn(move |c| {
             c.query_row(
-                "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at) \
-                 SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+                "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker) \
+                 SELECT ?1, COALESCE(MAX(seq),0)+1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
                  FROM messages WHERE session_pk=?1 \
                  RETURNING seq",
                 params![m.session_pk, m.role, m.block_type, payload,
-                        m.tool_call_id, m.status, m.tool_kind, created],
+                        m.tool_call_id, m.status, m.tool_kind, created, m.speaker],
                 |r| r.get::<_, i64>(0),
             )
         })
@@ -2024,6 +2275,7 @@ impl Store {
                         status: None,
                         tool_kind: None,
                         created_at,
+                        speaker: None,
                     })
                 })
                 .transpose()?;
@@ -2061,7 +2313,7 @@ impl Store {
         let session_pk = session_pk.to_string();
         self.with_conn(move |c| -> rusqlite::Result<Vec<Message>> {
             let mut stmt = c.prepare(
-                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at \
+                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker \
                  FROM messages WHERE session_pk=?1 ORDER BY seq",
             )?;
             let items = stmt
@@ -2079,12 +2331,131 @@ impl Store {
                         status: r.get(6)?,
                         tool_kind: r.get(7)?,
                         created_at: r.get(8)?,
+                        speaker: r.get(9)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
         .await
+    }
+
+    /// Resolve `pk`'s lineage root: walk `parent_session_pk` up to the
+    /// session with no parent. Used to exclude the CALLING session's own
+    /// lineage from `session_search` recall — a session should never
+    /// "discover" the very conversation it's part of. Empty when `pk` is
+    /// unknown (nothing to exclude).
+    pub async fn lineage_of(&self, pk: &str) -> anyhow::Result<Vec<String>> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<String>> {
+            let root: Option<String> = c
+                .query_row(
+                    "WITH RECURSIVE up(pk, parent) AS ( \
+                       SELECT session_pk, parent_session_pk FROM sessions WHERE session_pk=?1 \
+                       UNION ALL \
+                       SELECT s.session_pk, s.parent_session_pk FROM sessions s \
+                       JOIN up ON s.session_pk = up.parent) \
+                     SELECT pk FROM up WHERE parent IS NULL LIMIT 1",
+                    [&pk],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(root.into_iter().collect())
+        })
+        .await
+    }
+
+    /// DISCOVERY over `messages_fts` for the `session_search` native tool
+    /// (spec §7.4): match `query`, join `sessions` for title/kind, exclude
+    /// worker/review sessions (internal delegation noise) and any hit whose
+    /// lineage root is in `exclude_lineage` (the caller's own conversation),
+    /// dedup remaining hits by lineage root (one hit per past conversation),
+    /// and rank interactive-origin sessions above scheduler/orch-started
+    /// ones.
+    ///
+    /// `query` is always passed as a bound parameter — never interpolated
+    /// into the SQL — so it cannot inject outer-SQL syntax. It IS still
+    /// parsed as an FTS5 query expression by SQLite itself; a malformed
+    /// expression (e.g. an unterminated quote) surfaces as an `Err` here,
+    /// which the `session_search` tool turns into a clean tool-result error
+    /// instead of panicking.
+    pub async fn search_messages_fts(
+        &self,
+        query: &str,
+        exclude_lineage: &[String],
+        limit: i64,
+    ) -> anyhow::Result<Vec<FtsHit>> {
+        let query = query.to_string();
+        let exclude: std::collections::HashSet<String> = exclude_lineage.iter().cloned().collect();
+        self.with_conn(move |c| -> rusqlite::Result<Vec<FtsHit>> {
+            let mut stmt = c.prepare(
+                "SELECT f.session_pk, f.seq, \
+                        snippet(messages_fts, 0, '[', ']', ' … ', 12) AS snip, \
+                        s.title, s.kind, s.started_by, m.created_at \
+                 FROM messages_fts f \
+                 JOIN sessions s ON s.session_pk = f.session_pk \
+                 JOIN messages m ON m.session_pk = f.session_pk AND m.seq = f.seq \
+                 WHERE messages_fts MATCH ?1 \
+                   AND s.kind NOT IN ('worker','review') \
+                 ORDER BY (s.started_by IN ('scheduler','orch')) ASC, \
+                          m.created_at DESC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![query, limit], |r| {
+                Ok(FtsHit {
+                    session_pk: r.get(0)?,
+                    seq: r.get(1)?,
+                    snippet: r.get(2)?,
+                    title: r.get(3)?,
+                    kind: r.get(4)?,
+                    created_at: r.get(6)?,
+                })
+            })?;
+            // Lineage-dedup: collapse each lineage to its single best (most
+            // recent) hit and drop anything in the caller's own lineage.
+            let mut seen_roots = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for hit in rows {
+                let hit = hit?;
+                let root: String = c
+                    .query_row(
+                        "WITH RECURSIVE up(pk, parent) AS ( \
+                           SELECT session_pk, parent_session_pk FROM sessions WHERE session_pk=?1 \
+                           UNION ALL \
+                           SELECT s.session_pk, s.parent_session_pk FROM sessions s \
+                           JOIN up ON s.session_pk = up.parent) \
+                         SELECT pk FROM up WHERE parent IS NULL LIMIT 1",
+                        [&hit.session_pk],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| hit.session_pk.clone());
+                if exclude.contains(&root) || !seen_roots.insert(root) {
+                    continue;
+                }
+                out.push(hit);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// A `±radius`-message window around `seq` in session `pk`'s ledger, for
+    /// the `session_search` tool's `read` action. Reuses `list_messages`
+    /// (already ordered by seq) and slices in memory — recall windows are
+    /// small and infrequent, so a second indexed query isn't worth it.
+    pub async fn messages_window(
+        &self,
+        pk: &str,
+        seq: i64,
+        radius: i64,
+    ) -> anyhow::Result<Vec<Message>> {
+        let all = self.list_messages(pk).await?;
+        let lo = seq.saturating_sub(radius);
+        let hi = seq.saturating_add(radius);
+        Ok(all
+            .into_iter()
+            .filter(|m| m.seq >= lo && m.seq <= hi)
+            .collect())
     }
 
     /// Append one message to the native runtime's provider-turn ledger,
@@ -2286,6 +2657,7 @@ impl Store {
     /// On conflict (same project+tool already has a policy), update the decision.
     pub async fn set_tool_policy(
         &self,
+        origin: crate::domain::WriteOrigin,
         project_id: &str,
         tool: &str,
         decision: &str,
@@ -2294,6 +2666,7 @@ impl Store {
         let tool = tool.to_string();
         let decision = decision.to_string();
         self.with_conn(move |c| {
+            ensure_user_origin(origin, "tool_policies")?;
             c.execute(
                 "INSERT INTO tool_policies(project_id, tool, decision) \
                  VALUES (?1, ?2, ?3) \
@@ -2327,10 +2700,16 @@ impl Store {
     }
 
     /// Remove one persisted tool policy (the Settings "revoke" action).
-    pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
+    pub async fn delete_tool_policy(
+        &self,
+        origin: crate::domain::WriteOrigin,
+        project_id: &str,
+        tool: &str,
+    ) -> anyhow::Result<()> {
         let project_id = project_id.to_string();
         let tool = tool.to_string();
         self.with_conn(move |c| {
+            ensure_user_origin(origin, "tool_policies")?;
             c.execute(
                 "DELETE FROM tool_policies WHERE project_id=?1 AND tool=?2",
                 params![project_id, tool],
@@ -2338,6 +2717,62 @@ impl Store {
         })
         .await?;
         Ok(())
+    }
+
+    /// Record one app-control mutation. `actor` and `origin` both carry the
+    /// `WriteOrigin` string (the legacy `actor` column stays populated for the
+    /// gateway-audit tooling; `origin` is the Phase-6 column). This accepts
+    /// any origin — it records who acted, it is not a guarded setter like
+    /// `set_tool_policy`. Reads are never audited — only mutations call this.
+    pub async fn record_audit(
+        &self,
+        origin: crate::domain::WriteOrigin,
+        session_pk: Option<&str>,
+        tool: &str,
+        action: &str,
+        decision: &str,
+    ) -> anyhow::Result<()> {
+        let origin_s = origin.as_str().to_string();
+        let session_pk = session_pk.map(|s| s.to_string());
+        let tool = tool.to_string();
+        let action = action.to_string();
+        let decision = decision.to_string();
+        let at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO audit(actor, action, tool, decision, at, session_pk, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![origin_s, action, tool, decision, at, session_pk, origin_s],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// The most recent `limit` app-control audit rows, newest first.
+    pub async fn list_audit(&self, limit: u32) -> anyhow::Result<Vec<crate::domain::AuditRow>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, tool, action, decision, \
+                        COALESCE(origin, actor, 'user') AS origin, session_pk, at \
+                 FROM audit ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit], |r| {
+                    Ok(crate::domain::AuditRow {
+                        id: r.get(0)?,
+                        tool: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        action: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        decision: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        origin: r.get(4)?,
+                        session_pk: r.get(5)?,
+                        at: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Merge `patch` into the tool_call row's payload (SQLite `json_patch`,
@@ -2456,6 +2891,12 @@ impl Store {
     /// session is IDLE (the idle-only invariant, spec §6.1). Returns `None`
     /// when nothing is deliverable. The claim + read run in one transaction so
     /// two drainers never claim the same row.
+    ///
+    /// Excludes `kind='learning'` rows (spec §3.1/§7.2 rail split): a
+    /// learning fork is never delivered as a chat user turn — it is claimed
+    /// separately by [`Store::claim_learning_event`] and driven by the
+    /// dedicated learning worker (`learning.rs`), never by this generic
+    /// drainer.
     pub async fn claim_deliverable_background_event(
         &self,
         claimer: &str,
@@ -2468,8 +2909,63 @@ impl Store {
                     "SELECT be.id FROM background_events be \
                      JOIN sessions s ON s.session_pk = be.target_session_pk \
                      WHERE be.delivered_at IS NULL AND be.claimed_by IS NULL \
+                       AND be.kind != 'learning' \
                        AND s.status = 'idle' \
                      ORDER BY be.created_at ASC LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(id) = picked else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE background_events SET claimed_by = ?2 WHERE id = ?1",
+                params![id, claimer],
+            )?;
+            let row = tx.query_row(
+                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                 FROM background_events WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(crate::domain::BackgroundEvent {
+                        id: r.get(0)?,
+                        target_session_pk: r.get(1)?,
+                        kind: r.get(2)?,
+                        payload: r.get(3)?,
+                        created_at: r.get(4)?,
+                        claimed_by: r.get(5)?,
+                        delivered_at: r.get(6)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Atomically claim the OLDEST undelivered, unclaimed `kind='learning'`
+    /// row (spec §3.1/§7.2), for the dedicated learning worker
+    /// (`learning.rs`) — the counterpart to
+    /// [`Store::claim_deliverable_background_event`], which excludes these
+    /// rows. Deliberately has NO idle-target filter: a learning fork drives
+    /// an isolated review session, not the target chat's turn, so it must
+    /// run regardless of whether the parent chat is idle or mid-turn. The
+    /// claim + read run in one transaction so two learning workers never
+    /// claim the same row.
+    pub async fn claim_learning_event(
+        &self,
+        claimer: &str,
+    ) -> anyhow::Result<Option<crate::domain::BackgroundEvent>> {
+        let claimer = claimer.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let picked: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM background_events \
+                     WHERE kind = 'learning' AND delivered_at IS NULL AND claimed_by IS NULL \
+                     ORDER BY created_at ASC LIMIT 1",
                     [],
                     |r| r.get::<_, String>(0),
                 )
@@ -3087,6 +3583,271 @@ impl Store {
         .await
     }
 
+    /// Bump `deploy`'s use counter and `last_used_at` — recorded on every
+    /// successful `skill_manage` USE action (Task 6).
+    pub async fn record_skill_use(&self, name: &str) -> anyhow::Result<()> {
+        self.bump_skill_counter(name, "use_count", "last_used_at")
+            .await
+    }
+
+    /// Bump the view counter — recorded when a skill's body is read (e.g. the
+    /// `skill` discovery tool), independent of whether it is later used.
+    pub async fn record_skill_view(&self, name: &str) -> anyhow::Result<()> {
+        self.bump_skill_counter(name, "view_count", "last_viewed_at")
+            .await
+    }
+
+    /// Bump the patch counter — recorded on every `skill_manage` PATCH
+    /// action, feeding the curator's (Task 10) edit-frequency heuristics.
+    pub async fn record_skill_patch(&self, name: &str) -> anyhow::Result<()> {
+        self.bump_skill_counter(name, "patch_count", "last_patched_at")
+            .await
+    }
+
+    /// Upsert-increment one `skill_usage` counter column and stamp its
+    /// paired timestamp column. `count_col`/`ts_col` are internal constants
+    /// supplied only by the three `record_skill_*` wrappers above, never
+    /// user input — safe to interpolate into the SQL text.
+    async fn bump_skill_counter(
+        &self,
+        name: &str,
+        count_col: &str,
+        ts_col: &str,
+    ) -> anyhow::Result<()> {
+        let (name, now) = (name.to_string(), now_ms());
+        let sql = format!(
+            "INSERT INTO skill_usage(name, {count_col}, {ts_col}, created_at) \
+                 VALUES (?1, 1, ?2, ?2) \
+             ON CONFLICT(name) DO UPDATE SET \
+                 {count_col} = {count_col} + 1, {ts_col} = ?2",
+        );
+        self.with_conn(move |c| c.execute(&sql, params![name, now]).map(|_| ()))
+            .await
+    }
+
+    /// Transition a skill's lifecycle state (e.g. `active` → `stale` →
+    /// `archived`), driven by the curator (Task 10). `archived_at` is
+    /// typically `Some(now)` only for the `archived` transition.
+    pub async fn set_skill_state(
+        &self,
+        name: &str,
+        state: &str,
+        archived_at: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let (name, state, now) = (name.to_string(), state.to_string(), now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO skill_usage(name, state, archived_at, created_at) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(name) DO UPDATE SET \
+                     state=excluded.state, archived_at=excluded.archived_at",
+                params![name, state, archived_at, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Pin/unpin a skill — a pinned skill is exempt from curator archival
+    /// regardless of staleness.
+    pub async fn set_skill_pinned(&self, name: &str, pinned: bool) -> anyhow::Result<()> {
+        let (name, now) = (name.to_string(), now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO skill_usage(name, pinned, created_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET pinned=excluded.pinned",
+                params![name, pinned as i64, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Record that a skill was authored by an autonomous agent turn rather
+    /// than a human (Tasks 8/9 review-fork provenance).
+    pub async fn mark_skill_created_by_agent(&self, name: &str) -> anyhow::Result<()> {
+        let (name, now) = (name.to_string(), now_ms());
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO skill_usage(name, created_by, created_at) \
+                     VALUES (?1, 'agent', ?2) \
+                 ON CONFLICT(name) DO UPDATE SET created_by='agent'",
+                params![name, now],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_skill_usage(&self, name: &str) -> anyhow::Result<Option<SkillUsage>> {
+        let name = name.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {SKILL_USAGE_COLS} FROM skill_usage WHERE name=?1"),
+                params![name],
+                map_skill_usage_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// All tracked skills, ordered by name — the curator's (Task 10) and the
+    /// Cockpit Learning panel's (Task 11) full-sweep read.
+    pub async fn list_skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SKILL_USAGE_COLS} FROM skill_usage ORDER BY name"
+            ))?;
+            let rows = stmt
+                .query_map([], map_skill_usage_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// The curator's (Task 10) last completed-or-started run timestamp, or
+    /// `None` if it has never run. `curator_state` is a singleton row
+    /// (`id=1`); `curator::tick`'s weekly-cadence gate reads this before
+    /// deciding whether a sweep is due.
+    pub async fn curator_last_run(&self) -> anyhow::Result<Option<i64>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT last_run_at FROM curator_state WHERE id=1",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+        })
+        .await
+    }
+
+    /// Open a new `curator_runs` row (`status='running'`) and stamp
+    /// `curator_state.last_run_at`/`last_run_id` to it in the same call —
+    /// the write `curator_last_run` observes, so a second daemon boot within
+    /// the same interval can't double-start a sweep.
+    pub async fn insert_curator_run(&self, id: &str, started_at: i64) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO curator_runs(id, started_at, status) VALUES (?1, ?2, 'running')",
+                params![id, started_at],
+            )?;
+            c.execute(
+                "INSERT INTO curator_state(id, last_run_at, last_run_id) VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                     last_run_at=excluded.last_run_at, last_run_id=excluded.last_run_id",
+                params![started_at, id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Close out a `curator_runs` row: final `status` (`"ok"`/`"error"`), how
+    /// many skills the deterministic planner transitioned, whether the
+    /// opt-in consolidation pass ran, its pre-mutation snapshot path (if it
+    /// did), and an error message on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_curator_run(
+        &self,
+        id: &str,
+        finished_at: i64,
+        status: &str,
+        transitioned: i64,
+        consolidated: bool,
+        snapshot_path: Option<&str>,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (id, status, snapshot_path, error) = (
+            id.to_string(),
+            status.to_string(),
+            snapshot_path.map(str::to_string),
+            error.map(str::to_string),
+        );
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE curator_runs SET finished_at=?1, status=?2, transitioned=?3, \
+                     consolidated=?4, snapshot_path=?5, error=?6 WHERE id=?7",
+                params![
+                    finished_at,
+                    status,
+                    transitioned,
+                    consolidated as i64,
+                    snapshot_path,
+                    error,
+                    id,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Most recent `curator_runs` rows, newest first — the Cockpit Learning
+    /// panel's (Task 11) history view.
+    pub async fn list_curator_runs(&self, limit: i64) -> anyhow::Result<Vec<CuratorRun>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, started_at, finished_at, status, transitioned, consolidated, \
+                     snapshot_path, error, log \
+                 FROM curator_runs ORDER BY started_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit], map_curator_run_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Record a worker child's failure and decide retry vs. give-up. Increments
+    /// `consecutive_failures`; if it stays `<= max_retries` the child re-queues
+    /// (`todo`, cleared outcome) for another attempt; otherwise the breaker
+    /// trips (`gave_up=1`, `failed`). Only affects a `running` child.
+    pub async fn record_child_failure(
+        &self,
+        id: &str,
+        max_retries: i64,
+    ) -> anyhow::Result<crate::domain::ChildFailure> {
+        let id = id.to_string();
+        let now = crate::paths::now_ms();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let n: i64 = tx
+                .query_row(
+                    "SELECT consecutive_failures FROM orch_tasks WHERE id=?1 AND status='running'",
+                    params![id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+                + 1;
+            let gave_up = n > max_retries;
+            if gave_up {
+                tx.execute(
+                    "UPDATE orch_tasks SET status='failed', gave_up=1, \
+                     consecutive_failures=?2, finished_at=?3 WHERE id=?1",
+                    params![id, n, now],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE orch_tasks SET status='todo', consecutive_failures=?2, \
+                     session_pk=NULL, error=NULL, result=NULL, finished_at=NULL WHERE id=?1",
+                    params![id, n],
+                )?;
+            }
+            tx.commit()?;
+            Ok(crate::domain::ChildFailure {
+                requeued: !gave_up,
+                gave_up,
+            })
+        })
+        .await
+    }
+
     /// Replace the entire cached remote catalog with `rows` in one
     /// transaction. Called after a signed feed fetch verifies successfully;
     /// an empty slice clears the cache.
@@ -3111,6 +3872,29 @@ impl Store {
                 )?;
             }
             tx.commit()
+        })
+        .await
+    }
+
+    /// The orch task whose worker (or judge) session is `session_pk`, if any.
+    /// The `orch_block` tool's runtime guard (Task E6, spec §8): a session
+    /// with no matching row here is not an orchestrated worker turn, so the
+    /// tool refuses regardless of what the schema-level gate advertised.
+    pub async fn task_by_session(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM orch_tasks WHERE session_pk=?1",
+                    crate::orch::ORCH_COLS
+                ),
+                params![session_pk],
+                crate::orch::task_from,
+            )
+            .optional()
         })
         .await
     }
@@ -3166,6 +3950,44 @@ impl Store {
                 },
             )
             .optional()
+        })
+        .await
+    }
+
+    /// A non-terminal root bound to `home_session_pk` (the live orchestration a
+    /// typed steer targets), if any.
+    pub async fn live_root_for_home(
+        &self,
+        home_session_pk: &str,
+    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
+        let home = home_session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM orch_tasks WHERE root_id IS NULL AND home_session_pk=?1 \
+                     AND status IN ('decomposing','waiting','judging') ORDER BY created_at DESC LIMIT 1",
+                    crate::orch::ORCH_COLS
+                ),
+                params![home],
+                crate::orch::task_from,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Append a mid-run user directive to a root's steer note (newline-joined).
+    pub async fn append_steer_note(&self, root_id: &str, text: &str) -> anyhow::Result<()> {
+        let (root_id, text) = (root_id.to_string(), text.to_string());
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE orch_tasks SET steer_note = \
+                   CASE WHEN steer_note IS NULL OR steer_note='' THEN ?2 \
+                        ELSE steer_note || char(10) || ?2 END \
+                 WHERE id=?1 AND root_id IS NULL",
+                params![root_id, text],
+            )
+            .map(|_| ())
         })
         .await
     }
@@ -3370,7 +4192,7 @@ pub fn quarantine_legacy_db(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project};
+    use crate::domain::{NewMessage, PermMode, Project, WriteOrigin};
     use crate::domain::{Session, SessionStatus};
     use crate::llm_router::provenance::{
         RouteFailureCategory, RouteSelection, RouteSelectionReason,
@@ -3962,6 +4784,58 @@ mod tests {
             .unwrap();
     }
 
+    /// A store with one `waiting` root and one `running` child (`ot-child`) —
+    /// just enough orch-task graph for the circuit-breaker test below. Raw
+    /// SQL rather than `orch::insert_root`/`insert_children`: those mint
+    /// random ids, and this test needs a stable id to fail repeatedly.
+    async fn orch_test_store() -> Store {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        std::mem::forget(tmp);
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
+                     VALUES ('ot-root', NULL, 'p1', 'goal', 'do it', '', 'waiting', 1)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
+                     VALUES ('ot-child', 'ot-root', 'p1', 'child', 'do child', '', 'running', 2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn record_child_failure_requeues_then_trips_the_breaker() {
+        let store = orch_test_store().await;
+        let child = "ot-child";
+        // First two failures re-queue for retry.
+        let a = store.record_child_failure(child, 2).await.unwrap();
+        assert!(a.requeued && !a.gave_up);
+        // Re-mark running to model the retry attempt, then fail again.
+        crate::orch::set_status(&store, child, "todo", "running")
+            .await
+            .unwrap();
+        let b = store.record_child_failure(child, 2).await.unwrap();
+        assert!(b.requeued && !b.gave_up);
+        crate::orch::set_status(&store, child, "todo", "running")
+            .await
+            .unwrap();
+        // Third failure trips the breaker.
+        let c = store.record_child_failure(child, 2).await.unwrap();
+        assert!(!c.requeued && c.gave_up);
+        let t = crate::orch::get_task(&store, child).await.unwrap().unwrap();
+        assert_eq!(t.status, "failed");
+        assert!(t.gave_up);
+        assert_eq!(t.consecutive_failures, 3);
+    }
+
     #[tokio::test]
     async fn migration_adds_sessions_branch_owned_defaulting_to_owned() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -4309,6 +5183,7 @@ mod tests {
                 tool_call_id: Some("tc-1".into()),
                 status: Some("pending".into()),
                 tool_kind: Some("execute".into()),
+                speaker: None,
             })
             .await
             .unwrap();
@@ -4373,6 +5248,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_origin_settings_and_policy_writes_are_rejected() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        // A USER-origin write succeeds (the normal path).
+        store
+            .set_setting(WriteOrigin::User, "theme", "dark")
+            .await
+            .expect("user setting write");
+        store
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "allowAlways")
+            .await
+            .expect("user policy write");
+
+        // An AGENT-origin write to the SAME protected APIs is refused AT THE
+        // STORE — even though the caller invoked the method directly.
+        let e = store
+            .set_setting(WriteOrigin::Agent, "theme", "light")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not permitted"), "got: {e}");
+        let e = store
+            .set_tool_policy(WriteOrigin::Agent, "p1", "Bash", "rejectAlways")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not permitted"), "got: {e}");
+        let e = store
+            .delete_tool_policy(WriteOrigin::BackgroundReview, "p1", "Bash")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not permitted"), "got: {e}");
+
+        // The rejected writes had no effect: the user's values still stand.
+        assert_eq!(
+            store.get_setting("theme").await.unwrap().as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            store
+                .get_tool_policy("p1", "Bash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("allowAlways")
+        );
+    }
+
+    #[tokio::test]
     async fn tool_policy_is_per_project_and_upserts() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -4380,7 +5303,7 @@ mod tests {
         assert!(store.get_tool_policy("p1", "Bash").await.unwrap().is_none());
         // set a policy
         store
-            .set_tool_policy("p1", "Bash", "allowAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "allowAlways")
             .await
             .unwrap();
         assert_eq!(
@@ -4395,7 +5318,7 @@ mod tests {
         assert!(store.get_tool_policy("p2", "Bash").await.unwrap().is_none());
         // upsert (update) the existing policy
         store
-            .set_tool_policy("p1", "Bash", "rejectAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "rejectAlways")
             .await
             .unwrap();
         assert_eq!(
@@ -4413,16 +5336,19 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         store
-            .set_tool_policy("p1", "Bash", "allowAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "allowAlways")
             .await
             .unwrap();
         store
-            .set_tool_policy("p2", "Edit", "rejectAlways")
+            .set_tool_policy(WriteOrigin::User, "p2", "Edit", "rejectAlways")
             .await
             .unwrap();
         let rows = store.list_tool_policies().await.unwrap();
         assert_eq!(rows.len(), 2);
-        store.delete_tool_policy("p1", "Bash").await.unwrap();
+        store
+            .delete_tool_policy(WriteOrigin::User, "p1", "Bash")
+            .await
+            .unwrap();
         let rows = store.list_tool_policies().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project_id, "p2");
@@ -4430,16 +5356,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_audit_writes_rows_read_back_newest_first() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .record_audit(
+                WriteOrigin::Agent,
+                Some("sess-1"),
+                "app_jobs",
+                "create",
+                "allow",
+            )
+            .await
+            .unwrap();
+        store
+            .record_audit(
+                WriteOrigin::Agent,
+                Some("sess-1"),
+                "app_orchestrate",
+                "submit",
+                "allow",
+            )
+            .await
+            .unwrap();
+        let rows = store.list_audit(10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].tool, "app_orchestrate");
+        assert_eq!(rows[0].action, "submit");
+        assert_eq!(rows[0].origin, "agent");
+        assert_eq!(rows[0].session_pk.as_deref(), Some("sess-1"));
+        assert_eq!(rows[1].tool, "app_jobs");
+        // Limit is honored.
+        assert_eq!(store.list_audit(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn settings_kv_upserts_and_reads_back() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         assert!(store.get_setting("default_agent").await.unwrap().is_none());
-        store.set_setting("default_agent", "claude").await.unwrap();
+        store
+            .set_setting(WriteOrigin::User, "default_agent", "claude")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_setting("default_agent").await.unwrap().as_deref(),
             Some("claude")
         );
-        store.set_setting("default_agent", "codex").await.unwrap();
+        store
+            .set_setting(WriteOrigin::User, "default_agent", "codex")
+            .await
+            .unwrap();
         assert_eq!(
             store.get_setting("default_agent").await.unwrap().as_deref(),
             Some("codex")
@@ -5028,7 +5996,52 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 30, "forward migration must land at v30");
+        assert_eq!(user_version, 33, "forward migration must land at v33");
+    }
+
+    #[tokio::test]
+    async fn migration_29_adds_speaker_and_orch_group_chat_columns() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // A speaker-labeled display row round-trips.
+        store
+            .insert_message(crate::domain::NewMessage::speaker_block(
+                "s1",
+                "build",
+                "text",
+                serde_json::json!({ "text": "worker report" }),
+            ))
+            .await
+            .unwrap();
+        let rows = store.list_messages("s1").await.unwrap();
+        assert_eq!(rows[0].speaker.as_deref(), Some("build"));
+        // A root task records its home chat + starts un-broken.
+        let root = crate::orch::insert_root(&store, "p1", "goal", "waiting", Some("home-1"))
+            .await
+            .unwrap();
+        let t = crate::orch::get_task(&store, &root).await.unwrap().unwrap();
+        assert_eq!(t.home_session_pk.as_deref(), Some("home-1"));
+        assert_eq!(t.consecutive_failures, 0);
+        assert!(!t.gave_up);
+        assert_eq!(t.steer_note, None);
+    }
+
+    #[tokio::test]
+    async fn migration_30_adds_audit_session_and_origin_columns() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let cols: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("PRAGMA table_info(audit)")?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "session_pk"), "cols: {cols:?}");
+        assert!(cols.iter().any(|c| c == "origin"), "cols: {cols:?}");
     }
 
     #[tokio::test]
@@ -5169,7 +6182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_30_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_33_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -5186,23 +6199,22 @@ mod tests {
         // perm_mode; 23 plugin_installs + plugin_attach_status; 24 typed model
         // effort preferences + legacy normalization; 25 session_route_state;
         // 26 session_runtime_settings; 27 background_events + jobs.model_override;
-        // 28 plugin_catalog_cache + catalog_feed_state; 29 devices +
-        // pairing_codes — CREATE TABLE IF NOT EXISTS; 30
-        // gateways.fingerprint + gateways.device_token — hook-guarded, like
-        // branch_owned/pre_check/perm_mode; all convergent, existence-
-        // guarded, or CREATE TABLE IF NOT EXISTS) re-run on next open.
+        // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs;
+        // 29 messages.speaker + orch_tasks home/breaker/steer columns;
+        // 30 audit.session_pk + audit.origin;
+        // 31 plugin_catalog_cache + catalog_feed_state —
+        // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
+        // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 30
-        // defined (tail after renumbering the remote-runner migrations to
-        // 29/30 past main's 28), wind back eighteen: 30 - 18 = 12, i.e. just
-        // before migration 13 so it — and every migration after it — replay.
+        // this test starts failing its assertions). With migrations through 31
+        // defined, wind back nineteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 18)
+            c.pragma_update(None, "user_version", v - 21)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5259,15 +6271,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back ten, and reopen so 21 (and the tail
-        // migrations 22–30, including main's 24-28 and the renumbered
-        // remote-runner 29/30) replay against it. Back TEN: the fully
-        // migrated tail is now v30, so rewinding to v20 is what makes
-        // migration 21 (native-only) replay: 30 - 10 = 20.
+        // wind user_version back eleven, and reopen so 21 (and the tail
+        // migrations 22–31) replay against it. Back ELEVEN: the fully migrated
+        // tail is now v31, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 10)
+            c.pragma_update(None, "user_version", v - 13)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5363,7 +6374,7 @@ mod tests {
 
         // KV-absent rule: a pre-existing agent_model must NOT be clobbered on replay.
         store
-            .set_setting("agent_model", "user-chose-this")
+            .set_setting(WriteOrigin::User, "agent_model", "user-chose-this")
             .await
             .unwrap();
         store.with_conn(rewind).await.unwrap();
@@ -5405,9 +6416,299 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 30, "forward migration must land at v30");
+        assert_eq!(uv, 33, "forward migration must land at v33");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
+    }
+
+    #[tokio::test]
+    async fn migration_28_adds_fts_skill_usage_and_curator_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (uv, has_fts, has_usage, has_cstate, has_cruns) = store
+            .with_conn(|c| {
+                let uv: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let t = |name: &str| -> rusqlite::Result<bool> {
+                    c.prepare("SELECT 1 FROM sqlite_master WHERE name=?1")?
+                        .exists([name])
+                };
+                Ok((
+                    uv,
+                    t("messages_fts")?,
+                    t("skill_usage")?,
+                    t("curator_state")?,
+                    t("curator_runs")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uv, 33, "forward migration must land at v33");
+        assert!(has_fts && has_usage && has_cstate && has_cruns);
+    }
+
+    #[tokio::test]
+    async fn messages_fts_trigger_indexes_text_rows_and_matches() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // A session row is not required for the trigger; insert a user text message.
+        store
+            .insert_message(crate::domain::NewMessage::block(
+                "s1",
+                "user",
+                "text",
+                serde_json::json!({ "text": "deploy the widget service to staging" }),
+            ))
+            .await
+            .unwrap();
+        // A non-text tool row must NOT be indexed.
+        store
+            .insert_message(crate::domain::NewMessage {
+                session_pk: "s1".into(),
+                role: "assistant".into(),
+                block_type: "tool_call".into(),
+                payload: serde_json::json!({ "name": "bash" }),
+                tool_call_id: Some("t1".into()),
+                status: None,
+                tool_kind: Some("execute".into()),
+                speaker: None,
+            })
+            .await
+            .unwrap();
+        let hits: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'widget'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits, 1, "only the user text row is indexed and matches");
+    }
+
+    /// Builds a minimal `Session` row for `search_messages_fts`/lineage tests.
+    fn mk_session(pk: &str, kind: crate::domain::SessionKind, now: i64) -> crate::domain::Session {
+        mk_session_with_parent(pk, kind, now, None)
+    }
+
+    fn mk_session_with_parent(
+        pk: &str,
+        kind: crate::domain::SessionKind,
+        now: i64,
+        parent: Option<&str>,
+    ) -> crate::domain::Session {
+        crate::domain::Session {
+            session_pk: pk.into(),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: Some(format!("t-{pk}")),
+            status: crate::domain::SessionStatus::Idle,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind,
+            speaker: None,
+            agent: None,
+            parent_session_pk: parent.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_finds_and_excludes_worker_sessions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(mk_session("chat-1", crate::domain::SessionKind::Chat, now))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk_session("wrk-1", crate::domain::SessionKind::Worker, now))
+            .await
+            .unwrap();
+        for pk in ["chat-1", "wrk-1"] {
+            store
+                .insert_message(crate::domain::NewMessage::block(
+                    pk,
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": "kubernetes ingress routing" }),
+                ))
+                .await
+                .unwrap();
+        }
+        let hits = store.search_messages_fts("ingress", &[], 20).await.unwrap();
+        assert!(hits.iter().any(|h| h.session_pk == "chat-1"));
+        assert!(
+            !hits.iter().any(|h| h.session_pk == "wrk-1"),
+            "worker sessions excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_non_matching_query_returns_empty() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(mk_session("chat-1", crate::domain::SessionKind::Chat, now))
+            .await
+            .unwrap();
+        store
+            .insert_message(crate::domain::NewMessage::block(
+                "chat-1",
+                "user",
+                "text",
+                serde_json::json!({ "text": "kubernetes ingress routing" }),
+            ))
+            .await
+            .unwrap();
+        let hits = store
+            .search_messages_fts("nonexistentzzz", &[], 20)
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_malformed_query_errors_cleanly_not_panics() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        // An unterminated quote is invalid FTS5 query syntax; SQLite surfaces
+        // it as a runtime error on the bound MATCH parameter, not a panic.
+        let result = store.search_messages_fts("\"unterminated", &[], 20).await;
+        assert!(
+            result.is_err(),
+            "malformed FTS5 query must error, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_messages_fts_dedups_by_lineage_root_and_excludes_caller_lineage() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        // Two chat sessions in the SAME lineage (root "chat-root"): only the
+        // best (most recent) hit should survive the dedup.
+        store
+            .insert_session(mk_session(
+                "chat-root",
+                crate::domain::SessionKind::Chat,
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk_session_with_parent(
+                "chat-child",
+                crate::domain::SessionKind::Chat,
+                now + 1,
+                Some("chat-root"),
+            ))
+            .await
+            .unwrap();
+        // A separate, unrelated lineage that the caller wants excluded
+        // (its own current conversation).
+        store
+            .insert_session(mk_session(
+                "own-lineage",
+                crate::domain::SessionKind::Chat,
+                now,
+            ))
+            .await
+            .unwrap();
+        for pk in ["chat-root", "chat-child", "own-lineage"] {
+            store
+                .insert_message(crate::domain::NewMessage::block(
+                    pk,
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": "kubernetes ingress routing" }),
+                ))
+                .await
+                .unwrap();
+        }
+        let hits = store
+            .search_messages_fts("ingress", &["own-lineage".to_string()], 20)
+            .await
+            .unwrap();
+        assert!(
+            !hits.iter().any(|h| h.session_pk == "own-lineage"),
+            "caller's own lineage excluded"
+        );
+        let lineage_hits: Vec<_> = hits
+            .iter()
+            .filter(|h| h.session_pk == "chat-root" || h.session_pk == "chat-child")
+            .collect();
+        assert_eq!(
+            lineage_hits.len(),
+            1,
+            "same-lineage hits dedup to a single entry, got {lineage_hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_of_walks_to_the_root_and_is_empty_for_unknown_session() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(mk_session(
+                "chat-root",
+                crate::domain::SessionKind::Chat,
+                now,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_session(mk_session_with_parent(
+                "chat-child",
+                crate::domain::SessionKind::Chat,
+                now + 1,
+                Some("chat-root"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.lineage_of("chat-child").await.unwrap(),
+            vec!["chat-root".to_string()]
+        );
+        assert_eq!(
+            store.lineage_of("chat-root").await.unwrap(),
+            vec!["chat-root".to_string()]
+        );
+        assert!(store
+            .lineage_of("no-such-session")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn messages_window_returns_the_radius_slice() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for i in 0..12 {
+            store
+                .insert_message(crate::domain::NewMessage::block(
+                    "s1",
+                    "user",
+                    "text",
+                    serde_json::json!({ "text": format!("msg {i}") }),
+                ))
+                .await
+                .unwrap();
+        }
+        // seqs run 1..=12; a ±5 window around seq 6 is [1,11].
+        let window = store.messages_window("s1", 6, 5).await.unwrap();
+        let seqs: Vec<i64> = window.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, (1..=11).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -5853,6 +7154,79 @@ mod tests {
         assert_eq!(store.pending_background_count().await.unwrap(), 0);
     }
 
+    /// Pins the Task 8 rail split (spec §3.1/§7.2): the generic drainer's
+    /// claim must NEVER return a `kind='learning'` row (it would otherwise
+    /// inject a learning payload as a chat user turn), and
+    /// `claim_learning_event` must be the only way to claim one. A
+    /// `delegation` row (Phase 3 behavior) must still be claimable by the
+    /// generic drainer — proving the exclusion is scoped to `learning` only,
+    /// not a regression of ordinary background delivery.
+    #[tokio::test]
+    async fn claim_deliverable_background_event_skips_learning_rows_claim_learning_event_takes_them(
+    ) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: "idle-1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        let learning_id = store
+            .enqueue_background_event("idle-1", "learning", "{}")
+            .await
+            .unwrap();
+        let delegation_id = store
+            .enqueue_background_event("idle-1", "delegation", "{\"x\":1}")
+            .await
+            .unwrap();
+
+        // The generic drainer must skip the learning row and reach the
+        // delegation row instead (no Phase-3 regression).
+        let claimed = store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, delegation_id);
+        assert_eq!(claimed.kind, "delegation");
+        // With the only non-learning row now claimed, the generic drainer
+        // finds nothing else — specifically NOT the still-pending learning
+        // row.
+        assert!(store
+            .claim_deliverable_background_event("drainer")
+            .await
+            .unwrap()
+            .is_none());
+
+        // The dedicated learning claim DOES pick up the learning row.
+        let learning_claimed = store
+            .claim_learning_event("learner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(learning_claimed.id, learning_id);
+        assert_eq!(learning_claimed.kind, "learning");
+    }
+
     #[tokio::test]
     async fn migration_23_creates_plugin_install_tables() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -5938,6 +7312,152 @@ mod tests {
         assert_eq!(got.outcome, "ok");
         assert_eq!(got.last_attach_at, 9);
         assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skill_usage_records_and_transitions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.record_skill_view("deploy").await.unwrap();
+        store.record_skill_use("deploy").await.unwrap();
+        store.record_skill_use("deploy").await.unwrap();
+        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
+        assert_eq!(u.use_count, 2);
+        assert_eq!(u.view_count, 1);
+        assert_eq!(u.state, "active");
+        store
+            .set_skill_state("deploy", "stale", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_skill_usage("deploy")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_usage_patch_created_by_and_pinned_round_trip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.record_skill_patch("deploy").await.unwrap();
+        store.record_skill_patch("deploy").await.unwrap();
+        store.mark_skill_created_by_agent("deploy").await.unwrap();
+        store.set_skill_pinned("deploy", true).await.unwrap();
+        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
+        assert_eq!(u.patch_count, 2);
+        assert_eq!(u.created_by.as_deref(), Some("agent"));
+        assert!(u.pinned);
+        assert!(u.last_patched_at.is_some());
+
+        store
+            .set_skill_state("deploy", "archived", Some(42))
+            .await
+            .unwrap();
+        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
+        assert_eq!(u.state, "archived");
+        assert_eq!(u.archived_at, Some(42));
+        // set_skill_state/pinned/mark_skill_created_by_agent must not clobber
+        // counters recorded by earlier upserts on the same row.
+        assert_eq!(u.patch_count, 2);
+        assert!(u.pinned);
+    }
+
+    #[tokio::test]
+    async fn get_skill_usage_missing_returns_none_list_skill_usage_orders_by_name() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.get_skill_usage("nope").await.unwrap().is_none());
+
+        store.record_skill_use("zeta").await.unwrap();
+        store.record_skill_use("alpha").await.unwrap();
+        let all = store.list_skill_usage().await.unwrap();
+        assert_eq!(
+            all.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+    }
+
+    // ---------- curator_state / curator_runs (Task 10) ----------
+
+    #[tokio::test]
+    async fn curator_last_run_is_none_until_a_run_is_inserted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(store.curator_last_run().await.unwrap().is_none());
+
+        store.insert_curator_run("run-1", 1_000).await.unwrap();
+        assert_eq!(store.curator_last_run().await.unwrap(), Some(1_000));
+
+        // A later run overwrites the singleton `curator_state` anchor.
+        store.insert_curator_run("run-2", 2_000).await.unwrap();
+        assert_eq!(store.curator_last_run().await.unwrap(), Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn finish_curator_run_updates_the_row_and_list_curator_runs_orders_newest_first() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_curator_run("run-1", 1_000).await.unwrap();
+        store.insert_curator_run("run-2", 2_000).await.unwrap();
+
+        store
+            .finish_curator_run("run-1", 1_500, "ok", 3, false, None, None)
+            .await
+            .unwrap();
+        store
+            .finish_curator_run(
+                "run-2",
+                2_500,
+                "error",
+                0,
+                true,
+                Some("/tmp/snap.tar.gz"),
+                Some("boom"),
+            )
+            .await
+            .unwrap();
+
+        let runs = store.list_curator_runs(10).await.unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run-2", "run-1"],
+            "newest (highest started_at) first"
+        );
+
+        let run1 = runs.iter().find(|r| r.id == "run-1").unwrap();
+        assert_eq!(run1.finished_at, Some(1_500));
+        assert_eq!(run1.status, "ok");
+        assert_eq!(run1.transitioned, 3);
+        assert!(!run1.consolidated);
+        assert_eq!(run1.snapshot_path, None);
+        assert_eq!(run1.error, None);
+
+        let run2 = runs.iter().find(|r| r.id == "run-2").unwrap();
+        assert_eq!(run2.finished_at, Some(2_500));
+        assert_eq!(run2.status, "error");
+        assert_eq!(run2.transitioned, 0);
+        assert!(run2.consolidated);
+        assert_eq!(run2.snapshot_path.as_deref(), Some("/tmp/snap.tar.gz"));
+        assert_eq!(run2.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn list_curator_runs_respects_limit() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for (i, id) in ["run-a", "run-b", "run-c"].into_iter().enumerate() {
+            store
+                .insert_curator_run(id, 1_000 + i as i64)
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list_curator_runs(2).await.unwrap().len(), 2);
+        assert_eq!(store.list_curator_runs(100).await.unwrap().len(), 3);
     }
 
     #[tokio::test]

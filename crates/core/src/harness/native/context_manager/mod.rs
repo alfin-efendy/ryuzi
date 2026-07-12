@@ -93,6 +93,40 @@ impl ContextManager {
         }
     }
 
+    /// Seed a fresh, ephemeral `ContextManager` whose ledger starts pre-
+    /// loaded with `messages` verbatim (Task 9's review-fork cache-parity
+    /// replay) — `messages_for_request()` returns exactly `messages` as its
+    /// leading prefix; a later `append_*` call adds AFTER it without
+    /// retroactively touching a block already inside `messages`.
+    pub fn seed_projected(
+        session_pk: &str,
+        cfg: ContextConfig,
+        messages: Vec<Value>,
+    ) -> ContextManager {
+        let mut cm = ContextManager {
+            ledger: Ledger::seed_projected(session_pk, messages),
+            cfg,
+            tokens: TokenState::default(),
+        };
+        cm.tokens.local_appended = cm.ledger.messages().iter().map(estimate_tokens).sum();
+        cm
+    }
+
+    /// Seed a fresh `ContextManager` from only the last `tail` messages of a
+    /// captured payload — used when the review fork's resolved model differs
+    /// from the payload's captured model (Task 9): a different model may
+    /// tokenize/cache differently, so byte-identical cache-parity replay is
+    /// impossible, and a digest is all the fork needs to have SOME context.
+    pub fn seed_digest(
+        session_pk: &str,
+        cfg: ContextConfig,
+        messages: Vec<Value>,
+        tail: usize,
+    ) -> ContextManager {
+        let start = messages.len().saturating_sub(tail);
+        Self::seed_projected(session_pk, cfg, messages[start..].to_vec())
+    }
+
     pub fn cfg(&self) -> &ContextConfig {
         &self.cfg
     }

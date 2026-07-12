@@ -11,6 +11,8 @@ import { ActivityCluster } from "./ToolChip";
 import { TurnSummary } from "./TurnSummary";
 import { FileChangeCards } from "./FileChangeCards";
 import { TurnActions } from "./TurnActions";
+import { SpeakerBubble } from "./SpeakerBubble";
+import { BlockCard } from "./BlockCard";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 /** Renders one saved attachment. Unlike the pre-P4-3 `convertFileSrc(a.path)`
@@ -275,6 +277,12 @@ export function Transcript({
                   return <ErrorRow key={g.key} text={g.text} />;
                 case "notice":
                   return <NoticeRow key={g.key} text={g.text} />;
+                case "speaker":
+                  return g.blockType === "orch_block" && g.taskId ? (
+                    <BlockCard key={g.key} taskId={g.taskId} question={g.markdown} speaker={g.speaker} />
+                  ) : (
+                    <SpeakerBubble key={g.key} speaker={g.speaker} markdown={g.markdown} />
+                  );
                 case "summary":
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">

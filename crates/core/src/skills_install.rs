@@ -219,6 +219,15 @@ impl RepoCloner for GitRepoCloner {
 // remains for `refresh_installed_skill` and tests; `install_skill_source_with_recorded`
 // is now test-only (the gated/begin paths inline the equivalent ledger write).
 
+/// The live skills root (`~/.config/ryuzi/skills`, or the injected root under
+/// `RYUZI_TEST_CONFIG_ROOT` in tests) — the ONLY directory the `skill_manage`
+/// native tool (Task 6) may write beneath. A thin public accessor over the
+/// otherwise-private [`InstallRoots`], so callers outside this module never
+/// need to duplicate the home-dir/env-override resolution logic.
+pub fn skills_root() -> Result<PathBuf> {
+    Ok(InstallRoots::for_user()?.skills_root)
+}
+
 pub fn list_installed_skills() -> Result<Vec<InstalledSkillInfo>> {
     let roots = InstallRoots::for_user()?;
     list_installed_skills_in(&roots)

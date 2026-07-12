@@ -259,6 +259,62 @@ async listBranches(runnerId: string | null, projectId: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
+async orchSubmit(projectId: string, goal: string, decompose: boolean, homeSessionPk: string | null) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_submit", { projectId, goal, decompose, homeSessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async orchListRoots() : Promise<Result<OrchTask[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_list_roots") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async orchTasks(root: string) : Promise<Result<OrchTask[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_tasks", { root }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async orchCancel(root: string) : Promise<Result<number, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_cancel", { root }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async orchRetry(taskId: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_retry", { taskId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async orchAnswerBlock(taskId: string, answer: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_answer_block", { taskId, answer }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async orchSteer(sessionPk: string, text: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("orch_steer", { sessionPk, text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAgentSettings(runnerId: string | null) : Promise<Result<AgentSettingsInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_agent_settings", { runnerId }) };
@@ -1241,6 +1297,78 @@ async pluginsRestartRequired(runnerId: string | null) : Promise<Result<boolean, 
     else return { status: "error", error: e  as any };
 }
 },
+async readMemory(scope: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_memory", { scope }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async writeMemory(scope: string, action: string, text: string | null, match: string | null) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("write_memory", { scope, action, text, match }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async searchSessions(query: string) : Promise<Result<FtsHit[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_sessions", { query }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async learningGraph() : Promise<Result<LearningGraph, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("learning_graph") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async curatorStatus() : Promise<Result<CuratorStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("curator_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async curatorRollback(runId: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("curator_rollback", { runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listSkillUsage() : Promise<Result<SkillUsage[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_skill_usage") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setSkillPinned(name: string, pinned: boolean) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_skill_pinned", { name, pinned }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listAudit(limit: number) : Promise<Result<AuditRow[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_audit", { limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Force an out-of-cadence catalog fetch right now — `RemoteCatalogManager`'s
  * background timer lives daemon-side and is not otherwise user-triggerable.
@@ -1477,6 +1605,18 @@ export type ApprovalScope =
  * Persisted to the project's `tool_policies` row.
  */
 "project"
+/**
+ * One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
+ */
+export type AuditRow = { id: number; tool: string; action: string; decision: string; 
+/**
+ * The initiating `WriteOrigin` as a string (`user`|`agent`|`background_review`).
+ */
+origin: string; sessionPk: string | null; 
+/**
+ * Unix ms.
+ */
+at: number }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type BranchList = { 
 /**
@@ -1528,7 +1668,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1583,6 +1723,34 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * P3-4/P3-6 route by runner.
  */
 export type CoreEventMsg = { runnerId: string; event: CoreEvent }
+/**
+ * One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
+ * sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
+ * history view.
+ */
+export type CuratorRun = { id: string; startedAt: number; finishedAt: number | null; 
+/**
+ * `running` | `ok` | `error`.
+ */
+status: string; 
+/**
+ * How many skills the deterministic planner transitioned this run.
+ */
+transitioned: number; 
+/**
+ * Whether the opt-in LLM consolidation pass ran this run.
+ */
+consolidated: boolean; 
+/**
+ * Pre-mutation tar.gz snapshot path, set only when `consolidated`.
+ */
+snapshotPath: string | null; error: string | null; log: string | null }
+/**
+ * `curator_status`'s response: when the curator last swept (`None` if it
+ * has never run) plus its recent run history for the Learning panel's
+ * curator-activity feed.
+ */
+export type CuratorStatus = { lastRunAt: number | null; recent: CuratorRun[] }
 /**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll
@@ -1649,6 +1817,13 @@ restartCount: number;
  * `restart-exhausted: ...` marker), never extension-supplied raw text.
  */
 lastError: string | null; confirmedEvents: string[]; toolCount: number }
+/**
+ * One `messages_fts` match, joined against its owning session — the unit
+ * the `session_search` native tool's DISCOVERY action returns, and (Task
+ * 11) the `search_sessions` RPC method's response for the Cockpit Learning
+ * panel.
+ */
+export type FtsHit = { sessionPk: string; seq: number; snippet: string; title: string | null; kind: string; createdAt: number }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string; 
 /**
@@ -1704,12 +1879,51 @@ export type KeychainStatus =
  * restart, or a previously stored key was corrupt and was replaced.
  */
 "unavailable"
+export type LearningGraph = { nodes: LearningGraphNode[]; edges: LearningGraphEdge[] }
+/**
+ * One edge in the Learning panel's journey graph: `related_skills` links
+ * two skills whose names share a token (a lexical relatedness signal, since
+ * `skill_usage` carries no free-text description to compare); `lexical`
+ * links a memory entry to a skill its text mentions by name.
+ */
+export type LearningGraphEdge = { source: string; target: string; 
+/**
+ * `"related_skills"` | `"lexical"`.
+ */
+kind: string }
+/**
+ * One node in the Learning panel's journey graph: either a skill
+ * (`kind == "skill"`, `state` set from `skill_usage.state`) or a memory
+ * entry (`kind == "memory"`, `scope` set to which memory file it lives in).
+ * `id` is content-stable (see `learning_api::build_learning_graph`) so a
+ * re-fetch after an unrelated edit doesn't reshuffle node identity —
+ * unlike Hermes' fragile positional memory ids (spec §7.6).
+ */
+export type LearningGraphNode = { id: string; 
+/**
+ * `"skill"` | `"memory"`.
+ */
+kind: string; label: string; 
+/**
+ * Skill lifecycle state (`active`/`stale`/`archived`); `None` for a
+ * memory node.
+ */
+state: string | null; 
+/**
+ * Memory scope (`global`/`user`/`project`); `None` for a skill node.
+ */
+scope: string | null }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry, one row per native-runtime event block.
  */
-export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number }
+export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number; 
+/**
+ * Group-chat attribution: the agent name for a labeled worker/orchestrator
+ * bubble. `None` for ordinary user/assistant rows.
+ */
+speaker: string | null }
 /**
  * One model's accumulated billed tokens + computed dollar cost within a
  * session. Token fields are the durable truth; `usd` is derived from the
@@ -1743,6 +1957,38 @@ export type ModelStatusEntry = { family: string; model: string; status: string; 
 export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
 export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
+/**
+ * One row of the orchestrated task graph.
+ */
+export type OrchTask = { id: string; 
+/**
+ * `None` for a root (goal) task.
+ */
+rootId: string | null; projectId: string; title: string; body: string; 
+/**
+ * Recorded from the decomposer and resolved by name against
+ * `AgentRegistry` when the worker session starts (falling back to the
+ * registry's default agent for an unknown/blank name).
+ */
+agent: string; status: string; sessionPk: string | null; result: string | null; error: string | null; createdAt: number; finishedAt: number | null; 
+/**
+ * The originating chat session (root only) — where worker bubbles post
+ * and the aggregate outcome re-enters over the rail. `None` for goals
+ * submitted without a home chat (CLI/tests).
+ */
+homeSessionPk: string | null; 
+/**
+ * Consecutive failed attempts for this child (circuit breaker input).
+ */
+consecutiveFailures: number; 
+/**
+ * The breaker tripped: this child exhausted its retries and stays failed.
+ */
+gaveUp: boolean; 
+/**
+ * Accumulated mid-run user guidance (root only), fed to the judge prompt.
+ */
+steerNote: string | null }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PluginAuthInfo = { 
 /**
@@ -1989,6 +2235,13 @@ export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
  * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
+/**
+ * Per-skill telemetry (Phase 4 §4/§7): use/view/patch counters and
+ * lifecycle state, read by the `skill_manage` native tool (Task 6) and the
+ * curator (Task 10) to decide when a skill should transition between
+ * `active`, `stale`, and `archived`.
+ */
+export type SkillUsage = { name: string; createdBy: string | null; useCount: number; viewCount: number; patchCount: number; lastUsedAt: number | null; lastViewedAt: number | null; lastPatchedAt: number | null; state: string; pinned: boolean; archivedAt: number | null; createdAt: number | null }
 export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string; 

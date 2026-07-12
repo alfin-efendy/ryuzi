@@ -35,6 +35,8 @@ const row = (partial: Partial<Row>): Row => ({
   toolExitCode: null,
   toolSummary: null,
   toolSubagent: null,
+  speaker: null,
+  taskId: null,
   ...partial,
 });
 
@@ -208,6 +210,16 @@ test("route switch copy groups as notices for model, account, failover, and comb
 
   const groups = groupRows(notices.map((text, index) => row({ seq: index + 1, role: "system", blockType: "notice", text })));
   expect(groups).toEqual(notices.map((text, index) => ({ type: "notice", key: `s${index + 1}`, text })));
+});
+
+test("speaker rows group into labeled speaker bubbles", () => {
+  const rows = [
+    messageToRow(1, "assistant", "status", { text: "started: a" }, null, null, null, 0, "", "build"),
+    messageToRow(2, "assistant", "text", { text: "done a" }, null, null, null, 0, "", "build"),
+  ];
+  const groups = groupRows(rows);
+  expect(groups.every((g) => g.type === "speaker")).toBe(true);
+  expect(groups.map((g: any) => g.speaker)).toEqual(["build", "build"]);
 });
 
 test("closeDanglingFence closes an odd number of line-start fences and leaves balanced ones alone", () => {
@@ -656,4 +668,18 @@ test("sub-agent tool rows carry their subagent label through to activity items",
 test("parent tool rows have no subagent label", () => {
   const r = messageToRow(6, "assistant", "tool_call", { name: "bash", input: {} }, "tc-2", "completed", "execute", null);
   expect(r.toolSubagent).toBeNull();
+});
+
+test("an orch_block row carries its task id through to the speaker group", () => {
+  const r = messageToRow(7, "assistant", "orch_block", { text: "which port?", task_id: "ot-7" }, null, null, null, null, "", "build");
+  expect(r.taskId).toBe("ot-7");
+  const groups = groupRows([r]);
+  expect(groups).toEqual([
+    { type: "speaker", key: "s7", speaker: "build", markdown: "which port?", blockType: "orch_block", taskId: "ot-7" },
+  ]);
+});
+
+test("an ordinary speaker row (no orch_block) carries a null task id", () => {
+  const r = messageToRow(8, "assistant", "text", { text: "done" }, null, null, null, null, "", "build");
+  expect(r.taskId).toBeNull();
 });

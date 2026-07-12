@@ -4,8 +4,8 @@
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
 use crate::domain::{
-    AttachmentRef, CoreEvent, PermMode, Project, Session, SessionGitOptions, SessionKind,
-    SessionStatus,
+    AttachmentRef, CoreEvent, NewMessage, PermMode, Project, Session, SessionGitOptions,
+    SessionKind, SessionStatus, WriteOrigin,
 };
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
@@ -13,6 +13,15 @@ use crate::settings::SettingsStore;
 use crate::worktree;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Binds a spawned session to an orchestration as a labeled worker (spec §8):
+/// it runs `agent`, its bubbles are attributed to that name, and its
+/// `parent_session_pk` points at the home chat it reports into.
+#[derive(Debug, Clone)]
+pub struct WorkerBinding {
+    pub agent: String,
+    pub home_session_pk: Option<String>,
+}
 
 impl ControlPlane {
     pub async fn start_session(
@@ -30,6 +39,7 @@ impl ControlPlane {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -44,6 +54,7 @@ impl ControlPlane {
         git: Option<SessionGitOptions>,
         perm_mode: Option<PermMode>,
         model_override: Option<String>,
+        worker: Option<WorkerBinding>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -115,10 +126,14 @@ impl ControlPlane {
             last_active: Some(now),
             resume_attempts: 0,
             branch_owned: project.is_git && git.create_branch && git.branch_name.is_none(),
-            kind: SessionKind::Project,
-            speaker: None,
-            agent: None,
-            parent_session_pk: None,
+            kind: if worker.is_some() {
+                SessionKind::Worker
+            } else {
+                SessionKind::Project
+            },
+            speaker: worker.as_ref().map(|w| w.agent.clone()),
+            agent: worker.as_ref().map(|w| w.agent.clone()),
+            parent_session_pk: worker.as_ref().and_then(|w| w.home_session_pk.clone()),
         };
         self.store.insert_session(session.clone()).await?;
         let _ = self.events.send(CoreEvent::SessionCreated {
@@ -473,6 +488,7 @@ impl ControlPlane {
                 tool_call_id: None,
                 status: None,
                 tool_kind: None,
+                speaker: None,
             });
         }
     }
@@ -492,8 +508,72 @@ impl ControlPlane {
                 tool_call_id: None,
                 status: None,
                 tool_kind: None,
+                speaker: None,
             });
         }
+    }
+
+    /// Post a labeled display bubble into a session's transcript (spec §8:
+    /// worker/orchestrator start/status/report bubbles). A DISPLAY row only —
+    /// written to the `messages` ledger via `insert_message`, NOT
+    /// `provider_turns`, so it never enters the model's history or perturbs
+    /// role alternation. Emits the live `CoreEvent::Message` so attached
+    /// surfaces render it immediately.
+    pub async fn post_speaker_bubble(
+        &self,
+        session_pk: &str,
+        speaker: &str,
+        block_type: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let payload = serde_json::json!({ "text": text });
+        let seq = self
+            .store
+            .insert_message(NewMessage::speaker_block(
+                session_pk,
+                speaker,
+                block_type,
+                payload.clone(),
+            ))
+            .await?;
+        let _ = self.events.send(CoreEvent::Message {
+            session_pk: session_pk.to_string(),
+            seq,
+            role: "assistant".to_string(),
+            block_type: block_type.to_string(),
+            payload,
+            tool_call_id: None,
+            status: None,
+            tool_kind: None,
+            speaker: Some(speaker.to_string()),
+        });
+        Ok(())
+    }
+
+    /// Deliver a human's answer to a blocked worker (spec §8, Task E6). The
+    /// answer flows back over the rail (`kind='unblock'`) as a clean new user
+    /// turn once the worker session is idle — never a mid-turn splice; the
+    /// idle-only drainer resumes the worker. Returns whether the task was
+    /// actually blocked (a stale/unknown/already-resumed task id is a no-op,
+    /// not an error).
+    pub async fn answer_orch_block(&self, task_id: &str, answer: &str) -> anyhow::Result<bool> {
+        let Some(task) = crate::orch::get_task(&self.store, task_id).await? else {
+            return Ok(false);
+        };
+        if task.status != "blocked" {
+            return Ok(false);
+        }
+        let Some(worker) = task.session_pk.as_deref() else {
+            return Ok(false);
+        };
+        let block = format!(
+            "[HUMAN ANSWER — orchestration block for task {task_id}] The user answered your \
+             blocking question. Continue the subtask using this answer.\n\n{answer}"
+        );
+        self.store
+            .enqueue_background_event(worker, "unblock", &block)
+            .await?;
+        Ok(true)
     }
 
     /// Background half of `start_session_with_prompt`. Registers a
@@ -912,6 +992,17 @@ impl ControlPlane {
             .map(|s| s.perm_mode)
             .unwrap_or(perm_mode);
         let agent = session_row.and_then(|s| s.agent);
+        // The curated app-control facade (spec §9.1) is only for a top-level
+        // interactive session: a worker or review-fork session never gets
+        // the `app_*` tools (mirrors the existing sub-agent blocklist, Task
+        // 6's `child_deps.app_control` reset, and this crate's `Harness`
+        // trait boundary — `SessionCtx` is the one channel from here into
+        // `NativeHarness::start_session`, which cannot reach `ControlPlane`
+        // itself to build one).
+        let app_control = match kind {
+            SessionKind::Project | SessionKind::Chat => Some(self.build_app_control()),
+            SessionKind::Worker | SessionKind::Review => None,
+        };
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             project_id: project.map(|p| p.project_id.clone()),
@@ -932,6 +1023,7 @@ impl ControlPlane {
             approvals: self.approvals.clone(),
             background: self.background.clone(),
             store: self.store.clone(),
+            app_control,
         };
 
         let handle: Arc<dyn HarnessSession> = Arc::from(harness.start_session(ctx).await?);
@@ -1109,10 +1201,24 @@ impl ControlPlane {
                     if let Some(sid) = handle.agent_session_id() {
                         let _ = me.store.update_agent_session_id(&session_pk, &sid).await;
                     }
-                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
+                    // Broadcast `Result` BEFORE the idle demote (the Err arm
+                    // below deliberately demotes first, for UI-refresh
+                    // reasons; this arm must not). The ordering is load-bearing
+                    // for orch's block-for-human resume (Task E6): the
+                    // background-rail drainer flips a `blocked` worker task to
+                    // `running` (`orch::on_unblock_delivered`) only AFTER it
+                    // claims the unblock event, and a claim requires the worker
+                    // session to be idle (`claim_deliverable_background_event`
+                    // joins on `sessions.status`). Emitting `Result` before the
+                    // demote guarantees a parked `watch_session` has the block
+                    // turn's `Result` queued before the session is ever
+                    // claimable — so it reads the task as still `blocked` and
+                    // keeps waiting, instead of racing the flip and finishing
+                    // the unanswered block turn as `done`.
                     let _ = me.events.send(CoreEvent::Result {
                         session_pk: session_pk.clone(),
                     });
+                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 }
                 Err(e) => {
                     let message = e.to_string();
@@ -1266,6 +1372,207 @@ impl ControlPlane {
             &format!("session {short} ended"),
         )
         .await;
+        Ok(())
+    }
+
+    /// Drive one learning-fork replay for a claimed `kind='learning'`
+    /// background-event payload (spec §3.1/§7.2, Phase 4 Task 9): decode the
+    /// captured `LearningPayload`, spin up a `kind='review'`,
+    /// `parent_session_pk`-linked session — a real, isolatable session, but
+    /// hidden from every picker (which filters on `kind`) — and replay the
+    /// parent's exact captured `system`/`tool_defs`/`messages` prefix
+    /// byte-for-byte when the resolved review model matches the payload's
+    /// captured model (prompt-cache parity), or a tail digest otherwise. The
+    /// fork advertises the parent's full `tool_defs` but is restricted to
+    /// `runner::REVIEW_TOOL_WHITELIST` at DISPATCH time
+    /// (`agent.tools.allows`, enforced inside `runner::drive`), carries
+    /// `WriteOrigin::BackgroundReview` into every `ToolCtx` it builds (so
+    /// Task 6's skill-write guard applies), and runs with a fresh
+    /// `NudgeState` under `DisplayMode::Silent` so it can never recursively
+    /// enqueue its own review. On completion, persists a `💾
+    /// Self-improvement review: …` notice into the PARENT transcript and
+    /// broadcasts it so a live Cockpit view picks it up immediately.
+    ///
+    /// Called by `learning::tick` once per claimed row; a successful return
+    /// marks the row delivered, an error releases the claim so a later tick
+    /// retries it.
+    pub async fn run_review_fork(&self, payload: &str) -> anyhow::Result<()> {
+        use crate::harness::native::agents::AgentRegistry;
+        use crate::harness::native::commands::CommandRegistry;
+        use crate::harness::native::context_manager::{ContextConfig, ContextManager};
+        use crate::harness::native::memory::MemoryStore;
+        use crate::harness::native::runner::{self, LearningPayload, NudgeState, RunnerDeps};
+        use crate::harness::native::steer::SteerBuffer;
+        use crate::harness::native::tools::ToolRegistry;
+
+        let payload: LearningPayload = serde_json::from_str(payload)?;
+        let store = self.store.clone();
+
+        // Resolve the review model: `auxiliary.review.model` if configured,
+        // else the parent's captured model. Only an EXACT match with the
+        // captured model can safely replay the captured prefix — a
+        // different model may tokenize/route/cache differently, so cache
+        // parity is impossible and a tail digest stands in instead.
+        let model = crate::harness::native::llm::aux_model(&store, "review", &payload.model).await;
+        let cache_parity = model == payload.model;
+
+        let mut meta = crate::llm_router::model_meta::resolve(&store, &model).await;
+        if cache_parity {
+            // Pin the EXACT flag the payload was captured with — `drive()`'s
+            // system-wrapping formula branches on this, and it must
+            // reproduce whatever the parent's turn actually did, regardless
+            // of any model-metadata drift since capture time.
+            meta.supports_prompt_cache = payload.supports_prompt_cache;
+        }
+
+        let parent = store.get_session(&payload.parent_session_pk).await?;
+        let project_id = parent.as_ref().and_then(|s| s.project_id.clone());
+        // Reuse the parent's own workspace so `skill`/`skill_manage` see the
+        // same project-local skill dirs the parent conversation saw. Project
+        // sessions have a real worktree; chat-first sessions have none — the
+        // same deterministic scratch dir the parent's own harness session
+        // already runs in stands in.
+        let work_dir = parent
+            .as_ref()
+            .and_then(|s| s.worktree_path.clone())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::paths::chat_scratch_dir(&payload.parent_session_pk));
+
+        let review_pk = new_id();
+        let now = now_ms();
+        self.store
+            .insert_session(Session {
+                session_pk: review_pk.clone(),
+                project_id: project_id.clone(),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Running,
+                perm_mode: PermMode::BypassPermissions,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Review,
+                speaker: None,
+                agent: None,
+                parent_session_pk: Some(payload.parent_session_pk.clone()),
+            })
+            .await?;
+
+        let settings = SettingsStore::new(store.clone());
+        let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        let effort_policy =
+            crate::llm_router::model_effort::build_utility_effort_policy(&store, &model).await?;
+        let llm = self.review_llm_factory().create(store.clone());
+
+        let deps = RunnerDeps {
+            session_pk: review_pk.clone(),
+            kind: SessionKind::Review,
+            work_dir,
+            attachments_dir: None,
+            extra_skill_dirs,
+            model: Some(model.clone()),
+            turn_effort_policy: Arc::new(effort_policy),
+            meta,
+            // BypassPermissions: the review fork is unattended — no human
+            // can ever answer an approval prompt — and the ONLY tools it can
+            // reach at dispatch are `memory`/`skill`/`skill_manage`, whose
+            // real safety boundary is Task 6's origin × provenance guard
+            // (via `write_origin` below), not the interactive gate.
+            perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
+            project_id: project_id.clone(),
+            perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
+            store: store.clone(),
+            events: self.events.clone(),
+            approvals: self.approvals.clone(),
+            llm,
+            tools: Arc::new(ToolRegistry::builtin()),
+            agent: runner::review_agent(payload.system.clone()),
+            agents: Arc::new(AgentRegistry::builtin()),
+            commands: Arc::new(CommandRegistry::builtin()),
+            memory: Some(Arc::new(MemoryStore::at_default(project_id.as_deref()))),
+            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            steer: SteerBuffer::new(),
+            background: self.background.clone(),
+            // The review fork is never a top-level interactive session — no
+            // app-control facade, mirroring the primary builder's default.
+            app_control: None,
+            // Isolated background session: no extension host/event sink, like
+            // sub-agent and test builders.
+            extension_events: None,
+            // A fresh, unshared `NudgeState`: the review fork's own tool
+            // iterations must never feed the PARENT's nudge counters (that
+            // would be a feedback loop), and it drives under
+            // `DisplayMode::Silent` so its own end_turn never fires a nudge
+            // regardless.
+            nudge: Arc::new(NudgeState::default()),
+            // Cache parity: advertise the parent's FULL captured tool set —
+            // dispatch (`agent.tools`, above) still enforces the whitelist.
+            review_tool_defs: Some(payload.tool_defs.clone()),
+            write_origin: WriteOrigin::BackgroundReview,
+        };
+
+        let cfg = ContextConfig::with_meta(deps.meta.clone());
+        let mut cm = if cache_parity {
+            ContextManager::seed_projected(&review_pk, cfg, payload.messages.clone())
+        } else {
+            ContextManager::seed_digest(&review_pk, cfg, payload.messages.clone(), 24)
+        };
+        cm.append_user_text(&runner::review_prompt_text(&payload.review_kind))
+            .await?;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = runner::drive_review(&deps, &deps.agent, &mut cm, &cancel).await;
+
+        // The review session is throwaway — never resumed, hidden from every
+        // picker by `kind` — so it never lingers as `running`, whether the
+        // drive succeeded or errored.
+        let _ = self
+            .store
+            .update_status(&review_pk, SessionStatus::Ended, Some(now_ms()))
+            .await;
+
+        let final_text = result?;
+        let outcome_line = {
+            let t = final_text.trim();
+            if t.is_empty() {
+                "reviewed, no changes needed".to_string()
+            } else {
+                t.lines()
+                    .next()
+                    .unwrap_or(t)
+                    .chars()
+                    .take(240)
+                    .collect::<String>()
+            }
+        };
+        let summary = format!("{}: {outcome_line}", runner::SELF_IMPROVEMENT_NOTICE_PREFIX);
+        let notice_payload = serde_json::json!({ "text": summary });
+        if let Ok(seq) = self
+            .store
+            .insert_message(NewMessage::block(
+                &payload.parent_session_pk,
+                "system",
+                "notice",
+                notice_payload.clone(),
+            ))
+            .await
+        {
+            self.emit(CoreEvent::Message {
+                session_pk: payload.parent_session_pk.clone(),
+                seq,
+                role: "system".into(),
+                block_type: "notice".into(),
+                payload: notice_payload,
+                tool_call_id: None,
+                status: None,
+                tool_kind: None,
+                speaker: None,
+            });
+        }
         Ok(())
     }
 }

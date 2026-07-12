@@ -174,14 +174,19 @@ async fn apply_response(gate: &PermGate<'_>, tool: &str, resp: ApprovalResponse)
 async fn persist_rule(gate: &PermGate<'_>, tool: &str, decision: &str) {
     if let Some(pid) = gate.project_id {
         // Best-effort: a failed write must not flip the user's verdict.
-        let _ = gate.store.set_tool_policy(pid, tool, decision).await;
+        // Triggered by a human answering an approval prompt, so this is
+        // always a `WriteOrigin::User` write.
+        let _ = gate
+            .store
+            .set_tool_policy(crate::domain::WriteOrigin::User, pid, tool, decision)
+            .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+    use crate::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope, WriteOrigin};
     use crate::store::Store;
     use std::sync::Arc;
 
@@ -287,7 +292,7 @@ mod tests {
     async fn project_reject_always_row_denies_without_prompt() {
         let f = Fixture::new().await;
         f.store
-            .set_tool_policy("p1", "Bash", "rejectAlways")
+            .set_tool_policy(WriteOrigin::User, "p1", "Bash", "rejectAlways")
             .await
             .unwrap();
         let d = evaluate(
@@ -494,6 +499,50 @@ mod tests {
         assert!(f.approvals.has_pending());
         f.cancel.cancel();
         assert_eq!(fut.await, PermDecision::Deny);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn app_write_key_allow_always_persists_and_is_honored() {
+        let f = Fixture::new().await;
+        let approvals = f.approvals.clone();
+        let mut rx = f.events.subscribe();
+        tokio::spawn(async move {
+            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+                approvals.resolve(
+                    &request_id,
+                    ApprovalResponse {
+                        decision: ApprovalDecision::AllowAlways,
+                        scope: Some(ApprovalScope::Project),
+                        payload: None,
+                    },
+                );
+            }
+        });
+        // First call prompts, user picks Always-in-project → row persists.
+        let d = evaluate(
+            &spec("jobs.write"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, Some("p1")),
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert_eq!(
+            f.store
+                .get_tool_policy("p1", "jobs.write")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("allowAlways")
+        );
+        // Second call auto-allows from the persisted grant — no prompt.
+        let d2 = evaluate(
+            &spec("jobs.write"),
+            &serde_json::json!({}),
+            &f.gate(PermMode::Default, Some("p1")),
+        )
+        .await;
+        assert_eq!(d2, PermDecision::Allow);
         assert!(!f.approvals.has_pending());
     }
 

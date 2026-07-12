@@ -48,6 +48,9 @@ const setSetting = mock((_runnerId: string, key: string, value: string): Promise
 const listToolPolicies = mock(() => Promise.resolve(ok([])));
 const deleteToolPolicy = mock(() => Promise.resolve(ok(null)));
 const pickDirectory = mock((): Promise<string | null> => Promise.resolve(null));
+// SettingsView now mounts <AuditCard/>, which calls commands.listAudit on mount
+// — stub it (empty feed) so mounting the view doesn't throw.
+const listAudit = mock(async (_limit: number) => ok([]));
 
 // Mock the Tauri IPC boundary before the view (and the stores it pulls in) load.
 mock.module("@/bindings", () => ({
@@ -60,6 +63,7 @@ mock.module("@/bindings", () => ({
     getAgentSettings,
     setAgentSettings,
     listSelectableModels,
+    listAudit,
   },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));

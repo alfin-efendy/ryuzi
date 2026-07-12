@@ -35,6 +35,9 @@ mock.module("@/bindings", () => ({
     sessionRuntimeInfo: async () => ({ status: "ok" as const, data: null }),
     listProviderCatalog: async () => [],
     listConnections: async () => [],
+    // SessionView's orch task-strip effect fires this on mount; an empty
+    // result means no strip mounts (see SessionView.test.tsx's stub note).
+    orchListRoots: async () => ({ status: "ok" as const, data: [] }),
     // Not reached from any mount path here (Transcript is mocked away below),
     // but `mock.module` replaces "@/bindings" process-wide: the real
     // Transcript other test files render (e.g. ModalShells.test.tsx) resolves

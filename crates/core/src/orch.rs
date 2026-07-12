@@ -17,15 +17,13 @@ use crate::control::ControlPlane;
 use crate::domain::CoreEvent;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension};
-use serde::Serialize;
-use specta::Type;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// One row of the orchestrated task graph.
-#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct OrchTask {
     pub id: String,
@@ -34,8 +32,9 @@ pub struct OrchTask {
     pub project_id: String,
     pub title: String,
     pub body: String,
-    /// Advisory: recorded from the decomposer; worker sessions currently run
-    /// the project's default agent (start_session has no agent selection yet).
+    /// Recorded from the decomposer and resolved by name against
+    /// `AgentRegistry` when the worker session starts (falling back to the
+    /// registry's default agent for an unknown/blank name).
     pub agent: String,
     pub status: String,
     pub session_pk: Option<String>,
@@ -43,6 +42,16 @@ pub struct OrchTask {
     pub error: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
+    /// The originating chat session (root only) — where worker bubbles post
+    /// and the aggregate outcome re-enters over the rail. `None` for goals
+    /// submitted without a home chat (CLI/tests).
+    pub home_session_pk: Option<String>,
+    /// Consecutive failed attempts for this child (circuit breaker input).
+    pub consecutive_failures: i64,
+    /// The breaker tripped: this child exhausted its retries and stays failed.
+    pub gave_up: bool,
+    /// Accumulated mid-run user guidance (root only), fed to the judge prompt.
+    pub steer_note: Option<String>,
 }
 
 /// One subtask planned by the decomposer, before insertion.
@@ -180,10 +189,13 @@ fn check_acyclic(tasks: &[PlannedTask]) -> anyhow::Result<()> {
 // Persistence
 // ---------------------------------------------------------------------------
 
-const ORCH_COLS: &str =
-    "id,root_id,project_id,title,body,agent,status,session_pk,result,error,created_at,finished_at";
+/// Column list shared with [`crate::store::Store::task_by_session`] so it can
+/// build an [`OrchTask`] without duplicating the schema.
+pub(crate) const ORCH_COLS: &str =
+    "id,root_id,project_id,title,body,agent,status,session_pk,result,error,created_at,finished_at,\
+     home_session_pk,consecutive_failures,gave_up,steer_note";
 
-fn task_from(r: &rusqlite::Row) -> rusqlite::Result<OrchTask> {
+pub(crate) fn task_from(r: &rusqlite::Row) -> rusqlite::Result<OrchTask> {
     Ok(OrchTask {
         id: r.get(0)?,
         root_id: r.get(1)?,
@@ -197,6 +209,10 @@ fn task_from(r: &rusqlite::Row) -> rusqlite::Result<OrchTask> {
         error: r.get(9)?,
         created_at: r.get(10)?,
         finished_at: r.get(11)?,
+        home_session_pk: r.get(12)?,
+        consecutive_failures: r.get(13)?,
+        gave_up: r.get::<_, i64>(14)? != 0,
+        steer_note: r.get(15)?,
     })
 }
 
@@ -210,22 +226,24 @@ pub async fn insert_root(
     project_id: &str,
     goal: &str,
     status: &str,
+    home_session_pk: Option<&str>,
 ) -> anyhow::Result<String> {
     let id = new_task_id();
     let title: String = goal.chars().take(80).collect();
-    let (id2, project_id, goal, status, now) = (
+    let (id2, project_id, goal, status, home, now) = (
         id.clone(),
         project_id.to_string(),
         goal.to_string(),
         status.to_string(),
+        home_session_pk.map(str::to_string),
         crate::paths::now_ms(),
     );
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO orch_tasks(id,root_id,project_id,title,body,agent,status,created_at) \
-                 VALUES (?1,NULL,?2,?3,?4,'',?5,?6)",
-                params![id2, project_id, title, goal, status, now],
+                "INSERT INTO orch_tasks(id,root_id,project_id,title,body,agent,status,created_at,home_session_pk) \
+                 VALUES (?1,NULL,?2,?3,?4,'',?5,?6,?7)",
+                params![id2, project_id, title, goal, status, now, home],
             )
             .map(|_| ())
         })
@@ -318,6 +336,14 @@ pub async fn get_task(store: &Store, id: &str) -> anyhow::Result<Option<OrchTask
             .optional()
         })
         .await
+}
+
+/// The home chat of a task's root (workers post bubbles + deliver into it).
+pub async fn home_session(store: &Store, task: &OrchTask) -> anyhow::Result<Option<String>> {
+    let root_id = task.root_id.clone().unwrap_or_else(|| task.id.clone());
+    Ok(get_task(store, &root_id)
+        .await?
+        .and_then(|r| r.home_session_pk))
 }
 
 /// Flip `todo` children whose dependencies are all `done` to `ready`.
@@ -427,6 +453,21 @@ pub async fn finish_task(
         .await
 }
 
+/// Flag a task as having exhausted retries, without touching its other
+/// outcome fields. A worker that fails without ever entering the
+/// [`Store::record_child_failure`] retry loop (namely a START failure —
+/// the session never got created, so there is nothing to retry) still needs
+/// to read as `gave_up` for [`roots_with_failed_children`] to sweep its root.
+async fn mark_gave_up(store: &Store, id: &str) -> anyhow::Result<()> {
+    let id = id.to_string();
+    store
+        .with_conn(move |c| {
+            c.execute("UPDATE orch_tasks SET gave_up=1 WHERE id=?1", params![id])
+                .map(|_| ())
+        })
+        .await
+}
+
 /// Cancel a task and (for roots) every unfinished child. Running sessions are
 /// not killed — their results are discarded by the `finish_task` guard.
 /// Returns how many rows were cancelled.
@@ -438,7 +479,7 @@ pub async fn cancel_tree(store: &Store, id: &str) -> anyhow::Result<u32> {
             let n = c.execute(
                 "UPDATE orch_tasks SET status='cancelled', finished_at=?2 \
                  WHERE (id=?1 OR root_id=?1) \
-                 AND status IN ('todo','ready','running','waiting','judging','decomposing')",
+                 AND status IN ('todo','ready','running','waiting','judging','decomposing','blocked')",
                 params![id, now],
             )?;
             Ok(n as u32)
@@ -545,6 +586,9 @@ pub async fn roots_ready_to_judge(store: &Store) -> anyhow::Result<Vec<OrchTask>
 }
 
 /// `waiting` roots with terminally-failed children, plus a failure digest.
+/// A child only counts once it has `gave_up` — merely `failed` (retrying
+/// behind the circuit breaker, transiently `failed`→`todo`) must not fail
+/// the root out from under a retry in flight.
 pub async fn roots_with_failed_children(store: &Store) -> anyhow::Result<Vec<(OrchTask, String)>> {
     let roots: Vec<OrchTask> = store
         .with_conn(|c| {
@@ -552,7 +596,7 @@ pub async fn roots_with_failed_children(store: &Store) -> anyhow::Result<Vec<(Or
                 "SELECT {ORCH_COLS} FROM orch_tasks r WHERE r.root_id IS NULL \
                  AND r.status='waiting' \
                  AND EXISTS (SELECT 1 FROM orch_tasks ch WHERE ch.root_id = r.id \
-                    AND ch.status IN ('failed','cancelled'))"
+                    AND ((ch.status='failed' AND ch.gave_up=1) OR ch.status='cancelled'))"
             ))?;
             let rows = stmt.query_map([], task_from)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -607,6 +651,44 @@ pub async fn set_status(
         .await
 }
 
+/// Resume a blocked worker at the moment its answer is delivered over the rail
+/// (spec §8). Called by the background-rail drainer for a `kind='unblock'`
+/// event BEFORE it re-enters the worker's turn, so the flip is causal with the
+/// answer's delivery (never a session-status guess). This is what makes
+/// `watch_session`'s bare-status read of the post-resume `Result` correct:
+/// the drainer can only claim (and thus flip) once the block turn's session is
+/// idle, and `spawn_prompt` broadcasts that turn's `Result` BEFORE demoting the
+/// session to idle — so a parked `watch_session` has already observed the task
+/// as `blocked` before any flip is possible. No-op if the target session has no
+/// `blocked` orch task (defensive).
+pub async fn on_unblock_delivered(cp: &Arc<ControlPlane>, worker_session_pk: &str) {
+    let store = cp.store();
+    if let Ok(Some(task)) = store.task_by_session(worker_session_pk).await {
+        if task.status == "blocked"
+            && set_status(store, &task.id, "blocked", "running")
+                .await
+                .unwrap_or(false)
+        {
+            emit_changed(cp, &task.id, task.root_id.clone(), "running");
+        }
+    }
+}
+
+/// Every currently `blocked` task, for `tick`'s live status announcement —
+/// re-emitted each pass so Cockpit's task strip (a pure status upsert) stays
+/// in sync even across a daemon restart.
+async fn list_blocked(store: &Store) -> anyhow::Result<Vec<OrchTask>> {
+    store
+        .with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ORCH_COLS} FROM orch_tasks WHERE status='blocked'"
+            ))?;
+            let rows = stmt.query_map([], task_from)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+}
+
 /// Fail a root from any non-terminal state, recording the error.
 pub async fn fail_root(store: &Store, id: &str, error: &str) -> anyhow::Result<bool> {
     let (id, error) = (id.to_string(), error.to_string());
@@ -635,23 +717,70 @@ fn emit_changed(cp: &Arc<ControlPlane>, task_id: &str, root_id: Option<String>, 
     });
 }
 
+/// Emit the `cancelled` changed-event for a root after [`cancel_tree`]. A
+/// thin public wrapper so the orch RPC family (spec §8) can notify Cockpit
+/// without reaching into [`emit_changed`]'s private signature.
+pub fn emit_root_cancelled(cp: &Arc<ControlPlane>, root_id: &str) {
+    emit_changed(cp, root_id, None, "cancelled");
+}
+
+/// What a typed home-chat message did to a live orchestration (spec §8:
+/// steer-the-orchestrator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    NoOrchestration,
+    Noted,
+    Cancelled,
+}
+
+/// Route a message typed into a home chat while an orchestration is running:
+/// a cancel directive cancels the tree; anything else is recorded as guidance
+/// the judge will see. Returns `NoOrchestration` when no live root is bound.
+pub async fn note_steer(
+    cp: &Arc<ControlPlane>,
+    home_session_pk: &str,
+    text: &str,
+) -> anyhow::Result<SteerOutcome> {
+    let Some(root) = cp.store().live_root_for_home(home_session_pk).await? else {
+        return Ok(SteerOutcome::NoOrchestration);
+    };
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("cancel") || t.eq_ignore_ascii_case("/cancel") {
+        cancel_tree(cp.store(), &root.id).await?;
+        emit_changed(cp, &root.id, None, "cancelled");
+        return Ok(SteerOutcome::Cancelled);
+    }
+    cp.store().append_steer_note(&root.id, t).await?;
+    Ok(SteerOutcome::Noted)
+}
+
 /// Submit a goal for orchestrated execution. With `decompose`, an LLM plans
 /// the subtasks in the background (the root sits in `decomposing` meanwhile);
-/// otherwise the goal itself becomes the root's single subtask. Returns the
-/// root id — the dispatcher loop picks the work up on its next tick.
+/// otherwise the goal itself becomes the root's single subtask. `home_session_pk`
+/// is the originating chat (if any) worker bubbles post into and the aggregate
+/// outcome re-enters over the rail. Returns the root id — the dispatcher loop
+/// picks the work up on its next tick.
 pub async fn submit(
     cp: &Arc<ControlPlane>,
     project_id: &str,
     goal: &str,
     decompose: bool,
+    home_session_pk: Option<&str>,
 ) -> anyhow::Result<String> {
     if cp.store().get_project(project_id).await?.is_none() {
         anyhow::bail!("unknown project: {project_id}");
     }
     if !decompose {
-        return submit_with_plan(cp, project_id, goal, single_task_plan(goal)).await;
+        return submit_with_plan(
+            cp,
+            project_id,
+            goal,
+            single_task_plan(goal),
+            home_session_pk,
+        )
+        .await;
     }
-    let root = insert_root(cp.store(), project_id, goal, "decomposing").await?;
+    let root = insert_root(cp.store(), project_id, goal, "decomposing", home_session_pk).await?;
     emit_changed(cp, &root, None, "decomposing");
     let (cp2, root2, project_id, goal) = (
         cp.clone(),
@@ -692,12 +821,21 @@ pub fn single_task_plan(goal: &str) -> Vec<PlannedTask> {
 /// Store-only goal submission (no events, no ControlPlane): validate the
 /// project, insert a `waiting` root plus the single-task plan. Used by the
 /// CLI, whose daemonless process has no event bus; a running daemon host's
-/// dispatcher picks the rows up on its next tick.
-pub async fn queue_goal(store: &Store, project_id: &str, goal: &str) -> anyhow::Result<String> {
+/// dispatcher picks the rows up on its next tick. `home_session_pk` is
+/// threaded straight to `insert_root`. No in-tree caller passes a home today
+/// (a daemonless enqueue has no chat to bind a home session to), but the
+/// parameter exists so a future caller with a real chat doesn't need a
+/// signature change.
+pub async fn queue_goal(
+    store: &Store,
+    project_id: &str,
+    goal: &str,
+    home_session_pk: Option<&str>,
+) -> anyhow::Result<String> {
     if store.get_project(project_id).await?.is_none() {
         anyhow::bail!("unknown project: {project_id}");
     }
-    let root = insert_root(store, project_id, goal, "waiting").await?;
+    let root = insert_root(store, project_id, goal, "waiting", home_session_pk).await?;
     insert_children(store, &root, project_id, &single_task_plan(goal)).await?;
     Ok(root)
 }
@@ -709,8 +847,9 @@ pub async fn submit_with_plan(
     project_id: &str,
     goal: &str,
     plan: Vec<PlannedTask>,
+    home_session_pk: Option<&str>,
 ) -> anyhow::Result<String> {
-    let root = insert_root(cp.store(), project_id, goal, "waiting").await?;
+    let root = insert_root(cp.store(), project_id, goal, "waiting", home_session_pk).await?;
     let ids = insert_children(cp.store(), &root, project_id, &plan).await?;
     emit_changed(cp, &root, None, "waiting");
     for id in &ids {
@@ -822,6 +961,11 @@ pub async fn decompose_goal(
 /// How long one worker/judge session may run before the watcher gives up.
 const SESSION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// How many times a worker child may re-run after a RUN failure (a failed
+/// session, not a failed start) before the circuit breaker trips and the
+/// child — and eventually its root — fails for real.
+pub const MAX_TASK_RETRIES: i64 = 2;
+
 /// The `max_concurrent_runs` setting (default 3, floor 1).
 async fn max_concurrent(store: &Store) -> usize {
     crate::settings::usize_setting(store, "max_concurrent_runs", 3).await
@@ -840,11 +984,26 @@ pub async fn run_loop(cp: Arc<ControlPlane>) {
     }
 }
 
-/// One dispatcher pass: promote unblocked tasks, start workers up to the
-/// concurrency cap, then settle roots (failure digests / judge sessions).
-/// Factored out of [`run_loop`] so tests can drive it without sleeping.
+/// One dispatcher pass: announce live blocks, promote ready tasks, start
+/// workers up to the concurrency cap, then settle roots (failure digests /
+/// judge sessions). Blocked workers resume event-driven at unblock delivery
+/// (`on_unblock_delivered`), not here. Factored out of [`run_loop`] so tests
+/// can drive it without sleeping.
 pub async fn tick(cp: &Arc<ControlPlane>) {
     let store = cp.store();
+    // Blocked workers resume event-driven, at unblock DELIVERY on the rail
+    // (`on_unblock_delivered`, called by the background-rail drainer) — NOT by
+    // polling session status here. A `blocked` task whose session is `running`
+    // is the block-turn tail (the turn ends after `orch_block`), not an
+    // answered block, so a status poll would false-resume it. See the doc on
+    // `on_unblock_delivered`.
+    // Announce every still-blocked task live so Cockpit's task strip renders
+    // the block card even across a daemon restart. Idempotent by design —
+    // the strip arm is a pure status upsert, so repeats each pass are
+    // harmless.
+    for t in list_blocked(store).await.unwrap_or_default() {
+        emit_changed(cp, &t.id, t.root_id.clone(), "blocked");
+    }
     if let Ok(promoted) = promote_ready(store).await {
         for id in &promoted {
             if let Ok(Some(t)) = get_task(store, id).await {
@@ -863,10 +1022,8 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
     }
     if let Ok(failed) = roots_with_failed_children(store).await {
         for (root, digest) in failed {
-            if fail_root(store, &root.id, &format!("subtasks failed: {digest}"))
-                .await
-                .unwrap_or(false)
-            {
+            let verdict = format!("subtasks failed: {digest}");
+            if fail_root(store, &root.id, &verdict).await.unwrap_or(false) {
                 emit_changed(cp, &root.id, None, "failed");
                 // Park the dead goal's queued siblings (the live-root guards
                 // in promote/claim also stop them; this records the outcome).
@@ -877,6 +1034,10 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("orch: sibling cancel failed: {e}"),
                 }
+                // Re-enter the failure into the home chat too (spec §8), same
+                // as the judge's `done` path — a failed root is still an
+                // outcome the originating chat should see.
+                deliver_outcome(cp, &root, &verdict).await;
             }
         }
     }
@@ -894,39 +1055,144 @@ async fn start_worker(cp: &Arc<ControlPlane>, t: OrchTask) {
     // Subscribe BEFORE starting so a fast turn can't slip past the watcher.
     let rx = cp.subscribe();
     let prompt = format!("[Orchestrated subtask: {}]\n\n{}", t.title, t.body);
+    let home = home_session(store, &t).await.unwrap_or(None);
     let session = match cp
-        .start_session(&t.project_id, &prompt, "orchestrator", &[])
+        .start_session_with_prompt(
+            &t.project_id,
+            crate::harness::TurnPrompt::text(prompt.clone(), prompt),
+            "orchestrator",
+            &[],
+            None,
+            None,
+            None,
+            Some(crate::control::WorkerBinding {
+                agent: t.agent.clone(),
+                home_session_pk: home,
+            }),
+        )
         .await
     {
         Ok(s) => s,
         Err(e) => {
+            // A START failure (the session itself couldn't be created) never
+            // enters the run-failure retry loop below — it fails for good on
+            // the spot, so it's flagged `gave_up` immediately rather than
+            // going through `record_child_failure`.
             let _ = finish_task(store, &t.id, "running", "failed", None, Some(e.to_string())).await;
+            let _ = mark_gave_up(store, &t.id).await;
             emit_changed(cp, &t.id, t.root_id.clone(), "failed");
             return;
         }
     };
     let _ = set_task_session(store, &t.id, &session.session_pk).await;
     emit_changed(cp, &t.id, t.root_id.clone(), "running");
-    let (cp2, task_id, root_id, session_pk) = (
+    // Start bubble: labels the worker's agent in the home chat the moment it
+    // begins, so a live group-chat view sees who picked up the subtask. Best
+    // effort — a goal submitted without a home chat (CLI/tests) has no `home`
+    // to post into, and a failed post must never abort the worker.
+    if let Ok(Some(home)) = home_session(store, &t).await {
+        let _ = cp
+            .post_speaker_bubble(&home, &t.agent, "status", &format!("started: {}", t.title))
+            .await;
+    }
+    let (cp2, task_id, root_id, session_pk, task) = (
         cp.clone(),
         t.id.clone(),
         t.root_id.clone(),
         session.session_pk.clone(),
+        t.clone(),
     );
     tokio::spawn(async move {
-        let outcome = watch_session(cp2.store(), rx, &session_pk).await;
-        let (status, result, error) = match outcome {
+        let outcome = watch_session(cp2.store(), rx, &session_pk, &task_id).await;
+        match outcome {
             Ok(()) => {
                 let report = crate::scheduler::final_assistant_text(cp2.store(), &session_pk).await;
-                ("done", report, None)
+                // Report bubble: the worker's final assistant text, posted
+                // into the home chat BEFORE `finish_task` settles the row —
+                // mirrors the start bubble's best-effort/home-chat gating
+                // above.
+                if let (Ok(Some(home)), Some(report)) =
+                    (home_session(cp2.store(), &task).await, report.clone())
+                {
+                    let _ = cp2
+                        .post_speaker_bubble(&home, &task.agent, "text", &report)
+                        .await;
+                }
+                match finish_task(cp2.store(), &task_id, "running", "done", report, None).await {
+                    Ok(true) => emit_changed(&cp2, &task_id, root_id, "done"),
+                    _ => tracing::debug!("orch: task {task_id} outcome discarded (cancelled?)"),
+                }
             }
-            Err(e) => ("failed", None, Some(e)),
-        };
-        match finish_task(cp2.store(), &task_id, "running", status, result, error).await {
-            Ok(true) => emit_changed(&cp2, &task_id, root_id, status),
-            _ => tracing::debug!("orch: task {task_id} outcome discarded (cancelled?)"),
+            Err(e) => {
+                // Retry behind the circuit breaker instead of failing the
+                // root on the first stumble: a RUN failure (unlike a START
+                // failure above, which fails immediately) re-queues the
+                // child (`todo`) for another attempt, up to
+                // MAX_TASK_RETRIES, before the breaker trips and the child —
+                // and eventually its root, via `roots_with_failed_children`
+                // — fails for real.
+                match cp2
+                    .store()
+                    .record_child_failure(&task_id, MAX_TASK_RETRIES)
+                    .await
+                {
+                    Ok(f) if f.requeued => {
+                        // Re-queued; the existing `claim_ready` dispatcher
+                        // re-promotes it on a later tick like any other
+                        // `todo` task — no separate retry scheduling needed.
+                        emit_changed(&cp2, &task_id, root_id, "todo")
+                    }
+                    Ok(_) => emit_changed(&cp2, &task_id, root_id, "failed"), // gave_up recorded already
+                    Err(_) => {
+                        match finish_task(cp2.store(), &task_id, "running", "failed", None, Some(e))
+                            .await
+                        {
+                            Ok(true) => {
+                                // Symmetry with the START-failure path (see
+                                // `mark_gave_up` above): a child failed via this
+                                // fallback must be `gave_up`-visible to the
+                                // `roots_with_failed_children` sweep, or its root
+                                // would wait forever — there is no waiting-root
+                                // reaper. Only reachable under a genuine transient
+                                // DB fault (the common `QueryReturnedNoRows` race
+                                // no-ops via the `expected="running"` guard).
+                                let _ = mark_gave_up(cp2.store(), &task_id).await;
+                                emit_changed(&cp2, &task_id, root_id, "failed");
+                            }
+                            _ => tracing::debug!(
+                                "orch: task {task_id} outcome discarded (cancelled?)"
+                            ),
+                        }
+                    }
+                }
+            }
         }
     });
+}
+
+/// Post the root's final verdict as an `"orchestrator"` bubble AND re-enter it
+/// into the home chat over the rail (spec §8: orchestrator output re-enters
+/// the originating chat). The rail delivery is the ONLY turn-driving path —
+/// the daemon's background-rail drainer injects it as a clean new user turn
+/// once the home chat is idle (never mid-turn). Both the bubble post and the
+/// rail enqueue are best-effort: a delivery failure must not fail or abort
+/// judge/orchestration completion.
+async fn deliver_outcome(cp: &Arc<ControlPlane>, root: &OrchTask, verdict: &str) {
+    let Some(home) = root.home_session_pk.as_deref() else {
+        return; // headless submit (CLI/tests) — nothing to deliver into
+    };
+    let _ = cp
+        .post_speaker_bubble(home, "orchestrator", "text", verdict)
+        .await;
+    let block = format!(
+        "[ORCHESTRATION COMPLETE — {}] The orchestrated goal below finished. \
+         The full verdict from the orchestrator follows.\n\nGoal:\n{}\n\nVerdict:\n{}",
+        root.id, root.body, verdict
+    );
+    let _ = cp
+        .store()
+        .enqueue_background_event(home, "orch", &block)
+        .await;
 }
 
 /// Start the judge session for a root whose children are all done.
@@ -967,7 +1233,7 @@ async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
     let _ = set_task_session(store, &root.id, &session.session_pk).await;
     let (cp2, root_id, session_pk) = (cp.clone(), root.id.clone(), session.session_pk.clone());
     tokio::spawn(async move {
-        let outcome = watch_session(cp2.store(), rx, &session_pk).await;
+        let outcome = watch_session(cp2.store(), rx, &session_pk, &root_id).await;
         let changed = match outcome {
             Ok(()) => {
                 let verdict =
@@ -977,13 +1243,18 @@ async fn start_judge(cp: &Arc<ControlPlane>, root: OrchTask) {
             Err(e) => finish_task(cp2.store(), &root_id, "judging", "failed", None, Some(e)).await,
         };
         if changed.unwrap_or(false) {
-            let status = get_task(cp2.store(), &root_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|t| t.status)
+            let root_now = get_task(cp2.store(), &root_id).await.ok().flatten();
+            let status = root_now
+                .as_ref()
+                .map(|t| t.status.clone())
                 .unwrap_or_else(|| "done".into());
             emit_changed(&cp2, &root_id, None, &status);
+            if let Some(root_now) = root_now {
+                if status == "done" {
+                    let verdict = root_now.result.clone().unwrap_or_default();
+                    deliver_outcome(&cp2, &root_now, &verdict).await;
+                }
+            }
         }
     });
 }
@@ -1004,6 +1275,11 @@ fn judge_prompt(root: &OrchTask, children: &[OrchTask]) -> String {
             .collect();
         s.push_str(&format!("- {}: {report}\n", c.title));
     }
+    if let Some(note) = root.steer_note.as_deref().filter(|n| !n.trim().is_empty()) {
+        s.push_str(&format!(
+            "\nThe user added guidance mid-run — honor it:\n{note}\n"
+        ));
+    }
     s.push_str(
         "\nVerify the goal is satisfied by these outcomes; fix small gaps yourself \
          where possible. Reply with one final report of the overall outcome.",
@@ -1015,15 +1291,28 @@ fn judge_prompt(root: &OrchTask, children: &[OrchTask]) -> String {
 /// scheduler's watcher shape, 2h deadline). A lagged receiver may have missed
 /// the terminal event entirely, so on `Lagged` the session row is consulted:
 /// a session no longer `Running` finished while we weren't looking.
+///
+/// `task_id` lets a `Result` (or a `Lagged`-observed idle session) tolerate a
+/// blocked worker (spec §8, Task E6): `orch_block` ends the worker's turn
+/// cleanly WITHOUT finishing its subtask, so a bare `Result` there is not the
+/// real outcome — the task's own status disambiguates. While the task reads
+/// `blocked`, keep waiting for the post-unblock terminal event that arrives
+/// once the rail delivers the human's answer and the worker resumes.
 async fn watch_session(
     store: &Store,
     mut rx: broadcast::Receiver<CoreEvent>,
     session_pk: &str,
+    task_id: &str,
 ) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + SESSION_DEADLINE;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Ok(CoreEvent::Result { session_pk: pk })) if pk == session_pk => return Ok(()),
+            Ok(Ok(CoreEvent::Result { session_pk: pk })) if pk == session_pk => {
+                match get_task(store, task_id).await {
+                    Ok(Some(t)) if t.status == "blocked" => continue,
+                    _ => return Ok(()),
+                }
+            }
             Ok(Ok(CoreEvent::Error {
                 session_pk: pk,
                 message,
@@ -1032,7 +1321,10 @@ async fn watch_session(
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
                 if let Ok(Some(session)) = store.get_session(session_pk).await {
                     if session.status != crate::domain::SessionStatus::Running {
-                        return Ok(()); // terminal event was among the drops
+                        match get_task(store, task_id).await {
+                            Ok(Some(t)) if t.status == "blocked" => continue,
+                            _ => return Ok(()), // terminal event was among the drops
+                        }
                     }
                 }
                 continue;
@@ -1150,7 +1442,9 @@ mod tests {
     #[tokio::test]
     async fn promotion_follows_dependencies() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "the goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "the goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1180,7 +1474,9 @@ mod tests {
     #[tokio::test]
     async fn claim_respects_concurrency_cap() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let plan: Vec<PlannedTask> = (0..4)
             .map(|i| PlannedTask {
                 title: format!("t{i}"),
@@ -1205,7 +1501,9 @@ mod tests {
     #[tokio::test]
     async fn judge_readiness_and_failure_digest() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1219,6 +1517,11 @@ mod tests {
         finish_task(&s, &ids[1], "running", "failed", None, Some("boom".into()))
             .await
             .unwrap();
+        // `roots_with_failed_children` only sweeps a root once a child has
+        // `gave_up` — a bare `failed` status alone could still be mid-retry
+        // behind the circuit breaker. This test drives a permanent failure
+        // directly (bypassing the retry loop), so flag it explicitly.
+        mark_gave_up(&s, &ids[1]).await.unwrap();
 
         let failed = roots_with_failed_children(&s).await.unwrap();
         assert_eq!(failed.len(), 1);
@@ -1226,7 +1529,9 @@ mod tests {
         assert!(failed[0].1.contains("boom"), "{}", failed[0].1);
 
         // A fully-done tree instead becomes judge-ready.
-        let root2 = insert_root(&s, "p1", "goal2", "waiting").await.unwrap();
+        let root2 = insert_root(&s, "p1", "goal2", "waiting", None)
+            .await
+            .unwrap();
         let ids2 = insert_children(
             &s,
             &root2,
@@ -1263,7 +1568,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_tree_spares_finished_children_and_guards_races() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1315,6 +1622,7 @@ mod tests {
                     tool_call_id: None,
                     status: None,
                     tool_kind: None,
+                    speaker: None,
                 })
                 .await?;
             Ok(())
@@ -1434,6 +1742,7 @@ mod tests {
                     parents: vec![0],
                 },
             ],
+            None,
         )
         .await
         .unwrap();
@@ -1476,6 +1785,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_posts_start_and_report_bubbles_into_the_home_chat() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        // A real idle home chat to receive the bubbles.
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        // Drive the plan to completion (EchoHarness ends the worker turn quickly).
+        drive_until(&cp, &root, "done", 10_000).await;
+        let rows = cp.store().list_messages(&home.session_pk).await.unwrap();
+        // A start bubble (status) and a report bubble (text), both labeled "build".
+        assert!(rows
+            .iter()
+            .any(|m| m.speaker.as_deref() == Some("build") && m.block_type == "status"));
+        assert!(rows
+            .iter()
+            .any(|m| m.speaker.as_deref() == Some("build") && m.block_type == "text"));
+    }
+
+    #[tokio::test]
+    async fn typing_into_the_home_chat_steers_or_cancels_the_orchestration() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some("home-9"),
+        )
+        .await
+        .unwrap();
+        // A note accumulates on the live root.
+        assert_eq!(
+            note_steer(&cp, "home-9", "prefer TypeScript")
+                .await
+                .unwrap(),
+            SteerOutcome::Noted
+        );
+        let t = get_task(cp.store(), &root).await.unwrap().unwrap();
+        assert!(t
+            .steer_note
+            .as_deref()
+            .unwrap()
+            .contains("prefer TypeScript"));
+        // The judge prompt surfaces it.
+        let children = list_tasks(cp.store(), Some(&root)).await.unwrap();
+        assert!(judge_prompt(&t, &children).contains("prefer TypeScript"));
+        // A cancel directive cancels the tree.
+        assert_eq!(
+            note_steer(&cp, "home-9", "/cancel").await.unwrap(),
+            SteerOutcome::Cancelled
+        );
+        assert_eq!(
+            get_task(cp.store(), &root).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+        // No live orchestration for an unrelated chat.
+        assert_eq!(
+            note_steer(&cp, "home-nope", "hi").await.unwrap(),
+            SteerOutcome::NoOrchestration
+        );
+    }
+
+    #[tokio::test]
+    async fn root_completion_enqueues_an_orch_rail_event_to_the_home_chat() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        drive_until(&cp, &root, "done", 10_000).await;
+        // Exactly one pending 'orch' rail row targets the home chat with the marker.
+        let ev = cp
+            .store()
+            .claim_deliverable_background_event("t")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.target_session_pk, home.session_pk);
+        assert_eq!(ev.kind, "orch");
+        assert!(ev.payload.contains("[ORCHESTRATION COMPLETE"));
+        // Nothing else pending — exactly one row was enqueued for this root.
+        assert!(cp
+            .store()
+            .claim_deliverable_background_event("t2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn block_and_answer_round_trips_over_the_rail() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        tick(&cp).await; // start the worker
+        let child = list_tasks(cp.store(), Some(&root))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.root_id.is_some())
+            .unwrap();
+        let worker_pk = child.session_pk.clone().unwrap();
+        // Simulate the worker calling `orch_block`: task → blocked. This must
+        // win the race against EchoHarness's own near-instant completion (its
+        // background `watch_session` would otherwise flip the task straight
+        // to `done`), so it runs immediately after starting the worker with
+        // no extra yields in between.
+        assert!(set_status(cp.store(), &child.id, "running", "blocked")
+            .await
+            .unwrap());
+        // The user answers.
+        assert!(cp
+            .answer_orch_block(&child.id, "use port 8080")
+            .await
+            .unwrap());
+        // The worker's session-start (git worktree prep + harness start +
+        // EchoSession's send_prompt) finishes in a background task; wait for
+        // it to settle the session back to idle. With the task already
+        // `blocked`, `watch_session` tolerates the turn's `Result` event
+        // (Task E6) instead of finishing the task, so the session goes idle
+        // without ever reaching `done`.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(5_000);
+        loop {
+            let s = cp.store().get_session(&worker_pk).await.unwrap().unwrap();
+            if s.status == crate::domain::SessionStatus::Idle {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker session never went idle (stuck at {:?})",
+                s.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Confirm the task is still `blocked`, not raced to `done`.
+        let after = get_task(cp.store(), &child.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "blocked");
+        // An 'unblock' rail row now targets the WORKER session with the
+        // answer (the worker session is idle after a blocked turn, so it is
+        // deliverable).
+        let ev = cp
+            .store()
+            .claim_deliverable_background_event("t")
+            .await
+            .unwrap()
+            .expect("an unblock row must be pending for the worker");
+        assert_eq!(ev.kind, "unblock");
+        assert_eq!(ev.target_session_pk, worker_pk);
+        assert!(ev.payload.contains("use port 8080"));
+    }
+
+    #[tokio::test]
     async fn worker_start_failure_fails_task_then_root() {
         let (cp, _repo) = cp_with_project().await;
         // A project rooted at a nonexistent work_dir: EchoHarness::start_session
@@ -1504,6 +2027,7 @@ mod tests {
                 agent: "build".into(),
                 parents: vec![],
             }],
+            None,
         )
         .await
         .unwrap();
@@ -1523,7 +2047,7 @@ mod tests {
     #[tokio::test]
     async fn submit_without_decompose_queues_a_single_child() {
         let (cp, _repo) = cp_with_project().await;
-        let root = submit(&cp, "p1", "just do it", false).await.unwrap();
+        let root = submit(&cp, "p1", "just do it", false, None).await.unwrap();
         let tasks = list_tasks(cp.store(), Some(&root)).await.unwrap();
         let (roots, children): (Vec<_>, Vec<_>) =
             tasks.into_iter().partition(|t| t.root_id.is_none());
@@ -1533,13 +2057,56 @@ mod tests {
         assert_eq!(children[0].status, "todo");
         assert_eq!(children[0].body, "just do it");
         // Unknown projects are rejected up front.
-        assert!(submit(&cp, "nope", "x", false).await.is_err());
+        assert!(submit(&cp, "nope", "x", false, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_session_runs_its_assigned_agent_and_binds_the_home_chat() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        // Two-task plan with distinct assignees.
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "plan".into(),
+                parents: vec![],
+            }],
+            Some("home-42"),
+        )
+        .await
+        .unwrap();
+        tick(&cp).await; // promote + claim + start_worker
+                         // The claimed child now has a worker session with the right shape.
+        let child = list_tasks(cp.store(), Some(&root))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.root_id.is_some())
+            .unwrap();
+        let s = cp
+            .store()
+            .get_session(child.session_pk.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.kind, crate::domain::SessionKind::Worker);
+        assert_eq!(s.agent.as_deref(), Some("plan"));
+        assert_eq!(s.speaker.as_deref(), Some("plan"));
+        assert_eq!(s.parent_session_pk.as_deref(), Some("home-42"));
     }
 
     #[tokio::test]
     async fn dead_roots_park_their_remaining_children() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1552,7 +2119,9 @@ mod tests {
     #[tokio::test]
     async fn retry_child_revives_failed_root_and_cancelled_siblings() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1580,12 +2149,16 @@ mod tests {
     async fn retry_root_requeues_failed_children_but_not_childless_roots() {
         let s = store().await;
         // Childless failed root (decomposition failure): nothing to re-run.
-        let bare = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let bare = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         fail_root(&s, &bare, "no plan").await.unwrap();
         assert!(!retry_task(&s, &bare).await.unwrap());
 
         // Root with failed children: everything re-queues.
-        let root = insert_root(&s, "p1", "goal2", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal2", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1607,7 +2180,7 @@ mod tests {
     #[tokio::test]
     async fn attach_plan_inserts_nothing_for_a_cancelled_root() {
         let (cp, _repo) = cp_with_project().await;
-        let root = insert_root(cp.store(), "p1", "goal", "decomposing")
+        let root = insert_root(cp.store(), "p1", "goal", "decomposing", None)
             .await
             .unwrap();
         // Cancelled while the (simulated) LLM planning was in flight.
@@ -1625,7 +2198,9 @@ mod tests {
     #[tokio::test]
     async fn retry_requeues_only_failed_tasks() {
         let s = store().await;
-        let root = insert_root(&s, "p1", "goal", "waiting").await.unwrap();
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
         let ids = insert_children(&s, &root, "p1", &plan_ab_c())
             .await
             .unwrap();
@@ -1641,5 +2216,223 @@ mod tests {
         assert!(a.error.is_none());
         // Non-failed tasks refuse.
         assert!(!retry_task(&s, &ids[1]).await.unwrap());
+    }
+
+    // -- block-for-human resume (Task E6 Fix 1) -----------------------------
+
+    /// Insert a worker session row directly in the given status/kind, bound to
+    /// a project, so a test can hand-craft the block-turn tail (task `blocked`
+    /// while the session row is still `running`).
+    async fn insert_worker_session(
+        cp: &Arc<ControlPlane>,
+        pk: &str,
+        project_id: &str,
+        status: crate::domain::SessionStatus,
+    ) {
+        let now = crate::paths::now_ms();
+        cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: pk.into(),
+                project_id: Some(project_id.into()),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: crate::domain::SessionKind::Worker,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The CRITICAL regression: a dispatcher `tick` landing in the block-turn
+    /// tail (task `blocked`, session still `running`, no answer delivered) must
+    /// NOT resume the task. The old heuristic (session `running` ⇒ resume)
+    /// would flip it to `running`; the event-driven design leaves it `blocked`.
+    #[tokio::test]
+    async fn tick_does_not_false_resume_an_unanswered_block() {
+        let (cp, _repo) = cp_with_project().await;
+        let root = submit_with_plan(
+            &cp,
+            "p1",
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+        // Promote + claim the child to `running` by hand (no real worker turn,
+        // so nothing races the state we build).
+        promote_ready(cp.store()).await.unwrap();
+        let claimed = claim_ready(cp.store(), 10).await.unwrap();
+        let child_id = claimed[0].id.clone();
+
+        // A worker session that is STILL `Running` — the block-turn tail after
+        // `orch_block` set the task `blocked` mid-turn but before `send_prompt`
+        // returned. This is exactly the shape the old poll false-resumed.
+        let worker_pk = "worker-blocktail";
+        insert_worker_session(&cp, worker_pk, "p1", crate::domain::SessionStatus::Running).await;
+        set_task_session(cp.store(), &child_id, worker_pk)
+            .await
+            .unwrap();
+        assert!(set_status(cp.store(), &child_id, "running", "blocked")
+            .await
+            .unwrap());
+
+        // The dispatcher runs while the block sits unanswered.
+        tick(&cp).await;
+
+        let after = get_task(cp.store(), &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status, "blocked",
+            "an unanswered block must stay blocked (not resumed, not done) — \
+             session-status is NOT an answer signal"
+        );
+        let root_row = get_task(cp.store(), &root).await.unwrap().unwrap();
+        assert_eq!(root_row.status, "waiting", "the root is untouched too");
+    }
+
+    /// The IMPORTANT half: a REAL answer, delivered over the rail, resumes the
+    /// worker — driven by `on_unblock_delivered` in the drainer, with no
+    /// reliance on `tick` timing. The resumed worker then reaches `done`.
+    #[tokio::test]
+    async fn delivered_unblock_resumes_the_worker() {
+        let (cp, _repo) = cp_with_project().await;
+        let project_id = cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let home = cp
+            .start_chat_session(crate::harness::TurnPrompt::text("hi", "hi"), "test", &[])
+            .await
+            .unwrap();
+        let root = submit_with_plan(
+            &cp,
+            &project_id,
+            "goal",
+            vec![PlannedTask {
+                title: "a".into(),
+                body: "do a".into(),
+                agent: "build".into(),
+                parents: vec![],
+            }],
+            Some(&home.session_pk),
+        )
+        .await
+        .unwrap();
+        tick(&cp).await; // start the worker
+        let child = list_tasks(cp.store(), Some(&root))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.root_id.is_some())
+            .unwrap();
+        let worker_pk = child.session_pk.clone().unwrap();
+        // Worker calls `orch_block`: task → blocked (wins the race against the
+        // near-instant EchoHarness turn, as in the round-trip test).
+        assert!(set_status(cp.store(), &child.id, "running", "blocked")
+            .await
+            .unwrap());
+        // The human answers — enqueues the `unblock` rail row for the worker.
+        assert!(cp
+            .answer_orch_block(&child.id, "use port 8080")
+            .await
+            .unwrap());
+        // Let the block turn's tail settle the worker session back to idle so
+        // the unblock row is deliverable.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(5_000);
+        loop {
+            let s = cp.store().get_session(&worker_pk).await.unwrap().unwrap();
+            if s.status == crate::domain::SessionStatus::Idle {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker never went idle (stuck at {:?})",
+                s.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            get_task(cp.store(), &child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "blocked",
+            "still blocked until the answer is DELIVERED"
+        );
+
+        // Drive the background-rail drainer (the same entry the rail tests
+        // use). It claims the idle worker's `unblock` row, calls
+        // `on_unblock_delivered` to flip `blocked → running`, then re-enters
+        // the worker's turn — which EchoHarness completes, so the worker
+        // reaches `done` with no strand.
+        let done = drive_child_until(&cp, &child.id, "done", 10_000).await;
+        assert_eq!(
+            done.status, "done",
+            "the delivered answer resumed the worker to done"
+        );
+    }
+
+    /// Poll `background_rail::tick` + the child row until it reaches `target`.
+    async fn drive_child_until(
+        cp: &Arc<ControlPlane>,
+        child_id: &str,
+        target: &str,
+        max_ms: u64,
+    ) -> OrchTask {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(max_ms);
+        loop {
+            crate::background_rail::tick(cp).await;
+            let t = get_task(cp.store(), child_id).await.unwrap().unwrap();
+            if t.status == target {
+                return t;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child stuck in `{}` waiting for `{target}`",
+                t.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A cancel must clean a `blocked` child, not orphan it (the `blocked`
+    /// state was previously omitted from `cancel_tree`'s IN-list).
+    #[tokio::test]
+    async fn cancel_tree_cancels_a_blocked_child() {
+        let s = store().await;
+        let root = insert_root(&s, "p1", "goal", "waiting", None)
+            .await
+            .unwrap();
+        let ids = insert_children(&s, &root, "p1", &plan_ab_c())
+            .await
+            .unwrap();
+        promote_ready(&s).await.unwrap();
+        claim_ready(&s, 10).await.unwrap();
+        // A child blocks on a human question.
+        assert!(set_status(&s, &ids[0], "running", "blocked").await.unwrap());
+
+        let n = cancel_tree(&s, &root).await.unwrap();
+        assert!(n >= 2, "root + the blocked child (at least) were cancelled");
+        let child = get_task(&s, &ids[0]).await.unwrap().unwrap();
+        assert_eq!(
+            child.status, "cancelled",
+            "a cancel must clean the blocked child, not strand it at `blocked`"
+        );
     }
 }

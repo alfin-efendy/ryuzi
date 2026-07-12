@@ -112,6 +112,47 @@ async fn connect_mcp_tools(
     extra
 }
 
+/// Best-effort seed for a (re)started session's [`runner::NudgeState`]:
+/// `user_turns` resumes from the count of persisted user turns since the
+/// last `💾 Self-improvement review` notice (or since the session's start, if
+/// none has fired yet), so the memory-nudge interval survives a daemon
+/// restart instead of resetting to zero on every resume. `skill_iters`
+/// always restarts at 0 — the "tool iterations since last skill_manage"
+/// counter (§7.2) is a live, in-memory-only signal a resumed session cannot
+/// reconstruct from the transcript alone. Any read failure (bare test
+/// contexts with no session row, a fresh session with no history yet) is
+/// swallowed and treated as zero — hydration is a nice-to-have, not load-
+/// bearing.
+async fn seed_nudge_state(
+    store: &crate::store::Store,
+    session_pk: &str,
+) -> Arc<runner::NudgeState> {
+    let user_turns = match store.list_messages(session_pk).await {
+        Ok(messages) => {
+            let since = messages
+                .iter()
+                .rposition(|m| {
+                    m.role == "system"
+                        && m.block_type == "notice"
+                        && m.payload["text"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with(runner::SELF_IMPROVEMENT_NOTICE_PREFIX))
+                })
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            messages[since..]
+                .iter()
+                .filter(|m| m.role == "user" && m.block_type == "text")
+                .count()
+        }
+        Err(_) => 0,
+    };
+    Arc::new(runner::NudgeState {
+        user_turns: std::sync::atomic::AtomicUsize::new(user_turns),
+        skill_iters: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
 /// Gather every currently-provided extension tool (Track D, DT6) from the
 /// daemon-global extension host and wrap each as a native `Tool` — the
 /// extension analogue of `connect_mcp_tools`, called at the same session-
@@ -167,7 +208,14 @@ impl Harness for NativeHarness {
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
-        let agent = agents.default_agent();
+        // Agent-per-task: a worker session carries its assignee in `ctx.agent`
+        // (Phase 2 threaded the column through). Fall back to the default when
+        // unset (ordinary project/chat sessions) or unknown (stale roster).
+        let agent = ctx
+            .agent
+            .as_deref()
+            .and_then(|name| agents.get(name))
+            .unwrap_or_else(|| agents.default_agent());
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
@@ -207,14 +255,15 @@ impl Harness for NativeHarness {
             effort_policy.project_override = ctx.effort;
         }
         // Persistent memory is unconditional: a chat (project-less) session
-        // still gets GLOBAL memory, while a project session gets global +
-        // project scope. `at_default(None)` sets the global path and leaves
-        // the project path unset — global memory works, project-scope ops
-        // error cleanly — so previously skipping `MemoryStore` entirely for
-        // `project_id: None` needlessly denied chat sessions memory. Tool-
-        // policy lookups (below, via `RunnerDeps::project_id`) stay
-        // project-scoped and off without a project — chat sessions have no
-        // project to scope a `tool_policies` row to.
+        // still gets GLOBAL + USER memory, while a project session gets
+        // global + user + project scope. `at_default(None)` sets the global
+        // and user paths unconditionally and leaves the project path unset —
+        // global/user memory work, project-scope ops error cleanly — so
+        // previously skipping `MemoryStore` entirely for `project_id: None`
+        // needlessly denied chat sessions memory. Tool-policy lookups
+        // (below, via `RunnerDeps::project_id`) stay project-scoped and off
+        // without a project — chat sessions have no project to scope a
+        // `tool_policies` row to.
         let project_id = ctx.project_id.clone();
         let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
             project_id.as_deref(),
@@ -223,11 +272,13 @@ impl Harness for NativeHarness {
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
         let steer = steer::SteerBuffer::new();
+        let nudge = seed_nudge_state(&ctx.store, &ctx.session_pk).await;
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
+                kind: ctx.kind,
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
@@ -250,6 +301,37 @@ impl Harness for NativeHarness {
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
                 background: ctx.background,
+                // The control plane only populates `ctx.app_control` for a
+                // top-level interactive session (`kind` Project/Chat); worker,
+                // review, and bare test contexts pass `None` through.
+                app_control: ctx.app_control,
+                nudge,
+                review_tool_defs: None,
+                // Every agent tool call — even one an interactive human turn
+                // triggers — is the AGENT deciding to call a tool, not a
+                // direct human action, so a top-level Project/Chat session is
+                // `Agent` origin (tightening skill_manage's autonomous-write
+                // Every autonomous agent session (Project/Chat/Worker) runs as
+                // `Agent` so the negative-space storage guard + the skill_manage
+                // guard engage; the human acts as `User` through Cockpit/TUI. A
+                // Worker is an UNATTENDED orchestration agent — it must be at
+                // least as guarded as an attended chat, never less (avoiding the
+                // "unattended-with-more-power" inversion). Review never routes
+                // through here: its fork builds `RunnerDeps` directly with
+                // `BackgroundReview`, so the `Review` arm below is defensively
+                // dead.
+                write_origin: match ctx.kind {
+                    crate::domain::SessionKind::Project
+                    | crate::domain::SessionKind::Chat
+                    | crate::domain::SessionKind::Worker => crate::domain::WriteOrigin::Agent,
+                    // Defensively least-privileged: this arm is dead (the review
+                    // fork builds its own `RunnerDeps` with `BackgroundReview` and
+                    // never routes through here), but if ever reached it must not
+                    // grant the most-privileged `User` origin.
+                    crate::domain::SessionKind::Review => {
+                        crate::domain::WriteOrigin::BackgroundReview
+                    }
+                },
             },
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
@@ -448,6 +530,7 @@ mod tests {
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
             store,
+            app_control: None,
         }
     }
 
@@ -621,22 +704,25 @@ mod tests {
     /// previously skipped `MemoryStore` construction entirely (`project_id:
     /// None` short-circuited it in `NativeHarness::start_session`), so a
     /// fact saved by one chat session was invisible to the next. Seed the
-    /// GLOBAL memory file `at_default(None)` resolves to, start a session
-    /// through the real `Harness` trait with `ctx.project_id: None` (as
-    /// `ctx_for` now sets), and confirm the seeded entry reaches the first
-    /// request's system prompt exactly like `memory_snapshot_reaches_
+    /// GLOBAL and USER memory files `at_default(None)` resolves to, start a
+    /// session through the real `Harness` trait with `ctx.project_id: None`
+    /// (as `ctx_for` now sets), and confirm both seeded entries reach the
+    /// first request's system prompt exactly like `memory_snapshot_reaches_
     /// primary_system_but_not_subagents` proves it does for a project
-    /// session in `runner.rs`.
+    /// session in `runner.rs`. A chat session has no project, so `user` is
+    /// the only per-person scope it ever sees.
     #[tokio::test]
     #[serial_test::serial]
-    async fn chat_session_without_a_project_still_gets_global_memory() {
+    async fn chat_session_without_a_project_still_gets_global_and_user_memory() {
         use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
         let _guard = StateDirGuard::new();
-        memory::MemoryStore::at_default(None)
-            .add(
-                memory::MemoryScope::Global,
-                "the deploy key lives in 1Password",
-            )
+        let mem = memory::MemoryStore::at_default(None);
+        mem.add(
+            memory::MemoryScope::Global,
+            "the deploy key lives in 1Password",
+        )
+        .unwrap();
+        mem.add(memory::MemoryScope::User, "prefers terse answers")
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
@@ -673,6 +759,13 @@ mod tests {
             "{system}"
         );
         assert!(system.contains("# Persistent memory (global)"), "{system}");
+        assert!(system.contains("prefers terse answers"), "{system}");
+        assert!(system.contains("# Persistent memory (user)"), "{system}");
+        // No project in a chat session, so no project section.
+        assert!(
+            !system.contains("# Persistent memory (project)"),
+            "{system}"
+        );
     }
 
     #[tokio::test]

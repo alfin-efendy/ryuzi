@@ -153,6 +153,111 @@ impl BackgroundKind {
     }
 }
 
+/// Outcome of `Store::record_child_failure`: whether the child re-queued for
+/// another attempt, or the circuit breaker tripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildFailure {
+    pub requeued: bool,
+    pub gave_up: bool,
+}
+
+/// Which actor initiated a write — a general-purpose provenance marker
+/// carried on `ToolCtx` (Phase 4 §7) and reused by Phase 6's app-control
+/// negative-space guard. Deliberately NOT skill-usage-specific: any tool or
+/// subsystem that needs to know "who is asking" (a human in an interactive
+/// session, an autonomous agent turn, or the strictest background
+/// self-review fork) can gate on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteOrigin {
+    /// An interactive human-driven session.
+    #[default]
+    User,
+    /// An autonomous agent turn (primary or sub-agent).
+    Agent,
+    /// The background self-improvement review fork (Phase 4 §7.2) — the
+    /// strictest origin.
+    BackgroundReview,
+}
+
+impl WriteOrigin {
+    /// True for every origin except an interactive user turn.
+    pub fn is_autonomous(self) -> bool {
+        !matches!(self, WriteOrigin::User)
+    }
+
+    /// True only for an interactive user turn — the inverse of
+    /// `is_autonomous`. The protected write APIs (settings, tool policies)
+    /// admit only this origin (Phase 6 §9.3 negative space).
+    pub fn is_user(self) -> bool {
+        matches!(self, WriteOrigin::User)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WriteOrigin::User => "user",
+            WriteOrigin::Agent => "agent",
+            WriteOrigin::BackgroundReview => "background_review",
+        }
+    }
+
+    /// Parse a persisted origin string. Fails CLOSED: any unrecognized value
+    /// decodes to the least-privileged `Agent`, never `User`, so a corrupt or
+    /// unknown persisted origin (e.g. a future variant read by an older build,
+    /// or a tampered audit row) can never be read back as a privileged
+    /// settings/policy write. `default()` remains `User` — that is the trusted
+    /// in-code default for interactive sessions, a distinct concern from
+    /// decoding untrusted persisted data.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "user" => WriteOrigin::User,
+            "background_review" => WriteOrigin::BackgroundReview,
+            _ => WriteOrigin::Agent,
+        }
+    }
+}
+
+/// Per-skill telemetry (Phase 4 §4/§7): use/view/patch counters and
+/// lifecycle state, read by the `skill_manage` native tool (Task 6) and the
+/// curator (Task 10) to decide when a skill should transition between
+/// `active`, `stale`, and `archived`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUsage {
+    pub name: String,
+    pub created_by: Option<String>,
+    pub use_count: i64,
+    pub view_count: i64,
+    pub patch_count: i64,
+    pub last_used_at: Option<i64>,
+    pub last_viewed_at: Option<i64>,
+    pub last_patched_at: Option<i64>,
+    pub state: String,
+    pub pinned: bool,
+    pub archived_at: Option<i64>,
+    pub created_at: Option<i64>,
+}
+
+/// One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
+/// sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
+/// history view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratorRun {
+    pub id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    /// `running` | `ok` | `error`.
+    pub status: String,
+    /// How many skills the deterministic planner transitioned this run.
+    pub transitioned: i64,
+    /// Whether the opt-in LLM consolidation pass ran this run.
+    pub consolidated: bool,
+    /// Pre-mutation tar.gz snapshot path, set only when `consolidated`.
+    pub snapshot_path: Option<String>,
+    pub error: Option<String>,
+    pub log: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -389,6 +494,21 @@ pub struct ToolPolicyRow {
     pub decision: String,
 }
 
+/// One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRow {
+    pub id: i64,
+    pub tool: String,
+    pub action: String,
+    pub decision: String,
+    /// The initiating `WriteOrigin` as a string (`user`|`agent`|`background_review`).
+    pub origin: String,
+    pub session_pk: Option<String>,
+    /// Unix ms.
+    pub at: i64,
+}
+
 /// A persisted transcript entry, one row per native-runtime event block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -402,6 +522,9 @@ pub struct Message {
     pub status: Option<String>,
     pub tool_kind: Option<String>,
     pub created_at: i64,
+    /// Group-chat attribution: the agent name for a labeled worker/orchestrator
+    /// bubble. `None` for ordinary user/assistant rows.
+    pub speaker: Option<String>,
 }
 
 /// Input to `Store::insert_message`; `seq` and `created_at` are assigned by the store.
@@ -414,6 +537,8 @@ pub struct NewMessage {
     pub tool_call_id: Option<String>,
     pub status: Option<String>,
     pub tool_kind: Option<String>,
+    /// Speaker label for a group-chat bubble (`None` for normal rows).
+    pub speaker: Option<String>,
 }
 
 impl NewMessage {
@@ -432,6 +557,28 @@ impl NewMessage {
             tool_call_id: None,
             status: None,
             tool_kind: None,
+            speaker: None,
+        }
+    }
+
+    /// A labeled display bubble (role `assistant`) attributed to `speaker`.
+    /// Used by the orchestrator to post worker start/status/report bubbles into
+    /// the home chat. A display row only — never a `provider_turns` entry.
+    pub fn speaker_block(
+        session_pk: &str,
+        speaker: &str,
+        block_type: &str,
+        payload: serde_json::Value,
+    ) -> Self {
+        NewMessage {
+            session_pk: session_pk.to_string(),
+            role: "assistant".to_string(),
+            block_type: block_type.to_string(),
+            payload,
+            tool_call_id: None,
+            status: None,
+            tool_kind: None,
+            speaker: Some(speaker.to_string()),
         }
     }
 }
@@ -505,6 +652,8 @@ pub enum CoreEvent {
         tool_call_id: Option<String>,
         status: Option<String>,
         tool_kind: Option<String>,
+        /// Speaker label for a group-chat bubble (`None` for normal rows).
+        speaker: Option<String>,
     },
     Result {
         session_pk: String,
@@ -628,6 +777,32 @@ mod tests {
             assert_eq!(SessionStatus::from_db(s.as_str()), s);
         }
         assert_eq!(SessionStatus::from_db("nonsense"), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn write_origin_roundtrips_through_db_string() {
+        for o in [
+            WriteOrigin::User,
+            WriteOrigin::Agent,
+            WriteOrigin::BackgroundReview,
+        ] {
+            assert_eq!(WriteOrigin::from_db(o.as_str()), o);
+        }
+        // Fails CLOSED: an unrecognized persisted origin decodes to the
+        // least-privileged `Agent`, never the privileged `User` (Phase 6 §9.3).
+        assert_eq!(WriteOrigin::from_db("nonsense"), WriteOrigin::Agent);
+    }
+
+    #[test]
+    fn write_origin_default_is_user_and_autonomy() {
+        assert_eq!(WriteOrigin::default(), WriteOrigin::User);
+        assert!(!WriteOrigin::User.is_autonomous());
+        assert!(WriteOrigin::Agent.is_autonomous());
+        assert!(WriteOrigin::BackgroundReview.is_autonomous());
+        // `is_user` is the exact inverse of `is_autonomous`.
+        assert!(WriteOrigin::User.is_user());
+        assert!(!WriteOrigin::Agent.is_user());
+        assert!(!WriteOrigin::BackgroundReview.is_user());
     }
 
     #[test]

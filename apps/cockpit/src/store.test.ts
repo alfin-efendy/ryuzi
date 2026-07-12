@@ -1,4 +1,4 @@
-import { test, expect, mock, spyOn } from "bun:test";
+import { afterAll, test, expect, mock, spyOn } from "bun:test";
 import { useStore, markFocusedSessionReadOnEvent, drainQueueOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
@@ -9,6 +9,17 @@ import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const k1 = sessKey(LOCAL_RUNNER, "s1");
 const k2 = sessKey(LOCAL_RUNNER, "s2");
+
+// The sendNextQueued suite below overwrites the store's real `send` action with
+// stubs via `setState({ send })`. `useStore` is a process-global singleton shared
+// with every other test file in the same `bun test` run, so leaving a stub in
+// place leaks into later files (e.g. store-orch.test.ts's send-routing tests,
+// which then invoke the stub instead of the real orch-steer path). Snapshot the
+// genuine implementation at module load and reinstate it once this file is done.
+const realSendImpl = useStore.getState().send;
+afterAll(() => {
+  useStore.setState({ send: realSendImpl });
+});
 
 // refresh() (called fire-and-forget by start/startChat/send/stop/end/cloneProject, and by the
 // result/error event handlers, and awaited directly by send()) always fans out to
@@ -378,6 +389,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -392,6 +404,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -406,6 +419,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -421,6 +435,7 @@ test("message events project to rows by role/blockType and dedupe by seq", () =>
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -445,6 +460,7 @@ test("durable system notice messages render live once and hydrate identically", 
     tool_call_id: null,
     status: null,
     tool_kind: null,
+    speaker: null,
   };
 
   useStore.getState().applyCoreEvent(event, LOCAL_RUNNER);
@@ -472,6 +488,7 @@ test("durable system notice messages render live once and hydrate identically", 
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt,
     },
   ]);
@@ -492,6 +509,7 @@ test("tool_call events append once, then merge in place by toolCallId (same-seq 
       tool_call_id: "tc-1",
       status: "pending",
       tool_kind: "execute",
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -507,6 +525,7 @@ test("tool_call events append once, then merge in place by toolCallId (same-seq 
       tool_call_id: "tc-1",
       status: "completed",
       tool_kind: "execute",
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -522,6 +541,7 @@ test("tool_call events append once, then merge in place by toolCallId (same-seq 
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -547,6 +567,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt: 1,
     },
     {
@@ -558,6 +579,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       toolCallId: "tc-9",
       status: "completed",
       toolKind: "read",
+      speaker: null,
       createdAt: 2,
     },
   ];
@@ -581,6 +603,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -595,6 +618,7 @@ test("hydrateTranscript replaces the transcript from persisted messages and sets
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -613,6 +637,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt: 1,
     },
     {
@@ -624,6 +649,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
       toolCallId: null,
       status: null,
       toolKind: null,
+      speaker: null,
       createdAt: 2,
     },
   ];
@@ -640,6 +666,7 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
         tool_call_id: null,
         status: null,
         tool_kind: null,
+        speaker: null,
       },
       LOCAL_RUNNER,
     );
@@ -841,6 +868,7 @@ test("error event appends no transient row — the durable error row arrives via
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -1148,6 +1176,7 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
       tool_call_id: "tc-todo",
       status: "in_progress",
       tool_kind: "other",
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -1164,6 +1193,7 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
       tool_call_id: "tc-todo",
       status: "completed",
       tool_kind: "other",
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -1181,6 +1211,7 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
       tool_call_id: "tc-bash",
       status: "completed",
       tool_kind: "execute",
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -1296,6 +1327,7 @@ test("markFocusedSessionReadOnEvent marks the focused session read as live activ
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
     { runnerId: LOCAL_RUNNER, pk: "s1" },
@@ -1316,6 +1348,7 @@ test("markFocusedSessionReadOnEvent leaves read state untouched for events on a 
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
     { runnerId: LOCAL_RUNNER, pk: "s1" },
@@ -1346,6 +1379,7 @@ test("two runners with the same session_pk keep separate transcripts and separat
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     LOCAL_RUNNER,
   );
@@ -1360,6 +1394,7 @@ test("two runners with the same session_pk keep separate transcripts and separat
       tool_call_id: null,
       status: null,
       tool_kind: null,
+      speaker: null,
     },
     remote,
   );

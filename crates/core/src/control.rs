@@ -13,12 +13,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+mod app_control;
 mod attachments;
 mod lifecycle;
 mod provisioning;
 #[cfg(test)]
 mod tests;
 
+pub use lifecycle::WorkerBinding;
 pub use provisioning::{ProvisionProjectRequest, ProvisionSettings};
 
 /// Nudge prompt used when re-driving a turn interrupted by a restart.
@@ -81,6 +83,16 @@ pub struct ControlPlane {
     /// every startup, so a stale `true` surviving a restart would be
     /// meaningless).
     plugins_restart_required: std::sync::atomic::AtomicBool,
+    /// Builds the `LlmStream` the background review fork (Task 9) drives
+    /// through. Bypasses `registries.harness` (an opaque `Harness` trait
+    /// object with no way to recover its concrete `LlmStreamFactory`)
+    /// because the review fork is a native-runtime-only capability that
+    /// talks to `harness::native::runner::drive_review` directly, not
+    /// through the generic `Harness` trait. Real
+    /// (`RouterLlmStreamFactory`) in production; tests swap in a scripted
+    /// stream via `set_review_llm_factory_for_test` to capture and assert on
+    /// the exact request body the fork sends.
+    review_llm_factory: Mutex<Arc<dyn crate::harness::native::llm::LlmStreamFactory>>,
     /// Track D's extension host — constructed empty here (no real subprocess
     /// spawn; see [`Self::spawn_extensions`]'s hermeticity doc) and shared
     /// as a single `Arc` between the daemon entry (which calls
@@ -148,6 +160,9 @@ impl ControlPlane {
             active_turns: std::sync::atomic::AtomicUsize::new(0),
             background: crate::harness::native::background::BackgroundRegistry::new(),
             plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
+            review_llm_factory: Mutex::new(Arc::new(
+                crate::harness::native::llm::RouterLlmStreamFactory,
+            )),
             extension_host: Arc::new(ExtensionHost::new()),
         })
     }
@@ -230,6 +245,27 @@ impl ControlPlane {
     /// The shared background-delegation registry (capacity + cancellation).
     pub fn background(&self) -> &Arc<crate::harness::native::background::BackgroundRegistry> {
         &self.background
+    }
+
+    /// The `LlmStreamFactory` `run_review_fork` (control/lifecycle.rs)
+    /// builds its `RunnerDeps.llm` from. See the field doc for why this
+    /// bypasses `registries.harness`.
+    pub(crate) fn review_llm_factory(
+        &self,
+    ) -> Arc<dyn crate::harness::native::llm::LlmStreamFactory> {
+        self.review_llm_factory.lock().unwrap().clone()
+    }
+
+    /// Test-only: override the `LlmStreamFactory` a review fork drives
+    /// through, so a test can inject a scripted/recording stream and assert
+    /// on the exact request the fork sends (Task 9).
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn set_review_llm_factory_for_test(
+        &self,
+        factory: Arc<dyn crate::harness::native::llm::LlmStreamFactory>,
+    ) {
+        *self.review_llm_factory.lock().unwrap() = factory;
     }
 
     /// The plugin host — every installed plugin's manifest, capabilities, and
@@ -333,6 +369,38 @@ impl ControlPlane {
         self.store.list_sessions(project_id).await
     }
 
+    /// Bind an existing session to a project (`app_projects`'s "attach"
+    /// action, spec §9.1). Validates both rows exist, then persists the
+    /// association — see [`Store::set_session_project`] for the caveat that a
+    /// currently-live session keeps running under whatever `project_id` its
+    /// `RunnerDeps` was already built with until it is resumed.
+    pub async fn attach_project(&self, session_pk: &str, project_id: &str) -> anyhow::Result<()> {
+        self.store
+            .get_session(session_pk)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
+        self.store
+            .get_project(project_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
+        self.store.set_session_project(session_pk, project_id).await
+    }
+
+    /// Build the curated app-control facade (spec §9.1) for a top-level
+    /// interactive session: holds a `Weak<ControlPlane>` so a session's
+    /// `ToolCtx` never keeps the plane alive, and tags every write it makes
+    /// with `WriteOrigin::Agent` — the storage-layer negative-space guard
+    /// (spec §9.3) refuses this origin on settings/policy writes, and its
+    /// audit rows are tagged `agent`.
+    pub fn build_app_control(
+        self: &Arc<Self>,
+    ) -> Arc<dyn crate::harness::native::tools::AppControl> {
+        Arc::new(app_control::AppControlImpl::new(
+            Arc::downgrade(self),
+            crate::domain::WriteOrigin::Agent,
+        ))
+    }
+
     /// Persist per-project preferences (host-supplied model/effort/perm overrides).
     /// `None` leaves the corresponding column untouched.
     pub async fn set_project_prefs(
@@ -360,14 +428,18 @@ impl ControlPlane {
         self.store.get_tool_policy(project_id, tool).await
     }
 
-    /// Persist (or update) a tool policy for `(project_id, tool)`.
+    /// Persist (or update) a tool policy for `(project_id, tool)`. Only
+    /// reached from the Cockpit/gateway resolve path (a human clicked
+    /// "Always allow"), so this always writes as `WriteOrigin::User`.
     pub async fn set_tool_policy(
         &self,
         project_id: &str,
         tool: &str,
         decision: &str,
     ) -> anyhow::Result<()> {
-        self.store.set_tool_policy(project_id, tool, decision).await
+        self.store
+            .set_tool_policy(crate::domain::WriteOrigin::User, project_id, tool, decision)
+            .await
     }
 
     /// All persisted tool policies (Settings → Permissions).
@@ -375,9 +447,13 @@ impl ControlPlane {
         self.store.list_tool_policies().await
     }
 
-    /// Remove a persisted tool policy.
+    /// Remove a persisted tool policy. Only reached from the Cockpit
+    /// Settings → Permissions "revoke" action (a human), so this always
+    /// writes as `WriteOrigin::User`.
     pub async fn delete_tool_policy(&self, project_id: &str, tool: &str) -> anyhow::Result<()> {
-        self.store.delete_tool_policy(project_id, tool).await
+        self.store
+            .delete_tool_policy(crate::domain::WriteOrigin::User, project_id, tool)
+            .await
     }
 }
 

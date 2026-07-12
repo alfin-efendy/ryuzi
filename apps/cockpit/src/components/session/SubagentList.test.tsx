@@ -27,6 +27,8 @@ function row(over: Partial<Row>): Row {
     toolExitCode: null,
     toolSummary: null,
     toolSubagent: null,
+    speaker: null,
+    taskId: null,
     ...over,
   };
 }

@@ -5,11 +5,13 @@
 
 pub mod agent_api;
 pub mod apps_api;
+pub mod audit;
 pub mod connections_api;
 pub mod endpoint_api;
 pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
+pub mod learning_api;
 pub mod native_api;
 pub mod orch_api;
 pub mod plugins_api;
@@ -87,7 +89,9 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if endpoint_api::HANDLES.contains(&m) => endpoint_api::dispatch(state, m, p).await,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
+        m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
         m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
+        m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await
         }
@@ -123,6 +127,28 @@ pub(crate) mod tests_support {
             cp,
             control_token: "t".into(),
         }
+    }
+
+    /// Like `state()`, but with one connected project (`"p1"`) already in the
+    /// store — for command families (orch, scheduler, ...) whose calls need a
+    /// real `project_id` to validate against.
+    pub(crate) async fn state_with_project() -> ApiState {
+        let s = state().await;
+        s.cp.store()
+            .insert_project(crate::domain::Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        s
     }
 
     /// A no-op `HarnessSession` — the RPC tests that use
@@ -284,5 +310,32 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::OK);
         assert!(rx.await.unwrap().allowed());
+    }
+
+    #[tokio::test]
+    async fn list_audit_returns_recorded_rows() {
+        let s = state().await;
+        s.cp.store()
+            .record_audit(
+                crate::domain::WriteOrigin::Agent,
+                Some("s"),
+                "app_jobs",
+                "create",
+                "allow",
+            )
+            .await
+            .unwrap();
+        let port = serve(s, opts(0)).await.unwrap();
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/rpc/list_audit"))
+            .bearer_auth("t")
+            .json(&json!({"limit": 10}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp[0]["tool"], "app_jobs");
     }
 }

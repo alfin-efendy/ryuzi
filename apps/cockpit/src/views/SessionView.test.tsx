@@ -45,7 +45,18 @@ const projectRuntimeInfo = mock(() =>
 const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data: { dataBase64: "", contentType: null } }));
 
 mock.module("@/bindings", () => ({
-  commands: { listOpenTargets, openIn, sessionWorkdir, nativeCommands, sessionTodos, projectRuntimeInfo, fetchAttachment },
+  commands: {
+    listOpenTargets,
+    openIn,
+    sessionWorkdir,
+    nativeCommands,
+    sessionTodos,
+    projectRuntimeInfo,
+    fetchAttachment,
+    // SessionView's orch task-strip effect (Phase 5) calls this on a chat
+    // session; stub an empty result so no strip mounts and it doesn't throw.
+    orchListRoots: async () => ({ status: "ok" as const, data: [] }),
+  },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount (see HomeView.test.tsx).

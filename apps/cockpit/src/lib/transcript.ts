@@ -35,6 +35,10 @@ export type Row = {
   toolSummary: string | null;
   /** Sub-agent label when this tool ran inside a dispatched sub-agent (payload.subagent). */
   toolSubagent: string | null;
+  /** Worker/orchestrator agent name for group-chat rows (Message.speaker); null for ordinary assistant turns. */
+  speaker: string | null;
+  /** Blocking task id for an `orch_block` speaker row (payload.task_id); null for every other row. */
+  taskId: string | null;
 };
 
 export type RowAttachment = {
@@ -74,7 +78,8 @@ export type Group =
   | { type: "thought"; key: string; markdown: string }
   | { type: "activity"; key: string; items: ActivityItem[] }
   | { type: "error"; key: string; text: string }
-  | { type: "notice"; key: string; text: string };
+  | { type: "notice"; key: string; text: string }
+  | { type: "speaker"; key: string; speaker: string; markdown: string; blockType: string; taskId: string | null };
 
 export type EditCard = { path: string; kind: string };
 
@@ -188,6 +193,7 @@ export function messageToRow(
   // to pass this — optional with an inert default rather than a required
   // 9th positional arg everywhere.
   sessionPk = "",
+  speaker: string | null = null,
 ): Row {
   const p = (payload ?? {}) as Record<string, unknown>;
   const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
@@ -209,6 +215,8 @@ export function messageToRow(
     toolExitCode: blockType === "tool_call" && typeof p.exit_code === "number" ? p.exit_code : null,
     toolSummary: blockType === "tool_call" && typeof p.summary === "string" && p.summary ? p.summary : null,
     toolSubagent: blockType === "tool_call" && typeof p.subagent === "string" && p.subagent ? p.subagent : null,
+    speaker,
+    taskId: blockType === "orch_block" && typeof p.task_id === "string" && p.task_id ? p.task_id : null,
   };
 }
 
@@ -255,6 +263,15 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
     }
     if (row.blockType === "notice") {
       groups.push({ type: "notice", key, text: row.text });
+      return;
+    }
+    // Group-chat rows (worker/orchestrator speaker set) render as their own
+    // labeled bubble — one per row, never coalesced with the agent-turn
+    // markdown run or with each other, so per-worker bubbles stay distinct.
+    // Tool calls dispatched by a sub-agent keep flowing through the normal
+    // activity cluster below (their subagent label already renders there).
+    if (row.speaker && row.blockType !== "tool_call") {
+      groups.push({ type: "speaker", key, speaker: row.speaker, markdown: row.text, blockType: row.blockType, taskId: row.taskId });
       return;
     }
     if (row.blockType === "tool_call" || row.blockType === "status") {

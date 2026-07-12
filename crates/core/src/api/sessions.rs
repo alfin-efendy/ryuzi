@@ -124,7 +124,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "set_setting" => {
             let a: KeyValue = params(p)?;
-            ok(cp.store().set_setting(&a.key, &a.value).await?)
+            ok(cp
+                .store()
+                .set_setting(crate::domain::WriteOrigin::User, &a.key, &a.value)
+                .await?)
         }
         "update_project" => {
             let a: UpdateProjectP = params(p)?;
@@ -319,6 +322,7 @@ async fn start_session(
             &attachments,
             git,
             options.perm_mode,
+            None,
             None,
         )
         .await?)

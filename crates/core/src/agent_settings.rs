@@ -30,13 +30,23 @@ pub async fn get(store: &Store) -> anyhow::Result<AgentSettings> {
 
 /// Persist the settings: `Some(v)` upserts the key, `None` deletes it, so a
 /// cleared field falls back to the engine default instead of pinning "".
+/// Only reached from the `set_agent_settings` API command (Cockpit/CLI), so
+/// this always writes as `WriteOrigin::User`.
 pub async fn set(store: &Store, s: &AgentSettings) -> anyhow::Result<()> {
     match &s.model {
-        Some(v) => store.set_setting(KEY_MODEL, v).await?,
+        Some(v) => {
+            store
+                .set_setting(crate::domain::WriteOrigin::User, KEY_MODEL, v)
+                .await?
+        }
         None => store.delete_setting_raw(KEY_MODEL).await?,
     }
     match &s.perm_mode {
-        Some(v) => store.set_setting(KEY_PERM_MODE, v).await?,
+        Some(v) => {
+            store
+                .set_setting(crate::domain::WriteOrigin::User, KEY_PERM_MODE, v)
+                .await?
+        }
         None => store.delete_setting_raw(KEY_PERM_MODE).await?,
     }
     Ok(())

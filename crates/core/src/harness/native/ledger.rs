@@ -73,6 +73,31 @@ impl Ledger {
         }
     }
 
+    /// A fresh, unpersisted ledger pre-loaded with `messages` verbatim as its
+    /// starting turns (Task 9's review-fork cache-parity replay): each
+    /// message is installed byte-for-byte, so a later `messages_for_request`
+    /// call reproduces them unchanged (aside from `sanitize_tool_pairing`'s
+    /// dangling-`tool_use` repair, a no-op on an already-valid captured
+    /// prefix) — any `cache_control` marker a seeded message already carries
+    /// on its own content survives untouched for as long as it stays out of
+    /// the LAST position, exactly like a live session's moving breakpoint.
+    pub fn seed_projected(session_pk: &str, messages: Vec<Value>) -> Ledger {
+        let turns = messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, msg)| Turn {
+                seq: i as i64 + 1,
+                msg,
+            })
+            .collect();
+        Ledger {
+            session_pk: session_pk.to_string(),
+            store: None,
+            turns,
+            window_number: 0,
+        }
+    }
+
     /// Append a user turn (content = Anthropic content-block array).
     pub async fn append_user(&mut self, content: Value) -> anyhow::Result<()> {
         self.append("user", content).await

@@ -156,7 +156,11 @@ async fn set_last_seen(cp: &ControlPlane, id: &str) {
     let key = format!("gateway_last_seen.{id}");
     let _ = cp
         .store()
-        .set_setting(&key, &crate::paths::now_ms().to_string())
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            &key,
+            &crate::paths::now_ms().to_string(),
+        )
         .await;
 }
 

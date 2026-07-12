@@ -144,10 +144,18 @@ async fn set_endpoint_config(
     let cp = &state.cp;
     let srv = &state.router_server;
     cp.store()
-        .set_setting("endpoint_port", &port.to_string())
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            "endpoint_port",
+            &port.to_string(),
+        )
         .await?;
     cp.store()
-        .set_setting("endpoint_autostart", if autostart { "1" } else { "0" })
+        .set_setting(
+            crate::domain::WriteOrigin::User,
+            "endpoint_autostart",
+            if autostart { "1" } else { "0" },
+        )
         .await?;
     if srv.status().running {
         srv.start(port).await?;

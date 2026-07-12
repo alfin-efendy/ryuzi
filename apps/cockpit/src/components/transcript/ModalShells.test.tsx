@@ -51,6 +51,8 @@ test("image preview uses the shared shell with visible X and footer action", asy
     toolExitCode: null,
     toolSummary: null,
     toolSubagent: null,
+    speaker: null,
+    taskId: null,
   };
   render(<Transcript runnerId={LOCAL_RUNNER} sessionPk="s1" rows={[row]} agentName="Ryuzi" agentColor="#fff" running={false} />);
   // The image loads asynchronously via `commands.fetchAttachment` (remote-safe

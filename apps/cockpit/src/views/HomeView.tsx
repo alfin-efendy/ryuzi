@@ -26,8 +26,17 @@ import { BranchNameModal } from "@/components/modals/BranchNameModal";
 const NO_PROJECT = "__none__";
 
 export function HomeView() {
-  const { projects, selectedProjectId, selectProject, start, startChat, projectRuntimeById, loadProjectRuntime, setProjectRuntime } =
-    useStore();
+  const {
+    projects,
+    selectedProjectId,
+    selectProject,
+    start,
+    startChat,
+    startOrchestration,
+    projectRuntimeById,
+    loadProjectRuntime,
+    setProjectRuntime,
+  } = useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
@@ -37,6 +46,10 @@ export function HomeView() {
   const stopVoice = useRef<(() => void) | null>(null);
   // Permission mode for the session about to be created. null = project default.
   const [composerPerm, setComposerPerm] = useState<UiPermMode | null>(null);
+  // Orchestrate mode: submit the goal to the orchestrator (decomposed into
+  // tracked subtasks run by workers) instead of starting a normal turn.
+  // Requires an attached project — see the toggle's disabled state below.
+  const [orchestrate, setOrchestrate] = useState(false);
 
   // Chat is the default: no project is auto-selected. A project is attached
   // only when the user explicitly picks one (sidebar "+" or the composer's
@@ -108,6 +121,11 @@ export function HomeView() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
   useEffect(() => {
     setComposerPerm(null);
+  }, [projectId]);
+  // Orchestration needs a project — detaching one turns the toggle back off
+  // instead of leaving it silently unusable.
+  useEffect(() => {
+    if (!projectId) setOrchestrate(false);
   }, [projectId]);
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
@@ -198,6 +216,42 @@ export function HomeView() {
   const send = async () => {
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
+    // The toggle or a typed "/orchestrate " prefix both route to the
+    // orchestrator instead of a normal turn.
+    const orchestrateRequested = orchestrate || t.startsWith("/orchestrate ");
+    const typed = draft;
+    if (orchestrateRequested) {
+      if (!project) {
+        toast.error("Attach a project to orchestrate.");
+        return;
+      }
+      const goal = t.replace(/^\/orchestrate\s+/, "");
+      useNav.getState().clearDraft(draftKey);
+      composerFiles.clear();
+      setContextRefs([]);
+      // Orchestration posts worker bubbles, block-for-human cards, and the
+      // aggregate report into a home chat — create one (chat-first; the
+      // project attached above scopes the goal itself, not the session) so
+      // there's somewhere for those to land and for follow-up messages to
+      // steer the run (store.send's orch-steer route).
+      const chatOk = await startChat(LOCAL_RUNNER, goal, {
+        model: nav.composerModel ?? null,
+        effort: nav.composerEffort ?? null,
+        context: { branch: null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+        attachments: composerFiles.attachments,
+        git: null,
+        permMode: composerPerm ? uiPermToCore(composerPerm) : null,
+      });
+      if (!chatOk) {
+        useNav.getState().restoreDraft(draftKey, typed);
+        return;
+      }
+      if (!(await startOrchestration(goal, true))) {
+        toast.error("Chat started, but orchestration couldn't be submitted.");
+      }
+      nav.navigate({ kind: "session" });
+      return;
+    }
     const opts = {
       model: project ? null : (nav.composerModel ?? null),
       effort: project ? null : (nav.composerEffort ?? null),
@@ -206,7 +260,6 @@ export function HomeView() {
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
       permMode: composerPerm ? uiPermToCore(composerPerm) : null,
     };
-    const typed = draft;
     useNav.getState().clearDraft(draftKey);
     composerFiles.clear();
     setContextRefs([]);
@@ -310,6 +363,17 @@ export function HomeView() {
               }}
               disabled={agentModels.length === 0}
             />
+            <div
+              className={`flex items-center gap-1.5 px-1 ${project ? "" : "cursor-not-allowed opacity-50"}`}
+              title={project ? "Decompose this goal into tracked subtasks run by workers" : "Attach a project to orchestrate"}
+            >
+              <span className="text-[11px] font-medium text-muted-foreground">Orchestrate</span>
+              <Switch
+                on={orchestrate}
+                onToggle={() => project && setOrchestrate((v) => !v)}
+                label="Orchestrate this goal into tracked subtasks"
+              />
+            </div>
             <Button
               variant="ghost"
               size="icon-sm"

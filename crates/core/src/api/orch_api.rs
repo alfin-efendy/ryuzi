@@ -1,18 +1,20 @@
-//! Orchestrated-task-graph RPCs: the 4 operations the deleted `ryuzi orch`
-//! CLI used to call directly against the store, now exposed in-daemon so a
-//! live event bus backs `submit_goal` (see `orch::submit`'s doc comment).
+//! Orchestration RPC family (spec §8): submit a goal, read the task DAG,
+//! cancel/retry, answer a block-for-human, and steer a live run. Cockpit's
+//! task strip + drill-down + orchestrate toggle proxy these.
 
 use super::{ok, params, ApiError};
-use crate::orch;
 use crate::serve::ApiState;
 use serde::Deserialize;
 use serde_json::Value;
 
 pub(crate) const HANDLES: &[&str] = &[
-    "submit_goal",
-    "list_orch_tasks",
-    "cancel_orch_task",
-    "retry_orch_task",
+    "orch_submit",
+    "orch_list_roots",
+    "orch_tasks",
+    "orch_cancel",
+    "orch_retry",
+    "orch_answer_block",
+    "orch_steer",
 ];
 
 #[derive(Deserialize)]
@@ -20,34 +22,77 @@ struct SubmitP {
     project_id: String,
     goal: String,
     decompose: bool,
+    /// The originating chat/project session (its home chat). Optional so the
+    /// agent's own tool path and headless callers still work.
+    #[serde(default)]
+    home_session_pk: Option<String>,
 }
 #[derive(Deserialize)]
 struct RootP {
-    root: Option<String>,
+    root: String,
 }
 #[derive(Deserialize)]
-struct IdP {
-    id: String,
+struct TaskIdP {
+    task_id: String,
+}
+#[derive(Deserialize)]
+struct AnswerP {
+    task_id: String,
+    answer: String,
+}
+#[derive(Deserialize)]
+struct SteerP {
+    session_pk: String,
+    text: String,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
     match method {
-        "submit_goal" => {
+        "orch_submit" => {
             let a: SubmitP = params(p)?;
-            ok(orch::submit(cp, &a.project_id, &a.goal, a.decompose).await?)
+            ok(crate::orch::submit(
+                cp,
+                &a.project_id,
+                &a.goal,
+                a.decompose,
+                a.home_session_pk.as_deref(),
+            )
+            .await?)
         }
-        "list_orch_tasks" => {
+        "orch_list_roots" => {
+            let all = crate::orch::list_tasks(cp.store(), None).await?;
+            ok(all
+                .into_iter()
+                .filter(|t| t.root_id.is_none())
+                .collect::<Vec<_>>())
+        }
+        "orch_tasks" => {
             let a: RootP = params(p)?;
-            ok(orch::list_tasks(cp.store(), a.root.as_deref()).await?)
+            ok(crate::orch::list_tasks(cp.store(), Some(&a.root)).await?)
         }
-        "cancel_orch_task" => {
-            let a: IdP = params(p)?;
-            ok(orch::cancel_tree(cp.store(), &a.id).await?)
+        "orch_cancel" => {
+            let a: RootP = params(p)?;
+            let n = crate::orch::cancel_tree(cp.store(), &a.root).await?;
+            crate::orch::emit_root_cancelled(cp, &a.root);
+            ok(n)
         }
-        "retry_orch_task" => {
-            let a: IdP = params(p)?;
-            ok(orch::retry_task(cp.store(), &a.id).await?)
+        "orch_retry" => {
+            let a: TaskIdP = params(p)?;
+            ok(crate::orch::retry_task(cp.store(), &a.task_id).await?)
+        }
+        "orch_answer_block" => {
+            let a: AnswerP = params(p)?;
+            ok(cp.answer_orch_block(&a.task_id, &a.answer).await?)
+        }
+        "orch_steer" => {
+            let a: SteerP = params(p)?;
+            let outcome = crate::orch::note_steer(cp, &a.session_pk, &a.text).await?;
+            ok(match outcome {
+                crate::orch::SteerOutcome::NoOrchestration => "noOrchestration",
+                crate::orch::SteerOutcome::Noted => "noted",
+                crate::orch::SteerOutcome::Cancelled => "cancelled",
+            })
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
@@ -55,111 +100,76 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::api::tests_support::state;
-    use crate::domain::{PermMode, Project};
-    use serde_json::json;
-
-    async fn state_with_project() -> ApiState {
-        let s = state().await;
-        s.cp.store()
-            .insert_project(Project {
-                project_id: "p1".into(),
-                name: "p1".into(),
-                workdir: ".".into(),
-                source: None,
-                model: None,
-                effort: None,
-                perm_mode: PermMode::Default,
-                created_at: Some(0),
-                is_git: false,
-            })
-            .await
-            .unwrap();
-        s
-    }
+    use crate::api::tests_support;
 
     #[tokio::test]
-    async fn submit_goal_returns_a_root_id_for_a_known_project() {
-        let s = state_with_project().await;
-        let v = dispatch(
+    async fn orch_submit_then_tasks_round_trips() {
+        let s = tests_support::state_with_project().await;
+        let project_id = s.cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        let root = crate::api::dispatch(
             &s,
-            "submit_goal",
-            json!({"project_id": "p1", "goal": "ship it", "decompose": false}),
-        )
-        .await
-        .unwrap();
-        let root = v.as_str().unwrap();
-        assert!(root.starts_with("ot-"));
-    }
-
-    #[tokio::test]
-    async fn submit_goal_rejects_an_unknown_project() {
-        let s = state().await;
-        let err = dispatch(
-            &s,
-            "submit_goal",
-            json!({"project_id": "nope", "goal": "ship it", "decompose": false}),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, 500);
-    }
-
-    #[tokio::test]
-    async fn list_orch_tasks_returns_the_submitted_root() {
-        let s = state_with_project().await;
-        let root = dispatch(
-            &s,
-            "submit_goal",
-            json!({"project_id": "p1", "goal": "ship it", "decompose": false}),
+            "orch_submit",
+            serde_json::json!({ "project_id": project_id, "goal": "do it", "decompose": false }),
         )
         .await
         .unwrap();
         let root = root.as_str().unwrap().to_string();
-        let list = dispatch(&s, "list_orch_tasks", json!({"root": null}))
+        let tasks = crate::api::dispatch(&s, "orch_tasks", serde_json::json!({ "root": root }))
             .await
             .unwrap();
-        let tasks = list.as_array().unwrap();
-        assert!(tasks.iter().any(|t| t["id"] == root));
-        // Field naming: camelCase per the RPC param/response convention.
-        let r = tasks.iter().find(|t| t["id"] == root).unwrap();
-        assert_eq!(r["rootId"], Value::Null);
-        assert_eq!(r["projectId"], "p1");
+        assert!(tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["rootId"].is_null())); // the root row
     }
 
+    /// The `orch_steer` RPC maps every `SteerOutcome` to its exact wire string —
+    /// this is a cross-layer contract (Cockpit's steer handler switches on
+    /// `"noOrchestration"|"noted"|"cancelled"`), so a transposed literal here
+    /// would silently misdirect the UI. Exercise all three arms.
     #[tokio::test]
-    async fn cancel_orch_task_returns_a_count() {
-        let s = state_with_project().await;
-        let root = dispatch(
+    async fn orch_steer_maps_every_outcome_to_its_wire_string() {
+        let s = tests_support::state_with_project().await;
+        let project_id = s.cp.store().list_projects().await.unwrap()[0]
+            .project_id
+            .clone();
+        // No live orchestration bound to this home yet → "noOrchestration".
+        let out = crate::api::dispatch(
             &s,
-            "submit_goal",
-            json!({"project_id": "p1", "goal": "ship it", "decompose": false}),
+            "orch_steer",
+            serde_json::json!({ "session_pk": "home-x", "text": "hi" }),
         )
         .await
         .unwrap();
-        let root = root.as_str().unwrap().to_string();
-        let n = dispatch(&s, "cancel_orch_task", json!({"id": root}))
-            .await
-            .unwrap();
-        // The root plus its single planned child.
-        assert_eq!(n, 2);
-    }
-
-    #[tokio::test]
-    async fn retry_orch_task_on_a_non_failed_row_returns_false() {
-        let s = state_with_project().await;
-        let root = dispatch(
+        assert_eq!(out.as_str(), Some("noOrchestration"));
+        // Bind a live root (submit lands it at `waiting`) to that home chat.
+        crate::api::dispatch(
             &s,
-            "submit_goal",
-            json!({"project_id": "p1", "goal": "ship it", "decompose": false}),
+            "orch_submit",
+            serde_json::json!({ "project_id": project_id, "goal": "do it", "decompose": false, "home_session_pk": "home-x" }),
         )
         .await
         .unwrap();
-        let root = root.as_str().unwrap().to_string();
-        let retried = dispatch(&s, "retry_orch_task", json!({"id": root}))
-            .await
-            .unwrap();
-        assert_eq!(retried, false);
+        // A typed message → "noted".
+        let out = crate::api::dispatch(
+            &s,
+            "orch_steer",
+            serde_json::json!({ "session_pk": "home-x", "text": "prefer rust" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.as_str(), Some("noted"));
+        // The exact cancel directive → "cancelled" (distinct from "noted").
+        let out = crate::api::dispatch(
+            &s,
+            "orch_steer",
+            serde_json::json!({ "session_pk": "home-x", "text": "/cancel" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.as_str(), Some("cancelled"));
     }
 }

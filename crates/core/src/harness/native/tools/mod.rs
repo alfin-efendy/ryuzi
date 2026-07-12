@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+pub mod app_jobs;
+pub mod app_orchestrate;
+pub mod app_projects;
 pub mod bash;
+pub mod clarify;
 pub mod edit;
 pub mod extension;
 pub mod glob;
@@ -25,11 +29,14 @@ pub mod ls;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
+pub mod orch_block;
 pub mod plan;
 pub mod question;
 pub mod read;
 pub mod revert;
+pub mod session_search;
 pub mod skill;
+pub mod skill_manage;
 pub mod task;
 pub mod todo;
 pub mod webfetch;
@@ -136,6 +143,84 @@ pub trait SubagentSpawner: Send + Sync {
     }
 }
 
+/// A cron job as seen through the curated app surface.
+#[derive(Debug, Clone)]
+pub struct AppJobSummary {
+    pub id: String,
+    pub name: String,
+    pub cron: String,
+    pub enabled: bool,
+}
+
+/// Inputs to create a job through `app_jobs`. `schedule` is natural language
+/// (`crate::scheduler::natural_to_cron`) or a raw cron expression.
+#[derive(Debug, Clone)]
+pub struct AppJobCreate {
+    pub name: String,
+    pub schedule: String,
+    pub prompt: String,
+    pub project_id: Option<String>,
+    pub model_override: Option<String>,
+}
+
+/// One orchestration task as seen through `app_orchestrate`.
+#[derive(Debug, Clone)]
+pub struct AppOrchSummary {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub agent: String,
+    /// The judge's final verdict text, present once a root reaches `done`
+    /// (`None` while in progress). Lets an agent-initiated (home-less)
+    /// orchestration retrieve its outcome via the `app_orchestrate` status
+    /// action — the rail verdict delivery is skipped when there's no home chat.
+    pub result: Option<String>,
+}
+
+/// A project as seen through `app_projects`.
+#[derive(Debug, Clone)]
+pub struct AppProjectSummary {
+    pub id: String,
+    pub name: String,
+}
+
+/// The curated surface the agent uses to operate the app itself (spec §9.1).
+///
+/// This is the ENTIRE app-control contract: what is not a method here is not a
+/// capability the agent has. It is deliberately narrow — no settings, model
+/// switching, approval resolution, daemon control, or OAuth (spec §9.3
+/// negative space). Every mutating method records an audit row inside its
+/// implementation, so auditing cannot be forgotten per-tool. `None` on
+/// `ToolCtx` (sub-agents, workers, review forks, bare tests) means "no app
+/// control"; the tool then returns a "not available" error.
+#[async_trait]
+pub trait AppControl: Send + Sync {
+    /// The originating write origin (always `Agent` in production; used for the
+    /// audit rows the impl writes).
+    fn origin(&self) -> crate::domain::WriteOrigin;
+
+    // --- jobs (permission keys jobs.read / jobs.write) ---
+    async fn list_jobs(&self) -> anyhow::Result<Vec<AppJobSummary>>;
+    async fn create_job(&self, spec: AppJobCreate) -> anyhow::Result<String>;
+    async fn set_job_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool>;
+    async fn run_job_now(&self, id: &str) -> anyhow::Result<String>;
+
+    // --- orchestration (orch.read / orch.write) ---
+    async fn submit_orchestration(&self, project_id: &str, goal: &str) -> anyhow::Result<String>;
+    async fn list_orchestrations(&self, root: Option<&str>) -> anyhow::Result<Vec<AppOrchSummary>>;
+    async fn cancel_orchestration(&self, id: &str) -> anyhow::Result<u32>;
+    async fn retry_orchestration(&self, id: &str) -> anyhow::Result<bool>;
+
+    // --- projects (projects.read / projects.write) ---
+    async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>>;
+    async fn create_chat_session(&self, title: Option<String>) -> anyhow::Result<String>;
+    async fn attach_project(&self, session_pk: &str, project_id: &str) -> anyhow::Result<()>;
+}
+
+/// The app-control tool names — added to the sub-agent blocklist and never
+/// advertised to delegated children (spec §9.1).
+pub const APP_TOOLS: &[&str] = &["app_jobs", "app_orchestrate", "app_projects", "clarify"];
+
 /// Channel bundle for tools whose EXECUTION is a user interaction
 /// (`exitplanmode`, `askuserquestion`): they emit their own
 /// `ApprovalRequested` and block on the reply, reusing the approval pipeline.
@@ -217,6 +302,22 @@ pub struct ToolCtx {
     /// Present when the session has interactive surfaces; `None` disables
     /// `exitplanmode`/`askuserquestion` (they return a tool error).
     pub interaction: Option<Arc<Interaction>>,
+    /// Curated app-control facade (spec §9.1). `None` disables the `app_*`
+    /// tools (sub-agents, workers, review forks, bare tests) — they return a
+    /// "not available" error, mirroring `interaction`/`spawn`/`memory`.
+    pub app: Option<Arc<dyn AppControl>>,
+    /// Which actor is driving this tool call (Phase 4 §7). Defaults to
+    /// `User` for interactive turns; the background review fork
+    /// (`WriteOrigin::BackgroundReview`) and sub-agent turns
+    /// (`WriteOrigin::Agent`) set it explicitly at their own `ToolCtx` build
+    /// sites. Consulted by `skill_manage` and the app-control negative-space
+    /// guard (Phase 6) to gate autonomous writes more strictly than
+    /// human-driven ones.
+    pub write_origin: crate::domain::WriteOrigin,
+    /// Skill names viewed so far this tool-call turn — the `skill` tool
+    /// records into this set so a same-turn `skill_manage` USE can tell
+    /// "viewed-then-used" apart from "used blind", without a DB round trip.
+    pub viewed_skills: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The result of a tool call.
@@ -332,12 +433,26 @@ impl ToolRegistry {
             Arc::new(webfetch::WebFetch),
             Arc::new(websearch::WebSearch),
             Arc::new(skill::SkillTool),
+            Arc::new(skill_manage::SkillManage),
             Arc::new(memory::MemoryTool),
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
+            Arc::new(session_search::SessionSearch),
             Arc::new(plan::ExitPlanMode),
             Arc::new(question::AskUserQuestion),
+            // Gated to `kind='worker'` sessions — see
+            // `runner::visible_tool_defs` (schema) and its own
+            // `Store::task_by_session` guard (runtime).
+            Arc::new(orch_block::OrchBlock),
+            // App-control tools over the curated `AppControl` facade (spec
+            // §9.1); `None` on `ctx.app` (sub-agents/workers/tests) errors
+            // "not available". Blocked from delegated children — see
+            // `runner::SUBAGENT_BLOCKLIST`.
+            Arc::new(app_jobs::AppJobs),
+            Arc::new(app_orchestrate::AppOrchestrate),
+            Arc::new(app_projects::AppProjects),
+            Arc::new(clarify::Clarify),
         ];
         let mut tools = BTreeMap::new();
         for t in list {
@@ -548,6 +663,9 @@ pub(crate) mod testutil {
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tool_call_id: "test-call".into(),
             interaction: None,
+            app: None,
+            write_origin: crate::domain::WriteOrigin::User,
+            viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -573,6 +691,76 @@ pub(crate) mod testutil {
             project_id: None,
         }));
         (ctx, hub, rx, perm)
+    }
+
+    /// A recording fake `AppControl` for tool unit tests.
+    #[derive(Default)]
+    pub struct FakeAppControl {
+        pub created: std::sync::Mutex<Vec<AppJobCreate>>,
+        pub submitted: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AppControl for FakeAppControl {
+        fn origin(&self) -> crate::domain::WriteOrigin {
+            crate::domain::WriteOrigin::Agent
+        }
+        async fn list_jobs(&self) -> anyhow::Result<Vec<AppJobSummary>> {
+            Ok(vec![AppJobSummary {
+                id: "job-1".into(),
+                name: "nightly".into(),
+                cron: "0 9 * * *".into(),
+                enabled: true,
+            }])
+        }
+        async fn create_job(&self, spec: AppJobCreate) -> anyhow::Result<String> {
+            self.created.lock().unwrap().push(spec);
+            Ok("job-new".into())
+        }
+        async fn set_job_enabled(&self, _id: &str, _enabled: bool) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn run_job_now(&self, _id: &str) -> anyhow::Result<String> {
+            Ok("run-1".into())
+        }
+        async fn submit_orchestration(
+            &self,
+            _project_id: &str,
+            goal: &str,
+        ) -> anyhow::Result<String> {
+            self.submitted.lock().unwrap().push(goal.to_string());
+            Ok("orch-root".into())
+        }
+        async fn list_orchestrations(
+            &self,
+            _root: Option<&str>,
+        ) -> anyhow::Result<Vec<AppOrchSummary>> {
+            Ok(vec![AppOrchSummary {
+                id: "orch-root".into(),
+                title: "build it".into(),
+                status: "running".into(),
+                agent: "orchestrator".into(),
+                result: None,
+            }])
+        }
+        async fn cancel_orchestration(&self, _id: &str) -> anyhow::Result<u32> {
+            Ok(3)
+        }
+        async fn retry_orchestration(&self, _id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>> {
+            Ok(vec![AppProjectSummary {
+                id: "p1".into(),
+                name: "Ryuzi".into(),
+            }])
+        }
+        async fn create_chat_session(&self, _title: Option<String>) -> anyhow::Result<String> {
+            Ok("chat-1".into())
+        }
+        async fn attach_project(&self, _session_pk: &str, _project_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -674,6 +862,35 @@ mod tests {
         assert!(out.contains("99\n100"));
     }
 
+    #[tokio::test]
+    async fn tool_ctx_carries_app_facade_and_write_origin() {
+        use super::testutil::ctx_at;
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+        // Default (bare test) context: no facade, user origin.
+        assert!(ctx.app.is_none());
+        assert_eq!(ctx.write_origin, crate::domain::WriteOrigin::User);
+        // A fake facade can be attached and called.
+        let fake = std::sync::Arc::new(testutil::FakeAppControl::default());
+        ctx.app = Some(fake.clone());
+        ctx.write_origin = crate::domain::WriteOrigin::Agent;
+        let id = ctx
+            .app
+            .as_ref()
+            .unwrap()
+            .create_job(AppJobCreate {
+                name: "nightly".into(),
+                schedule: "every day at 9am".into(),
+                prompt: "summarize".into(),
+                project_id: Some("p1".into()),
+                model_override: None,
+            })
+            .await
+            .unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(fake.created.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn registry_has_all_builtins_with_definitions() {
         let reg = ToolRegistry::builtin();
@@ -690,17 +907,24 @@ mod tests {
             "webfetch",
             "websearch",
             "skill",
+            "skill_manage",
             "memory",
             "revert",
             "lsp",
             "task",
+            "session_search",
             "exitplanmode",
             "askuserquestion",
+            "orch_block",
+            "app_jobs",
+            "app_orchestrate",
+            "app_projects",
+            "clarify",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 18);
+        assert_eq!(defs.len(), 25);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

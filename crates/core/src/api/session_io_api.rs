@@ -136,6 +136,7 @@ async fn apply_import(
                 tool_call_id: m.tool_call_id,
                 status: m.status,
                 tool_kind: m.tool_kind,
+                speaker: None,
             })
             .await?;
     }
@@ -346,6 +347,7 @@ mod tests {
                 status: None,
                 tool_kind: None,
                 created_at: 0,
+                speaker: None,
             },
             Message {
                 session_pk: "s".into(),
@@ -357,6 +359,7 @@ mod tests {
                 status: Some("completed".into()),
                 tool_kind: Some("execute".into()),
                 created_at: 0,
+                speaker: None,
             },
         ];
         let html = build_html("My & Session", &messages);

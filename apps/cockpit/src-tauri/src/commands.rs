@@ -4,7 +4,7 @@ use ryuzi_core::api::fsview_api::{content_type_for_path, MediaFile, MAX_MEDIA_RE
 use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
 use ryuzi_core::llm_router::model_effort::{ModelPreferenceKey, ProjectRuntimeInfo};
-use ryuzi_core::{Message, PermMode, Project, Session};
+use ryuzi_core::{Message, OrchTask, PermMode, Project, Session};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
@@ -267,6 +267,85 @@ pub async fn list_branches(
         .rpc(
             "list_branches",
             serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_submit(
+    engine: Engine<'_>,
+    project_id: String,
+    goal: String,
+    decompose: bool,
+    home_session_pk: Option<String>,
+) -> R<String> {
+    let client = engine.client("local")?;
+    client
+        .rpc(
+            "orch_submit",
+            serde_json::json!({
+                "project_id": project_id, "goal": goal, "decompose": decompose,
+                "home_session_pk": home_session_pk,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_list_roots(engine: Engine<'_>) -> R<Vec<OrchTask>> {
+    let client = engine.client("local")?;
+    client.rpc("orch_list_roots", serde_json::json!({})).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_tasks(engine: Engine<'_>, root: String) -> R<Vec<OrchTask>> {
+    let client = engine.client("local")?;
+    client
+        .rpc("orch_tasks", serde_json::json!({ "root": root }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_cancel(engine: Engine<'_>, root: String) -> R<u32> {
+    let client = engine.client("local")?;
+    client
+        .rpc("orch_cancel", serde_json::json!({ "root": root }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_retry(engine: Engine<'_>, task_id: String) -> R<bool> {
+    let client = engine.client("local")?;
+    client
+        .rpc("orch_retry", serde_json::json!({ "task_id": task_id }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_answer_block(engine: Engine<'_>, task_id: String, answer: String) -> R<bool> {
+    let client = engine.client("local")?;
+    client
+        .rpc(
+            "orch_answer_block",
+            serde_json::json!({ "task_id": task_id, "answer": answer }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn orch_steer(engine: Engine<'_>, session_pk: String, text: String) -> R<String> {
+    let client = engine.client("local")?;
+    client
+        .rpc(
+            "orch_steer",
+            serde_json::json!({ "session_pk": session_pk, "text": text }),
         )
         .await
 }

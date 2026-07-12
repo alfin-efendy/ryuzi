@@ -133,7 +133,11 @@ mod tests {
         // unset → falls back to the provided default
         assert_eq!(aux_model(&store, "title", "sess/model").await, "sess/model");
         store
-            .set_setting("auxiliary.title.model", "cheap/haiku")
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "auxiliary.title.model",
+                "cheap/haiku",
+            )
             .await
             .unwrap();
         assert_eq!(
