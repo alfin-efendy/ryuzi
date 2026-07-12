@@ -6,14 +6,19 @@
 
 use super::{ok, params, ApiError};
 use crate::agent_settings::{self, AgentSettings};
+use crate::agents::knowledge::AgentLearningSnapshot;
+use crate::agents::learning_queue::{LearningEventPayload, RollbackEvent};
+use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
 use crate::agents::types::{
     AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissionMode, AgentPermissions,
     AgentRegistrySnapshot, AgentSnapshot, AgentTools, PermissionDecision, PermissionRule,
 };
 use crate::api::types::{
-    AgentDetailInfo, AgentModelInfo, AgentMutationInfo, AgentRecoveryInfo, AgentRegistryInfo,
-    AgentSettingsInfo, AgentSummaryInfo, AgentValidationInfo, PermissionRuleInfo,
-    SessionRuntimeInfo,
+    AgentDetailInfo, AgentLearningInfo, AgentModelInfo, AgentMutationInfo, AgentRecoveryInfo,
+    AgentRegistryInfo, AgentSettingsInfo, AgentSkillUsageInfo, AgentSummaryInfo,
+    AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
+    JourneyMilestoneInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, LearningReviewInfo,
+    PermissionRuleInfo, SessionRuntimeInfo,
 };
 use crate::llm_router::model_effort::{
     self, EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
@@ -21,6 +26,8 @@ use crate::llm_router::model_effort::{
 };
 use crate::serve::ApiState;
 use crate::{PermMode, SessionKind};
+use chrono::SecondsFormat;
+use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -43,6 +50,14 @@ pub(crate) const HANDLES: &[&str] = &[
     "set_default_agent",
     "get_subagent_model",
     "update_subagent_model",
+    "get_agent_learning",
+    "create_agent_concept",
+    "update_agent_concept",
+    "delete_agent_concept",
+    "validate_agent_concept_raw",
+    "replace_agent_concept_raw",
+    "delete_invalid_agent_concept",
+    "rollback_agent_learning",
 ];
 
 #[derive(Deserialize)]
@@ -106,6 +121,44 @@ struct UpdateAgentP {
 #[derive(Deserialize)]
 struct UpdateSubagentModelP {
     model: AgentModelInfo,
+}
+
+#[derive(Deserialize)]
+struct ConceptP {
+    agent_id: String,
+    concept_id: String,
+}
+
+#[derive(Deserialize)]
+struct CreateConceptP {
+    agent_id: String,
+    input: KnowledgeConceptMutationInfo,
+}
+
+#[derive(Deserialize)]
+struct UpdateConceptP {
+    agent_id: String,
+    concept_id: String,
+    input: KnowledgeConceptMutationInfo,
+}
+
+#[derive(Deserialize)]
+struct RawConceptP {
+    agent_id: String,
+    relative_path: String,
+    raw_markdown: String,
+}
+
+#[derive(Deserialize)]
+struct InvalidConceptP {
+    agent_id: String,
+    relative_path: String,
+}
+
+#[derive(Deserialize)]
+struct RollbackLearningP {
+    agent_id: String,
+    snapshot_id: String,
 }
 
 impl From<AgentModel> for AgentModelInfo {
@@ -558,6 +611,173 @@ async fn session_runtime_info(
     })
 }
 
+/// Confirms the agent exists (404 otherwise) and returns its trimmed id.
+/// Every per-agent Learning handler goes through this first so deleted or
+/// unknown agents can never touch a knowledge bundle path.
+async fn require_agent(state: &ApiState, agent_id: &str) -> Result<String, ApiError> {
+    let agent_id = agent_id.trim().to_owned();
+    state
+        .agents
+        .get(&agent_id)
+        .await
+        .map_err(|_| ApiError::not_found(format!("unknown agent: {agent_id}")))?;
+    Ok(agent_id)
+}
+
+/// Knowledge-store failures are caller mistakes, not server faults: missing
+/// concepts/paths surface as 404, everything else (parse and validation
+/// failures) as 400.
+fn knowledge_api_error(error: anyhow::Error) -> ApiError {
+    let message = format!("{error:#}");
+    if message.contains("was not found") || message.contains("does not exist") {
+        ApiError::not_found(message)
+    } else {
+        ApiError::bad_request(message)
+    }
+}
+
+/// The wire scope vocabulary is exactly `global`, `user`, and `project`;
+/// `project_id` must be nonblank for `project` and absent for the others.
+/// This management surface authors memory concepts only, so `extensions`
+/// is always empty — existing extension fields survive updates because the
+/// store merges through its lossless document.
+fn concept_input_from_mutation(
+    info: KnowledgeConceptMutationInfo,
+) -> Result<KnowledgeConceptInput, ApiError> {
+    let title = info.title.trim().to_owned();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("concept title cannot be blank"));
+    }
+    let description = info.description.trim().to_owned();
+    if description.is_empty() {
+        return Err(ApiError::bad_request("concept description cannot be blank"));
+    }
+    let project_id = info
+        .project_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let scope = match info.scope.trim() {
+        "project" => KnowledgeScope::Project {
+            project_id: project_id.ok_or_else(|| {
+                ApiError::bad_request("scope `project` requires a nonblank projectId")
+            })?,
+        },
+        scope @ ("global" | "user") => {
+            if project_id.is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "scope `{scope}` does not take a projectId"
+                )));
+            }
+            if scope == "global" {
+                KnowledgeScope::Global
+            } else {
+                KnowledgeScope::User
+            }
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown scope `{other}` (expected global, user, or project)"
+            )));
+        }
+    };
+    Ok(KnowledgeConceptInput {
+        area: ConceptArea::Memory(scope),
+        title,
+        description,
+        body: info.body,
+        tags: info.tags,
+        extensions: IndexMap::new(),
+    })
+}
+
+fn concept_info(concept: KnowledgeConcept) -> KnowledgeConceptInfo {
+    let (scope, project_id) = match &concept.scope {
+        None => (None, None),
+        Some(KnowledgeScope::Global) => (Some("global"), None),
+        Some(KnowledgeScope::User) => (Some("user"), None),
+        Some(KnowledgeScope::Project { project_id }) => (Some("project"), Some(project_id.clone())),
+    };
+    KnowledgeConceptInfo {
+        id: concept.id,
+        relative_path: concept.relative_path,
+        concept_type: concept.concept_type,
+        title: concept.title,
+        description: concept.description,
+        body: concept.body,
+        scope: scope.map(str::to_owned),
+        project_id,
+        tags: concept.tags,
+        timestamp: concept.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
+    }
+}
+
+fn learning_info(snapshot: AgentLearningSnapshot) -> AgentLearningInfo {
+    AgentLearningInfo {
+        concepts: snapshot.concepts.into_iter().map(concept_info).collect(),
+        invalid: snapshot
+            .invalid
+            .into_iter()
+            .map(|invalid| InvalidKnowledgeConceptInfo {
+                relative_path: invalid.relative_path,
+                error: invalid.error,
+                raw_markdown: invalid.raw_markdown,
+            })
+            .collect(),
+        journey: snapshot
+            .journey
+            .into_iter()
+            .map(|milestone| JourneyMilestoneInfo {
+                concept_id: milestone.concept_id,
+                title: milestone.title,
+                timestamp: milestone
+                    .timestamp
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            })
+            .collect(),
+        skill_usage: snapshot
+            .skill_usage
+            .into_iter()
+            .map(|usage| AgentSkillUsageInfo {
+                skill_id: usage.skill_id,
+                uses: usage.uses,
+                successes: usage.successes,
+                concept_id: usage.concept_id,
+            })
+            .collect(),
+        reviews: snapshot
+            .reviews
+            .into_iter()
+            .map(|review| LearningReviewInfo {
+                concept_id: review.concept_id,
+                title: review.title,
+                description: review.description,
+                timestamp: review.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
+            })
+            .collect(),
+        curator: CuratorStateInfo {
+            concept: snapshot.curator.concept.map(concept_info),
+            last_event_id: snapshot.curator.last_event_id,
+        },
+        curator_history: snapshot
+            .curator_history
+            .into_iter()
+            .map(|history| CuratorHistorySnapshotInfo {
+                snapshot_id: history.snapshot_id,
+                concept: concept_info(history.concept),
+            })
+            .collect(),
+    }
+}
+
+async fn agent_learning_info(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<AgentLearningInfo, ApiError> {
+    Ok(learning_info(
+        state.agent_knowledge.learning_snapshot(agent_id).await?,
+    ))
+}
+
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
     match method {
@@ -749,6 +969,100 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let snapshot = state.agents.set_subagent_model(model).await?;
             ok(registry_info(state, snapshot).await?)
         }
+        "get_agent_learning" => {
+            let a: AgentIdP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            ok(agent_learning_info(state, &agent_id).await?)
+        }
+        "create_agent_concept" => {
+            let a: CreateConceptP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let input = concept_input_from_mutation(a.input)?;
+            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let concept = knowledge.create(input).await.map_err(knowledge_api_error)?;
+            ok(concept_info(concept))
+        }
+        "update_agent_concept" => {
+            let a: UpdateConceptP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let input = concept_input_from_mutation(a.input)?;
+            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let concept = knowledge
+                .update(&a.concept_id, input)
+                .await
+                .map_err(knowledge_api_error)?;
+            ok(concept_info(concept))
+        }
+        "delete_agent_concept" => {
+            let a: ConceptP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            knowledge
+                .delete(&a.concept_id)
+                .await
+                .map_err(knowledge_api_error)?;
+            ok(agent_learning_info(state, &agent_id).await?)
+        }
+        "validate_agent_concept_raw" => {
+            let a: RawConceptP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let concept = knowledge
+                .validate_raw(&a.relative_path, &a.raw_markdown)
+                .await
+                .map_err(knowledge_api_error)?;
+            ok(concept_info(concept))
+        }
+        "replace_agent_concept_raw" => {
+            let a: RawConceptP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let concept = knowledge
+                .replace_raw(&a.relative_path, &a.raw_markdown)
+                .await
+                .map_err(knowledge_api_error)?;
+            ok(concept_info(concept))
+        }
+        "delete_invalid_agent_concept" => {
+            let a: InvalidConceptP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            knowledge
+                .delete_invalid(&a.relative_path)
+                .await
+                .map_err(knowledge_api_error)?;
+            ok(agent_learning_info(state, &agent_id).await?)
+        }
+        "rollback_agent_learning" => {
+            let a: RollbackLearningP = params(p)?;
+            let agent_id = require_agent(state, &a.agent_id).await?;
+            let snapshot_id = a.snapshot_id.trim().to_owned();
+            // Reject unknown snapshots before enqueueing: a rollback event
+            // that can never apply would otherwise sit at the head of the
+            // durable queue and block every later Learning event.
+            let snapshot = state.agent_knowledge.learning_snapshot(&agent_id).await?;
+            if !snapshot
+                .curator_history
+                .iter()
+                .any(|history| history.snapshot_id == snapshot_id)
+            {
+                return Err(ApiError::not_found(format!(
+                    "rollback snapshot `{snapshot_id}` was not found"
+                )));
+            }
+            state
+                .learning_queue
+                .deliver_through(
+                    &agent_id,
+                    LearningEventPayload::Rollback(RollbackEvent {
+                        snapshot_id,
+                        restored_concept_ids: Vec::new(),
+                    }),
+                )
+                .await
+                .map_err(knowledge_api_error)?;
+            ok(agent_learning_info(state, &agent_id).await?)
+        }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
@@ -895,6 +1209,348 @@ mod tests {
         );
         let got = dispatch(&s, "get_subagent_model", json!({})).await.unwrap();
         assert_eq!(got, json!({"kind":"route","route":"smart"}));
+    }
+
+    async fn default_agent_id(s: &crate::serve::ApiState) -> String {
+        s.agents.default_agent_id().await
+    }
+
+    /// A `state_with_agents()` whose default agent has one unparseable
+    /// Markdown file inside its knowledge bundle's `memory/user` area.
+    async fn state_with_invalid_concept() -> crate::serve::ApiState {
+        let s = state_with_agents().await;
+        let id = default_agent_id(&s).await;
+        let root = s
+            .agent_knowledge
+            .for_agent(&id)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        std::fs::create_dir_all(root.join("memory/user")).unwrap();
+        std::fs::write(root.join("memory/user/broken.md"), "nope").unwrap();
+        s
+    }
+
+    fn valid_memory_markdown(agent_id: &str) -> String {
+        format!(
+            "---\ntype: Memory\ntitle: Repaired\ndescription: Repaired memory.\n\
+             timestamp: 2026-07-12T14:30:00Z\nscope: user\nagent_id: {agent_id}\n---\n\n\
+             Repaired body.\n"
+        )
+    }
+
+    fn user_concept_input() -> Value {
+        json!({
+            "title": "Concise summaries",
+            "description": "Prefer concise summaries.",
+            "body": "Identify changed files and checks.",
+            "scope": "user",
+            "projectId": null,
+            "tags": ["communication"]
+        })
+    }
+
+    #[tokio::test]
+    async fn knowledge_crud_is_scoped_by_agent_id() {
+        let s = state_with_agents().await;
+        let a = dispatch(&s, "list_agents", json!({})).await.unwrap()["agents"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let b = dispatch(
+            &s,
+            "create_agent",
+            json!({"input": reviewer_input("Reviewer")}),
+        )
+        .await
+        .unwrap()["summary"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        dispatch(
+            &s,
+            "create_agent_concept",
+            json!({"agent_id": a, "input": user_concept_input()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch(&s, "get_agent_learning", json!({"agent_id": a}))
+                .await
+                .unwrap()["concepts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            dispatch(&s, "get_agent_learning", json!({"agent_id": b}))
+                .await
+                .unwrap()["concepts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_repair_validation_does_not_write_until_replace() {
+        let s = state_with_invalid_concept().await;
+        let id = default_agent_id(&s).await;
+        let raw = valid_memory_markdown(&id);
+        dispatch(
+            &s,
+            "validate_agent_concept_raw",
+            json!({
+                "agent_id": id, "relative_path": "memory/user/broken.md", "raw_markdown": raw
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+                .await
+                .unwrap()["invalid"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let unparseable = dispatch(
+            &s,
+            "validate_agent_concept_raw",
+            json!({
+                "agent_id": id, "relative_path": "memory/user/broken.md",
+                "raw_markdown": "still broken"
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unparseable.status, 400);
+        dispatch(
+            &s,
+            "replace_agent_concept_raw",
+            json!({
+                "agent_id": id, "relative_path": "memory/user/broken.md", "raw_markdown": raw
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+                .await
+                .unwrap()["invalid"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn concept_mutations_round_trip_scope_project_and_rfc3339_timestamp() {
+        let s = state_with_agents().await;
+        let id = default_agent_id(&s).await;
+        let created = dispatch(
+            &s,
+            "create_agent_concept",
+            json!({"agent_id": id, "input": {
+                "title": "Project fact", "description": "Project memory.", "body": "Body.",
+                "scope": "project", "projectId": "p1", "tags": ["ops"]
+            }}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["scope"], "project");
+        assert_eq!(created["projectId"], "p1");
+        assert_eq!(created["conceptType"], "Memory");
+        assert!(created["relativePath"]
+            .as_str()
+            .unwrap()
+            .starts_with("memory/projects/p1/"));
+        assert_eq!(created["tags"], json!(["ops"]));
+        chrono::DateTime::parse_from_rfc3339(created["timestamp"].as_str().unwrap()).unwrap();
+
+        let concept_id = created["id"].as_str().unwrap().to_owned();
+        let updated = dispatch(
+            &s,
+            "update_agent_concept",
+            json!({"agent_id": id, "concept_id": concept_id, "input": {
+                "title": "Global fact", "description": "Global memory.", "body": "Body 2.",
+                "scope": "global", "projectId": null, "tags": []
+            }}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated["scope"], "global");
+        assert!(updated["projectId"].is_null());
+        assert!(updated["relativePath"]
+            .as_str()
+            .unwrap()
+            .starts_with("memory/global/"));
+
+        dispatch(
+            &s,
+            "delete_agent_concept",
+            json!({"agent_id": id, "concept_id": concept_id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+                .await
+                .unwrap()["concepts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn learning_handlers_enforce_agent_404_and_scope_400() {
+        let s = state_with_agents().await;
+        let id = default_agent_id(&s).await;
+        for (method, params) in [
+            ("get_agent_learning", json!({"agent_id": "missing"})),
+            (
+                "create_agent_concept",
+                json!({"agent_id": "missing", "input": user_concept_input()}),
+            ),
+            (
+                "delete_invalid_agent_concept",
+                json!({"agent_id": "missing", "relative_path": "memory/user/x.md"}),
+            ),
+            (
+                "rollback_agent_learning",
+                json!({"agent_id": "missing", "snapshot_id": "snap"}),
+            ),
+        ] {
+            let error = dispatch(&s, method, params).await.unwrap_err();
+            assert_eq!(error.status, 404, "{method} should 404 for unknown agents");
+        }
+
+        let missing_project = dispatch(
+            &s,
+            "create_agent_concept",
+            json!({"agent_id": id, "input": {
+                "title": "T", "description": "D", "body": "B",
+                "scope": "project", "projectId": null, "tags": []
+            }}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_project.status, 400);
+
+        let stray_project = dispatch(
+            &s,
+            "create_agent_concept",
+            json!({"agent_id": id, "input": {
+                "title": "T", "description": "D", "body": "B",
+                "scope": "user", "projectId": "p1", "tags": []
+            }}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stray_project.status, 400);
+
+        let unknown_scope = dispatch(
+            &s,
+            "create_agent_concept",
+            json!({"agent_id": id, "input": {
+                "title": "T", "description": "D", "body": "B",
+                "scope": "workspace", "projectId": null, "tags": []
+            }}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown_scope.status, 400);
+
+        let unknown_concept = dispatch(
+            &s,
+            "update_agent_concept",
+            json!({"agent_id": id, "concept_id": "nope", "input": user_concept_input()}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown_concept.status, 404);
+    }
+
+    #[tokio::test]
+    async fn delete_invalid_agent_concept_removes_the_broken_file() {
+        let s = state_with_invalid_concept().await;
+        let id = default_agent_id(&s).await;
+        dispatch(
+            &s,
+            "delete_invalid_agent_concept",
+            json!({"agent_id": id, "relative_path": "memory/user/broken.md"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+                .await
+                .unwrap()["invalid"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_agent_learning_restores_snapshot_through_the_durable_queue() {
+        use crate::agents::learning_queue::{CuratorStateEvent, LearningEventPayload};
+        let s = state_with_agents().await;
+        let id = default_agent_id(&s).await;
+        s.learning_queue
+            .deliver_through(
+                &id,
+                LearningEventPayload::CuratorState(CuratorStateEvent {
+                    title: "Current state".into(),
+                    description: "Current description.".into(),
+                    body: "Current body.".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let knowledge = s.agent_knowledge.for_agent(&id).unwrap();
+        knowledge
+            .replace_raw(
+                "curator/history/snap1.md",
+                "---\ntype: CuratorHistory\ntitle: Snapshotted state\n\
+                 description: State before curation.\ntimestamp: 2026-07-12T14:30:00Z\n---\n\n\
+                 Snapshot body.\n",
+            )
+            .await
+            .unwrap();
+
+        let unknown = dispatch(
+            &s,
+            "rollback_agent_learning",
+            json!({"agent_id": id, "snapshot_id": "missing"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown.status, 404);
+
+        let out = dispatch(
+            &s,
+            "rollback_agent_learning",
+            json!({"agent_id": id, "snapshot_id": "snap1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["curator"]["concept"]["title"], "Snapshotted state");
+        assert!(out["curatorHistory"].as_array().unwrap().len() >= 2);
+        // The rollback drained through the queue: nothing is left pending.
+        assert!(s
+            .learning_queue
+            .claim_next(&id, "assert")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

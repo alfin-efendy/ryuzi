@@ -437,6 +437,77 @@ impl LearningQueue {
             .await
     }
 
+    /// Enqueues `payload` durably, then synchronously drains the agent's
+    /// queue in strict sequence order until that event is delivered — so an
+    /// RPC caller gets an authoritative post-apply view without ever
+    /// becoming a second direct writer or skipping an earlier event. When
+    /// the background worker owns the head claim, this polls the event's
+    /// status and retries; after 30 seconds without delivery it errors,
+    /// leaving the durable event in place (never dropped or reordered).
+    pub async fn deliver_through(
+        &self,
+        agent_id: &str,
+        payload: LearningEventPayload,
+    ) -> anyhow::Result<()> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+        const DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let target = self.enqueue(agent_id, payload).await?;
+        let worker_id = format!("deliver-through-{}", target.event_id);
+        let deadline = std::time::Instant::now() + DELIVERY_TIMEOUT;
+        loop {
+            if self.event_status(&target.event_id).await?.as_deref() == Some("delivered") {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "learning event `{}` was not delivered within 30s; \
+                     it remains queued for the background worker",
+                    target.event_id
+                );
+            }
+            match self.claim_next(agent_id, &worker_id).await? {
+                Some(event) => match self.apply_claimed(&event).await {
+                    Ok(()) => {
+                        self.mark_delivered(&event.event_id).await?;
+                        if event.event_id == target.event_id {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.release(&event.event_id, &message).await?;
+                        // An earlier event that cannot apply blocks the
+                        // head-of-line; ours must not jump the queue.
+                        return Err(error).with_context(|| {
+                            format!(
+                                "learning event `{}` could not be applied while draining \
+                                 toward `{}`",
+                                event.event_id, target.event_id
+                            )
+                        });
+                    }
+                },
+                // The head is claimed elsewhere (likely the background
+                // worker). Wait for that claim to resolve, then re-check.
+                None => tokio::time::sleep(POLL_INTERVAL).await,
+            }
+        }
+    }
+
+    async fn event_status(&self, event_id: &str) -> anyhow::Result<Option<String>> {
+        let event = event_id.to_owned();
+        self.store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT status FROM agent_learning_queue WHERE event_id=?1",
+                    params![event],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await
+    }
+
     /// Resets every claim older than the stale window (relative to
     /// `now_ms`) across all agents; returns how many claims were reset.
     pub async fn reclaim_stale(&self, now_ms: i64) -> anyhow::Result<u64> {

@@ -264,8 +264,28 @@ pub(crate) fn build_learning_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{dispatch, tests_support::state};
+    use crate::api::{
+        dispatch,
+        tests_support::{state, state_with_agents},
+    };
     use serde_json::json;
+
+    /// Compile-bridge guarantee for the Plan 3 migration window: the new
+    /// per-agent Learning surface and the legacy global one are both
+    /// dispatched until Task 9 removes the legacy consumer and handlers.
+    #[tokio::test]
+    async fn per_agent_and_legacy_learning_surfaces_coexist() {
+        let s = state_with_agents().await;
+        let agent_id = s.agents.default_agent_id().await;
+        let per_agent = dispatch(&s, "get_agent_learning", json!({"agent_id": agent_id}))
+            .await
+            .unwrap();
+        assert!(per_agent["concepts"].is_array());
+        let legacy = dispatch(&s, "read_memory", json!({"scope": "user"}))
+            .await
+            .unwrap();
+        assert!(legacy.is_array());
+    }
 
     fn usage(name: &str, state: &str) -> SkillUsage {
         SkillUsage {
