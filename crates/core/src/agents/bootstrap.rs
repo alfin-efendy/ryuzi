@@ -15,6 +15,7 @@ use crate::agent_settings;
 use crate::paths;
 use crate::store::Store;
 
+use super::knowledge::ensure_bundle_at;
 use super::registry::{discover_agent_directories, new_agent_id, AgentRegistry};
 use super::transaction::{atomic_write, recover_transactions, AgentTransaction};
 use super::types::*;
@@ -188,7 +189,8 @@ async fn bootstrap_defaults(
         store.delete_legacy_agent_settings().await?;
     }
 
-    let registry = Arc::new(AgentRegistry::load(config_root, store.clone()).await?);
+    let registry = Arc::new(AgentRegistry::load(config_root.clone(), store.clone()).await?);
+    ensure_knowledge_bundles(&config_root, &registry).await?;
     // Marker last: a crash anywhere above leaves either the old state (the
     // transaction rolled back) or valid new files that the next startup
     // adopts as `Existing` and re-marks.
@@ -220,10 +222,30 @@ async fn load_existing(
     } else {
         append_default_ryuzi(&config_root, &store, &snapshot).await?
     };
+    ensure_knowledge_bundles(&config_root, &registry).await?;
     store
         .set_setting_raw(AGENT_PERSISTENCE_MARKER, AGENT_PERSISTENCE_SCHEMA)
         .await?;
     Ok(AgentBootstrap { registry, reason })
+}
+
+/// Creates (idempotently) every agent's knowledge bundle skeleton: the
+/// concept directories plus empty generated `index.md`/`log.md` files.
+/// Existing bundle content is never modified.
+async fn ensure_knowledge_bundles(
+    config_root: &Path,
+    registry: &AgentRegistry,
+) -> anyhow::Result<()> {
+    for agent in registry.snapshot().await.agents {
+        let bundle = paths::agent_knowledge_dir_in(config_root, &agent.profile.id);
+        ensure_bundle_at(&bundle).with_context(|| {
+            format!(
+                "failed to create knowledge bundle for agent `{}`",
+                agent.profile.id
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Appends a new UUID-identified Ryuzi built from the template without
@@ -720,6 +742,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.reason, BootstrapReason::Existing);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_creates_knowledge_bundle_with_generated_indexes_and_log() {
+        let fixture = BootstrapFixture::fresh().await;
+        let result = initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let agent_id = result.registry.snapshot().await.agents[0]
+            .profile
+            .id
+            .clone();
+        let bundle = crate::paths::agent_knowledge_dir_in(&fixture.config_root(), &agent_id);
+        for directory in [
+            "memory/global",
+            "memory/user",
+            "memory/projects",
+            "learning/skills",
+            "learning/reviews",
+            "learning/journey",
+            "learning/curator",
+            "learning/curator-history",
+        ] {
+            assert!(bundle.join(directory).is_dir(), "missing {directory}");
+        }
+        for generated in ["memory/index.md", "learning/index.md", "log.md"] {
+            let path = bundle.join(generated);
+            assert!(path.is_file(), "missing {generated}");
+            assert!(std::fs::read_to_string(&path).unwrap().is_empty());
+        }
+        // A second startup does not disturb the existing bundle.
+        std::fs::write(bundle.join("log.md"), "- existing entry\n").unwrap();
+        initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("log.md")).unwrap(),
+            "- existing entry\n"
+        );
     }
 
     #[tokio::test]
