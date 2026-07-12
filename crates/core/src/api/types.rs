@@ -908,6 +908,202 @@ pub struct CuratorStatus {
     pub recent: Vec<crate::domain::CuratorRun>,
 }
 
+// --- agent_api (Plan 3: agent management RPC family for the Cockpit Agents panel) ---
+
+/// An agent's model assignment: either a concrete provider model (with an
+/// optional effort override) or a symbolic router route (`smart`, `fast`,
+/// ...). Routes never carry an effort — `deny_unknown_fields` makes a
+/// `{"kind":"route", ..., "effort": ...}` payload a decode error rather
+/// than a silently dropped field.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AgentModelInfo {
+    Concrete {
+        name: String,
+        effort: Option<String>,
+    },
+    Route {
+        route: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRuleInfo {
+    pub id: String,
+    pub tool: String,
+    pub decision: String,
+    pub command_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentValidationInfo {
+    pub field: String,
+    pub message: String,
+}
+
+/// One startup-recovery note surfaced to the UI (for example a quarantined
+/// agent file that failed to parse and was set aside).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRecoveryInfo {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSummaryInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub avatar_color: String,
+    pub model: AgentModelInfo,
+    pub permission_mode: String,
+    pub skill_count: u32,
+    pub tool_count: u32,
+    pub knowledge_count: u32,
+    pub executable: bool,
+    pub validation: Vec<AgentValidationInfo>,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDetailInfo {
+    pub summary: AgentSummaryInfo,
+    pub permission_rules: Vec<PermissionRuleInfo>,
+    pub skills: Vec<String>,
+    pub native_tools: Vec<String>,
+    pub plugin_tools: Vec<String>,
+    pub apps: Vec<String>,
+    pub max_turns: u32,
+    pub max_tool_rounds: u32,
+    pub model_info: Option<SelectableModelInfo>,
+}
+
+/// Everything a create/update mutation may set on an agent. Server-derived
+/// fields (`id`, counts, `executable`, `validation`, `is_default`) are
+/// deliberately absent so the client can't submit them.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMutationInfo {
+    pub name: String,
+    pub description: String,
+    pub avatar_color: String,
+    pub model: AgentModelInfo,
+    pub permission_mode: String,
+    pub permission_rules: Vec<PermissionRuleInfo>,
+    pub skills: Vec<String>,
+    pub native_tools: Vec<String>,
+    pub plugin_tools: Vec<String>,
+    pub apps: Vec<String>,
+    pub max_turns: u32,
+    pub max_tool_rounds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistryInfo {
+    pub agents: Vec<AgentSummaryInfo>,
+    pub default_agent_id: String,
+    pub recovery: Vec<AgentRecoveryInfo>,
+    pub subagent_model: AgentModelInfo,
+}
+
+/// One knowledge concept as stored in the agent's OKF tree. `timestamp` is
+/// RFC3339. `scope` is `None` for non-memory concepts and one of `global`,
+/// `user`, or `project` for memory; `project_id` is non-null only for
+/// project memory.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeConceptInfo {
+    pub id: String,
+    pub relative_path: String,
+    pub concept_type: String,
+    pub title: String,
+    pub description: String,
+    pub body: String,
+    pub scope: Option<String>,
+    pub project_id: Option<String>,
+    pub tags: Vec<String>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeConceptMutationInfo {
+    pub title: String,
+    pub description: String,
+    pub body: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// A knowledge file that failed OKF parsing: surfaced with its raw markdown
+/// so the UI can offer repair instead of silently dropping it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct InvalidKnowledgeConceptInfo {
+    pub relative_path: String,
+    pub error: String,
+    pub raw_markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JourneyMilestoneInfo {
+    pub concept_id: String,
+    pub title: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSkillUsageInfo {
+    pub skill_id: String,
+    pub uses: u64,
+    pub successes: u64,
+    pub concept_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningReviewInfo {
+    pub concept_id: String,
+    pub title: String,
+    pub description: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratorStateInfo {
+    pub concept: Option<KnowledgeConceptInfo>,
+    pub last_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratorHistorySnapshotInfo {
+    pub snapshot_id: String,
+    pub concept: KnowledgeConceptInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLearningInfo {
+    pub concepts: Vec<KnowledgeConceptInfo>,
+    pub invalid: Vec<InvalidKnowledgeConceptInfo>,
+    pub journey: Vec<JourneyMilestoneInfo>,
+    pub skill_usage: Vec<AgentSkillUsageInfo>,
+    pub reviews: Vec<LearningReviewInfo>,
+    pub curator: CuratorStateInfo,
+    pub curator_history: Vec<CuratorHistorySnapshotInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,5 +1191,49 @@ mod tests {
         assert_eq!(sanitize_file_name("a/b/c.png"), "c.png");
         assert_eq!(sanitize_file_name("we|ird?.png"), "weird.png");
         assert_eq!(sanitize_file_name("   "), "file");
+    }
+}
+
+#[cfg(test)]
+mod agent_management_dto_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn agent_model_union_uses_discriminated_camel_case_shape() {
+        assert_eq!(
+            serde_json::to_value(AgentModelInfo::Concrete {
+                name: "anthropic/claude-opus-4-8".into(),
+                effort: Some("high".into()),
+            })
+            .unwrap(),
+            json!({"kind":"concrete","name":"anthropic/claude-opus-4-8","effort":"high"})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentModelInfo::Route {
+                route: "smart".into()
+            })
+            .unwrap(),
+            json!({"kind":"route","route":"smart"})
+        );
+    }
+
+    #[test]
+    fn mutation_input_rejects_route_effort_by_construction() {
+        let parsed = serde_json::from_value::<AgentMutationInfo>(json!({
+            "name":"Reviewer",
+            "description":"Reviews changes",
+            "avatarColor":"violet",
+            "model":{"kind":"route","route":"smart","effort":"high"},
+            "permissionMode":"ask",
+            "permissionRules":[],
+            "skills":[],
+            "nativeTools":["read"],
+            "pluginTools":[],
+            "apps":[],
+            "maxTurns":50,
+            "maxToolRounds":100
+        }));
+        assert!(parsed.is_err());
     }
 }

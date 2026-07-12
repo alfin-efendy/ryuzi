@@ -46,6 +46,39 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        ApiError {
+            status: 409,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<crate::agents::registry::AgentRegistryError> for ApiError {
+    fn from(e: crate::agents::registry::AgentRegistryError) -> Self {
+        use crate::agents::registry::AgentRegistryError;
+        match e {
+            AgentRegistryError::LastAgent => {
+                ApiError::conflict("at least one main agent must remain")
+            }
+            AgentRegistryError::NotFound(_) => ApiError::not_found(e.to_string()),
+            AgentRegistryError::DuplicateId(_) | AgentRegistryError::DuplicateName(_) => {
+                ApiError::bad_request(e.to_string())
+            }
+            AgentRegistryError::Invalid(issues) => ApiError::bad_request(
+                issues
+                    .iter()
+                    .map(|issue| format!("{}: {}", issue.field, issue.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            AgentRegistryError::Io(error) => ApiError {
+                status: 500,
+                message: error.to_string(),
+            },
+        }
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -286,6 +319,40 @@ mod tests {
         let err: ApiError = params::<Req>(json!({})).unwrap_err();
         assert_eq!(err.status, 400);
         assert!(err.message.contains("bad params"));
+    }
+
+    #[test]
+    fn conflict_has_http_409_status() {
+        let error = ApiError::conflict("at least one main agent must remain");
+        assert_eq!(error.status, 409);
+        assert_eq!(error.message, "at least one main agent must remain");
+    }
+
+    #[test]
+    fn agent_registry_errors_map_to_http_statuses() {
+        use crate::agents::registry::AgentRegistryError;
+        use crate::agents::types::AgentValidationIssue;
+
+        let conflict: ApiError = AgentRegistryError::LastAgent.into();
+        assert_eq!(conflict.status, 409);
+        assert_eq!(conflict.message, "at least one main agent must remain");
+
+        let missing: ApiError = AgentRegistryError::NotFound("a1".into()).into();
+        assert_eq!(missing.status, 404);
+
+        let duplicate: ApiError = AgentRegistryError::DuplicateName("Reviewer".into()).into();
+        assert_eq!(duplicate.status, 400);
+
+        let invalid: ApiError = AgentRegistryError::Invalid(vec![AgentValidationIssue {
+            field: "name".into(),
+            message: "must not be empty".into(),
+        }])
+        .into();
+        assert_eq!(invalid.status, 400);
+        assert_eq!(invalid.message, "name: must not be empty");
+
+        let io: ApiError = AgentRegistryError::Io(anyhow::anyhow!("disk full")).into();
+        assert_eq!(io.status, 500);
     }
 
     #[tokio::test]
