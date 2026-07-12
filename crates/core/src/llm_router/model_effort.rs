@@ -1,5 +1,5 @@
 use crate::llm_router::model_meta::ModelMeta;
-use crate::llm_router::{connections, model_meta, registry, routes};
+use crate::llm_router::{connections, model_capabilities, registry, routes};
 use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -338,13 +338,8 @@ pub(crate) async fn capabilities_for_preference(
             connection_id: Some(connection.id.clone()),
             model: key.model.clone(),
         };
-        let metadata = model_meta::resolve_for_surface(store, &surface).await;
-        capabilities.push(ExecutionModelEffortCapabilities {
-            surface,
-            model_display_name: metadata.display_name.unwrap_or_else(|| key.model.clone()),
-            supported: metadata.reasoning_efforts,
-            provider_default: metadata.default_reasoning_effort,
-        });
+        capabilities
+            .push(model_capabilities::resolve_for_surface(store, &key.family, &surface).await);
     }
     Ok(capabilities)
 }
@@ -357,12 +352,8 @@ pub async fn set_preference(
     let Some(effort) = effort else {
         return store.clear_model_effort_preference(key).await;
     };
-    let intersection = intersect_capabilities(&capabilities_for_preference(store, key).await?);
-    if !intersection
-        .supported
-        .iter()
-        .any(|option| option.value == effort)
-    {
+    let capabilities = model_capabilities::resolve_for_model(store, key).await?;
+    if !capabilities.supports(effort) {
         anyhow::bail!(
             "effort {effort:?} is not supported for {}/{}",
             key.family,
@@ -966,6 +957,54 @@ mod tests {
         assert_eq!(resolved.display_name.as_deref(), Some("Surface GPT"));
         assert!(resolved.reasoning_efforts.is_empty());
         assert_eq!(resolved.context_window, 64_000);
+    }
+
+    #[tokio::test]
+    async fn preference_validation_accepts_pinned_anthropic_and_rejects_unknown_values() {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "anthropic-pref".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    models_override: Some(vec!["claude-opus-4-6".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let key = ModelPreferenceKey {
+            family: "anthropic".into(),
+            model: "claude-opus-4-6".into(),
+        };
+
+        set_preference(&store, &key, Some("max")).await.unwrap();
+        assert_eq!(
+            store
+                .get_model_effort_preference(&key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("max")
+        );
+
+        let error = set_preference(&store, &key, Some("xhigh"))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("is not supported for anthropic/claude-opus-4-6"));
     }
 
     #[tokio::test]
