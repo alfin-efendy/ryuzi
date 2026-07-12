@@ -2848,6 +2848,22 @@ impl Store {
         Ok(())
     }
 
+    /// Delete exactly the legacy single-agent settings keys (`agent_model`
+    /// and `agent_perm_mode`) in one transaction. Used by agent bootstrap's
+    /// first-upgrade/reset cleanup after the registry filesystem commit; no
+    /// other settings row is touched.
+    pub async fn delete_legacy_agent_settings(&self) -> anyhow::Result<()> {
+        self.with_conn(|c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "DELETE FROM settings WHERE key IN ('agent_model', 'agent_perm_mode')",
+                [],
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+
     /// List all persisted settings rows.
     pub async fn list_settings(&self) -> anyhow::Result<Vec<(String, String)>> {
         self.with_conn(|c| -> rusqlite::Result<Vec<(String, String)>> {

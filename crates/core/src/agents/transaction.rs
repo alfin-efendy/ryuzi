@@ -14,6 +14,12 @@ use super::types::{AgentRecoveryNotice, RegistryDiskImage};
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 
+/// The pre-registry single-agent memory directory (`<config>/memory`).
+/// First-upgrade/reset bootstrap deletes it inside the same journaled
+/// transaction that installs the default registry files; it is the only
+/// non-`agents/**` path a journal may reference, and only as a delete target.
+const LEGACY_MEMORY_DIR: &str = "memory";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalPhase {
@@ -148,6 +154,19 @@ impl AgentTransaction {
         candidate: &RegistryDiskImage,
         expected_generation: Option<&str>,
     ) -> anyhow::Result<Self> {
+        Self::prepare_with_legacy_cleanup(config_root, candidate, expected_generation, false)
+    }
+
+    /// Like [`Self::prepare`], but when `delete_legacy_memory` is set the
+    /// transaction also stages a journaled delete of the legacy
+    /// `<config>/memory` directory (if it exists), so bootstrap cleanup and
+    /// default-file creation commit or roll back together.
+    pub fn prepare_with_legacy_cleanup(
+        config_root: &Path,
+        candidate: &RegistryDiskImage,
+        expected_generation: Option<&str>,
+        delete_legacy_memory: bool,
+    ) -> anyhow::Result<Self> {
         let agents_root = config_root.join("agents");
         fs::create_dir_all(&agents_root)?;
         let lock = RegistryFileLock::acquire(config_root)?;
@@ -218,6 +237,13 @@ impl AgentTransaction {
             operations.push(JournalOperation::Delete {
                 target: format!("agents/{id}"),
                 trash: format!("{relative_dir}/trash/agents/{id}"),
+            });
+        }
+
+        if delete_legacy_memory && config_root.join(LEGACY_MEMORY_DIR).exists() {
+            operations.push(JournalOperation::Delete {
+                target: LEGACY_MEMORY_DIR.to_owned(),
+                trash: format!("{relative_dir}/trash/{LEGACY_MEMORY_DIR}"),
             });
         }
 
@@ -601,7 +627,9 @@ fn validate_journal(journal: &TransactionJournal, directory_id: &str) -> anyhow:
                 validate_internal_path(stage, &format!("{transaction_root}/stage/{target}"))?;
             }
             JournalOperation::Delete { target, trash } => {
-                validate_agent_directory_target(target)?;
+                if target != LEGACY_MEMORY_DIR {
+                    validate_agent_directory_target(target)?;
+                }
                 validate_internal_path(trash, &format!("{transaction_root}/trash/{target}"))?;
             }
         }
@@ -654,6 +682,14 @@ fn path_from_relative(value: &str) -> anyhow::Result<PathBuf> {
     let first = components.next().context("journal path is empty")?;
     match first {
         Component::Normal(value) if value == "agents" => {}
+        // The legacy memory directory itself (never anything under it) is a
+        // permitted delete target for first-upgrade/reset cleanup.
+        Component::Normal(value) if value == LEGACY_MEMORY_DIR => {
+            if components.next().is_some() {
+                bail!("journal path is outside the agent registry root");
+            }
+            return Ok(path.to_owned());
+        }
         _ => bail!("journal path is outside the agent registry root"),
     }
     for component in components {

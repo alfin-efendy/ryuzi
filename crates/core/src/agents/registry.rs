@@ -45,7 +45,7 @@ struct RegistryState {
     repairs: Vec<ProfileRepairRecord>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProfileRepairRecord {
     #[allow(dead_code)]
     path: PathBuf,
@@ -210,6 +210,26 @@ impl AgentRegistry {
     pub async fn snapshot(&self) -> AgentRegistrySnapshot {
         let state = self.state.read().await.clone();
         snapshot_from_state(&state)
+    }
+
+    /// Appends bootstrap-time notices (transaction recovery, default agent
+    /// creation) to the published snapshot without touching disk state.
+    pub(crate) async fn append_recovery_notices(&self, notices: Vec<AgentRecoveryNotice>) {
+        if notices.is_empty() {
+            return;
+        }
+        let mut guard = self.state.write().await;
+        let current = guard.as_ref();
+        let mut recovery = current.recovery.clone();
+        recovery.extend(notices);
+        *guard = Arc::new(RegistryState {
+            index: current.index.clone(),
+            agents: current.agents.clone(),
+            subagents: current.subagents.clone(),
+            generation: current.generation.clone(),
+            recovery,
+            repairs: current.repairs.clone(),
+        });
     }
 
     pub async fn get(&self, agent_id: &str) -> anyhow::Result<AgentSnapshot> {
@@ -863,7 +883,7 @@ fn recover_minimal_profile(raw: &str, directory_id: &str) -> Option<AgentProfile
     })
 }
 
-fn discover_agent_directories(root: &Path) -> anyhow::Result<Vec<AgentId>> {
+pub(crate) fn discover_agent_directories(root: &Path) -> anyhow::Result<Vec<AgentId>> {
     let mut ids = match std::fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(Result::ok)
@@ -923,7 +943,7 @@ fn typed_profiles(state: &RegistryState) -> IndexMap<AgentId, AgentProfile> {
         .collect()
 }
 
-fn new_agent_id() -> AgentId {
+pub(crate) fn new_agent_id() -> AgentId {
     format!("agent-{}", paths::new_id())
 }
 

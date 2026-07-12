@@ -1,0 +1,740 @@
+//! Startup bootstrap for the YAML agent registry. Decides between fresh
+//! install, first upgrade from the legacy single-agent settings, reset, and
+//! recovery; performs journaled destructive cleanup limited to legacy agent
+//! data (the `agent_model`/`agent_perm_mode` settings keys and the legacy
+//! `<config>/memory` directory); creates the built-in Ryuzi templates; and
+//! sets the retry-safe schema marker only after the files are valid.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Context;
+use indexmap::IndexMap;
+
+use crate::agent_settings;
+use crate::paths;
+use crate::store::Store;
+
+use super::registry::{discover_agent_directories, new_agent_id, AgentRegistry};
+use super::transaction::{atomic_write, recover_transactions, AgentTransaction};
+use super::types::*;
+use super::yaml::{
+    parse_agent_index_document, render_agent_index, render_agent_index_document,
+    render_agent_profile, render_subagent_config,
+};
+
+/// Settings key marking that the YAML agent registry schema has been
+/// bootstrapped. Set with `set_setting_raw` only after the default files are
+/// committed and loadable, so a crash before it retries idempotently.
+pub const AGENT_PERSISTENCE_MARKER: &str = "agent_persistence_schema";
+
+/// The only schema value this build understands.
+const AGENT_PERSISTENCE_SCHEMA: &str = "1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapReason {
+    Existing,
+    FreshInstall,
+    FirstUpgrade,
+    Reset,
+    Recovery,
+}
+
+pub struct AgentBootstrap {
+    pub registry: Arc<AgentRegistry>,
+    pub reason: BootstrapReason,
+}
+
+/// The built-in Ryuzi profile template. YAML permission mode `ask` is the
+/// runtime `PermMode::Default`; empty native tools mean runtime defaults.
+pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
+    AgentProfile {
+        schema_version: AGENT_SCHEMA_VERSION,
+        id: agent_id,
+        name: "Ryuzi".into(),
+        description: "General-purpose coding and operations agent.".into(),
+        avatar: AgentAvatar {
+            color: "blue".into(),
+        },
+        model: AgentModel::Route {
+            route: "smart".into(),
+        },
+        permissions: AgentPermissions {
+            mode: crate::PermMode::Default,
+            rules: Vec::new(),
+        },
+        skills: Vec::new(),
+        tools: AgentTools {
+            native: Vec::new(),
+            plugins: Vec::new(),
+            apps: Vec::new(),
+        },
+        loop_settings: AgentLoop {
+            max_turns: 50,
+            max_tool_rounds: 100,
+        },
+    }
+}
+
+/// The built-in shared subagent configuration template.
+pub fn default_subagent_config() -> SubagentConfig {
+    SubagentConfig {
+        schema_version: AGENT_SCHEMA_VERSION,
+        model: AgentModel::Route {
+            route: "fast".into(),
+        },
+    }
+}
+
+pub async fn initialize_agent_registry(
+    config_root: PathBuf,
+    store: Arc<Store>,
+) -> anyhow::Result<AgentBootstrap> {
+    let marker = store.get_setting(AGENT_PERSISTENCE_MARKER).await?;
+    let agents_exists = paths::agents_dir_in(&config_root)
+        .join("index.yaml")
+        .exists();
+    let reason = match (marker.as_deref(), agents_exists) {
+        (Some("1"), true) => BootstrapReason::Existing,
+        (Some("1"), false) => BootstrapReason::Recovery,
+        (None, false) if legacy_agent_data_exists(&config_root, &store).await? => {
+            BootstrapReason::FirstUpgrade
+        }
+        (None, false) => BootstrapReason::FreshInstall,
+        (None, true) => BootstrapReason::Existing,
+        (Some(other), _) => anyhow::bail!("unsupported agent persistence schema `{other}`"),
+    };
+    match reason {
+        BootstrapReason::FreshInstall | BootstrapReason::FirstUpgrade => {
+            bootstrap_defaults(config_root, store, reason).await
+        }
+        BootstrapReason::Existing | BootstrapReason::Recovery => {
+            load_existing(config_root, store, reason).await
+        }
+        BootstrapReason::Reset => unreachable!("reset only enters through reset_agent_registry"),
+    }
+}
+
+/// Replaces the whole agent registry with the built-in defaults. Destroys
+/// agent data only: every agent directory, the registry index/subagent files,
+/// the legacy `<config>/memory` directory, and the two legacy settings keys.
+/// Projects, providers, sessions, and every other settings row survive.
+pub async fn reset_agent_registry(
+    config_root: PathBuf,
+    store: Arc<Store>,
+) -> anyhow::Result<AgentBootstrap> {
+    bootstrap_defaults(config_root, store, BootstrapReason::Reset).await
+}
+
+async fn legacy_agent_data_exists(config_root: &Path, store: &Store) -> anyhow::Result<bool> {
+    if store
+        .get_setting(agent_settings::KEY_MODEL)
+        .await?
+        .is_some()
+        || store
+            .get_setting(agent_settings::KEY_PERM_MODE)
+            .await?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(config_root.join("memory").exists())
+}
+
+async fn bootstrap_defaults(
+    config_root: PathBuf,
+    store: Arc<Store>,
+    reason: BootstrapReason,
+) -> anyhow::Result<AgentBootstrap> {
+    // Settle pending journals before staging destructive cleanup so a stale
+    // committed journal cannot resurrect deleted directories afterwards.
+    recover_transactions(&config_root)?;
+
+    let agents_root = paths::agents_dir_in(&config_root);
+    let existing = discover_agent_directories(&agents_root)?;
+    // A surviving or invalid user-owned `ryuzi` directory must never be
+    // overwritten by the template; fall back to a unique generated id.
+    let agent_id = if existing.iter().any(|id| id == "ryuzi") {
+        new_agent_id()
+    } else {
+        "ryuzi".to_owned()
+    };
+    let destructive = matches!(
+        reason,
+        BootstrapReason::FirstUpgrade | BootstrapReason::Reset
+    );
+    let deleted_agent_ids = if destructive { existing } else { Vec::new() };
+
+    let profile = default_ryuzi_profile(agent_id.clone());
+    let index = AgentIndex {
+        schema_version: AGENT_SCHEMA_VERSION,
+        order: vec![agent_id.clone()],
+        default_agent_id: agent_id.clone(),
+        extensions: IndexMap::new(),
+    };
+    let image = RegistryDiskImage {
+        index_yaml: render_agent_index(&index)?,
+        subagents_yaml: render_subagent_config(&default_subagent_config())?,
+        agents: IndexMap::from([(agent_id, render_agent_profile(&profile)?)]),
+        deleted_agent_ids,
+    };
+    let transaction =
+        AgentTransaction::prepare_with_legacy_cleanup(&config_root, &image, None, destructive)?;
+    #[cfg(test)]
+    let transaction = transaction.with_failpoint(testing::current(&config_root));
+    transaction.commit()?;
+
+    if destructive {
+        store.delete_legacy_agent_settings().await?;
+    }
+
+    let registry = Arc::new(AgentRegistry::load(config_root, store.clone()).await?);
+    // Marker last: a crash anywhere above leaves either the old state (the
+    // transaction rolled back) or valid new files that the next startup
+    // adopts as `Existing` and re-marks.
+    store
+        .set_setting_raw(AGENT_PERSISTENCE_MARKER, AGENT_PERSISTENCE_SCHEMA)
+        .await?;
+    Ok(AgentBootstrap { registry, reason })
+}
+
+async fn load_existing(
+    config_root: PathBuf,
+    store: Arc<Store>,
+    reason: BootstrapReason,
+) -> anyhow::Result<AgentBootstrap> {
+    // A wiped registry may be missing subagents.yaml entirely, which the
+    // loader treats as fatal. Restoring the default template is idempotent,
+    // so it happens directly rather than through a journaled transaction.
+    let subagents_path = paths::agents_dir_in(&config_root).join("subagents.yaml");
+    if !subagents_path.exists() {
+        atomic_write(
+            &subagents_path,
+            render_subagent_config(&default_subagent_config())?.as_bytes(),
+        )?;
+    }
+    let registry = AgentRegistry::load(config_root.clone(), store.clone()).await?;
+    let snapshot = registry.snapshot().await;
+    let registry = if snapshot.agents.iter().any(|agent| agent.executable) {
+        Arc::new(registry)
+    } else {
+        append_default_ryuzi(&config_root, &store, &snapshot).await?
+    };
+    store
+        .set_setting_raw(AGENT_PERSISTENCE_MARKER, AGENT_PERSISTENCE_SCHEMA)
+        .await?;
+    Ok(AgentBootstrap { registry, reason })
+}
+
+/// Appends a new UUID-identified Ryuzi built from the template without
+/// touching any existing directory or name, then reloads so the published
+/// state reflects the committed files.
+async fn append_default_ryuzi(
+    config_root: &Path,
+    store: &Arc<Store>,
+    snapshot: &AgentRegistrySnapshot,
+) -> anyhow::Result<Arc<AgentRegistry>> {
+    let agent_id = new_agent_id();
+    let mut profile = default_ryuzi_profile(agent_id.clone());
+    profile.name = unique_default_name(snapshot);
+    let mut order: Vec<AgentId> = snapshot
+        .agents
+        .iter()
+        .map(|agent| agent.profile.id.clone())
+        .collect();
+    order.push(agent_id.clone());
+    let index = AgentIndex {
+        schema_version: AGENT_SCHEMA_VERSION,
+        order,
+        // Every existing agent failed validation (that is why this path
+        // runs), so the fresh default becomes the registry default.
+        default_agent_id: agent_id.clone(),
+        extensions: IndexMap::new(),
+    };
+    let index_path = paths::agents_dir_in(config_root).join("index.yaml");
+    let index_yaml = match std::fs::read_to_string(&index_path)
+        .ok()
+        .and_then(|raw| parse_agent_index_document(&raw).ok())
+    {
+        Some(mut document) => {
+            document.merge_typed(index);
+            render_agent_index_document(&document)?
+        }
+        None => render_agent_index(&index)?,
+    };
+    let subagents_path = paths::agents_dir_in(config_root).join("subagents.yaml");
+    let subagents_yaml = std::fs::read_to_string(&subagents_path)
+        .with_context(|| format!("failed to read {}", subagents_path.display()))?;
+    let image = RegistryDiskImage {
+        index_yaml,
+        subagents_yaml,
+        agents: IndexMap::from([(agent_id, render_agent_profile(&profile)?)]),
+        deleted_agent_ids: Vec::new(),
+    };
+    let transaction = AgentTransaction::prepare(config_root, &image, None)?;
+    #[cfg(test)]
+    let transaction = transaction.with_failpoint(testing::current(config_root));
+    transaction.commit()?;
+
+    let reloaded = AgentRegistry::load(config_root.to_owned(), store.clone()).await?;
+    let mut notices = snapshot.recovery.clone();
+    notices.push(AgentRecoveryNotice {
+        code: "default-created".into(),
+        message: format!(
+            "Created default agent `{}` because no executable agent existed.",
+            profile.name
+        ),
+    });
+    reloaded.append_recovery_notices(notices).await;
+    Ok(Arc::new(reloaded))
+}
+
+/// The template name, uniquified against existing (possibly invalid) agents
+/// so the appended default never collides case-insensitively.
+fn unique_default_name(snapshot: &AgentRegistrySnapshot) -> String {
+    let taken: Vec<String> = snapshot
+        .agents
+        .iter()
+        .map(|agent| agent.profile.name.trim().to_ascii_lowercase())
+        .collect();
+    for number in 1u32.. {
+        let candidate = if number == 1 {
+            "Ryuzi".to_owned()
+        } else {
+            format!("Ryuzi {number}")
+        };
+        if !taken.contains(&candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Test-only failpoint plumbing: bootstrap creates its transactions
+/// internally, so tests register a per-config-root transaction failpoint
+/// that `bootstrap_defaults`/`append_default_ryuzi` pick up.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::super::transaction::TransactionFailpoint;
+
+    fn map() -> &'static Mutex<HashMap<PathBuf, TransactionFailpoint>> {
+        static MAP: OnceLock<Mutex<HashMap<PathBuf, TransactionFailpoint>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) struct BootstrapFailpoint {
+        root: PathBuf,
+    }
+
+    impl BootstrapFailpoint {
+        pub(crate) fn for_root(root: &Path) -> Self {
+            Self {
+                root: root.to_owned(),
+            }
+        }
+
+        pub(crate) fn set(&self, failpoint: TransactionFailpoint) {
+            map().lock().unwrap().insert(self.root.clone(), failpoint);
+        }
+
+        pub(crate) fn clear(&self) {
+            map().lock().unwrap().remove(&self.root);
+        }
+    }
+
+    impl Drop for BootstrapFailpoint {
+        fn drop(&mut self) {
+            self.clear();
+        }
+    }
+
+    pub(super) fn current(root: &Path) -> TransactionFailpoint {
+        map()
+            .lock()
+            .unwrap()
+            .get(root)
+            .copied()
+            .unwrap_or(TransactionFailpoint::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::domain::{PermMode, Project, Session, SessionKind, SessionStatus};
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+    use crate::llm_router::routes::{self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget};
+    use crate::store::Store;
+
+    use super::super::transaction::TransactionFailpoint;
+    use super::testing::BootstrapFailpoint;
+    use super::*;
+
+    struct BootstrapFixture {
+        root: tempfile::TempDir,
+        _db: tempfile::NamedTempFile,
+        store: Arc<Store>,
+        failpoint: BootstrapFailpoint,
+    }
+
+    impl BootstrapFixture {
+        async fn base() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let db = tempfile::NamedTempFile::new().unwrap();
+            let store = Arc::new(Store::open(db.path()).await.unwrap());
+            for name in ["smart", "fast"] {
+                routes::save_model_route(
+                    &store,
+                    ModelRouteInfo {
+                        id: String::new(),
+                        name: name.into(),
+                        enabled: true,
+                        strategy: ModelRouteStrategy::Fallback,
+                        targets: vec![ModelRouteTarget {
+                            provider: "anthropic".into(),
+                            model: "claude-opus-4-8".into(),
+                            effort: None,
+                        }],
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let failpoint = BootstrapFailpoint::for_root(root.path());
+            Self {
+                root,
+                _db: db,
+                store,
+                failpoint,
+            }
+        }
+
+        async fn fresh() -> Self {
+            Self::base().await
+        }
+
+        /// A legacy install: no `agents/` registry and no schema marker. The
+        /// legacy settings keys and memory directory are written by tests.
+        async fn legacy() -> Self {
+            Self::base().await
+        }
+
+        /// Marker present, `agents/index.yaml` missing, and a user-owned
+        /// `agents/ryuzi` directory whose profile validates as non-executable.
+        async fn invalid_ryuzi_directory() -> Self {
+            let fixture = Self::base().await;
+            fixture
+                .store
+                .set_setting_raw(AGENT_PERSISTENCE_MARKER, "1")
+                .await
+                .unwrap();
+            fixture.write_raw(
+                "agents/ryuzi/agent.yaml",
+                "schema_version: 1\nid: ryuzi\nname: Legacy Ryuzi\ndescription: Broken agent.\navatar: { color: violet }\nmodel: { route: nonexistent }\npermissions: { mode: ask, rules: [] }\nskills: { enabled: [] }\ntools: { native: [], plugins: [], apps: [] }\nloop: { max_turns: 50, max_tool_rounds: 100 }\n",
+            );
+            fixture
+        }
+
+        async fn initialized_with_two_agents() -> Self {
+            let fixture = Self::base().await;
+            fixture
+                .store
+                .set_setting_raw(AGENT_PERSISTENCE_MARKER, "1")
+                .await
+                .unwrap();
+            fixture.write_raw(
+                "agents/index.yaml",
+                "schema_version: 1\norder: [ryuzi, helper]\ndefault_agent_id: ryuzi\n",
+            );
+            fixture.write_raw("agents/ryuzi/agent.yaml", &profile_yaml("ryuzi", "Ryuzi"));
+            fixture.write_raw(
+                "agents/helper/agent.yaml",
+                &profile_yaml("helper", "Helper"),
+            );
+            fixture.write_raw(
+                "agents/subagents.yaml",
+                "schema_version: 1\nmodel: { route: fast }\n",
+            );
+            fixture
+        }
+
+        fn config_root(&self) -> PathBuf {
+            self.root.path().to_owned()
+        }
+
+        fn write_raw(&self, relative: &str, value: &str) {
+            let path = self.root.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, value).unwrap();
+        }
+
+        fn write_legacy_memory(&self, name: &str, content: &str) {
+            let dir = self.root.path().join("memory");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+
+        async fn insert_project_provider_and_session(&self) {
+            self.store
+                .insert_project(Project {
+                    project_id: "proj-1".into(),
+                    name: "Project".into(),
+                    workdir: "/tmp/proj".into(),
+                    source: None,
+                    model: None,
+                    effort: None,
+                    perm_mode: PermMode::Default,
+                    created_at: Some(1),
+                    is_git: false,
+                })
+                .await
+                .unwrap();
+            connections::add_connection(
+                &self.store,
+                ConnectionRow {
+                    id: "anthropic-live".into(),
+                    provider: "anthropic".into(),
+                    auth_type: "api_key".into(),
+                    label: "Anthropic".into(),
+                    priority: 0,
+                    enabled: true,
+                    data: ConnectionData::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .await
+            .unwrap();
+            self.store
+                .insert_session(Session {
+                    session_pk: "sess-1".into(),
+                    project_id: Some("proj-1".into()),
+                    agent_session_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    title: None,
+                    status: SessionStatus::Idle,
+                    perm_mode: PermMode::Default,
+                    started_by: None,
+                    created_at: Some(1),
+                    last_active: Some(1),
+                    resume_attempts: 0,
+                    branch_owned: false,
+                    kind: SessionKind::Project,
+                    speaker: None,
+                    agent: None,
+                    parent_session_pk: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn assert_project_provider_and_session_survive(&self) {
+            assert!(self.store.get_project("proj-1").await.unwrap().is_some());
+            assert!(connections::get_connection(&self.store, "anthropic-live")
+                .await
+                .unwrap()
+                .is_some());
+            assert!(self.store.get_session("sess-1").await.unwrap().is_some());
+        }
+    }
+
+    fn profile_yaml(id: &str, name: &str) -> String {
+        format!(
+            "schema_version: 1\nid: {id}\nname: {name}\ndescription: Test agent.\navatar: {{ color: violet }}\nmodel: {{ route: smart }}\npermissions: {{ mode: ask, rules: [] }}\nskills: {{ enabled: [] }}\ntools: {{ native: [], plugins: [], apps: [] }}\nloop: {{ max_turns: 50, max_tool_rounds: 100 }}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn first_upgrade_removes_only_legacy_agent_data_and_preserves_operational_data() {
+        let fixture = BootstrapFixture::legacy().await;
+        fixture
+            .store
+            .set_setting_raw("agent_model", "smart")
+            .await
+            .unwrap();
+        fixture
+            .store
+            .set_setting_raw("agent_perm_mode", "full")
+            .await
+            .unwrap();
+        fixture
+            .store
+            .set_setting_raw("unrelated", "keep")
+            .await
+            .unwrap();
+        fixture.write_legacy_memory("MEMORY.md", "old fact");
+        fixture.insert_project_provider_and_session().await;
+        let result = initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.reason, BootstrapReason::FirstUpgrade);
+        assert_eq!(
+            result.registry.snapshot().await.agents[0].profile.name,
+            "Ryuzi"
+        );
+        assert_eq!(
+            fixture.store.get_setting("agent_model").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture.store.get_setting("agent_perm_mode").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_setting("unrelated")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("keep")
+        );
+        fixture.assert_project_provider_and_session_survive().await;
+        assert!(!fixture.config_root().join("memory").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_bootstrap_does_not_set_marker_and_retries() {
+        let fixture = BootstrapFixture::fresh().await;
+        fixture
+            .failpoint
+            .set(TransactionFailpoint::BeforeIndexReplace);
+        assert!(
+            initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_setting("agent_persistence_schema")
+                .await
+                .unwrap(),
+            None
+        );
+        fixture.failpoint.clear();
+        assert!(
+            initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_setting("agent_persistence_schema")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_creates_unique_ryuzi_without_overwriting_invalid_directory() {
+        let fixture = BootstrapFixture::invalid_ryuzi_directory().await;
+        let result = initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.reason, BootstrapReason::Recovery);
+        let snapshot = result.registry.snapshot().await;
+        assert!(snapshot
+            .agents
+            .iter()
+            .any(|a| a.profile.id == "ryuzi" && !a.executable));
+        assert!(snapshot
+            .agents
+            .iter()
+            .any(|a| a.profile.name == "Ryuzi" && a.executable && a.profile.id != "ryuzi"));
+        assert!(snapshot
+            .recovery
+            .iter()
+            .any(|n| n.code == "default-created"));
+        // The invalid user-owned directory is preserved byte-for-byte.
+        let raw =
+            std::fs::read_to_string(fixture.config_root().join("agents/ryuzi/agent.yaml")).unwrap();
+        assert!(raw.contains("name: Legacy Ryuzi"));
+    }
+
+    #[tokio::test]
+    async fn reset_replaces_agents_but_preserves_projects_providers_and_sessions() {
+        let fixture = BootstrapFixture::initialized_with_two_agents().await;
+        fixture.insert_project_provider_and_session().await;
+        let reset = reset_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(reset.reason, BootstrapReason::Reset);
+        let snapshot = reset.registry.snapshot().await;
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].profile.name, "Ryuzi");
+        fixture.assert_project_provider_and_session_survive().await;
+    }
+
+    #[tokio::test]
+    async fn fresh_install_creates_the_exact_ryuzi_and_subagent_templates() {
+        let fixture = BootstrapFixture::fresh().await;
+        let result = initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.reason, BootstrapReason::FreshInstall);
+        let snapshot = result.registry.snapshot().await;
+        assert_eq!(snapshot.agents.len(), 1);
+        let agent = &snapshot.agents[0];
+        assert!(agent.executable);
+        assert_eq!(agent.profile.name, "Ryuzi");
+        assert_eq!(
+            agent.profile.description,
+            "General-purpose coding and operations agent."
+        );
+        assert_eq!(agent.profile.avatar.color, "blue");
+        assert_eq!(
+            agent.profile.model,
+            AgentModel::Route {
+                route: "smart".into()
+            }
+        );
+        assert_eq!(agent.profile.permissions.mode, PermMode::Default);
+        assert!(agent.profile.permissions.rules.is_empty());
+        assert!(agent.profile.skills.is_empty());
+        assert!(agent.profile.tools.native.is_empty());
+        assert!(agent.profile.tools.plugins.is_empty());
+        assert!(agent.profile.tools.apps.is_empty());
+        assert_eq!(agent.profile.loop_settings.max_turns, 50);
+        assert_eq!(agent.profile.loop_settings.max_tool_rounds, 100);
+        assert_eq!(
+            snapshot.subagent_model,
+            AgentModel::Route {
+                route: "fast".into()
+            }
+        );
+        // A second startup adopts the created files.
+        let again = initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(again.reason, BootstrapReason::Existing);
+    }
+
+    #[tokio::test]
+    async fn unsupported_schema_marker_fails_bootstrap() {
+        let fixture = BootstrapFixture::fresh().await;
+        fixture
+            .store
+            .set_setting_raw(AGENT_PERSISTENCE_MARKER, "2")
+            .await
+            .unwrap();
+        let error =
+            match initialize_agent_registry(fixture.config_root(), fixture.store.clone()).await {
+                Ok(_) => panic!("bootstrap must fail for an unsupported schema"),
+                Err(error) => error.to_string(),
+            };
+        assert!(error.contains("unsupported agent persistence schema"));
+    }
+}

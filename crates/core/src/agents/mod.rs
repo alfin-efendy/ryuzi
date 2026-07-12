@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod registry;
 pub mod transaction;
 pub mod types;
