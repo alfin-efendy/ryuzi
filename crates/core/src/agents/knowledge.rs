@@ -46,7 +46,7 @@ struct BundleTransactionManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LearningCompletion {
     event_id: String,
-    writes: Vec<String>,
+    writes: Vec<(String, String)>,
     removes: Vec<String>,
 }
 
@@ -56,6 +56,7 @@ enum KnowledgeFailpoint {
     None,
     AfterBackupRename,
     AfterActivationBeforeCommit,
+    ActivationAndRestoreFailure,
 }
 
 #[cfg(test)]
@@ -184,6 +185,12 @@ impl AgentKnowledgeStore {
         })
     }
 
+    pub(crate) async fn recover_agent_bundle(&self, agent_id: &str) -> anyhow::Result<()> {
+        let store = self.for_agent(agent_id)?;
+        let _guard = store.write_lock.lock().await;
+        store.recover_bundle_transactions()
+    }
+
     /// Reads one agent's bundle into the shape the Plan 3 Learning surface
     /// consumes: journey milestones, skill usage counters, reviews, the
     /// newest curator state, and curator history snapshots.
@@ -274,10 +281,14 @@ impl KnowledgeStore {
     }
 
     pub async fn scan(&self) -> anyhow::Result<KnowledgeScan> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
         scan_bundle(&self.root)
     }
 
     pub async fn read(&self, concept_id: &str) -> anyhow::Result<KnowledgeConcept> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
         find_concept(&self.root, concept_id)?
             .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))
     }
@@ -343,6 +354,8 @@ impl KnowledgeStore {
     /// Case-insensitive substring match over title, description, body, and
     /// tags of every valid concept.
     pub async fn search(&self, query: &str) -> anyhow::Result<Vec<KnowledgeConcept>> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
         let needle = query.to_lowercase();
         Ok(scan_bundle(&self.root)?
             .valid
@@ -366,6 +379,8 @@ impl KnowledgeStore {
         if let Some(project_id) = project_id {
             validate_path_component(project_id).context("invalid project id")?;
         }
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
         let scan = scan_bundle(&self.root)?;
         let keep = |relative_path: &str| {
             let Some((directory, _)) = relative_path.rsplit_once('/') else {
@@ -487,52 +502,51 @@ impl KnowledgeStore {
         }
         self.recover_bundle_transactions()?;
         ensure_bundle_at(&self.root)?;
-        let scan = scan_bundle(&self.root)?;
-        let writes = plan(&scan)?;
-        let completion = LearningCompletion {
-            event_id: event_id.to_owned(),
-            writes: sorted_paths(writes.writes.iter().map(|(path, _)| path)),
-            removes: sorted_paths(writes.removes.iter()),
-        };
         let completion_path = self
             .root
             .join(LEARNING_COMPLETIONS_DIR)
             .join(format!("{event_id}.yaml"));
-        if let Ok(raw) = fs::read_to_string(&completion_path) {
-            let recorded: LearningCompletion = serde_yaml::from_str(&raw)?;
-            if recorded == completion && completion_matches(&self.root, &recorded, &writes.writes)?
-            {
-                return Ok(false);
+        let completion = match fs::read_to_string(&completion_path) {
+            Ok(raw) => serde_yaml::from_str(&raw)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let scan = scan_bundle(&self.root)?;
+                let writes = plan(&scan)?;
+                validate_learning_writes(event_id, &writes)?;
+                LearningCompletion {
+                    event_id: event_id.to_owned(),
+                    writes: writes.writes,
+                    removes: sorted_paths(writes.removes.iter()),
+                }
             }
+            Err(error) => return Err(error.into()),
+        };
+        if completion.event_id != event_id {
+            bail!(
+                "learning completion for `{event_id}` records event `{}`",
+                completion.event_id
+            );
         }
-        for (relative_path, content) in &writes.writes {
-            validate_concept_relative_path(relative_path)?;
-            let concept = parse_concept(relative_path, content)
-                .with_context(|| format!("learning write `{relative_path}` failed to reparse"))?;
-            if concept.event_id.as_deref() != Some(event_id) {
-                bail!("learning write `{relative_path}` does not record event `{event_id}`");
-            }
-        }
-        for relative_path in &writes.removes {
-            validate_concept_relative_path(relative_path)?;
+        validate_learning_completion(&completion)?;
+        if completion_matches(&self.root, &completion)? {
+            return Ok(false);
         }
         let txn = self.prepare_bundle_transaction()?;
         let stage = txn.join("stage");
-        for (relative_path, content) in &writes.writes {
+        for (relative_path, content) in &completion.writes {
             let target = stage.join(relative_path);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
             atomic_write(&target, content.as_bytes())?;
         }
-        for relative_path in &writes.removes {
+        for relative_path in &completion.removes {
             let target = stage.join(relative_path);
             if target.exists() {
                 fs::remove_file(target)?;
             }
         }
         self.regenerate_indexes_at(&stage)?;
-        for (relative_path, _) in &writes.writes {
+        for (relative_path, _) in &completion.writes {
             append_log_at(
                 &stage,
                 "learning-apply",
@@ -540,7 +554,7 @@ impl KnowledgeStore {
                 relative_path,
             )?;
         }
-        for relative_path in &writes.removes {
+        for relative_path in &completion.removes {
             append_log_at(
                 &stage,
                 "learning-remove",
@@ -667,7 +681,7 @@ impl KnowledgeStore {
         }
     }
 
-    fn prepare_bundle_transaction(&self) -> anyhow::Result<PathBuf> {
+    pub(crate) fn prepare_bundle_transaction(&self) -> anyhow::Result<PathBuf> {
         let transaction_root = self.transaction_root()?;
         fs::create_dir_all(&transaction_root)?;
         let txn = transaction_root.join(paths::new_id());
@@ -683,28 +697,69 @@ impl KnowledgeStore {
         fs::rename(&self.root, &backup).context("failed to move active knowledge to backup")?;
         #[cfg(test)]
         if self.failpoint() == KnowledgeFailpoint::AfterBackupRename {
-            fs::rename(&backup, &self.root)?;
-            fs::remove_dir_all(txn)?;
-            return Err(anyhow!("knowledge failpoint after backup rename"));
+            return Err(anyhow!(
+                "knowledge failpoint after backup rename for transaction `{}`",
+                txn.display()
+            ));
+        }
+        #[cfg(test)]
+        if self.failpoint() == KnowledgeFailpoint::ActivationAndRestoreFailure {
+            return Err(anyhow!(
+                "failed to activate staged knowledge bundle for transaction `{}`: injected activation failure; rollback failed: injected restore failure",
+                txn.display()
+            ));
         }
         if let Err(error) = fs::rename(&stage, &self.root) {
-            let _ = fs::rename(&backup, &self.root);
-            return Err(error).context("failed to activate staged knowledge bundle");
+            return match fs::rename(&backup, &self.root) {
+                Ok(()) => {
+                    let _ = fs::remove_dir_all(txn);
+                    Err(error).with_context(|| {
+                        format!(
+                            "failed to activate staged knowledge bundle for transaction `{}`",
+                            txn.display()
+                        )
+                    })
+                }
+                Err(rollback) => Err(anyhow!(
+                    "failed to activate staged knowledge bundle for transaction `{}`: {error}; rollback failed: {rollback}",
+                    txn.display()
+                )),
+            };
         }
         #[cfg(test)]
         if self.failpoint() == KnowledgeFailpoint::AfterActivationBeforeCommit {
-            fs::rename(&self.root, &stage)?;
-            fs::rename(&backup, &self.root)?;
-            fs::remove_dir_all(txn)?;
-            return Err(anyhow!("knowledge failpoint before commit marker"));
+            let original = anyhow!("knowledge failpoint before commit marker");
+            return self.rollback_activated_transaction(txn, &stage, &backup, original);
         }
         if let Err(error) = write_bundle_manifest(txn, BundleTransactionPhase::Committed) {
-            let _ = fs::rename(&self.root, &stage);
-            let _ = fs::rename(&backup, &self.root);
-            return Err(error);
+            return self.rollback_activated_transaction(txn, &stage, &backup, error);
         }
         fs::remove_dir_all(txn)?;
         Ok(())
+    }
+
+    fn rollback_activated_transaction(
+        &self,
+        txn: &Path,
+        stage: &Path,
+        backup: &Path,
+        original: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let restore = (|| -> anyhow::Result<()> {
+            fs::rename(&self.root, stage).context("failed to preserve activated stage")?;
+            fs::rename(backup, &self.root).context("failed to restore knowledge backup")?;
+            Ok(())
+        })();
+        match restore {
+            Ok(()) => {
+                fs::remove_dir_all(txn)?;
+                Err(original)
+            }
+            Err(rollback) => Err(anyhow!(
+                "knowledge transaction `{}` failed: {original:#}; rollback failed: {rollback:#}",
+                txn.display()
+            )),
+        }
     }
 
     fn recover_bundle_transactions(&self) -> anyhow::Result<()> {
@@ -839,21 +894,36 @@ fn sorted_paths<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<String> {
     paths
 }
 
-fn completion_matches(
-    root: &Path,
-    completion: &LearningCompletion,
-    expected_writes: &[(String, String)],
-) -> anyhow::Result<bool> {
-    for relative_path in &completion.writes {
+fn validate_learning_writes(event_id: &str, writes: &LearningEventWrites) -> anyhow::Result<()> {
+    for (relative_path, content) in &writes.writes {
+        validate_concept_relative_path(relative_path)?;
+        let concept = parse_concept(relative_path, content)
+            .with_context(|| format!("learning write `{relative_path}` failed to reparse"))?;
+        if concept.event_id.as_deref() != Some(event_id) {
+            bail!("learning write `{relative_path}` does not record event `{event_id}`");
+        }
+    }
+    for relative_path in &writes.removes {
+        validate_concept_relative_path(relative_path)?;
+    }
+    Ok(())
+}
+
+fn validate_learning_completion(completion: &LearningCompletion) -> anyhow::Result<()> {
+    validate_learning_writes(
+        &completion.event_id,
+        &LearningEventWrites {
+            writes: completion.writes.clone(),
+            removes: completion.removes.clone(),
+        },
+    )
+}
+
+fn completion_matches(root: &Path, completion: &LearningCompletion) -> anyhow::Result<bool> {
+    for (relative_path, expected) in &completion.writes {
         let raw = match fs::read_to_string(root.join(relative_path)) {
             Ok(raw) => raw,
             Err(_) => return Ok(false),
-        };
-        let Some((_, expected)) = expected_writes
-            .iter()
-            .find(|(path, _)| path == relative_path)
-        else {
-            return Ok(false);
         };
         if &raw != expected {
             return Ok(false);
@@ -1160,6 +1230,59 @@ mod tests {
                     .is_none()
         );
         assert_eq!(store.scan().await.unwrap().valid.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_recovers_prepared_transaction_before_observing_bundle() {
+        let (_root, store) = fixture_store("a");
+        let created = store
+            .create(memory_input(KnowledgeScope::User, "original"))
+            .await
+            .unwrap();
+        let prepared = store.prepare_bundle_transaction().unwrap();
+        std::fs::rename(store.root(), prepared.join("backup")).unwrap();
+
+        assert_eq!(store.read(&created.id).await.unwrap().body, "original body");
+        assert!(store.root().is_dir());
+        assert!(!prepared.exists());
+    }
+
+    #[tokio::test]
+    async fn activation_and_restore_failure_retains_evidence_for_recovery() {
+        let (_root, store) = fixture_store("a");
+        store
+            .create(memory_input(KnowledgeScope::User, "original"))
+            .await
+            .unwrap();
+        let before = bundle_bytes(store.root());
+        store.set_failpoint(KnowledgeFailpoint::ActivationAndRestoreFailure);
+        let error = store
+            .create(memory_input(KnowledgeScope::User, "must fail"))
+            .await
+            .unwrap_err()
+            .to_string();
+        store.set_failpoint(KnowledgeFailpoint::None);
+        assert!(error.contains("failed to activate staged knowledge bundle"));
+        assert!(error.contains("rollback failed"));
+        assert!(error.contains("transaction"));
+        assert!(!store.root().exists());
+        assert!(store
+            .transaction_root()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+
+        store.recover_bundle_transactions().unwrap();
+        assert_eq!(bundle_bytes(store.root()), before);
+        assert!(store
+            .transaction_root()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[tokio::test]

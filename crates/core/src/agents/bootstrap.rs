@@ -80,6 +80,17 @@ pub async fn initialize_agent_persistence(
 ) -> anyhow::Result<AgentPersistence> {
     let bootstrap = initialize_agent_registry(config_root.clone(), store.clone()).await?;
     let knowledge = Arc::new(AgentKnowledgeStore::new(config_root));
+    for agent in bootstrap.registry.snapshot().await.agents {
+        knowledge
+            .recover_agent_bundle(&agent.profile.id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to recover knowledge bundle for agent `{}`",
+                    agent.profile.id
+                )
+            })?;
+    }
     let learning = Arc::new(LearningQueue::new(store, knowledge.clone()));
     bootstrap
         .registry
@@ -325,7 +336,17 @@ async fn ensure_knowledge_bundles(
     config_root: &Path,
     registry: &AgentRegistry,
 ) -> anyhow::Result<()> {
+    let knowledge = AgentKnowledgeStore::new(config_root.to_owned());
     for agent in registry.snapshot().await.agents {
+        knowledge
+            .recover_agent_bundle(&agent.profile.id)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to recover knowledge bundle for agent `{}`",
+                    agent.profile.id
+                )
+            })?;
         let bundle = paths::agent_knowledge_dir_in(config_root, &agent.profile.id);
         ensure_bundle_at(&bundle).with_context(|| {
             format!(
@@ -885,6 +906,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.reason, BootstrapReason::Existing);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recovers_prepared_knowledge_before_ensuring_bundle() {
+        let fixture = BootstrapFixture::fresh().await;
+        let persistence =
+            initialize_agent_persistence(fixture.config_root(), fixture.store.clone())
+                .await
+                .unwrap();
+        let agent_id = persistence.registry.default_agent_id().await;
+        let knowledge = persistence.knowledge.for_agent(&agent_id).unwrap();
+        let created = knowledge
+            .create(super::super::okf::KnowledgeConceptInput {
+                area: super::super::okf::ConceptArea::Memory(
+                    super::super::okf::KnowledgeScope::User,
+                ),
+                title: "Original".into(),
+                description: "Original description".into(),
+                body: "original body".into(),
+                tags: Vec::new(),
+                extensions: IndexMap::new(),
+            })
+            .await
+            .unwrap();
+        let prepared = knowledge.prepare_bundle_transaction().unwrap();
+        std::fs::rename(knowledge.root(), prepared.join("backup")).unwrap();
+        drop(persistence);
+
+        let restarted = initialize_agent_persistence(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let restored = restarted
+            .knowledge
+            .for_agent(&agent_id)
+            .unwrap()
+            .read(&created.id)
+            .await
+            .unwrap();
+        assert_eq!(restored.body, "original body");
+        assert!(!prepared.exists());
     }
 
     #[tokio::test]

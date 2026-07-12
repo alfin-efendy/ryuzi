@@ -1021,11 +1021,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replayed_event_is_applied_once_and_then_acknowledged() {
+    async fn replayed_memory_add_is_applied_once_and_then_acknowledged() {
         let (_root, _tmp, queue) = fixture_queue().await;
-        let event = queue.enqueue("a", review_payload("finding")).await.unwrap();
+        let event = queue
+            .enqueue(
+                "a",
+                LearningEventPayload::Memory(memory_event("a durable fact")),
+            )
+            .await
+            .unwrap();
         let claimed = queue.claim_next("a", "w1").await.unwrap().unwrap();
         queue.apply_claimed(&claimed).await.unwrap();
+        let before = queue
+            .knowledge
+            .for_agent("a")
+            .unwrap()
+            .scan()
+            .await
+            .unwrap();
         // Crash window: applied but never acknowledged — the event goes
         // back to pending and a second worker replays it end to end.
         queue
@@ -1037,22 +1050,136 @@ mod tests {
         assert_eq!(replay.attempts, 2);
         queue.apply_claimed(&replay).await.unwrap();
         queue.mark_delivered(&replay.event_id).await.unwrap();
-        let concepts = queue
+        let after = queue
             .knowledge
             .for_agent("a")
             .unwrap()
             .scan()
             .await
-            .unwrap()
-            .valid;
-        assert_eq!(
-            concepts
-                .iter()
-                .filter(|c| c.event_id.as_deref() == Some(event.event_id.as_str()))
-                .count(),
-            1
-        );
+            .unwrap();
+        assert_eq!(after.valid, before.valid);
+        assert_eq!(after.valid.len(), 1);
+        assert_eq!(queue_status(&queue, &event.event_id).await, "delivered");
         assert!(queue.claim_next("a", "w2").await.unwrap().is_none());
+    }
+
+    async fn replay_claimed(queue: &LearningQueue, event: &LearningEvent) {
+        let claimed = queue.claim_next("a", "w1").await.unwrap().unwrap();
+        assert_eq!(claimed.event_id, event.event_id);
+        queue.apply_claimed(&claimed).await.unwrap();
+        queue
+            .release(&event.event_id, "simulated ack crash")
+            .await
+            .unwrap();
+        let replay = queue.claim_next("a", "w2").await.unwrap().unwrap();
+        queue.apply_claimed(&replay).await.unwrap();
+        queue.mark_delivered(&replay.event_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replayed_skill_usage_does_not_increment_twice() {
+        let (_root, _tmp, queue) = fixture_queue().await;
+        let event = queue
+            .enqueue(
+                "a",
+                LearningEventPayload::SkillUsage(SkillUsageEvent {
+                    skill_id: "Commit Helper".into(),
+                    succeeded: true,
+                    source: "session".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        replay_claimed(&queue, &event).await;
+
+        let snapshot = queue.knowledge.learning_snapshot("a").await.unwrap();
+        assert_eq!(snapshot.skill_usage.len(), 1);
+        assert_eq!(snapshot.skill_usage[0].uses, 1);
+        assert_eq!(snapshot.skill_usage[0].successes, 1);
+    }
+
+    #[tokio::test]
+    async fn replayed_memory_remove_uses_the_recorded_target() {
+        let (_root, _tmp, queue) = fixture_queue().await;
+        for text in ["remove this exact fact", "keep this fact"] {
+            let event = queue
+                .enqueue("a", LearningEventPayload::Memory(memory_event(text)))
+                .await
+                .unwrap();
+            let claimed = queue.claim_next("a", "seed").await.unwrap().unwrap();
+            queue.apply_claimed(&claimed).await.unwrap();
+            queue.mark_delivered(&event.event_id).await.unwrap();
+        }
+        let event = queue
+            .enqueue(
+                "a",
+                LearningEventPayload::Memory(MemoryLearningEvent {
+                    operation: MemoryOperation::Remove {
+                        scope: MemoryScope::User,
+                        matcher: "remove this exact".into(),
+                    },
+                    source: "test".into(),
+                    project_id: None,
+                }),
+            )
+            .await
+            .unwrap();
+        replay_claimed(&queue, &event).await;
+
+        let scan = queue
+            .knowledge
+            .for_agent("a")
+            .unwrap()
+            .scan()
+            .await
+            .unwrap();
+        assert_eq!(scan.valid.len(), 1);
+        assert_eq!(scan.valid[0].body, "keep this fact");
+    }
+
+    #[tokio::test]
+    async fn replayed_memory_replace_uses_the_recorded_target_and_output() {
+        let (_root, _tmp, queue) = fixture_queue().await;
+        let seed = queue
+            .enqueue(
+                "a",
+                LearningEventPayload::Memory(memory_event("old unique fact")),
+            )
+            .await
+            .unwrap();
+        let claimed = queue.claim_next("a", "seed").await.unwrap().unwrap();
+        queue.apply_claimed(&claimed).await.unwrap();
+        queue.mark_delivered(&seed.event_id).await.unwrap();
+        let event = queue
+            .enqueue(
+                "a",
+                LearningEventPayload::Memory(MemoryLearningEvent {
+                    operation: MemoryOperation::Replace {
+                        scope: MemoryScope::User,
+                        matcher: "old unique".into(),
+                        text: "new durable fact".into(),
+                    },
+                    source: "test".into(),
+                    project_id: None,
+                }),
+            )
+            .await
+            .unwrap();
+        replay_claimed(&queue, &event).await;
+
+        let scan = queue
+            .knowledge
+            .for_agent("a")
+            .unwrap()
+            .scan()
+            .await
+            .unwrap();
+        assert_eq!(scan.valid.len(), 1);
+        assert_eq!(scan.valid[0].body, "new durable fact");
+        assert_eq!(
+            scan.valid[0].event_id.as_deref(),
+            Some(event.event_id.as_str())
+        );
     }
 
     #[tokio::test]
