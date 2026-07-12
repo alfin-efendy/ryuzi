@@ -258,7 +258,12 @@ impl AgentTransaction {
         self
     }
 
-    pub fn commit(mut self) -> anyhow::Result<()> {
+    /// Commits the prepared image and returns the on-disk registry
+    /// generation, computed while the exclusive registry file lock is still
+    /// held. Callers must cache this value instead of re-reading the disk
+    /// lock-free: a foreign process could commit in that window and its
+    /// generation would mask this instance's now-stale in-memory profiles.
+    pub fn commit(mut self) -> anyhow::Result<String> {
         if let Err(commit_error) = self.commit_before_marker() {
             return self.rollback_after_failure(commit_error);
         }
@@ -277,6 +282,9 @@ impl AgentTransaction {
             self.journal.phase = JournalPhase::Prepared;
             return self.rollback_after_failure(commit_error);
         }
+        // Captured before the lock is released (on drop of self) so the
+        // caller sees exactly the generation of the just-committed image.
+        let generation = registry_generation(&self.config_root)?;
         if let Err(error) = cleanup_committed(&self.config_root, &self.dir, &self.journal) {
             tracing::warn!(
                 transaction_id = %self.journal.transaction_id,
@@ -284,10 +292,10 @@ impl AgentTransaction {
                 "agent transaction committed; cleanup deferred to recovery"
             );
         }
-        Ok(())
+        Ok(generation)
     }
 
-    fn rollback_after_failure(&self, commit_error: anyhow::Error) -> anyhow::Result<()> {
+    fn rollback_after_failure<T>(&self, commit_error: anyhow::Error) -> anyhow::Result<T> {
         let rollback_result =
             if self.failpoint == TransactionFailpoint::CommittedMarkerWriteAndRollback {
                 Err(anyhow!("injected rollback failure"))
@@ -792,6 +800,34 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.path().join("agents/index.yaml")).unwrap(),
             "old index\n"
+        );
+    }
+
+    #[test]
+    fn commit_captures_the_generation_of_the_committed_image() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("agents/ryuzi")).unwrap();
+        fs::write(root.path().join("agents/ryuzi/agent.yaml"), "name: Old\n").unwrap();
+        fs::write(root.path().join("agents/index.yaml"), "old index\n").unwrap();
+        fs::write(root.path().join("agents/subagents.yaml"), "old subagents\n").unwrap();
+        let tx = AgentTransaction::prepare(root.path(), &image("New"), None).unwrap();
+
+        let committed_generation: String = tx.commit().unwrap();
+
+        assert_eq!(
+            committed_generation,
+            registry_generation(root.path()).unwrap()
+        );
+        // A foreign write landing after commit must not be what commit
+        // captured: the returned value reflects exactly the committed image.
+        fs::write(
+            root.path().join("agents/ryuzi/agent.yaml"),
+            "name: Foreign\n",
+        )
+        .unwrap();
+        assert_ne!(
+            committed_generation,
+            registry_generation(root.path()).unwrap()
         );
     }
 

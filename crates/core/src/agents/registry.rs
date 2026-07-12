@@ -440,8 +440,21 @@ impl AgentRegistry {
                 _ => TransactionFailpoint::None,
             },
         );
-        transaction.commit()?;
-        let generation = registry_generation(&self.config_root)?;
+        // The committed generation is captured inside `commit()` while the
+        // transaction still holds the exclusive registry file lock. Reading
+        // the disk again here would race a foreign process committing after
+        // the lock is released, caching its generation over our stale image.
+        let generation = transaction.commit()?;
+        #[cfg(test)]
+        if self.failpoint.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+            // Simulates a foreign process that acquires the registry lock and
+            // commits in the window after our commit released the lock but
+            // before this instance caches the on-disk generation.
+            let index_path = paths::agents_dir_in(&self.config_root).join("index.yaml");
+            let mut raw = std::fs::read_to_string(&index_path).map_err(anyhow::Error::from)?;
+            raw.push_str("# foreign commit\n");
+            std::fs::write(&index_path, raw).map_err(anyhow::Error::from)?;
+        }
         let agents = profiles
             .into_iter()
             .map(|(id, profile)| {
@@ -1368,6 +1381,41 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"Worker One".to_owned()));
         assert!(!names.contains(&"Worker Two".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn foreign_commit_in_the_post_commit_window_marks_the_cache_stale() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        // Failpoint 3 mutates the on-disk index immediately after the
+        // transaction commits, simulating a foreign process that grabs the
+        // registry lock and commits before this instance refreshes its cache.
+        registry
+            .failpoint
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        registry.create(mutation_input("Worker One")).await.unwrap();
+        registry
+            .failpoint
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // The cached generation must describe this instance's own committed
+        // image, so the next mutation is rejected instead of overwriting the
+        // foreign commit with stale in-memory profiles.
+        let error = registry
+            .create(mutation_input("Worker Two"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed on disk"));
+        let index = std::fs::read_to_string(fixture.root.path().join("agents/index.yaml")).unwrap();
+        assert!(index.contains("# foreign commit"));
     }
 
     #[tokio::test]
