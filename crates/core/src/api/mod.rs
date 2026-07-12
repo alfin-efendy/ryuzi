@@ -11,6 +11,7 @@ pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
 pub mod native_api;
+pub mod orch_api;
 pub mod plugins_api;
 pub mod remote_catalog_api;
 pub mod scheduler_api;
@@ -86,6 +87,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if endpoint_api::HANDLES.contains(&m) => endpoint_api::dispatch(state, m, p).await,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
+        m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await
         }
@@ -119,7 +121,7 @@ pub(crate) mod tests_support {
                 cp.store().clone(),
             )),
             cp,
-            token: Some("t".into()),
+            control_token: "t".into(),
         }
     }
 
@@ -184,7 +186,7 @@ pub(crate) mod tests_support {
                 cp.store().clone(),
             )),
             cp,
-            token: Some("t".into()),
+            control_token: "t".into(),
         }
     }
 }
@@ -193,8 +195,18 @@ pub(crate) mod tests_support {
 mod tests {
     use super::tests_support::state;
     use super::{params, ApiError};
-    use crate::serve::serve;
+    use crate::serve::{serve, ServeOpts};
     use serde_json::json;
+    use std::net::Ipv4Addr;
+
+    /// Plaintext-loopback `ServeOpts` for tests that don't exercise TLS.
+    fn opts(port: u16) -> ServeOpts {
+        ServeOpts {
+            addr: Ipv4Addr::LOCALHOST.into(),
+            port,
+            tls: None,
+        }
+    }
 
     /// Exercises the `params` decode helper directly — no command family
     /// wired up yet needs it, so this also keeps it from tripping the
@@ -228,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_is_404_with_error_envelope() {
-        let port = serve(state().await, 0).await.unwrap();
+        let port = serve(state().await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/rpc/nope"))
             .bearer_auth("t")
@@ -243,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_projects_dispatches_empty() {
-        let port = serve(state().await, 0).await.unwrap();
+        let port = serve(state().await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/rpc/list_projects"))
             .bearer_auth("t")
@@ -260,7 +272,7 @@ mod tests {
     async fn approvals_endpoint_resolves_a_registered_approval() {
         let s = state().await;
         let rx = s.cp.approvals_for_test_register("req-9");
-        let port = serve(s, 0).await.unwrap();
+        let port = serve(s, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/approvals/req-9"))
             .bearer_auth("t")

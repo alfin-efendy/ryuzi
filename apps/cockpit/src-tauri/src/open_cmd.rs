@@ -1,7 +1,7 @@
 //! "Open in…" targets: detect installed editors/terminals/file managers once
 //! per app run and launch them detached on the session workdir.
 
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use tauri::State;
 
 type R<T> = Result<T, CmdError>;
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -230,8 +230,14 @@ pub fn list_open_targets() -> Vec<OpenTarget> {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn open_in(engine: Engine<'_>, session_pk: String, target_id: String) -> R<()> {
-    let dir: String = engine
+pub async fn open_in(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    target_id: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let dir: String = client
         .rpc(
             "session_workdir",
             serde_json::json!({ "session_pk": session_pk }),

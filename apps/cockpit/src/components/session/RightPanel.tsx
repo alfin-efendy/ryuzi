@@ -4,6 +4,7 @@ import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { useDiff, reviewFileIndex, EMPTY, type PendingReview } from "@/store-diff";
 import { commands } from "@/bindings";
+import { sessKey } from "@/lib/session-key";
 import { diffLineStyle, type ReviewFile } from "@/lib/diff";
 import { basename, joinPath } from "@/lib/paths";
 import { Button, Input, Segmented } from "@ryuzi/ui";
@@ -22,7 +23,7 @@ type TargetFetch = {
 };
 
 function samePendingReview(a: PendingReview | null, b: PendingReview | null): boolean {
-  return a?.sessionPk === b?.sessionPk && a?.path === b?.path;
+  return a?.runnerId === b?.runnerId && a?.sessionPk === b?.sessionPk && a?.path === b?.path;
 }
 
 let observedPendingReview = useDiff.getState().pendingReview;
@@ -38,7 +39,7 @@ useDiff.subscribe((state) => {
   currentTargetFetch = null;
 });
 
-function startTargetFetch(target: PendingReview, fetchDiff: (sessionPk: string) => Promise<void>): TargetFetch {
+function startTargetFetch(target: PendingReview, fetchDiff: (runnerId: string, sessionPk: string) => Promise<void>): TargetFetch {
   let resolveCompletion!: () => void;
   const attempt: TargetFetch = {
     target,
@@ -56,7 +57,7 @@ function startTargetFetch(target: PendingReview, fetchDiff: (sessionPk: string) 
   };
 
   try {
-    void fetchDiff(target.sessionPk).then(
+    void fetchDiff(target.runnerId, target.sessionPk).then(
       () => settle("fulfilled"),
       () => settle("rejected"),
     );
@@ -68,11 +69,13 @@ function startTargetFetch(target: PendingReview, fetchDiff: (sessionPk: string) 
 }
 
 export function RightPanel({
+  runnerId,
   sessionPk,
   branch,
   running,
   isGit,
 }: {
+  runnerId: string;
   sessionPk: string;
   branch: string | null;
   running: boolean;
@@ -84,10 +87,24 @@ export function RightPanel({
   const [pathDraft, setPathDraft] = useState("");
   const [treeFilter, setTreeFilter] = useState("");
   const [treeRefresh, setTreeRefresh] = useState(0);
-  const diff = useDiff((s) => s.bySession[sessionPk]) ?? EMPTY;
+  const [workdir, setWorkdir] = useState<string | null>(null);
+  const diff = useDiff((s) => s.bySession[sessKey(runnerId, sessionPk)]) ?? EMPTY;
   const fetchDiff = useDiff((s) => s.fetch);
   const pendingReview = useDiff((s) => s.pendingReview);
   const setPendingReview = useDiff((s) => s.setPendingReview);
+
+  // Fetched once per session and reused both to open files from Review
+  // (below) and to resolve the file viewer's session-relative reads.
+  useEffect(() => {
+    let cancelled = false;
+    setWorkdir(null);
+    void commands.sessionWorkdir(runnerId, sessionPk).then((res) => {
+      if (!cancelled && res.status === "ok") setWorkdir(res.data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runnerId, sessionPk]);
 
   const activeFileTab = ui.tabs.find((t) => t.id === ui.activeTabId) ?? ui.tabs[0];
   // Explicit per-tab choice wins; otherwise previewable files default to View.
@@ -106,15 +123,16 @@ export function RightPanel({
   // Non-git projects have no diff to fetch (git_diff would just error).
   useEffect(() => {
     if (!nav.rightOpen || nav.rightTab !== "review" || running || !isGit) return;
-    if (useDiff.getState().pendingReview?.sessionPk === sessionPk) return;
-    void fetchDiff(sessionPk);
-  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, sessionPk, isGit]);
+    const pending = useDiff.getState().pendingReview;
+    if (pending?.runnerId === runnerId && pending.sessionPk === sessionPk) return;
+    void fetchDiff(runnerId, sessionPk);
+  }, [nav.rightOpen, nav.rightTab, running, fetchDiff, runnerId, sessionPk, isGit]);
 
   // Each same-session transcript target owns one global attempt. Its revision
   // distinguishes repeated equal targets (A -> B -> A) and keeps an unresolved
   // attempt available to a remounted panel.
   useEffect(() => {
-    const target = pendingReview?.sessionPk === sessionPk ? pendingReview : null;
+    const target = pendingReview?.runnerId === runnerId && pendingReview.sessionPk === sessionPk ? pendingReview : null;
     if (target === null) {
       setTargetFetchSettled((settled) => (settled === null ? settled : null));
       return;
@@ -133,13 +151,13 @@ export function RightPanel({
         setTargetFetchSettled(attempt);
       }
     });
-  }, [pendingReview, fetchDiff, sessionPk]);
+  }, [pendingReview, fetchDiff, runnerId, sessionPk]);
 
   // Consume a pending jump only after its exact target-scoped attempt has
   // settled. Result errors deliberately retain old files in the store, so do
   // not select from them; rejected fetches clear without waiting for loading.
   useEffect(() => {
-    if (pendingReview === null || pendingReview.sessionPk !== sessionPk) return;
+    if (pendingReview === null || pendingReview.runnerId !== runnerId || pendingReview.sessionPk !== sessionPk) return;
     const attempt = currentTargetFetch;
     if (attempt === null || targetFetchSettled !== attempt || attempt.status === "pending") return;
     if (attempt.revision !== pendingReviewRevision || !samePendingReview(attempt.target, pendingReview)) return;
@@ -150,7 +168,7 @@ export function RightPanel({
     currentTargetFetch = null;
     setTargetFetchSettled(null);
     setPendingReview(null);
-  }, [pendingReview, diff.files, diff.loading, diff.error, targetFetchSettled, setPendingReview, sessionPk]);
+  }, [pendingReview, diff.files, diff.loading, diff.error, targetFetchSettled, setPendingReview, runnerId, sessionPk]);
 
   // A refresh may shrink the file list out from under a stale selected
   // index (e.g. commits amended away) — clamp it back into range.
@@ -179,9 +197,13 @@ export function RightPanel({
   const reviewDel = diff.files.reduce((n, f) => n + f.del, 0);
 
   const openInFiles = async (f: ReviewFile) => {
-    const res = await commands.sessionWorkdir(sessionPk);
-    if (res.status !== "ok") return;
-    ui.openFile(joinPath(res.data, `${f.dir}${f.name}`));
+    let root = workdir;
+    if (root === null) {
+      const res = await commands.sessionWorkdir(runnerId, sessionPk);
+      if (res.status !== "ok") return;
+      root = res.data;
+    }
+    ui.openFile(joinPath(root, `${f.dir}${f.name}`));
     nav.setRightTab("file");
   };
 
@@ -252,7 +274,7 @@ export function RightPanel({
               variant="ghost"
               size="icon-xs"
               title="Refresh diff"
-              onClick={() => void fetchDiff(sessionPk)}
+              onClick={() => void fetchDiff(runnerId, sessionPk)}
               className="text-muted-foreground"
             >
               <RotateCw aria-hidden size={12} strokeWidth={2} className={diff.loading ? "animate-spin" : ""} />
@@ -316,7 +338,8 @@ export function RightPanel({
         </>
       )}
 
-      {/* File tab — wired to the real readFile IPC via dock tabs */}
+      {/* File tab — reads go through the jailed fsview read_file*
+          RPC, resolved via dock tabs */}
       {nav.rightTab === "file" && (
         <>
           <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-4 py-2.5 text-xs text-muted-foreground">
@@ -411,7 +434,7 @@ export function RightPanel({
           <div className="flex min-h-0 flex-1 overflow-hidden">
             <div className="flex min-w-0 flex-1 flex-col overflow-hidden text-xs">
               {activeFileTab ? (
-                <FileViewer path={activeFileTab.path} mode={fileMode} />
+                <FileViewer runnerId={runnerId} sessionPk={sessionPk} path={activeFileTab.path} mode={fileMode} workdir={workdir} />
               ) : (
                 <div className="flex flex-1 items-center justify-center font-sans text-[12.5px] text-muted-foreground">
                   Select a file from the tree.
@@ -439,13 +462,13 @@ export function RightPanel({
                   <RotateCw aria-hidden size={12} strokeWidth={2} className="size-3" />
                 </Button>
               </div>
-              <FileTreePane sessionPk={sessionPk} filter={treeFilter} refreshKey={treeRefresh} />
+              <FileTreePane runnerId={runnerId} sessionPk={sessionPk} filter={treeFilter} refreshKey={treeRefresh} />
             </div>
           </div>
         </>
       )}
 
-      {nav.rightTab === "agents" && <SubagentList sessionPk={sessionPk} />}
+      {nav.rightTab === "agents" && <SubagentList runnerId={runnerId} sessionPk={sessionPk} />}
     </div>
   );
 }

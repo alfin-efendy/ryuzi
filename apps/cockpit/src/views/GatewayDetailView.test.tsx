@@ -1,6 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { GatewayEventInfo, GatewayInfo, Session } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The view renders straight from the gateways/session stores and only touches
 // IPC through store actions, so we mock the Tauri bindings boundary and seed
@@ -47,13 +48,13 @@ const runningSession: Session = {
 };
 const endedSession: Session = { ...runningSession, sessionPk: "s-done", title: "Old finished run", status: "ended" };
 
-const gatewayEvents = mock(async (_id: string) => ({ status: "ok" as const, data: daemonEvents }));
-const updateGateway = mock(async (id: string, fsMode: string, paths: string[]) => ({
+const gatewayEvents = mock(async (_runnerId: string, _id: string) => ({ status: "ok" as const, data: daemonEvents }));
+const updateGateway = mock(async (_runnerId: string, id: string, fsMode: string, paths: string[]) => ({
   status: "ok" as const,
   data: [{ ...localGateway, id, fsMode, paths, latency: "0.9 ms" }],
 }));
 const probeGateways = mock(async () => ({ status: "ok" as const, data: [localGateway] }));
-const removeGateway = mock(async (_id: string) => ({ status: "ok" as const, data: [] as GatewayInfo[] }));
+const removeGateway = mock(async (_runnerId: string, _id: string) => ({ status: "ok" as const, data: [] as GatewayInfo[] }));
 const pickDirectory = mock(async () => null);
 
 mock.module("@/bindings", () => ({
@@ -67,7 +68,13 @@ const { useStore } = await import("@/store");
 
 function seed() {
   useGateways.setState({ gateways: [localGateway], eventsById: {}, loaded: true, probing: false });
-  useStore.setState({ sessions: [runningSession, endedSession], focusedSessionPk: null });
+  useStore.setState({
+    sessions: [
+      { ...runningSession, runnerId: LOCAL_RUNNER },
+      { ...endedSession, runnerId: LOCAL_RUNNER },
+    ],
+    focusedSession: null,
+  });
 }
 
 afterEach(() => {
@@ -104,7 +111,7 @@ test("loads daemon events on mount and renders the log card", async () => {
   render(<GatewayDetailView id="local" />);
 
   expect(await screen.findByText(/Daemon handshake complete/)).toBeTruthy();
-  expect(gatewayEvents).toHaveBeenCalledWith("local");
+  expect(gatewayEvents).toHaveBeenCalledWith(LOCAL_RUNNER, "local");
   expect(screen.getByText("Daemon events, most recent last")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
 });
@@ -117,7 +124,7 @@ test("switching filesystem access persists the mode and re-renders from the IPC 
 
   fireEvent.click(screen.getByRole("button", { name: "Read-only" }));
 
-  expect(updateGateway).toHaveBeenCalledWith("local", "read", ["/home/dev/projects"]);
+  expect(updateGateway).toHaveBeenCalledWith(LOCAL_RUNNER, "local", "read", ["/home/dev/projects"]);
   // Health re-renders from the mocked updateGateway response.
   expect(await screen.findByText("0.9 ms")).toBeTruthy();
   expect(screen.getByText("Agents can inspect files but never write outside a worktree.")).toBeTruthy();

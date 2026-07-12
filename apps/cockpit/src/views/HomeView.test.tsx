@@ -12,10 +12,15 @@ import type {
   Result,
   Session,
 } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
-const listBranches = mock((): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }));
-const nativeCommands = mock((): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+const listBranches = mock(
+  (_runnerId: string, _projectId: string): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }),
+);
+const nativeCommands = mock(
+  (_runnerId: string, _projectId: string): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
+);
 const searchFiles = mock((): Promise<Result<string[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const runtimeInfo: ProjectRuntimeInfo = {
   projectId: "p1",
@@ -32,7 +37,7 @@ const projectRuntimeInfo = mock(() => Promise.resolve({ status: "ok" as const, d
 // so the permission-picker test can drive the real store's start() and
 // inspect what startSession actually received.
 const startSession = mock(
-  (_projectId: string, _prompt: string, _options: ChatRequestOptions | null): Promise<Result<Session, CmdError>> =>
+  (_runnerId: string, _projectId: string, _prompt: string, _options: ChatRequestOptions | null): Promise<Result<Session, CmdError>> =>
     Promise.resolve({
       status: "ok",
       data: {
@@ -58,9 +63,12 @@ const startSession = mock(
 );
 const listProjects = mock((): Promise<Result<Project[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const listSessions = mock((): Promise<Result<Session[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+// refresh() (fire-and-forget after a successful start()) always fans out to
+// listGateways too — unmocked it rejects.
+const listGateways = mock((): Promise<Result<never[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo, startSession, listProjects, listSessions },
+  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo, startSession, listProjects, listSessions, listGateways },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount.
@@ -151,6 +159,7 @@ beforeEach(() => {
   startSession.mockClear();
   listProjects.mockClear();
   listSessions.mockClear();
+  listGateways.mockClear();
 });
 
 // Reset the shared zustand singletons so later test files in the same bun
@@ -170,7 +179,7 @@ test("git project: branch pill shows and branches are fetched", async () => {
   // ARIA role is "combobox" (Base UI) with its accessible name taken from
   // aria-label="Branch"; the visible branch name lives in its text content.
   await waitFor(() => expect(screen.getByRole("combobox", { name: "Branch" }).textContent).toContain("main"));
-  expect(listBranches).toHaveBeenCalledWith("p1");
+  expect(listBranches).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
 });
 
 test("non-git project: no branch pill, no worktree toggle, no list_branches call", async () => {
@@ -179,7 +188,7 @@ test("non-git project: no branch pill, no worktree toggle, no list_branches call
   // The whole branch Combobox — trigger pill AND its worktree-Switch footer — is gone.
   expect(screen.queryByRole("combobox", { name: "Branch" })).toBeNull();
   // Let the other mount effect flush so a stray branch fetch would have fired by now.
-  await waitFor(() => expect(nativeCommands).toHaveBeenCalledWith("p1"));
+  await waitFor(() => expect(nativeCommands).toHaveBeenCalledWith(LOCAL_RUNNER, "p1"));
   expect(listBranches).not.toHaveBeenCalled();
 });
 
@@ -261,6 +270,6 @@ test("permission picker seeds the new session's mode", async () => {
   fireEvent.keyDown(box, { key: "Enter" });
 
   await waitFor(() => expect(startSession).toHaveBeenCalled());
-  const [, , options] = startSession.mock.calls[0];
+  const [, , , options] = startSession.mock.calls[0];
   expect(options?.permMode).toBe("bypassPermissions");
 });

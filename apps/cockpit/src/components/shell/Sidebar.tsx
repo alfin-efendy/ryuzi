@@ -38,7 +38,7 @@ import { useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
 import { useTerms } from "@/store-terms";
-import { commands, type Session } from "@/bindings";
+import { commands } from "@/bindings";
 import {
   archivedCount,
   chatSessions,
@@ -49,6 +49,7 @@ import {
   sessionsForProject,
   type Ordering,
 } from "@/lib/sidebar";
+import { LOCAL_RUNNER, isSession, refOf, sessionKey, type UiSession } from "@/lib/session-key";
 import { statusMeta } from "@/lib/status";
 import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
@@ -68,7 +69,7 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
 
 export function Sidebar() {
-  const { projects, sessions, setFocused, focusedSessionPk, selectProject, end } = useStore();
+  const { projects, sessions, setFocused, focusedSession, selectProject, end } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
   const {
     pinned,
@@ -83,7 +84,7 @@ export function Sidebar() {
     pinnedOrder,
     reorderPinned,
   } = useUi();
-  const [confirmArchive, setConfirmArchive] = useState<{ session: Session; reason: string } | null>(null);
+  const [confirmArchive, setConfirmArchive] = useState<{ session: UiSession; reason: string } | null>(null);
   const archiveCancelRef = useRef<HTMLButtonElement>(null);
   const [archivingPk, setArchivingPk] = useState<string | null>(null);
   const sensors = useSensors(
@@ -100,33 +101,34 @@ export function Sidebar() {
   // hide the row. Work that teardown would destroy — uncommitted changes OR
   // commits that exist only on the session branch — gets a confirmation.
   // The row is archived ONLY when the backend teardown succeeded.
-  const finishArchive = async (s: Session) => {
+  const finishArchive = async (s: UiSession) => {
     setArchivingPk(s.sessionPk);
     try {
       // Shells opened for this session hold their cwd inside the worktree;
-      // kill them first or the directory removal fails on Windows.
+      // kill them first or the directory removal fails on Windows. Terminals
+      // are always local Cockpit-process PTYs (never runner-scoped).
       await commands.termCloseSession(s.sessionPk);
-      const ok = await end(s.sessionPk);
+      const ok = await end(s.runnerId, s.sessionPk);
       if (!ok) return; // end() already toasted; leave the row visible
-      setArchived(s.sessionPk, true);
-      if (focusedSessionPk === s.sessionPk) setFocused(null);
+      setArchived(sessionKey(s), true);
+      if (isSession(s, focusedSession)) setFocused(null);
       // Drop the JS-side terminal cache only now — after teardown succeeded and
       // the drawer has unmounted (setFocused(null)). Emptying the tabs earlier
       // would let the drawer's auto-spawn open a fresh PTY into the worktree
       // being removed. termCloseSession already emitted the exit events, so on
       // the failure path above we intentionally leave the cache alone.
-      useTerms.getState().disposeSession(s.sessionPk);
+      useTerms.getState().disposeSession(s.runnerId, s.sessionPk);
     } finally {
       setArchivingPk(null);
       setConfirmArchive(null);
     }
   };
 
-  const archiveSession = async (s: Session) => {
+  const archiveSession = async (s: UiSession) => {
     if (archivingPk !== null) return;
     setArchivingPk(s.sessionPk);
     try {
-      const res = await commands.worktreeDirty(s.sessionPk);
+      const res = await commands.worktreeDirty(s.runnerId, s.sessionPk);
       // Can't prove it's clean → treat as at-risk and ask.
       if (res.status !== "ok") {
         setConfirmArchive({ session: s, reason: "Cockpit couldn't inspect this session's worktree." });
@@ -171,18 +173,25 @@ export function Sidebar() {
   const qLower = q.trim().toLowerCase();
   const chatList = chatSessions(sessions)
     .filter((s) => !qLower || sessionTitle(s).toLowerCase().includes(qLower))
-    .filter((s) => archivedGlobal || !archived[s.sessionPk])
+    .filter((s) => archivedGlobal || !archived[sessionKey(s)])
     .sort((a, b) => {
-      const pin = (pinned[b.sessionPk] ? 1 : 0) - (pinned[a.sessionPk] ? 1 : 0);
+      const pin = (pinned[sessionKey(b)] ? 1 : 0) - (pinned[sessionKey(a)] ? 1 : 0);
       if (pin !== 0) return pin;
       return (b.lastActive ?? 0) - (a.lastActive ?? 0);
     });
-  const filter = { statuses: sessionFilter.statuses, unreadOnly: sessionFilter.unreadOnly, readAt, focusedSessionPk };
+  const filter = { statuses: sessionFilter.statuses, unreadOnly: sessionFilter.unreadOnly, readAt, focusedSession };
   const filterActive = Object.keys(sessionFilter.statuses).length > 0 || sessionFilter.unreadOnly;
 
-  const openSession = (pk: string) => {
-    setFocused(pk);
+  const openSession = (s: UiSession) => {
+    setFocused(refOf(s));
     nav.navigate({ kind: "session" });
+  };
+
+  /** Non-local runners get a small chip next to the title so multi-runner
+   *  sessions are distinguishable in a merged sidebar. */
+  const runnerLabel = (runnerId: string): string | null => {
+    if (runnerId === LOCAL_RUNNER) return null;
+    return gateways.find((g) => g.id === runnerId)?.name ?? runnerId;
   };
 
   return (
@@ -225,24 +234,28 @@ export function Sidebar() {
           </div>
           {chatList.map((s) => {
             const m = statusMeta(s.status);
-            const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
-            const isPinned = !!pinned[s.sessionPk];
+            const key = sessionKey(s);
+            const isActive = view.kind === "session" && isSession(s, focusedSession);
+            const isPinned = !!pinned[key];
+            const rLabel = runnerLabel(s.runnerId);
             return (
-              <div
-                key={s.sessionPk}
-                className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[s.sessionPk] ? "opacity-55" : ""}`}
-              >
+              <div key={key} className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[key] ? "opacity-55" : ""}`}>
                 <span
                   className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-2 pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
                 >
                   <Button
                     type="button"
                     variant="ghost"
-                    onClick={() => openSession(s.sessionPk)}
+                    onClick={() => openSession(s)}
                     className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
                   >
                     <StatusDot color={m.color} pulse={m.pulse} />
                     <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
+                    {rLabel && (
+                      <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">
+                        {rLabel}
+                      </Badge>
+                    )}
                   </Button>
                   <Button
                     type="button"
@@ -250,7 +263,7 @@ export function Sidebar() {
                     size="icon-xs"
                     title={isPinned ? "Unpin" : "Pin"}
                     className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                    onClick={() => togglePin(s.sessionPk)}
+                    onClick={() => togglePin(key)}
                   >
                     <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
                   </Button>
@@ -258,10 +271,10 @@ export function Sidebar() {
                     type="button"
                     variant="ghost"
                     size="icon-xs"
-                    title={archived[s.sessionPk] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
+                    title={archived[key] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
                     disabled={archivingPk === s.sessionPk}
                     className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
-                    onClick={() => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s))}
+                    onClick={() => (archived[key] ? setArchived(key, false) : void archiveSession(s))}
                   >
                     <Archive aria-hidden size={12} strokeWidth={2} />
                   </Button>
@@ -421,13 +434,14 @@ export function Sidebar() {
                     onDragEnd={onPinnedDragEnd}
                   >
                     <SortableContext
-                      items={sess.filter((s) => pinned[s.sessionPk]).map((s) => s.sessionPk)}
+                      items={sess.filter((s) => pinned[sessionKey(s)]).map((s) => sessionKey(s))}
                       strategy={verticalListSortingStrategy}
                     >
                       {sess.map((s, i) => {
-                        const isActive = view.kind === "session" && s.sessionPk === focusedSessionPk;
-                        const isPinned = !!pinned[s.sessionPk];
-                        const unread = isUnreadVisible(s, readAt, focusedSessionPk);
+                        const key = sessionKey(s);
+                        const isActive = view.kind === "session" && isSession(s, focusedSession);
+                        const isPinned = !!pinned[key];
+                        const unread = isUnreadVisible(s, readAt, focusedSession);
                         const showArchivedLabel = archCount > 0 && !archivedGlobal;
                         const hasTail = i < sess.length - 1 || showArchivedLabel;
                         const rowProps = {
@@ -435,18 +449,15 @@ export function Sidebar() {
                           isActive,
                           isPinned,
                           unread,
-                          isArchived: !!archived[s.sessionPk],
+                          isArchived: !!archived[key],
                           hasTail,
                           archiveDisabled: archivingPk === s.sessionPk,
-                          onOpen: () => openSession(s.sessionPk),
-                          onTogglePin: () => togglePin(s.sessionPk),
-                          onToggleArchive: () => (archived[s.sessionPk] ? setArchived(s.sessionPk, false) : void archiveSession(s)),
+                          runnerLabel: runnerLabel(s.runnerId),
+                          onOpen: () => openSession(s),
+                          onTogglePin: () => togglePin(key),
+                          onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
                         };
-                        return isPinned ? (
-                          <SortableSessionRow key={s.sessionPk} {...rowProps} />
-                        ) : (
-                          <SessionRow key={s.sessionPk} {...rowProps} />
-                        );
+                        return isPinned ? <SortableSessionRow key={key} {...rowProps} /> : <SessionRow key={key} {...rowProps} />;
                       })}
                     </SortableContext>
                   </DndContext>

@@ -7,6 +7,7 @@ mod connections_cmd;
 mod endpoint_cmd;
 pub mod engine;
 pub mod engine_daemon;
+pub mod engine_manager;
 mod error;
 mod events;
 mod fsview_cmd;
@@ -39,9 +40,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::list_tool_policies,
             commands::delete_tool_policy,
             commands::resolve_approval,
-            commands::read_file,
             commands::stage_attachment,
-            commands::read_file_base64,
+            commands::read_local_media,
+            commands::fetch_attachment,
             commands::pick_directory,
             commands::pick_files,
             commands::backdrop_capability,
@@ -62,6 +63,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             gateways_cmd::list_gateways,
             gateways_cmd::probe_gateways,
             gateways_cmd::add_gateway,
+            gateways_cmd::add_runner,
             gateways_cmd::remove_gateway,
             gateways_cmd::update_gateway,
             gateways_cmd::gateway_events,
@@ -86,6 +88,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             fsview_cmd::git_diff,
             fsview_cmd::search_files,
             fsview_cmd::revert_file,
+            fsview_cmd::read_file,
+            fsview_cmd::read_file_base64,
             open_cmd::list_open_targets,
             open_cmd::open_in,
             term::term_open,
@@ -218,17 +222,31 @@ pub fn run() {
             // `EngineClient` (the daemon's HTTP control API). The attachments
             // root is derived engine-side (`workdir_root` setting) — fetch it
             // over the same RPC so the asset-protocol scope below still works.
-            let (engine_handle, attachments_root) = tauri::async_runtime::block_on(async move {
-                let client = crate::engine::connect_or_spawn()
-                    .await
-                    .expect("engine daemon unreachable");
-                let root: String = client
+            //
+            // P3-3: Cockpit now talks to `EngineManager`'s runnerId->client
+            // map instead of a single `Arc<EngineClient>`. `"local"` is
+            // seeded first (and its attachments root fetched over it, same
+            // as before); paired remote runners load afterwards, each
+            // getting its own pinned `EngineClient` and its own SSE bridge
+            // (`engine_manager::spawn_bridge`, fanned out one-per-runner —
+            // see that module's docs for how the decrypted device token used
+            // to build each remote client stays backend-only).
+            let app_handle = app.handle().clone();
+            let (manager, attachments_root) = tauri::async_runtime::block_on(async move {
+                let (manager, local_client) =
+                    crate::engine_manager::EngineManager::bootstrap_local()
+                        .await
+                        .expect("engine daemon unreachable");
+                let root: String = local_client
                     .rpc("attachments_root", serde_json::json!({}))
                     .await
                     .expect("attachments root");
-                (std::sync::Arc::new(client), std::path::PathBuf::from(root))
+                manager.start_bridge("local".to_string(), local_client, &app_handle);
+                if let Err(e) = manager.load_remotes(&app_handle).await {
+                    eprintln!("[ryuzi] loading remote runners failed: {e}");
+                }
+                (manager, std::path::PathBuf::from(root))
             });
-            let bridge_client = engine_handle.clone();
             // Media previews: serve attachment files to the webview via the
             // asset protocol, scoped to the attachments root ONLY. The root
             // derives from the runtime-configurable `workdir_root` setting,
@@ -253,77 +271,11 @@ pub fn run() {
             let cap = backdrop::apply_backdrop(&main_window);
             app.manage(backdrop::BackdropState(cap));
             accent::spawn_accent_watcher(app.handle());
-            // Bridge: forward every CoreEvent from the engine daemon's SSE
-            // stream to the webview. Reconnects with exponential backoff
-            // (500ms -> 30s cap) whenever the stream ends or errors — the
-            // daemon may restart independently of Cockpit. OAuth-authorize-URL
-            // events are mapped onto their legacy Tauri events AND trigger a
-            // local browser open (the daemon has no webview to open one from).
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use futures::StreamExt;
-                use tauri_specta::Event as _;
-                let mut backoff_ms: u64 = 500;
-                loop {
-                    match bridge_client.events().await {
-                        Ok(stream) => {
-                            backoff_ms = 500;
-                            let mut stream = Box::pin(stream);
-                            while let Some(v) = stream.next().await {
-                                match v.get("kind").and_then(|k| k.as_str()) {
-                                    Some("oauthAuthorizeUrl") => {
-                                        let provider =
-                                            v["provider"].as_str().unwrap_or("").to_string();
-                                        let url =
-                                            v["authorize_url"].as_str().unwrap_or("").to_string();
-                                        let _ = tauri_plugin_opener::open_url(
-                                            url.clone(),
-                                            None::<String>,
-                                        );
-                                        let _ = events::OauthAuthorizeUrlMsg {
-                                            provider,
-                                            authorize_url: url,
-                                        }
-                                        .emit(&app_handle);
-                                    }
-                                    Some("pluginOauthAuthorizeUrl") => {
-                                        let plugin_id =
-                                            v["plugin_id"].as_str().unwrap_or("").to_string();
-                                        let url =
-                                            v["authorize_url"].as_str().unwrap_or("").to_string();
-                                        let _ = tauri_plugin_opener::open_url(
-                                            url.clone(),
-                                            None::<String>,
-                                        );
-                                        let _ = events::PluginOauthAuthorizeUrlMsg {
-                                            plugin_id,
-                                            authorize_url: url,
-                                        }
-                                        .emit(&app_handle);
-                                    }
-                                    _ => {
-                                        if let Ok(ev) =
-                                            serde_json::from_value::<ryuzi_core::CoreEvent>(v)
-                                        {
-                                            let _ = events::CoreEventMsg { event: ev }
-                                                .emit(&app_handle);
-                                        }
-                                    }
-                                }
-                            }
-                            eprintln!("[ryuzi] engine event stream ended — reconnecting");
-                        }
-                        Err(e) => eprintln!(
-                            "[ryuzi] engine event stream error: {} — retrying",
-                            e.message
-                        ),
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(30_000);
-                }
-            });
-            // Make Arc<EngineClient> available to all Tauri commands.
-            app.manage(engine_handle);
+            // P3-4: every engine-backed command now resolves its runner's
+            // client through `EngineManager` directly (`runner_id: Option<
+            // String>` param, defaulting to `"local"`) — the temporary P3-3
+            // dual-manage of a bare `Arc<EngineClient>` is gone.
+            app.manage(std::sync::Arc::new(manager));
             Ok(())
         })
         .run(tauri::generate_context!())

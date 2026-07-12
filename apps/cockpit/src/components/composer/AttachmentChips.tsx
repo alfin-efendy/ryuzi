@@ -5,14 +5,16 @@ import { commands } from "@/bindings";
 import { basename } from "@/lib/paths";
 import { mediaKindForPath } from "@/lib/attachments";
 
-/** Image thumbnail via read_file_base64 (arbitrary paths sit outside the
- *  asset-protocol scope); falls back to a plain chip on any error. */
+/** Image thumbnail via read_local_media — these paths are CLIENT-LOCAL files
+ *  the user picked/dropped to attach (staged via stage_attachment on send),
+ *  which arbitrary-path local reads correctly, even for a remote session.
+ *  Falls back to a plain chip on any error. */
 function ImageChip({ path, onRemove }: { path: string; onRemove: () => void }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    void commands.readFileBase64(path).then((res) => {
+    void commands.readLocalMedia(path).then((res) => {
       if (cancelled) return;
       if (res.status === "ok") setSrc(`data:${res.data.contentType ?? "image/png"};base64,${res.data.dataBase64}`);
       else setFailed(true);

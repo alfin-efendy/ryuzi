@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { BranchList, CmdError, GatewayInfo, JobInfo, Project, Result } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const branchListData: BranchList = { branches: ["main", "develop"], current: "main", detached: false };
 const listBranches = mock((): Promise<Result<BranchList, CmdError>> => Promise.resolve({ status: "ok", data: branchListData }));
@@ -61,7 +62,7 @@ afterEach(cleanup);
 test("git project: branches are fetched for the branch picker", async () => {
   useStore.setState({ projects: [project()] });
   render(<JobNewView />);
-  await waitFor(() => expect(listBranches).toHaveBeenCalledWith("p1"));
+  await waitFor(() => expect(listBranches).toHaveBeenCalledWith(LOCAL_RUNNER, "p1"));
 });
 
 test("non-git project: no branch fetch, no branch pill, job creates branchless", async () => {
@@ -81,6 +82,6 @@ test("non-git project: no branch fetch, no branch pill, job creates branchless",
 
   fireEvent.click(create);
   await waitFor(() => expect(createJob).toHaveBeenCalledTimes(1));
-  expect(createJob).toHaveBeenCalledWith(expect.objectContaining({ projectId: "p1", branch: "" }));
+  expect(createJob).toHaveBeenCalledWith(LOCAL_RUNNER, expect.objectContaining({ projectId: "p1", branch: "" }));
   expect(listBranches).not.toHaveBeenCalled();
 });

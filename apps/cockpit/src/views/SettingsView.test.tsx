@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { CmdError, Result } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const ok = <T,>(data: T): Result<T, CmdError> => ({ status: "ok", data });
 
@@ -16,7 +17,7 @@ let getAgentSettingsImpl: () => Promise<Result<AgentSettings, CmdError>> = () =>
   Promise.resolve(ok({ model: "anthropic/claude-opus-4", permMode: "ask" }));
 
 const getAgentSettings = mock(() => getAgentSettingsImpl());
-const setAgentSettings = mock(async (_model: string | null, _permMode: string | null) => ok(null));
+const setAgentSettings = mock(async (_runnerId: string, _model: string | null, _permMode: string | null) => ok(null));
 const selectable = (requestValue: string) => ({
   kind: "concrete" as const,
   requestValue,
@@ -27,7 +28,7 @@ const selectable = (requestValue: string) => ({
   resolvedDefault: null,
   defaultSource: "none" as const,
 });
-const listSelectableModels = mock(async () => ok([selectable("smart"), selectable("anthropic/claude-opus-4")]));
+const listSelectableModels = mock(async (_runnerId: string) => ok([selectable("smart"), selectable("anthropic/claude-opus-4")]));
 
 // AgentLoopCard: a failed save must roll the input back to the last CONFIRMED
 // value — not to whatever the user just typed (the bug this guards: `onChange`
@@ -38,12 +39,12 @@ let setSettingImpl: (key: string, value: string) => Promise<Result<null, CmdErro
 
 const WORKTREE_DIR_KEY = "worktree_dir";
 
-const getSetting = mock((key: string): Promise<Result<string | null, CmdError>> => {
+const getSetting = mock((_runnerId: string, key: string): Promise<Result<string | null, CmdError>> => {
   if (key === MAX_TURNS_KEY) return Promise.resolve(ok("50"));
   if (key === WORKTREE_DIR_KEY) return Promise.resolve(ok("D:\\wt"));
   return Promise.resolve(ok(null));
 });
-const setSetting = mock((key: string, value: string): Promise<Result<null, CmdError>> => setSettingImpl(key, value));
+const setSetting = mock((_runnerId: string, key: string, value: string): Promise<Result<null, CmdError>> => setSettingImpl(key, value));
 const listToolPolicies = mock(() => Promise.resolve(ok([])));
 const deleteToolPolicy = mock(() => Promise.resolve(ok(null)));
 const pickDirectory = mock((): Promise<string | null> => Promise.resolve(null));
@@ -111,7 +112,7 @@ test("changing the default model persists it with the hydrated permMode via set_
   render(<SettingsView />);
   await waitFor(() => expect(useAgent.getState().model).toBe("anthropic/claude-opus-4"));
   await useAgent.getState().setModel("smart");
-  expect(setAgentSettings).toHaveBeenCalledWith("smart", "ask");
+  expect(setAgentSettings).toHaveBeenCalledWith(LOCAL_RUNNER, "smart", "ask");
 });
 
 test("the default model picker stays disabled when the agent-settings load fails, even though the model list is available", async () => {
@@ -183,5 +184,5 @@ test("Worktree folder shows the configured path and Browse saves a new one", asy
   setSettingImpl = () => Promise.resolve({ status: "ok", data: null });
   fireEvent.click(within(card).getByRole("button", { name: "Browse" }));
 
-  await waitFor(() => expect(setSetting).toHaveBeenCalledWith(WORKTREE_DIR_KEY, "E:\\other-wt"));
+  await waitFor(() => expect(setSetting).toHaveBeenCalledWith(LOCAL_RUNNER, WORKTREE_DIR_KEY, "E:\\other-wt"));
 });

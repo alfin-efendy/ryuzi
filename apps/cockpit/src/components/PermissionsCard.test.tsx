@@ -1,6 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { CmdError, Project, Result, ToolPolicyRow } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // Mock the Tauri boundary before the component (and the store it pulls in) load.
 let seededRules: ToolPolicyRow[] = [];
@@ -87,7 +88,7 @@ test("clicking the delete button revokes the rule and refetches", async () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove rule for Bash" }));
   });
 
-  expect(deleteToolPolicy).toHaveBeenCalledWith("p1", "Bash");
+  expect(deleteToolPolicy).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "Bash");
   expect(listToolPolicies).toHaveBeenCalledTimes(2);
   expect(screen.getByText("No saved rules.")).toBeTruthy();
 });

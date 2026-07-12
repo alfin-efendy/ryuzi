@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { commands, type ProviderQuotaCapability, type ProviderQuotaInfo } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 export type ConnectionQuotaState =
   | { status: "idle"; quota: null; error: null }
@@ -57,7 +58,7 @@ export function useConnectionQuota(connectionId: string | null, capability: Prov
       commit(generation, requestContext, { status: "loading", quota: priorQuota, error: null });
 
       try {
-        const result = await commands.connectionProviderQuota(requestConnectionId);
+        const result = await commands.connectionProviderQuota(LOCAL_RUNNER, requestConnectionId);
         if (result.status === "ok") {
           commit(generation, requestContext, { status: "loaded", quota: result.data, error: null });
           return;
@@ -92,7 +93,7 @@ export function useConnectionQuota(connectionId: string | null, capability: Prov
     resettingRef.current = true;
     if (mountedRef.current) setResetting(true);
     try {
-      const result = await commands.resetCodexCredit(requestConnectionId);
+      const result = await commands.resetCodexCredit(LOCAL_RUNNER, requestConnectionId);
       if (result.status !== "ok") return false;
 
       const current = contextRef.current;

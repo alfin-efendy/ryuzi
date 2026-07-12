@@ -52,6 +52,15 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+# Remote-runner pinned TLS (Phase 3): IDENTICAL to crates/core/Cargo.toml's
+# rustls line. reqwest's `use_preconfigured_tls` downcasts the ClientConfig
+# via `Any` — if this resolves to a different rustls version/features than
+# the one reqwest was built against, the downcast silently fails and falls
+# back to default TLS, bypassing the pin with no compile/runtime error. Keep
+# in lockstep with core; verify with `cargo tree -p ryuzi-cockpit -i rustls`
+# after any bump (must show exactly one 0.23.x). ring-only — see core's note;
+# verify `cargo tree -p ryuzi-cockpit -i aws-lc-rs`/`-i aws-lc-sys` (absent).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures.workspace = true
 portable-pty.workspace = true
 specta = { workspace = true, features = ["derive"] }

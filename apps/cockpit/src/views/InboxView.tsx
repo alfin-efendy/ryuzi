@@ -36,7 +36,7 @@ export function InboxView() {
                     variant="ghost"
                     className="text-xs text-muted-foreground"
                     onClick={() => {
-                      setFocused(a.sessionPk);
+                      setFocused({ runnerId: a.runnerId, pk: a.sessionPk });
                       navigate({ kind: "session" });
                     }}
                   >

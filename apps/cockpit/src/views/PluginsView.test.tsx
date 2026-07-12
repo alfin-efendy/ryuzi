@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AddAppInput, AppInfo, CatalogStatus, PluginDetail, PluginInfo, PluginInstallBeginResult } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 function plugin(id: string, categories: string[], over: Partial<PluginInfo> = {}): PluginInfo {
   return {
@@ -70,9 +71,9 @@ let doctorFindingsFixture: { pluginId: string; severity: string; kind: string; m
 let catalogStatusFixture: CatalogStatus = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
 
 const listApps = mock(async () => ({ status: "ok" as const, data: appsFixture }));
-const addApp = mock(async (_input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
+const addApp = mock(async (_runnerId: string, _input: AddAppInput) => ({ status: "ok" as const, data: appsFixture }));
 const listPlugins = mock(async () => ({ status: "ok" as const, data: pluginsFixture }));
-const uninstallPlugin = mock(async (id: string) => ({
+const uninstallPlugin = mock(async (_runnerId: string, id: string) => ({
   status: "ok" as const,
   data: pluginsFixture.filter((p) => p.id !== id),
 }));
@@ -82,17 +83,23 @@ const catalogStatus = mock(async () => ({ status: "ok" as const, data: catalogSt
 // `refresh_catalog` behavior of returning the fresh `catalog_status` snapshot.
 const refreshCatalog = mock(async () => ({ status: "ok" as const, data: catalogStatusFixture }));
 const pluginDoctor = mock(async () => ({ status: "ok" as const, data: doctorFindingsFixture }));
-const updatePlugin = mock(async (_id: string, _force: boolean) => ({ status: "ok" as const, data: { kind: "updated" as const } }));
-const updateAllPlugins = mock(async () => ({ status: "ok" as const, data: [] as { id: string; outcome: { kind: string } }[] }));
+const updatePlugin = mock(async (_runnerId: string, _id: string, _force: boolean) => ({
+  status: "ok" as const,
+  data: { kind: "updated" as const },
+}));
+const updateAllPlugins = mock(async (_runnerId: string) => ({
+  status: "ok" as const,
+  data: [] as { id: string; outcome: { kind: string } }[],
+}));
 // Mutates the fixture list that `listPlugins` reads from, so `pin()`'s
 // internal reload comes back with the real persisted flag — the same
 // authoritative-reload behavior being exercised, not a session-only mock.
-const setPluginPin = mock(async (id: string, pinned: boolean, _reason: string | null) => {
+const setPluginPin = mock(async (_runnerId: string, id: string, pinned: boolean, _reason: string | null) => {
   pluginsFixture = pluginsFixture.map((p) => (p.id === id ? { ...p, pinned } : p));
   return { status: "ok" as const, data: null };
 });
 
-const beginSkillInstall = mock(async (_source: string) => ({
+const beginSkillInstall = mock(async (_runnerId: string, _source: string) => ({
   status: "ok" as const,
   data: {
     completed: true,
@@ -107,7 +114,7 @@ const beginSkillInstall = mock(async (_source: string) => ({
     },
   },
 }));
-const confirmSkillInstall = mock(async (_token: string) => ({
+const confirmSkillInstall = mock(async (_runnerId: string, _token: string) => ({
   status: "ok" as const,
   data: {
     id: "superpowers",
@@ -131,12 +138,12 @@ const listSkills = mock(async () => ({
   }[],
 }));
 
-const removeSkill = mock(async (_id: string) => ({
+const removeSkill = mock(async (_runnerId: string, _id: string) => ({
   status: "ok" as const,
   data: null,
 }));
 
-const refreshSkill = mock(async (_id: string) => ({
+const refreshSkill = mock(async (_runnerId: string, _id: string) => ({
   status: "ok" as const,
   data: {
     id: "superpowers",
@@ -172,16 +179,22 @@ const wizardBegin: PluginInstallBeginResult = {
   oauthBegin: null,
   dcrError: null,
 };
-const pluginDetail = mock(async (_id: string) => ({ status: "ok" as const, data: wizardDetail }));
-const beginPluginInstall = mock(async (_pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
-const setPluginOauthClientId = mock(async (_pluginId: string, _clientId: string) => ({ status: "ok" as const, data: null }));
-const cancelPluginInstall = mock(async (_pluginId: string, _stateToken: string | null) => ({ status: "ok" as const, data: null }));
-const completePluginOauth = mock(async (_pluginId: string, _code: string, _stateToken: string) => ({
+const pluginDetail = mock(async (_runnerId: string, _id: string) => ({ status: "ok" as const, data: wizardDetail }));
+const beginPluginInstall = mock(async (_runnerId: string, _pluginId: string) => ({ status: "ok" as const, data: wizardBegin }));
+const setPluginOauthClientId = mock(async (_runnerId: string, _pluginId: string, _clientId: string) => ({
   status: "ok" as const,
   data: null,
 }));
-const setPluginSetting = mock(async (_key: string, _value: string) => ({ status: "ok" as const, data: null }));
-const setPluginEnabled = mock(async (_id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+const cancelPluginInstall = mock(async (_runnerId: string, _pluginId: string, _stateToken: string | null) => ({
+  status: "ok" as const,
+  data: null,
+}));
+const completePluginOauth = mock(async (_runnerId: string, _pluginId: string, _code: string, _stateToken: string) => ({
+  status: "ok" as const,
+  data: null,
+}));
+const setPluginSetting = mock(async (_runnerId: string, _key: string, _value: string) => ({ status: "ok" as const, data: null }));
+const setPluginEnabled = mock(async (_runnerId: string, _id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
 const pluginOauthCompletedMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
 );
@@ -351,7 +364,7 @@ test("browse install routes an integration to the install wizard", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Install github" }));
 
   expect(await screen.findByText("Install github", { selector: "h2" })).toBeTruthy();
-  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith("github"));
+  await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 });
 
 test("browse install routes a provider to the connection modal", async () => {
@@ -375,7 +388,7 @@ test("browse install routes a skill pack through the two-phase trust flow (begin
 
   fireEvent.click(screen.getByRole("button", { name: "Install superpowers" }));
 
-  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith("superpowers"));
+  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers"));
   // Curated packs resolve `completed: true` — no trust step, no old
   // `install_skill` one-phase command involved.
   await waitFor(() => expect(listPlugins.mock.calls.length).toBeGreaterThan(1));
@@ -400,7 +413,7 @@ test("installed aggregates apps and installed plugins with uninstall", async () 
 
   fireEvent.click(screen.getByRole("button", { name: "Uninstall notion" }));
 
-  await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith("notion"));
+  await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "notion"));
 });
 
 test("an installed curated pack renders as exactly one card, not a duplicate manual row", async () => {
@@ -451,10 +464,10 @@ test("an installed skill pack shows Update/Pin actions, which call the store's c
   await renderView();
 
   fireEvent.click(screen.getByRole("button", { name: "Update superpowers" }));
-  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith("superpowers", false));
+  await waitFor(() => expect(updatePlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers", false));
 
   fireEvent.click(screen.getByRole("button", { name: "Pin superpowers" }));
-  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith("superpowers", true, "Pinned from Cockpit"));
+  await waitFor(() => expect(setPluginPin).toHaveBeenCalledWith(LOCAL_RUNNER, "superpowers", true, "Pinned from Cockpit"));
 
   expect(await screen.findByText("Pinned")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Unpin superpowers" })).toBeTruthy();

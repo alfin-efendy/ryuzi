@@ -3,6 +3,7 @@ import type { ConnectionInfo } from "./bindings";
 import { commands } from "./bindings";
 import { useStore } from "./store";
 import { useConnections } from "./store-connections";
+import { LOCAL_RUNNER } from "./lib/session-key";
 
 const originalRefreshModelConfiguration = useStore.getState().refreshModelConfiguration;
 
@@ -38,7 +39,7 @@ test("rename uses the dedicated command, returns true, updates accounts, and ref
   const command = spyOn(commands, "renameConnection").mockResolvedValue({ status: "ok", data: [renamed] });
 
   expect(await useConnections.getState().rename(connection.id, "Work")).toBe(true);
-  expect(command).toHaveBeenCalledWith(connection.id, "Work");
+  expect(command).toHaveBeenCalledWith(LOCAL_RUNNER, connection.id, "Work");
   expect(useConnections.getState().connections).toEqual([renamed]);
   expect(refreshModelConfiguration).toHaveBeenCalledTimes(1);
   command.mockRestore();
@@ -51,7 +52,7 @@ test("setEnabled uses the dedicated command and reports failure without refreshi
   });
 
   expect(await useConnections.getState().setEnabled(connection.id, false)).toBe(false);
-  expect(command).toHaveBeenCalledWith(connection.id, false);
+  expect(command).toHaveBeenCalledWith(LOCAL_RUNNER, connection.id, false);
   expect(useConnections.getState().connections).toEqual([connection]);
   expect(refreshModelConfiguration).not.toHaveBeenCalled();
   command.mockRestore();
@@ -71,7 +72,7 @@ test("remove returns true only after the dedicated command succeeds and refreshe
   const command = spyOn(commands, "removeConnection").mockResolvedValue({ status: "ok", data: [] });
 
   expect(await useConnections.getState().remove(connection.id)).toBe(true);
-  expect(command).toHaveBeenCalledWith(connection.id);
+  expect(command).toHaveBeenCalledWith(LOCAL_RUNNER, connection.id);
   expect(useConnections.getState().connections).toEqual([]);
   expect(refreshModelConfiguration).toHaveBeenCalledTimes(1);
   command.mockRestore();

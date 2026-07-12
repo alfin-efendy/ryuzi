@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, Result } from "@/bindings";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
-const gitDiff = mock((): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }));
-const sessionWorkdir = mock((): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "C:\\code\\demo" }));
+const gitDiff = mock(
+  (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }),
+);
+const sessionWorkdir = mock(
+  (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> =>
+    Promise.resolve({ status: "ok", data: "C:\\code\\demo" }),
+);
 
 mock.module("@/bindings", () => ({
   commands: { gitDiff, sessionWorkdir },
@@ -39,7 +45,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 test("non-git session: Review shows the empty state and never fetches a diff", () => {
-  render(<RightPanel sessionPk="s1" branch={null} running={false} isGit={false} />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch={null} running={false} isGit={false} />);
   expect(screen.getByText(/Not a git repository/)).toBeTruthy();
   expect(screen.queryByText("No changes yet.")).toBeNull();
   // Mount effects already ran synchronously under act() — no fetch fired.
@@ -47,8 +53,8 @@ test("non-git session: Review shows the empty state and never fetches a diff", (
 });
 
 test("git session: Review fetches the diff as before", async () => {
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
-  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith("s1"));
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
   expect(screen.queryByText(/Not a git repository/)).toBeNull();
 });
 
@@ -62,19 +68,19 @@ test("pending review target waits for its fresh fetch instead of consuming a sta
   );
   useDiff.setState({
     bySession: {
-      s1: {
+      [sessKey(LOCAL_RUNNER, "s1")]: {
         loading: false,
         error: null,
         files: [{ dir: "src/", name: "stale.ts", add: 1, del: 0, lines: [["add", 1, "const stale = true;"]] }],
       },
     },
-    pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" },
+    pendingReview: { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" },
   });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
-  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith("s1"));
-  expect(useDiff.getState().pendingReview).toEqual({ sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" });
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
+  expect(useDiff.getState().pendingReview).toEqual({ runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" });
 
   await act(async () => {
     resolveDiff({ status: "ok", data: FRESH_DIFF });
@@ -93,7 +99,7 @@ test("result-error target fetch clears without selecting a preserved stale match
   gitDiff.mockImplementation(() => Promise.resolve({ status: "error", error: { message: "diff failed" } }));
   useDiff.setState({
     bySession: {
-      s1: {
+      [sessKey(LOCAL_RUNNER, "s1")]: {
         loading: false,
         error: null,
         files: [
@@ -102,10 +108,10 @@ test("result-error target fetch clears without selecting a preserved stale match
         ],
       },
     },
-    pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\second.ts" },
+    pendingReview: { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\second.ts" },
   });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
   await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
   expect(screen.getByTitle("src/first.ts").className).toContain("bg-accent");
@@ -115,28 +121,28 @@ test("result-error target fetch clears without selecting a preserved stale match
 
 test("rejected target fetch clears the pending review target", async () => {
   gitDiff.mockImplementation(() => Promise.reject(new Error("diff failed")));
-  useDiff.setState({ pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
+  useDiff.setState({ pendingReview: { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
   await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
 });
 
 test("other-session pending review target remains unchanged", async () => {
-  const pending = { sessionPk: "s2", path: "C:\\code\\demo\\src\\app.ts" };
+  const pending = { runnerId: LOCAL_RUNNER, sessionPk: "s2", path: "C:\\code\\demo\\src\\app.ts" };
   useDiff.setState({ pendingReview: pending });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
-  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith("s1"));
+  await waitFor(() => expect(gitDiff).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
   expect(useDiff.getState().pendingReview).toEqual(pending);
 });
 
 test("completed diff selects and clears a pending transcript review target", async () => {
   gitDiff.mockImplementation(() => Promise.resolve({ status: "ok", data: APP_DIFF }));
-  useDiff.setState({ pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
+  useDiff.setState({ pendingReview: { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
   await waitFor(() => expect(screen.getByText("src/app.ts")).toBeTruthy());
   await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
@@ -144,11 +150,11 @@ test("completed diff selects and clears a pending transcript review target", asy
 
 test("completed diff clears an unmatched pending target", async () => {
   gitDiff.mockImplementation(() => Promise.resolve({ status: "ok", data: APP_DIFF }));
-  useDiff.setState({ pendingReview: { sessionPk: "s1", path: "src/missing.ts" } });
+  useDiff.setState({ pendingReview: { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "src/missing.ts" } });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
-  await waitFor(() => expect(useDiff.getState().bySession.s1?.loading).toBe(false));
+  await waitFor(() => expect(useDiff.getState().bySession[sessKey(LOCAL_RUNNER, "s1")]?.loading).toBe(false));
   await waitFor(() => expect(useDiff.getState().pendingReview).toBeNull());
   expect(screen.getByText("app.ts")).toBeTruthy();
 });
@@ -161,12 +167,12 @@ test("pending review target stays pending while its fresh diff fetch is still lo
         resolveDiff = resolve;
       }),
   );
-  useDiff.setState({ pendingReview: { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
+  useDiff.setState({ pendingReview: { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" } });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
-  await waitFor(() => expect(useDiff.getState().bySession.s1?.loading).toBe(true));
-  expect(useDiff.getState().pendingReview).toEqual({ sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" });
+  await waitFor(() => expect(useDiff.getState().bySession[sessKey(LOCAL_RUNNER, "s1")]?.loading).toBe(true));
+  expect(useDiff.getState().pendingReview).toEqual({ runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" });
 
   await act(async () => {
     resolveDiff({ status: "ok", data: APP_DIFF });
@@ -184,11 +190,11 @@ test("A -> B -> A target fetches do not let stale completions settle the latest 
         deferred.push({ resolve });
       }),
   );
-  const targetA = { sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" };
-  const targetB = { sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" };
+  const targetA = { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" };
+  const targetB = { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\app.ts" };
   useDiff.setState({ pendingReview: targetA });
 
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
   await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(1));
 
   await act(async () => {
@@ -224,16 +230,16 @@ test("remount attaches to an unresolved target fetch instead of fetching again",
         resolveDiff = resolve;
       }),
   );
-  const target = { sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" };
+  const target = { runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "C:\\code\\demo\\src\\fresh.ts" };
   useDiff.setState({ pendingReview: target });
 
-  const firstPanel = render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  const firstPanel = render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
   await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(1));
 
   await act(async () => {
     firstPanel.unmount();
   });
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
   expect(gitDiff).toHaveBeenCalledTimes(1);
   expect(useDiff.getState().pendingReview).toEqual(target);
@@ -249,7 +255,7 @@ test("remount attaches to an unresolved target fetch instead of fetching again",
 test("refreshing to fewer files clamps the selected review file", async () => {
   useDiff.setState({
     bySession: {
-      s1: {
+      [sessKey(LOCAL_RUNNER, "s1")]: {
         loading: false,
         error: null,
         files: [
@@ -259,7 +265,7 @@ test("refreshing to fewer files clamps the selected review file", async () => {
       },
     },
   });
-  const view = render(<RightPanel sessionPk="s1" branch="main" running isGit />);
+  const view = render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running isGit />);
   act(() => {
     fireEvent.click(screen.getByTitle("src/second.ts"));
   });
@@ -271,14 +277,14 @@ test("refreshing to fewer files clamps the selected review file", async () => {
   act(() => {
     useDiff.setState({
       bySession: {
-        s1: {
+        [sessKey(LOCAL_RUNNER, "s1")]: {
           loading: false,
           error: null,
           files: [{ dir: "src/", name: "first.ts", add: 1, del: 0, lines: [["add", 1, "const first = true;"]] }],
         },
       },
     });
-    view.rerender(<RightPanel sessionPk="s1" branch="main" running isGit />);
+    view.rerender(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running isGit />);
   });
 
   // The clamped index now points at the surviving first.ts — its row is
@@ -290,7 +296,7 @@ test("refreshing to fewer files clamps the selected review file", async () => {
 
 test("Review error keeps Refresh available and retries", async () => {
   gitDiff.mockImplementationOnce(() => Promise.resolve({ status: "error", error: { message: "diff failed" } }));
-  render(<RightPanel sessionPk="s1" branch="main" running={false} isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
 
   await waitFor(() => expect(screen.getByText("diff failed")).toBeTruthy());
   gitDiff.mockImplementationOnce(() => Promise.resolve({ status: "ok", data: APP_DIFF }));
@@ -312,7 +318,7 @@ test("many file tabs do not move the expand action out of the fixed header", () 
     activeTabId: "/work/file-0.ts",
   });
 
-  render(<RightPanel sessionPk="s1" branch="main" running isGit />);
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running isGit />);
 
   const header = screen.getByTestId("right-panel-header");
   const expand = screen.getByTitle("Expand panel");

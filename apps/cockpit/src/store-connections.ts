@@ -11,9 +11,49 @@ import {
   type CmdError,
 } from "./bindings";
 import { KIRO_IMPORT_ACTION, KIRO_SIGNIN_ACTION } from "./constants";
+import { LOCAL_RUNNER } from "./lib/session-key";
 import { useStore } from "./store";
 
 // Providers tab: catalog + credentialed provider connections.
+//
+// Runner target: every command below is pinned to `LOCAL_RUNNER`. This is
+// intentional, not a leftover — there is no remote-runner Providers UI yet
+// (a per-runner runner selector for this tab is a follow-up), and
+// connections are correctly scoped per-runner regardless: each engine
+// (local or remote) owns its own credential store, so "Providers" always
+// means "the local engine's providers" until that selector exists.
+//
+// Remote OAuth support matrix (see also `engine_manager.rs::spawn_bridge`,
+// which already opens `oauthAuthorizeUrl` / `pluginOauthAuthorizeUrl` in the
+// CLIENT-side browser via `tauri_plugin_opener::open_url`, once per runner —
+// so "the client browses to the authorize URL" is already remote-safe for
+// every flow below, including on a future remote runner):
+//   - Device flow (Qwen, GitHub Copilot, Kiro): daemon requests a device
+//     code over outbound HTTPS and polls the token endpoint — no loopback,
+//     already machine-independent. Remote-safe.
+//   - Manual paste (anthropic-oauth, RedirectMode::LoopbackRandom in
+//     `registry.rs`): `beginOauthManual` builds the URL + PKCE
+//     Cockpit-side, the user pastes the code, `completeOauthManual` is
+//     daemon-proxied. Remote-safe.
+//   - Plugin OAuth: Cockpit binds the loopback callback client-side
+//     (port 8976); the daemon only builds the authorize URL. Remote-safe.
+//   - `connectOauth` / `reconnectOauth` (interactive loopback flow, e.g.
+//     anthropic-oauth): the loopback listener is bound BY THE DAEMON
+//     (`registry.rs` `RedirectMode::LoopbackRandom`), so on a remote runner
+//     the browser's redirect would hit the client's own localhost, where
+//     nothing is listening. Local-runner-only for now — splitting this
+//     into a client-side-loopback flow is a larger future change, not done
+//     here.
+//   - LoopbackFixed providers (openai-oauth, fixed port 1455 — see
+//     `RedirectMode::LoopbackFixed` in `registry.rs`): same daemon-side
+//     loopback problem as above, AND manual paste bails for fixed-port
+//     redirects (see `begin_oauth_manual`'s doc comment), AND there's no
+//     device flow for these providers. This is the one OAuth class with no
+//     remote-safe path at all today. If/when a remote Providers selector is
+//     built, fixed-port providers must stay gated to the local runner (or
+//     gain a dedicated remote-loopback-forwarding flow) — do not wire
+//     `connectOauth`/`reconnectOauth` for them against a remote `runnerId`
+//     without solving that first.
 
 type ConnectionsState = {
   catalog: CatalogEntry[];
@@ -78,27 +118,27 @@ export const useConnections = create<ConnectionsState>((set) => ({
   loaded: false,
 
   hydrate: async () => {
-    const [cat, conns] = await Promise.all([commands.listProviderCatalog(), commands.listConnections()]);
+    const [cat, conns] = await Promise.all([commands.listProviderCatalog(), commands.listConnections(LOCAL_RUNNER)]);
     if (cat.status === "ok") set({ catalog: cat.data });
     if (conns.status === "ok") set({ connections: conns.data });
     set({ loaded: true });
   },
   add: async (provider, label, apiKey, baseUrl) =>
-    apply(set, await commands.addConnection(provider, label, apiKey, baseUrl), "Add connection"),
-  rename: async (id, label) => runAccountAction(set, commands.renameConnection(id, label), "Rename account"),
-  setEnabled: async (id, enabled) => runAccountAction(set, commands.setConnectionEnabled(id, enabled), "Update account"),
-  remove: async (id) => runAccountAction(set, commands.removeConnection(id), "Remove account"),
+    apply(set, await commands.addConnection(LOCAL_RUNNER, provider, label, apiKey, baseUrl), "Add connection"),
+  rename: async (id, label) => runAccountAction(set, commands.renameConnection(LOCAL_RUNNER, id, label), "Rename account"),
+  setEnabled: async (id, enabled) => runAccountAction(set, commands.setConnectionEnabled(LOCAL_RUNNER, id, enabled), "Update account"),
+  remove: async (id) => runAccountAction(set, commands.removeConnection(LOCAL_RUNNER, id), "Remove account"),
   move: async (id, dir) => {
-    await apply(set, await commands.moveConnection(id, dir), "Reorder");
+    await apply(set, await commands.moveConnection(LOCAL_RUNNER, id, dir), "Reorder");
   },
   test: async (id) => {
-    const res = await commands.testConnection(id);
+    const res = await commands.testConnection(LOCAL_RUNNER, id);
     if (res.status === "ok") return res.data;
     toast.error(`Test failed: ${res.error.message}`);
     return null;
   },
-  connectOauth: async (provider, label) => apply(set, await commands.connectOauth(provider, label), "Connect"),
-  reconnectOauth: async (connectionId) => runAccountAction(set, commands.reconnectOauth(connectionId), "Reconnect"),
+  connectOauth: async (provider, label) => apply(set, await commands.connectOauth(LOCAL_RUNNER, provider, label), "Connect"),
+  reconnectOauth: async (connectionId) => runAccountAction(set, commands.reconnectOauth(LOCAL_RUNNER, connectionId), "Reconnect"),
   beginOauthManual: async (provider) => {
     const res = await commands.beginOauthManual(provider);
     if (res.status === "ok") return res.data;
@@ -106,21 +146,22 @@ export const useConnections = create<ConnectionsState>((set) => ({
     return null;
   },
   completeOauthManual: async (provider, label, verifier, state, pasted, redirectUri) =>
-    apply(set, await commands.completeOauthManual(provider, label, verifier, state, pasted, redirectUri), "Connect"),
-  addFree: async (provider, label) => apply(set, await commands.addFreeConnection(provider, label), "Add connection"),
+    apply(set, await commands.completeOauthManual(LOCAL_RUNNER, provider, label, verifier, state, pasted, redirectUri), "Connect"),
+  addFree: async (provider, label) => apply(set, await commands.addFreeConnection(LOCAL_RUNNER, provider, label), "Add connection"),
   startKiroDevice: async () => {
-    const res = await commands.startKiroDeviceFlow();
+    const res = await commands.startKiroDeviceFlow(LOCAL_RUNNER);
     if (res.status === "ok") return res.data;
     toast.error(`${KIRO_SIGNIN_ACTION} failed: ${res.error.message}`);
     return null;
   },
-  awaitKiroDevice: async (label, flowId) => apply(set, await commands.awaitKiroDeviceFlow(label, flowId), KIRO_SIGNIN_ACTION),
-  importKiro: async (label) => apply(set, await commands.importKiroToken(label), KIRO_IMPORT_ACTION),
+  awaitKiroDevice: async (label, flowId) => apply(set, await commands.awaitKiroDeviceFlow(LOCAL_RUNNER, label, flowId), KIRO_SIGNIN_ACTION),
+  importKiro: async (label) => apply(set, await commands.importKiroToken(LOCAL_RUNNER, label), KIRO_IMPORT_ACTION),
   startDeviceFlow: async (provider) => {
-    const res = await commands.startDeviceFlow(provider);
+    const res = await commands.startDeviceFlow(LOCAL_RUNNER, provider);
     if (res.status === "ok") return res.data;
     toast.error(`Sign in failed: ${res.error.message}`);
     return null;
   },
-  awaitDeviceFlow: async (provider, label, flowId) => apply(set, await commands.awaitDeviceFlow(provider, label, flowId), "Sign in"),
+  awaitDeviceFlow: async (provider, label, flowId) =>
+    apply(set, await commands.awaitDeviceFlow(LOCAL_RUNNER, provider, label, flowId), "Sign in"),
 }));

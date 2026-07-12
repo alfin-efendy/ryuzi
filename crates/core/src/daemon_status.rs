@@ -14,6 +14,20 @@ pub struct DaemonStatusFile {
     /// Bound control-API port (None while connecting / for pre-API daemons).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// The control API's URL scheme: `"http"` (loopback bind) or `"https"`
+    /// (non-loopback bind — see `daemon_cmd::start_control_api`, P2-7). None
+    /// while connecting / for pre-remote-runner daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    /// The bound IP the control API is listening on. None while connecting /
+    /// for pre-remote-runner daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Base64 SHA-256 pin of the TLS leaf certificate (see
+    /// `tls::fingerprint_cert_der`) — only present for `https` (non-loopback)
+    /// binds; `None` for `http`/loopback daemons, which have no TLS material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -163,15 +177,45 @@ mod tests {
             last_error: None,
             version: Some("0.0.0".into()),
             port: None,
+            scheme: None,
+            host: None,
+            fingerprint: None,
         };
         write_status(dir.path(), &s).unwrap();
         let raw = std::fs::read_to_string(status_path(dir.path())).unwrap();
         assert!(raw.contains("\"startedAt\":1"), "camelCase compact: {raw}");
         assert!(!raw.contains('\n'));
         assert!(!raw.contains("lastError")); // skipped when None
+        assert!(!raw.contains("scheme")); // skipped when None
+        assert!(!raw.contains("host"));
+        assert!(!raw.contains("fingerprint"));
         assert_eq!(read_status(dir.path()), Some(s));
         clear_status(dir.path());
         assert_eq!(read_status(dir.path()), None);
+    }
+
+    /// The non-loopback (`https`) case: `scheme`/`host`/`fingerprint` are all
+    /// `Some` and round-trip through the compact camelCase JSON.
+    #[test]
+    fn round_trip_carries_scheme_host_fingerprint_when_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DaemonStatusFile {
+            pid: 42,
+            state: DaemonFileState::Running,
+            started_at: 1,
+            last_error: None,
+            version: Some("0.0.0".into()),
+            port: Some(4483),
+            scheme: Some("https".into()),
+            host: Some("0.0.0.0".into()),
+            fingerprint: Some("deadbeef==".into()),
+        };
+        write_status(dir.path(), &s).unwrap();
+        let raw = std::fs::read_to_string(status_path(dir.path())).unwrap();
+        assert!(raw.contains("\"scheme\":\"https\""), "raw: {raw}");
+        assert!(raw.contains("\"host\":\"0.0.0.0\""), "raw: {raw}");
+        assert!(raw.contains("\"fingerprint\":\"deadbeef==\""), "raw: {raw}");
+        assert_eq!(read_status(dir.path()), Some(s));
     }
 
     #[test]
@@ -185,6 +229,9 @@ mod tests {
         let s = read_status(dir.path()).unwrap();
         assert_eq!(s.port, None);
         assert_eq!(s.pid, 42);
+        assert_eq!(s.scheme, None);
+        assert_eq!(s.host, None);
+        assert_eq!(s.fingerprint, None);
     }
 
     #[test]
@@ -211,6 +258,9 @@ mod tests {
             last_error: last_error.map(String::from),
             version: None,
             port: None,
+            scheme: None,
+            host: None,
+            fingerprint: None,
         };
         assert_eq!(derive_state(None, &alive), DaemonState::default());
         let e = derive_state(Some(&f(DaemonFileState::Error, -1, Some("boom"))), &alive);

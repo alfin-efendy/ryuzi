@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
 import { PROJECTS_ROOT_KEY } from "@/constants";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { Button, ChoiceCard, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
 
 type Mode = "folder" | "clone";
@@ -26,7 +27,7 @@ export function AddProjectModal({ open, onClose }: { open: boolean; onClose: () 
     setBusy(false);
     // Default clone destination = the persisted "Projects folder" setting;
     // Browse below overrides it for this clone only.
-    void commands.getSetting(PROJECTS_ROOT_KEY).then((res) => {
+    void commands.getSetting(LOCAL_RUNNER, PROJECTS_ROOT_KEY).then((res) => {
       setDest(res.status === "ok" ? (res.data ?? "") : "");
     });
   }, [open]);

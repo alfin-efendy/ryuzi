@@ -23,7 +23,7 @@ type ModelStatusesState = {
 export const useModelStatuses = create<ModelStatusesState>((set) => ({
   byKey: {},
   hydrate: async () => {
-    const res = await commands.listAllModelStatuses();
+    const res = await commands.listAllModelStatuses("local");
     if (res.status !== "ok") return;
     const byKey: Record<string, ModelTestStatus> = {};
     for (const row of res.data) byKey[statusKey(row.family, row.model)] = row.status as ModelTestStatus;

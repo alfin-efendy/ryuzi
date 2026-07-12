@@ -8,6 +8,7 @@ import { useStore } from "@/store";
 import { commands } from "@/bindings";
 import { statusMeta } from "@/lib/status";
 import { sessionTitle } from "@/lib/sidebar";
+import { refOf } from "@/lib/session-key";
 import {
   Button,
   Segmented,
@@ -51,8 +52,9 @@ export function GatewayDetailView({ id }: { id: string }) {
   const statusColor = online ? "#22C55E" : "var(--muted-foreground)";
   const fsDesc = GW_FS_MODES.find((m) => m.id === g.fsMode)?.desc;
 
-  // Real sessions all run on the local gateway until the remote daemon ships.
-  const gwSessions = id === "local" ? sessions.filter((s) => s.status !== "ended") : [];
+  // Sessions are stamped with the runner (gateway) that owns them — this gateway's
+  // route id IS a runner id (LOCAL_RUNNER for the local one, gateway.id for a remote).
+  const gwSessions = sessions.filter((s) => s.runnerId === id && s.status !== "ended");
 
   const addFolder = async () => {
     const dir = await commands.pickDirectory();
@@ -87,7 +89,7 @@ export function GatewayDetailView({ id }: { id: string }) {
             <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "size-[13px] animate-spin" : "size-[13px]"} />
             {probing ? "Probing…" : "Probe now"}
           </Button>
-          {g.kind === "ssh" && (
+          {(g.kind === "ssh" || g.kind === "remote") && (
             <Button
               variant="outline"
               size="icon"
@@ -95,7 +97,7 @@ export function GatewayDetailView({ id }: { id: string }) {
                 void remove(g.id);
                 nav.navigate({ kind: "gateways" });
               }}
-              title="Remove gateway"
+              title={g.kind === "remote" ? "Remove runner" : "Remove gateway"}
               className="shrink-0 text-destructive hover:text-destructive"
             >
               <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
@@ -110,7 +112,7 @@ export function GatewayDetailView({ id }: { id: string }) {
               <div className="min-w-0 flex-1">
                 <div className="text-[13.5px] font-semibold">Offline — last seen {formatLastSeen(g.lastSeenMs)}</div>
                 <div className="mt-[3px] text-[12.5px] leading-[1.55] text-muted-foreground">
-                  {g.kind === "ssh"
+                  {g.kind === "ssh" || g.kind === "remote"
                     ? "The TCP probe couldn't reach the host. Check the address, port, and firewall, then probe again."
                     : "The distro isn't running. Start it and probe again."}
                 </div>
@@ -180,7 +182,7 @@ export function GatewayDetailView({ id }: { id: string }) {
                     key={s.sessionPk}
                     variant="ghost"
                     onClick={() => {
-                      setFocused(s.sessionPk);
+                      setFocused(refOf(s));
                       nav.navigate({ kind: "session" });
                     }}
                     className="h-auto w-full justify-start gap-2.5 rounded-none px-[18px] py-2 text-left"

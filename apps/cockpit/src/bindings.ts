@@ -5,141 +5,158 @@
 
 
 export const commands = {
-async listProjects() : Promise<Result<Project[], CmdError>> {
+async listProjects(runnerId: string | null) : Promise<Result<Project[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_projects") };
+    return { status: "ok", data: await TAURI_INVOKE("list_projects", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listSessions(projectId: string | null) : Promise<Result<Session[], CmdError>> {
+async listSessions(runnerId: string | null, projectId: string | null) : Promise<Result<Session[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_sessions", { projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_sessions", { runnerId, projectId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listMessages(sessionPk: string) : Promise<Result<Message[], CmdError>> {
+async listMessages(runnerId: string | null, sessionPk: string) : Promise<Result<Message[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_messages", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_messages", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async connectProject(workdir: string, name: string) : Promise<Result<Project, CmdError>> {
+async connectProject(runnerId: string | null, workdir: string, name: string) : Promise<Result<Project, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("connect_project", { workdir, name }) };
+    return { status: "ok", data: await TAURI_INVOKE("connect_project", { runnerId, workdir, name }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async cloneProject(url: string, destParent: string) : Promise<Result<Project, CmdError>> {
+async cloneProject(runnerId: string | null, url: string, destParent: string) : Promise<Result<Project, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("clone_project", { url, destParent }) };
+    return { status: "ok", data: await TAURI_INVOKE("clone_project", { runnerId, url, destParent }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async startSession(projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+async startSession(runnerId: string | null, projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_session", { projectId, prompt, options }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_session", { runnerId, projectId, prompt, options }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async startChatSession(prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+async startChatSession(runnerId: string | null, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { prompt, options }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { runnerId, prompt, options }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async continueSession(sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
+async continueSession(runnerId: string | null, sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("continue_session", { sessionPk, prompt, options }) };
+    return { status: "ok", data: await TAURI_INVOKE("continue_session", { runnerId, sessionPk, prompt, options }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async steerSession(sessionPk: string, text: string) : Promise<Result<boolean, CmdError>> {
+async steerSession(runnerId: string | null, sessionPk: string, text: string) : Promise<Result<boolean, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("steer_session", { sessionPk, text }) };
+    return { status: "ok", data: await TAURI_INVOKE("steer_session", { runnerId, sessionPk, text }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async stopSession(sessionPk: string) : Promise<Result<null, CmdError>> {
+async stopSession(runnerId: string | null, sessionPk: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("stop_session", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("stop_session", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async endSession(sessionPk: string) : Promise<Result<null, CmdError>> {
+async endSession(runnerId: string | null, sessionPk: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("end_session", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("end_session", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listToolPolicies() : Promise<Result<ToolPolicyRow[], CmdError>> {
+async listToolPolicies(runnerId: string | null) : Promise<Result<ToolPolicyRow[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_tool_policies") };
+    return { status: "ok", data: await TAURI_INVOKE("list_tool_policies", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async deleteToolPolicy(projectId: string, tool: string) : Promise<Result<null, CmdError>> {
+async deleteToolPolicy(runnerId: string | null, projectId: string, tool: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_tool_policy", { projectId, tool }) };
+    return { status: "ok", data: await TAURI_INVOKE("delete_tool_policy", { runnerId, projectId, tool }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async resolveApproval(requestId: string, response: ApprovalResponse) : Promise<boolean> {
-    return await TAURI_INVOKE("resolve_approval", { requestId, response });
-},
-async readFile(path: string) : Promise<Result<string, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("read_file", { path }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
+async resolveApproval(runnerId: string | null, requestId: string, response: ApprovalResponse) : Promise<boolean> {
+    return await TAURI_INVOKE("resolve_approval", { runnerId, requestId, response });
 },
 /**
  * Write pasted bytes into the attachments staging area and return the
  * absolute path — from there the file flows through the normal attachment
  * pipeline on send. Staging is wiped on app start (see lib.rs setup).
  */
-async stageAttachment(name: string, dataBase64: string) : Promise<Result<string, CmdError>> {
+async stageAttachment(runnerId: string | null, name: string, dataBase64: string) : Promise<Result<string, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("stage_attachment", { name, dataBase64 }) };
+    return { status: "ok", data: await TAURI_INVOKE("stage_attachment", { runnerId, name, dataBase64 }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Read a media file as base64 for composer thumbnails (arbitrary user paths
- * sit outside the asset-protocol scope, so previews go through this instead).
+ * Read a media file as base64 for composer thumbnails: paths here are
+ * CLIENT-LOCAL (files the user picked/dropped to attach, staged via
+ * `stage_attachment`), never the session workdir — those arbitrary user
+ * paths sit outside the asset-protocol scope, so previews go through this
+ * instead. This reads THIS machine's disk unconditionally, which is correct
+ * even for a remote session: the attachment lives on the user's machine
+ * until it's uploaded. Session-workdir file reads (the file viewer) go
+ * through the jailed, size-capped `fsview::read_file`/`read_file_base64`
+ * RPCs instead — see `fsview_cmd.rs`.
  */
-async readFileBase64(path: string) : Promise<Result<MediaFile, CmdError>> {
+async readLocalMedia(path: string) : Promise<Result<MediaFile, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("read_file_base64", { path }) };
+    return { status: "ok", data: await TAURI_INVOKE("read_local_media", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Base64-encoded read of one saved attachment, proxied through the engine's
+ * authed `GET /attachments/{rel}` route (`EngineClient::get_attachment_bytes`)
+ * — remote-safe: the bytes are read on the RUNNER's disk (local or a
+ * pinned-TLS remote), unlike `read_local_media` above (which is correctly
+ * always-local, since composer previews are of files still on the user's
+ * own machine). `rel` is the `RowAttachment.rel` the transcript row carries
+ * (or the caller's `sessionPk + basename(path)` fallback for pre-P4-3 rows
+ * with no `rel` recorded).
+ */
+async fetchAttachment(runnerId: string | null, rel: string) : Promise<Result<MediaFile, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_attachment", { runnerId, rel }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -154,121 +171,121 @@ async pickFiles() : Promise<string[]> {
 async backdropCapability() : Promise<BackdropCapability> {
     return await TAURI_INVOKE("backdrop_capability");
 },
-async getSetting(key: string) : Promise<Result<string | null, CmdError>> {
+async getSetting(runnerId: string | null, key: string) : Promise<Result<string | null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_setting", { key }) };
+    return { status: "ok", data: await TAURI_INVOKE("get_setting", { runnerId, key }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
+async setSetting(runnerId: string | null, key: string, value: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_setting", { key, value }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_setting", { runnerId, key, value }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateProject(projectId: string, model: string | null, permMode: PermMode) : Promise<Result<Project, CmdError>> {
+async updateProject(runnerId: string | null, projectId: string, model: string | null, permMode: PermMode) : Promise<Result<Project, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project", { projectId, model, permMode }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_project", { runnerId, projectId, model, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateProjectPermMode(projectId: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+async updateProjectPermMode(runnerId: string | null, projectId: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project_perm_mode", { projectId, permMode }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_project_perm_mode", { runnerId, projectId, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async projectRuntimeInfo(projectId: string) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+async projectRuntimeInfo(runnerId: string | null, projectId: string) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("project_runtime_info", { projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("project_runtime_info", { runnerId, projectId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateProjectRuntime(projectId: string, model: string | null, effort: string | null) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
+async updateProjectRuntime(runnerId: string | null, projectId: string, model: string | null, effort: string | null) : Promise<Result<ProjectRuntimeInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_project_runtime", { projectId, model, effort }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_project_runtime", { runnerId, projectId, model, effort }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setModelEffortPreference(key: ModelPreferenceKey, effort: string | null) : Promise<Result<null, CmdError>> {
+async setModelEffortPreference(runnerId: string | null, key: ModelPreferenceKey, effort: string | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_model_effort_preference", { key, effort }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_model_effort_preference", { runnerId, key, effort }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async sessionRuntimeInfo(sessionPk: string) : Promise<Result<SessionRuntimeInfo, CmdError>> {
+async sessionRuntimeInfo(runnerId: string | null, sessionPk: string) : Promise<Result<SessionRuntimeInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_runtime_info", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_runtime_info", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateSessionRuntime(sessionPk: string, model: string | null, effort: string | null) : Promise<Result<SessionRuntimeInfo, CmdError>> {
+async updateSessionRuntime(runnerId: string | null, sessionPk: string, model: string | null, effort: string | null) : Promise<Result<SessionRuntimeInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_session_runtime", { sessionPk, model, effort }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_session_runtime", { runnerId, sessionPk, model, effort }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateSessionPermMode(sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
+async updateSessionPermMode(runnerId: string | null, sessionPk: string, permMode: PermMode) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { sessionPk, permMode }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_session_perm_mode", { runnerId, sessionPk, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listBranches(projectId: string) : Promise<Result<BranchList, CmdError>> {
+async listBranches(runnerId: string | null, projectId: string) : Promise<Result<BranchList, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_branches", { projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_branches", { runnerId, projectId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async getAgentSettings() : Promise<Result<AgentSettingsInfo, CmdError>> {
+async getAgentSettings(runnerId: string | null) : Promise<Result<AgentSettingsInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings") };
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setAgentSettings(model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
+async setAgentSettings(runnerId: string | null, model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { model, permMode }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { runnerId, model, permMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listSelectableModels() : Promise<Result<SelectableModelInfo[], CmdError>> {
+async listSelectableModels(runnerId: string | null) : Promise<Result<SelectableModelInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_selectable_models") };
+    return { status: "ok", data: await TAURI_INVOKE("list_selectable_models", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listGateways() : Promise<Result<GatewayInfo[], CmdError>> {
+async listGateways(runnerId: string | null) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_gateways") };
+    return { status: "ok", data: await TAURI_INVOKE("list_gateways", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -277,89 +294,130 @@ async listGateways() : Promise<Result<GatewayInfo[], CmdError>> {
 /**
  * Live probe: local telemetry, WSL detection, and SSH TCP reachability.
  */
-async probeGateways() : Promise<Result<GatewayInfo[], CmdError>> {
+async probeGateways(runnerId: string | null) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("probe_gateways") };
+    return { status: "ok", data: await TAURI_INVOKE("probe_gateways", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async addGateway(name: string, host: string, port: number, username: string) : Promise<Result<GatewayInfo[], CmdError>> {
+async addGateway(runnerId: string | null, name: string, host: string, port: number, username: string) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_gateway", { name, host, port, username }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_gateway", { runnerId, name, host, port, username }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async removeGateway(id: string) : Promise<Result<GatewayInfo[], CmdError>> {
+/**
+ * P3-6 "Add Runner" flow. The user copies Name/Host/Port/Fingerprint/code
+ * off `ryuzi pair`'s printout on the REMOTE host and enters them here.
+ * Three steps, all in Cockpit's Tauri backend (never core — core stays
+ * free of outbound HTTP to arbitrary hosts):
+ * 
+ * 1. Pair over a pinned-TLS client trusting `fingerprint` (TOFU):
+ * `POST https://{host}:{port}/pair {code, device_name}` ->
+ * `{device_token}` ([`crate::engine::pair_over_pinned_tls`]).
+ * 2. Persist the paired row via the LOCAL engine's `save_runner` RPC
+ * (encrypts `device_token` at rest — see `gateways_api::save_runner`).
+ * 3. Live-add the runner to the [`EngineManager`] (pinned client + SSE
+ * bridge) so it's usable immediately, no Cockpit restart required.
+ * 
+ * SECURITY: `device_token` never leaves this function — it's consumed by
+ * step 1's caller and handed straight to steps 2 and 3, never placed on
+ * the `Vec<GatewayInfo>` this command returns (that DTO has no token
+ * field) and never logged. See `engine_manager.rs`'s module docs for the
+ * broader invariant this preserves.
+ */
+async addRunner(name: string, host: string, port: number, fingerprint: string, code: string) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_gateway", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_runner", { name, host, port, fingerprint, code }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateGateway(id: string, fsMode: string, paths: string[]) : Promise<Result<GatewayInfo[], CmdError>> {
+/**
+ * Deletes the persisted `gateways` row (works for `local`'s WSL entries,
+ * `ssh` remotes, and paired `remote` runners alike — all three kinds live
+ * in the LOCAL engine's store, hence this always dispatches to `"local"` by
+ * default). For a paired runner, deleting the row is only half the job: the
+ * [`EngineManager`] also holds a live pinned `EngineClient` and a
+ * reconnecting SSE bridge task keyed by that same id (see `add_runner`,
+ * `load_remotes`). Without the `remove_runner` call below, that bridge
+ * would keep retrying the now-gone runner and its events would land in an
+ * orphaned store bucket until Cockpit restarts. `remove_runner` is a no-op
+ * for `"local"` and for any id that was never a live runner (ssh/wsl ids),
+ * so it's safe to call unconditionally after every successful delete.
+ */
+async removeGateway(runnerId: string | null, id: string) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_gateway", { id, fsMode, paths }) };
+    return { status: "ok", data: await TAURI_INVOKE("remove_gateway", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async gatewayEvents(id: string) : Promise<Result<GatewayEventInfo[], CmdError>> {
+async updateGateway(runnerId: string | null, id: string, fsMode: string, paths: string[]) : Promise<Result<GatewayInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("gateway_events", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_gateway", { runnerId, id, fsMode, paths }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listJobs() : Promise<Result<JobInfo[], CmdError>> {
+async gatewayEvents(runnerId: string | null, id: string) : Promise<Result<GatewayEventInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_jobs") };
+    return { status: "ok", data: await TAURI_INVOKE("gateway_events", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async createJob(input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
+async listJobs(runnerId: string | null) : Promise<Result<JobInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("create_job", { input }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_jobs", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateJob(id: string, input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
+async createJob(runnerId: string | null, input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_job", { id, input }) };
+    return { status: "ok", data: await TAURI_INVOKE("create_job", { runnerId, input }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async toggleJob(id: string, enabled: boolean) : Promise<Result<JobInfo[], CmdError>> {
+async updateJob(runnerId: string | null, id: string, input: JobInput) : Promise<Result<JobInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("toggle_job", { id, enabled }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_job", { runnerId, id, input }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async deleteJob(id: string) : Promise<Result<JobInfo[], CmdError>> {
+async toggleJob(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<JobInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_job", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("toggle_job", { runnerId, id, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async runJobNow(id: string) : Promise<Result<JobInfo[], CmdError>> {
+async deleteJob(runnerId: string | null, id: string) : Promise<Result<JobInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("run_job_now", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("delete_job", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async runJobNow(runnerId: string | null, id: string) : Promise<Result<JobInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("run_job_now", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -371,65 +429,65 @@ async runJobNow(id: string) : Promise<Result<JobInfo[], CmdError>> {
 async parseNaturalSchedule(text: string) : Promise<string | null> {
     return await TAURI_INVOKE("parse_natural_schedule", { text });
 },
-async listApps() : Promise<Result<AppInfo[], CmdError>> {
+async listApps(runnerId: string | null) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_apps") };
+    return { status: "ok", data: await TAURI_INVOKE("list_apps", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async addApp(input: AddAppInput) : Promise<Result<AppInfo[], CmdError>> {
+async addApp(runnerId: string | null, input: AddAppInput) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_app", { input }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_app", { runnerId, input }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async removeApp(id: string) : Promise<Result<AppInfo[], CmdError>> {
+async removeApp(runnerId: string | null, id: string) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_app", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("remove_app", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async probeApp(id: string) : Promise<Result<AppInfo[], CmdError>> {
+async probeApp(runnerId: string | null, id: string) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("probe_app", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("probe_app", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async updateAppScope(id: string, scope: string, scopeGateways: string[]) : Promise<Result<AppInfo[], CmdError>> {
+async updateAppScope(runnerId: string | null, id: string, scope: string, scopeGateways: string[]) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_app_scope", { id, scope, scopeGateways }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_app_scope", { runnerId, id, scope, scopeGateways }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setAppToolPerm(id: string, tool: string, perm: string) : Promise<Result<AppInfo[], CmdError>> {
+async setAppToolPerm(runnerId: string | null, id: string, tool: string, perm: string) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_app_tool_perm", { id, tool, perm }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_app_tool_perm", { runnerId, id, tool, perm }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async toggleAppAgent(id: string, agentId: string, allowed: boolean) : Promise<Result<AppInfo[], CmdError>> {
+async toggleAppAgent(runnerId: string | null, id: string, agentId: string, allowed: boolean) : Promise<Result<AppInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("toggle_app_agent", { id, agentId, allowed }) };
+    return { status: "ok", data: await TAURI_INVOKE("toggle_app_agent", { runnerId, id, agentId, allowed }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
+async listDir(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_dir", { sessionPk, rel }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_dir", { runnerId, sessionPk, rel }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -438,9 +496,9 @@ async listDir(sessionPk: string, rel: string) : Promise<Result<DirEntryInfo[], C
 /**
  * Absolute root path of the session's working tree (for opening files).
  */
-async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
+async sessionWorkdir(runnerId: string | null, sessionPk: string) : Promise<Result<string, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_workdir", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_workdir", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -452,9 +510,9 @@ async sessionWorkdir(sessionPk: string) : Promise<Result<string, CmdError>> {
  * escapes are simply "not found" (false), never an error — chat file-links
  * must fail silent.
  */
-async fileExists(sessionPk: string, rel: string) : Promise<Result<boolean, CmdError>> {
+async fileExists(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<boolean, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("file_exists", { sessionPk, rel }) };
+    return { status: "ok", data: await TAURI_INVOKE("file_exists", { runnerId, sessionPk, rel }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -467,25 +525,25 @@ async fileExists(sessionPk: string, rel: string) : Promise<Result<boolean, CmdEr
  * deliberately NOT the project-workdir fallback: the main checkout's state
  * is the user's business, not the session's.
  */
-async worktreeDirty(sessionPk: string) : Promise<Result<WorktreeState, CmdError>> {
+async worktreeDirty(runnerId: string | null, sessionPk: string) : Promise<Result<WorktreeState, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("worktree_dirty", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("worktree_dirty", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async gitDiff(sessionPk: string) : Promise<Result<string, CmdError>> {
+async gitDiff(runnerId: string | null, sessionPk: string) : Promise<Result<string, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("git_diff", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("git_diff", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async searchFiles(projectId: string, query: string) : Promise<Result<string[], CmdError>> {
+async searchFiles(runnerId: string | null, projectId: string, query: string) : Promise<Result<string[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("search_files", { projectId, query }) };
+    return { status: "ok", data: await TAURI_INVOKE("search_files", { runnerId, projectId, query }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -494,9 +552,34 @@ async searchFiles(projectId: string, query: string) : Promise<Result<string[], C
 /**
  * Revert one file in the session workdir to HEAD (Undo on a file-edit card).
  */
-async revertFile(sessionPk: string, path: string) : Promise<Result<null, CmdError>> {
+async revertFile(runnerId: string | null, sessionPk: string, path: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("revert_file", { sessionPk, path }) };
+    return { status: "ok", data: await TAURI_INVOKE("revert_file", { runnerId, sessionPk, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Session-workdir text read for the file viewer — jailed and size-capped on
+ * the engine side (see `fsview_api::read_file`). Remote-safe: reads happen
+ * on the runner, never on this machine's disk.
+ */
+async readFile(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<string, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_file", { runnerId, sessionPk, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Session-workdir binary read for the file viewer's image/svg preview —
+ * jailed and size-capped on the engine side (see `fsview_api::read_file_base64`).
+ */
+async readFileBase64(runnerId: string | null, sessionPk: string, rel: string) : Promise<Result<MediaFile, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_file_base64", { runnerId, sessionPk, rel }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -505,9 +588,9 @@ async revertFile(sessionPk: string, path: string) : Promise<Result<null, CmdErro
 async listOpenTargets() : Promise<OpenTarget[]> {
     return await TAURI_INVOKE("list_open_targets");
 },
-async openIn(sessionPk: string, targetId: string) : Promise<Result<null, CmdError>> {
+async openIn(runnerId: string | null, sessionPk: string, targetId: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("open_in", { sessionPk, targetId }) };
+    return { status: "ok", data: await TAURI_INVOKE("open_in", { runnerId, sessionPk, targetId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -516,9 +599,9 @@ async openIn(sessionPk: string, targetId: string) : Promise<Result<null, CmdErro
 /**
  * Open a shell in the session's worktree (or the project workdir).
  */
-async termOpen(sessionPk: string, cols: number, rows: number) : Promise<Result<string, CmdError>> {
+async termOpen(runnerId: string | null, sessionPk: string, cols: number, rows: number) : Promise<Result<string, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("term_open", { sessionPk, cols, rows }) };
+    return { status: "ok", data: await TAURI_INVOKE("term_open", { runnerId, sessionPk, cols, rows }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -564,25 +647,25 @@ async termCloseSession(sessionPk: string) : Promise<Result<null, CmdError>> {
 async systemAccentColor() : Promise<string | null> {
     return await TAURI_INVOKE("system_accent_color");
 },
-async endpointStatus() : Promise<Result<EndpointStatusInfo, CmdError>> {
+async endpointStatus(runnerId: string | null) : Promise<Result<EndpointStatusInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("endpoint_status") };
+    return { status: "ok", data: await TAURI_INVOKE("endpoint_status", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async startEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
+async startEndpoint(runnerId: string | null) : Promise<Result<EndpointStatusInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_endpoint") };
+    return { status: "ok", data: await TAURI_INVOKE("start_endpoint", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async stopEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
+async stopEndpoint(runnerId: string | null) : Promise<Result<EndpointStatusInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("stop_endpoint") };
+    return { status: "ok", data: await TAURI_INVOKE("stop_endpoint", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -591,49 +674,49 @@ async stopEndpoint() : Promise<Result<EndpointStatusInfo, CmdError>> {
 /**
  * Persist port + autostart; restart the server when it was running.
  */
-async setEndpointConfig(port: number, autostart: boolean) : Promise<Result<EndpointStatusInfo, CmdError>> {
+async setEndpointConfig(runnerId: string | null, port: number, autostart: boolean) : Promise<Result<EndpointStatusInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_endpoint_config", { port, autostart }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_endpoint_config", { runnerId, port, autostart }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listEndpointKeys() : Promise<Result<EndpointKeyInfo[], CmdError>> {
+async listEndpointKeys(runnerId: string | null) : Promise<Result<EndpointKeyInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_endpoint_keys") };
+    return { status: "ok", data: await TAURI_INVOKE("list_endpoint_keys", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async createEndpointKey(name: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
+async createEndpointKey(runnerId: string | null, name: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("create_endpoint_key", { name }) };
+    return { status: "ok", data: await TAURI_INVOKE("create_endpoint_key", { runnerId, name }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async revokeEndpointKey(id: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
+async revokeEndpointKey(runnerId: string | null, id: string) : Promise<Result<EndpointKeyInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("revoke_endpoint_key", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("revoke_endpoint_key", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async connectionUsage(connectionId: string, days: number) : Promise<Result<UsageSeries, CmdError>> {
+async connectionUsage(runnerId: string | null, connectionId: string, days: number) : Promise<Result<UsageSeries, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("connection_usage", { connectionId, days }) };
+    return { status: "ok", data: await TAURI_INVOKE("connection_usage", { runnerId, connectionId, days }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async endpointUsage(days: number) : Promise<Result<UsageSeries, CmdError>> {
+async endpointUsage(runnerId: string | null, days: number) : Promise<Result<UsageSeries, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("endpoint_usage", { days }) };
+    return { status: "ok", data: await TAURI_INVOKE("endpoint_usage", { runnerId, days }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -647,49 +730,49 @@ async listProviderCatalog() : Promise<Result<CatalogEntry[], CmdError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async listConnections() : Promise<Result<ConnectionInfo[], CmdError>> {
+async listConnections(runnerId: string | null) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_connections") };
+    return { status: "ok", data: await TAURI_INVOKE("list_connections", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async addConnection(provider: string, label: string, apiKey: string, baseUrl: string | null) : Promise<Result<ConnectionInfo[], CmdError>> {
+async addConnection(runnerId: string | null, provider: string, label: string, apiKey: string, baseUrl: string | null) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_connection", { provider, label, apiKey, baseUrl }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_connection", { runnerId, provider, label, apiKey, baseUrl }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async renameConnection(id: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async renameConnection(runnerId: string | null, id: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("rename_connection", { id, label }) };
+    return { status: "ok", data: await TAURI_INVOKE("rename_connection", { runnerId, id, label }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setConnectionEnabled(id: string, enabled: boolean) : Promise<Result<ConnectionInfo[], CmdError>> {
+async setConnectionEnabled(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_connection_enabled", { id, enabled }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_connection_enabled", { runnerId, id, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async removeConnection(id: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async removeConnection(runnerId: string | null, id: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_connection", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("remove_connection", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async moveConnection(id: string, dir: number) : Promise<Result<ConnectionInfo[], CmdError>> {
+async moveConnection(runnerId: string | null, id: string, dir: number) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("move_connection", { id, dir }) };
+    return { status: "ok", data: await TAURI_INVOKE("move_connection", { runnerId, id, dir }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -699,17 +782,17 @@ async moveConnection(id: string, dir: number) : Promise<Result<ConnectionInfo[],
  * Hit the upstream's model-list endpoint to distinguish bad credentials
  * (401/403) from network trouble, and persist the discovered model ids.
  */
-async testConnection(id: string) : Promise<Result<TestResult, CmdError>> {
+async testConnection(runnerId: string | null, id: string) : Promise<Result<TestResult, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("test_connection", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("test_connection", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async testConnectionModel(id: string, model: string) : Promise<Result<TestResult, CmdError>> {
+async testConnectionModel(runnerId: string | null, id: string, model: string) : Promise<Result<TestResult, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("test_connection_model", { id, model }) };
+    return { status: "ok", data: await TAURI_INVOKE("test_connection_model", { runnerId, id, model }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -720,9 +803,9 @@ async testConnectionModel(id: string, model: string) : Promise<Result<TestResult
  * family, persisting discoveries. Unlike the add/update-time best-effort
  * refresh, failures are returned to the UI instead of being swallowed.
  */
-async refreshProviderModels(family: string) : Promise<Result<RefreshModelsResult[], CmdError>> {
+async refreshProviderModels(runnerId: string | null, family: string) : Promise<Result<RefreshModelsResult[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_provider_models", { family }) };
+    return { status: "ok", data: await TAURI_INVOKE("refresh_provider_models", { runnerId, family }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -732,9 +815,9 @@ async refreshProviderModels(family: string) : Promise<Result<RefreshModelsResult
  * Persisted per-model probe verdicts for a vendor family — hydrates the
  * provider Models card so earlier Test All results show immediately.
  */
-async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdError>> {
+async listModelStatuses(runnerId: string | null, family: string) : Promise<Result<ModelStatusInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_model_statuses", { family }) };
+    return { status: "ok", data: await TAURI_INVOKE("list_model_statuses", { runnerId, family }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -745,79 +828,82 @@ async listModelStatuses(family: string) : Promise<Result<ModelStatusInfo[], CmdE
  * `list_model_statuses` above stays for the provider Models card; this
  * variant feeds the app-wide picker filter.
  */
-async listAllModelStatuses() : Promise<Result<ModelStatusEntry[], CmdError>> {
+async listAllModelStatuses(runnerId: string | null) : Promise<Result<ModelStatusEntry[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_all_model_statuses") };
+    return { status: "ok", data: await TAURI_INVOKE("list_all_model_statuses", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async connectionProviderQuota(id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
+async connectionProviderQuota(runnerId: string | null, id: string) : Promise<Result<ProviderQuotaInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("connection_provider_quota", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async resetCodexCredit(id: string) : Promise<Result<CodexResetCreditResult, CmdError>> {
+async resetCodexCredit(runnerId: string | null, id: string) : Promise<Result<CodexResetCreditResult, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("reset_codex_credit", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("reset_codex_credit", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listModelRoutes() : Promise<Result<ModelRouteInfo[], CmdError>> {
+async listModelRoutes(runnerId: string | null) : Promise<Result<ModelRouteInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_model_routes") };
+    return { status: "ok", data: await TAURI_INVOKE("list_model_routes", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async saveModelRoute(route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
+async saveModelRoute(runnerId: string | null, route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("save_model_route", { route }) };
+    return { status: "ok", data: await TAURI_INVOKE("save_model_route", { runnerId, route }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async deleteModelRoute(id: string) : Promise<Result<ModelRouteInfo[], CmdError>> {
+async deleteModelRoute(runnerId: string | null, id: string) : Promise<Result<ModelRouteInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_model_route", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("delete_model_route", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async providerAccountRoute(provider: string) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
+async providerAccountRoute(runnerId: string | null, provider: string) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("provider_account_route", { provider }) };
+    return { status: "ok", data: await TAURI_INVOKE("provider_account_route", { runnerId, provider }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async setProviderAccountRoute(provider: string, strategy: ModelRouteStrategy) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
+async setProviderAccountRoute(runnerId: string | null, provider: string, strategy: ModelRouteStrategy) : Promise<Result<ProviderAccountRouteInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_provider_account_route", { provider, strategy }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_provider_account_route", { runnerId, provider, strategy }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Drive the full interactive OAuth flow: binds a loopback listener, opens
- * the provider's authorize URL in the system browser via
- * `tauri-plugin-opener`, and awaits the callback (up to 5 minutes) before
- * persisting the resulting connection.
+ * Drive the full interactive OAuth flow: a thin proxy to the daemon's
+ * `connect_oauth` RPC, which binds a loopback listener and awaits the
+ * callback (up to 5 minutes) before persisting the resulting connection.
+ * The provider's authorize URL is opened in the system browser
+ * client-side — by the per-runner SSE bridge
+ * (`engine_manager::spawn_bridge`'s `oauthAuthorizeUrl` arm) on receipt of
+ * `CoreEvent::OauthAuthorizeUrl` — not by this function directly.
  */
-async connectOauth(provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async connectOauth(runnerId: string | null, provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("connect_oauth", { provider, label }) };
+    return { status: "ok", data: await TAURI_INVOKE("connect_oauth", { runnerId, provider, label }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -830,9 +916,9 @@ async connectOauth(provider: string, label: string) : Promise<Result<ConnectionI
  * stale, dead connection would keep shadowing the fresh one in
  * `route_model`'s `priority ASC` ordering.
  */
-async reconnectOauth(connectionId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async reconnectOauth(runnerId: string | null, connectionId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("reconnect_oauth", { connectionId }) };
+    return { status: "ok", data: await TAURI_INVOKE("reconnect_oauth", { runnerId, connectionId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -852,9 +938,9 @@ async beginOauthManual(provider: string) : Promise<Result<ManualStartInfo, CmdEr
     else return { status: "error", error: e  as any };
 }
 },
-async completeOauthManual(provider: string, label: string, verifier: string, state: string, pasted: string, redirectUri: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async completeOauthManual(runnerId: string | null, provider: string, label: string, verifier: string, state: string, pasted: string, redirectUri: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("complete_oauth_manual", { provider, label, verifier, state, pasted, redirectUri }) };
+    return { status: "ok", data: await TAURI_INVOKE("complete_oauth_manual", { runnerId, provider, label, verifier, state, pasted, redirectUri }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -864,9 +950,9 @@ async completeOauthManual(provider: string, label: string, verifier: string, sta
  * Add a `no_auth` connection for a Free-category provider — refuses any
  * other category (those need the api-key or OAuth flows above).
  */
-async addFreeConnection(provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async addFreeConnection(runnerId: string | null, provider: string, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_free_connection", { provider, label }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_free_connection", { runnerId, provider, label }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -875,9 +961,9 @@ async addFreeConnection(provider: string, label: string) : Promise<Result<Connec
 /**
  * The agents available for a project (built-ins plus discovered custom agents).
  */
-async nativeAgents(projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
+async nativeAgents(runnerId: string | null, projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("native_agents", { projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("native_agents", { runnerId, projectId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -886,9 +972,9 @@ async nativeAgents(projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
 /**
  * The slash commands available for a project.
  */
-async nativeCommands(projectId: string) : Promise<Result<CommandInfo[], CmdError>> {
+async nativeCommands(runnerId: string | null, projectId: string) : Promise<Result<CommandInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("native_commands", { projectId }) };
+    return { status: "ok", data: await TAURI_INVOKE("native_commands", { runnerId, projectId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -897,57 +983,57 @@ async nativeCommands(projectId: string) : Promise<Result<CommandInfo[], CmdError
 /**
  * A session's current native todo list.
  */
-async sessionTodos(sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
+async sessionTodos(runnerId: string | null, sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_todos", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_todos", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listSkills() : Promise<Result<InstalledSkillInfo[], string>> {
+async listSkills(runnerId: string | null) : Promise<Result<InstalledSkillInfo[], string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_skills") };
+    return { status: "ok", data: await TAURI_INVOKE("list_skills", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async installSkill(source: string) : Promise<Result<InstalledSkillPack, string>> {
+async installSkill(runnerId: string | null, source: string) : Promise<Result<InstalledSkillPack, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("install_skill", { source }) };
+    return { status: "ok", data: await TAURI_INVOKE("install_skill", { runnerId, source }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async removeSkill(id: string) : Promise<Result<null, string>> {
+async removeSkill(runnerId: string | null, id: string) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_skill", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("remove_skill", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async refreshSkill(id: string) : Promise<Result<InstalledSkillPack, string>> {
+async refreshSkill(runnerId: string | null, id: string) : Promise<Result<InstalledSkillPack, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_skill", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("refresh_skill", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async listPlugins() : Promise<Result<PluginInfo[], CmdError>> {
+async listPlugins(runnerId: string | null) : Promise<Result<PluginInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("list_plugins") };
+    return { status: "ok", data: await TAURI_INVOKE("list_plugins", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async pluginDetail(id: string) : Promise<Result<PluginDetail, CmdError>> {
+async pluginDetail(runnerId: string | null, id: string) : Promise<Result<PluginDetail, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("plugin_detail", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("plugin_detail", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -957,9 +1043,9 @@ async pluginDetail(id: string) : Promise<Result<PluginDetail, CmdError>> {
  * Same semantics as `ryuzi plugins enable/disable` — delegates to the
  * shared core helper so the two surfaces never drift.
  */
-async setPluginEnabled(id: string, enabled: boolean) : Promise<Result<null, CmdError>> {
+async setPluginEnabled(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_plugin_enabled", { id, enabled }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_enabled", { runnerId, id, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -970,9 +1056,9 @@ async setPluginEnabled(id: string, enabled: boolean) : Promise<Result<null, CmdE
  * type-mismatched values the same way `ryuzi config set` does. Never
  * returns a value, so no secret can leak back through this command.
  */
-async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdError>> {
+async setPluginSetting(runnerId: string | null, key: string, value: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_plugin_setting", { key, value }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_setting", { runnerId, key, value }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -982,41 +1068,41 @@ async setPluginSetting(key: string, value: string) : Promise<Result<null, CmdErr
  * Kind-symmetric uninstall on the daemon; returns the refreshed list so the
  * entry's `installed` flips false and it reappears in Browse.
  */
-async uninstallPlugin(id: string) : Promise<Result<PluginInfo[], CmdError>> {
+async uninstallPlugin(runnerId: string | null, id: string) : Promise<Result<PluginInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("uninstall_plugin", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("uninstall_plugin", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async beginPluginOauth(pluginId: string) : Promise<Result<PluginOauthBeginResult, CmdError>> {
+async beginPluginOauth(runnerId: string | null, pluginId: string) : Promise<Result<PluginOauthBeginResult, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_oauth", { pluginId }) };
+    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_oauth", { runnerId, pluginId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async completePluginOauth(pluginId: string, code: string, stateToken: string) : Promise<Result<PluginAuthInfo, CmdError>> {
+async completePluginOauth(runnerId: string | null, pluginId: string, code: string, stateToken: string) : Promise<Result<PluginAuthInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("complete_plugin_oauth", { pluginId, code, stateToken }) };
+    return { status: "ok", data: await TAURI_INVOKE("complete_plugin_oauth", { runnerId, pluginId, code, stateToken }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async disconnectPluginOauth(pluginId: string) : Promise<Result<PluginAuthInfo, CmdError>> {
+async disconnectPluginOauth(runnerId: string | null, pluginId: string) : Promise<Result<PluginAuthInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("disconnect_plugin_oauth", { pluginId }) };
+    return { status: "ok", data: await TAURI_INVOKE("disconnect_plugin_oauth", { runnerId, pluginId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
+async pluginModels(runnerId: string | null, id: string) : Promise<Result<string[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("plugin_models", { id }) };
+    return { status: "ok", data: await TAURI_INVOKE("plugin_models", { runnerId, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1034,9 +1120,9 @@ async pluginModels(id: string) : Promise<Result<string[], CmdError>> {
  * daemon via `complete_plugin_oauth` for exchange + token storage. Degrades
  * to `callback_mode: "manual"` (paste) only when the port stays taken.
  */
-async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginResult, CmdError>> {
+async beginPluginInstall(runnerId: string | null, pluginId: string) : Promise<Result<PluginInstallBeginResult, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_install", { pluginId }) };
+    return { status: "ok", data: await TAURI_INVOKE("begin_plugin_install", { runnerId, pluginId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1047,9 +1133,9 @@ async beginPluginInstall(pluginId: string) : Promise<Result<PluginInstallBeginRe
  * it under the declared `auth.setting`; everyone else in
  * `plugin_oauth_clients`). Pure daemon write.
  */
-async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Result<null, CmdError>> {
+async setPluginOauthClientId(runnerId: string | null, pluginId: string, clientId: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_plugin_oauth_client_id", { pluginId, clientId }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_oauth_client_id", { runnerId, pluginId, clientId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1059,9 +1145,9 @@ async setPluginOauthClientId(pluginId: string, clientId: string) : Promise<Resul
  * Cancel a pending install: fire the LOCAL loopback shutdown first (frees
  * port 8976 immediately), then drop the daemon's flow state.
  */
-async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise<Result<null, CmdError>> {
+async cancelPluginInstall(runnerId: string | null, pluginId: string, stateToken: string | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("cancel_plugin_install", { pluginId, stateToken }) };
+    return { status: "ok", data: await TAURI_INVOKE("cancel_plugin_install", { runnerId, pluginId, stateToken }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1073,9 +1159,9 @@ async cancelPluginInstall(pluginId: string, stateToken: string | null) : Promise
  * `TrustPromptDto` the wizard must show before `confirm_skill_install` can
  * proceed.
  */
-async beginSkillInstall(source: string) : Promise<Result<SkillInstallBegin, CmdError>> {
+async beginSkillInstall(runnerId: string | null, source: string) : Promise<Result<SkillInstallBegin, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("begin_skill_install", { source }) };
+    return { status: "ok", data: await TAURI_INVOKE("begin_skill_install", { runnerId, source }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1085,9 +1171,9 @@ async beginSkillInstall(source: string) : Promise<Result<SkillInstallBegin, CmdE
  * Phase 2: complete a staged install (or update) after the user has
  * acknowledged its `TrustPromptDto`. The token is single-use.
  */
-async confirmSkillInstall(token: string) : Promise<Result<InstalledSkillPack, CmdError>> {
+async confirmSkillInstall(runnerId: string | null, token: string) : Promise<Result<InstalledSkillPack, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("confirm_skill_install", { token }) };
+    return { status: "ok", data: await TAURI_INVOKE("confirm_skill_install", { runnerId, token }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1097,9 +1183,9 @@ async confirmSkillInstall(token: string) : Promise<Result<InstalledSkillPack, Cm
  * Update one installed pack. `force` overrides the local-edits guard but
  * never the pinned guard or the hook-script re-ack gate.
  */
-async updatePlugin(id: string, force: boolean) : Promise<Result<UpdateOutcomeDto, CmdError>> {
+async updatePlugin(runnerId: string | null, id: string, force: boolean) : Promise<Result<UpdateOutcomeDto, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_plugin", { id, force }) };
+    return { status: "ok", data: await TAURI_INVOKE("update_plugin", { runnerId, id, force }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1110,9 +1196,9 @@ async updatePlugin(id: string, force: boolean) : Promise<Result<UpdateOutcomeDto
  * — a single pack's error surfaces as that pack's `UpdateOutcomeDto::Failed`
  * entry.
  */
-async updateAllPlugins() : Promise<Result<UpdateOutcomeEntry[], CmdError>> {
+async updateAllPlugins(runnerId: string | null) : Promise<Result<UpdateOutcomeEntry[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("update_all_plugins") };
+    return { status: "ok", data: await TAURI_INVOKE("update_all_plugins", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1121,9 +1207,9 @@ async updateAllPlugins() : Promise<Result<UpdateOutcomeEntry[], CmdError>> {
 /**
  * Pin (or unpin) an installed pack against future updates.
  */
-async setPluginPin(id: string, pinned: boolean, reason: string | null) : Promise<Result<null, CmdError>> {
+async setPluginPin(runnerId: string | null, id: string, pinned: boolean, reason: string | null) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_plugin_pin", { id, pinned, reason }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_plugin_pin", { runnerId, id, pinned, reason }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1134,9 +1220,9 @@ async setPluginPin(id: string, pinned: boolean, reason: string | null) : Promise
  * `plugins::doctor::plugin_doctor` for the full list of checks. Never mutates
  * state.
  */
-async pluginDoctor() : Promise<Result<DoctorFinding[], CmdError>> {
+async pluginDoctor(runnerId: string | null) : Promise<Result<DoctorFinding[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("plugin_doctor") };
+    return { status: "ok", data: await TAURI_INVOKE("plugin_doctor", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1147,9 +1233,9 @@ async pluginDoctor() : Promise<Result<DoctorFinding[], CmdError>> {
  * restart to take effect (in-memory flag on the daemon's `ControlPlane`,
  * cleared only by a daemon restart).
  */
-async pluginsRestartRequired() : Promise<Result<boolean, CmdError>> {
+async pluginsRestartRequired(runnerId: string | null) : Promise<Result<boolean, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("plugins_restart_required") };
+    return { status: "ok", data: await TAURI_INVOKE("plugins_restart_required", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1160,9 +1246,9 @@ async pluginsRestartRequired() : Promise<Result<boolean, CmdError>> {
  * background timer lives daemon-side and is not otherwise user-triggerable.
  * Returns the same snapshot shape as `catalog_status`.
  */
-async refreshCatalog() : Promise<Result<CatalogStatus, CmdError>> {
+async refreshCatalog(runnerId: string | null) : Promise<Result<CatalogStatus, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("refresh_catalog") };
+    return { status: "ok", data: await TAURI_INVOKE("refresh_catalog", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1172,9 +1258,9 @@ async refreshCatalog() : Promise<Result<CatalogStatus, CmdError>> {
  * Last accepted feed's sequence/outcome plus cached entry/blocked counts.
  * Read-only, never mutates state.
  */
-async catalogStatus() : Promise<Result<CatalogStatus, CmdError>> {
+async catalogStatus(runnerId: string | null) : Promise<Result<CatalogStatus, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("catalog_status") };
+    return { status: "ok", data: await TAURI_INVOKE("catalog_status", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1188,9 +1274,9 @@ async catalogStatus() : Promise<Result<CatalogStatus, CmdError>> {
  * (no spawn/restart/shutdown). `PluginDetailView` calls this for an
  * extension-capable plugin and filters the result down to its own `id`.
  */
-async extensionStatus() : Promise<Result<ExtensionStatusEntry[], CmdError>> {
+async extensionStatus(runnerId: string | null) : Promise<Result<ExtensionStatusEntry[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("extension_status") };
+    return { status: "ok", data: await TAURI_INVOKE("extension_status", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1199,9 +1285,9 @@ async extensionStatus() : Promise<Result<ExtensionStatusEntry[], CmdError>> {
 /**
  * Export a session as a pretty JSON string.
  */
-async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
+async exportSession(runnerId: string | null, sessionPk: string) : Promise<Result<string, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("export_session", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("export_session", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1210,9 +1296,9 @@ async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
 /**
  * Import a previously exported session JSON as a new archived session.
  */
-async importSession(projectId: string, data: string) : Promise<Result<Session, CmdError>> {
+async importSession(runnerId: string | null, projectId: string, data: string) : Promise<Result<Session, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("import_session", { projectId, data }) };
+    return { status: "ok", data: await TAURI_INVOKE("import_session", { runnerId, projectId, data }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1221,9 +1307,9 @@ async importSession(projectId: string, data: string) : Promise<Result<Session, C
 /**
  * Render a session as a self-contained, shareable HTML document.
  */
-async shareSession(sessionPk: string) : Promise<Result<string, CmdError>> {
+async shareSession(runnerId: string | null, sessionPk: string) : Promise<Result<string, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("share_session", { sessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("share_session", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1236,9 +1322,9 @@ async shareSession(sessionPk: string) : Promise<Result<string, CmdError>> {
  * [`await_kiro_device_flow`] to poll. Does not touch the store — nothing is
  * persisted until the user completes the browser step.
  */
-async startKiroDeviceFlow() : Promise<Result<DeviceFlowInfo, CmdError>> {
+async startKiroDeviceFlow(runnerId: string | null) : Promise<Result<DeviceFlowInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_kiro_device_flow") };
+    return { status: "ok", data: await TAURI_INVOKE("start_kiro_device_flow", { runnerId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1251,9 +1337,9 @@ async startKiroDeviceFlow() : Promise<Result<DeviceFlowInfo, CmdError>> {
  * state is consumed from [`FLOWS`] up front — a `flow_id` can only ever be
  * awaited once, success or failure.
  */
-async awaitKiroDeviceFlow(label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async awaitKiroDeviceFlow(runnerId: string | null, label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("await_kiro_device_flow", { label, flowId }) };
+    return { status: "ok", data: await TAURI_INVOKE("await_kiro_device_flow", { runnerId, label, flowId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1267,9 +1353,9 @@ async awaitKiroDeviceFlow(label: string, flowId: string) : Promise<Result<Connec
  * call (which mints a fresh access token) before persisting — a dead/expired
  * import token surfaces its error instead of a connection that can't route.
  */
-async importKiroToken(label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async importKiroToken(runnerId: string | null, label: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("import_kiro_token", { label }) };
+    return { status: "ok", data: await TAURI_INVOKE("import_kiro_token", { runnerId, label }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1282,9 +1368,9 @@ async importKiroToken(label: string) : Promise<Result<ConnectionInfo[], CmdError
  * Errors for providers that are not device-grant (e.g. `kiro`, which uses
  * `start_kiro_device_flow`).
  */
-async startDeviceFlow(provider: string) : Promise<Result<DeviceFlowInfo, CmdError>> {
+async startDeviceFlow(runnerId: string | null, provider: string) : Promise<Result<DeviceFlowInfo, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_device_flow", { provider }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_device_flow", { runnerId, provider }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1296,9 +1382,9 @@ async startDeviceFlow(provider: string) : Promise<Result<DeviceFlowInfo, CmdErro
  * the Copilot-token exchange (leg 2) before persisting; Qwen captures its
  * shard `resource_url`.
  */
-async awaitDeviceFlow(provider: string, label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
+async awaitDeviceFlow(runnerId: string | null, provider: string, label: string, flowId: string) : Promise<Result<ConnectionInfo[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("await_device_flow", { provider, label, flowId }) };
+    return { status: "ok", data: await TAURI_INVOKE("await_device_flow", { runnerId, provider, label, flowId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1489,7 +1575,14 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * `cacheRead`) are camelCased independently.
  */
 { kind: "sessionCost"; session_pk: string; total_usd: number; models: ModelCost[] }
-export type CoreEventMsg = { event: CoreEvent }
+/**
+ * `runner_id` identifies which engine (`"local"` or a paired remote
+ * runner's id — see `engine_manager::EngineManager`) produced this event.
+ * Stamped by `engine_manager::spawn_bridge`, one instance of which runs per
+ * runner, so the frontend can tell multiple runners' events apart once
+ * P3-4/P3-6 route by runner.
+ */
+export type CoreEventMsg = { runnerId: string; event: CoreEvent }
 /**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll
@@ -1648,7 +1741,7 @@ export type ModelStatusEntry = { family: string; model: string; status: string; 
  * One persisted probe verdict row for the provider Models card.
  */
 export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
-export type OauthAuthorizeUrlMsg = { provider: string; authorizeUrl: string }
+export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PluginAuthInfo = { 
@@ -1810,7 +1903,7 @@ transport: string;
  * `${auth}` substitution, matching `ryuzi plugins info`'s output.
  */
 commandOrUrl: string }
-export type PluginOauthAuthorizeUrlMsg = { pluginId: string; authorizeUrl: string }
+export type PluginOauthAuthorizeUrlMsg = { runnerId: string; pluginId: string; authorizeUrl: string }
 export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string; redirectUri: string }
 /**
  * Emitted by `begin_plugin_install`'s background callback task when the

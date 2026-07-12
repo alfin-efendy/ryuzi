@@ -5,6 +5,7 @@ use crate::error::CmdError;
 use futures::Stream;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub struct EngineClient {
     base_url: String,
@@ -19,6 +20,20 @@ impl EngineClient {
             token,
             // No global timeout: OAuth flows legitimately block for minutes.
             http: reqwest::Client::new(),
+        }
+    }
+
+    /// Like [`EngineClient::new`], but for a remote runner reached over TLS
+    /// where the leaf certificate is pinned by fingerprint (TOFU — paired
+    /// once via `/pair`, no CA chain) rather than validated against a root
+    /// store. `fingerprint` is the SHA-256 (base64) of the runner's cert, as
+    /// returned by the daemon's `tls::load_or_generate` and captured during
+    /// pairing. Same no-global-timeout property as `new`.
+    pub fn new_pinned(base_url: String, device_token: String, fingerprint: String) -> Self {
+        EngineClient {
+            base_url,
+            token: device_token,
+            http: pinned_client(&fingerprint),
         }
     }
 
@@ -54,6 +69,52 @@ impl EngineClient {
                     .to_string(),
             })
         }
+    }
+
+    /// Authed `GET {base_url}/attachments/{rel}` — the raw bytes of one
+    /// attachment file (plus its `Content-Type` header, if the server sent
+    /// one) reused for both the local engine and a pinned-TLS remote runner
+    /// exactly like [`EngineClient::rpc`]/[`EngineClient::events`]. `rel` is
+    /// interpolated directly into the URL path (same convention as `rpc`'s
+    /// `method` and `resolve_approval`'s `request_id` above) — the `reqwest`/
+    /// `url` stack percent-encodes anything that needs it (spaces, non-ASCII
+    /// filename bytes) while parsing, so callers never need to encode `rel`
+    /// themselves. The route itself (`serve.rs::get_attachment`) is jailed
+    /// and size-capped on the engine side; this is just the thin proxy.
+    pub async fn get_attachment_bytes(
+        &self,
+        rel: &str,
+    ) -> Result<(Vec<u8>, Option<String>), CmdError> {
+        let resp = self
+            .http
+            .get(format!("{}/attachments/{}", self.base_url, rel))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| CmdError {
+                message: format!("engine unreachable: {e}"),
+            })?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if !status.is_success() {
+            // Best-effort error message: the route's error envelope is JSON
+            // `{"error": "..."}`, but a non-JSON body (e.g. an intermediary's
+            // own error page) must not fail the whole call.
+            let body = resp.bytes().await.unwrap_or_default();
+            let message = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| format!("engine returned {status}"));
+            return Err(CmdError { message });
+        }
+        let bytes = resp.bytes().await.map_err(|e| CmdError {
+            message: format!("engine attachment read failed: {e}"),
+        })?;
+        Ok((bytes.to_vec(), content_type))
     }
 
     pub async fn resolve_approval(
@@ -234,6 +295,169 @@ fn spawn_engine_daemon(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---- P3-2: pinned-TLS client for remote runners ----
+//
+// Ported verbatim from `crates/core/tests/control_api.rs`'s
+// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` test support code
+// (FingerprintPin + pinned_client), which is exercised end-to-end there
+// against a real ring `ServerConfig` (`tls::load_or_generate` +
+// `tls::server_config`). Reuses `ryuzi_core::tls::fingerprint_cert_der` —
+// never reimplement the hash, or client and server pins drift and nothing
+// connects.
+
+/// A `rustls::client::danger::ServerCertVerifier` that trusts ONE
+/// certificate: the one whose SHA-256 fingerprint (base64, standard
+/// alphabet — computed via the real `tls::fingerprint_cert_der`, not a
+/// reimplementation, so the two can never drift) matches
+/// `expected_fingerprint`. This is TOFU certificate pinning, not
+/// `danger_accept_invalid_certs` — a presented cert with the WRONG
+/// fingerprint is rejected, `danger_accept_invalid_certs` would accept it.
+///
+/// Signature verification is NOT skipped: `verify_tls12_signature` /
+/// `verify_tls13_signature` delegate to the ring provider's own algorithms
+/// (`rustls::crypto::verify_tls12_signature` / `verify_tls13_signature`), so
+/// this verifier only relaxes the CA-chain-of-trust check (there is no CA —
+/// see `tls.rs`'s module docs), not cryptographic signature validation.
+#[derive(Debug)]
+struct FingerprintPin {
+    expected_fingerprint: String,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintPin {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let presented = ryuzi_core::tls::fingerprint_cert_der(end_entity.as_ref());
+        if presented == self.expected_fingerprint {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "fingerprint pin mismatch: expected {}, got {presented}",
+                self.expected_fingerprint
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A `reqwest::Client` wired to a ring-provider `rustls::ClientConfig` whose
+/// only trust decision is [`FingerprintPin`] — built via
+/// `ClientBuilder::use_preconfigured_tls`, the supported way to hand reqwest
+/// a fully custom rustls config (confirmed against the vendored reqwest
+/// 0.12.28 / rustls 0.23.41 sources: `use_preconfigured_tls` downcasts to
+/// `rustls::ClientConfig` and, when it matches, routes straight to
+/// `Connector::new_rustls_tls`, bypassing reqwest's own root-store/verifier
+/// setup entirely).
+fn pinned_client(fingerprint: &str) -> reqwest::Client {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(FingerprintPin {
+        expected_fingerprint: fingerprint.to_string(),
+        provider: provider.clone(),
+    });
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+
+    reqwest::Client::builder()
+        .use_preconfigured_tls(client_config)
+        .build()
+        .expect("reqwest client builds over the preconfigured pinned rustls config")
+}
+
+/// P3-6: pair with a remote runner the user just typed Host/Port/Fingerprint
+/// for. No [`EngineClient`] exists yet for this runner — pairing IS the
+/// bootstrap that produces its device token — so this is a free function
+/// rather than an instance method. Builds a one-shot [`pinned_client`]
+/// trusting `fingerprint` (TOFU: the operator copied it from `ryuzi pair`'s
+/// printout on the remote host) and POSTs the pairing code to
+/// `{base_url}/pair`, mirroring the wire shape `serve.rs`'s `PairRequest`
+/// /pair handler expects and returns (see
+/// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` in
+/// `crates/core/tests/control_api.rs`, which exercises the exact same call
+/// shape end-to-end). On success, returns the plaintext `device_token`;
+/// the only caller (`gateways_cmd::add_runner`) hands it straight to the
+/// LOCAL engine's `save_runner` RPC and to `EngineManager::add_runner` —
+/// it is never returned to a `#[tauri::command]`'s own return value, so it
+/// never reaches the webview.
+pub async fn pair_over_pinned_tls(
+    base_url: &str,
+    fingerprint: &str,
+    code: &str,
+    device_name: &str,
+) -> Result<String, CmdError> {
+    let client = pinned_client(fingerprint);
+    let resp = client
+        .post(format!("{base_url}/pair"))
+        .json(&serde_json::json!({ "code": code, "device_name": device_name }))
+        .send()
+        .await
+        .map_err(|e| CmdError {
+            message: format!("pairing request failed: {e}"),
+        })?;
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(|e| CmdError {
+        message: format!("pairing response decode failed: {e}"),
+    })?;
+    if status.is_success() {
+        body.get("device_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| CmdError {
+                message: "pairing response missing device_token".to_string(),
+            })
+    } else {
+        Err(CmdError {
+            message: body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pairing failed")
+                .to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,10 +474,67 @@ mod tests {
                 cp.store().clone(),
             )),
             cp: cp.clone(),
-            token: Some(token.to_string()),
+            control_token: token.to_string(),
         };
-        let port = ryuzi_core::serve::serve(state, 0).await.unwrap();
+        let opts = ryuzi_core::serve::ServeOpts {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            tls: None,
+        };
+        let port = ryuzi_core::serve::serve(state, opts).await.unwrap();
         (format!("http://127.0.0.1:{port}"), cp)
+    }
+
+    /// Points `cp`'s `attachments_root()` at `<dir>/.harness-attachments` by
+    /// writing the `workdir_root` setting the real method reads — same
+    /// pattern `serve.rs`'s own attachment-route tests use.
+    async fn set_attachments_root(
+        cp: &ryuzi_core::ControlPlane,
+        dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        ryuzi_core::settings::SettingsStore::new(cp.store().clone())
+            .set("workdir_root", dir.to_str().unwrap())
+            .await
+            .unwrap();
+        cp.attachments_root().await
+    }
+
+    #[tokio::test]
+    async fn get_attachment_bytes_round_trips_a_real_file_over_the_authed_route() {
+        let (base, cp) = test_server("tok").await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = set_attachments_root(&cp, dir.path()).await;
+        std::fs::create_dir_all(root.join("sess-1")).unwrap();
+        std::fs::write(
+            root.join("sess-1").join("shot.png"),
+            [0x89, 0x50, 0x4e, 0x47],
+        )
+        .unwrap();
+
+        let client = EngineClient::new(base, "tok".into());
+        let (bytes, content_type) = client
+            .get_attachment_bytes("sess-1/shot.png")
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![0x89, 0x50, 0x4e, 0x47]);
+        assert_eq!(content_type.as_deref(), Some("image/png"));
+    }
+
+    /// A missing attachment surfaces the engine's own JSON error message
+    /// (`"attachment not found"`, from `serve.rs::attachment_not_found`)
+    /// rather than a decode failure or a generic transport error string.
+    #[tokio::test]
+    async fn get_attachment_bytes_surfaces_the_engines_error_message_on_404() {
+        let (base, cp) = test_server("tok").await;
+        let dir = tempfile::tempdir().unwrap();
+        set_attachments_root(&cp, dir.path()).await;
+
+        let client = EngineClient::new(base, "tok".into());
+        let err = client
+            .get_attachment_bytes("sess-1/nope.png")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "attachment not found");
     }
 
     #[tokio::test]
@@ -321,6 +602,119 @@ mod tests {
         assert!(
             !events[0]["text"].as_str().unwrap().contains('\u{FFFD}'),
             "multi-byte char must not be corrupted into U+FFFD"
+        );
+    }
+
+    /// Construction-only smoke test: `pinned_client` builds a `reqwest::Client`
+    /// over a preconfigured, ring-provider rustls `ClientConfig` without
+    /// panicking (the `.expect()`s inside `pinned_client` would panic on a
+    /// bad provider/config or a `use_preconfigured_tls` downcast mismatch —
+    /// see the rustls-unification note on the Cargo.toml dependency). A full
+    /// handshake test (correct fingerprint accepted, wrong one rejected) is
+    /// already covered end-to-end against a real ring `ServerConfig` in
+    /// `crates/core/tests/control_api.rs`'s
+    /// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` — this is the
+    /// SAME `FingerprintPin`/`pinned_client` code, ported verbatim, so that
+    /// coverage applies here too. Standing up a second TLS server in this
+    /// crate's unit tests would be redundant; `EngineClient::new_pinned`
+    /// itself is a plain field-assignment wrapper with no branching logic to
+    /// cover beyond "it constructs".
+    ///
+    /// Note: on this Windows dev box, `cargo test -p ryuzi-cockpit` can crash
+    /// the test binary for unrelated reasons (tauri#13419); `cargo check
+    /// --tests -p ryuzi-cockpit` compiling this test is acceptable evidence
+    /// when the binary itself cannot be run locally.
+    #[test]
+    fn pinned_client_and_new_pinned_construct_without_panicking() {
+        let _client = pinned_client("somefp");
+        let engine = EngineClient::new_pinned(
+            "https://127.0.0.1:9999".into(),
+            "device-token".into(),
+            "somefp".into(),
+        );
+        assert_eq!(engine.base_url, "https://127.0.0.1:9999");
+        assert_eq!(engine.token, "device-token");
+    }
+
+    /// A TLS-enabled variant of `test_server`, standing up a real ring
+    /// `ServerConfig` (same construction `control_api.rs`'s
+    /// `remote_pair_then_authed_rpc_and_sse_over_pinned_tls` uses) so
+    /// `pair_over_pinned_tls`'s pinned-client `/pair` POST performs a
+    /// genuine TLS handshake, not a plaintext connection. Returns the base
+    /// URL, the server's real cert fingerprint, and an `Arc<Store>` handle
+    /// so tests can mint pairing codes against the same backing store.
+    async fn test_tls_server(token: &str) -> (String, String, std::sync::Arc<ryuzi_core::Store>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("ryuzi.sqlite");
+        let store = ryuzi_core::Store::open(&db_path).await.unwrap();
+        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        let material = ryuzi_core::tls::load_or_generate(tmp.path()).unwrap();
+        let tls_cfg = ryuzi_core::tls::server_config(&material).unwrap();
+        let store_handle = cp.store().clone();
+        let state = ryuzi_core::serve::ApiState {
+            router_server: Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
+                store_handle.clone(),
+            )),
+            cp: cp.clone(),
+            control_token: token.to_string(),
+        };
+        let opts = ryuzi_core::serve::ServeOpts {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            tls: Some(tls_cfg),
+        };
+        let port = ryuzi_core::serve::serve(state, opts).await.unwrap();
+        // Keep the temp dir (and its TLS key material / sqlite file) alive
+        // for the lifetime of the test — same pattern `test_server` uses.
+        std::mem::forget(tmp);
+        (
+            format!("https://127.0.0.1:{port}"),
+            material.fingerprint,
+            store_handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn pair_over_pinned_tls_redeems_a_valid_code() {
+        let (base, fingerprint, store) = test_tls_server("tok").await;
+        let code = ryuzi_core::pairing::mint_code(&store, 60_000, ryuzi_core::paths::now_ms())
+            .await
+            .unwrap();
+
+        let token = pair_over_pinned_tls(&base, &fingerprint, &code, "cockpit-test")
+            .await
+            .expect("a freshly minted code pairs successfully");
+        assert_eq!(token.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn pair_over_pinned_tls_rejects_a_wrong_code() {
+        let (base, fingerprint, _store) = test_tls_server("tok").await;
+
+        let err = pair_over_pinned_tls(&base, &fingerprint, "not-a-real-code", "cockpit-test")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "invalid or expired pairing code");
+    }
+
+    /// The whole point of `fingerprint` pinning: a wrong fingerprint must
+    /// reject the TLS handshake itself, before the pairing code is even
+    /// sent — distinct from `pair_over_pinned_tls_rejects_a_wrong_code`,
+    /// which exercises the correct-pin/wrong-code case.
+    #[tokio::test]
+    async fn pair_over_pinned_tls_rejects_a_wrong_fingerprint() {
+        let (base, _fingerprint, store) = test_tls_server("tok").await;
+        let code = ryuzi_core::pairing::mint_code(&store, 60_000, ryuzi_core::paths::now_ms())
+            .await
+            .unwrap();
+
+        let err = pair_over_pinned_tls(&base, "wrong-fingerprint==", &code, "cockpit-test")
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("pairing request failed"),
+            "a wrong pin should fail the TLS handshake itself: {}",
+            err.message
         );
     }
 }

@@ -51,6 +51,9 @@ async fn run_inner() -> i32 {
             last_error: None,
             version: version.clone(),
             port: None,
+            scheme: None,
+            host: None,
+            fingerprint: None,
         },
     );
 
@@ -108,9 +111,13 @@ async fn run_inner() -> i32 {
         ryuzi_core::serve::ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
-            token: Some(token),
+            control_token: token,
         },
-        control_port,
+        ryuzi_core::serve::ServeOpts {
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: control_port,
+            tls: None,
+        },
     )
     .await
     {
@@ -129,6 +136,11 @@ async fn run_inner() -> i32 {
             last_error: None,
             version,
             port: Some(bound),
+            // engine-daemon always binds loopback-only (see the `ServeOpts`
+            // above) — no TLS material, so plain `http` and no fingerprint.
+            scheme: Some("http".to_string()),
+            host: Some(std::net::Ipv4Addr::LOCALHOST.to_string()),
+            fingerprint: None,
         },
     );
     println!("engine-daemon: running on 127.0.0.1:{bound}");
@@ -171,6 +183,9 @@ fn fail(
             last_error: Some(msg.to_string()),
             version,
             port: None,
+            scheme: None,
+            host: None,
+            fingerprint: None,
         },
     );
     eprintln!("engine-daemon: failed to start: {msg}");

@@ -7,6 +7,10 @@
 # reason = "dev-only dependency; upstream fix tracked in <issue link>"
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = "rustls-pemfile 2.2.0 is a deprecated/unmaintained shim (its PEM parsing moved into rustls-pki-types); pulled transitively by axum-server 0.7 (the control-API TLS listener). ryuzi builds its rustls ServerConfig from DER via ryuzi_core::tls::server_config, so rustls-pemfile is not on any runtime-critical path. Revisit when axum-server drops it. Tracked in #40."
+
+[[IgnoredVulns]]
 id = "GHSA-82j2-j2ch-gfr8"
 reason = "rustls-webpki <0.103.13 DoS panic on malformed CRL. Only reachable when CRL revocation checking is explicitly enabled, which ryuzi never does. Pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; revisit when serenity releases past 0.12.5. Tracked in #40."
 

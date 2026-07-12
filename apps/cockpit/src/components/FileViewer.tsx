@@ -4,30 +4,60 @@ import { EditorView } from "@codemirror/view";
 import type { LanguageSupport } from "@codemirror/language";
 import { CircleAlert } from "lucide-react";
 import { commands } from "@/bindings";
-import { basename } from "@/lib/paths";
+import { basename, toRepoRelative } from "@/lib/paths";
 import { languageFor } from "@/lib/language";
 import { cockpitCodeTheme } from "@/lib/codemirror-theme";
 import { base64ToUtf8, previewImageSrc, previewKindForPath, type ViewMode } from "@/lib/preview";
 import { Markdown } from "@/components/transcript/Markdown";
 
-export function FileViewer({ path, mode }: { path: string; mode: ViewMode }) {
+/** toRepoRelative leaves an absolute path unchanged when it doesn't start
+ *  under `workdir` — that's how a tab opened via free-text absolute-path
+ *  input pointing outside the session workdir is detected, without a second
+ *  traversal check (the engine's jail is authoritative either way). */
+function looksAbsolute(p: string): boolean {
+  return p.startsWith("/") || /^[A-Za-z]:\//.test(p);
+}
+
+export function FileViewer({
+  runnerId,
+  sessionPk,
+  path,
+  mode,
+  workdir,
+}: {
+  runnerId: string;
+  sessionPk: string;
+  path: string;
+  mode: ViewMode;
+  /** Session workdir, or null while it's still being fetched. */
+  workdir: string | null;
+}) {
   const [content, setContent] = useState("");
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lang, setLang] = useState<LanguageSupport | null>(null);
   const kind = previewKindForPath(path);
+  const rel = workdir !== null ? toRepoRelative(path, workdir) : null;
+  const outsideWorkdir = rel !== null && looksAbsolute(rel);
 
   // One read per path serves both modes — toggling View|Code must not hit disk.
   // Images/svg go through readFileBase64 (readFile rejects non-UTF-8 bytes);
-  // svg Code mode decodes the same payload instead of reading again.
+  // svg Code mode decodes the same payload instead of reading again. Reads
+  // are jailed to the session workdir on the engine side (fsview::read_file*)
+  // so this works over a remote pinned-TLS runner, not just locally.
   useEffect(() => {
     let cancelled = false;
     setContent("");
     setImageSrc(null);
     setError(null);
     setLang(null);
+    if (rel === null) return; // workdir not resolved yet
+    if (outsideWorkdir) {
+      setError("File is outside the session workdir.");
+      return;
+    }
     if (kind === "image" || kind === "svg") {
-      void commands.readFileBase64(path).then((res) => {
+      void commands.readFileBase64(runnerId, sessionPk, rel).then((res) => {
         if (cancelled) return;
         if (res.status === "ok") {
           setImageSrc(previewImageSrc(kind, res.data.contentType, res.data.dataBase64));
@@ -35,7 +65,7 @@ export function FileViewer({ path, mode }: { path: string; mode: ViewMode }) {
         } else setError(res.error.message);
       });
     } else {
-      void commands.readFile(path).then((res) => {
+      void commands.readFile(runnerId, sessionPk, rel).then((res) => {
         if (cancelled) return;
         if (res.status === "ok") setContent(res.data);
         else setError(res.error.message);
@@ -51,7 +81,7 @@ export function FileViewer({ path, mode }: { path: string; mode: ViewMode }) {
     return () => {
       cancelled = true;
     };
-  }, [path, kind]);
+  }, [runnerId, sessionPk, rel, outsideWorkdir, kind, path]);
 
   if (error) {
     return (
