@@ -67,7 +67,7 @@ test("a tool card's path opens the file without toggling the card", async () => 
     output: "file contents",
   };
   render(
-    <TranscriptFileContext.Provider value={{ sessionPk: "s1", workdir: "/home/u/proj" }}>
+    <TranscriptFileContext.Provider value={{ runnerId: "local", sessionPk: "s1", workdir: "/home/u/proj" }}>
       <ActivityCluster items={[item]} />
     </TranscriptFileContext.Provider>,
   );

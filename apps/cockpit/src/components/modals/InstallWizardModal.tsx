@@ -7,6 +7,7 @@ import { commands, events, type PluginDetail, type PluginInstallBeginResult } fr
 import { IconChip, StatusDot } from "@/components/common/bits";
 import { pluginIcon as iconFor } from "@/lib/plugin-icons";
 import { usePlugins } from "@/store-plugins";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 type WizardStep = "checking" | "tokenInput" | "manualClientId" | "waitingOauth" | "settings" | "done";
 
@@ -53,7 +54,7 @@ export function InstallWizardModal({
   const close = () => {
     const oauthFlow = begin ? begin.authKind === "oauth" : detail?.auth?.kind === "oauth";
     if (oauthFlow) {
-      void commands.cancelPluginInstall(pluginId, begin?.oauthBegin?.stateToken ?? null);
+      void commands.cancelPluginInstall(LOCAL_RUNNER, pluginId, begin?.oauthBegin?.stateToken ?? null);
     }
     onClose();
   };
@@ -77,7 +78,7 @@ export function InstallWizardModal({
       const { pluginId: pid, begin: b, detail: d } = wizardStateRef.current;
       const oauthFlow = b ? b.authKind === "oauth" : d?.auth?.kind === "oauth";
       if (oauthFlow) {
-        void commands.cancelPluginInstall(pid, b?.oauthBegin?.stateToken ?? null);
+        void commands.cancelPluginInstall(LOCAL_RUNNER, pid, b?.oauthBegin?.stateToken ?? null);
       }
     };
   }, []);
@@ -86,7 +87,7 @@ export function InstallWizardModal({
     const key = detail?.auth?.setting;
     if (!key || tokenValue.trim().length === 0 || busy) return;
     setBusy(true);
-    const res = await commands.setPluginSetting(key, tokenValue.trim());
+    const res = await commands.setPluginSetting(LOCAL_RUNNER, key, tokenValue.trim());
     setBusy(false);
     if (res.status === "error") {
       toast.error(res.error.message);
@@ -98,7 +99,7 @@ export function InstallWizardModal({
   const submitClientId = async () => {
     if (clientId.trim().length === 0 || busy) return;
     setBusy(true);
-    const saved = await commands.setPluginOauthClientId(pluginId, clientId.trim());
+    const saved = await commands.setPluginOauthClientId(LOCAL_RUNNER, pluginId, clientId.trim());
     if (saved.status === "error") {
       setBusy(false);
       toast.error(saved.error.message);
@@ -113,7 +114,7 @@ export function InstallWizardModal({
     }
     // Re-begin: the client id is on the row now, DCR is permanently
     // suppressed, and the backend goes straight to the browser flow.
-    const res = await commands.beginPluginInstall(pluginId);
+    const res = await commands.beginPluginInstall(LOCAL_RUNNER, pluginId);
     setBusy(false);
     if (res.status === "error") {
       toast.error(res.error.message);
@@ -131,7 +132,7 @@ export function InstallWizardModal({
     if (busy) return;
     setBusy(true);
     setOauthError(null);
-    const res = await commands.beginPluginInstall(pluginId);
+    const res = await commands.beginPluginInstall(LOCAL_RUNNER, pluginId);
     setBusy(false);
     if (res.status === "error") {
       setOauthError(res.error.message);
@@ -145,7 +146,7 @@ export function InstallWizardModal({
     const stateToken = begin?.oauthBegin?.stateToken;
     if (!stateToken || code.trim().length === 0 || busy) return;
     setBusy(true);
-    const res = await commands.completePluginOauth(pluginId, code.trim(), stateToken);
+    const res = await commands.completePluginOauth(LOCAL_RUNNER, pluginId, code.trim(), stateToken);
     setBusy(false);
     if (res.status === "error") {
       setOauthError(res.error.message);
@@ -155,7 +156,7 @@ export function InstallWizardModal({
     // The loopback callback server is still listening for this flow's
     // redirect — a manual paste bypasses it, so shut it down explicitly or
     // it leaks until the flow's own timeout (Phase 1 whole-branch review).
-    await commands.cancelPluginInstall(pluginId, stateToken);
+    await commands.cancelPluginInstall(LOCAL_RUNNER, pluginId, stateToken);
     setStep(settingsOrDone(detail));
   };
 
@@ -170,7 +171,7 @@ export function InstallWizardModal({
     for (const f of settingsFields) {
       const value = (fieldValues[f.key] ?? "").trim();
       if (value.length === 0) continue;
-      const res = await commands.setPluginSetting(f.key, value);
+      const res = await commands.setPluginSetting(LOCAL_RUNNER, f.key, value);
       if (res.status === "error") {
         setBusy(false);
         toast.error(res.error.message);
@@ -189,7 +190,7 @@ export function InstallWizardModal({
   const runBegin = useCallback(
     async (d: PluginDetail | null) => {
       setCheckError(null);
-      const res = await commands.beginPluginInstall(pluginId);
+      const res = await commands.beginPluginInstall(LOCAL_RUNNER, pluginId);
       if (res.status === "error") {
         setCheckError(res.error.message);
         return;
@@ -222,7 +223,7 @@ export function InstallWizardModal({
     void (async () => {
       // Detail first (local manifest read, fast) so the spinner can flip to
       // "Preparing sign-in…" while the network-bound begin call runs.
-      const res = await commands.pluginDetail(pluginId);
+      const res = await commands.pluginDetail(LOCAL_RUNNER, pluginId);
       const d = res.status === "ok" ? res.data : null;
       if (!active) return;
       setDetail(d);
@@ -270,7 +271,7 @@ export function InstallWizardModal({
     let active = true;
     void (async () => {
       if (detail && !detail.info.experimental) {
-        const res = await commands.setPluginEnabled(pluginId, true);
+        const res = await commands.setPluginEnabled(LOCAL_RUNNER, pluginId, true);
         if (!active) return;
         if (res.status === "error") toast.error(res.error.message);
       }

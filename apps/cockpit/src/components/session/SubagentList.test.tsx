@@ -2,6 +2,9 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, render, screen } from "@testing-library/react";
 import { useStore } from "@/store";
 import type { Row } from "@/lib/transcript";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
+
+const KEY = sessKey(LOCAL_RUNNER, "s1");
 
 const { SubagentList } = await import("./SubagentList");
 
@@ -38,14 +41,14 @@ beforeEach(() => {
 test("renders a roster row per sub-agent with a count label", () => {
   useStore.setState({
     transcripts: {
-      s1: [
+      [KEY]: [
         row({ toolSubagent: "explore", createdAt: 2 }),
         row({ toolSubagent: "explore", createdAt: 3 }),
         row({ toolSubagent: "plan", createdAt: 1 }),
       ],
     },
   });
-  render(<SubagentList sessionPk="s1" />);
+  render(<SubagentList runnerId={LOCAL_RUNNER} sessionPk="s1" />);
   expect(screen.getByText("explore")).toBeTruthy();
   expect(screen.getByText("2 calls")).toBeTruthy();
   expect(screen.getByText("plan")).toBeTruthy();
@@ -53,6 +56,6 @@ test("renders a roster row per sub-agent with a count label", () => {
 });
 
 test("empty transcript shows the empty-state line", () => {
-  render(<SubagentList sessionPk="s1" />);
+  render(<SubagentList runnerId={LOCAL_RUNNER} sessionPk="s1" />);
   expect(screen.getByText(/no sub-agents/i)).toBeTruthy();
 });

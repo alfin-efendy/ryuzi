@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import { commands, type CmdError, type GatewayEventInfo, type GatewayInfo, type Result } from "./bindings";
+import { useStore } from "./store";
 
 // Gateways domain store. The local host always exists (live telemetry); WSL
 // distros are detected; SSH remotes are persisted config with a TCP probe.
@@ -16,6 +17,7 @@ type GatewaysState = {
   hydrate: () => Promise<void>;
   probe: () => Promise<void>;
   add: (name: string, host: string, port: number, username: string) => Promise<boolean>;
+  addRunner: (name: string, host: string, port: number, fingerprint: string, code: string) => Promise<boolean>;
   remove: (id: string) => Promise<void>;
   updateFs: (id: string, fsMode: string, paths: string[]) => Promise<void>;
   loadEvents: (id: string) => Promise<void>;
@@ -39,7 +41,7 @@ export const useGateways = create<GatewaysState>((set, get) => ({
   probing: false,
 
   hydrate: async () => {
-    applyResult(set, await commands.listGateways(), "Gateway list");
+    applyResult(set, await commands.listGateways("local"), "Gateway list");
     void get().probe();
   },
 
@@ -47,30 +49,56 @@ export const useGateways = create<GatewaysState>((set, get) => ({
     if (get().probing) return;
     set({ probing: true });
     try {
-      applyResult(set, await commands.probeGateways(), "Gateway probe");
+      applyResult(set, await commands.probeGateways("local"), "Gateway probe");
     } finally {
       set({ probing: false });
     }
   },
 
   add: async (name, host, port, username) => {
-    const ok = applyResult(set, await commands.addGateway(name, host, port, username), "Add gateway");
+    const ok = applyResult(set, await commands.addGateway("local", name, host, port, username), "Add gateway");
+    return ok;
+  },
+
+  // Pairs a remote runner over pinned TLS and persists + live-adds it — all
+  // handled backend-side (Cockpit's `add_runner` Tauri command); the device
+  // token it mints along the way never crosses into this store or the webview.
+  addRunner: async (name, host, port, fingerprint, code) => {
+    const ok = applyResult(set, await commands.addRunner(name, host, port, fingerprint, code), "Add runner");
     return ok;
   },
 
   remove: async (id) => {
-    applyResult(set, await commands.removeGateway(id), "Remove gateway");
+    const ok = applyResult(set, await commands.removeGateway("local", id), "Remove gateway");
+    // The Tauri command already aborted the runner's SSE bridge and dropped
+    // its EngineClient backend-side (`EngineManager::remove_runner`); the
+    // removed runner's sessions vanish from `useStore.sessions` on the next
+    // `refresh()` (it re-fetches from `listGateways`, so a gone runner is
+    // simply not in the fan-out list anymore). `transcripts`/`lastSeq` are
+    // keyed by `sessKey(runnerId, pk)` and never otherwise get an eviction
+    // pass, so prune this runner's entries here too rather than leaving them
+    // as orphaned memory for the rest of the session. (A few smaller
+    // per-session maps — `loaded`, `contextUsage`, `sessionCost` — and the
+    // `pendingApprovals` array are left as-is: same orphaned-but-harmless
+    // shape, not worth the extra surface for this fix.)
+    if (ok) {
+      const prefix = `${id}::`;
+      useStore.setState((st) => ({
+        transcripts: Object.fromEntries(Object.entries(st.transcripts).filter(([k]) => !k.startsWith(prefix))),
+        lastSeq: Object.fromEntries(Object.entries(st.lastSeq).filter(([k]) => !k.startsWith(prefix))),
+      }));
+    }
   },
 
   updateFs: async (id, fsMode, paths) => {
     set({
       gateways: get().gateways.map((g) => (g.id === id ? { ...g, fsMode, paths } : g)),
     });
-    applyResult(set, await commands.updateGateway(id, fsMode, paths), "Gateway update");
+    applyResult(set, await commands.updateGateway("local", id, fsMode, paths), "Gateway update");
   },
 
   loadEvents: async (id) => {
-    const res = await commands.gatewayEvents(id);
+    const res = await commands.gatewayEvents("local", id);
     if (res.status === "ok") set({ eventsById: { ...get().eventsById, [id]: res.data } });
   },
 

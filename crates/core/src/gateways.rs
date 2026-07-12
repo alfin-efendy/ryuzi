@@ -11,13 +11,23 @@ use std::time::Duration;
 pub struct GatewayRow {
     pub id: String,
     pub name: String,
-    /// local | wsl | ssh
+    /// local | wsl | ssh | remote
     pub kind: String,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub username: Option<String>,
     pub fs_mode: String,
     pub paths: Vec<String>,
+    /// `remote` kind only: base64-std SHA-256 over the paired runner's TLS
+    /// cert DER, computed client-side by `tls::fingerprint_cert_der` and
+    /// persisted verbatim so the daemon (and Cockpit) can pin against it.
+    pub fingerprint: Option<String>,
+    /// `remote` kind only: the paired device's bearer token, stored
+    /// value-encrypted (`enc:v1:...` via `secrets::encrypt_field`) — NOT
+    /// hashed, since Cockpit must recover and replay it as a bearer on every
+    /// call to the remote runner. Contrast with the server-side `devices`
+    /// table (migration 24), which stores only a hash.
+    pub device_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,10 +171,12 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<GatewayRow> {
         username: r.get(5)?,
         fs_mode: r.get(6)?,
         paths: serde_json::from_str(&paths).unwrap_or_default(),
+        fingerprint: r.get(8)?,
+        device_token: r.get(9)?,
     })
 }
 
-const GW_COLS: &str = "id,name,kind,host,port,username,fs_mode,paths";
+const GW_COLS: &str = "id,name,kind,host,port,username,fs_mode,paths,fingerprint,device_token";
 
 pub async fn list_rows(store: &Store) -> anyhow::Result<Vec<GatewayRow>> {
     store
@@ -200,12 +212,13 @@ pub async fn upsert_row(store: &Store, row: GatewayRow) -> anyhow::Result<()> {
     store
         .with_conn(move |c| {
             c.execute(
-                "INSERT INTO gateways(id,name,kind,host,port,username,fs_mode,paths,created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                "INSERT INTO gateways(id,name,kind,host,port,username,fs_mode,paths,fingerprint,device_token,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
                  ON CONFLICT(id) DO UPDATE SET \
                    name=excluded.name, kind=excluded.kind, host=excluded.host, \
                    port=excluded.port, username=excluded.username, \
-                   fs_mode=excluded.fs_mode, paths=excluded.paths",
+                   fs_mode=excluded.fs_mode, paths=excluded.paths, \
+                   fingerprint=excluded.fingerprint, device_token=excluded.device_token",
                 params![
                     row.id,
                     row.name,
@@ -215,6 +228,8 @@ pub async fn upsert_row(store: &Store, row: GatewayRow) -> anyhow::Result<()> {
                     row.username,
                     row.fs_mode,
                     paths,
+                    row.fingerprint,
+                    row.device_token,
                     now
                 ],
             )
@@ -339,6 +354,8 @@ mod tests {
                 username: Some("dev".into()),
                 fs_mode: "projects".into(),
                 paths: vec!["/srv/app".into()],
+                fingerprint: None,
+                device_token: None,
             },
         )
         .await

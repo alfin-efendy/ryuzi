@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, Pencil, Plus, RefreshCw, TestTube2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { commands, type ConnectionInfo, type ModelRouteStrategy, type SelectableModelInfo, type UsageSeries } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useConnections } from "@/store-connections";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
@@ -261,7 +262,7 @@ function ProviderModelsCard({
 
   useEffect(() => {
     let active = true;
-    void commands.listModelStatuses(family).then((result) => {
+    void commands.listModelStatuses(LOCAL_RUNNER, family).then((result) => {
       if (!active || result.status !== "ok") return;
       setResults(new Map(result.data.map((row) => [row.model, { status: row.status as ModelTestStatus, message: row.message }])));
     });
@@ -280,7 +281,7 @@ function ProviderModelsCard({
     try {
       let entry: ModelTestEntry;
       try {
-        const result = await commands.testConnectionModel(conn.id, model);
+        const result = await commands.testConnectionModel(LOCAL_RUNNER, conn.id, model);
         entry =
           result.status === "ok"
             ? { status: result.data.status as ModelTestStatus, message: result.data.message }
@@ -328,7 +329,7 @@ function ProviderModelsCard({
   const runRefresh = async () => {
     setRefreshing(true);
     setRefreshErrors([]);
-    const result = await commands.refreshProviderModels(family);
+    const result = await commands.refreshProviderModels(LOCAL_RUNNER, family);
     setRefreshing(false);
     if (result.status !== "ok") {
       toast.error(`Refresh failed: ${result.error.message}`);
@@ -424,7 +425,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
 
   useEffect(() => {
     let active = true;
-    void commands.providerAccountRoute(provider).then((result) => {
+    void commands.providerAccountRoute(LOCAL_RUNNER, provider).then((result) => {
       if (active && result.status === "ok") setAccountStrategy(result.data.strategy);
     });
     return () => {
@@ -471,7 +472,7 @@ export function ProviderDetailView({ provider }: { provider: string }) {
   const setStrategy = async (strategy: ModelRouteStrategy) => {
     setAccountStrategy(strategy);
     setSavingStrategy(true);
-    const result = await commands.setProviderAccountRoute(provider, strategy);
+    const result = await commands.setProviderAccountRoute(LOCAL_RUNNER, provider, strategy);
     setSavingStrategy(false);
     if (result.status === "ok") {
       setAccountStrategy(result.data.strategy);

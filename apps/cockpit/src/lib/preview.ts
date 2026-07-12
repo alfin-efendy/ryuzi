@@ -27,7 +27,7 @@ export function defaultModeForPath(path: string): ViewMode {
   return previewKindForPath(path) === null ? "code" : "view";
 }
 
-/** Data URL for <img> previews. svg forces its mime — read_file_base64 has no svg mapping. */
+/** Data URL for <img> previews. svg forces its mime — the fsview read_file_base64 RPC has no svg content-type mapping. */
 export function previewImageSrc(kind: PreviewKind, contentType: string | null, dataBase64: string): string {
   const mime = kind === "svg" ? "image/svg+xml" : (contentType ?? "application/octet-stream");
   return `data:${mime};base64,${dataBase64}`;

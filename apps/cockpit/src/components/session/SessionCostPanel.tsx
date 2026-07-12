@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Button, MenuPanel } from "@ryuzi/ui";
 import { useStore } from "@/store";
+import { sessKey } from "@/lib/session-key";
 import { ContextRing } from "./ContextRing";
 
 function fmtUsd(usd: number): string {
@@ -14,9 +15,10 @@ const fmtTokens = (n: number) => n.toLocaleString();
 /** Composer trigger: context-usage ring + cost popover, replacing the old
  *  "% context left" text. Reads `contextUsage`/`sessionCost` itself so
  *  callers only need the session pk. */
-export function SessionCostPanel({ sessionPk }: { sessionPk: string }) {
-  const usage = useStore((s) => s.contextUsage[sessionPk]);
-  const cost = useStore((s) => s.sessionCost[sessionPk]);
+export function SessionCostPanel({ runnerId, sessionPk }: { runnerId: string; sessionPk: string }) {
+  const key = sessKey(runnerId, sessionPk);
+  const usage = useStore((s) => s.contextUsage[key]);
+  const cost = useStore((s) => s.sessionCost[key]);
   const [open, setOpen] = useState(false);
   if (!usage) return null;
 

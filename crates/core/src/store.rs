@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_31_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -913,7 +913,79 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
-        // Migration 28 — Phase 4 self-learning (spec §4/§7): cross-session
+        // Migration 28 — Remote catalog cache (origin/main #113).
+        // to the tail here since Phase 4/5/6 also appended #28/#29/#30).
+        // `plugin_catalog_cache` holds the
+        // entries of the last verified signed feed (id, manifest TOML, semver,
+        // feed sequence, blocked flag+reason); `catalog_feed_state` is a single
+        // KV row tracking the last-accepted sequence + fetch outcome for
+        // anti-rollback and status. Appended as the tail after migration 30
+        // (Phase 6 audit columns). IF NOT EXISTS: the rewind-and-replay test re-runs
+        // this on an already-migrated DB, so it must be a no-op on replay.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_catalog_cache (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                manifest_toml TEXT NOT NULL,\
+                version TEXT NOT NULL,\
+                sequence INTEGER NOT NULL,\
+                blocked INTEGER NOT NULL DEFAULT 0,\
+                blocked_reason TEXT,\
+                fetched_at INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS catalog_feed_state (\
+                id INTEGER PRIMARY KEY CHECK (id = 1),\
+                sequence INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                outcome TEXT NOT NULL\
+            );",
+        ),
+        // Migration 29 — Phase 2 remote pairing: `devices` holds paired remote
+        // clients (hashed bearer token); `pairing_codes` holds single-use,
+        // TTL-bounded enrollment codes (hashed). IF NOT EXISTS so the replay
+        // migration tests re-run this as a no-op. Renumbered to sit after
+        // main's migration 28 (remote catalog cache) — this is the new tail
+        // established by the merge with main's #110/#112/#113/#114/#115.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS devices (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                name TEXT NOT NULL,\
+                token_hash TEXT NOT NULL UNIQUE,\
+                created_at INTEGER NOT NULL,\
+                last_seen INTEGER,\
+                revoked INTEGER NOT NULL DEFAULT 0\
+            );\
+            CREATE TABLE IF NOT EXISTS pairing_codes (\
+                code_hash TEXT PRIMARY KEY NOT NULL,\
+                expires_at INTEGER NOT NULL\
+            );",
+        ),
+        // Migration 30 — Phase 3 runner registry: extend the `gateways` table
+        // (already used for local/wsl/ssh rows) with a `remote` kind that
+        // carries a cert fingerprint (base64-std SHA-256 over the paired
+        // runner's TLS cert DER, verbatim) and an encrypted device token
+        // (`secrets::encrypt_field` — recoverable, NOT hashed, since Cockpit
+        // replays it as a bearer; contrast with the `devices` table from
+        // migration 29, which hashes). Hook-guarded (SQLite has no ADD
+        // COLUMN IF NOT EXISTS) exactly like the jobs.pre_check migration
+        // above: replaying this on a DB that already has the columns (the
+        // rewind-and-replay migration tests) must be a no-op instead of a
+        // "duplicate column" error.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_fingerprint = tx
+                .prepare("SELECT 1 FROM pragma_table_info('gateways') WHERE name='fingerprint'")?
+                .exists([])?;
+            if !has_fingerprint {
+                tx.execute("ALTER TABLE gateways ADD COLUMN fingerprint TEXT", [])?;
+            }
+            let has_device_token = tx
+                .prepare("SELECT 1 FROM pragma_table_info('gateways') WHERE name='device_token'")?
+                .exists([])?;
+            if !has_device_token {
+                tx.execute("ALTER TABLE gateways ADD COLUMN device_token TEXT", [])?;
+            }
+            Ok(())
+        }),
+        // Migration 31 — Phase 4 self-learning (spec §4/§7): cross-session
         // recall (messages_fts + sync triggers), skill telemetry, and curator
         // lifecycle state. All statements existence-guarded so the
         // rewind-and-replay migration tests re-run this as a no-op.
@@ -990,13 +1062,13 @@ fn migrations() -> Migrations<'static> {
             )?;
             Ok(())
         }),
-        // 29: group-chat orchestration. `messages.speaker` (Phase 2 added
+        // 32: group-chat orchestration. `messages.speaker` (Phase 2 added
         // `speaker` only to `sessions`, never `messages`); `orch_tasks` gains
         // its home-chat binding, per-child circuit-breaker counters, and the
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_31_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1043,7 +1115,7 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
-        // 30: app-control audit needs to record the initiating session and
+        // 33: app-control audit needs to record the initiating session and
         // the WriteOrigin. The `audit` table has existed (writerless) since
         // an early migration; these two nullable columns let Phase 6 write
         // app-control rows without overloading the gateway-oriented
@@ -1051,7 +1123,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_31_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1069,32 +1141,6 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
-        // Migration 31 — Remote catalog cache (from origin/main #113, renumbered
-        // to the tail here since Phase 4/5/6 also appended #28/#29/#30).
-        // `plugin_catalog_cache` holds the
-        // entries of the last verified signed feed (id, manifest TOML, semver,
-        // feed sequence, blocked flag+reason); `catalog_feed_state` is a single
-        // KV row tracking the last-accepted sequence + fetch outcome for
-        // anti-rollback and status. Appended as the tail after migration 30
-        // (Phase 6 audit columns). IF NOT EXISTS: the rewind-and-replay test re-runs
-        // this on an already-migrated DB, so it must be a no-op on replay.
-        M::up(
-            "CREATE TABLE IF NOT EXISTS plugin_catalog_cache (\
-                id TEXT PRIMARY KEY NOT NULL,\
-                manifest_toml TEXT NOT NULL,\
-                version TEXT NOT NULL,\
-                sequence INTEGER NOT NULL,\
-                blocked INTEGER NOT NULL DEFAULT 0,\
-                blocked_reason TEXT,\
-                fetched_at INTEGER NOT NULL\
-            );\
-            CREATE TABLE IF NOT EXISTS catalog_feed_state (\
-                id INTEGER PRIMARY KEY CHECK (id = 1),\
-                sequence INTEGER NOT NULL,\
-                updated_at INTEGER NOT NULL,\
-                outcome TEXT NOT NULL\
-            );",
-        ),
     ])
 }
 
@@ -1273,6 +1319,16 @@ fn map_curator_run_row(r: &Row) -> rusqlite::Result<CuratorRun> {
     })
 }
 
+fn map_device_row(r: &Row) -> rusqlite::Result<Device> {
+    Ok(Device {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        created_at: r.get(2)?,
+        last_seen: r.get(3)?,
+        revoked: r.get::<_, i64>(4)? != 0,
+    })
+}
+
 fn parse_plugin_oauth_token_json(raw: &str) -> anyhow::Result<Map<String, Value>> {
     let value: Value = serde_json::from_str(raw)?;
     let object = value
@@ -1429,6 +1485,20 @@ pub struct RemoteCatalogRow {
     pub blocked: bool,
     pub blocked_reason: Option<String>,
     pub fetched_at: i64,
+}
+
+/// One row of `devices`: a paired remote client. `id` is caller-assigned;
+/// `token_hash` is the SHA-256 of the device's bearer token (hashing happens
+/// in the caller — this layer only stores/compares the hash). A revoked
+/// device is kept for audit but no longer resolves via
+/// `find_device_by_token_hash`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+    pub revoked: bool,
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -3939,6 +4009,121 @@ impl Store {
         })
         .await
     }
+
+    /// Register a newly paired remote device. `token_hash` is already the
+    /// SHA-256 of the device's bearer token — this layer never sees the
+    /// plaintext token.
+    pub async fn insert_device(
+        &self,
+        id: &str,
+        name: &str,
+        token_hash: &str,
+    ) -> anyhow::Result<()> {
+        let id = id.to_string();
+        let name = name.to_string();
+        let token_hash = token_hash.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO devices(id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, name, token_hash, created_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Resolve a device by its hashed bearer token. Revoked devices never
+    /// resolve here (they still appear in `list_devices` for audit).
+    pub async fn find_device_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<Device>> {
+        let token_hash = token_hash.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT id, name, created_at, last_seen, revoked FROM devices \
+                 WHERE token_hash = ?1 AND revoked = 0",
+                params![token_hash],
+                map_device_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, created_at, last_seen, revoked FROM devices ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], map_device_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Revoke a device by id. Returns `true` iff a row was found and revoked.
+    pub async fn revoke_device(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        let rows = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE devices SET revoked = 1 WHERE id = ?1 AND revoked = 0",
+                    params![id],
+                )
+            })
+            .await?;
+        Ok(rows == 1)
+    }
+
+    pub async fn touch_device_last_seen(&self, id: &str, now_ms: i64) -> anyhow::Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE devices SET last_seen = ?2 WHERE id = ?1",
+                params![id, now_ms],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Insert a single-use, TTL-bounded pairing code. `code_hash` is already
+    /// hashed — this layer never sees the plaintext enrollment code.
+    pub async fn insert_pairing_code(
+        &self,
+        code_hash: &str,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        let code_hash = code_hash.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO pairing_codes(code_hash, expires_at) VALUES (?1, ?2)",
+                params![code_hash, expires_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Atomically consume a pairing code: deletes it iff it exists and has
+    /// not expired, returning whether it was consumed. A code can only ever
+    /// be consumed once (the row is gone after the first success).
+    pub async fn consume_pairing_code(&self, code_hash: &str, now_ms: i64) -> anyhow::Result<bool> {
+        let code_hash = code_hash.to_string();
+        let rows_affected = self
+            .with_conn(move |c| {
+                c.execute(
+                    "DELETE FROM pairing_codes WHERE code_hash = ?1 AND expires_at > ?2",
+                    params![code_hash, now_ms],
+                )
+            })
+            .await?;
+        Ok(rows_affected == 1)
+    }
 }
 
 const SESSION_COLS: &str =
@@ -5811,7 +5996,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 31, "forward migration must land at v31");
+        assert_eq!(user_version, 33, "forward migration must land at v33");
     }
 
     #[tokio::test]
@@ -5997,7 +6182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_31_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_33_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -6029,13 +6214,13 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 19)
+            c.pragma_update(None, "user_version", v - 21)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v28 here, so `harness` was
+                    // The DB is fully migrated to v30 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -6093,7 +6278,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 11)
+            c.pragma_update(None, "user_version", v - 13)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6231,7 +6416,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 31, "forward migration must land at v31");
+        assert_eq!(uv, 33, "forward migration must land at v33");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6257,7 +6442,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 31, "forward migration must land at v31");
+        assert_eq!(uv, 33, "forward migration must land at v33");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
@@ -7298,5 +7483,107 @@ mod tests {
         // replace-all semantics: a second upsert with fewer rows clears the old set
         store.upsert_remote_catalog(&[]).await.unwrap();
         assert!(store.list_remote_catalog().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_29_creates_devices_and_pairing_codes_tables() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let counts = store
+            .with_conn(|c| {
+                let devices: i64 = c.query_row("SELECT count(*) FROM devices", [], |r| r.get(0))?;
+                let codes: i64 =
+                    c.query_row("SELECT count(*) FROM pairing_codes", [], |r| r.get(0))?;
+                Ok((devices, codes))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn device_insert_find_and_revoke_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .insert_device("dev-1", "alfin-laptop", "hash-abc")
+            .await
+            .unwrap();
+
+        let found = store
+            .find_device_by_token_hash("hash-abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "dev-1");
+        assert_eq!(found.name, "alfin-laptop");
+        assert!(!found.revoked);
+        assert!(found.last_seen.is_none());
+
+        assert!(store
+            .find_device_by_token_hash("no-such-hash")
+            .await
+            .unwrap()
+            .is_none());
+
+        store.touch_device_last_seen("dev-1", 12_345).await.unwrap();
+        let touched = store
+            .find_device_by_token_hash("hash-abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(touched.last_seen, Some(12_345));
+
+        assert_eq!(store.list_devices().await.unwrap().len(), 1);
+
+        let revoked = store.revoke_device("dev-1").await.unwrap();
+        assert!(revoked);
+        // Revoked devices no longer resolve by token hash...
+        assert!(store
+            .find_device_by_token_hash("hash-abc")
+            .await
+            .unwrap()
+            .is_none());
+        // ...but still show up in the full listing, marked revoked.
+        let all = store.list_devices().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].revoked);
+
+        // Revoking an unknown device id is a no-op, not an error.
+        assert!(!store.revoke_device("no-such-device").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pairing_code_is_single_use_and_expiry_bounded() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let now = 1_700_000_000_000_i64;
+
+        store
+            .insert_pairing_code("code-hash-1", now + 60_000)
+            .await
+            .unwrap();
+
+        // First consume succeeds...
+        assert!(store
+            .consume_pairing_code("code-hash-1", now)
+            .await
+            .unwrap());
+        // ...second consume of the same (now-deleted) code fails.
+        assert!(!store
+            .consume_pairing_code("code-hash-1", now)
+            .await
+            .unwrap());
+
+        // An expired code never consumes, even on the first attempt.
+        store
+            .insert_pairing_code("code-hash-2", now - 1)
+            .await
+            .unwrap();
+        assert!(!store
+            .consume_pairing_code("code-hash-2", now)
+            .await
+            .unwrap());
     }
 }

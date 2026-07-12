@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Project, Session, SessionStatus } from "../bindings";
+import type { Project, SessionStatus } from "../bindings";
 import {
   archivedCount,
   chatSessions,
@@ -10,9 +10,11 @@ import {
   sessionTitle,
   type SessionFilterCtx,
 } from "./sidebar";
+import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
 
-function sess(pk: string, projectId: string, title: string | null, lastActive = 0): Session {
+function sess(pk: string, projectId: string, title: string | null, lastActive = 0): UiSession {
   return {
+    runnerId: LOCAL_RUNNER,
     sessionPk: pk,
     projectId,
     agentSessionId: null,
@@ -33,6 +35,10 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
   };
 }
 
+// Composite-key wrapper for the pinned/archived/readAt maps used below —
+// every fixture in this file lives on LOCAL_RUNNER.
+const K = (pk: string) => sessKey(LOCAL_RUNNER, pk);
+
 const sessions = [
   sess("a", "p1", "Fix auth", 10),
   sess("b", "p1", "Dark mode", 30),
@@ -40,7 +46,7 @@ const sessions = [
   sess("d", "p1", null, 40),
 ];
 
-const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };
+const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
 
 describe("sidebar sessions", () => {
   test("filters by project and sorts newest first", () => {
@@ -49,7 +55,7 @@ describe("sidebar sessions", () => {
   });
 
   test("pinned sessions sort first", () => {
-    const out = sessionsForProject(sessions, "p1", "", false, { a: true }, {}, noFilter);
+    const out = sessionsForProject(sessions, "p1", "", false, { [K("a")]: true }, {}, noFilter);
     expect(out[0].sessionPk).toBe("a");
   });
 
@@ -59,9 +65,9 @@ describe("sidebar sessions", () => {
   });
 
   test("archived sessions hide unless revealed", () => {
-    expect(sessionsForProject(sessions, "p1", "", false, {}, { b: true }, noFilter).map((s) => s.sessionPk)).toEqual(["d", "a"]);
-    expect(sessionsForProject(sessions, "p1", "", true, {}, { b: true }, noFilter).map((s) => s.sessionPk)).toEqual(["d", "b", "a"]);
-    expect(archivedCount(sessions, "p1", { b: true, c: true })).toBe(1);
+    expect(sessionsForProject(sessions, "p1", "", false, {}, { [K("b")]: true }, noFilter).map((s) => s.sessionPk)).toEqual(["d", "a"]);
+    expect(sessionsForProject(sessions, "p1", "", true, {}, { [K("b")]: true }, noFilter).map((s) => s.sessionPk)).toEqual(["d", "b", "a"]);
+    expect(archivedCount(sessions, "p1", { [K("b")]: true, [K("c")]: true })).toBe(1);
   });
 
   test("untitled sessions get a fallback title", () => {
@@ -77,8 +83,8 @@ describe("sidebar sessions", () => {
 
   test("chat sessions bucket separately from project sessions", () => {
     const sessions = [
-      { sessionPk: "c1", projectId: null, kind: "chat" },
-      { sessionPk: "p1", projectId: "proj", kind: "project" },
+      { sessionPk: "c1", projectId: null, kind: "chat", runnerId: LOCAL_RUNNER },
+      { sessionPk: "p1", projectId: "proj", kind: "project", runnerId: LOCAL_RUNNER },
     ] as any;
     expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
     expect(sessionsForProject(sessions, "proj", "", false, {}, {}, noFilter).map((s) => s.sessionPk)).toEqual(["p1"]);
@@ -100,8 +106,9 @@ describe("sidebar sessions", () => {
 
 // Distinct from the `sess` helper above (different field defaults); named to
 // avoid colliding with it while matching the read-state brief fixtures.
-function unreadSess(pk: string, lastActive: number | null): Session {
+function unreadSess(pk: string, lastActive: number | null): UiSession {
   return {
+    runnerId: LOCAL_RUNNER,
     sessionPk: pk,
     projectId: "p",
     agentSessionId: null,
@@ -124,26 +131,26 @@ function unreadSess(pk: string, lastActive: number | null): Session {
 
 describe("isUnreadVisible", () => {
   test("unread when lastActive is newer than the cursor", () => {
-    expect(isUnreadVisible(unreadSess("s1", 500), { s1: 100 }, null)).toBe(true);
+    expect(isUnreadVisible(unreadSess("s1", 500), { [K("s1")]: 100 }, null)).toBe(true);
   });
   test("read when lastActive is at or before the cursor", () => {
-    expect(isUnreadVisible(unreadSess("s1", 100), { s1: 100 }, null)).toBe(false);
-    expect(isUnreadVisible(unreadSess("s1", 50), { s1: 100 }, null)).toBe(false);
+    expect(isUnreadVisible(unreadSess("s1", 100), { [K("s1")]: 100 }, null)).toBe(false);
+    expect(isUnreadVisible(unreadSess("s1", 50), { [K("s1")]: 100 }, null)).toBe(false);
   });
   test("absent cursor is not unread", () => {
     expect(isUnreadVisible(unreadSess("s1", 500), {}, null)).toBe(false);
   });
   test("null lastActive is not unread", () => {
-    expect(isUnreadVisible(unreadSess("s1", null), { s1: 0 }, null)).toBe(false);
+    expect(isUnreadVisible(unreadSess("s1", null), { [K("s1")]: 0 }, null)).toBe(false);
   });
   test("the focused session is never unread", () => {
-    expect(isUnreadVisible(unreadSess("s1", 500), { s1: 100 }, "s1")).toBe(false);
+    expect(isUnreadVisible(unreadSess("s1", 500), { [K("s1")]: 100 }, { runnerId: LOCAL_RUNNER, pk: "s1" })).toBe(false);
   });
 });
 
 // Built on `unreadSess` (not the 4-arg `sess`) so the status-carrying fixture
 // shares the same project id ("p") the filter-composition tests rely on.
-function sessS(pk: string, status: SessionStatus, lastActive: number | null): Session {
+function sessS(pk: string, status: SessionStatus, lastActive: number | null): UiSession {
   return { ...unreadSess(pk, lastActive), status };
 }
 
@@ -175,7 +182,7 @@ describe("sessionsForProject filter", () => {
       false,
       {},
       {},
-      { ...noFilter, unreadOnly: true, readAt: { a: 100, b: 100 } },
+      { ...noFilter, unreadOnly: true, readAt: { [K("a")]: 100, [K("b")]: 100 } },
     );
     expect(rows.map((r) => r.sessionPk)).toEqual(["a"]);
   });
@@ -186,7 +193,7 @@ describe("sessionsForProject filter", () => {
       "p",
       "",
       false,
-      { a: true },
+      { [K("a")]: true },
       {},
       { ...noFilter, statuses: { running: true } },
     );
@@ -209,7 +216,8 @@ test("reorder no-ops on missing id or equal ids", () => {
 });
 
 test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fall after by recency", () => {
-  const mk = (pk: string, lastActive: number) => ({
+  const mk = (pk: string, lastActive: number): UiSession => ({
+    runnerId: LOCAL_RUNNER,
     sessionPk: pk,
     projectId: "p",
     agentSessionId: null,
@@ -229,14 +237,18 @@ test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fa
     parentSessionPk: null,
   });
   const sessions = [mk("a", 100), mk("b", 200), mk("c", 300)];
-  const noFilter = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };
+  const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
   // a,b,c all pinned; pinnedOrder = [c, a] → c, a first (by order), then b (unordered → recency)
-  const out = sessionsForProject(sessions, "p", "", false, { a: true, b: true, c: true }, {}, noFilter, ["c", "a"]);
+  const out = sessionsForProject(sessions, "p", "", false, { [K("a")]: true, [K("b")]: true, [K("c")]: true }, {}, noFilter, [
+    K("c"),
+    K("a"),
+  ]);
   expect(out.map((s) => s.sessionPk)).toEqual(["c", "a", "b"]);
 });
 
 test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-recency", () => {
-  const mk = (pk: string, lastActive: number) => ({
+  const mk = (pk: string, lastActive: number): UiSession => ({
+    runnerId: LOCAL_RUNNER,
     sessionPk: pk,
     projectId: "p",
     agentSessionId: null,
@@ -256,7 +268,7 @@ test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-r
     parentSessionPk: null,
   });
   const sessions = [mk("a", 100), mk("b", 300)];
-  const noFilter = { statuses: {}, unreadOnly: false, readAt: {}, focusedSessionPk: null };
+  const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
   // a pinned, b not → a first despite older lastActive (no pinnedOrder arg → default [])
-  expect(sessionsForProject(sessions, "p", "", false, { a: true }, {}, noFilter).map((s) => s.sessionPk)).toEqual(["a", "b"]);
+  expect(sessionsForProject(sessions, "p", "", false, { [K("a")]: true }, {}, noFilter).map((s) => s.sessionPk)).toEqual(["a", "b"]);
 });

@@ -3,6 +3,7 @@ import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
 import { commands, type BranchList } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
@@ -96,7 +97,8 @@ export function HomeView() {
   const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
-    if (projectId) void loadCommands(projectId);
+    // Slash commands are project metadata on the local engine.
+    if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
   }, [projectId, loadCommands]);
 
   useEffect(() => {
@@ -136,7 +138,7 @@ export function HomeView() {
     // (it errors "not a git repository").
     if (!projectId || !isGit) return;
     let cancelled = false;
-    void commands.listBranches(projectId).then((res) => {
+    void commands.listBranches(LOCAL_RUNNER, projectId).then((res) => {
       if (cancelled) return;
       if (res.status === "ok") {
         setBranchList(res.data);
@@ -172,7 +174,7 @@ export function HomeView() {
     }
     let cancelled = false;
     const t = setTimeout(() => {
-      void commands.searchFiles(projectId, contextQueryText).then((res) => {
+      void commands.searchFiles(LOCAL_RUNNER, projectId, contextQueryText).then((res) => {
         if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
       });
     }, 120);
@@ -232,7 +234,7 @@ export function HomeView() {
       // project attached above scopes the goal itself, not the session) so
       // there's somewhere for those to land and for follow-up messages to
       // steer the run (store.send's orch-steer route).
-      const chatOk = await startChat(goal, {
+      const chatOk = await startChat(LOCAL_RUNNER, goal, {
         model: nav.composerModel ?? null,
         effort: nav.composerEffort ?? null,
         context: { branch: null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
@@ -262,8 +264,13 @@ export function HomeView() {
     composerFiles.clear();
     setContextRefs([]);
     // No project attached → a chat-first session (the Home default);
-    // a picked project starts a normal project session, unchanged.
-    const ok = project ? await start(project.projectId, t, opts) : await startChat(t, opts);
+    // a picked project starts a normal project session, unchanged. Home has no
+    // runner picker yet — new sessions always start on the local engine.
+    // TODO(P3-6 deferred): add a small LOCAL/remote-runner dropdown here once
+    // `useStore().projects` is runner-scoped (today it's a single flat list
+    // sourced from the local engine only, so picking a remote runner would
+    // need its own project listing first — bigger than a composer tweak).
+    const ok = project ? await start(LOCAL_RUNNER, project.projectId, t, opts) : await startChat(LOCAL_RUNNER, t, opts);
     if (ok) nav.navigate({ kind: "session" });
     else useNav.getState().restoreDraft(draftKey, typed);
   };

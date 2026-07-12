@@ -2,6 +2,8 @@
 // and the render-time grouping of rows into visual blocks. No React, no I/O —
 // tested directly (same pattern as lib/diff.ts).
 
+import { basename } from "./paths";
+
 export type Row = {
   /** DB seq; 0 for transient error events (they carry no wire seq). */
   seq: number;
@@ -39,7 +41,19 @@ export type Row = {
   taskId: string | null;
 };
 
-export type RowAttachment = { name: string; path: string; contentType: string | null; size: number };
+export type RowAttachment = {
+  name: string;
+  path: string;
+  contentType: string | null;
+  size: number;
+  /** Root-relative path (`"{sessionPk}/{filename}"`) the authed
+   *  `GET /attachments/{*rel}` engine route expects — how the cockpit fetches
+   *  the bytes from whichever host (local or remote) actually holds them,
+   *  instead of reading `path` off its own disk. Rows persisted before this
+   *  field existed have it derived (`sessionPk + basename(path)`) by
+   *  `rowAttachments` below rather than left empty. */
+  rel: string;
+};
 
 export type ActivityItem =
   | {
@@ -134,7 +148,7 @@ function outputPreview(v: unknown): string | null {
   return JSON.stringify(v, null, 2);
 }
 
-function rowAttachments(p: Record<string, unknown>): RowAttachment[] {
+function rowAttachments(p: Record<string, unknown>, sessionPk: string): RowAttachment[] {
   if (!Array.isArray(p.attachments)) return [];
   return (p.attachments as Record<string, unknown>[]).flatMap((a) =>
     a && typeof a.path === "string"
@@ -144,6 +158,12 @@ function rowAttachments(p: Record<string, unknown>): RowAttachment[] {
             path: a.path,
             contentType: typeof a.contentType === "string" ? a.contentType : null,
             size: typeof a.size === "number" ? a.size : 0,
+            // Back-compat: rows persisted before P4-3 carry no `rel` — derive
+            // the same root-relative shape the engine now records
+            // (`attachment_display_meta`) from the session + the path's own
+            // basename, since that's exactly how the engine laid the file
+            // out (`{attachments_root}/{session_pk}/{filename}`).
+            rel: typeof a.rel === "string" && a.rel ? a.rel : `${sessionPk}/${basename(a.path)}`,
           },
         ]
       : [],
@@ -168,6 +188,11 @@ export function messageToRow(
   status: string | null,
   toolKind: string | null,
   createdAt: number | null,
+  // Only user rows ever carry attachments, so most call sites (tool_call/
+  // status/assistant rows, and every existing test of those) have no reason
+  // to pass this — optional with an inert default rather than a required
+  // 9th positional arg everywhere.
+  sessionPk = "",
   speaker: string | null = null,
 ): Row {
   const p = (payload ?? {}) as Record<string, unknown>;
@@ -183,7 +208,7 @@ export function messageToRow(
     toolName: blockType === "tool_call" && typeof p.name === "string" && p.name ? p.name : null,
     toolOutput: blockType === "tool_call" ? outputPreview(p.output) : null,
     createdAt,
-    attachments: rowAttachments(p),
+    attachments: rowAttachments(p, sessionPk),
     toolPath: blockType === "tool_call" ? toolPathOf(p) : null,
     toolInput: blockType === "tool_call" && p.input !== undefined ? p.input : null,
     toolDurationMs: blockType === "tool_call" && typeof p.duration_ms === "number" ? p.duration_ms : null,

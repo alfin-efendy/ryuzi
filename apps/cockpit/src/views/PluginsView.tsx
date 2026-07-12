@@ -3,6 +3,7 @@ import { CircleAlert, MonitorUp, Pin, PinOff, Plus, RefreshCw, Sparkles, Trash2 
 import { toast } from "sonner";
 import { Badge, Button, Combobox, Segmented, SettingsCard as Card } from "@ryuzi/ui";
 import { commands, type AppInfo, type CatalogStatus, type PluginInfo } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BlockedBadge, Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
 import { DoctorPanel } from "@/components/DoctorPanel";
 import { useApps } from "@/store-apps";
@@ -261,7 +262,7 @@ export function PluginsView() {
   const runUpdateAll = async () => {
     if (updatingAll) return;
     setUpdatingAll(true);
-    const res = await commands.updateAllPlugins();
+    const res = await commands.updateAllPlugins(LOCAL_RUNNER);
     setUpdatingAll(false);
     if (res.status === "error") {
       toast.error(`Update all failed: ${res.error.message}`);

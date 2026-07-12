@@ -17,7 +17,7 @@ beforeEach(() => {
   useUi.setState({ tabs: [], activeTabId: null });
 });
 
-const ctx = { sessionPk: "s1", workdir: "/home/u/proj" };
+const ctx = { runnerId: "local", sessionPk: "s1", workdir: "/home/u/proj" };
 
 test("path-like inline code with a :line suffix opens the file (suffix stripped)", async () => {
   render(

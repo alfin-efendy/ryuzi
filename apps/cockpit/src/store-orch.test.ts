@@ -2,15 +2,25 @@ import { beforeEach, expect, spyOn, test } from "bun:test";
 import { useStore } from "./store";
 import { commands } from "./bindings";
 import type { CoreEvent } from "./bindings";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
+
+const kHome = sessKey(LOCAL_RUNNER, "home-1");
+const kS1 = sessKey(LOCAL_RUNNER, "s1");
 
 beforeEach(() => {
-  useStore.setState({ orchTasks: {}, focusedSessionPk: null, loaded: {}, transcripts: {}, lastSeq: {} });
+  useStore.setState({ orchTasks: {}, focusedSession: null, loaded: {}, transcripts: {}, lastSeq: {} });
 });
 
 test("orchTaskChanged upserts a chip status without dropping siblings", () => {
-  useStore.getState().applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "running" } as CoreEvent);
-  useStore.getState().applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-2", root_id: "ot-root", status: "todo" } as CoreEvent);
-  useStore.getState().applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "done" } as CoreEvent);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "running" } as CoreEvent, LOCAL_RUNNER);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-2", root_id: "ot-root", status: "todo" } as CoreEvent, LOCAL_RUNNER);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "done" } as CoreEvent, LOCAL_RUNNER);
 
   const tasks = useStore.getState().orchTasks["ot-root"];
   expect(tasks.find((t) => t.id === "ot-1")?.status).toBe("done");
@@ -18,7 +28,9 @@ test("orchTaskChanged upserts a chip status without dropping siblings", () => {
 });
 
 test("a root reports its own status under its own id (root_id: null)", () => {
-  useStore.getState().applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-root", root_id: null, status: "decomposing" } as CoreEvent);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-root", root_id: null, status: "decomposing" } as CoreEvent, LOCAL_RUNNER);
 
   const tasks = useStore.getState().orchTasks["ot-root"];
   expect(tasks).toHaveLength(1);
@@ -26,20 +38,24 @@ test("a root reports its own status under its own id (root_id: null)", () => {
 });
 
 test("terminal/blocked status for a child refetches the focused session's transcript", () => {
-  useStore.setState({ focusedSessionPk: "home-1", loaded: { "home-1": true } });
+  useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "home-1" }, loaded: { [kHome]: true } });
   const listMessages = spyOn(commands, "listMessages").mockResolvedValue({ status: "ok", data: [] });
 
-  useStore.getState().applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "done" } as CoreEvent);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "done" } as CoreEvent, LOCAL_RUNNER);
 
-  expect(listMessages).toHaveBeenCalledWith("home-1");
+  expect(listMessages).toHaveBeenCalledWith(LOCAL_RUNNER, "home-1");
   listMessages.mockRestore();
 });
 
 test("a running/todo status does not trigger a refetch", () => {
-  useStore.setState({ focusedSessionPk: "home-1", loaded: { "home-1": true } });
+  useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "home-1" }, loaded: { [kHome]: true } });
   const listMessages = spyOn(commands, "listMessages").mockResolvedValue({ status: "ok", data: [] });
 
-  useStore.getState().applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "running" } as CoreEvent);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "orchTaskChanged", task_id: "ot-1", root_id: "ot-root", status: "running" } as CoreEvent, LOCAL_RUNNER);
 
   expect(listMessages).not.toHaveBeenCalled();
   listMessages.mockRestore();
@@ -79,17 +95,17 @@ test("loadOrchTasks stores the full rows returned by commands.orchTasks", async 
 });
 
 test("refetchTranscript bypasses the loaded short-circuit that hydrateTranscript honors", async () => {
-  useStore.setState({ loaded: { s1: true }, transcripts: { s1: [] }, lastSeq: { s1: 0 } });
+  useStore.setState({ loaded: { [kS1]: true }, transcripts: { [kS1]: [] }, lastSeq: { [kS1]: 0 } });
 
   // hydrateTranscript no-ops once a session is already loaded...
   const noopFetcher = async () => {
     throw new Error("hydrateTranscript should not fetch when already loaded");
   };
-  await useStore.getState().hydrateTranscript("s1", noopFetcher as never);
+  await useStore.getState().hydrateTranscript(LOCAL_RUNNER, "s1", noopFetcher as never);
 
   // ...but refetchTranscript forces the fetch through regardless.
   let called = false;
-  await useStore.getState().refetchTranscript("s1", async () => {
+  await useStore.getState().refetchTranscript(LOCAL_RUNNER, "s1", async () => {
     called = true;
     return [];
   });
@@ -104,7 +120,7 @@ test("answering a block calls orchAnswerBlock with the task id", async () => {
 });
 
 test("startOrchestration submits when both a project and a focused home session are present", async () => {
-  useStore.setState({ selectedProjectId: "p1", focusedSessionPk: "home-1" });
+  useStore.setState({ selectedProjectId: "p1", focusedSession: { runnerId: LOCAL_RUNNER, pk: "home-1" } });
   const submit = spyOn(commands, "orchSubmit").mockResolvedValue({ status: "ok", data: "root-1" });
   await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(true);
   expect(submit).toHaveBeenCalledWith("p1", "fix the bug", true, "home-1");
@@ -114,10 +130,10 @@ test("startOrchestration submits when both a project and a focused home session 
 test("startOrchestration is a no-op without both an attached project and a focused home session", async () => {
   const submit = spyOn(commands, "orchSubmit");
 
-  useStore.setState({ selectedProjectId: null, focusedSessionPk: "home-1" });
+  useStore.setState({ selectedProjectId: null, focusedSession: { runnerId: LOCAL_RUNNER, pk: "home-1" } });
   await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(false);
 
-  useStore.setState({ selectedProjectId: "p1", focusedSessionPk: null });
+  useStore.setState({ selectedProjectId: "p1", focusedSession: null });
   await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(false);
 
   expect(submit).not.toHaveBeenCalled();
@@ -130,7 +146,7 @@ test("send steers a live orchestration and does not also send a normal chat turn
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const steerSession = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
 
-  await expect(useStore.getState().send("home-1", "cancel the build task", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "home-1", "cancel the build task", null)).resolves.toBe(true);
   expect(steer).toHaveBeenCalledWith("home-1", "cancel the build task");
   expect(cont).not.toHaveBeenCalled();
   expect(steerSession).not.toHaveBeenCalled();
@@ -146,15 +162,17 @@ test("send falls through to the normal path when orchSteer reports no live orche
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = spyOn(commands, "listGateways").mockResolvedValue({ status: "ok", data: [] });
 
-  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
   expect(steer).toHaveBeenCalledWith("s1", "hi");
-  expect(cont).toHaveBeenCalledWith("s1", "hi", null);
+  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hi", null);
 
   steer.mockRestore();
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });
 
 test("send falls through to the normal path when orchSteer itself errors", async () => {
@@ -163,12 +181,14 @@ test("send falls through to the normal path when orchSteer itself errors", async
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = spyOn(commands, "listGateways").mockResolvedValue({ status: "ok", data: [] });
 
-  await expect(useStore.getState().send("s1", "hi", null)).resolves.toBe(true);
-  expect(cont).toHaveBeenCalledWith("s1", "hi", null);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hi", null);
 
   steer.mockRestore();
   cont.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
+  listGateways.mockRestore();
 });

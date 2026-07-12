@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const gitDiff = mock(async () => ({ status: "ok" as const, data: "" }));
 const sessionWorkdir = mock(async () => ({ status: "ok" as const, data: "/work/demo" }));
@@ -16,7 +17,7 @@ const { useNav } = await import("@/store-nav");
 
 beforeEach(() => {
   useDiff.setState({
-    bySession: { s1: { files: [], loading: false, error: null } },
+    bySession: { [sessKey(LOCAL_RUNNER, "s1")]: { files: [], loading: false, error: null } },
     pendingReview: null,
   });
   useNav.setState({ rightOpen: false, rightTab: "file" });
@@ -27,6 +28,7 @@ afterEach(cleanup);
 test("Review opens the right panel on the selected changed file", () => {
   render(
     <FileChangeCards
+      runnerId={LOCAL_RUNNER}
       sessionPk="s1"
       cards={[
         {
@@ -39,7 +41,7 @@ test("Review opens the right panel on the selected changed file", () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Review" }));
 
-  expect(useDiff.getState().pendingReview).toEqual({ sessionPk: "s1", path: "src/app.ts" });
+  expect(useDiff.getState().pendingReview).toEqual({ runnerId: LOCAL_RUNNER, sessionPk: "s1", path: "src/app.ts" });
   expect(useNav.getState().rightOpen).toBe(true);
   expect(useNav.getState().rightTab).toBe("review");
 });

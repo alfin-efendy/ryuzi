@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, InstalledSkillPack, Result, SkillInstallBegin, TrustPromptDto } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // The modal talks only to the Tauri IPC boundary (`@/bindings`) and the real
 // `usePlugins` zustand store (for `load()` after a successful install) —
@@ -107,7 +108,7 @@ test("arbitrary source shows the trust-ack step before installing", async () => 
   expect(await screen.findByText(/acme\/p/)).toBeTruthy();
   expect(screen.getByText(/tool\.before\/g\.sh/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: /Install|Trust/ }));
-  await waitFor(() => expect(confirmSkillInstall).toHaveBeenCalledWith("t"));
+  await waitFor(() => expect(confirmSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "t"));
 });
 
 test("shows the manual source-entry step when no initialSource is given", async () => {
@@ -120,7 +121,7 @@ test("shows the manual source-entry step when no initialSource is given", async 
   fireEvent.change(input, { target: { value: "obra/superpowers" } });
   fireEvent.click(screen.getByRole("button", { name: "Install" }));
 
-  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith("obra/superpowers"));
+  await waitFor(() => expect(beginSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "obra/superpowers"));
   expect(await screen.findByText(/tool\.before\/g\.sh/)).toBeTruthy();
 });
 
@@ -157,7 +158,7 @@ test("confirming installs, reloads the plugin list, and closes", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Trust & Install" }));
 
-  await waitFor(() => expect(confirmSkillInstall).toHaveBeenCalledWith("t"));
+  await waitFor(() => expect(confirmSkillInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "t"));
   await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Acme Pack installed"));
   expect(listPlugins).toHaveBeenCalled();
   expect(onClose).toHaveBeenCalled();

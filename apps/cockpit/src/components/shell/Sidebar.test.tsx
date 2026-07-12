@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { Project, Session } from "@/bindings";
+import type { Project } from "@/bindings";
+import { LOCAL_RUNNER, sessKey, type UiSession } from "@/lib/session-key";
 
 const worktreeDirty = mock(async () => ({ status: "ok" as const, data: { dirty: true, unmergedCommits: 0 } }));
 const termCloseSession = mock(async () => ({ status: "ok" as const, data: null }));
@@ -28,7 +29,8 @@ const project: Project = {
   isGit: true,
 };
 
-const session: Session = {
+const session: UiSession = {
+  runnerId: LOCAL_RUNNER,
   sessionPk: "s1",
   projectId: "p1",
   agentSessionId: null,
@@ -48,7 +50,7 @@ const session: Session = {
   parentSessionPk: null,
 };
 
-const endSession = mock((_sessionPk: string): Promise<boolean> => Promise.resolve(true));
+const endSession = mock((_runnerId: string, _sessionPk: string): Promise<boolean> => Promise.resolve(true));
 
 beforeEach(() => {
   worktreeDirty.mockClear();
@@ -59,7 +61,7 @@ beforeEach(() => {
     sessions: [session],
     transcripts: {},
     pendingApprovals: [],
-    focusedSessionPk: null,
+    focusedSession: null,
     selectedProjectId: null,
     end: endSession,
   });
@@ -118,10 +120,10 @@ test("busy archive locks every dismissal path until teardown settles", async () 
 
   await act(async () => resolveClose?.({ status: "ok", data: null }));
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Archive session?" })).toBeNull());
-  expect(endSession).toHaveBeenCalledWith("s1");
+  expect(endSession).toHaveBeenCalledWith(LOCAL_RUNNER, "s1");
 });
 
-function sessionFixture(pk: string, lastActive: number): Session {
+function sessionFixture(pk: string, lastActive: number): UiSession {
   return {
     ...session,
     sessionPk: pk,
@@ -134,12 +136,15 @@ function sessionFixture(pk: string, lastActive: number): Session {
   };
 }
 
+const k1 = sessKey(LOCAL_RUNNER, "s1");
+const k2 = sessKey(LOCAL_RUNNER, "s2");
+
 test("renders an unread dot for an unread, non-focused session", () => {
-  useUi.setState({ readAt: { s1: 100, s2: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100, [k2]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
   useStore.setState({
     projects: [project],
     sessions: [sessionFixture("s1", 500), sessionFixture("s2", 50)],
-    focusedSessionPk: null,
+    focusedSession: null,
     pendingApprovals: [],
   });
   render(<Sidebar />);
@@ -148,11 +153,11 @@ test("renders an unread dot for an unread, non-focused session", () => {
 });
 
 test("does not show an unread dot for the focused session even if unseen", () => {
-  useUi.setState({ readAt: { s1: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
   useStore.setState({
     projects: [project],
     sessions: [sessionFixture("s1", 500)],
-    focusedSessionPk: "s1",
+    focusedSession: { runnerId: LOCAL_RUNNER, pk: "s1" },
     pendingApprovals: [],
   });
   render(<Sidebar />);

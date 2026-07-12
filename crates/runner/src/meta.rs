@@ -20,6 +20,7 @@ pub fn help_text() -> String {
         "  service            manage the system service: ryuzi service <install|uninstall|status>",
         "  doctor             check your environment (git, settings)",
         "  config             read/write settings: ryuzi config <get|set|list> ...",
+        "  pair               issue a single-use pairing code (--list, --revoke <id>)",
     ]
     .join("\n")
 }

@@ -1,31 +1,39 @@
 import type { CoreEvent, Session } from "@/bindings";
 import { isUnreadVisible, sessionTitle } from "@/lib/sidebar";
+import { sessKey, type SessionRef, type UiSession } from "@/lib/session-key";
 
 /** Total items needing the user: unread sessions + pending approvals. The
  *  focused session is never counted (isUnreadVisible excludes it). */
 export function attentionCount(
-  sessions: Session[],
+  sessions: UiSession[],
   readAt: Record<string, number>,
-  focusedSessionPk: string | null,
+  focusedSession: SessionRef | null,
   pendingApprovalCount: number,
 ): number {
-  const unread = sessions.filter((s) => isUnreadVisible(s, readAt, focusedSessionPk)).length;
+  const unread = sessions.filter((s) => isUnreadVisible(s, readAt, focusedSession)).length;
   return unread + pendingApprovalCount;
 }
 
-export type NotifyIntent = { sessionPk: string; kind: "finished" | "approval" | "error"; settle: boolean; detail?: string } | null;
+export type NotifyIntent = {
+  runnerId: string;
+  sessionPk: string;
+  kind: "finished" | "approval" | "error";
+  settle: boolean;
+  detail?: string;
+} | null;
 
 /** What (if anything) to notify for a CoreEvent. Suppressed entirely while the
- *  window is focused (the in-app unread dot already signals it). */
-export function notifyIntentForEvent(event: CoreEvent, _focusedSessionPk: string | null, windowFocused: boolean): NotifyIntent {
+ *  window is focused (the in-app unread dot already signals it). `runnerId` is
+ *  the runner that produced the event. */
+export function notifyIntentForEvent(event: CoreEvent, runnerId: string, windowFocused: boolean): NotifyIntent {
   if (windowFocused) return null;
   switch (event.kind) {
     case "result":
-      return { sessionPk: event.session_pk, kind: "finished", settle: true };
+      return { runnerId, sessionPk: event.session_pk, kind: "finished", settle: true };
     case "approvalRequested":
-      return { sessionPk: event.session_pk, kind: "approval", settle: false, detail: event.tool };
+      return { runnerId, sessionPk: event.session_pk, kind: "approval", settle: false, detail: event.tool };
     case "error":
-      return { sessionPk: event.session_pk, kind: "error", settle: false };
+      return { runnerId, sessionPk: event.session_pk, kind: "error", settle: false };
     default:
       return null;
   }
@@ -44,7 +52,7 @@ export type NotifierDeps = {
 
 export type Notifier = {
   handle(intent: NonNullable<NotifyIntent>, session: Session | undefined): void;
-  cancelSettle(sessionPk: string): void;
+  cancelSettle(runnerId: string, sessionPk: string): void;
   cancelAllSettles(): void;
   updateBadge(count: number): void;
 };
@@ -63,15 +71,18 @@ export function notificationText(intent: NonNullable<NotifyIntent>, session: Ses
 }
 
 export function createNotifier(deps: NotifierDeps): Notifier {
+  // Keyed by `sessKey(runnerId, sessionPk)` — settles must not collide across
+  // runners that share a session pk.
   const settles = new Map<string, () => void>();
   // Real counts are >= 0, so -1 guarantees the first updateBadge call fires.
   let lastBadge = -1;
 
-  const cancelSettle = (sessionPk: string) => {
-    const cancel = settles.get(sessionPk);
+  const cancelSettle = (runnerId: string, sessionPk: string) => {
+    const key = sessKey(runnerId, sessionPk);
+    const cancel = settles.get(key);
     if (cancel) {
       cancel();
-      settles.delete(sessionPk);
+      settles.delete(key);
     }
   };
 
@@ -84,15 +95,16 @@ export function createNotifier(deps: NotifierDeps): Notifier {
 
   return {
     handle(intent, session) {
+      const key = sessKey(intent.runnerId, intent.sessionPk);
       // Any new event for a session supersedes its pending "finished" settle.
-      cancelSettle(intent.sessionPk);
+      cancelSettle(intent.runnerId, intent.sessionPk);
       if (!deps.isEnabled()) return;
       if (intent.settle) {
         const cancel = deps.schedule(() => {
-          settles.delete(intent.sessionPk);
+          settles.delete(key);
           send(intent, session);
         }, SETTLE_MS);
-        settles.set(intent.sessionPk, cancel);
+        settles.set(key, cancel);
       } else {
         send(intent, session);
       }
@@ -117,12 +129,12 @@ import { useStore } from "@/store";
 
 /** Convenience: the badge number for the current store slices. */
 export function badgeCountFor(
-  sessions: Session[],
+  sessions: UiSession[],
   readAt: Record<string, number>,
-  focusedSessionPk: string | null,
+  focusedSession: SessionRef | null,
   pendingApprovalCount: number,
 ): number {
-  return attentionCount(sessions, readAt, focusedSessionPk, pendingApprovalCount);
+  return attentionCount(sessions, readAt, focusedSession, pendingApprovalCount);
 }
 
 let permissionChecked = false;
@@ -187,7 +199,7 @@ export function initNotifications(): void {
 
   const recomputeBadge = () => {
     const st = useStore.getState();
-    notifier.updateBadge(badgeCountFor(st.sessions, useUi.getState().readAt, st.focusedSessionPk, st.pendingApprovals.length));
+    notifier.updateBadge(badgeCountFor(st.sessions, useUi.getState().readAt, st.focusedSession, st.pendingApprovals.length));
   };
   useStore.subscribe(recomputeBadge);
   useUi.subscribe(recomputeBadge);

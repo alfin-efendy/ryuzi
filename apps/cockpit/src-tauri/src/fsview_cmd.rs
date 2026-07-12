@@ -2,20 +2,26 @@
 //! family — real file tree, real git diff, and project-wide filename search
 //! for the ⌘K palette.
 
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use std::sync::Arc;
 use tauri::State;
 
-pub use ryuzi_core::api::fsview_api::{DirEntryInfo, WorktreeState};
+pub use ryuzi_core::api::fsview_api::{DirEntryInfo, MediaFile, WorktreeState};
 
 type R<T> = Result<T, CmdError>;
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_dir(engine: Engine<'_>, session_pk: String, rel: String) -> R<Vec<DirEntryInfo>> {
-    engine
+pub async fn list_dir(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    rel: String,
+) -> R<Vec<DirEntryInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "list_dir",
             serde_json::json!({ "session_pk": session_pk, "rel": rel }),
@@ -26,8 +32,13 @@ pub async fn list_dir(engine: Engine<'_>, session_pk: String, rel: String) -> R<
 /// Absolute root path of the session's working tree (for opening files).
 #[tauri::command]
 #[specta::specta]
-pub async fn session_workdir(engine: Engine<'_>, session_pk: String) -> R<String> {
-    engine
+pub async fn session_workdir(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<String> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "session_workdir",
             serde_json::json!({ "session_pk": session_pk }),
@@ -41,8 +52,14 @@ pub async fn session_workdir(engine: Engine<'_>, session_pk: String) -> R<String
 /// must fail silent.
 #[tauri::command]
 #[specta::specta]
-pub async fn file_exists(engine: Engine<'_>, session_pk: String, rel: String) -> R<bool> {
-    engine
+pub async fn file_exists(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    rel: String,
+) -> R<bool> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "file_exists",
             serde_json::json!({ "session_pk": session_pk, "rel": rel }),
@@ -57,8 +74,13 @@ pub async fn file_exists(engine: Engine<'_>, session_pk: String, rel: String) ->
 /// is the user's business, not the session's.
 #[tauri::command]
 #[specta::specta]
-pub async fn worktree_dirty(engine: Engine<'_>, session_pk: String) -> R<WorktreeState> {
-    engine
+pub async fn worktree_dirty(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<WorktreeState> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "worktree_dirty",
             serde_json::json!({ "session_pk": session_pk }),
@@ -68,16 +90,27 @@ pub async fn worktree_dirty(engine: Engine<'_>, session_pk: String) -> R<Worktre
 
 #[tauri::command]
 #[specta::specta]
-pub async fn git_diff(engine: Engine<'_>, session_pk: String) -> R<String> {
-    engine
+pub async fn git_diff(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<String> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("git_diff", serde_json::json!({ "session_pk": session_pk }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn search_files(engine: Engine<'_>, project_id: String, query: String) -> R<Vec<String>> {
-    engine
+pub async fn search_files(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    query: String,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "search_files",
             serde_json::json!({ "project_id": project_id, "query": query }),
@@ -85,11 +118,56 @@ pub async fn search_files(engine: Engine<'_>, project_id: String, query: String)
         .await
 }
 
+/// Session-workdir text read for the file viewer — jailed and size-capped on
+/// the engine side (see `fsview_api::read_file`). Remote-safe: reads happen
+/// on the runner, never on this machine's disk.
+#[tauri::command]
+#[specta::specta]
+pub async fn read_file(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    rel: String,
+) -> R<String> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "read_file",
+            serde_json::json!({ "session_pk": session_pk, "rel": rel }),
+        )
+        .await
+}
+
+/// Session-workdir binary read for the file viewer's image/svg preview —
+/// jailed and size-capped on the engine side (see `fsview_api::read_file_base64`).
+#[tauri::command]
+#[specta::specta]
+pub async fn read_file_base64(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    rel: String,
+) -> R<MediaFile> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "read_file_base64",
+            serde_json::json!({ "session_pk": session_pk, "rel": rel }),
+        )
+        .await
+}
+
 /// Revert one file in the session workdir to HEAD (Undo on a file-edit card).
 #[tauri::command]
 #[specta::specta]
-pub async fn revert_file(engine: Engine<'_>, session_pk: String, path: String) -> R<()> {
-    engine
+pub async fn revert_file(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    path: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "revert_file",
             serde_json::json!({ "session_pk": session_pk, "path": path }),

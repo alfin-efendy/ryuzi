@@ -37,10 +37,101 @@ pub fn required_for_provider(provider: &str) -> bool {
 }
 
 pub fn apply_request_cloak(body: &mut Value, access_token: &str, session_id: &str) -> ToolNameMap {
+    normalize_tool_input_schemas(body);
     let map = cloak_tools(body);
     inject_billing_block(body);
     inject_user_id(body, access_token, session_id);
     map
+}
+
+fn normalize_tool_input_schemas(body: &mut Value) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        if let Some(schema) = tool.get_mut("input_schema") {
+            normalize_top_level_combinators(schema);
+        }
+    }
+}
+
+fn normalize_top_level_combinators(schema: &mut Value) {
+    const COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+    let Some(root) = schema.as_object_mut() else {
+        return;
+    };
+    if !COMBINATORS.iter().any(|key| root.contains_key(*key)) {
+        return;
+    }
+
+    let mut properties = match root.remove("properties") {
+        Some(Value::Object(properties)) => properties,
+        _ => serde_json::Map::new(),
+    };
+    let mut required = required_names(root.remove("required"));
+
+    for keyword in COMBINATORS {
+        let branches = match root.remove(keyword) {
+            Some(Value::Array(branches)) => branches,
+            _ => continue,
+        };
+        let branch_required = branches
+            .iter()
+            .map(|branch| required_names(branch.get("required").cloned()))
+            .collect::<Vec<_>>();
+
+        for branch in &branches {
+            let Some(branch_properties) = branch.get("properties").and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (name, definition) in branch_properties {
+                properties
+                    .entry(name.clone())
+                    .or_insert_with(|| definition.clone());
+            }
+        }
+
+        let inferred_required = if keyword == "allOf" {
+            branch_required.into_iter().flatten().collect::<Vec<_>>()
+        } else {
+            let mut alternatives = branch_required.into_iter();
+            let mut common = alternatives.next().unwrap_or_default();
+            for alternative in alternatives {
+                common.retain(|name| alternative.contains(name));
+            }
+            common
+        };
+        for name in inferred_required {
+            if !required.contains(&name) {
+                required.push(name);
+            }
+        }
+    }
+
+    root.insert("type".into(), json!("object"));
+    if !properties.is_empty() {
+        root.insert("properties".into(), Value::Object(properties));
+    }
+    if !required.is_empty() {
+        root.insert("required".into(), json!(required));
+    }
+}
+
+fn required_names(value: Option<Value>) -> Vec<String> {
+    let Some(Value::Array(names)) = value else {
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .fold(Vec::new(), |mut unique, name| {
+            if !unique.contains(&name) {
+                unique.push(name);
+            }
+            unique
+        })
 }
 
 pub fn tool_name_map_from_request(body: &Value) -> ToolNameMap {
@@ -338,6 +429,90 @@ mod tests {
         let user_id = body["metadata"]["user_id"].as_str().unwrap();
         assert!(user_id.contains("\"device_id\""));
         assert!(user_id.contains("\"session_id\":\"session-1\""));
+    }
+
+    #[test]
+    fn request_cloak_normalizes_top_level_tool_schema_combinators() {
+        let mut body = json!({
+            "tools": [
+                {
+                    "name": "task",
+                    "input_schema": {
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "properties": {
+                                    "description": {"type": "string"},
+                                    "prompt": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"}
+                                        ]
+                                    }
+                                },
+                                "required": ["description", "prompt"]
+                            },
+                            {
+                                "properties": {
+                                    "description": {"type": "string"},
+                                    "tasks": {"type": "array"}
+                                },
+                                "required": ["description", "tasks"]
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "lookup",
+                    "input_schema": {
+                        "anyOf": [
+                            {"properties": {"query": {"type": "string"}}},
+                            {"properties": {"id": {"type": "integer"}}}
+                        ]
+                    }
+                },
+                {
+                    "name": "write",
+                    "input_schema": {
+                        "allOf": [
+                            {
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"]
+                            },
+                            {
+                                "properties": {"content": {"type": "string"}},
+                                "required": ["content"]
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        super::apply_request_cloak(&mut body, "sk-ant-oat-test", "session-1");
+
+        let task_schema = &body["tools"][0]["input_schema"];
+        assert_eq!(task_schema["type"], "object");
+        assert!(task_schema.get("oneOf").is_none());
+        assert!(task_schema["properties"].get("prompt").is_some());
+        assert!(task_schema["properties"].get("tasks").is_some());
+        assert_eq!(
+            task_schema["properties"]["prompt"]["anyOf"],
+            json!([{"type": "string"}, {"type": "null"}]),
+            "nested combinators remain supported"
+        );
+        assert_eq!(task_schema["required"], json!(["description"]));
+
+        let lookup_schema = &body["tools"][1]["input_schema"];
+        assert_eq!(lookup_schema["type"], "object");
+        assert!(lookup_schema.get("anyOf").is_none());
+        assert!(lookup_schema["properties"].get("query").is_some());
+        assert!(lookup_schema["properties"].get("id").is_some());
+
+        let write_schema = &body["tools"][2]["input_schema"];
+        assert_eq!(write_schema["type"], "object");
+        assert!(write_schema.get("allOf").is_none());
+        assert_eq!(write_schema["required"], json!(["path", "content"]));
     }
 
     #[test]

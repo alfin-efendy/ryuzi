@@ -4,7 +4,7 @@
 //! Result/Error events. `parse_natural_schedule` stays local — a pure wrapper
 //! around `scheduler::natural_to_cron` that needs no engine round-trip.
 
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use std::sync::Arc;
 use tauri::State;
@@ -16,26 +16,38 @@ use tauri::State;
 pub use ryuzi_core::api::types::{JobInfo, JobInput, RunInfo};
 
 type R<T> = Result<T, CmdError>;
-type Engine<'a> = State<'a, Arc<EngineClient>>;
+type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn list_jobs(engine: Engine<'_>) -> R<Vec<JobInfo>> {
-    engine.rpc("list_jobs", serde_json::json!({})).await
+pub async fn list_jobs(engine: Engine<'_>, runner_id: Option<String>) -> R<Vec<JobInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client.rpc("list_jobs", serde_json::json!({})).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn create_job(engine: Engine<'_>, input: JobInput) -> R<Vec<JobInfo>> {
-    engine
+pub async fn create_job(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    input: JobInput,
+) -> R<Vec<JobInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("create_job", serde_json::json!({ "input": input }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_job(engine: Engine<'_>, id: String, input: JobInput) -> R<Vec<JobInfo>> {
-    engine
+pub async fn update_job(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    input: JobInput,
+) -> R<Vec<JobInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "update_job",
             serde_json::json!({ "id": id, "input": input }),
@@ -45,8 +57,14 @@ pub async fn update_job(engine: Engine<'_>, id: String, input: JobInput) -> R<Ve
 
 #[tauri::command]
 #[specta::specta]
-pub async fn toggle_job(engine: Engine<'_>, id: String, enabled: bool) -> R<Vec<JobInfo>> {
-    engine
+pub async fn toggle_job(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    enabled: bool,
+) -> R<Vec<JobInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc(
             "toggle_job",
             serde_json::json!({ "id": id, "enabled": enabled }),
@@ -56,16 +74,26 @@ pub async fn toggle_job(engine: Engine<'_>, id: String, enabled: bool) -> R<Vec<
 
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_job(engine: Engine<'_>, id: String) -> R<Vec<JobInfo>> {
-    engine
+pub async fn delete_job(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<JobInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("delete_job", serde_json::json!({ "id": id }))
         .await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn run_job_now(engine: Engine<'_>, id: String) -> R<Vec<JobInfo>> {
-    engine
+pub async fn run_job_now(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<JobInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
         .rpc("run_job_now", serde_json::json!({ "id": id }))
         .await
 }

@@ -10,7 +10,7 @@ use crate::serve::ApiState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) const HANDLES: &[&str] = &[
     "list_dir",
@@ -20,7 +20,52 @@ pub(crate) const HANDLES: &[&str] = &[
     "git_diff",
     "search_files",
     "revert_file",
+    "read_file",
+    "read_file_base64",
 ];
+
+/// Largest file the viewer will load into memory as text.
+pub const MAX_READ_BYTES: u64 = 2 * 1024 * 1024; // 2 MB cap
+
+/// Largest media file inlined as a base64 preview — shared by the
+/// session-workdir file viewer (this module) and the composer's
+/// client-local media previews (`commands::read_local_media`).
+pub const MAX_MEDIA_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFile {
+    pub data_base64: String,
+    pub content_type: Option<String>,
+}
+
+/// Best-effort content type from a file extension — `None` (and thus no data
+/// URL mime) for anything unrecognized, including svg (callers force
+/// `image/svg+xml` themselves since it's always trustworthy text).
+pub fn content_type_for_path(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" | "md" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml" | "yaml" | "yml" => {
+            Some("text/plain".to_string())
+        }
+        "png" => Some("image/png".to_string()),
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "gif" => Some("image/gif".to_string()),
+        "pdf" => Some("application/pdf".to_string()),
+        "zip" => Some("application/zip".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        "mp4" => Some("video/mp4".to_string()),
+        "webm" => Some("video/webm".to_string()),
+        "mov" => Some("video/quicktime".to_string()),
+        "mkv" => Some("video/x-matroska".to_string()),
+        "mp3" => Some("audio/mpeg".to_string()),
+        "wav" => Some("audio/wav".to_string()),
+        "ogg" => Some("audio/ogg".to_string()),
+        "m4a" => Some("audio/mp4".to_string()),
+        "flac" => Some("audio/flac".to_string()),
+        _ => None,
+    }
+}
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -145,8 +190,90 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let root = session_root(cp, &a.session_pk).await?;
             ok(fsview::revert_file(&root.to_string_lossy(), &a.path).await?)
         }
+        "read_file" => {
+            let a: ListDirP = params(p)?;
+            ok(read_file(cp, &a.session_pk, &a.rel).await?)
+        }
+        "read_file_base64" => {
+            let a: ListDirP = params(p)?;
+            ok(read_file_base64(cp, &a.session_pk, &a.rel).await?)
+        }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
+}
+
+/// Resolve `rel` inside `root`'s jail and enforce a byte-size cap before any
+/// content is read — escapes/absolute paths and oversize files both fail as
+/// a 400, and neither ever gets its bytes touched.
+///
+/// `fsview::jail` itself is lexical-only (it rejects absolute paths and `..`
+/// components but doesn't touch the filesystem), which is correct for its
+/// other callers (`list_dir`/`search_files`/`git_diff` may legitimately
+/// target non-existent or not-yet-existing paths). A file READ needs the
+/// stronger guarantee: canonicalize both `root` and the joined path and
+/// re-check with `starts_with`, so a symlink planted inside the session root
+/// that points outside it is caught too — mirroring `serve.rs`'s
+/// `get_attachment` jail (the other read surface in this crate) rather than
+/// changing `fsview::jail`'s shared lexical behavior. A canonicalize failure
+/// (missing file, dangling symlink, permission error) folds into the same
+/// not_found as a metadata miss, so a jail escape and a missing file are
+/// indistinguishable to the caller.
+async fn jailed_readable(root: &Path, rel: &str, cap: u64) -> Result<PathBuf, ApiError> {
+    let path = fsview::jail(root, rel).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let root_canon = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
+    let target_canon = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
+    if !target_canon.starts_with(&root_canon) {
+        return Err(ApiError::not_found(format!(
+            "cannot read {rel}: {rel} escapes the workspace"
+        )));
+    }
+
+    let meta = tokio::fs::metadata(&target_canon)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
+    if meta.len() > cap {
+        return Err(ApiError::bad_request(format!(
+            "file too large ({} bytes)",
+            meta.len()
+        )));
+    }
+    Ok(target_canon)
+}
+
+/// Session-workdir text read for the file viewer — jailed to the session's
+/// root and capped at [`MAX_READ_BYTES`]. Remote-safe: never touches the
+/// caller's local disk, only the runner's.
+async fn read_file(cp: &ControlPlane, session_pk: &str, rel: &str) -> Result<String, ApiError> {
+    let root = session_root(cp, session_pk).await?;
+    let path = jailed_readable(&root, rel, MAX_READ_BYTES).await?;
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))
+}
+
+/// Session-workdir binary read for the file viewer's image/svg preview —
+/// jailed and capped at [`MAX_MEDIA_READ_BYTES`], base64-encoded for the
+/// data-URL the viewer renders.
+async fn read_file_base64(
+    cp: &ControlPlane,
+    session_pk: &str,
+    rel: &str,
+) -> Result<MediaFile, ApiError> {
+    use base64::Engine as _;
+    let root = session_root(cp, session_pk).await?;
+    let path = jailed_readable(&root, rel, MAX_MEDIA_READ_BYTES).await?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ApiError::not_found(format!("cannot read {rel}: {e}")))?;
+    Ok(MediaFile {
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        content_type: content_type_for_path(&path),
+    })
 }
 
 async fn list_dir(
@@ -356,5 +483,181 @@ mod tests {
         assert!(!st.dirty);
         assert_eq!(st.unmerged_commits, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session whose worktree is `worktree`, bypassing the project lookup
+    /// entirely — `session_root` returns it directly since the dir exists.
+    async fn insert_worktree_session(cp: &ControlPlane, session_pk: &str, worktree: &str) {
+        let now = crate::paths::now_ms();
+        cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: session_pk.into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: Some(worktree.into()),
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_file_round_trips_a_normal_file() {
+        let s = state().await;
+        let dir = fresh_dir("read-file-ok");
+        std::fs::write(dir.join("hello.txt"), "hi there").unwrap();
+        insert_worktree_session(&s.cp, "sess-read-ok", dir.to_str().unwrap()).await;
+        let out = dispatch(
+            &s,
+            "read_file",
+            json!({"session_pk": "sess-read-ok", "rel": "hello.txt"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, json!("hi there"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_parent_traversal() {
+        let s = state().await;
+        let dir = fresh_dir("read-file-traversal");
+        insert_worktree_session(&s.cp, "sess-read-trav", dir.to_str().unwrap()).await;
+        let err = dispatch(
+            &s,
+            "read_file",
+            json!({"session_pk": "sess-read-trav", "rel": "../etc/passwd"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 400, "got: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_an_absolute_path() {
+        let s = state().await;
+        let dir = fresh_dir("read-file-absolute");
+        insert_worktree_session(&s.cp, "sess-read-abs", dir.to_str().unwrap()).await;
+        let abs = if cfg!(windows) {
+            "C:\\Windows\\win.ini"
+        } else {
+            "/etc/passwd"
+        };
+        let err = dispatch(
+            &s,
+            "read_file",
+            json!({"session_pk": "sess-read-abs", "rel": abs}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 400, "got: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn jailed_readable_rejects_a_file_over_the_cap() {
+        let dir = fresh_dir("read-file-cap");
+        std::fs::write(dir.join("big.txt"), "0123456789").unwrap(); // 10 bytes
+        let err = jailed_readable(&dir, "big.txt", 5).await.unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(err.message.contains("too large"), "got: {}", err.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Symlink creation on Windows normally requires elevated privileges (or
+    // Developer Mode), unlike Unix — so this proves the canonicalize +
+    // starts_with jail escape check on the platform where it's cheap to set
+    // up. The check itself (`jailed_readable`'s canonicalize/starts_with
+    // logic) compiles and runs on every platform; only this symlink fixture
+    // is unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jailed_readable_rejects_a_symlink_escaping_the_root() {
+        let outside = fresh_dir("read-file-symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").unwrap();
+
+        let root = fresh_dir("read-file-symlink-root");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+
+        let err = jailed_readable(&root, "link.txt", MAX_READ_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, 404, "got: {err:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// `read_file` end-to-end through `dispatch`, proving the jail escape is
+    /// caught at the RPC layer too, not just in the `jailed_readable` helper.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_a_symlink_escaping_the_session_root() {
+        let s = state().await;
+        let outside = fresh_dir("read-file-rpc-symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "outside secret").unwrap();
+
+        let dir = fresh_dir("read-file-rpc-symlink-root");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("link.txt")).unwrap();
+        insert_worktree_session(&s.cp, "sess-read-symlink", dir.to_str().unwrap()).await;
+
+        let err = dispatch(
+            &s,
+            "read_file",
+            json!({"session_pk": "sess-read-symlink", "rel": "link.txt"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404, "got: {err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn read_file_base64_round_trips_and_resolves_content_type() {
+        use base64::Engine as _;
+        let s = state().await;
+        let dir = fresh_dir("read-file-b64");
+        std::fs::write(dir.join("shot.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+        insert_worktree_session(&s.cp, "sess-read-b64", dir.to_str().unwrap()).await;
+        let out = dispatch(
+            &s,
+            "read_file_base64",
+            json!({"session_pk": "sess-read-b64", "rel": "shot.png"}),
+        )
+        .await
+        .unwrap();
+        let media: MediaFile = serde_json::from_value(out).unwrap();
+        assert_eq!(media.content_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(media.data_base64)
+                .unwrap(),
+            vec![0x89, 0x50, 0x4e, 0x47]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_content_types_cover_video_and_audio() {
+        let ct = |p: &str| content_type_for_path(Path::new(p));
+        assert_eq!(ct("a.webp").as_deref(), Some("image/webp"));
+        assert_eq!(ct("a.mp4").as_deref(), Some("video/mp4"));
+        assert_eq!(ct("a.mp3").as_deref(), Some("audio/mpeg"));
+        assert_eq!(ct("a.wav").as_deref(), Some("audio/wav"));
     }
 }

@@ -28,6 +28,7 @@ pub fn run_cli(args: Vec<String>, deps: &mut Deps) -> u8 {
         Some("status") => crate::status_cmd::cmd_status(deps),
         Some("service") => crate::service_cmd::cmd_service(&args[1..], deps),
         Some("config") => crate::config_cmd::cmd_config(&args[1..], deps), // headless automation
+        Some("pair") => crate::pair_cmd::cmd_pair(&args[1..], deps),
         Some("__daemon") => crate::daemon_cmd::cmd_daemon(&args[1..], deps), // hidden: updater/canary respawn target
         Some(other) => {
             (deps.err)(&format!("unknown command: {other} - run `ryuzi --help`"));

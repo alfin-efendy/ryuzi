@@ -1,6 +1,7 @@
 import { test, expect, spyOn } from "bun:test";
 import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll } from "./store-plugins";
 import { commands, type CatalogStatus, type DoctorFinding, type PluginInfo } from "./bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 function reset() {
   usePlugins.setState({
@@ -185,7 +186,7 @@ test("setEnabled optimistically flips the flag, calls the command, then reconcil
   expect(usePlugins.getState().plugins[0].enabled).toBe(false);
   await p;
 
-  expect(setSpy).toHaveBeenCalledWith("github", false);
+  expect(setSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "github", false);
   expect(listSpy).toHaveBeenCalled();
   expect(usePlugins.getState().plugins[0].enabled).toBe(false);
   setSpy.mockRestore();
@@ -204,7 +205,7 @@ test("setEnabled reloads (not crashes) when the command errors, so state reconci
 
   await usePlugins.getState().setEnabled("github", false);
 
-  expect(setSpy).toHaveBeenCalledWith("github", false);
+  expect(setSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "github", false);
   expect(listSpy).toHaveBeenCalled();
   // Reload brought back the server truth (still enabled), undoing the optimistic flip.
   expect(usePlugins.getState().plugins[0].enabled).toBe(true);
@@ -258,7 +259,7 @@ test("update calls updatePlugin with force and reloads on an `updated` outcome",
 
   await usePlugins.getState().update("acme", true);
 
-  expect(updateSpy).toHaveBeenCalledWith("acme", true);
+  expect(updateSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "acme", true);
   expect(listSpy).toHaveBeenCalled();
   updateSpy.mockRestore();
   listSpy.mockRestore();
@@ -316,7 +317,7 @@ test("pin optimistically flips the plugin's pinned flag, calls the command, then
   expect(usePlugins.getState().plugins[0].pinned).toBe(true);
   await p;
 
-  expect(pinSpy).toHaveBeenCalledWith("acme", true, "vendored fork");
+  expect(pinSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "acme", true, "vendored fork");
   expect(listSpy).toHaveBeenCalled();
   // The source of truth after reload is the server's `pinned` ledger flag,
   // not the transient optimistic paint.
@@ -324,7 +325,7 @@ test("pin optimistically flips the plugin's pinned flag, calls the command, then
 
   listSpy.mockResolvedValueOnce({ status: "ok", data: [{ ...skillPack, pinned: false }] });
   await usePlugins.getState().pin("acme", false);
-  expect(pinSpy).toHaveBeenCalledWith("acme", false, null);
+  expect(pinSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "acme", false, null);
   expect(usePlugins.getState().plugins[0].pinned).toBe(false);
 
   pinSpy.mockRestore();

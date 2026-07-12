@@ -1,6 +1,7 @@
 import { test, expect, beforeEach } from "bun:test";
 import { openFileTab, closeTab, normalizeActive, setTabMode, useUi, type DockTab } from "./store-ui";
 import type { Session } from "./bindings";
+import { LOCAL_RUNNER, sessKey, type UiSession } from "@/lib/session-key";
 
 const fileTab = (path: string): DockTab => ({ id: path, kind: "file", path, title: path.split("/").pop() ?? path });
 
@@ -91,8 +92,8 @@ test("notificationsEnabled defaults on and toggles + persists", () => {
   expect(localStorage.getItem("cockpit.ui.notificationsEnabled")).toBe("1");
 });
 
-function sess(pk: string, lastActive: number | null): Session {
-  return {
+function sess(pk: string, lastActive: number | null): UiSession {
+  const s: Session = {
     sessionPk: pk,
     projectId: "p",
     agentSessionId: null,
@@ -111,6 +112,7 @@ function sess(pk: string, lastActive: number | null): Session {
     agent: null,
     parentSessionPk: null,
   };
+  return { ...s, runnerId: LOCAL_RUNNER };
 }
 
 beforeEach(() => {
@@ -118,28 +120,32 @@ beforeEach(() => {
   useUi.setState({ readAt: {} });
 });
 
+const k1 = sessKey(LOCAL_RUNNER, "s1");
+const k2 = sessKey(LOCAL_RUNNER, "s2");
+const k3 = sessKey(LOCAL_RUNNER, "s3");
+
 test("markRead sets and persists the cursor", () => {
-  useUi.getState().markRead("s1", 1000);
-  expect(useUi.getState().readAt.s1).toBe(1000);
-  expect(JSON.parse(localStorage.getItem("cockpit.ui.readAt")!)).toEqual({ s1: 1000 });
+  useUi.getState().markRead(k1, 1000);
+  expect(useUi.getState().readAt[k1]).toBe(1000);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.readAt")!)).toEqual({ [k1]: 1000 });
 });
 
 test("seedReadState fills only absent keys, never overwriting an advanced cursor", () => {
-  useUi.getState().markRead("s1", 5000); // already read at 5000
+  useUi.getState().markRead(k1, 5000); // already read at 5000
   useUi.getState().seedReadState([sess("s1", 9000), sess("s2", 200)]);
   // s1 keeps its advanced cursor; s2 seeded to its lastActive.
-  expect(useUi.getState().readAt).toEqual({ s1: 5000, s2: 200 });
+  expect(useUi.getState().readAt).toEqual({ [k1]: 5000, [k2]: 200 });
 });
 
 test("seedReadState treats null lastActive as 0", () => {
   useUi.getState().seedReadState([sess("s3", null)]);
-  expect(useUi.getState().readAt.s3).toBe(0);
+  expect(useUi.getState().readAt[k3]).toBe(0);
 });
 
 test("markAllRead advances every session to its lastActive", () => {
-  useUi.setState({ readAt: { s1: 1 } });
+  useUi.setState({ readAt: { [k1]: 1 } });
   useUi.getState().markAllRead([sess("s1", 400), sess("s2", 700)]);
-  expect(useUi.getState().readAt).toEqual({ s1: 400, s2: 700 });
+  expect(useUi.getState().readAt).toEqual({ [k1]: 400, [k2]: 700 });
 });
 
 test("toggleStatusFilter and toggleUnreadOnly persist", () => {

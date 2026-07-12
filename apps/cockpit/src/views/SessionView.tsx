@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
 import { commands, type SessionRuntimeInfo } from "@/bindings";
 import { useStore, type ChatOptions } from "@/store";
+import { LOCAL_RUNNER, isSession, refKey } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
@@ -37,7 +38,7 @@ export function SessionView() {
   const {
     sessions,
     transcripts,
-    focusedSessionPk,
+    focusedSession,
     send,
     stop,
     pendingApprovals,
@@ -57,7 +58,7 @@ export function SessionView() {
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
   // the visible text instead of leaking one session's draft into another.
-  const draftKey = focusedSessionPk ?? "";
+  const draftKey = focusedSession ? refKey(focusedSession) : "";
   const draft = nav.drafts[draftKey] ?? "";
   // Same call shape as the old useState setter so pickContext/voice callbacks
   // keep working; reads go through getState() to avoid stale closures.
@@ -68,14 +69,19 @@ export function SessionView() {
     },
     [draftKey],
   );
-  const composerFiles = useComposerAttachments();
+  const session = sessions.find((s) => isSession(s, focusedSession));
+  const runnerId = session?.runnerId ?? LOCAL_RUNNER;
+  // A local ConPTY/bash and locally-installed apps can't operate on a remote
+  // host's workdir — the bottom terminal drawer and Open-in menu are gated
+  // off entirely for sessions running on a non-local runner.
+  const isRemote = runnerId !== LOCAL_RUNNER;
+  const composerFiles = useComposerAttachments(runnerId);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
 
-  const session = sessions.find((s) => s.sessionPk === focusedSessionPk);
-  const rows = (focusedSessionPk && transcripts[focusedSessionPk]) || [];
+  const rows = (focusedSession && transcripts[refKey(focusedSession)]) || [];
   // Ryuzi-only: every session runs the native agent. Tolerant by
   // construction — legacy rows still saying "claude-code" (restored DBs)
   // are simply treated as native.
@@ -91,7 +97,8 @@ export function SessionView() {
   const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
-    if (projectId) void loadCommands(projectId);
+    // Slash commands are project metadata on the local engine.
+    if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
   }, [projectId, loadCommands]);
 
   useEffect(() => {
@@ -99,8 +106,8 @@ export function SessionView() {
   }, [projectId, loadProjectRuntime]);
 
   useEffect(() => {
-    if (session?.sessionPk && runtimeScope === "session") void loadSessionRuntime(session.sessionPk);
-  }, [runtimeScope, session?.sessionPk, loadSessionRuntime]);
+    if (session?.sessionPk && runtimeScope === "session") void loadSessionRuntime(runnerId, session.sessionPk);
+  }, [runtimeScope, runnerId, session?.sessionPk, loadSessionRuntime]);
 
   useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
@@ -164,10 +171,10 @@ export function SessionView() {
   const prevSessionRunning = useRef(sessionRunning);
   useEffect(() => {
     if (prevSessionRunning.current && !sessionRunning && session?.sessionPk) {
-      void fetchDiff(session.sessionPk);
+      void fetchDiff(runnerId, session.sessionPk);
     }
     prevSessionRunning.current = sessionRunning;
-  }, [sessionRunning, session?.sessionPk, fetchDiff]);
+  }, [sessionRunning, session?.sessionPk, runnerId, fetchDiff]);
 
   // Session working directory, used to linkify workspace file paths in the
   // transcript's markdown (see TranscriptFileContext).
@@ -176,25 +183,24 @@ export function SessionView() {
     setWorkdir(null);
     if (!session?.sessionPk) return;
     let alive = true;
-    void commands.sessionWorkdir(session.sessionPk).then((res) => {
+    void commands.sessionWorkdir(runnerId, session.sessionPk).then((res) => {
       if (alive && res.status === "ok") setWorkdir(res.data);
     });
     return () => {
       alive = false;
     };
-  }, [session?.sessionPk]);
+  }, [session?.sessionPk, runnerId]);
   // Provider value for TranscriptFileContext — memoized so the Transcript's
   // WorkspacePathCode instances don't all re-render on every SessionView render.
   const transcriptFileCtx = useMemo(
-    () => (workdir && session?.sessionPk ? { sessionPk: session.sessionPk, workdir } : null),
-    [session?.sessionPk, workdir],
+    () => (workdir && session?.sessionPk ? { runnerId, sessionPk: session.sessionPk, workdir } : null),
+    [runnerId, session?.sessionPk, workdir],
   );
 
   // ArrowUp/Down history over this session's sent messages. A ref (not state)
   // holds the navigation cursor — it never drives rendering.
   const historyRef = useRef<HistoryState>(HISTORY_IDLE);
   const history = useMemo(() => historyEntries(rows), [rows]);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the cleanup writes back to the *previous* session (closed over from this render); reset is edge-triggered off the focused session
   useEffect(() => {
     historyRef.current = HISTORY_IDLE;
     return () => {
@@ -210,7 +216,7 @@ export function SessionView() {
         useNav.getState().setDraft(draftKey, historyRef.current.pending);
       }
     };
-  }, [focusedSessionPk]);
+  }, [draftKey]);
 
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
@@ -231,7 +237,7 @@ export function SessionView() {
     }
     let cancelled = false;
     const t = setTimeout(() => {
-      void commands.searchFiles(projectId, contextQueryText).then((res) => {
+      void commands.searchFiles(LOCAL_RUNNER, projectId, contextQueryText).then((res) => {
         if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
       });
     }, 120);
@@ -278,7 +284,7 @@ export function SessionView() {
 
   const meta = statusMeta(session.status);
   const running = session.status === "running";
-  const pendingForSession = pendingApprovals.filter((a) => a.sessionPk === session.sessionPk);
+  const pendingForSession = pendingApprovals.filter((a) => a.runnerId === runnerId && a.sessionPk === session.sessionPk);
   const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
 
@@ -298,10 +304,10 @@ export function SessionView() {
     composerFiles.clear();
     setContextRefs([]);
     if (running) {
-      enqueueMessage(key, { id: crypto.randomUUID(), text: t, options });
+      enqueueMessage(runnerId, key, { id: crypto.randomUUID(), text: t, options });
       return;
     }
-    void send(key, t, options).then((ok) => {
+    void send(runnerId, key, t, options).then((ok) => {
       if (!ok) useNav.getState().restoreDraft(key, typed);
     });
   };
@@ -344,16 +350,23 @@ export function SessionView() {
         data-testid="session-panel-controls"
         className="absolute right-2.5 top-2.5 z-30 flex items-center gap-1 rounded-md border border-border bg-background/80 p-1 shadow-xs backdrop-blur"
       >
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          title="Toggle bottom panel"
-          aria-pressed={nav.bottomOpen}
-          onClick={nav.toggleBottom}
-          className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
-        >
-          <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
-        </Button>
+        {/* The disabled Button gets pointer-events-none, so its own `title`
+            never fires a hover tooltip — a wrapping span (still hoverable)
+            carries the "why disabled" tooltip. The Button keeps its normal
+            title in both states so it still has a stable accessible name. */}
+        <span title={isRemote ? "Not available for sessions on a remote runner" : undefined}>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            title="Toggle bottom panel"
+            aria-pressed={nav.bottomOpen}
+            onClick={nav.toggleBottom}
+            disabled={isRemote}
+            className={nav.bottomOpen ? "bg-accent text-accent-foreground" : "text-muted-foreground"}
+          >
+            <PanelBottom aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+          </Button>
+        </span>
         <Button
           variant="ghost"
           size="icon-sm"
@@ -387,7 +400,7 @@ export function SessionView() {
               </div>
             </div>
             <div className="flex-1" />
-            <OpenInMenu sessionPk={session.sessionPk} />
+            <OpenInMenu runnerId={runnerId} sessionPk={session.sessionPk} />
           </div>
 
           {/* Transcript, with the floating plan panel overlaying it */}
@@ -396,6 +409,7 @@ export function SessionView() {
             {orchRootId && <TaskStrip rootId={orchRootId} />}
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
               <Transcript
+                runnerId={runnerId}
                 sessionPk={session.sessionPk}
                 rows={rows}
                 agentName={NATIVE_AGENT.name}
@@ -410,12 +424,12 @@ export function SessionView() {
               </Transcript>
             </TranscriptFileContext.Provider>
             {/* Agent plan (todowrite) — floating rounded panel */}
-            <TodoPanel sessionPk={session.sessionPk} running={running} />
+            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
           </div>
 
           {/* Session composer */}
           <div className="shrink-0 px-6 pb-4 pt-3">
-            <QueuedMessages sessionPk={session.sessionPk} />
+            <QueuedMessages runnerId={runnerId} sessionPk={session.sessionPk} />
             <div
               className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
             >
@@ -485,7 +499,7 @@ export function SessionView() {
                   options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
                   value={permUi}
                   onValueChange={(mode) => {
-                    void setSessionPermMode(session.sessionPk, uiPermToCore(mode as UiPermMode));
+                    void setSessionPermMode(runnerId, session.sessionPk, uiPermToCore(mode as UiPermMode));
                   }}
                   trigger={
                     <Button
@@ -502,13 +516,13 @@ export function SessionView() {
                   }
                 />
                 <div className="flex-1" />
-                <SessionCostPanel sessionPk={session.sessionPk} />
+                <SessionCostPanel runnerId={runnerId} sessionPk={session.sessionPk} />
                 <ComposerModelEffortMenu
                   models={agentModels}
                   runtime={runtime}
                   onChange={(model, effort) => {
                     if (runtimeScope === "project" && projectId) void setProjectRuntime(projectId, model, effort);
-                    else if (runtimeScope === "session") void setSessionRuntime(session.sessionPk, model, effort);
+                    else if (runtimeScope === "session") void setSessionRuntime(runnerId, session.sessionPk, model, effort);
                   }}
                   disabled={agentModels.length === 0 || runtimeScope === null}
                   running={running}
@@ -523,7 +537,7 @@ export function SessionView() {
                   <Mic aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
                 </Button>
                 {composerMode(session.status) === "stop" ? (
-                  <Button size="icon" title="Stop" onClick={() => void stop(session.sessionPk)} className="rounded-full">
+                  <Button size="icon" title="Stop" onClick={() => void stop(runnerId, session.sessionPk)} className="rounded-full">
                     <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
                   </Button>
                 ) : (
@@ -560,7 +574,8 @@ export function SessionView() {
             by sessionPk so sessions never see each other's results. */}
         {nav.rightOpen && (
           <RightPanel
-            key={session.sessionPk}
+            key={refKey({ runnerId, pk: session.sessionPk })}
+            runnerId={runnerId}
             sessionPk={session.sessionPk}
             branch={session.branch ?? null}
             running={running}
@@ -570,10 +585,15 @@ export function SessionView() {
       </div>
 
       {/* Bottom terminal drawer — a real shell in the session worktree, spanning
-          the full workspace width below both the chat column and right panel. */}
-      {nav.bottomOpen && (
+          the full workspace width below both the chat column and right panel.
+          Gating on !isRemote here (not just disabling the toggle button) matters
+          because nav.bottomOpen is a global, localStorage-persisted flag also
+          toggled from TitleBar — without this render guard, switching into a
+          remote session while the panel is already open would auto-spawn a
+          PTY against a host that has none. */}
+      {nav.bottomOpen && !isRemote && (
         <div data-testid="session-bottom-row" className="min-w-0 shrink-0">
-          <BottomTerminalDrawer sessionPk={session.sessionPk} projectName={projectName} />
+          <BottomTerminalDrawer runnerId={runnerId} sessionPk={session.sessionPk} projectName={projectName} />
         </div>
       )}
     </div>

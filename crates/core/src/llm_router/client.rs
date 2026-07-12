@@ -4057,7 +4057,27 @@ mod tests {
             route_target_key: None,
             request_compatibility_effort: None,
         };
-        let body = json!({"model": "claude-x", "system": "be helpful", "messages": []});
+        let body = json!({
+            "model": "claude-x",
+            "system": "be helpful",
+            "messages": [],
+            "tools": [{
+                "name": "task",
+                "input_schema": {
+                    "type": "object",
+                    "oneOf": [
+                        {
+                            "properties": {"prompt": {"type": "string"}},
+                            "required": ["prompt"]
+                        },
+                        {
+                            "properties": {"tasks": {"type": "array"}},
+                            "required": ["tasks"]
+                        }
+                    ]
+                }
+            }]
+        });
         let req = upstream_request(&ctx, &target, &body)
             .unwrap()
             .build()
@@ -4085,6 +4105,10 @@ mod tests {
             .starts_with("x-anthropic-billing-header: cc_version=2.1.92."));
         assert_eq!(sent["system"][1]["text"], CLAUDE_CODE_SYSTEM_PROMPT);
         assert_eq!(sent["system"][2]["text"], "be helpful");
+        let schema = &sent["tools"][0]["input_schema"];
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema["properties"].get("prompt").is_some());
+        assert!(schema["properties"].get("tasks").is_some());
     }
 
     #[tokio::test]

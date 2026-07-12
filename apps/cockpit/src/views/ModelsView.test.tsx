@@ -11,6 +11,7 @@ import type {
   Result,
   UsageSeries,
 } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const status: EndpointStatusInfo = {
   running: true,
@@ -160,11 +161,11 @@ const usage: UsageSeries = {
   todayOutputTokens: 210,
 };
 
-const saveModelRoute = mock((_route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
-const deleteModelRoute = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
-const revokeEndpointKey = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
+const saveModelRoute = mock((_runnerId: string, _route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
+const deleteModelRoute = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
+const revokeEndpointKey = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
 
-const refreshProviderModels = mock((_family: string) =>
+const refreshProviderModels = mock((_runnerId: string, _family: string) =>
   Promise.resolve({
     status: "ok" as const,
     data: [
@@ -173,16 +174,16 @@ const refreshProviderModels = mock((_family: string) =>
   }),
 );
 
-const renameConnection = mock((_id: string, label: string) =>
+const renameConnection = mock((_runnerId: string, _id: string, label: string) =>
   Promise.resolve({ status: "ok" as const, data: [{ ...connection, label }, secondConnection] }),
 );
-const setConnectionEnabled = mock((_id: string, enabled: boolean) =>
+const setConnectionEnabled = mock((_runnerId: string, _id: string, enabled: boolean) =>
   Promise.resolve({ status: "ok" as const, data: [{ ...connection, enabled }, secondConnection] }),
 );
-const removeConnection = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [secondConnection] }));
-const reconnectOauth = mock((_id: string) => Promise.resolve({ status: "ok" as const, data: [claudeConnection] }));
+const removeConnection = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [secondConnection] }));
+const reconnectOauth = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [claudeConnection] }));
 const resetCodexCredit = mock(
-  (_id: string): Promise<Result<CodexResetCreditResult, CmdError>> =>
+  (_runnerId: string, _id: string): Promise<Result<CodexResetCreditResult, CmdError>> =>
     Promise.resolve({
       status: "ok" as const,
       data: { reset: true, code: null, windowsReset: 1, message: null, redeemRequestId: null },
@@ -412,7 +413,7 @@ test("revoke endpoint key uses the shared confirmation modal", async () => {
   expect(dialog.querySelector('[data-slot="modal-footer"]')).toBeTruthy();
   expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
   fireEvent.click(within(dialog).getByRole("button", { name: "Revoke" }));
-  await waitFor(() => expect(revokeEndpointKey).toHaveBeenCalledWith("k1"));
+  await waitFor(() => expect(revokeEndpointKey).toHaveBeenCalledWith(LOCAL_RUNNER, "k1"));
 });
 
 test("provider detail shows accounts for the selected provider", async () => {
@@ -484,7 +485,7 @@ test("Refresh models surfaces per-connection failures inline", async () => {
 
   fireEvent.click(await screen.findByRole("button", { name: "Refresh models" }));
 
-  await waitFor(() => expect(refreshProviderModels).toHaveBeenCalledWith("openai"));
+  await waitFor(() => expect(refreshProviderModels).toHaveBeenCalledWith(LOCAL_RUNNER, "openai"));
   expect(await screen.findByText("Work OpenAI: model list request for openai failed with status 401")).toBeTruthy();
 });
 
@@ -510,7 +511,7 @@ test("rename pencil opens the rename modal and persists only the trimmed name", 
   fireEvent.change(input, { target: { value: "  Primary  " } });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-  await waitFor(() => expect(renameConnection).toHaveBeenCalledWith("c1", "Primary"));
+  await waitFor(() => expect(renameConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "c1", "Primary"));
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Rename account" })).toBeNull());
 });
 
@@ -519,7 +520,7 @@ test("enabled switch uses the dedicated account command", async () => {
   useConnections.setState({ catalog, connections: [connection], loaded: true });
   render(<ProviderDetailView provider="openai" />);
   fireEvent.click(screen.getByRole("switch", { name: "Enabled Work OpenAI" }));
-  await waitFor(() => expect(setConnectionEnabled).toHaveBeenCalledWith("c1", false));
+  await waitFor(() => expect(setConnectionEnabled).toHaveBeenCalledWith(LOCAL_RUNNER, "c1", false));
 });
 
 test("delete uses confirmation and restores focus to the invoking Delete button when cancelled", async () => {
@@ -542,7 +543,7 @@ test("redirect OAuth reconnects in place while device sign-in reopens Add accoun
   useConnections.setState({ catalog, connections: [redirect], loaded: true });
   const { unmount } = render(<ProviderDetailView provider="anthropic" />);
   fireEvent.click(screen.getByRole("button", { name: "Reconnect Claude subscription" }));
-  await waitFor(() => expect(reconnectOauth).toHaveBeenCalledWith("c3"));
+  await waitFor(() => expect(reconnectOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "c3"));
   await waitFor(() => expect(screen.getByRole("button", { name: "Reconnect Claude subscription" })).toBeTruthy());
   unmount();
 
@@ -580,7 +581,7 @@ test("quota renders only from capability and Codex reset uses the shared confirm
   fireEvent.click(await screen.findByRole("button", { name: "Reset credit for Work OpenAI" }));
   const dialog = screen.getByRole("dialog", { name: "Reset credit?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "Reset credit" }));
-  await waitFor(() => expect(resetCodexCredit).toHaveBeenCalledWith("c1"));
+  await waitFor(() => expect(resetCodexCredit).toHaveBeenCalledWith(LOCAL_RUNNER, "c1"));
 });
 
 test("pointer-opened reset confirmation restores focus to the exact reset button on Cancel", async () => {
@@ -605,7 +606,7 @@ test("programmatic reset open retains account context after false confirm and re
   const dialog = await screen.findByRole("dialog", { name: "Reset credit?" });
   expect(dialog.textContent).toContain("Work OpenAI");
   fireEvent.click(within(dialog).getByRole("button", { name: "Reset credit" }));
-  await waitFor(() => expect(resetCodexCredit).toHaveBeenCalledWith("c1"));
+  await waitFor(() => expect(resetCodexCredit).toHaveBeenCalledWith(LOCAL_RUNNER, "c1"));
   expect(screen.getByRole("dialog", { name: "Reset credit?" }).textContent).toContain("Work OpenAI");
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   await waitFor(() => expect(document.activeElement).toBe(trigger));
@@ -631,7 +632,7 @@ test("delete route uses the shared confirmation modal", async () => {
   expect(dialog.querySelector('[data-slot="modal-footer"]')).toBeTruthy();
   expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
   fireEvent.click(within(dialog).getByRole("button", { name: "Delete route" }));
-  await waitFor(() => expect(deleteModelRoute).toHaveBeenCalledWith("r1"));
+  await waitFor(() => expect(deleteModelRoute).toHaveBeenCalledWith(LOCAL_RUNNER, "r1"));
 });
 
 test("route form renders strategy and target comboboxes with option lists", async () => {
@@ -696,7 +697,7 @@ test("route form saves targets as {provider, model} scoped to the family, not th
   fireEvent.click(screen.getByRole("button", { name: "Save route" }));
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
-  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  const [, savedRoute] = saveModelRoute.mock.calls[0] as [string, ModelRouteInfo];
   expect(savedRoute.targets).toEqual([{ provider: "openai", model: "gpt-4.1", effort: null }]);
 });
 
@@ -783,6 +784,6 @@ test("route target adapter round-trips a slash-containing model id (cloudflare-a
   fireEvent.click(screen.getByRole("button", { name: "Save route" }));
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
-  const [savedRoute] = saveModelRoute.mock.calls[0] as [ModelRouteInfo];
+  const [, savedRoute] = saveModelRoute.mock.calls[0] as [string, ModelRouteInfo];
   expect(savedRoute.targets).toEqual([{ provider: "cloudflare-ai", model: "@cf/meta/llama-3.1-8b-instruct", effort: null }]);
 });

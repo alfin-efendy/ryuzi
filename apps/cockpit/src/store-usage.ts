@@ -14,11 +14,11 @@ export const useUsage = create<UsageState>((set, get) => ({
   byConnection: {},
   endpoint: null,
   loadConnection: async (id, days = 14) => {
-    const res = await commands.connectionUsage(id, days);
+    const res = await commands.connectionUsage("local", id, days);
     if (res.status === "ok") set({ byConnection: { ...get().byConnection, [id]: res.data } });
   },
   loadEndpoint: async (days = 14) => {
-    const res = await commands.endpointUsage(days);
+    const res = await commands.endpointUsage("local", days);
     if (res.status === "ok") set({ endpoint: res.data });
   },
 }));

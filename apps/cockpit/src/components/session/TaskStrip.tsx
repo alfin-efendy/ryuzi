@@ -2,6 +2,7 @@ import { Check, CircleDot, HandHelping, Loader2, X } from "lucide-react";
 import { Button } from "@ryuzi/ui";
 import { useStore } from "@/store";
 import { agentColor } from "@/lib/agent-color";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // One lucide glyph per orch task status. `running` spins; everything else is
 // static — see the `animate-spin` guard below.
@@ -45,7 +46,7 @@ export function TaskStrip({ rootId }: { rootId: string }) {
             size="xs"
             title={`${t.title || "Untitled task"} — ${t.status}`}
             disabled={!t.sessionPk}
-            onClick={() => t.sessionPk && setFocused(t.sessionPk)}
+            onClick={() => t.sessionPk && setFocused({ runnerId: LOCAL_RUNNER, pk: t.sessionPk })}
             className="shrink-0 gap-1.5 rounded-full px-2.5 font-normal text-muted-foreground"
           >
             <Icon

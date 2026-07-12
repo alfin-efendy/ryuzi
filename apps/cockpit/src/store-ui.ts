@@ -1,8 +1,8 @@
 import { create } from "zustand";
-import type { Session } from "./bindings";
 import { basename } from "./lib/paths";
 import type { ViewMode } from "./lib/preview";
 import { reorder } from "@/lib/sidebar";
+import { sessionKey, type UiSession } from "@/lib/session-key";
 
 export type DockTab = { id: string; kind: "file"; path: string; title: string; mode?: ViewMode };
 
@@ -114,10 +114,12 @@ type UiState = {
   rightPanelOpen: boolean;
   tabs: DockTab[];
   activeTabId: string | null;
+  /** Runner-safe: keyed by `sessKey(runnerId, pk)`. */
   pinned: Record<string, true>;
   pinnedOrder: string[];
   archived: Record<string, true>;
-  /** Per-session last-read epoch-ms cursor (unread = lastActive > cursor). */
+  /** Per-session last-read epoch-ms cursor (unread = lastActive > cursor),
+   *  keyed by `sessKey(runnerId, pk)`. */
   readAt: Record<string, number>;
   /** Sidebar session filters: status checkboxes (empty = all) + unread-only toggle. */
   sessionFilter: { statuses: Record<string, true>; unreadOnly: boolean };
@@ -137,16 +139,17 @@ type UiState = {
   closeTab: (id: string) => void;
   setActiveTab: (id: string) => void;
   setTabMode: (id: string, mode: ViewMode) => void;
-  togglePin: (sessionPk: string) => void;
+  /** All session args below are composite `sessKey(runnerId, pk)` strings. */
+  togglePin: (key: string) => void;
   reorderPinned: (fromId: string, toId: string) => void;
-  toggleArchive: (sessionPk: string) => void;
+  toggleArchive: (key: string) => void;
   /** Idempotent write — archive flows must not race a pure toggle. */
-  setArchived: (sessionPk: string, on: boolean) => void;
+  setArchived: (key: string, on: boolean) => void;
   toggleHideInvalidModels: () => void;
   toggleNotifications: () => void;
-  markRead: (sessionPk: string, ts: number) => void;
-  markAllRead: (sessions: Session[]) => void;
-  seedReadState: (sessions: Session[]) => void;
+  markRead: (key: string, ts: number) => void;
+  markAllRead: (sessions: UiSession[]) => void;
+  seedReadState: (sessions: UiSession[]) => void;
   toggleStatusFilter: (status: string) => void;
   toggleUnreadOnly: () => void;
 };
@@ -212,11 +215,11 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.tabs, JSON.stringify(tabs));
     set({ tabs });
   },
-  togglePin: (sessionPk) => {
-    const pinned = toggleKey(get().pinned, sessionPk);
-    const nowPinned = !!pinned[sessionPk];
+  togglePin: (key) => {
+    const pinned = toggleKey(get().pinned, key);
+    const nowPinned = !!pinned[key];
     const cur = get().pinnedOrder;
-    const pinnedOrder = nowPinned ? (cur.includes(sessionPk) ? cur : [...cur, sessionPk]) : cur.filter((id) => id !== sessionPk);
+    const pinnedOrder = nowPinned ? (cur.includes(key) ? cur : [...cur, key]) : cur.filter((id) => id !== key);
     persist(KEY.pinned, JSON.stringify(pinned));
     persist(KEY.pinnedOrder, JSON.stringify(pinnedOrder));
     set({ pinned, pinnedOrder });
@@ -226,15 +229,15 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.pinnedOrder, JSON.stringify(pinnedOrder));
     set({ pinnedOrder });
   },
-  toggleArchive: (sessionPk) => {
-    const archived = toggleKey(get().archived, sessionPk);
+  toggleArchive: (key) => {
+    const archived = toggleKey(get().archived, key);
     persist(KEY.archived, JSON.stringify(archived));
     set({ archived });
   },
-  setArchived: (sessionPk, on) => {
+  setArchived: (key, on) => {
     const archived = { ...get().archived };
-    if (on) archived[sessionPk] = true;
-    else delete archived[sessionPk];
+    if (on) archived[key] = true;
+    else delete archived[key];
     persist(KEY.archived, JSON.stringify(archived));
     set({ archived });
   },
@@ -250,14 +253,14 @@ export const useUi = create<UiState>((set, get) => ({
       persist(KEY.notificationsEnabled, v ? "1" : "0");
       return { notificationsEnabled: v };
     }),
-  markRead: (sessionPk, ts) => {
-    const readAt = { ...get().readAt, [sessionPk]: ts };
+  markRead: (key, ts) => {
+    const readAt = { ...get().readAt, [key]: ts };
     persist(KEY.readAt, JSON.stringify(readAt));
     set({ readAt });
   },
   markAllRead: (sessions) => {
     const readAt = { ...get().readAt };
-    for (const s of sessions) readAt[s.sessionPk] = s.lastActive ?? 0;
+    for (const s of sessions) readAt[sessionKey(s)] = s.lastActive ?? 0;
     persist(KEY.readAt, JSON.stringify(readAt));
     set({ readAt });
   },
@@ -266,8 +269,9 @@ export const useUi = create<UiState>((set, get) => ({
     let changed = false;
     const readAt = { ...cur };
     for (const s of sessions) {
-      if (readAt[s.sessionPk] === undefined) {
-        readAt[s.sessionPk] = s.lastActive ?? 0;
+      const key = sessionKey(s);
+      if (readAt[key] === undefined) {
+        readAt[key] = s.lastActive ?? 0;
         changed = true;
       }
     }

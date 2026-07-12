@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod doctor;
 pub mod meta;
 pub mod paint;
+pub mod pair_cmd;
 pub mod service_cmd;
 pub mod setup_cmd;
 pub mod status_cmd;

@@ -22,7 +22,7 @@ export const useSkills = create<SkillsState>((set, get) => ({
 
   refresh: async () => {
     set({ loading: true, error: null });
-    const res = await commands.listSkills();
+    const res = await commands.listSkills("local");
     if (res.status === "ok") {
       set({ skills: res.data, loading: false, error: null });
       return;
@@ -35,7 +35,7 @@ export const useSkills = create<SkillsState>((set, get) => ({
 
   refreshSkillPack: async (id) => {
     set({ loading: true, error: null });
-    const res = await commands.refreshSkill(id);
+    const res = await commands.refreshSkill("local", id);
     if (res.status === "error") {
       const message = trimMessage(res.error);
       set({ loading: false, error: message });
@@ -49,7 +49,7 @@ export const useSkills = create<SkillsState>((set, get) => ({
 
   remove: async (id) => {
     set({ loading: true, error: null });
-    const res = await commands.removeSkill(id);
+    const res = await commands.removeSkill("local", id);
     if (res.status === "error") {
       const message = trimMessage(res.error);
       set({ loading: false, error: message });

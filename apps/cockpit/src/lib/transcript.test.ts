@@ -214,8 +214,8 @@ test("route switch copy groups as notices for model, account, failover, and comb
 
 test("speaker rows group into labeled speaker bubbles", () => {
   const rows = [
-    messageToRow(1, "assistant", "status", { text: "started: a" }, null, null, null, 0, "build"),
-    messageToRow(2, "assistant", "text", { text: "done a" }, null, null, null, 0, "build"),
+    messageToRow(1, "assistant", "status", { text: "started: a" }, null, null, null, 0, "", "build"),
+    messageToRow(2, "assistant", "text", { text: "done a" }, null, null, null, 0, "", "build"),
   ];
   const groups = groupRows(rows);
   expect(groups.every((g) => g.type === "speaker")).toBe(true);
@@ -229,20 +229,43 @@ test("closeDanglingFence closes an odd number of line-start fences and leaves ba
   expect(closeDanglingFence("no fences")).toBe("no fences");
 });
 
-test("messageToRow extracts attachments metadata from user payloads", () => {
+test("messageToRow extracts attachments metadata from user payloads, preferring a recorded rel", () => {
   const row = messageToRow(
     3,
     "user",
     "text",
-    { text: "look", attachments: [{ name: "a.png", path: "C:\\att\\a.png", contentType: "image/png", size: 42 }] },
+    {
+      text: "look",
+      attachments: [{ name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42, rel: "sess-9/a.png" }],
+    },
     null,
     null,
     null,
     1700000000000,
+    "sess-9",
   );
   expect(row.text).toBe("look");
   expect(row.createdAt).toBe(1700000000000);
-  expect(row.attachments).toEqual([{ name: "a.png", path: "C:\\att\\a.png", contentType: "image/png", size: 42 }]);
+  expect(row.attachments).toEqual([
+    { name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42, rel: "sess-9/a.png" },
+  ]);
+});
+
+test("messageToRow derives rel from sessionPk + basename for pre-P4-3 rows with no recorded rel", () => {
+  const row = messageToRow(
+    3,
+    "user",
+    "text",
+    { text: "look", attachments: [{ name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42 }] },
+    null,
+    null,
+    null,
+    null,
+    "sess-9",
+  );
+  expect(row.attachments).toEqual([
+    { name: "a.png", path: "C:\\att\\sess-9\\a.png", contentType: "image/png", size: 42, rel: "sess-9/a.png" },
+  ]);
 });
 
 test("messageToRow tolerates missing/malformed attachments", () => {
@@ -648,7 +671,7 @@ test("parent tool rows have no subagent label", () => {
 });
 
 test("an orch_block row carries its task id through to the speaker group", () => {
-  const r = messageToRow(7, "assistant", "orch_block", { text: "which port?", task_id: "ot-7" }, null, null, null, null, "build");
+  const r = messageToRow(7, "assistant", "orch_block", { text: "which port?", task_id: "ot-7" }, null, null, null, null, "", "build");
   expect(r.taskId).toBe("ot-7");
   const groups = groupRows([r]);
   expect(groups).toEqual([
@@ -657,6 +680,6 @@ test("an orch_block row carries its task id through to the speaker group", () =>
 });
 
 test("an ordinary speaker row (no orch_block) carries a null task id", () => {
-  const r = messageToRow(8, "assistant", "text", { text: "done" }, null, null, null, null, "build");
+  const r = messageToRow(8, "assistant", "text", { text: "done" }, null, null, null, null, "", "build");
   expect(r.taskId).toBeNull();
 });

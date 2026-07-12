@@ -16,6 +16,7 @@ import {
   Switch,
 } from "@ryuzi/ui";
 import { commands, events, type ExtensionStatusEntry, type PluginDetail } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
@@ -211,7 +212,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const settingsRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
-    const res = await commands.pluginDetail(id);
+    const res = await commands.pluginDetail(LOCAL_RUNNER, id);
     if (res.status === "ok") setDetail(res.data);
     else toast.error(`Couldn't load plugin: ${res.error.message}`);
     setLoaded(true);
@@ -246,7 +247,7 @@ export function PluginDetailView({ id }: { id: string }) {
       return;
     }
     let active = true;
-    void commands.extensionStatus().then((res) => {
+    void commands.extensionStatus(LOCAL_RUNNER).then((res) => {
       if (active && res.status === "ok") setExtensionEntries(res.data.filter((e) => e.pluginId === id));
     });
     return () => {
@@ -358,7 +359,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const saveAuth = async () => {
     if (!detail.auth?.setting || authValue.trim().length === 0 || savingAuth) return;
     setSavingAuth(true);
-    const res = await commands.setPluginSetting(detail.auth.setting, authValue.trim());
+    const res = await commands.setPluginSetting(LOCAL_RUNNER, detail.auth.setting, authValue.trim());
     if (res.status === "error") toast.error(res.error.message);
     else {
       toast.success("Saved");
@@ -377,7 +378,7 @@ export function PluginDetailView({ id }: { id: string }) {
     const value = rawValue.trim();
     if (value.length === 0 || savingField) return;
     setSavingField(key);
-    const res = await commands.setPluginSetting(key, value);
+    const res = await commands.setPluginSetting(LOCAL_RUNNER, key, value);
     if (res.status === "error") toast.error(res.error.message);
     else {
       toast.success("Saved");
@@ -391,7 +392,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const startOauth = async () => {
     if (!detail?.auth || oauthBusy) return;
     setOauthBusy("begin");
-    const res = await commands.beginPluginOauth(id);
+    const res = await commands.beginPluginOauth(LOCAL_RUNNER, id);
     if (res.status === "error") {
       toast.error(res.error.message);
       setOauthBusy(null);
@@ -407,7 +408,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const completeOauth = async () => {
     if (!oauthStateToken || oauthCode.trim().length === 0 || oauthBusy) return;
     setOauthBusy("complete");
-    const res = await commands.completePluginOauth(id, oauthCode.trim(), oauthStateToken);
+    const res = await commands.completePluginOauth(LOCAL_RUNNER, id, oauthCode.trim(), oauthStateToken);
     if (res.status === "error") {
       toast.error(res.error.message);
       setOauthBusy(null);
@@ -426,7 +427,7 @@ export function PluginDetailView({ id }: { id: string }) {
   const disconnectOauth = async () => {
     if (!detail?.auth?.oauthTokenStored || oauthBusy) return;
     setOauthBusy("disconnect");
-    const res = await commands.disconnectPluginOauth(id);
+    const res = await commands.disconnectPluginOauth(LOCAL_RUNNER, id);
     if (res.status === "error") toast.error(res.error.message);
     else {
       toast.success("Disconnected");

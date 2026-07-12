@@ -1,6 +1,7 @@
 import type { CatalogEntry, CmdError, ConnectionInfo, DeviceFlowInfo, Result } from "@/bindings";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, mock, test } from "bun:test";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { usesDeviceSignin } from "./deviceSignin";
 
 const info: DeviceFlowInfo = {
@@ -48,8 +49,8 @@ test("oauth-category device grant renders and starts the device flow", async () 
   expect(screen.getByText("Free — sign in with your Qwen account. No API key needed.")).toBeTruthy();
   expect(screen.queryByText(/Waiting for your browser/)).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
-  await waitFor(() => expect(startDeviceFlow).toHaveBeenCalledWith("qwen"));
-  await waitFor(() => expect(awaitDeviceFlow).toHaveBeenCalledWith("qwen", "Qwen Code", "flow-qwen"));
+  await waitFor(() => expect(startDeviceFlow).toHaveBeenCalledWith(LOCAL_RUNNER, "qwen"));
+  await waitFor(() => expect(awaitDeviceFlow).toHaveBeenCalledWith(LOCAL_RUNNER, "qwen", "Qwen Code", "flow-qwen"));
   expect(connectOauth).not.toHaveBeenCalled();
 });
 

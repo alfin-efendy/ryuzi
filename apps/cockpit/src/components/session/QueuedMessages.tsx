@@ -1,11 +1,12 @@
 import { Button } from "@ryuzi/ui";
 import { ListPlus, X } from "lucide-react";
 import { useStore } from "@/store";
+import { sessKey } from "@/lib/session-key";
 
 /** The pending type-ahead queue for a session, shown above the composer.
  *  Renders nothing when the queue is empty. */
-export function QueuedMessages({ sessionPk }: { sessionPk: string }) {
-  const queued = useStore((s) => s.queued[sessionPk]);
+export function QueuedMessages({ runnerId, sessionPk }: { runnerId: string; sessionPk: string }) {
+  const queued = useStore((s) => s.queued[sessKey(runnerId, sessionPk)]);
   const removeQueued = useStore((s) => s.removeQueued);
   if (!queued || queued.length === 0) return null;
   return (
@@ -21,7 +22,7 @@ export function QueuedMessages({ sessionPk }: { sessionPk: string }) {
             variant="ghost"
             size="icon-sm"
             title="Remove from queue"
-            onClick={() => removeQueued(sessionPk, m.id)}
+            onClick={() => removeQueued(runnerId, sessionPk, m.id)}
             className="rounded-full"
           >
             <X aria-hidden size={13} strokeWidth={2} className="size-[13px]" />

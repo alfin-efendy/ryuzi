@@ -1,12 +1,18 @@
 import type { CatalogEntry, CmdError, ConnectionInfo, Result } from "@/bindings";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
 const listRuntimes = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const getAgentSettings = mock(() => Promise.resolve({ status: "ok" as const, data: { model: null, permMode: null } }));
 const listSelectableModels = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+// refreshModelConfiguration() (fired after every successful account mutation)
+// also re-fetches runtime info for any project already tracked in
+// `projectRuntimeById` — stubbed so a leftover entry from state that outlives
+// a single test file doesn't throw on an unmocked call.
+const projectRuntimeInfo = mock(() => Promise.resolve({ status: "ok" as const, data: null }));
 let oauthAuthorizeUrlListener: ((event: { payload: { provider: string; authorizeUrl: string } }) => void) | null = null;
 const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string; authorizeUrl: string } }) => void) => {
   oauthAuthorizeUrlListener = cb;
@@ -16,7 +22,7 @@ const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string;
 });
 
 mock.module("@/bindings", () => ({
-  commands: { addConnection, connectOauth, listRuntimes, getAgentSettings, listSelectableModels },
+  commands: { addConnection, connectOauth, listRuntimes, getAgentSettings, listSelectableModels, projectRuntimeInfo },
   events: { oauthAuthorizeUrlMsg: { listen: listenOauthAuthorizeUrl } },
 }));
 
@@ -132,7 +138,7 @@ test("submitting api key for anthropic family calls addConnection with the membe
   fireEvent.change(screen.getByLabelText("API key", { selector: "input" }), { target: { value: "sk-ant-test" } });
   fireEvent.click(screen.getByRole("button", { name: "Add account" }));
   await screen.findByText("Add account");
-  expect(addConnection).toHaveBeenCalledWith("anthropic", "Anthropic", "sk-ant-test", null);
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic", "Anthropic", "sk-ant-test", null);
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
@@ -143,7 +149,8 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
   fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
-  expect(connectOauth).toHaveBeenCalledWith("anthropic-oauth", "Claude Code");
+  expect(connectOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic-oauth", "Claude Code");
+
   const authorizeUrl = "https://claude.ai/oauth/authorize?client_id=test";
   await act(async () => {
     oauthAuthorizeUrlListener?.({ payload: { provider: "anthropic-oauth", authorizeUrl } });
@@ -176,7 +183,7 @@ test("single-member custom-openai family requires a base URL before it can be su
   expect(submit.disabled).toBe(false);
   fireEvent.click(submit);
   await screen.findByText("Add account");
-  expect(addConnection).toHaveBeenCalledWith("custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 

@@ -5,6 +5,7 @@ import { useStore, type PendingApproval } from "@/store";
 import type { ApprovalResponse } from "@/bindings";
 import { Markdown } from "@/components/transcript/Markdown";
 import { Pill } from "@/components/common/bits";
+import { isSession } from "@/lib/session-key";
 
 type Question = {
   question: string;
@@ -115,7 +116,7 @@ export function ApprovalCard({
   hotkey?: boolean;
 }) {
   const resolveApproval = useStore((s) => s.resolveApproval);
-  const session = useStore((s) => s.sessions.find((x) => x.sessionPk === approval.sessionPk));
+  const session = useStore((s) => s.sessions.find((x) => isSession(x, { runnerId: approval.runnerId, pk: approval.sessionPk })));
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
@@ -140,7 +141,7 @@ export function ApprovalCard({
     setRejecting(false);
   }, [approval.requestId]);
 
-  const resolve = (response: ApprovalResponse) => void resolveApproval(approval.requestId, response);
+  const resolve = (response: ApprovalResponse) => void resolveApproval(approval.runnerId, approval.requestId, response);
 
   const activeStep = questions.length === 0 ? 0 : Math.min(step, questions.length - 1);
   const activeQuestion = questions[activeStep];

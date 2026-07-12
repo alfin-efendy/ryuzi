@@ -1,16 +1,17 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ProviderQuotaInfo } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 type QuotaCommandMocks = {
-  connectionProviderQuota: ReturnType<typeof mock<(...args: [string]) => Promise<unknown>>>;
-  resetCodexCredit: ReturnType<typeof mock<(...args: [string]) => Promise<unknown>>>;
+  connectionProviderQuota: ReturnType<typeof mock<(...args: [string, string]) => Promise<unknown>>>;
+  resetCodexCredit: ReturnType<typeof mock<(...args: [string, string]) => Promise<unknown>>>;
 };
 
 const shared = globalThis as typeof globalThis & { __quotaCommandMocks?: QuotaCommandMocks };
 const quotaCommandMocks = (shared.__quotaCommandMocks ??= {
-  connectionProviderQuota: mock<(...args: [string]) => Promise<unknown>>(),
-  resetCodexCredit: mock<(...args: [string]) => Promise<unknown>>(),
+  connectionProviderQuota: mock<(...args: [string, string]) => Promise<unknown>>(),
+  resetCodexCredit: mock<(...args: [string, string]) => Promise<unknown>>(),
 });
 const { connectionProviderQuota, resetCodexCredit } = quotaCommandMocks;
 
@@ -68,7 +69,7 @@ test("loads quota on mount and does nothing for unsupported accounts", async () 
 
   await waitFor(() => expect(mounted.result.current.state.status).toBe("loaded"));
   expect(mounted.result.current.state).toEqual({ status: "loaded", quota: quota("Pro"), error: null });
-  expect(connectionProviderQuota).toHaveBeenCalledWith("account-a");
+  expect(connectionProviderQuota).toHaveBeenCalledWith(LOCAL_RUNNER, "account-a");
 
   const unsupported = renderHook(() => useConnectionQuota("account-b", null));
   expect(unsupported.result.current.state).toEqual({ status: "idle", quota: null, error: null });
@@ -89,7 +90,7 @@ test("refreshes manually and retries an account-local error", async () => {
 });
 
 test("keeps quota errors isolated between accounts", async () => {
-  connectionProviderQuota.mockImplementation((id) =>
+  connectionProviderQuota.mockImplementation((_runnerId, id) =>
     Promise.resolve(id === "account-a" ? error("Account A unavailable") : ok(quota("Account B"))),
   );
   const accountA = renderHook(() => useConnectionQuota("account-a", "claude"));
@@ -134,7 +135,7 @@ test("does not carry quota from one connection into another connection's error",
 
   await waitFor(() => expect(result.current.state).toEqual({ status: "loaded", quota: quota("Account A"), error: null }));
   rerender({ id: "account-b", capability: "claude" });
-  await waitFor(() => expect(connectionProviderQuota).toHaveBeenCalledWith("account-b"));
+  await waitFor(() => expect(connectionProviderQuota).toHaveBeenCalledWith(LOCAL_RUNNER, "account-b"));
   expect(result.current.state).toEqual({ status: "loading", quota: null, error: null });
   await act(async () => {
     accountB.resolve(error("Account B unavailable"));
@@ -193,7 +194,7 @@ test("resets a Codex credit and refreshes exactly once", async () => {
   });
 
   expect(reset).toBe(true);
-  expect(resetCodexCredit).toHaveBeenCalledWith("account-a");
+  expect(resetCodexCredit).toHaveBeenCalledWith(LOCAL_RUNNER, "account-a");
   expect(connectionProviderQuota).toHaveBeenCalledTimes(2);
   expect(result.current.state).toEqual({ status: "loaded", quota: quota("After"), error: null });
 });

@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { AudioLines, ChevronDown, Paperclip } from "lucide-react";
+import { commands } from "@/bindings";
 import { buildTranscript, closeDanglingFence, type Row, type RowAttachment } from "@/lib/transcript";
 import { mediaKindForContentType } from "@/lib/attachments";
 import { distanceFromBottom, isStuck, pinningInterrupted, showScrollFab } from "@/lib/scroll";
@@ -15,10 +15,37 @@ import { SpeakerBubble } from "./SpeakerBubble";
 import { BlockCard } from "./BlockCard";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
-function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: string) => void }) {
-  const [failed, setFailed] = useState(false);
+/** Renders one saved attachment. Unlike the pre-P4-3 `convertFileSrc(a.path)`
+ *  (Tauri's asset protocol, which only ever reads THIS host's disk), the
+ *  bytes are fetched through the engine's authed, jailed `GET /attachments`
+ *  route (`commands.fetchAttachment`) — remote-safe, since a remote runner's
+ *  attachments live on ITS disk, not the cockpit's. Non-previewable kinds
+ *  (`"file"`) never fetch at all — there's nothing to render beyond the
+ *  chip, so the IPC round-trip and base64 blow-up are skipped entirely. */
+function MediaItem({ runnerId, a, onOpenImage }: { runnerId: string; a: RowAttachment; onOpenImage: (src: string) => void }) {
   const kind = mediaKindForContentType(a.contentType, a.path);
-  const src = convertFileSrc(a.path);
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(null);
+    setFailed(false);
+    if (kind === "file") return;
+    void commands.fetchAttachment(runnerId, a.rel).then((res) => {
+      if (cancelled) return;
+      if (res.status === "ok") {
+        const mime = a.contentType ?? res.data.contentType ?? "application/octet-stream";
+        setSrc(`data:${mime};base64,${res.data.dataBase64}`);
+      } else {
+        setFailed(true);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runnerId, a.rel, a.contentType, kind]);
+
   if (failed || kind === "file") {
     const Icon = kind === "audio" ? AudioLines : Paperclip;
     return (
@@ -29,6 +56,13 @@ function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: st
         <Icon aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
         <span className="truncate">{a.name}</span>
       </span>
+    );
+  }
+  if (!src) {
+    // Loading: same rounded footprint as the eventual media so the bubble
+    // doesn't jump once the fetch resolves.
+    return (
+      <span className="flex h-10 w-16 animate-pulse items-center justify-center rounded-lg border border-border bg-muted/40" aria-hidden />
     );
   }
   if (kind === "image") {
@@ -49,10 +83,12 @@ function MediaItem({ a, onOpenImage }: { a: RowAttachment; onOpenImage: (src: st
 }
 
 function UserBubble({
+  runnerId,
   text,
   attachments,
   onOpenImage,
 }: {
+  runnerId: string;
   text: string;
   attachments: RowAttachment[];
   onOpenImage: (src: string) => void;
@@ -62,7 +98,7 @@ function UserBubble({
       {attachments.length > 0 && (
         <div className="flex max-w-[70%] flex-wrap justify-end gap-1.5">
           {attachments.map((a) => (
-            <MediaItem key={a.path} a={a} onOpenImage={onOpenImage} />
+            <MediaItem key={a.rel || a.path} runnerId={runnerId} a={a} onOpenImage={onOpenImage} />
           ))}
         </div>
       )}
@@ -126,6 +162,7 @@ function WorkingPulse({ color }: { color: string }) {
 }
 
 export function Transcript({
+  runnerId,
   sessionPk,
   rows,
   agentName,
@@ -133,6 +170,7 @@ export function Transcript({
   running,
   children,
 }: {
+  runnerId: string;
   sessionPk: string;
   rows: Row[];
   agentName: string;
@@ -219,7 +257,7 @@ export function Transcript({
               const streamingTail = running && i === groups.length - 1;
               switch (g.type) {
                 case "user":
-                  return <UserBubble key={g.key} text={g.text} attachments={g.attachments} onOpenImage={setLightbox} />;
+                  return <UserBubble key={g.key} runnerId={runnerId} text={g.text} attachments={g.attachments} onOpenImage={setLightbox} />;
                 case "agent":
                   return (
                     <div key={g.key} className="flex flex-col">
@@ -249,7 +287,7 @@ export function Transcript({
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">
                       <TurnSummary groups={g.groups} durationMs={g.durationMs} />
-                      <FileChangeCards sessionPk={sessionPk} cards={g.editCards} />
+                      <FileChangeCards runnerId={runnerId} sessionPk={sessionPk} cards={g.editCards} />
                     </div>
                   );
                 default:

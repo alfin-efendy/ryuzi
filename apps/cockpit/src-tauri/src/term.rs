@@ -2,7 +2,7 @@
 //! (ConPTY on Windows). Output streams to the webview over the
 //! `term-output-msg` event; input/resize/close are commands.
 
-use crate::engine::EngineClient;
+use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -62,13 +62,15 @@ fn default_shell() -> (String, Vec<String>) {
 #[specta::specta]
 pub async fn term_open(
     app: tauri::AppHandle,
-    engine: State<'_, Arc<EngineClient>>,
+    engine: State<'_, Arc<EngineManager>>,
+    runner_id: Option<String>,
     terms: State<'_, Arc<UiTerms>>,
     session_pk: String,
     cols: u16,
     rows: u16,
 ) -> R<String> {
-    let cwd: String = engine
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    let cwd: String = client
         .rpc(
             "session_workdir",
             serde_json::json!({ "session_pk": session_pk.clone() }),

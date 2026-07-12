@@ -33,7 +33,7 @@ export const useScheduler = create<SchedulerState>((set, get) => ({
   loaded: false,
 
   hydrate: async () => {
-    applyResult(set, await commands.listJobs(), "Job list");
+    applyResult(set, await commands.listJobs("local"), "Job list");
     if (!listening) {
       listening = true;
       void events.coreEventMsg.listen((e) => {
@@ -43,24 +43,24 @@ export const useScheduler = create<SchedulerState>((set, get) => ({
   },
 
   refresh: async () => {
-    applyResult(set, await commands.listJobs(), "Job list");
+    applyResult(set, await commands.listJobs("local"), "Job list");
   },
 
-  createJob: async (input) => applyResult(set, await commands.createJob(input), "Create job"),
+  createJob: async (input) => applyResult(set, await commands.createJob("local", input), "Create job"),
 
-  updateJob: async (id, input) => applyResult(set, await commands.updateJob(id, input), "Update job"),
+  updateJob: async (id, input) => applyResult(set, await commands.updateJob("local", id, input), "Update job"),
 
   toggle: async (id, enabled) => {
     set({ jobs: get().jobs.map((j) => (j.id === id ? { ...j, enabled } : j)) });
-    applyResult(set, await commands.toggleJob(id, enabled), "Toggle job");
+    applyResult(set, await commands.toggleJob("local", id, enabled), "Toggle job");
   },
 
   remove: async (id) => {
-    applyResult(set, await commands.deleteJob(id), "Delete job");
+    applyResult(set, await commands.deleteJob("local", id), "Delete job");
   },
 
   runNow: async (id) => {
-    applyResult(set, await commands.runJobNow(id), "Run job");
+    applyResult(set, await commands.runJobNow("local", id), "Run job");
   },
 }));
 

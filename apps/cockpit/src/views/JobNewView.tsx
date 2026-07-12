@@ -16,6 +16,7 @@ import {
 } from "@ryuzi/ui";
 import { toast } from "sonner";
 import { commands, type BranchList } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton } from "@/components/common/DetailHeader";
 import { ScheduleCard, type ScheduleValue } from "./JobDetailView";
 
@@ -51,7 +52,7 @@ export function JobNewView() {
     // (it errors "not a git repository").
     if (!branchProjectId || !isGit) return;
     let cancelled = false;
-    void commands.listBranches(branchProjectId).then((res) => {
+    void commands.listBranches(LOCAL_RUNNER, branchProjectId).then((res) => {
       if (cancelled) return;
       if (res.status === "ok") {
         setBranchList(res.data);

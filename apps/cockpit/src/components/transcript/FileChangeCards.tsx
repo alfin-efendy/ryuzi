@@ -8,15 +8,17 @@ import { reviewFileIndex, useDiff } from "@/store-diff";
 import { basename, toRepoRelative } from "@/lib/paths";
 import { DiffStat } from "@/components/common/bits";
 import type { EditCard } from "@/lib/transcript";
+import { sessKey } from "@/lib/session-key";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 const kindIcon = { edit: Pencil, write: Pencil, delete: Trash2, move: FolderInput } as const;
 
 /** Per-file change cards under a turn summary: DiffStat from the shared diff,
  *  Review jumps the right panel to the file, Undo reverts it to HEAD. */
-export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards: EditCard[] }) {
-  const files = useDiff((s) => s.bySession[sessionPk]?.files ?? []);
-  const hasDiff = useDiff((s) => s.bySession[sessionPk] !== undefined);
+export function FileChangeCards({ runnerId, sessionPk, cards }: { runnerId: string; sessionPk: string; cards: EditCard[] }) {
+  const key = sessKey(runnerId, sessionPk);
+  const files = useDiff((s) => s.bySession[key]?.files ?? []);
+  const hasDiff = useDiff((s) => s.bySession[key] !== undefined);
   const fetchDiff = useDiff((s) => s.fetch);
   const setPendingReview = useDiff((s) => s.setPendingReview);
   const nav = useNav();
@@ -26,23 +28,23 @@ export function FileChangeCards({ sessionPk, cards }: { sessionPk: string; cards
   // Cards render even when the right panel (the usual fetch trigger) is
   // closed — fetch once so +adds/-dels aren't blank by default.
   useEffect(() => {
-    if (cards.length > 0 && !hasDiff) void fetchDiff(sessionPk);
-  }, [cards.length, hasDiff, sessionPk, fetchDiff]);
+    if (cards.length > 0 && !hasDiff) void fetchDiff(runnerId, sessionPk);
+  }, [cards.length, hasDiff, runnerId, sessionPk, fetchDiff]);
 
   const review = (card: EditCard) => {
-    setPendingReview({ sessionPk, path: card.path });
+    setPendingReview({ runnerId, sessionPk, path: card.path });
     nav.setRightOpen(true);
     nav.setRightTab("review");
   };
 
   const undo = async (card: EditCard) => {
-    const wd = await commands.sessionWorkdir(sessionPk);
+    const wd = await commands.sessionWorkdir(runnerId, sessionPk);
     const rel = toRepoRelative(card.path, wd.status === "ok" ? wd.data : "");
-    const res = await commands.revertFile(sessionPk, rel);
+    const res = await commands.revertFile(runnerId, sessionPk, rel);
     if (res.status === "ok") {
       setReverted((cur) => ({ ...cur, [card.path]: true }));
       toast.success(`Reverted ${basename(card.path)}`);
-      void fetchDiff(sessionPk);
+      void fetchDiff(runnerId, sessionPk);
     } else {
       toast.error("Couldn't revert: " + res.error.message);
     }

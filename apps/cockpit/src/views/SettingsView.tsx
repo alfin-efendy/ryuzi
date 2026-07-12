@@ -5,6 +5,7 @@ import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
 import { AuditCard } from "@/components/AuditCard";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 import { ModelPicker } from "@/components/ModelPicker";
 import { PermissionsCard } from "@/components/PermissionsCard";
 import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
@@ -253,7 +254,7 @@ function AgentLoopCard() {
   const [saved, setSaved] = useState<Record<string, string>>({});
   useEffect(() => {
     for (const s of LOOP_SETTINGS) {
-      void commands.getSetting(s.key).then((res) => {
+      void commands.getSetting(LOCAL_RUNNER, s.key).then((res) => {
         if (res.status === "ok" && res.data) {
           setValues((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
           setSaved((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
@@ -269,7 +270,7 @@ function AgentLoopCard() {
       return;
     }
     setValues((cur) => ({ ...cur, [key]: normalized }));
-    const res = await commands.setSetting(key, normalized);
+    const res = await commands.setSetting(LOCAL_RUNNER, key, normalized);
     if (res.status === "error") {
       setValues((cur) => ({ ...cur, [key]: saved[key] ?? "" }));
       toast.error("Couldn't save setting: " + res.error.message);
@@ -349,7 +350,7 @@ export function SettingsView() {
 
   const [projectsRoot, setProjectsRoot] = useState("");
   useEffect(() => {
-    void commands.getSetting(PROJECTS_ROOT_KEY).then((res) => {
+    void commands.getSetting(LOCAL_RUNNER, PROJECTS_ROOT_KEY).then((res) => {
       if (res.status === "ok") setProjectsRoot(res.data ?? "");
     });
   }, []);
@@ -358,13 +359,13 @@ export function SettingsView() {
     const dir = await commands.pickDirectory();
     if (!dir) return;
     setProjectsRoot(dir);
-    const res = await commands.setSetting(PROJECTS_ROOT_KEY, dir);
+    const res = await commands.setSetting(LOCAL_RUNNER, PROJECTS_ROOT_KEY, dir);
     if (res.status === "error") toast.error("Couldn't save projects folder: " + res.error.message);
   };
 
   const [worktreeDir, setWorktreeDir] = useState("");
   useEffect(() => {
-    void commands.getSetting(WORKTREE_DIR_KEY).then((res) => {
+    void commands.getSetting(LOCAL_RUNNER, WORKTREE_DIR_KEY).then((res) => {
       if (res.status === "ok") setWorktreeDir(res.data ?? "");
     });
   }, []);
@@ -373,7 +374,7 @@ export function SettingsView() {
     const dir = await commands.pickDirectory();
     if (!dir) return;
     setWorktreeDir(dir);
-    const res = await commands.setSetting(WORKTREE_DIR_KEY, dir);
+    const res = await commands.setSetting(LOCAL_RUNNER, WORKTREE_DIR_KEY, dir);
     if (res.status === "error") toast.error("Couldn't save worktree folder: " + res.error.message);
   };
 

@@ -1,6 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { CmdError, GatewayInfo, JobInfo, Result, RunInfo } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // Mock the Tauri boundary before the view (and the stores it pulls in) load.
 let seededJobs: JobInfo[] = [];
@@ -159,7 +160,7 @@ test("clicking Run now invokes the runJobNow command with the job id", async () 
   });
 
   expect(runJobNow).toHaveBeenCalledTimes(1);
-  expect(runJobNow).toHaveBeenCalledWith("job-1");
+  expect(runJobNow).toHaveBeenCalledWith(LOCAL_RUNNER, "job-1");
 });
 
 test("shows a not-found placeholder for an unknown job id", () => {

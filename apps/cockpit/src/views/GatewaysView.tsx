@@ -7,6 +7,7 @@ import { useStore } from "@/store";
 import type { GatewayInfo } from "@/bindings";
 import { Button, SettingsCard as Card } from "@ryuzi/ui";
 import { AddGatewayModal } from "@/components/modals/AddGatewayModal";
+import { AddRunnerModal } from "@/components/modals/AddRunnerModal";
 import { QuotaTrack, StatusDot } from "@/components/common/bits";
 
 function plural(n: number, word: string): string {
@@ -68,6 +69,7 @@ function GatewayCard({ g }: { g: GatewayInfo }) {
 export function GatewaysView() {
   const { gateways, loaded, probing, hydrate, probe } = useGateways();
   const [addOpen, setAddOpen] = useState(false);
+  const [addRunnerOpen, setAddRunnerOpen] = useState(false);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -87,6 +89,10 @@ export function GatewaysView() {
             <RefreshCw aria-hidden size={13} strokeWidth={2} className={probing ? "size-[13px] animate-spin" : "size-[13px]"} />
             {probing ? "Probing…" : "Probe"}
           </Button>
+          <Button variant="outline" onClick={() => setAddRunnerOpen(true)} className="shrink-0">
+            <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
+            Connect runner
+          </Button>
           <Button onClick={() => setAddOpen(true)} className="shrink-0">
             <Plus aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             Connect gateway
@@ -101,6 +107,7 @@ export function GatewaysView() {
         </div>
       </div>
       {addOpen && <AddGatewayModal onClose={() => setAddOpen(false)} />}
+      {addRunnerOpen && <AddRunnerModal onClose={() => setAddRunnerOpen(false)} />}
     </div>
   );
 }

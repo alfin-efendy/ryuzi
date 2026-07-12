@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import { createTerm, getTerm, setOnExit, setCopyOnSelect as cacheSetCopyOnSelect } from "./lib/term-cache";
+import { sessKey } from "./lib/session-key";
 
 const KEY_COPY = "cockpit.term.copyOnSelect";
 
@@ -29,18 +30,20 @@ export function markExited(tabs: TermTab[], termId: string): TermTab[] {
   return tabs.map((t) => (t.termId === termId ? { ...t, exited: true } : t));
 }
 
+// `tabs`/`active` are keyed by `sessKey(runnerId, sessionPk)` — terminals must
+// not collide across runners that share a session pk.
 type TermsState = {
   tabs: Record<string, TermTab[]>;
   active: Record<string, string>;
-  open: (sessionPk: string) => Promise<void>;
+  open: (runnerId: string, sessionPk: string) => Promise<void>;
   /** Spawn Terminal 1 iff the session has none. Module-level in-flight guard
    *  makes this safe under React StrictMode's dev double-mount. */
-  ensureOne: (sessionPk: string) => Promise<void>;
-  close: (sessionPk: string, termId: string) => void;
-  setActive: (sessionPk: string, termId: string) => void;
+  ensureOne: (runnerId: string, sessionPk: string) => Promise<void>;
+  close: (runnerId: string, sessionPk: string, termId: string) => void;
+  setActive: (runnerId: string, sessionPk: string, termId: string) => void;
   /** Archive teardown: drop every cached terminal for a session. The backend
    *  term_close_session already killed the PTYs; this clears the JS side. */
-  disposeSession: (sessionPk: string) => void;
+  disposeSession: (runnerId: string, sessionPk: string) => void;
   copyOnSelect: boolean;
   setCopyOnSelect: (v: boolean) => void;
 };
@@ -60,12 +63,13 @@ export const useTerms = create<TermsState>((set, get) => {
     tabs: {},
     active: {},
 
-    open: async (sessionPk) => {
+    open: async (runnerId, sessionPk) => {
+      const key = sessKey(runnerId, sessionPk);
       let inst: Awaited<ReturnType<typeof createTerm>>;
       try {
         // createTerm can reject if the one-time event-listener registration
         // fails (see term-cache); the Result branch below stays for open errors.
-        inst = await createTerm(sessionPk);
+        inst = await createTerm(runnerId, sessionPk);
       } catch (e) {
         toast.error(`Terminal failed to open: ${e instanceof Error ? e.message : String(e)}`);
         return;
@@ -75,44 +79,47 @@ export const useTerms = create<TermsState>((set, get) => {
         return;
       }
       set((s) => {
-        const list = s.tabs[sessionPk] ?? [];
+        const list = s.tabs[key] ?? [];
         return {
-          tabs: { ...s.tabs, [sessionPk]: [...list, { termId: inst.termId, title: nextTitle(list), exited: false }] },
-          active: { ...s.active, [sessionPk]: inst.termId },
+          tabs: { ...s.tabs, [key]: [...list, { termId: inst.termId, title: nextTitle(list), exited: false }] },
+          active: { ...s.active, [key]: inst.termId },
         };
       });
     },
 
-    ensureOne: async (sessionPk) => {
-      if (inflight.has(sessionPk) || (get().tabs[sessionPk] ?? []).length > 0) return;
-      inflight.add(sessionPk);
+    ensureOne: async (runnerId, sessionPk) => {
+      const key = sessKey(runnerId, sessionPk);
+      if (inflight.has(key) || (get().tabs[key] ?? []).length > 0) return;
+      inflight.add(key);
       try {
-        await get().open(sessionPk);
+        await get().open(runnerId, sessionPk);
       } finally {
-        inflight.delete(sessionPk);
+        inflight.delete(key);
       }
     },
 
-    close: (sessionPk, termId) => {
+    close: (runnerId, sessionPk, termId) => {
+      const key = sessKey(runnerId, sessionPk);
       getTerm(termId)?.dispose();
       set((s) => {
-        const r = closeTermTab(s.tabs[sessionPk] ?? [], s.active[sessionPk] ?? null, termId);
+        const r = closeTermTab(s.tabs[key] ?? [], s.active[key] ?? null, termId);
         const active = { ...s.active };
-        if (r.active === null) delete active[sessionPk];
-        else active[sessionPk] = r.active;
-        return { tabs: { ...s.tabs, [sessionPk]: r.tabs }, active };
+        if (r.active === null) delete active[key];
+        else active[key] = r.active;
+        return { tabs: { ...s.tabs, [key]: r.tabs }, active };
       });
     },
 
-    setActive: (sessionPk, termId) => set((s) => ({ active: { ...s.active, [sessionPk]: termId } })),
+    setActive: (runnerId, sessionPk, termId) => set((s) => ({ active: { ...s.active, [sessKey(runnerId, sessionPk)]: termId } })),
 
-    disposeSession: (sessionPk) => {
-      for (const t of get().tabs[sessionPk] ?? []) getTerm(t.termId)?.dispose();
+    disposeSession: (runnerId, sessionPk) => {
+      const key = sessKey(runnerId, sessionPk);
+      for (const t of get().tabs[key] ?? []) getTerm(t.termId)?.dispose();
       set((s) => {
         const tabs = { ...s.tabs };
         const active = { ...s.active };
-        delete tabs[sessionPk];
-        delete active[sessionPk];
+        delete tabs[key];
+        delete active[key];
         return { tabs, active };
       });
     },
