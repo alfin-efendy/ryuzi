@@ -170,6 +170,11 @@ pub struct AppOrchSummary {
     pub title: String,
     pub status: String,
     pub agent: String,
+    /// The judge's final verdict text, present once a root reaches `done`
+    /// (`None` while in progress). Lets an agent-initiated (home-less)
+    /// orchestration retrieve its outcome via the `app_orchestrate` status
+    /// action — the rail verdict delivery is skipped when there's no home chat.
+    pub result: Option<String>,
 }
 
 /// A project as seen through `app_projects`.
@@ -735,6 +740,7 @@ pub(crate) mod testutil {
                 title: "build it".into(),
                 status: "running".into(),
                 agent: "orchestrator".into(),
+                result: None,
             }])
         }
         async fn cancel_orchestration(&self, _id: &str) -> anyhow::Result<u32> {

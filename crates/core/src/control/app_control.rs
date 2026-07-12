@@ -158,6 +158,7 @@ impl AppControl for AppControlImpl {
                 title: t.title,
                 status: t.status,
                 agent: t.agent,
+                result: t.result,
             })
             .collect())
     }

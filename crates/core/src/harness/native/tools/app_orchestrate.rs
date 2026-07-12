@@ -90,7 +90,18 @@ impl Tool for AppOrchestrate {
                 }
                 let lines: Vec<String> = tasks
                     .iter()
-                    .map(|t| format!("- [{}] {} — {} ({})", t.id, t.title, t.status, t.agent))
+                    .map(|t| {
+                        let verdict = t
+                            .result
+                            .as_deref()
+                            .filter(|r| !r.trim().is_empty())
+                            .map(|r| format!("\n    ↳ {r}"))
+                            .unwrap_or_default();
+                        format!(
+                            "- [{}] {} — {} ({}){}",
+                            t.id, t.title, t.status, t.agent, verdict
+                        )
+                    })
                     .collect();
                 Ok(ToolOutput::ok(lines.join("\n")))
             }
