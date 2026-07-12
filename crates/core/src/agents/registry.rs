@@ -14,7 +14,7 @@ use crate::store::Store;
 
 #[cfg(test)]
 use super::transaction::TransactionFailpoint;
-use super::transaction::{recover_transactions, AgentTransaction};
+use super::transaction::{recover_transactions, registry_generation, AgentTransaction};
 use super::types::*;
 use super::yaml::{
     parse_agent_index, parse_agent_index_document, parse_agent_profile,
@@ -39,6 +39,7 @@ struct RegistryState {
     index: AgentIndex,
     agents: IndexMap<AgentId, Arc<AgentSnapshot>>,
     subagents: SubagentConfig,
+    generation: String,
     recovery: Vec<AgentRecoveryNotice>,
     #[allow(dead_code)]
     repairs: Vec<ProfileRepairRecord>,
@@ -188,6 +189,7 @@ impl AgentRegistry {
                 )
             })
             .collect();
+        let generation = registry_generation(&config_root)?;
         Ok(Self {
             config_root,
             store,
@@ -195,6 +197,7 @@ impl AgentRegistry {
                 index,
                 agents,
                 subagents,
+                generation,
                 recovery,
                 repairs,
             })),
@@ -294,7 +297,13 @@ impl AgentRegistry {
         self.validate_mutation(&index, &profiles, &state.subagents, &id)
             .await?;
         let snapshot = self
-            .commit_candidate(index, profiles, state.subagents.clone(), Vec::new())
+            .commit_candidate_with_profile_sources(
+                index,
+                profiles,
+                state.subagents.clone(),
+                Vec::new(),
+                HashMap::from([(id.clone(), agent_id.to_owned())]),
+            )
             .await?;
         Ok(snapshot
             .agents
@@ -318,9 +327,15 @@ impl AgentRegistry {
         let mut profiles = typed_profiles(&state);
         profiles.shift_remove(agent_id);
         let mut index = state.index.clone();
+        let deleted_position = index
+            .order
+            .iter()
+            .position(|id| id == agent_id)
+            .expect("loaded agent is present in index order");
         index.order.retain(|id| id != agent_id);
         if index.default_agent_id == agent_id {
-            index.default_agent_id = index.order[0].clone();
+            let next_position = deleted_position.min(index.order.len() - 1);
+            index.default_agent_id = index.order[next_position].clone();
         }
         self.validate_candidate(&index, &profiles, &state.subagents)
             .await?;
@@ -387,11 +402,36 @@ impl AgentRegistry {
         subagents: SubagentConfig,
         deleted_agent_ids: Vec<AgentId>,
     ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
+        self.commit_candidate_with_profile_sources(
+            index,
+            profiles,
+            subagents,
+            deleted_agent_ids,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    async fn commit_candidate_with_profile_sources(
+        &self,
+        index: AgentIndex,
+        profiles: IndexMap<AgentId, AgentProfile>,
+        subagents: SubagentConfig,
+        deleted_agent_ids: Vec<AgentId>,
+        profile_sources: HashMap<AgentId, AgentId>,
+    ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
         self.validate_candidate(&index, &profiles, &subagents)
             .await?;
-        let disk_image =
-            self.render_disk_image(&index, &profiles, &subagents, deleted_agent_ids)?;
-        let transaction = AgentTransaction::prepare(&self.config_root, &disk_image)?;
+        let disk_image = self.render_disk_image(
+            &index,
+            &profiles,
+            &subagents,
+            deleted_agent_ids,
+            &profile_sources,
+        )?;
+        let expected_generation = self.state.read().await.generation.clone();
+        let transaction =
+            AgentTransaction::prepare(&self.config_root, &disk_image, Some(&expected_generation))?;
         #[cfg(test)]
         let transaction = transaction.with_failpoint(
             match self.failpoint.load(std::sync::atomic::Ordering::SeqCst) {
@@ -401,6 +441,7 @@ impl AgentRegistry {
             },
         );
         transaction.commit()?;
+        let generation = registry_generation(&self.config_root)?;
         let agents = profiles
             .into_iter()
             .map(|(id, profile)| {
@@ -418,6 +459,7 @@ impl AgentRegistry {
             index,
             agents,
             subagents,
+            generation,
             recovery: self.state.read().await.recovery.clone(),
             repairs: Vec::new(),
         });
@@ -432,6 +474,7 @@ impl AgentRegistry {
         profiles: &IndexMap<AgentId, AgentProfile>,
         subagents: &SubagentConfig,
         deleted_agent_ids: Vec<AgentId>,
+        profile_sources: &HashMap<AgentId, AgentId>,
     ) -> anyhow::Result<RegistryDiskImage> {
         let index_path = paths::agents_dir_in(&self.config_root).join("index.yaml");
         let index_yaml = match std::fs::read_to_string(&index_path)
@@ -457,7 +500,8 @@ impl AgentRegistry {
         };
         let mut agents = IndexMap::new();
         for (id, profile) in profiles {
-            let profile_path = paths::agent_dir_in(&self.config_root, id).join("agent.yaml");
+            let source_id = profile_sources.get(id).unwrap_or(id);
+            let profile_path = paths::agent_dir_in(&self.config_root, source_id).join("agent.yaml");
             let yaml = match std::fs::read_to_string(&profile_path)
                 .ok()
                 .and_then(|raw| parse_agent_profile_document(&raw).ok())
@@ -1286,6 +1330,95 @@ mod tests {
             1
         );
         assert_eq!(registry.snapshot().await.agents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_registry_rejects_mutation_instead_of_overwriting() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let first = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let second = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+
+        first.create(mutation_input("Worker One")).await.unwrap();
+        let error = second
+            .create(mutation_input("Worker Two"))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("changed on disk"));
+        let reloaded = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let names = reloaded
+            .snapshot()
+            .await
+            .agents
+            .into_iter()
+            .map(|agent| agent.profile.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"Worker One".to_owned()));
+        assert!(!names.contains(&"Worker Two".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn duplicate_preserves_source_profile_extensions() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_raw(
+            "agents/index.yaml",
+            "schema_version: 1\norder: [ryuzi]\ndefault_agent_id: ryuzi\n",
+        );
+        fixture.write_raw(
+            "agents/ryuzi/agent.yaml",
+            &format!(
+                "{}x_vendor:\n  retained: true\n",
+                profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high"))
+            ),
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+
+        let duplicate = registry.duplicate("ryuzi").await.unwrap();
+        let raw = std::fs::read_to_string(
+            fixture
+                .root
+                .path()
+                .join("agents")
+                .join(&duplicate.profile.id)
+                .join("agent.yaml"),
+        )
+        .unwrap();
+        assert!(raw.contains("x_vendor:"));
+        assert!(raw.contains("retained: true"));
+    }
+
+    #[tokio::test]
+    async fn deleting_default_selects_the_next_ordered_survivor() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["one", "two", "three"], "two");
+        for (id, name) in [("one", "One"), ("two", "Two"), ("three", "Three")] {
+            fixture.write_profile(
+                id,
+                profile_yaml(id, name, "anthropic/claude-opus-4-8", Some("high")),
+            );
+        }
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+
+        let snapshot = registry.delete("two").await.unwrap();
+
+        assert_eq!(snapshot.default_agent_id, "three");
     }
 
     #[tokio::test]
