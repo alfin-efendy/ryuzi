@@ -324,7 +324,13 @@ impl Harness for NativeHarness {
                     crate::domain::SessionKind::Project
                     | crate::domain::SessionKind::Chat
                     | crate::domain::SessionKind::Worker => crate::domain::WriteOrigin::Agent,
-                    crate::domain::SessionKind::Review => crate::domain::WriteOrigin::User,
+                    // Defensively least-privileged: this arm is dead (the review
+                    // fork builds its own `RunnerDeps` with `BackgroundReview` and
+                    // never routes through here), but if ever reached it must not
+                    // grant the most-privileged `User` origin.
+                    crate::domain::SessionKind::Review => {
+                        crate::domain::WriteOrigin::BackgroundReview
+                    }
                 },
             },
             live_cancel: Mutex::new(None),
