@@ -1,4 +1,9 @@
-use crate::llm_router::model_effort::{DiscoveredModelMeta, ReasoningEffortOption};
+use crate::llm_router::model_effort::{
+    DiscoveredModelMeta, ExecutionModelEffortCapabilities, ExecutionSurfaceKey, ModelPreferenceKey,
+    ReasoningEffortOption,
+};
+use crate::llm_router::{connections, model_meta, registry};
+use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -145,6 +150,156 @@ pub fn resolve_effort_capabilities(
         provider_default: None,
         source: ModelCapabilitySource::Unknown,
     }
+}
+
+pub async fn resolve_for_surface(
+    store: &Store,
+    family: &str,
+    surface: &ExecutionSurfaceKey,
+) -> ExecutionModelEffortCapabilities {
+    let catalog = model_meta::resolve_catalog_for_surface(surface);
+    let discovered = model_meta::discovered_for_surface(store, surface).await;
+    let wire_supports = registry::descriptor(&surface.provider_id).is_some_and(|descriptor| {
+        descriptor.family == family
+            && (family != "anthropic"
+                || matches!(descriptor.format, registry::ApiFormat::Anthropic))
+    });
+    let capabilities = resolve_effort_capabilities(
+        family,
+        &surface.model,
+        discovered.as_ref(),
+        &catalog.reasoning_efforts,
+        catalog.default_reasoning_effort.as_deref(),
+        wire_supports,
+    );
+    ExecutionModelEffortCapabilities {
+        surface: surface.clone(),
+        model_display_name: discovered
+            .as_ref()
+            .and_then(|metadata| metadata.display_name.clone())
+            .or(catalog.display_name)
+            .unwrap_or_else(|| surface.model.clone()),
+        supported: capabilities.supported,
+        provider_default: capabilities.provider_default,
+    }
+}
+
+fn connection_serves_model(
+    descriptor: &registry::ProviderDescriptor,
+    connection: &connections::ConnectionRow,
+    key: &ModelPreferenceKey,
+) -> bool {
+    if descriptor.family != key.family {
+        return false;
+    }
+    let models = connections::effective_models(descriptor, connection);
+    models.iter().any(|model| model == &key.model)
+        || (key.family == "openai"
+            && key
+                .model
+                .strip_suffix("-review")
+                .is_some_and(|base| models.iter().any(|model| model == base)))
+}
+
+pub async fn concrete_model_is_available(
+    store: &Store,
+    key: &ModelPreferenceKey,
+) -> anyhow::Result<bool> {
+    Ok(connections::list_connections(store)
+        .await?
+        .into_iter()
+        .any(|connection| {
+            connection.enabled
+                && registry::descriptor(&connection.provider)
+                    .is_some_and(|descriptor| connection_serves_model(descriptor, &connection, key))
+        }))
+}
+
+pub async fn resolve_for_model(
+    store: &Store,
+    key: &ModelPreferenceKey,
+) -> anyhow::Result<ModelEffortCapabilities> {
+    let mut surfaces = Vec::new();
+    for connection in connections::list_connections(store)
+        .await?
+        .into_iter()
+        .filter(|connection| connection.enabled)
+    {
+        let Some(descriptor) = registry::descriptor(&connection.provider) else {
+            continue;
+        };
+        if !connection_serves_model(descriptor, &connection, key) {
+            continue;
+        }
+        let surface = ExecutionSurfaceKey {
+            provider_id: connection.provider.clone(),
+            connection_id: Some(connection.id.clone()),
+            model: key.model.clone(),
+        };
+        surfaces.push(resolve_for_surface(store, &key.family, &surface).await);
+    }
+
+    if surfaces.is_empty() {
+        let fallback_provider = registry::descriptor(&key.family)
+            .filter(|descriptor| descriptor.family == key.family)
+            .map(|descriptor| descriptor.id)
+            .unwrap_or(key.family.as_str());
+        let catalog = model_meta::resolve_catalog_for_surface(&ExecutionSurfaceKey {
+            provider_id: fallback_provider.into(),
+            connection_id: None,
+            model: key.model.clone(),
+        });
+        return Ok(resolve_effort_capabilities(
+            &key.family,
+            &key.model,
+            None,
+            &catalog.reasoning_efforts,
+            catalog.default_reasoning_effort.as_deref(),
+            registry::descriptor(fallback_provider).is_some_and(|descriptor| {
+                descriptor.family == key.family
+                    && (key.family != "anthropic"
+                        || matches!(descriptor.format, registry::ApiFormat::Anthropic))
+            }),
+        ));
+    }
+
+    let supported = surfaces[0]
+        .supported
+        .iter()
+        .filter(|option| {
+            surfaces[1..].iter().all(|surface| {
+                surface
+                    .supported
+                    .iter()
+                    .any(|other| other.value == option.value)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let defaults = surfaces
+        .iter()
+        .map(|surface| {
+            surface
+                .provider_default
+                .as_ref()
+                .filter(|value| {
+                    supported
+                        .iter()
+                        .any(|option| option.value.as_str() == value.as_str())
+                })
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    let provider_default = defaults
+        .first()
+        .cloned()
+        .flatten()
+        .filter(|first| defaults.iter().all(|value| value.as_ref() == Some(first)));
+    Ok(ModelEffortCapabilities {
+        supported,
+        provider_default,
+        source: ModelCapabilitySource::Discovery,
+    })
 }
 
 #[cfg(test)]
@@ -335,5 +490,220 @@ mod tests {
         assert_eq!(values(&resolved), vec!["ultra"]);
         assert_eq!(resolved.provider_default.as_deref(), Some("ultra"));
         assert_eq!(resolved.source, ModelCapabilitySource::ExistingCatalog);
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+    use crate::llm_router::model_effort::{ExecutionSurfaceKey, ModelPreferenceKey};
+    use std::collections::HashMap;
+
+    async fn store() -> (tempfile::NamedTempFile, crate::store::Store) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        (tmp, store)
+    }
+
+    fn connection(
+        id: &str,
+        provider: &str,
+        models: &[&str],
+        metadata: Option<HashMap<String, DiscoveredModelMeta>>,
+    ) -> ConnectionRow {
+        ConnectionRow {
+            id: id.into(),
+            provider: provider.into(),
+            auth_type: if provider.ends_with("-oauth") {
+                "oauth".into()
+            } else {
+                "api_key".into()
+            },
+            label: id.into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData {
+                models_override: Some(models.iter().map(|model| (*model).to_string()).collect()),
+                model_meta_overrides: metadata,
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn discovered(values: Option<&[&str]>, default: Option<&str>) -> DiscoveredModelMeta {
+        DiscoveredModelMeta {
+            display_name: None,
+            effort_options: values.map(|values| {
+                values
+                    .iter()
+                    .map(|value| ReasoningEffortOption {
+                        value: (*value).into(),
+                        label: (*value).into(),
+                        description: None,
+                    })
+                    .collect()
+            }),
+            default_effort_advertised: default.is_some(),
+            default_effort: default.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_api_key_and_oauth_surfaces_share_the_pinned_fallback() {
+        let (_tmp, store) = store().await;
+        for (provider, model) in [
+            ("anthropic", "claude-sonnet-5"),
+            ("anthropic-oauth", "claude-opus-4-7-20260712"),
+        ] {
+            let surface = ExecutionSurfaceKey {
+                provider_id: provider.into(),
+                connection_id: None,
+                model: model.into(),
+            };
+            let resolved = resolve_for_surface(&store, "anthropic", &surface).await;
+            assert_eq!(resolved.provider_default.as_deref(), Some("high"));
+            assert!(resolved
+                .supported
+                .iter()
+                .any(|option| option.value == "xhigh"));
+        }
+    }
+
+    #[tokio::test]
+    async fn discovered_empty_beats_fallback_on_a_real_connection() {
+        let (_tmp, store) = store().await;
+        let model = "claude-opus-4-7";
+        let mut metadata = HashMap::new();
+        metadata.insert(model.into(), discovered(Some(&[]), None));
+        connections::add_connection(
+            &store,
+            connection("anthropic-live", "anthropic", &[model], Some(metadata)),
+        )
+        .await
+        .unwrap();
+
+        let surface = ExecutionSurfaceKey {
+            provider_id: "anthropic".into(),
+            connection_id: Some("anthropic-live".into()),
+            model: model.into(),
+        };
+        let resolved = resolve_for_surface(&store, "anthropic", &surface).await;
+        assert!(resolved.supported.is_empty());
+        assert_eq!(resolved.provider_default, None);
+    }
+
+    #[tokio::test]
+    async fn concrete_model_resolution_intersects_serving_surfaces() {
+        let (_tmp, store) = store().await;
+        let model = "claude-opus-4-7";
+        for (id, values) in [
+            ("anthropic-a", &["low", "high", "xhigh"][..]),
+            ("anthropic-b", &["low", "high"][..]),
+        ] {
+            let mut metadata = HashMap::new();
+            metadata.insert(model.into(), discovered(Some(values), Some("high")));
+            connections::add_connection(
+                &store,
+                connection(id, "anthropic", &[model], Some(metadata)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let resolved = resolve_for_model(
+            &store,
+            &ModelPreferenceKey {
+                family: "anthropic".into(),
+                model: model.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"],
+        );
+        assert_eq!(resolved.provider_default.as_deref(), Some("high"));
+        assert_eq!(resolved.source, ModelCapabilitySource::Discovery);
+    }
+
+    #[tokio::test]
+    async fn openai_review_model_is_served_by_base_id_and_keeps_review_metadata() {
+        let (_tmp, store) = store().await;
+        let metadata = HashMap::from([(
+            "gpt-5.5-review".into(),
+            discovered(Some(&["high"]), Some("high")),
+        )]);
+        connections::add_connection(
+            &store,
+            connection("codex", "openai-oauth", &["gpt-5.5"], Some(metadata)),
+        )
+        .await
+        .unwrap();
+        let key = ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-5.5-review".into(),
+        };
+        assert!(concrete_model_is_available(&store, &key).await.unwrap());
+        let resolved = resolve_for_model(&store, &key).await.unwrap();
+        assert_eq!(
+            resolved
+                .supported
+                .iter()
+                .map(|o| o.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["high"]
+        );
+        assert_eq!(resolved.provider_default.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn capability_fallback_does_not_make_an_unserved_model_available() {
+        let (_tmp, store) = store().await;
+        let key = ModelPreferenceKey {
+            family: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+        };
+        assert!(!concrete_model_is_available(&store, &key).await.unwrap());
+        assert!(!resolve_for_model(&store, &key)
+            .await
+            .unwrap()
+            .supported
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_connection_fallback_is_exact_and_unknown_stays_empty() {
+        let (_tmp, store) = store().await;
+        let known = resolve_for_model(
+            &store,
+            &ModelPreferenceKey {
+                family: "anthropic".into(),
+                model: "claude-opus-4-6".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(known.supports("max"));
+        assert!(!known.supports("xhigh"));
+
+        let unknown = resolve_for_model(
+            &store,
+            &ModelPreferenceKey {
+                family: "anthropic".into(),
+                model: "claude-invented".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(unknown.supported.is_empty());
+        assert_eq!(unknown.source, ModelCapabilitySource::Unknown);
     }
 }

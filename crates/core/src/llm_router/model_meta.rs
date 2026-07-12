@@ -286,6 +286,10 @@ fn resolve_catalog_meta(
     finalize_default(resolved)
 }
 
+pub(crate) fn resolve_catalog_for_surface(surface: &ExecutionSurfaceKey) -> ModelMeta {
+    resolve_catalog_meta(surface, refreshed().as_ref(), vendored())
+}
+
 /// Merge a partial JSON override (any subset of ModelMeta's fields) over base.
 fn apply_override(base: ModelMeta, v: &serde_json::Value) -> ModelMeta {
     ModelMeta {
@@ -446,25 +450,30 @@ pub async fn resolve(store: &Store, requested: &str) -> ModelMeta {
     base
 }
 
+pub(crate) async fn discovered_for_surface(
+    store: &Store,
+    surface: &ExecutionSurfaceKey,
+) -> Option<crate::llm_router::model_effort::DiscoveredModelMeta> {
+    let connection_id = surface.connection_id.as_ref()?;
+    let connection = crate::llm_router::connections::get_connection(store, connection_id)
+        .await
+        .ok()??;
+    if connection.provider != surface.provider_id {
+        return None;
+    }
+    connection
+        .data
+        .model_meta_overrides
+        .as_ref()?
+        .get(&surface.model)
+        .cloned()
+}
+
 /// Resolve metadata for one exact provider/connection/model execution surface.
 pub async fn resolve_for_surface(store: &Store, surface: &ExecutionSurfaceKey) -> ModelMeta {
-    let refreshed_map = refreshed();
-    let mut resolved = resolve_catalog_meta(surface, refreshed_map.as_ref(), vendored());
-    if let Some(connection_id) = &surface.connection_id {
-        if let Ok(Some(connection)) =
-            crate::llm_router::connections::get_connection(store, connection_id).await
-        {
-            if connection.provider == surface.provider_id {
-                if let Some(discovered) = connection
-                    .data
-                    .model_meta_overrides
-                    .as_ref()
-                    .and_then(|metadata| metadata.get(&surface.model))
-                {
-                    resolved = discovered.merge_over(resolved);
-                }
-            }
-        }
+    let mut resolved = resolve_catalog_for_surface(surface);
+    if let Some(discovered) = discovered_for_surface(store, surface).await {
+        resolved = discovered.merge_over(resolved);
     }
     if let Ok(Some(raw)) = store
         .get_setting_raw(&format!("models.meta.{}", surface.model))
