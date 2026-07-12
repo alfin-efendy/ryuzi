@@ -128,7 +128,7 @@ mod tests {
                 cp.store().clone(),
             )),
             cp,
-            token: Some("t".into()),
+            control_token: "t".into(),
         }
     }
 
