@@ -617,7 +617,5 @@ pub async fn extension_status(
     runner_id: Option<String>,
 ) -> R<Vec<ExtensionStatusEntry>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client
-        .rpc("extension_status", serde_json::json!({}))
-        .await
+    client.rpc("extension_status", serde_json::json!({})).await
 }

@@ -369,7 +369,7 @@ function placeLeadingLiveActivityAfterUser(groups: Group[]): Group[] {
   const leading = groups.slice(0, firstUser);
   if (!leading.every((group) => group.type === "activity")) return groups;
   const user = groups[firstUser];
-  if (!user || user.type !== "user") return groups;
+  if (user?.type !== "user") return groups;
   return [user, ...leading, ...groups.slice(firstUser + 1)];
 }
 
