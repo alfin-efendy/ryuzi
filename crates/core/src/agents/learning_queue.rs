@@ -122,6 +122,8 @@ pub struct LearningQueue {
     apply_pause: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
     fail_next_discard: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_apply_fence: std::sync::atomic::AtomicBool,
 }
 
 impl LearningQueue {
@@ -134,6 +136,8 @@ impl LearningQueue {
             apply_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_next_discard: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_apply_fence: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -349,6 +353,13 @@ impl LearningQueue {
         &self,
         agent_id: &str,
     ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+        #[cfg(test)]
+        if self
+            .fail_next_apply_fence
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected apply fence failure");
+        }
         Ok(self.knowledge.write_fence(agent_id)?.lock_owned().await)
     }
 
@@ -505,6 +516,12 @@ impl LearningQueue {
     #[cfg(test)]
     pub(crate) fn fail_next_discard_for_test(&self) {
         self.fail_next_discard
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_apply_fence_for_test(&self) {
+        self.fail_next_apply_fence
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use anyhow::{anyhow, Context};
 use indexmap::IndexMap;
 use serde_yaml::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::llm_router::model_effort::ModelPreferenceKey;
 use crate::llm_router::{model_capabilities, routes};
@@ -51,6 +51,96 @@ struct RegistryState {
 struct ProfileRepairRecord {
     #[allow(dead_code)]
     path: PathBuf,
+}
+
+/// Owns the pre-commit queue rollback independently from the delete future.
+/// Dropping the command sender (including task abortion) tells the worker to
+/// acquire the apply fence before reopening enqueue, preserving fence order.
+enum DeleteBlockCommand {
+    Commit,
+    Rollback { acquire_fence: bool },
+}
+
+struct DeleteBlockRollback {
+    command: Option<oneshot::Sender<DeleteBlockCommand>>,
+    completion: Option<oneshot::Receiver<anyhow::Result<()>>>,
+    committed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DeleteBlockRollback {
+    fn arm(queue: Arc<LearningQueue>, agent_id: AgentId) -> Self {
+        let (command_tx, command_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_committed = Arc::clone(&committed);
+        tokio::spawn(async move {
+            let command = command_rx.await.unwrap_or_else(|_| {
+                if worker_committed.load(std::sync::atomic::Ordering::Acquire) {
+                    DeleteBlockCommand::Commit
+                } else {
+                    DeleteBlockCommand::Rollback {
+                        acquire_fence: true,
+                    }
+                }
+            });
+            let result = match command {
+                DeleteBlockCommand::Commit => Ok(()),
+                DeleteBlockCommand::Rollback {
+                    acquire_fence: false,
+                } => queue.unblock(&agent_id).await,
+                DeleteBlockCommand::Rollback {
+                    acquire_fence: true,
+                } => match queue.acquire_apply_fence(&agent_id).await {
+                    Ok(fence) => {
+                        let result = queue.unblock(&agent_id).await;
+                        drop(fence);
+                        result
+                    }
+                    Err(error) => queue.unblock(&agent_id).await.map_err(|unblock| {
+                        anyhow!("{error}; queue rollback also failed: {unblock}")
+                    }),
+                },
+            };
+            let _ = completion_tx.send(result);
+        });
+        Self {
+            command: Some(command_tx),
+            completion: Some(completion_rx),
+            committed,
+        }
+    }
+
+    async fn rollback(mut self, acquire_fence: bool) -> anyhow::Result<()> {
+        if let Some(command) = self.command.take() {
+            let _ = command.send(DeleteBlockCommand::Rollback { acquire_fence });
+        }
+        self.wait().await
+    }
+
+    fn commit_marker(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.committed)
+    }
+
+    fn disarm(&self) {
+        self.committed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn commit(mut self) {
+        self.disarm();
+        if let Some(command) = self.command.take() {
+            let _ = command.send(DeleteBlockCommand::Commit);
+        }
+        let _ = self.wait().await;
+    }
+
+    async fn wait(&mut self) -> anyhow::Result<()> {
+        self.completion
+            .take()
+            .expect("rollback completion is consumed once")
+            .await
+            .map_err(|_| anyhow!("delete queue rollback worker stopped unexpectedly"))?
+    }
 }
 
 #[derive(Debug)]
@@ -350,6 +440,7 @@ impl AgentRegistry {
                 state.subagents.clone(),
                 Vec::new(),
                 HashMap::from([(id.clone(), agent_id.to_owned())]),
+                None,
             )
             .await?;
         Ok(snapshot
@@ -387,22 +478,48 @@ impl AgentRegistry {
         self.validate_candidate(&index, &profiles, &state.subagents)
             .await?;
         let queue = self.learning_queue.get().and_then(Weak::upgrade);
-        let apply_fence = if let Some(queue) = &queue {
+        let mut block_rollback = if let Some(queue) = &queue {
             queue.block(agent_id).await?;
-            Some(queue.acquire_apply_fence(agent_id).await?)
+            Some(DeleteBlockRollback::arm(
+                Arc::clone(queue),
+                agent_id.to_owned(),
+            ))
         } else {
             None
         };
+        let apply_fence = if let Some(queue) = &queue {
+            match queue.acquire_apply_fence(agent_id).await {
+                Ok(fence) => Some(fence),
+                Err(error) => {
+                    if let Some(rollback) = block_rollback.take() {
+                        rollback.rollback(false).await?;
+                    }
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
+        let commit_marker = block_rollback
+            .as_ref()
+            .map(DeleteBlockRollback::commit_marker);
         let result = self
-            .commit_candidate(
+            .commit_candidate_with_profile_sources(
                 index,
                 profiles,
                 state.subagents.clone(),
                 vec![agent_id.into()],
+                HashMap::new(),
+                commit_marker,
             )
             .await;
         match result {
             Ok(mut snapshot) => {
+                if let Some(rollback) = block_rollback.as_ref() {
+                    // `AgentTransaction::commit` is the filesystem commit point.
+                    // Cancellation after this point must retain the durable block.
+                    rollback.disarm();
+                }
                 if let Some(queue) = &queue {
                     if let Err(error) = queue.discard_unconsumed(agent_id).await {
                         snapshot.recovery.push(AgentRecoveryNotice {
@@ -414,12 +531,15 @@ impl AgentRegistry {
                     }
                 }
                 drop(apply_fence);
+                if let Some(rollback) = block_rollback.take() {
+                    rollback.commit().await;
+                }
                 Ok(snapshot)
             }
             Err(error) => {
                 drop(apply_fence);
-                if let Some(queue) = &queue {
-                    queue.unblock(agent_id).await?;
+                if let Some(rollback) = block_rollback.take() {
+                    rollback.rollback(false).await?;
                 }
                 Err(error)
             }
@@ -486,6 +606,7 @@ impl AgentRegistry {
             subagents,
             deleted_agent_ids,
             HashMap::new(),
+            None,
         )
         .await
     }
@@ -497,6 +618,7 @@ impl AgentRegistry {
         subagents: SubagentConfig,
         deleted_agent_ids: Vec<AgentId>,
         profile_sources: HashMap<AgentId, AgentId>,
+        commit_marker: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
         self.validate_candidate(&index, &profiles, &subagents)
             .await?;
@@ -523,6 +645,9 @@ impl AgentRegistry {
         // the disk again here would race a foreign process committing after
         // the lock is released, caching its generation over our stale image.
         let generation = transaction.commit()?;
+        if let Some(marker) = commit_marker {
+            marker.store(true, std::sync::atomic::Ordering::Release);
+        }
         #[cfg(test)]
         if self.failpoint.load(std::sync::atomic::Ordering::SeqCst) == 3 {
             // Simulates a foreign process that acquires the registry lock and
@@ -1286,6 +1411,177 @@ mod tests {
         assert!(
             matches!(error, AgentRegistryError::Invalid(issues) if issues.iter().any(|issue| issue.field == "model.name"))
         );
+    }
+
+    #[tokio::test]
+    async fn delete_unblocks_queue_when_apply_fence_acquisition_fails() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["ryuzi", "worker"], "ryuzi");
+        fixture.write_profile(
+            "ryuzi",
+            profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile(
+            "worker",
+            profile_yaml(
+                "worker",
+                "Worker",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let knowledge = Arc::new(AgentKnowledgeStore::new(fixture.config_root()));
+        let learning = Arc::new(LearningQueue::new(fixture.store.clone(), knowledge));
+        registry
+            .attach_learning_queue(Arc::downgrade(&learning))
+            .unwrap();
+        learning.fail_next_apply_fence_for_test();
+
+        let error = registry.delete("worker").await.unwrap_err();
+
+        assert!(error.to_string().contains("injected apply fence failure"));
+        assert!(learning
+            .enqueue(
+                "worker",
+                LearningEventPayload::Review(ReviewEvent {
+                    title: "retry".into(),
+                    description: "queue reopened".into(),
+                    body: "fence failure rolled back".into(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .is_ok());
+        assert!(fixture
+            .root
+            .path()
+            .join("agents/worker/agent.yaml")
+            .exists());
+        assert!(registry.get("worker").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_delete_while_waiting_for_apply_fence_unblocks_queue() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["ryuzi", "worker"], "ryuzi");
+        fixture.write_profile(
+            "ryuzi",
+            profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile(
+            "worker",
+            profile_yaml(
+                "worker",
+                "Worker",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        fixture.write_raw(
+            "agents/worker/knowledge/marker.md",
+            "must survive cancellation",
+        );
+        let registry = Arc::new(
+            AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+                .await
+                .unwrap(),
+        );
+        let knowledge = Arc::new(AgentKnowledgeStore::new(fixture.config_root()));
+        let learning = Arc::new(LearningQueue::new(fixture.store.clone(), knowledge));
+        registry
+            .attach_learning_queue(Arc::downgrade(&learning))
+            .unwrap();
+        learning
+            .enqueue(
+                "worker",
+                LearningEventPayload::Review(ReviewEvent {
+                    title: "active".into(),
+                    description: "active apply".into(),
+                    body: "must finish before deletion".into(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        let claimed = learning
+            .claim_next("worker", "worker-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let (apply_entered, release_apply) = learning.pause_next_apply_for_test();
+        let apply_queue = Arc::clone(&learning);
+        let apply = tokio::spawn(async move { apply_queue.apply_claimed(&claimed).await });
+        apply_entered.notified().await;
+
+        let delete_registry = Arc::clone(&registry);
+        let delete = tokio::spawn(async move { delete_registry.delete("worker").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if learning
+                    .blocked_agents()
+                    .await
+                    .unwrap()
+                    .contains(&"worker".to_owned())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete must durably block before waiting on the apply fence");
+        delete.abort();
+        assert!(delete.await.unwrap_err().is_cancelled());
+        release_apply.notify_one();
+        apply.await.unwrap().unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let enqueue = learning
+                    .enqueue(
+                        "worker",
+                        LearningEventPayload::Review(ReviewEvent {
+                            title: "after cancellation".into(),
+                            description: "queue reopened".into(),
+                            body: "delete did not commit".into(),
+                            tags: Vec::new(),
+                        }),
+                    )
+                    .await;
+                if enqueue.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled delete must unblock without a restart");
+
+        assert!(fixture
+            .root
+            .path()
+            .join("agents/worker/agent.yaml")
+            .exists());
+        assert_eq!(
+            std::fs::read_to_string(
+                fixture
+                    .root
+                    .path()
+                    .join("agents/worker/knowledge/marker.md")
+            )
+            .unwrap(),
+            "must survive cancellation"
+        );
+        assert!(registry.get("worker").await.is_ok());
+        assert!(!registry
+            .snapshot()
+            .await
+            .recovery
+            .iter()
+            .any(|notice| notice.code == "learning_cleanup_pending"));
     }
 
     #[tokio::test]
