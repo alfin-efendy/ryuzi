@@ -772,7 +772,23 @@ impl KnowledgeStore {
                 continue;
             }
             let txn = entry.path();
-            let manifest = read_bundle_manifest(&txn)?;
+            // A crash between transaction-dir creation/stage copy and the
+            // Prepared manifest write leaves a manifest-less (or partially
+            // written) directory. Nothing was activated yet — the active
+            // bundle is untouched — so treat it as un-prepared and reap it
+            // rather than blocking every read/write on the parse error.
+            let manifest = match read_bundle_manifest(&txn) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    tracing::warn!(
+                        transaction = %txn.display(),
+                        error = %error,
+                        "reaping knowledge transaction with missing or unreadable manifest"
+                    );
+                    fs::remove_dir_all(&txn)?;
+                    continue;
+                }
+            };
             let backup = txn.join("backup");
             let stage = txn.join("stage");
             match manifest.phase {
@@ -1311,6 +1327,32 @@ mod tests {
             "committed"
         );
         assert!(!committed.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_reaps_transactions_with_missing_or_corrupt_manifests() {
+        let (_root, store) = fixture_store("a");
+        let created = store
+            .create(memory_input(KnowledgeScope::User, "original"))
+            .await
+            .unwrap();
+        let before = bundle_bytes(store.root());
+
+        // Crash between transaction-dir creation/stage copy and the Prepared
+        // manifest write: the directory exists but has no manifest.
+        let transaction_root = store.transaction_root().unwrap();
+        let manifest_less = transaction_root.join("txn-manifest-less");
+        std::fs::create_dir_all(manifest_less.join("stage")).unwrap();
+
+        // A manifest that exists but cannot be parsed is equally un-prepared.
+        let corrupt = transaction_root.join("txn-corrupt-manifest");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join(KNOWLEDGE_TXN_MANIFEST), "phase: [not-a-phase").unwrap();
+
+        assert_eq!(store.read(&created.id).await.unwrap().body, "original body");
+        assert!(!manifest_less.exists());
+        assert!(!corrupt.exists());
+        assert_eq!(bundle_bytes(store.root()), before);
     }
 
     #[tokio::test]
