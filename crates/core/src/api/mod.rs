@@ -174,6 +174,60 @@ pub(crate) mod tests_support {
         }
     }
 
+    /// Like `state()`, but with the `smart` and `fast` model routes seeded
+    /// before agent persistence bootstraps, so the default Ryuzi profile
+    /// (route `smart`) and the subagent config (route `fast`) validate as
+    /// executable — required by registry mutations, which re-validate the
+    /// whole candidate registry.
+    pub(crate) async fn state_with_agents() -> ApiState {
+        use crate::llm_router::routes::{
+            self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        for name in ["smart", "fast"] {
+            routes::save_model_route(
+                &store,
+                ModelRouteInfo {
+                    id: String::new(),
+                    name: name.into(),
+                    enabled: true,
+                    strategy: ModelRouteStrategy::Fallback,
+                    targets: vec![ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-opus-4-8".into(),
+                        effort: None,
+                    }],
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            cp.store().clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        std::mem::forget(config);
+        std::mem::forget(tmp);
+        ApiState {
+            router_server: Arc::new(crate::llm_router::server::RouterServer::new(
+                cp.store().clone(),
+            )),
+            cp,
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            control_token: "t".into(),
+        }
+    }
+
     /// Like `state()`, but with one connected project (`"p1"`) already in the
     /// store — for command families (orch, scheduler, ...) whose calls need a
     /// real `project_id` to validate against.
