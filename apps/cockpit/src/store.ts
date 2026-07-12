@@ -716,15 +716,18 @@ export const useStore = create<State>((set, get) => ({
     // A typed message while THIS chat drives a live orchestration steers it
     // instead of running as a normal chat turn — e.g. "cancel" cancels the
     // tree, anything else is noted as guidance for the judge. `orch_steer`
-    // cheaply returns "noOrchestration" when there's no live root bound to
-    // this session (the store keeps no client-side cache of that binding —
-    // the backend check is authoritative), so this is a no-op for ordinary
-    // chats. Any failure here (backend error or a thrown IPC error) falls
-    // through to the normal send path below — a steer-check failure must
-    // never swallow the user's message.
+    // returns exactly one of three wire strings: "noted"/"cancelled" when the
+    // orchestration actually consumed the message, or "noOrchestration" when
+    // there's no live root bound to this session (the store keeps no
+    // client-side cache of that binding — the backend check is authoritative).
+    // Only the two positive outcomes short-circuit the normal turn; ANYTHING
+    // else — "noOrchestration", a thrown IPC error, or an unexpected/null
+    // payload from a backend that doesn't implement steering — MUST fall
+    // through to the normal send path so a steer-check never swallows the
+    // user's message.
     try {
       const steer = await commands.orchSteer(sessionPk, prompt);
-      if (steer.status === "ok" && steer.data !== "noOrchestration") return true;
+      if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
     } catch {
       // fall through to the normal send path
     }

@@ -325,7 +325,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let port = serve(s, 0).await.unwrap();
+        let port = serve(s, opts(0)).await.unwrap();
         let resp: serde_json::Value = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/rpc/list_audit"))
             .bearer_auth("t")
