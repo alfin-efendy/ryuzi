@@ -516,8 +516,34 @@ fn index_from_map(values: &Mapping) -> IndexMap<String, Value> {
 fn merge_and_render<T: Serialize>(raw: &Value, typed: &T) -> anyhow::Result<String> {
     let mut merged = raw.clone();
     let replacement = serde_yaml::to_value(typed)?;
+    remove_stale_model_keys(&mut merged, &replacement);
     merge_value(&mut merged, replacement);
     render_yaml(&merged)
+}
+
+fn remove_stale_model_keys(target: &mut Value, replacement: &Value) {
+    let model_key = Value::String("model".into());
+    let Some(replacement_model) = replacement
+        .as_mapping()
+        .and_then(|mapping| mapping.get(&model_key))
+        .and_then(Value::as_mapping)
+    else {
+        return;
+    };
+    let Some(target_model) = target
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(&model_key))
+        .and_then(Value::as_mapping_mut)
+    else {
+        return;
+    };
+
+    for key in ["name", "route", "effort"] {
+        let key = Value::String(key.into());
+        if !replacement_model.contains_key(&key) {
+            target_model.remove(&key);
+        }
+    }
 }
 
 fn merge_value(target: &mut Value, replacement: Value) {
@@ -578,6 +604,77 @@ x_vendor: { enabled: true }
         ] {
             assert!(parse_subagent_config(raw).is_err(), "accepted {raw}");
         }
+    }
+
+    #[test]
+    fn merge_typed_model_arm_switch_renders_reparseable_yaml() {
+        let raw = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet }
+model: { name: anthropic/claude-opus-4-8, effort: high, x_model: keep }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+        let mut doc = parse_agent_profile_document(raw).unwrap();
+        let mut typed = doc.typed().clone();
+        typed.model = AgentModel::Route {
+            route: "smart".into(),
+        };
+        doc.merge_typed(typed);
+        let rendered = render_agent_profile_document(&doc).unwrap();
+        let reparsed = parse_agent_profile_document(&rendered).unwrap();
+        assert_eq!(
+            reparsed.typed().model,
+            AgentModel::Route {
+                route: "smart".into()
+            }
+        );
+        assert_eq!(reparsed.extensions()["model"]["x_model"], "keep");
+
+        // Dropping an explicit effort inside the concrete arm must also
+        // remove the stale `effort` key from the rendered YAML.
+        let mut doc = parse_agent_profile_document(raw).unwrap();
+        let mut typed = doc.typed().clone();
+        typed.model = AgentModel::Concrete {
+            name: "anthropic/claude-opus-4-8".into(),
+            effort: None,
+        };
+        doc.merge_typed(typed);
+        let rendered = render_agent_profile_document(&doc).unwrap();
+        assert!(!rendered.contains("effort"), "stale effort in:\n{rendered}");
+        let reparsed = parse_agent_profile_document(&rendered).unwrap();
+        assert_eq!(
+            reparsed.typed().model,
+            AgentModel::Concrete {
+                name: "anthropic/claude-opus-4-8".into(),
+                effort: None,
+            }
+        );
+    }
+
+    #[test]
+    fn merge_typed_subagent_route_to_concrete_renders_reparseable_yaml() {
+        let mut doc =
+            parse_subagent_config_document("schema_version: 1\nmodel: { route: smart }\n").unwrap();
+        let mut typed = doc.typed().clone();
+        typed.model = AgentModel::Concrete {
+            name: "anthropic/claude-opus-4-8".into(),
+            effort: Some("high".into()),
+        };
+        doc.merge_typed(typed);
+        let rendered = render_subagent_config_document(&doc).unwrap();
+        let reparsed = parse_subagent_config(&rendered).unwrap();
+        assert_eq!(
+            reparsed.model,
+            AgentModel::Concrete {
+                name: "anthropic/claude-opus-4-8".into(),
+                effort: Some("high".into()),
+            }
+        );
     }
 
     #[test]

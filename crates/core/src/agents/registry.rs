@@ -1,0 +1,1048 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context};
+use indexmap::IndexMap;
+use serde_yaml::Value;
+use tokio::sync::{Mutex, RwLock};
+
+use crate::llm_router::model_effort::ModelPreferenceKey;
+use crate::llm_router::{model_capabilities, routes};
+use crate::paths;
+use crate::store::Store;
+
+use super::types::*;
+use super::yaml::{parse_agent_index, parse_agent_profile, parse_subagent_config};
+
+pub struct AgentRegistry {
+    // Task 3's transaction layer persists validated candidates beneath this root.
+    #[allow(dead_code)]
+    config_root: PathBuf,
+    store: Arc<Store>,
+    state: RwLock<Arc<RegistryState>>,
+    mutations: Mutex<()>,
+}
+
+#[derive(Debug)]
+struct RegistryState {
+    index: AgentIndex,
+    agents: IndexMap<AgentId, Arc<AgentSnapshot>>,
+    subagents: SubagentConfig,
+    recovery: Vec<AgentRecoveryNotice>,
+    #[allow(dead_code)]
+    repairs: Vec<ProfileRepairRecord>,
+}
+
+#[derive(Debug)]
+struct ProfileRepairRecord {
+    #[allow(dead_code)]
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+pub enum AgentRegistryError {
+    NotFound(String),
+    DuplicateId(String),
+    DuplicateName(String),
+    LastAgent,
+    Invalid(Vec<AgentValidationIssue>),
+    Io(anyhow::Error),
+}
+
+impl std::fmt::Display for AgentRegistryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(id) => write!(formatter, "agent `{id}` was not found"),
+            Self::DuplicateId(id) => write!(formatter, "agent id `{id}` already exists"),
+            Self::DuplicateName(name) => write!(formatter, "agent name `{name}` already exists"),
+            Self::LastAgent => formatter.write_str("the last agent cannot be deleted"),
+            Self::Invalid(_) => formatter.write_str("agent candidate is invalid"),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AgentRegistryError {}
+
+impl From<anyhow::Error> for AgentRegistryError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl AgentRegistry {
+    pub async fn load(config_root: PathBuf, store: Arc<Store>) -> anyhow::Result<Self> {
+        let agents_root = paths::agents_dir_in(&config_root);
+        let index_path = agents_root.join("index.yaml");
+        let parsed_index = read_to_string(&index_path)
+            .and_then(|raw| parse_agent_index(&raw).map_err(std::io::Error::other));
+        let recovering = parsed_index.is_err();
+        let mut repairs = Vec::new();
+        let mut profiles = IndexMap::new();
+        let mut parse_issues = IndexMap::<AgentId, Vec<AgentValidationIssue>>::new();
+
+        let ordered_ids = if let Ok(index) = &parsed_index {
+            index.order.clone()
+        } else {
+            discover_agent_directories(&agents_root)?
+        };
+
+        for directory_id in ordered_ids {
+            let path = paths::agent_dir_in(&config_root, &directory_id).join("agent.yaml");
+            match read_to_string(&path)
+                .and_then(|raw| parse_agent_profile(&raw).map_err(std::io::Error::other))
+            {
+                Ok(profile) => {
+                    profiles.insert(directory_id, profile);
+                }
+                Err(error) => {
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Some(profile) = recover_minimal_profile(&raw, &directory_id) {
+                            parse_issues.insert(
+                                directory_id.clone(),
+                                vec![issue(
+                                    "profile",
+                                    format!("profile could not be parsed: {error}"),
+                                )],
+                            );
+                            repairs.push(ProfileRepairRecord { path });
+                            profiles.insert(directory_id, profile);
+                        }
+                    }
+                }
+            }
+        }
+
+        let subagents_path = agents_root.join("subagents.yaml");
+        let subagents = parse_subagent_config(
+            &std::fs::read_to_string(&subagents_path)
+                .with_context(|| format!("failed to read {}", subagents_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", subagents_path.display()))?;
+
+        let recovery = recovering
+            .then(|| AgentRecoveryNotice {
+                code: "index-rebuilt".into(),
+                message: "Recovered agent registry order from agent directories.".into(),
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let mut index = parsed_index.unwrap_or_else(|_| AgentIndex {
+            schema_version: AGENT_SCHEMA_VERSION,
+            order: profiles.keys().cloned().collect(),
+            default_agent_id: profiles.keys().next().cloned().unwrap_or_default(),
+            extensions: IndexMap::new(),
+        });
+        let mut validation =
+            validate_registry_candidate(&store, &index, &profiles, &subagents).await;
+        merge_parse_issues(&mut validation, parse_issues);
+
+        if recovering {
+            index.default_agent_id = profiles
+                .keys()
+                .find(|id| validation.get(*id).is_none_or(Vec::is_empty))
+                .cloned()
+                .or_else(|| profiles.keys().next().cloned())
+                .unwrap_or_default();
+            validation = validate_registry_candidate(&store, &index, &profiles, &subagents).await;
+            // Parser failures must survive the second validation pass.
+            for (id, profile) in &profiles {
+                if repairs.iter().any(|record| {
+                    record
+                        .path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|value| value == id.as_str())
+                }) {
+                    validation.entry(id.clone()).or_default().push(issue(
+                        "profile",
+                        format!("profile `{id}` could not be parsed"),
+                    ));
+                }
+                let _ = profile;
+            }
+        }
+
+        let agents = profiles
+            .into_iter()
+            .map(|(id, profile)| {
+                let validation = validation.shift_remove(&id).unwrap_or_default();
+                (
+                    id,
+                    Arc::new(AgentSnapshot {
+                        executable: validation.is_empty(),
+                        profile,
+                        validation,
+                    }),
+                )
+            })
+            .collect();
+        Ok(Self {
+            config_root,
+            store,
+            state: RwLock::new(Arc::new(RegistryState {
+                index,
+                agents,
+                subagents,
+                recovery,
+                repairs,
+            })),
+            mutations: Mutex::new(()),
+        })
+    }
+
+    pub async fn snapshot(&self) -> AgentRegistrySnapshot {
+        let state = self.state.read().await.clone();
+        snapshot_from_state(&state)
+    }
+
+    pub async fn get(&self, agent_id: &str) -> anyhow::Result<AgentSnapshot> {
+        Ok(self.resolved_snapshot(agent_id).await?.as_ref().clone())
+    }
+
+    pub async fn resolved_snapshot(&self, agent_id: &str) -> anyhow::Result<Arc<AgentSnapshot>> {
+        self.state
+            .read()
+            .await
+            .agents
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("agent `{agent_id}` was not found"))
+    }
+
+    pub async fn create(
+        &self,
+        input: AgentMutationInput,
+    ) -> Result<AgentSnapshot, AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let id = new_agent_id();
+        let profile = profile_from_input(id.clone(), input);
+        let state = self.state.read().await.clone();
+        let mut profiles = typed_profiles(&state);
+        profiles.insert(id.clone(), profile.clone());
+        let mut index = state.index.clone();
+        index.order.push(id.clone());
+        self.validate_mutation(&index, &profiles, &state.subagents, &id)
+            .await?;
+        Err(transaction_unavailable())
+    }
+
+    pub async fn update(
+        &self,
+        agent_id: &str,
+        input: AgentMutationInput,
+    ) -> Result<AgentSnapshot, AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let state = self.state.read().await.clone();
+        if !state.agents.contains_key(agent_id) {
+            return Err(AgentRegistryError::NotFound(agent_id.into()));
+        }
+        let mut profiles = typed_profiles(&state);
+        profiles.insert(agent_id.into(), profile_from_input(agent_id.into(), input));
+        self.validate_mutation(&state.index, &profiles, &state.subagents, agent_id)
+            .await?;
+        Err(transaction_unavailable())
+    }
+
+    pub async fn duplicate(&self, agent_id: &str) -> Result<AgentSnapshot, AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let state = self.state.read().await.clone();
+        let source = state
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| AgentRegistryError::NotFound(agent_id.into()))?;
+        let id = new_agent_id();
+        let mut profile = source.profile.clone();
+        profile.id = id.clone();
+        profile.name = unique_copy_name(&profile.name, &state.agents);
+        let mut profiles = typed_profiles(&state);
+        profiles.insert(id.clone(), profile);
+        let mut index = state.index.clone();
+        index.order.push(id.clone());
+        self.validate_mutation(&index, &profiles, &state.subagents, &id)
+            .await?;
+        Err(transaction_unavailable())
+    }
+
+    pub async fn delete(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let state = self.state.read().await.clone();
+        if !state.agents.contains_key(agent_id) {
+            return Err(AgentRegistryError::NotFound(agent_id.into()));
+        }
+        if state.agents.len() == 1 {
+            return Err(AgentRegistryError::LastAgent);
+        }
+        let mut profiles = typed_profiles(&state);
+        profiles.shift_remove(agent_id);
+        let mut index = state.index.clone();
+        index.order.retain(|id| id != agent_id);
+        if index.default_agent_id == agent_id {
+            index.default_agent_id = index.order[0].clone();
+        }
+        self.validate_candidate(&index, &profiles, &state.subagents)
+            .await?;
+        Err(transaction_unavailable())
+    }
+
+    pub async fn set_default(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let state = self.state.read().await.clone();
+        if !state.agents.contains_key(agent_id) {
+            return Err(AgentRegistryError::NotFound(agent_id.into()));
+        }
+        let mut index = state.index.clone();
+        index.default_agent_id = agent_id.into();
+        self.validate_candidate(&index, &typed_profiles(&state), &state.subagents)
+            .await?;
+        Err(transaction_unavailable())
+    }
+
+    pub async fn set_subagent_model(
+        &self,
+        model: AgentModel,
+    ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
+        let _guard = self.mutations.lock().await;
+        let state = self.state.read().await.clone();
+        let subagents = SubagentConfig {
+            schema_version: AGENT_SCHEMA_VERSION,
+            model,
+        };
+        self.validate_candidate(&state.index, &typed_profiles(&state), &subagents)
+            .await?;
+        let issues = validate_model(&self.store, &subagents.model).await;
+        if !issues.is_empty() {
+            return Err(AgentRegistryError::Invalid(issues));
+        }
+        Err(transaction_unavailable())
+    }
+
+    async fn validate_mutation(
+        &self,
+        index: &AgentIndex,
+        profiles: &IndexMap<AgentId, AgentProfile>,
+        subagents: &SubagentConfig,
+        id: &str,
+    ) -> Result<(), AgentRegistryError> {
+        let issues = validate_registry_candidate(&self.store, index, profiles, subagents).await;
+        let current = issues.get(id).cloned().unwrap_or_default();
+        if let Some(issue) = current
+            .iter()
+            .find(|issue| issue.field == "name" && issue.message.contains("unique"))
+        {
+            return Err(AgentRegistryError::DuplicateName(issue.message.clone()));
+        }
+        let all = issues.into_values().flatten().collect::<Vec<_>>();
+        if all.is_empty() {
+            Ok(())
+        } else {
+            Err(AgentRegistryError::Invalid(all))
+        }
+    }
+
+    async fn validate_candidate(
+        &self,
+        index: &AgentIndex,
+        profiles: &IndexMap<AgentId, AgentProfile>,
+        subagents: &SubagentConfig,
+    ) -> Result<(), AgentRegistryError> {
+        let issues = validate_registry_candidate(&self.store, index, profiles, subagents).await;
+        let all = issues.into_values().flatten().collect::<Vec<_>>();
+        if all.is_empty() {
+            Ok(())
+        } else {
+            Err(AgentRegistryError::Invalid(all))
+        }
+    }
+}
+
+pub fn validate_agent_id(value: &str) -> Result<(), AgentValidationIssue> {
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.ends_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err(issue(
+            "id",
+            "agent id must match [a-z][a-z0-9-]{0,63} and cannot end with '-'",
+        ))
+    }
+}
+
+pub async fn validate_profile(store: &Store, profile: &AgentProfile) -> Vec<AgentValidationIssue> {
+    let mut issues = Vec::new();
+    if profile.schema_version != AGENT_SCHEMA_VERSION {
+        issues.push(issue("schema_version", "schema version must be 1"));
+    }
+    if let Err(value) = validate_agent_id(&profile.id) {
+        issues.push(value);
+    }
+    require_nonblank(&mut issues, "name", &profile.name);
+    require_nonblank(&mut issues, "description", &profile.description);
+    require_nonblank(&mut issues, "avatar.color", &profile.avatar.color);
+    if profile.loop_settings.max_turns == 0 {
+        issues.push(issue("loop.max_turns", "max turns must be positive"));
+    }
+    if profile.loop_settings.max_tool_rounds == 0 {
+        issues.push(issue(
+            "loop.max_tool_rounds",
+            "max tool rounds must be positive",
+        ));
+    }
+    let mut rule_ids = HashSet::new();
+    for (index, rule) in profile.permissions.rules.iter().enumerate() {
+        require_nonblank(
+            &mut issues,
+            &format!("permissions.rules[{index}].id"),
+            &rule.id,
+        );
+        require_nonblank(
+            &mut issues,
+            &format!("permissions.rules[{index}].tool"),
+            &rule.tool,
+        );
+        if !rule_ids.insert(rule.id.trim().to_ascii_lowercase()) {
+            issues.push(issue(
+                format!("permissions.rules[{index}].id"),
+                "permission rule ids must be unique",
+            ));
+        }
+        if rule
+            .command_prefix
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            issues.push(issue(
+                format!("permissions.rules[{index}].command_prefix"),
+                "command prefix cannot be blank",
+            ));
+        }
+    }
+    validate_references(&mut issues, "skills", &profile.skills);
+    validate_references(&mut issues, "tools.native", &profile.tools.native);
+    validate_references(&mut issues, "tools.plugins", &profile.tools.plugins);
+    validate_references(&mut issues, "tools.apps", &profile.tools.apps);
+    issues.extend(validate_model(store, &profile.model).await);
+    issues
+}
+
+pub async fn validate_registry_candidate(
+    store: &Store,
+    index: &AgentIndex,
+    profiles: &IndexMap<AgentId, AgentProfile>,
+    subagents: &SubagentConfig,
+) -> IndexMap<AgentId, Vec<AgentValidationIssue>> {
+    let mut result = IndexMap::new();
+    for (directory_id, profile) in profiles {
+        let mut issues = validate_profile(store, profile).await;
+        if directory_id != &profile.id {
+            issues.push(issue(
+                "id",
+                format!(
+                    "profile id `{}` must match directory `{directory_id}`",
+                    profile.id
+                ),
+            ));
+        }
+        result.insert(directory_id.clone(), issues);
+    }
+
+    let mut registry_issues = Vec::new();
+    if index.schema_version != AGENT_SCHEMA_VERSION {
+        registry_issues.push(issue("index.schema_version", "schema version must be 1"));
+    }
+    if subagents.schema_version != AGENT_SCHEMA_VERSION {
+        registry_issues.push(issue(
+            "subagents.schema_version",
+            "schema version must be 1",
+        ));
+    }
+    let mut order_ids = HashSet::new();
+    for id in &index.order {
+        if !order_ids.insert(id.clone()) {
+            registry_issues.push(issue(
+                "index.order",
+                format!("agent id `{id}` is duplicated"),
+            ));
+        }
+        if !profiles.contains_key(id) {
+            registry_issues.push(issue(
+                "index.order",
+                format!("agent id `{id}` has no matching profile"),
+            ));
+        }
+    }
+    for id in profiles.keys().filter(|id| !order_ids.contains(*id)) {
+        result.entry(id.clone()).or_default().push(issue(
+            "id",
+            format!("agent id `{id}` is missing from index order"),
+        ));
+    }
+    if !profiles.contains_key(&index.default_agent_id) {
+        registry_issues.push(issue(
+            "index.default_agent_id",
+            "default agent must be present in the registry",
+        ));
+    }
+
+    let mut names = HashMap::<String, Vec<AgentId>>::new();
+    for (id, profile) in profiles {
+        names
+            .entry(profile.name.trim().to_ascii_lowercase())
+            .or_default()
+            .push(id.clone());
+    }
+    for duplicates in names.values().filter(|ids| ids.len() > 1) {
+        for id in duplicates {
+            result.entry(id.clone()).or_default().push(issue(
+                "name",
+                "trimmed agent names must be unique (case-insensitive)",
+            ));
+        }
+    }
+    let subagent_issues = validate_model(store, &subagents.model).await;
+    registry_issues.extend(
+        subagent_issues
+            .into_iter()
+            .map(|value| issue(format!("subagents.{}", value.field), value.message)),
+    );
+    if !registry_issues.is_empty() {
+        for issues in result.values_mut() {
+            issues.extend(registry_issues.clone());
+        }
+    }
+    result
+}
+
+pub fn split_canonical_model(value: &str) -> Result<(&str, &str), AgentValidationIssue> {
+    let Some((family, model)) = value.split_once('/') else {
+        return Err(issue(
+            "model.name",
+            "concrete model must use canonical `family/model` syntax",
+        ));
+    };
+    if family.trim().is_empty() || model.trim().is_empty() || model.contains('/') {
+        return Err(issue(
+            "model.name",
+            "concrete model must use canonical `family/model` syntax",
+        ));
+    }
+    Ok((family, model))
+}
+
+async fn validate_model(store: &Store, value: &AgentModel) -> Vec<AgentValidationIssue> {
+    match value {
+        AgentModel::Concrete { name, effort } => {
+            let (family, model) = match split_canonical_model(name) {
+                Ok(parts) => parts,
+                Err(error) => return vec![error],
+            };
+            if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                return vec![issue("model.effort", "effort cannot be blank")];
+            }
+            let key = ModelPreferenceKey {
+                family: family.to_owned(),
+                model: model.to_owned(),
+            };
+            let available = match model_capabilities::concrete_model_is_available(store, &key).await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return vec![issue(
+                        "model.name",
+                        format!("failed to inspect model availability: {error}"),
+                    )];
+                }
+            };
+            if !available {
+                return vec![issue(
+                    "model.name",
+                    format!("model `{name}` is not served by an enabled connection"),
+                )];
+            }
+            if let Some(effort) = effort {
+                match model_capabilities::resolve_for_model(store, &key).await {
+                    Ok(capabilities) if !capabilities.supports(effort) => {
+                        return vec![issue(
+                            "model.effort",
+                            format!("effort `{effort}` is unsupported for `{name}`"),
+                        )];
+                    }
+                    Err(error) => {
+                        return vec![issue(
+                            "model.effort",
+                            format!("failed to resolve effort capabilities: {error}"),
+                        )];
+                    }
+                    _ => {}
+                }
+            }
+            Vec::new()
+        }
+        AgentModel::Route { route } => {
+            if route.trim().is_empty() {
+                return vec![issue("model.route", "route cannot be blank")];
+            }
+            match routes::list_model_routes(store).await {
+                Ok(values) if routes::route_by_name(&values, route).is_none() => vec![issue(
+                    "model.route",
+                    format!("route `{route}` does not exist or is not executable"),
+                )],
+                Ok(_) => Vec::new(),
+                Err(error) => vec![issue(
+                    "model.route",
+                    format!("failed to inspect model routes: {error}"),
+                )],
+            }
+        }
+    }
+}
+
+fn recover_minimal_profile(raw: &str, directory_id: &str) -> Option<AgentProfile> {
+    let value: Value = serde_yaml::from_str(raw).ok()?;
+    let mapping = value.as_mapping()?;
+    let string = |key: &str| {
+        mapping
+            .get(Value::String(key.into()))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let id = string("id").unwrap_or_else(|| directory_id.into());
+    let name = string("name")?;
+    Some(AgentProfile {
+        schema_version: AGENT_SCHEMA_VERSION,
+        id,
+        name,
+        description: "Invalid agent profile".into(),
+        avatar: AgentAvatar {
+            color: "gray".into(),
+        },
+        model: AgentModel::Concrete {
+            name: "invalid/missing".into(),
+            effort: None,
+        },
+        permissions: AgentPermissions {
+            mode: crate::PermMode::Default,
+            rules: Vec::new(),
+        },
+        skills: Vec::new(),
+        tools: AgentTools {
+            native: Vec::new(),
+            plugins: Vec::new(),
+            apps: Vec::new(),
+        },
+        loop_settings: AgentLoop {
+            max_turns: 1,
+            max_tool_rounds: 1,
+        },
+    })
+}
+
+fn discover_agent_directories(root: &Path) -> anyhow::Result<Vec<AgentId>> {
+    let mut ids = match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| !name.starts_with('.'))
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    ids.sort();
+    Ok(ids)
+}
+
+fn read_to_string(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+fn merge_parse_issues(
+    validation: &mut IndexMap<AgentId, Vec<AgentValidationIssue>>,
+    parse_issues: IndexMap<AgentId, Vec<AgentValidationIssue>>,
+) {
+    for (id, issues) in parse_issues {
+        validation.entry(id).or_default().extend(issues);
+    }
+}
+
+fn require_nonblank(issues: &mut Vec<AgentValidationIssue>, field: &str, value: &str) {
+    if value.trim().is_empty() {
+        issues.push(issue(field, format!("{field} cannot be blank")));
+    }
+}
+
+fn validate_references(issues: &mut Vec<AgentValidationIssue>, field: &str, values: &[String]) {
+    for (index, value) in values.iter().enumerate() {
+        if value.trim().is_empty() {
+            issues.push(issue(
+                format!("{field}[{index}]"),
+                "stable reference cannot be blank",
+            ));
+        }
+    }
+}
+
+fn issue(field: impl Into<String>, message: impl Into<String>) -> AgentValidationIssue {
+    AgentValidationIssue {
+        field: field.into(),
+        message: message.into(),
+    }
+}
+
+fn typed_profiles(state: &RegistryState) -> IndexMap<AgentId, AgentProfile> {
+    state
+        .agents
+        .iter()
+        .map(|(id, snapshot)| (id.clone(), snapshot.profile.clone()))
+        .collect()
+}
+
+fn new_agent_id() -> AgentId {
+    format!("agent-{}", paths::new_id())
+}
+
+fn profile_from_input(id: AgentId, input: AgentMutationInput) -> AgentProfile {
+    AgentProfile {
+        schema_version: AGENT_SCHEMA_VERSION,
+        id,
+        name: input.name,
+        description: input.description,
+        avatar: input.avatar,
+        model: input.model,
+        permissions: input.permissions,
+        skills: input.skills,
+        tools: input.tools,
+        loop_settings: input.loop_settings,
+    }
+}
+
+fn unique_copy_name(source: &str, agents: &IndexMap<AgentId, Arc<AgentSnapshot>>) -> String {
+    for number in 1.. {
+        let candidate = if number == 1 {
+            format!("{source} Copy")
+        } else {
+            format!("{source} Copy {number}")
+        };
+        if agents
+            .values()
+            .all(|agent| !agent.profile.name.eq_ignore_ascii_case(&candidate))
+        {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn snapshot_from_state(state: &RegistryState) -> AgentRegistrySnapshot {
+    AgentRegistrySnapshot {
+        agents: state
+            .agents
+            .values()
+            .map(|snapshot| snapshot.as_ref().clone())
+            .collect(),
+        default_agent_id: state.index.default_agent_id.clone(),
+        recovery: state.recovery.clone(),
+        subagent_model: state.subagents.model.clone(),
+    }
+}
+
+fn transaction_unavailable() -> AgentRegistryError {
+    AgentRegistryError::Io(anyhow!("agent transaction layer is not initialized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+
+    use super::*;
+
+    struct RegistryFixture {
+        root: tempfile::TempDir,
+        _db: tempfile::NamedTempFile,
+        store: Arc<Store>,
+    }
+
+    impl RegistryFixture {
+        async fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let db = tempfile::NamedTempFile::new().unwrap();
+            let store = Arc::new(Store::open(db.path()).await.unwrap());
+            connections::add_connection(
+                &store,
+                ConnectionRow {
+                    id: "anthropic-live".into(),
+                    provider: "anthropic".into(),
+                    auth_type: "api_key".into(),
+                    label: "Anthropic".into(),
+                    priority: 0,
+                    enabled: true,
+                    data: ConnectionData {
+                        models_override: Some(vec![
+                            "claude-opus-4-8".into(),
+                            "claude-opus-4-5".into(),
+                        ]),
+                        ..Default::default()
+                    },
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .await
+            .unwrap();
+            let fixture = Self {
+                root,
+                _db: db,
+                store,
+            };
+            fixture.write_raw(
+                "agents/subagents.yaml",
+                "schema_version: 1\nmodel: { name: anthropic/claude-opus-4-8, effort: high }\n",
+            );
+            fixture
+        }
+
+        fn config_root(&self) -> PathBuf {
+            self.root.path().to_owned()
+        }
+
+        fn write_raw(&self, relative: &str, value: &str) {
+            let path = self.root.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, value).unwrap();
+        }
+
+        fn write_index(&self, ids: &[&str], default: &str) {
+            self.write_raw(
+                "agents/index.yaml",
+                &format!(
+                    "schema_version: 1\norder: [{}]\ndefault_agent_id: {default}\n",
+                    ids.join(", ")
+                ),
+            );
+        }
+
+        fn write_profile(&self, id: &str, profile: String) {
+            self.write_raw(&format!("agents/{id}/agent.yaml"), &profile);
+        }
+
+        fn write_single(&self, profile: String) {
+            self.write_index(&["ryuzi"], "ryuzi");
+            self.write_profile("ryuzi", profile);
+        }
+    }
+
+    fn profile_yaml(id: &str, name: &str, model: &str, effort: Option<&str>) -> String {
+        let effort = effort
+            .map(|value| format!(", effort: {value}"))
+            .unwrap_or_default();
+        format!(
+            "schema_version: 1\nid: {id}\nname: {name}\ndescription: Test agent.\navatar: {{ color: violet }}\nmodel: {{ name: {model}{effort} }}\npermissions: {{ mode: ask, rules: [] }}\nskills: {{ enabled: [] }}\ntools: {{ native: [read], plugins: [], apps: [] }}\nloop: {{ max_turns: 50, max_tool_rounds: 100 }}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn load_preserves_invalid_agents_and_rejects_duplicate_names_case_insensitively() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["one", "two"], "one");
+        fixture.write_profile(
+            "one",
+            profile_yaml("one", "Reviewer", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile(
+            "two",
+            profile_yaml("two", " reviewer ", "unknown/missing", None),
+        );
+        let loaded = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let snapshot = loaded.snapshot().await;
+        assert_eq!(snapshot.agents.len(), 2);
+        assert!(snapshot.agents.iter().all(|agent| !agent.executable));
+        assert!(snapshot.agents[0]
+            .validation
+            .iter()
+            .any(|issue| issue.field == "name" && issue.message.contains("unique")));
+        assert!(snapshot.agents[1]
+            .validation
+            .iter()
+            .any(|issue| issue.field == "model.name"));
+    }
+
+    #[tokio::test]
+    async fn concrete_effort_uses_plan_one_resolver_and_route_effort_is_impossible() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-5",
+            Some("xhigh"),
+        ));
+        let loaded = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let agent = loaded.get("ryuzi").await.unwrap();
+        assert!(!agent.executable);
+        assert!(agent
+            .validation
+            .iter()
+            .any(|issue| { issue.field == "model.effort" && issue.message.contains("xhigh") }));
+    }
+
+    #[tokio::test]
+    async fn corrupt_index_recovers_profiles_by_directory_without_hiding_them() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_raw("agents/index.yaml", "not: [valid");
+        fixture.write_profile(
+            "visible",
+            profile_yaml(
+                "visible",
+                "Visible",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        let loaded = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let snapshot = loaded.snapshot().await;
+        assert_eq!(snapshot.agents[0].profile.id, "visible");
+        assert!(snapshot
+            .recovery
+            .iter()
+            .any(|notice| notice.code == "index-rebuilt"));
+    }
+
+    #[tokio::test]
+    async fn parser_failure_with_identity_remains_visible() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["broken"], "broken");
+        fixture.write_raw(
+            "agents/broken/agent.yaml",
+            "schema_version: 1\nid: broken\nname: Broken\nmodel: { route: smart, effort: high }\n",
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let agent = registry.get("broken").await.unwrap();
+        assert_eq!(agent.profile.name, "Broken");
+        assert!(!agent.executable);
+        assert!(agent
+            .validation
+            .iter()
+            .any(|issue| issue.field == "profile"));
+    }
+
+    #[test]
+    fn generated_agent_ids_satisfy_registry_validation() {
+        let first = new_agent_id();
+        let second = new_agent_id();
+        assert!(validate_agent_id(&first).is_ok());
+        assert!(validate_agent_id(&second).is_ok());
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn mutation_validates_the_complete_candidate() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["one", "two"], "one");
+        fixture.write_profile(
+            "one",
+            profile_yaml("one", "One", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile("two", profile_yaml("two", "Two", "unknown/missing", None));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let input = AgentMutationInput {
+            name: "One Updated".into(),
+            description: "Updated".into(),
+            avatar: AgentAvatar {
+                color: "blue".into(),
+            },
+            model: AgentModel::Concrete {
+                name: "anthropic/claude-opus-4-8".into(),
+                effort: Some("high".into()),
+            },
+            permissions: AgentPermissions {
+                mode: crate::PermMode::Default,
+                rules: Vec::new(),
+            },
+            skills: Vec::new(),
+            tools: AgentTools {
+                native: vec!["read".into()],
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+            loop_settings: AgentLoop {
+                max_turns: 10,
+                max_tool_rounds: 20,
+            },
+        };
+        let error = registry.update("one", input).await.unwrap_err();
+        assert!(
+            matches!(error, AgentRegistryError::Invalid(issues) if issues.iter().any(|issue| issue.field == "model.name"))
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_mutation_validates_then_stops_at_transaction_seam() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let before = registry.snapshot().await;
+        let input = AgentMutationInput {
+            name: "Ryuzi Updated".into(),
+            description: "Updated".into(),
+            avatar: AgentAvatar {
+                color: "blue".into(),
+            },
+            model: AgentModel::Concrete {
+                name: "anthropic/claude-opus-4-8".into(),
+                effort: Some("high".into()),
+            },
+            permissions: AgentPermissions {
+                mode: crate::PermMode::Default,
+                rules: Vec::new(),
+            },
+            skills: Vec::new(),
+            tools: AgentTools {
+                native: vec!["read".into()],
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+            loop_settings: AgentLoop {
+                max_turns: 10,
+                max_tool_rounds: 20,
+            },
+        };
+        let error = registry.update("ryuzi", input).await.unwrap_err();
+        assert!(matches!(error, AgentRegistryError::Io(_)));
+        assert_eq!(registry.snapshot().await, before);
+        assert_eq!(registry.config_root, fixture.config_root());
+    }
+}
