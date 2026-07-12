@@ -6,6 +6,28 @@ pub fn state_dir() -> PathBuf {
         .join("ryuzi")
 }
 
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ryuzi")
+}
+
+pub fn agents_dir() -> PathBuf {
+    agents_dir_in(&config_dir())
+}
+
+pub fn agents_dir_in(config_root: &Path) -> PathBuf {
+    config_root.join("agents")
+}
+
+pub fn agent_dir_in(config_root: &Path, agent_id: &str) -> PathBuf {
+    agents_dir_in(config_root).join(agent_id)
+}
+
+pub fn agent_knowledge_dir_in(config_root: &Path, agent_id: &str) -> PathBuf {
+    agent_dir_in(config_root, agent_id).join("knowledge")
+}
+
 pub fn db_path() -> PathBuf {
     state_dir().join("ryuzi.sqlite")
 }
@@ -61,6 +83,20 @@ mod tests {
         let base = PathBuf::from("/custom/wt-root");
         let p = worktree_path_for(Some(&base), "proj1", "abcdef0123456789");
         assert_eq!(p, PathBuf::from("/custom/wt-root/proj1/abcdef01"));
+    }
+
+    #[test]
+    fn agent_paths_use_config_not_state_root() {
+        let root = PathBuf::from("config-root");
+        assert_eq!(agents_dir_in(&root), root.join("agents"));
+        assert_eq!(
+            agent_dir_in(&root, "reviewer"),
+            root.join("agents/reviewer")
+        );
+        assert_eq!(
+            agent_knowledge_dir_in(&root, "reviewer"),
+            root.join("agents/reviewer/knowledge")
+        );
     }
 
     #[test]
