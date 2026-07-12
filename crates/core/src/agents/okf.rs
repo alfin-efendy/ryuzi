@@ -44,8 +44,8 @@ impl ConceptArea {
             Self::Skill => "learning/skills".into(),
             Self::Review => "learning/reviews".into(),
             Self::Journey => "learning/journey".into(),
-            Self::CuratorState => "learning/curator".into(),
-            Self::CuratorHistory => "learning/curator-history".into(),
+            Self::CuratorState => "curator".into(),
+            Self::CuratorHistory => "curator/history".into(),
         })
     }
 
@@ -262,8 +262,8 @@ pub const FIXED_CONCEPT_DIRECTORIES: [&str; 7] = [
     "learning/skills",
     "learning/reviews",
     "learning/journey",
-    "learning/curator",
-    "learning/curator-history",
+    "curator",
+    "curator/history",
 ];
 
 /// The parent directory of all per-project memory directories.
@@ -345,6 +345,18 @@ mod tests {
             "---\ntype: Review\ntitle: A\ndescription: A\ntimestamp: yesterday\n---\nA"
         )
         .is_err());
+    }
+
+    #[test]
+    fn curator_areas_use_the_design_layout() {
+        assert_eq!(ConceptArea::CuratorState.directory().unwrap(), "curator");
+        assert_eq!(
+            ConceptArea::CuratorHistory.directory().unwrap(),
+            "curator/history"
+        );
+        assert!(validate_concept_relative_path("curator/state.md").is_ok());
+        assert!(validate_concept_relative_path("curator/history/snapshot.md").is_ok());
+        assert!(validate_concept_relative_path("learning/curator/state.md").is_err());
     }
 
     #[test]

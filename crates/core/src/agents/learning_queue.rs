@@ -600,7 +600,7 @@ fn plan_learning_writes(
             writes: vec![render_event_concept(
                 agent_id,
                 event_id,
-                "learning/curator/state.md",
+                "curator/state.md",
                 "CuratorState",
                 &event.title,
                 &event.description,
@@ -762,7 +762,7 @@ fn plan_rollback(
     scan: &KnowledgeScan,
 ) -> anyhow::Result<LearningEventWrites> {
     validate_path_component(&event.snapshot_id).context("invalid rollback snapshot id")?;
-    let snapshot_path = format!("learning/curator-history/{}.md", event.snapshot_id);
+    let snapshot_path = format!("curator/history/{}.md", event.snapshot_id);
     let snapshot = scan
         .valid
         .iter()
@@ -795,7 +795,7 @@ fn plan_rollback(
             render_event_concept(
                 agent_id,
                 event_id,
-                "learning/curator/state.md",
+                "curator/state.md",
                 "CuratorState",
                 &snapshot.title,
                 &snapshot.description,
@@ -808,7 +808,7 @@ fn plan_rollback(
             render_event_concept(
                 agent_id,
                 event_id,
-                &format!("learning/curator-history/{event_id}.md"),
+                &format!("curator/history/{event_id}.md"),
                 "CuratorHistory",
                 &truncate_chars(&format!("Rollback to {}", event.snapshot_id), 80),
                 &truncate_chars(&record_body, 160),
@@ -1205,7 +1205,7 @@ mod tests {
         let (path, markdown) = render_event_concept(
             "a",
             &snapshot_id,
-            &format!("learning/curator-history/{snapshot_id}.md"),
+            &format!("curator/history/{snapshot_id}.md"),
             "CuratorHistory",
             "Snapshotted state",
             "State before curation.",
@@ -1255,12 +1255,13 @@ mod tests {
         let state = scan
             .valid
             .iter()
-            .find(|c| c.relative_path == "learning/curator/state.md")
+            .find(|c| c.relative_path == "curator/state.md")
             .unwrap();
         assert_eq!(state.title, "Snapshotted state");
         assert_eq!(state.event_id.as_deref(), Some(rollback.event_id.as_str()));
-        assert!(scan.valid.iter().any(
-            |c| c.relative_path == format!("learning/curator-history/{}.md", rollback.event_id)
-        ));
+        assert!(scan
+            .valid
+            .iter()
+            .any(|c| c.relative_path == format!("curator/history/{}.md", rollback.event_id)));
     }
 }

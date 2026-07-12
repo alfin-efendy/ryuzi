@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
 
+use serde::{Deserialize, Serialize};
+
 use crate::paths;
 
 use super::okf::{
@@ -25,6 +27,43 @@ use super::types::AgentId;
 /// Directory the batch API stages complete bundle copies under. Never
 /// scanned as concept content.
 const TRANSACTIONS_DIR: &str = ".knowledge-transactions";
+
+const KNOWLEDGE_TXN_MANIFEST: &str = "manifest.yaml";
+const LEARNING_COMPLETIONS_DIR: &str = ".learning-events";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BundleTransactionPhase {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BundleTransactionManifest {
+    phase: BundleTransactionPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LearningCompletion {
+    event_id: String,
+    writes: Vec<String>,
+    removes: Vec<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnowledgeFailpoint {
+    None,
+    AfterBackupRename,
+    AfterActivationBeforeCommit,
+}
+
+#[cfg(test)]
+fn knowledge_failpoints() -> &'static std::sync::Mutex<HashMap<PathBuf, KnowledgeFailpoint>> {
+    static FAILPOINTS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, KnowledgeFailpoint>>> =
+        std::sync::OnceLock::new();
+    FAILPOINTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
 
 /// Everything the future Learning surface needs from one agent's bundle.
 #[derive(Debug, Clone, PartialEq)]
@@ -178,8 +217,8 @@ impl AgentKnowledgeStore {
                     description: concept.description.clone(),
                     timestamp: concept.timestamp,
                 }),
-                "learning/curator" => curator_concepts.push(concept.clone()),
-                "learning/curator-history" => curator_history.push(CuratorHistorySnapshot {
+                "curator" => curator_concepts.push(concept.clone()),
+                "curator/history" => curator_history.push(CuratorHistorySnapshot {
                     snapshot_id: concept.id.clone(),
                     concept: concept.clone(),
                 }),
@@ -245,11 +284,18 @@ impl KnowledgeStore {
 
     pub async fn create(&self, input: KnowledgeConceptInput) -> anyhow::Result<KnowledgeConcept> {
         let _guard = self.write_lock.lock().await;
-        ensure_bundle_at(&self.root)?;
         let concept = self.concept_from_input(paths::new_id(), &input)?;
-        self.write_concept(&concept)?;
-        self.finish_write("create", &concept.id, &concept.relative_path)?;
-        Ok(concept)
+        self.commit_staged_mutation(|stage| {
+            stage_concept(stage, &concept)?;
+            Ok((
+                concept.clone(),
+                vec![(
+                    "create".into(),
+                    concept.id.clone(),
+                    concept.relative_path.clone(),
+                )],
+            ))
+        })
     }
 
     pub async fn update(
@@ -258,26 +304,40 @@ impl KnowledgeStore {
         input: KnowledgeConceptInput,
     ) -> anyhow::Result<KnowledgeConcept> {
         let _guard = self.write_lock.lock().await;
-        ensure_bundle_at(&self.root)?;
-        let existing = find_concept(&self.root, concept_id)?
-            .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
         let concept = self.concept_from_input(concept_id.to_owned(), &input)?;
-        self.write_concept(&concept)?;
-        if existing.relative_path != concept.relative_path {
-            fs::remove_file(self.safe_existing_path(&existing.relative_path)?)?;
-        }
-        self.finish_write("update", &concept.id, &concept.relative_path)?;
-        Ok(concept)
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+            stage_concept(stage, &concept)?;
+            if existing.relative_path != concept.relative_path {
+                fs::remove_file(stage.join(existing.relative_path))?;
+            }
+            Ok((
+                concept.clone(),
+                vec![(
+                    "update".into(),
+                    concept.id.clone(),
+                    concept.relative_path.clone(),
+                )],
+            ))
+        })
     }
 
     pub async fn delete(&self, concept_id: &str) -> anyhow::Result<()> {
         let _guard = self.write_lock.lock().await;
-        ensure_bundle_at(&self.root)?;
-        let existing = find_concept(&self.root, concept_id)?
-            .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
-        fs::remove_file(self.safe_existing_path(&existing.relative_path)?)?;
-        self.finish_write("delete", concept_id, &existing.relative_path)?;
-        Ok(())
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+            fs::remove_file(stage.join(&existing.relative_path))?;
+            Ok((
+                (),
+                vec![(
+                    "delete".into(),
+                    concept_id.to_owned(),
+                    existing.relative_path,
+                )],
+            ))
+        })
     }
 
     /// Case-insensitive substring match over title, description, body, and
@@ -355,11 +415,21 @@ impl KnowledgeStore {
         validate_concept_relative_path(relative_path)?;
         let concept = parse_concept(relative_path, raw)?;
         let _guard = self.write_lock.lock().await;
-        ensure_bundle_at(&self.root)?;
-        let target = self.safe_target(relative_path)?;
-        atomic_write(&target, render_concept(&concept)?.as_bytes())?;
-        self.finish_write("replace", &concept.id, relative_path)?;
-        Ok(concept)
+        self.commit_staged_mutation(|stage| {
+            let target = stage.join(relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&target, render_concept(&concept)?.as_bytes())?;
+            Ok((
+                concept.clone(),
+                vec![(
+                    "replace".into(),
+                    concept.id.clone(),
+                    relative_path.to_owned(),
+                )],
+            ))
+        })
     }
 
     /// Deletes a document that failed parsing. The path must still be a
@@ -367,20 +437,25 @@ impl KnowledgeStore {
     pub async fn delete_invalid(&self, relative_path: &str) -> anyhow::Result<()> {
         validate_concept_relative_path(relative_path)?;
         let _guard = self.write_lock.lock().await;
-        ensure_bundle_at(&self.root)?;
-        let target = self.safe_existing_path(relative_path)?;
-        fs::remove_file(target)?;
-        let stem = concept_id_of(relative_path);
-        self.finish_write("delete-invalid", &stem, relative_path)?;
-        Ok(())
+        self.commit_staged_mutation(|stage| {
+            let target = stage.join(relative_path);
+            if !target.is_file() {
+                bail!("`{relative_path}` does not exist");
+            }
+            fs::remove_file(target)?;
+            let stem = concept_id_of(relative_path);
+            Ok((
+                (),
+                vec![("delete-invalid".into(), stem, relative_path.to_owned())],
+            ))
+        })
     }
 
     /// Rebuilds `memory/index.md` and `learning/index.md` from the current
     /// valid concepts.
     pub async fn regenerate_indexes(&self) -> anyhow::Result<()> {
         let _guard = self.write_lock.lock().await;
-        ensure_bundle_at(&self.root)?;
-        self.regenerate_indexes_locked()
+        self.commit_staged_mutation(|_| Ok(((), Vec::new())))
     }
 
     /// Applies one learning event's mutations while holding the per-agent
@@ -410,16 +485,26 @@ impl KnowledgeStore {
         if event_id.trim().is_empty() {
             bail!("learning event id must not be blank");
         }
+        self.recover_bundle_transactions()?;
         ensure_bundle_at(&self.root)?;
         let scan = scan_bundle(&self.root)?;
-        if scan
-            .valid
-            .iter()
-            .any(|concept| concept.event_id.as_deref() == Some(event_id))
-        {
-            return Ok(false);
-        }
         let writes = plan(&scan)?;
+        let completion = LearningCompletion {
+            event_id: event_id.to_owned(),
+            writes: sorted_paths(writes.writes.iter().map(|(path, _)| path)),
+            removes: sorted_paths(writes.removes.iter()),
+        };
+        let completion_path = self
+            .root
+            .join(LEARNING_COMPLETIONS_DIR)
+            .join(format!("{event_id}.yaml"));
+        if let Ok(raw) = fs::read_to_string(&completion_path) {
+            let recorded: LearningCompletion = serde_yaml::from_str(&raw)?;
+            if recorded == completion && completion_matches(&self.root, &recorded, &writes.writes)?
+            {
+                return Ok(false);
+            }
+        }
         for (relative_path, content) in &writes.writes {
             validate_concept_relative_path(relative_path)?;
             let concept = parse_concept(relative_path, content)
@@ -431,31 +516,46 @@ impl KnowledgeStore {
         for relative_path in &writes.removes {
             validate_concept_relative_path(relative_path)?;
         }
+        let txn = self.prepare_bundle_transaction()?;
+        let stage = txn.join("stage");
         for (relative_path, content) in &writes.writes {
-            let target = self.safe_target(relative_path)?;
+            let target = stage.join(relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
             atomic_write(&target, content.as_bytes())?;
         }
         for relative_path in &writes.removes {
-            // A replayed remove converges: an already-missing target is fine.
-            if let Ok(target) = self.safe_existing_path(relative_path) {
+            let target = stage.join(relative_path);
+            if target.exists() {
                 fs::remove_file(target)?;
             }
         }
-        self.regenerate_indexes_locked()?;
+        self.regenerate_indexes_at(&stage)?;
         for (relative_path, _) in &writes.writes {
-            self.append_log(
+            append_log_at(
+                &stage,
                 "learning-apply",
                 &concept_id_of(relative_path),
                 relative_path,
             )?;
         }
         for relative_path in &writes.removes {
-            self.append_log(
+            append_log_at(
+                &stage,
                 "learning-remove",
                 &concept_id_of(relative_path),
                 relative_path,
             )?;
         }
+        let marker = stage
+            .join(LEARNING_COMPLETIONS_DIR)
+            .join(format!("{event_id}.yaml"));
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&marker, serde_yaml::to_string(&completion)?.as_bytes())?;
+        self.activate_bundle_transaction(&txn)?;
         Ok(true)
     }
 
@@ -469,35 +569,21 @@ impl KnowledgeStore {
         operations: Vec<KnowledgeOperation>,
     ) -> anyhow::Result<Vec<KnowledgeConcept>> {
         let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
         ensure_bundle_at(&self.root)?;
-        let staging = self
-            .root
-            .join(TRANSACTIONS_DIR)
-            .join(paths::new_id())
-            .join("stage");
-        let outcome = self.stage_batch(&staging, &operations);
-        let staged = match outcome {
+        let txn = self.prepare_bundle_transaction()?;
+        let staged = match self.stage_batch(&txn.join("stage"), &operations) {
             Ok(staged) => staged,
             Err(error) => {
-                let _ = fs::remove_dir_all(staging.parent().unwrap_or(&staging));
+                let _ = fs::remove_dir_all(&txn);
                 return Err(error);
             }
         };
-        // Every operation validated against the complete staged copy; swap
-        // the affected files into the active bundle.
-        for (relative_path, content) in &staged.writes {
-            let target = self.safe_target(relative_path)?;
-            atomic_write(&target, content.as_bytes())?;
-        }
-        for relative_path in &staged.removes {
-            let target = self.safe_existing_path(relative_path)?;
-            fs::remove_file(target)?;
-        }
-        self.regenerate_indexes_locked()?;
+        self.regenerate_indexes_at(&txn.join("stage"))?;
         for (action, concept_id, relative_path) in &staged.log_lines {
-            self.append_log(action, concept_id, relative_path)?;
+            append_log_at(&txn.join("stage"), action, concept_id, relative_path)?;
         }
-        let _ = fs::remove_dir_all(staging.parent().unwrap_or(&staging));
+        self.activate_bundle_transaction(&txn)?;
         Ok(staged.results)
     }
 
@@ -506,7 +592,7 @@ impl KnowledgeStore {
         staging: &Path,
         operations: &[KnowledgeOperation],
     ) -> anyhow::Result<StagedBatch> {
-        copy_concept_files(&self.root, staging)?;
+        copy_directory(&self.root, staging, &[TRANSACTIONS_DIR])?;
         let mut staged = StagedBatch::default();
         for operation in operations {
             match operation {
@@ -549,6 +635,139 @@ impl KnowledgeStore {
         Ok(staged)
     }
 
+    fn transaction_root(&self) -> anyhow::Result<PathBuf> {
+        let parent = self
+            .root
+            .parent()
+            .context("knowledge bundle has no parent")?;
+        let bundle_name = self
+            .root
+            .file_name()
+            .context("knowledge bundle has no directory name")?;
+        Ok(parent.join(TRANSACTIONS_DIR).join(bundle_name))
+    }
+
+    #[cfg(test)]
+    fn failpoint(&self) -> KnowledgeFailpoint {
+        knowledge_failpoints()
+            .lock()
+            .unwrap()
+            .get(&self.root)
+            .copied()
+            .unwrap_or(KnowledgeFailpoint::None)
+    }
+
+    #[cfg(test)]
+    fn set_failpoint(&self, failpoint: KnowledgeFailpoint) {
+        let mut failpoints = knowledge_failpoints().lock().unwrap();
+        if failpoint == KnowledgeFailpoint::None {
+            failpoints.remove(&self.root);
+        } else {
+            failpoints.insert(self.root.clone(), failpoint);
+        }
+    }
+
+    fn prepare_bundle_transaction(&self) -> anyhow::Result<PathBuf> {
+        let transaction_root = self.transaction_root()?;
+        fs::create_dir_all(&transaction_root)?;
+        let txn = transaction_root.join(paths::new_id());
+        fs::create_dir_all(&txn)?;
+        copy_directory(&self.root, &txn.join("stage"), &[TRANSACTIONS_DIR])?;
+        write_bundle_manifest(&txn, BundleTransactionPhase::Prepared)?;
+        Ok(txn)
+    }
+
+    fn activate_bundle_transaction(&self, txn: &Path) -> anyhow::Result<()> {
+        let stage = txn.join("stage");
+        let backup = txn.join("backup");
+        fs::rename(&self.root, &backup).context("failed to move active knowledge to backup")?;
+        #[cfg(test)]
+        if self.failpoint() == KnowledgeFailpoint::AfterBackupRename {
+            fs::rename(&backup, &self.root)?;
+            fs::remove_dir_all(txn)?;
+            return Err(anyhow!("knowledge failpoint after backup rename"));
+        }
+        if let Err(error) = fs::rename(&stage, &self.root) {
+            let _ = fs::rename(&backup, &self.root);
+            return Err(error).context("failed to activate staged knowledge bundle");
+        }
+        #[cfg(test)]
+        if self.failpoint() == KnowledgeFailpoint::AfterActivationBeforeCommit {
+            fs::rename(&self.root, &stage)?;
+            fs::rename(&backup, &self.root)?;
+            fs::remove_dir_all(txn)?;
+            return Err(anyhow!("knowledge failpoint before commit marker"));
+        }
+        if let Err(error) = write_bundle_manifest(txn, BundleTransactionPhase::Committed) {
+            let _ = fs::rename(&self.root, &stage);
+            let _ = fs::rename(&backup, &self.root);
+            return Err(error);
+        }
+        fs::remove_dir_all(txn)?;
+        Ok(())
+    }
+
+    fn recover_bundle_transactions(&self) -> anyhow::Result<()> {
+        let transaction_root = self.transaction_root()?;
+        if !transaction_root.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&transaction_root)?.filter_map(Result::ok) {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let txn = entry.path();
+            let manifest = read_bundle_manifest(&txn)?;
+            let backup = txn.join("backup");
+            let stage = txn.join("stage");
+            match manifest.phase {
+                BundleTransactionPhase::Prepared => {
+                    if backup.exists() {
+                        if self.root.exists() {
+                            fs::remove_dir_all(&self.root)?;
+                        }
+                        fs::rename(&backup, &self.root)?;
+                    }
+                    fs::remove_dir_all(&txn)?;
+                }
+                BundleTransactionPhase::Committed => {
+                    if !self.root.exists() && stage.exists() {
+                        fs::rename(&stage, &self.root)?;
+                    }
+                    fs::remove_dir_all(&txn)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_staged_mutation<T>(
+        &self,
+        mutate: impl FnOnce(&Path) -> anyhow::Result<(T, Vec<(String, String, String)>)>,
+    ) -> anyhow::Result<T> {
+        self.recover_bundle_transactions()?;
+        ensure_bundle_at(&self.root)?;
+        let txn = self.prepare_bundle_transaction()?;
+        let stage = txn.join("stage");
+        let (result, log_lines) = match mutate(&stage) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&txn);
+                return Err(error);
+            }
+        };
+        self.regenerate_indexes_at(&stage)?;
+        for (action, concept_id, relative_path) in log_lines {
+            append_log_at(&stage, &action, &concept_id, &relative_path)?;
+        }
+        self.activate_bundle_transaction(&txn)?;
+        Ok(result)
+    }
+
+    fn regenerate_indexes_at(&self, root: &Path) -> anyhow::Result<()> {
+        regenerate_indexes_at(root)
+    }
+
     fn concept_from_input(
         &self,
         id: String,
@@ -579,109 +798,6 @@ impl KnowledgeStore {
             tags: input.tags.clone(),
             extensions: input.extensions.clone(),
         })
-    }
-
-    fn write_concept(&self, concept: &KnowledgeConcept) -> anyhow::Result<()> {
-        let target = self.safe_target(&concept.relative_path)?;
-        atomic_write(&target, render_concept(concept)?.as_bytes())
-    }
-
-    /// Regenerates indexes and appends one log line; every mutation ends
-    /// its locked cycle here.
-    fn finish_write(
-        &self,
-        action: &str,
-        concept_id: &str,
-        relative_path: &str,
-    ) -> anyhow::Result<()> {
-        self.regenerate_indexes_locked()?;
-        self.append_log(action, concept_id, relative_path)
-    }
-
-    fn regenerate_indexes_locked(&self) -> anyhow::Result<()> {
-        let scan = scan_bundle(&self.root)?;
-        for area in ["memory", "learning"] {
-            let prefix = format!("{area}/");
-            let mut lines: Vec<String> = scan
-                .valid
-                .iter()
-                .filter_map(|concept| {
-                    concept.relative_path.strip_prefix(&prefix).map(|link| {
-                        format!("- [{}]({link}) — {}", concept.title, concept.description)
-                    })
-                })
-                .collect();
-            lines.sort();
-            let mut content = lines.join("\n");
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            atomic_write(&self.root.join(area).join("index.md"), content.as_bytes())?;
-        }
-        Ok(())
-    }
-
-    /// Appends one line to the root `log.md`: timestamp, action, concept id,
-    /// and relative path — never document bodies.
-    fn append_log(
-        &self,
-        action: &str,
-        concept_id: &str,
-        relative_path: &str,
-    ) -> anyhow::Result<()> {
-        let log_path = self.root.join("log.md");
-        let mut content = match fs::read_to_string(&log_path) {
-            Ok(existing) => existing,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        content.push_str(&format!(
-            "- {timestamp} {action} {concept_id} {relative_path}\n"
-        ));
-        atomic_write(&log_path, content.as_bytes())
-    }
-
-    /// Resolves a concept path for writing: creates the parent, then rejects
-    /// it when its canonical form (symlinks resolved) leaves the canonical
-    /// bundle root.
-    fn safe_target(&self, relative_path: &str) -> anyhow::Result<PathBuf> {
-        let full = self.root.join(relative_path);
-        let parent = full
-            .parent()
-            .context("concept path has no parent directory")?;
-        fs::create_dir_all(parent)?;
-        let file_name = full.file_name().context("concept path has no file name")?;
-        Ok(self.checked_canonical(parent)?.join(file_name))
-    }
-
-    /// Resolves an existing concept path for reads/removal with the same
-    /// canonical containment check as [`Self::safe_target`].
-    fn safe_existing_path(&self, relative_path: &str) -> anyhow::Result<PathBuf> {
-        let full = self.root.join(relative_path);
-        let parent = full
-            .parent()
-            .context("concept path has no parent directory")?;
-        let file_name = full.file_name().context("concept path has no file name")?;
-        let target = self.checked_canonical(parent)?.join(file_name);
-        if !target.is_file() {
-            bail!("`{relative_path}` does not exist");
-        }
-        Ok(target)
-    }
-
-    fn checked_canonical(&self, parent: &Path) -> anyhow::Result<PathBuf> {
-        let canonical_root = fs::canonicalize(&self.root)
-            .with_context(|| format!("bundle root {} is missing", self.root.display()))?;
-        let canonical_parent = fs::canonicalize(parent)
-            .with_context(|| format!("failed to canonicalize {}", parent.display()))?;
-        if !canonical_parent.starts_with(&canonical_root) {
-            bail!(
-                "path {} escapes the knowledge bundle",
-                canonical_parent.display()
-            );
-        }
-        Ok(canonical_parent)
     }
 }
 
@@ -717,6 +833,129 @@ fn stage_concept(staging: &Path, concept: &KnowledgeConcept) -> anyhow::Result<(
     atomic_write(&target, render_concept(concept)?.as_bytes())
 }
 
+fn sorted_paths<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut paths: Vec<String> = paths.cloned().collect();
+    paths.sort();
+    paths
+}
+
+fn completion_matches(
+    root: &Path,
+    completion: &LearningCompletion,
+    expected_writes: &[(String, String)],
+) -> anyhow::Result<bool> {
+    for relative_path in &completion.writes {
+        let raw = match fs::read_to_string(root.join(relative_path)) {
+            Ok(raw) => raw,
+            Err(_) => return Ok(false),
+        };
+        let Some((_, expected)) = expected_writes
+            .iter()
+            .find(|(path, _)| path == relative_path)
+        else {
+            return Ok(false);
+        };
+        if &raw != expected {
+            return Ok(false);
+        }
+        if parse_concept(relative_path, &raw)?.event_id.as_deref()
+            != Some(completion.event_id.as_str())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(completion
+        .removes
+        .iter()
+        .all(|path| !root.join(path).exists()))
+}
+
+fn write_bundle_manifest(txn: &Path, phase: BundleTransactionPhase) -> anyhow::Result<()> {
+    let raw = serde_yaml::to_string(&BundleTransactionManifest { phase })?;
+    atomic_write(&txn.join(KNOWLEDGE_TXN_MANIFEST), raw.as_bytes())
+}
+
+fn read_bundle_manifest(txn: &Path) -> anyhow::Result<BundleTransactionManifest> {
+    let raw = fs::read_to_string(txn.join(KNOWLEDGE_TXN_MANIFEST))?;
+    Ok(serde_yaml::from_str(&raw)?)
+}
+
+fn copy_directory(source: &Path, destination: &Path, excluded: &[&str]) -> anyhow::Result<()> {
+    fs::create_dir_all(destination)?;
+    if !source.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source)?.filter_map(Result::ok) {
+        let name = entry.file_name();
+        if excluded
+            .iter()
+            .any(|excluded| name == std::ffi::OsStr::new(excluded))
+        {
+            continue;
+        }
+        let target = destination.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_directory(&entry.path(), &target, excluded)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn regenerate_indexes_at(root: &Path) -> anyhow::Result<()> {
+    let scan = scan_bundle(root)?;
+    for area in ["memory", "learning", "curator"] {
+        let prefix = format!("{area}/");
+        let mut lines: Vec<String> =
+            scan.valid
+                .iter()
+                .filter_map(|concept| {
+                    concept.relative_path.strip_prefix(&prefix).map(|link| {
+                        format!("- [{}]({link}) — {}", concept.title, concept.description)
+                    })
+                })
+                .collect();
+        lines.sort();
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        atomic_write(&root.join(area).join("index.md"), content.as_bytes())?;
+    }
+    let mut root_lines: Vec<String> = scan
+        .valid
+        .iter()
+        .map(|concept| {
+            format!(
+                "- [{}]({}) — {}",
+                concept.title, concept.relative_path, concept.description
+            )
+        })
+        .collect();
+    root_lines.sort();
+    let mut root_content = root_lines.join("\n");
+    if !root_content.is_empty() {
+        root_content.push('\n');
+    }
+    atomic_write(&root.join("index.md"), root_content.as_bytes())
+}
+
+fn append_log_at(
+    root: &Path,
+    action: &str,
+    concept_id: &str,
+    relative_path: &str,
+) -> anyhow::Result<()> {
+    let log_path = root.join("log.md");
+    let mut content = fs::read_to_string(&log_path).unwrap_or_default();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    content.push_str(&format!(
+        "- {timestamp} {action} {concept_id} {relative_path}\n"
+    ));
+    atomic_write(&log_path, content.as_bytes())
+}
+
 /// Creates the full bundle skeleton: every fixed concept directory, the
 /// project-memory parent, and empty generated `index.md`/`log.md` files.
 /// Idempotent; never overwrites existing generated files.
@@ -725,7 +964,13 @@ pub fn ensure_bundle_at(root: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(root.join(directory))?;
     }
     fs::create_dir_all(root.join(PROJECT_MEMORY_PARENT))?;
-    for generated in ["memory/index.md", "learning/index.md", "log.md"] {
+    for generated in [
+        "index.md",
+        "memory/index.md",
+        "learning/index.md",
+        "curator/index.md",
+        "log.md",
+    ] {
         let path = root.join(generated);
         if !path.exists() {
             atomic_write(&path, b"")?;
@@ -807,33 +1052,6 @@ fn concept_id_of(relative_path: &str) -> String {
         .to_owned()
 }
 
-/// Copies every current concept document (valid or invalid) into the
-/// staging root, preserving relative paths, so batch operations validate
-/// against a complete bundle copy.
-fn copy_concept_files(root: &Path, staging: &Path) -> anyhow::Result<()> {
-    for directory in concept_directories(root)? {
-        let source = root.join(&directory);
-        let destination = staging.join(&directory);
-        fs::create_dir_all(&destination)?;
-        if !source.is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(&source)?.filter_map(Result::ok) {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !name.ends_with(".md") || RESERVED_FILE_NAMES.contains(&name.as_str()) {
-                continue;
-            }
-            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                continue;
-            }
-            fs::copy(entry.path(), destination.join(&name))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -865,6 +1083,128 @@ mod tests {
             .for_agent(agent_id)
             .unwrap();
         (root, store)
+    }
+
+    fn bundle_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(base: &Path, current: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            if !current.is_dir() {
+                return;
+            }
+            for entry in std::fs::read_dir(current).unwrap().filter_map(Result::ok) {
+                if entry.file_type().unwrap().is_dir() {
+                    walk(base, &entry.path(), out);
+                } else {
+                    out.push((
+                        entry
+                            .path()
+                            .strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        std::fs::read(entry.path()).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        walk(root, root, &mut result);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    fn event_write(event_id: &str, body: &str) -> LearningEventWrites {
+        let path = format!("learning/reviews/{event_id}.md");
+        let mut concept = KnowledgeConcept {
+            id: event_id.into(),
+            relative_path: path.clone(),
+            concept_type: "Review".into(),
+            title: "Review".into(),
+            description: "Review description".into(),
+            timestamp: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            body: body.into(),
+            scope: None,
+            agent_id: Some("a".into()),
+            event_id: Some(event_id.into()),
+            tags: vec![],
+            extensions: IndexMap::new(),
+        };
+        concept.agent_id = Some("a".into());
+        LearningEventWrites {
+            writes: vec![(path, render_concept(&concept).unwrap())],
+            removes: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn activation_failure_restores_bundle_byte_identically_and_keeps_txns_outside() {
+        let (_root, store) = fixture_store("a");
+        store
+            .create(memory_input(KnowledgeScope::User, "seed"))
+            .await
+            .unwrap();
+        let before = bundle_bytes(store.root());
+        store.set_failpoint(KnowledgeFailpoint::AfterActivationBeforeCommit);
+        let result = store
+            .create(memory_input(KnowledgeScope::User, "must fail"))
+            .await;
+        store.set_failpoint(KnowledgeFailpoint::None);
+        assert!(result.is_err());
+        assert_eq!(bundle_bytes(store.root()), before);
+        let transaction_root = store.transaction_root().unwrap();
+        assert!(!transaction_root.starts_with(store.root()));
+        assert!(
+            !transaction_root.exists()
+                || std::fs::read_dir(&transaction_root)
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+        assert_eq!(store.scan().await.unwrap().valid.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_rolls_back_prepared_and_cleans_committed_transactions() {
+        let (_root, store) = fixture_store("a");
+        ensure_bundle_at(store.root()).unwrap();
+        std::fs::write(store.root().join("log.md"), "original").unwrap();
+        let prepared = store.prepare_bundle_transaction().unwrap();
+        std::fs::rename(store.root(), prepared.join("backup")).unwrap();
+        std::fs::rename(prepared.join("stage"), store.root()).unwrap();
+        std::fs::write(store.root().join("log.md"), "partial").unwrap();
+        store.recover_bundle_transactions().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("log.md")).unwrap(),
+            "original"
+        );
+
+        let committed = store.prepare_bundle_transaction().unwrap();
+        std::fs::write(committed.join("stage/log.md"), "committed").unwrap();
+        std::fs::rename(store.root(), committed.join("backup")).unwrap();
+        std::fs::rename(committed.join("stage"), store.root()).unwrap();
+        write_bundle_manifest(&committed, BundleTransactionPhase::Committed).unwrap();
+        store.recover_bundle_transactions().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("log.md")).unwrap(),
+            "committed"
+        );
+        assert!(!committed.exists());
+    }
+
+    #[tokio::test]
+    async fn replay_repairs_partial_event_artifact_instead_of_skipping() {
+        let (_root, store) = fixture_store("a");
+        assert!(store
+            .apply_learning_event("event-1", |_| Ok(event_write("event-1", "complete")))
+            .await
+            .unwrap());
+        let path = store.root().join("learning/reviews/event-1.md");
+        let partial = event_write("event-1", "partial").writes.remove(0).1;
+        std::fs::write(&path, partial).unwrap();
+        assert!(store
+            .apply_learning_event("event-1", |_| Ok(event_write("event-1", "complete")))
+            .await
+            .unwrap());
+        assert!(std::fs::read_to_string(path).unwrap().contains("complete"));
     }
 
     #[tokio::test]
