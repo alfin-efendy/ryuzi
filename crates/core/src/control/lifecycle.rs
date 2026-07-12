@@ -1003,11 +1003,10 @@ impl ControlPlane {
             SessionKind::Project | SessionKind::Chat => Some(self.build_app_control()),
             SessionKind::Worker | SessionKind::Review => None,
         };
-        let main_agent_id = crate::agents::registry::AgentRegistry::default_agent_id_or_builtin(
-            crate::paths::config_dir(),
-            self.store.clone(),
-        )
-        .await;
+        let persistence = self.agent_persistence().ok_or_else(|| {
+            anyhow::anyhow!("agent persistence was not attached to the control plane")
+        })?;
+        let main_agent_id = persistence.registry.default_agent_id().await;
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
             main_agent_id,
@@ -1028,6 +1027,8 @@ impl ControlPlane {
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             background: self.background.clone(),
+            agent_knowledge: persistence.knowledge.clone(),
+            learning_queue: persistence.learning.clone(),
             store: self.store.clone(),
             app_control,
         };
@@ -1381,8 +1382,7 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Drive one learning-fork replay for a claimed `kind='learning'`
-    /// background-event payload (spec §3.1/§7.2, Phase 4 Task 9): decode the
+    /// Drive one review-fork replay from a durable learning-queue payload
     /// captured `LearningPayload`, spin up a `kind='review'`,
     /// `parent_session_pk`-linked session — a real, isolatable session, but
     /// hidden from every picker (which filters on `kind`) — and replay the
@@ -1473,9 +1473,13 @@ impl ControlPlane {
             crate::llm_router::model_effort::build_utility_effort_policy(&store, &model).await?;
         let llm = self.review_llm_factory().create(store.clone());
 
+        let persistence = self.agent_persistence().ok_or_else(|| {
+            anyhow::anyhow!("agent persistence was not attached to the control plane")
+        })?;
         let deps = RunnerDeps {
             session_pk: review_pk.clone(),
-            main_agent_id: "ryuzi".into(),
+            main_agent_id: persistence.registry.default_agent_id().await,
+            learning_queue: persistence.learning.clone(),
             kind: SessionKind::Review,
             work_dir,
             attachments_dir: None,

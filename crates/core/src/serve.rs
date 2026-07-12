@@ -3,6 +3,9 @@
 //! Server-Sent-Events stream of [`CoreEvent`]s so external clients (or a remote
 //! `attach`) can drive and observe sessions.
 
+use crate::agents::knowledge::AgentKnowledgeStore;
+use crate::agents::learning_queue::LearningQueue;
+use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
 use crate::llm_router::server::RouterServer;
 use crate::plugins::{CorePlugin, PluginSource};
@@ -30,6 +33,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub struct ApiState {
     pub cp: Arc<ControlPlane>,
     pub router_server: Arc<RouterServer>,
+    pub agents: Arc<AgentRegistry>,
+    pub agent_knowledge: Arc<AgentKnowledgeStore>,
+    pub learning_queue: Arc<LearningQueue>,
     /// The loopback-only control token (see [`require_token`]). Always a
     /// real secret — there is no auth-disable mode.
     pub control_token: String,
@@ -665,18 +671,30 @@ mod tests {
     /// both by tests that don't exercise the bearer-token middleware at all
     /// (e.g. `serve_binds_an_ephemeral_port`) and by tests that hit `/health`
     /// only (public) — as well as ones that authenticate explicitly.
-    fn state_for(cp: Arc<ControlPlane>) -> ApiState {
+    async fn state_for(cp: Arc<ControlPlane>) -> ApiState {
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            cp.store().clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        std::mem::forget(config);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp,
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             control_token: TEST_CONTROL_TOKEN.to_string(),
         }
     }
 
     async fn test_state() -> ApiState {
-        state_for(test_cp().await)
+        state_for(test_cp().await).await
     }
 
     /// A connector that contributes no MCP servers — enough to exercise the
@@ -742,20 +760,20 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert_eq!(v["service"], "ryuzi");
         // Router builds without panicking.
-        let _ = router(state_for(cp));
+        let _ = router(state_for(cp).await);
     }
 
     #[tokio::test]
     async fn serve_binds_an_ephemeral_port() {
         let cp = test_cp().await;
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         assert!(port > 0);
     }
 
     #[tokio::test]
     async fn list_plugins_shows_anthropic_enabled_with_provider_capability() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
 
         let body: Vec<Value> = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/plugins"))
@@ -779,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn get_plugin_returns_manifest_fields_plus_enabled_and_source() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
 
         let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/plugins/anthropic"))
@@ -800,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_plugin_id_is_404_with_error_envelope() {
         let cp = test_cp_with_plugins().await;
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
 
         let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/plugins/nope"))
@@ -819,7 +837,7 @@ mod tests {
         // Keep a handle to write the setting directly after the server (which
         // consumes an `Arc<ControlPlane>` into its router state) is started.
         let store = cp.store().clone();
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
 
         let fetch = || {
             let url = format!("http://127.0.0.1:{port}/plugins");
@@ -943,7 +961,7 @@ mod tests {
 
         let cp = test_cp().await;
         let port = serve(
-            state_for(cp),
+            state_for(cp).await,
             ServeOpts {
                 addr: Ipv4Addr::LOCALHOST.into(),
                 port: 0,
@@ -1034,7 +1052,7 @@ mod tests {
             .await
             .unwrap();
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/sessions"))
             .bearer_auth(raw_token)
@@ -1063,7 +1081,7 @@ mod tests {
             .unwrap();
         store.revoke_device("dev-2").await.unwrap();
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/sessions"))
             .bearer_auth(raw_token)
@@ -1090,7 +1108,7 @@ mod tests {
             .await
             .unwrap();
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let client = reqwest::Client::new();
 
         let r = client
@@ -1131,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn pair_rejects_an_unknown_code_with_no_bearer_needed() {
         let cp = test_cp().await;
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
 
         let r = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/pair"))
@@ -1150,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn pair_rate_limits_after_ten_requests_in_the_window() {
         let cp = test_cp().await;
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let client = reqwest::Client::new();
         let body = json!({ "code": "nope", "device_name": "flooder" });
 
@@ -1305,7 +1323,7 @@ mod tests {
         )
         .unwrap();
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let resp = reqwest::Client::new()
             .get(format!(
                 "http://127.0.0.1:{port}/attachments/sess-1/shot.png"
@@ -1353,7 +1371,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         set_attachments_root(&cp, dir.path()).await;
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let resp = reqwest::Client::new()
             .get(format!(
                 "http://127.0.0.1:{port}/attachments/sess-1/nope.png"
@@ -1390,7 +1408,7 @@ mod tests {
         let root = set_attachments_root(&cp, dir.path()).await;
         std::fs::create_dir_all(root.join("sess-1")).unwrap();
 
-        let state = state_for(cp);
+        let state = state_for(cp).await;
         let resp = get_attachment(State(state), Path("sess-1/../../secret.txt".to_string())).await;
 
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
@@ -1424,7 +1442,7 @@ mod tests {
         let big = vec![0u8; (DEFAULT_ATTACHMENT_MAX_BYTES + 1) as usize];
         std::fs::write(root.join("sess-1").join("huge.bin"), &big).unwrap();
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let resp = reqwest::Client::new()
             .get(format!(
                 "http://127.0.0.1:{port}/attachments/sess-1/huge.bin"
@@ -1452,7 +1470,7 @@ mod tests {
         std::fs::create_dir_all(root.join("sess-1")).unwrap();
         std::fs::write(root.join("sess-1").join("small.bin"), b"123456").unwrap();
 
-        let port = serve(state_for(cp), opts(0)).await.unwrap();
+        let port = serve(state_for(cp).await, opts(0)).await.unwrap();
         let resp = reqwest::Client::new()
             .get(format!(
                 "http://127.0.0.1:{port}/attachments/sess-1/small.bin"
@@ -1489,7 +1507,7 @@ mod tests {
             "the whole point is that rel is itself absolute"
         );
 
-        let state = state_for(cp);
+        let state = state_for(cp).await;
         let resp = get_attachment(
             State(state),
             Path(secret_path.to_str().unwrap().to_string()),

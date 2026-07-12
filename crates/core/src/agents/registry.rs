@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{anyhow, Context};
 use indexmap::IndexMap;
@@ -12,6 +12,7 @@ use crate::llm_router::{model_capabilities, routes};
 use crate::paths;
 use crate::store::Store;
 
+use super::learning_queue::LearningQueue;
 #[cfg(test)]
 use super::transaction::TransactionFailpoint;
 use super::transaction::{recover_transactions, registry_generation, AgentTransaction};
@@ -30,6 +31,7 @@ pub struct AgentRegistry {
     store: Arc<Store>,
     state: RwLock<Arc<RegistryState>>,
     mutations: Mutex<()>,
+    learning_queue: OnceLock<Weak<LearningQueue>>,
     #[cfg(test)]
     failpoint: std::sync::atomic::AtomicU8,
 }
@@ -202,9 +204,16 @@ impl AgentRegistry {
                 repairs,
             })),
             mutations: Mutex::new(()),
+            learning_queue: OnceLock::new(),
             #[cfg(test)]
             failpoint: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    pub fn attach_learning_queue(&self, queue: Weak<LearningQueue>) -> anyhow::Result<()> {
+        self.learning_queue
+            .set(queue)
+            .map_err(|_| anyhow!("learning queue is already attached"))
     }
 
     pub async fn default_agent_id(&self) -> String {
@@ -377,13 +386,32 @@ impl AgentRegistry {
         }
         self.validate_candidate(&index, &profiles, &state.subagents)
             .await?;
-        self.commit_candidate(
-            index,
-            profiles,
-            state.subagents.clone(),
-            vec![agent_id.into()],
-        )
-        .await
+        let queue = self.learning_queue.get().and_then(Weak::upgrade);
+        if let Some(queue) = &queue {
+            queue.block(agent_id).await?;
+        }
+        let result = self
+            .commit_candidate(
+                index,
+                profiles,
+                state.subagents.clone(),
+                vec![agent_id.into()],
+            )
+            .await;
+        match result {
+            Ok(snapshot) => {
+                if let Some(queue) = &queue {
+                    queue.discard_unconsumed(agent_id).await?;
+                }
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if let Some(queue) = &queue {
+                    queue.unblock(agent_id).await?;
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn set_default(
@@ -1014,6 +1042,8 @@ fn snapshot_from_state(state: &RegistryState) -> AgentRegistrySnapshot {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::agents::knowledge::AgentKnowledgeStore;
+    use crate::agents::learning_queue::{LearningEventPayload, LearningQueue, ReviewEvent};
     use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 
     use super::*;
@@ -1244,6 +1274,70 @@ mod tests {
         assert!(
             matches!(error, AgentRegistryError::Invalid(issues) if issues.iter().any(|issue| issue.field == "model.name"))
         );
+    }
+
+    #[tokio::test]
+    async fn delete_blocks_queue_discards_rows_and_rolls_back_block_on_file_failure() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["ryuzi", "worker"], "ryuzi");
+        fixture.write_profile(
+            "ryuzi",
+            profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile(
+            "worker",
+            profile_yaml(
+                "worker",
+                "Worker",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let knowledge = Arc::new(AgentKnowledgeStore::new(fixture.config_root()));
+        let learning = Arc::new(LearningQueue::new(fixture.store.clone(), knowledge));
+        registry
+            .attach_learning_queue(Arc::downgrade(&learning))
+            .unwrap();
+        let payload = |title: &str| {
+            LearningEventPayload::Review(ReviewEvent {
+                title: title.into(),
+                description: format!("{title} description"),
+                body: format!("{title} body"),
+                tags: Vec::new(),
+            })
+        };
+        learning
+            .enqueue("worker", payload("pending"))
+            .await
+            .unwrap();
+
+        registry
+            .failpoint
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(registry.delete("worker").await.is_err());
+        assert!(learning
+            .enqueue("worker", payload("retry allowed"))
+            .await
+            .is_ok());
+        assert!(fixture.root.path().join("agents/worker").exists());
+
+        registry
+            .failpoint
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        registry.delete("worker").await.unwrap();
+        assert!(learning
+            .enqueue("worker", payload("blocked forever"))
+            .await
+            .is_err());
+        assert!(!fixture.root.path().join("agents/worker").exists());
+        assert!(!learning
+            .pending_agents()
+            .await
+            .unwrap()
+            .contains(&"worker".into()));
     }
 
     #[tokio::test]

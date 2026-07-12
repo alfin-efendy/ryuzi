@@ -400,6 +400,19 @@ impl LearningQueue {
             .await
     }
 
+    /// Returns every agent whose enqueue gate is blocked.
+    pub async fn blocked_agents(&self) -> anyhow::Result<Vec<String>> {
+        self.store
+            .with_conn(|c| {
+                let mut statement = c.prepare(
+                    "SELECT agent_id FROM agent_learning_state WHERE enqueue_blocked=1 ORDER BY agent_id",
+                )?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .await
+    }
+
     /// Stops accepting new events for the agent (deletion in progress).
     pub async fn block(&self, agent_id: &str) -> anyhow::Result<()> {
         self.set_blocked(agent_id, true).await
@@ -863,6 +876,45 @@ mod tests {
         let knowledge = Arc::new(AgentKnowledgeStore::new(root.path().to_path_buf()));
         let queue = LearningQueue::new(store, knowledge);
         (root, db_dir, queue)
+    }
+
+    async fn queue_status(queue: &LearningQueue, event_id: &str) -> String {
+        queue
+            .store
+            .with_conn({
+                let event_id = event_id.to_owned();
+                move |c| {
+                    c.query_row(
+                        "SELECT status FROM agent_learning_queue WHERE event_id=?1",
+                        params![event_id],
+                        |row| row.get(0),
+                    )
+                }
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn worker_retries_failure_then_delivers_in_agent_sequence() {
+        let (root, _tmp, queue) = fixture_queue().await;
+        let queue = Arc::new(queue);
+        let first = queue.enqueue("a", review_payload("first")).await.unwrap();
+        let second = queue.enqueue("a", review_payload("second")).await.unwrap();
+        let knowledge_path = root.path().join("agents/a/knowledge");
+        std::fs::create_dir_all(knowledge_path.parent().unwrap()).unwrap();
+        std::fs::write(&knowledge_path, "blocks bundle creation").unwrap();
+
+        crate::learning::tick(&queue, "worker").await;
+        assert_eq!(queue_status(&queue, &first.event_id).await, "pending");
+        assert_eq!(queue_status(&queue, &second.event_id).await, "pending");
+
+        std::fs::remove_file(knowledge_path).unwrap();
+        crate::learning::tick(&queue, "worker").await;
+        assert_eq!(queue_status(&queue, &first.event_id).await, "delivered");
+        assert_eq!(queue_status(&queue, &second.event_id).await, "pending");
+        crate::learning::tick(&queue, "worker").await;
+        assert_eq!(queue_status(&queue, &second.event_id).await, "delivered");
     }
 
     #[tokio::test]

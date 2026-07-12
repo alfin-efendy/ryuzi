@@ -79,6 +79,10 @@ pub struct SessionCtx {
     /// `ControlPlane::background`; the native runner's `task` tool uses it to
     /// bound `background: true` delegations against `max_concurrent_runs`.
     pub background: Arc<crate::harness::native::background::BackgroundRegistry>,
+    /// Shared per-agent knowledge store used by memory and durable learning.
+    pub agent_knowledge: Arc<crate::agents::knowledge::AgentKnowledgeStore>,
+    /// Durable learning queue for this session's main agent.
+    pub learning_queue: Arc<crate::agents::learning_queue::LearningQueue>,
     /// Persistence handle (transcript rows, agent_session_id updates).
     pub store: Arc<Store>,
     /// Curated app-control facade (spec §9.1), built by the control plane
@@ -199,6 +203,13 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         let (events, _rx) = broadcast::channel(16);
+        let knowledge = Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+            std::env::temp_dir().join(crate::paths::new_id()),
+        ));
+        let learning_queue = Arc::new(crate::agents::learning_queue::LearningQueue::new(
+            store.clone(),
+            knowledge.clone(),
+        ));
         SessionCtx {
             session_pk: "s1".into(),
             main_agent_id: "ryuzi".into(),
@@ -219,6 +230,8 @@ mod tests {
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: crate::harness::native::background::BackgroundRegistry::new(),
+            agent_knowledge: knowledge,
+            learning_queue,
             store,
             app_control: None,
         }

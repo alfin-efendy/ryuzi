@@ -8,6 +8,9 @@
 //! `pub(crate)` function ([`handle_approval`]) separate from the broadcast
 //! loop that spawns it.
 
+use crate::agents::knowledge::AgentKnowledgeStore;
+use crate::agents::learning_queue::LearningQueue;
+use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
 use crate::domain::{
     ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Principal, Surface,
@@ -62,6 +65,9 @@ pub struct Daemon {
     /// `ApiState`) can share this one instance instead of standing up its
     /// own.
     pub router_server: Arc<RouterServer>,
+    pub agents: Arc<AgentRegistry>,
+    pub agent_knowledge: Arc<AgentKnowledgeStore>,
+    pub learning_queue: Arc<LearningQueue>,
     telemetry: Arc<dyn Telemetry>,
     stopped: AtomicBool,
     /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
@@ -282,6 +288,14 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
+    let config_root = opts
+        .db_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(crate::paths::config_dir);
+    let persistence =
+        crate::agents::bootstrap::initialize_agent_persistence(config_root, Arc::clone(&store))
+            .await?;
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
     // the atomicity/idempotency/degraded-state contract.
@@ -324,6 +338,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let cp =
         ControlPlane::new_with_telemetry(Arc::clone(&store), registries, Arc::clone(&telemetry))
             .await;
+    cp.attach_agent_persistence(persistence.handles())?;
     let settings = SettingsStore::new(Arc::clone(&store));
 
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
@@ -371,7 +386,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
     let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
-    let learning_handle = crate::learning::spawn_runner(Arc::clone(&cp));
+    let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
 
@@ -380,6 +395,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         store,
         gateways,
         router_server,
+        agents: persistence.registry,
+        agent_knowledge: persistence.knowledge,
+        learning_queue: persistence.learning,
         telemetry,
         stopped: AtomicBool::new(false),
         router_handle,
@@ -633,6 +651,20 @@ mod tests {
         let f = tempfile::NamedTempFile::new().unwrap();
         let path = f.path().to_path_buf();
         (f, path)
+    }
+
+    async fn test_agent_persistence(
+        store: Arc<Store>,
+    ) -> crate::agents::bootstrap::AgentPersistence {
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            store,
+        )
+        .await
+        .unwrap();
+        std::mem::forget(config);
+        persistence
     }
 
     fn capturing_console_telemetry() -> (Arc<Mutex<Vec<String>>>, Arc<dyn Telemetry>) {
@@ -1267,11 +1299,16 @@ mod tests {
             }
         });
 
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways,
             router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle,
@@ -1716,11 +1753,16 @@ mod tests {
             .await
             .unwrap();
 
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways: vec![],
             router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
@@ -1804,11 +1846,16 @@ mod tests {
             }
         });
 
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways,
             router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle,

@@ -15,7 +15,8 @@ use crate::agent_settings;
 use crate::paths;
 use crate::store::Store;
 
-use super::knowledge::ensure_bundle_at;
+use super::knowledge::{ensure_bundle_at, AgentKnowledgeStore};
+use super::learning_queue::LearningQueue;
 use super::registry::{discover_agent_directories, new_agent_id, AgentRegistry};
 use super::transaction::{atomic_write, recover_transactions, AgentTransaction};
 use super::types::*;
@@ -44,6 +45,67 @@ pub enum BootstrapReason {
 pub struct AgentBootstrap {
     pub registry: Arc<AgentRegistry>,
     pub reason: BootstrapReason,
+}
+
+pub struct AgentPersistence {
+    pub registry: Arc<AgentRegistry>,
+    pub knowledge: Arc<AgentKnowledgeStore>,
+    pub learning: Arc<LearningQueue>,
+    pub reason: BootstrapReason,
+}
+
+#[derive(Clone)]
+pub struct AgentPersistenceHandles {
+    pub registry: Arc<AgentRegistry>,
+    pub knowledge: Arc<AgentKnowledgeStore>,
+    pub learning: Arc<LearningQueue>,
+}
+
+impl AgentPersistence {
+    pub fn handles(&self) -> AgentPersistenceHandles {
+        AgentPersistenceHandles {
+            registry: self.registry.clone(),
+            knowledge: self.knowledge.clone(),
+            learning: self.learning.clone(),
+        }
+    }
+}
+
+pub async fn initialize_agent_persistence(
+    config_root: PathBuf,
+    store: Arc<Store>,
+) -> anyhow::Result<AgentPersistence> {
+    let bootstrap = initialize_agent_registry(config_root.clone(), store.clone()).await?;
+    let knowledge = Arc::new(AgentKnowledgeStore::new(config_root));
+    let learning = Arc::new(LearningQueue::new(store, knowledge.clone()));
+    bootstrap
+        .registry
+        .attach_learning_queue(Arc::downgrade(&learning))?;
+
+    let active: std::collections::HashSet<_> = bootstrap
+        .registry
+        .snapshot()
+        .await
+        .agents
+        .into_iter()
+        .map(|agent| agent.profile.id)
+        .collect();
+    for agent_id in &active {
+        learning.unblock(agent_id).await?;
+    }
+    for agent_id in learning.blocked_agents().await? {
+        if !active.contains(&agent_id) {
+            learning.discard_unconsumed(&agent_id).await?;
+        }
+    }
+    learning.reclaim_stale(paths::now_ms()).await?;
+
+    Ok(AgentPersistence {
+        registry: bootstrap.registry,
+        knowledge,
+        learning,
+        reason: bootstrap.reason,
+    })
 }
 
 /// The built-in Ryuzi profile template. YAML permission mode `ask` is the

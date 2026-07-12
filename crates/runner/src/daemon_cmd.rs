@@ -156,6 +156,9 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<Contro
     let state = ryuzi_core::serve::ApiState {
         cp: daemon.cp.clone(),
         router_server: daemon.router_server.clone(),
+        agents: daemon.agents.clone(),
+        agent_knowledge: daemon.agent_knowledge.clone(),
+        learning_queue: daemon.learning_queue.clone(),
         control_token: token,
     };
     let opts = ryuzi_core::serve::ServeOpts {

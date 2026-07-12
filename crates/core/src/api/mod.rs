@@ -119,12 +119,24 @@ pub(crate) mod tests_support {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = crate::store::Store::open(tmp.path()).await.unwrap();
         let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            cp.store().clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        std::mem::forget(config);
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp,
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             control_token: "t".into(),
         }
     }
@@ -206,12 +218,24 @@ pub(crate) mod tests_support {
         let mut registries = crate::plugins::Registries::new();
         registries.harness = Arc::new(FakeHarnessFactory);
         let cp = crate::control::ControlPlane::new(store, registries).await;
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            cp.store().clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        std::mem::forget(config);
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp,
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             control_token: "t".into(),
         }
     }

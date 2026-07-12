@@ -266,9 +266,7 @@ impl Harness for NativeHarness {
         // `tool_policies` row to.
         let project_id = ctx.project_id.clone();
         let memory_store = Some(Arc::new(memory::MemoryStore::for_agent(
-            Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
-                crate::paths::config_dir(),
-            )),
+            ctx.agent_knowledge.clone(),
             &ctx.main_agent_id,
             project_id.as_deref(),
         )?));
@@ -283,6 +281,7 @@ impl Harness for NativeHarness {
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 main_agent_id: ctx.main_agent_id,
+                learning_queue: ctx.learning_queue,
                 kind: ctx.kind,
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
@@ -515,6 +514,13 @@ mod tests {
 
     async fn ctx_for(store: Arc<Store>, work_dir: std::path::PathBuf) -> SessionCtx {
         let (events, _rx) = broadcast::channel(64);
+        let knowledge = Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+            work_dir.join(".agent-config"),
+        ));
+        let learning_queue = Arc::new(crate::agents::learning_queue::LearningQueue::new(
+            store.clone(),
+            knowledge.clone(),
+        ));
         SessionCtx {
             session_pk: "sess".into(),
             main_agent_id: "ryuzi".into(),
@@ -535,6 +541,8 @@ mod tests {
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
+            agent_knowledge: knowledge,
+            learning_queue,
             store,
             app_control: None,
         }

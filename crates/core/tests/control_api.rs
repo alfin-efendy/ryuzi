@@ -155,6 +155,9 @@ async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
         ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
+            agents: daemon.agents.clone(),
+            agent_knowledge: daemon.agent_knowledge.clone(),
+            learning_queue: daemon.learning_queue.clone(),
             control_token,
         },
         ServeOpts {
@@ -252,6 +255,9 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
         ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
+            agents: daemon.agents.clone(),
+            agent_knowledge: daemon.agent_knowledge.clone(),
+            learning_queue: daemon.learning_queue.clone(),
             control_token: token.clone(),
         },
         ServeOpts {

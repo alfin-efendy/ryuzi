@@ -97,6 +97,8 @@ pub struct RunnerDeps {
     pub session_pk: String,
     /// Main agent whose isolated knowledge bundle owns this session's memory.
     pub main_agent_id: String,
+    /// Durable learning queue shared with the daemon worker.
+    pub learning_queue: Arc<crate::agents::learning_queue::LearningQueue>,
     /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
     /// `SessionCtx::kind`. Consulted by `visible_tool_defs` to schema-gate
     /// `orch_block` (Task E6, spec §8) to `Worker` sessions only.
@@ -1105,10 +1107,8 @@ async fn drive(
 /// seam (see `drive()`, gated on `display.text()`). Advances `user_turns`;
 /// when either the memory or skill threshold is crossed, captures the exact
 /// `system` / `tool_defs` / `messages_for_request()` prefix this turn just
-/// used — the cache-parity payload Task 9's review fork replays — and
-/// enqueues it as a `kind='learning'` background-rail row targeting this
-/// session. Firing counter(s) reset to 0; a threshold that was NOT due is
-/// left untouched so it keeps accumulating toward its own next nudge.
+/// used — the cache-parity payload Task 9's review fork replays — and enqueues
+/// it in the durable learning queue for this session's executing main agent.
 async fn maybe_enqueue_review(
     deps: &RunnerDeps,
     system: &str,
@@ -1141,11 +1141,25 @@ async fn maybe_enqueue_review(
         tool_defs: tool_defs.to_vec(),
         messages: cm.messages_for_request(),
     };
-    if let Ok(json) = serde_json::to_string(&payload) {
-        let _ = deps
-            .store
-            .enqueue_background_event(&deps.session_pk, "learning", &json)
-            .await;
+    let serialized = serde_json::to_string(&payload).unwrap_or_default();
+    let review = crate::agents::learning_queue::ReviewEvent {
+        title: format!("{} review", payload.review_kind),
+        description: format!("Learning review from session {}", deps.session_pk),
+        body: serialized,
+        tags: vec![payload.review_kind.clone()],
+    };
+    if let Err(error) = deps
+        .learning_queue
+        .enqueue(
+            &deps.main_agent_id,
+            crate::agents::learning_queue::LearningEventPayload::Review(review),
+        )
+        .await
+    {
+        tracing::warn!(
+            agent_id = %deps.main_agent_id,
+            "failed to enqueue durable learning review: {error}"
+        );
     }
     if mem_due {
         deps.nudge.user_turns.store(0, Relaxed);
@@ -2487,9 +2501,17 @@ mod tests {
         let (events, _rx) = broadcast::channel(256);
         let agents = Arc::new(AgentRegistry::builtin());
         let agent = agents.default_agent();
+        let knowledge = Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+            dir.join(".agent-config"),
+        ));
+        let learning_queue = Arc::new(crate::agents::learning_queue::LearningQueue::new(
+            store.clone(),
+            knowledge,
+        ));
         RunnerDeps {
             session_pk: "s1".into(),
             main_agent_id: "ryuzi".into(),
+            learning_queue,
             kind: SessionKind::Chat,
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
@@ -2803,8 +2825,8 @@ mod tests {
     }
 
     /// Step 1 of Task 7's TDD brief: two end_turn turns with
-    /// `memory.nudge_interval=2` must enqueue exactly one `kind='learning'`
-    /// rail row targeting the parent, carrying a cache-parity payload.
+    /// `memory.nudge_interval=2` must enqueue exactly one durable learning
+    /// queue row for the main agent, carrying a cache-parity payload.
     #[tokio::test]
     async fn finalizer_enqueues_a_learning_row_every_nudge_interval() {
         use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
@@ -2855,8 +2877,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            deps.store
-                .claim_learning_event("peek")
+            deps.learning_queue
+                .claim_next("ryuzi", "peek")
                 .await
                 .unwrap()
                 .is_none(),
@@ -2870,27 +2892,16 @@ mod tests {
         )
         .await
         .unwrap();
-        // A learning row is claimed via the dedicated `claim_learning_event`
-        // (Task 8's rail split) — the generic chat drainer's
-        // `claim_deliverable_background_event` must NEVER see it, proven
-        // right below.
-        assert!(
-            deps.store
-                .claim_deliverable_background_event("chat-drainer")
-                .await
-                .unwrap()
-                .is_none(),
-            "the generic chat drainer must never claim a learning row"
-        );
         let ev = deps
-            .store
-            .claim_learning_event("learner")
+            .learning_queue
+            .claim_next("ryuzi", "learner")
             .await
             .unwrap()
             .expect("threshold crossed on turn 2 — a learning row must be enqueued");
-        assert_eq!(ev.kind, "learning");
-        assert_eq!(ev.target_session_pk, "s1");
-        let payload: LearningPayload = serde_json::from_str(&ev.payload)
+        let crate::agents::learning_queue::LearningEventPayload::Review(review) = ev.payload else {
+            panic!("nudge producer must enqueue a review payload");
+        };
+        let payload: LearningPayload = serde_json::from_str(&review.body)
             .expect("learning payload must round-trip through JSON");
         assert_eq!(payload.review_kind, "memory");
         assert_eq!(payload.parent_session_pk, "s1");
@@ -2900,8 +2911,8 @@ mod tests {
 
         // Firing resets the counter: no second row is left queued.
         assert!(deps
-            .store
-            .claim_learning_event("learner2")
+            .learning_queue
+            .claim_next("ryuzi", "learner2")
             .await
             .unwrap()
             .is_none());

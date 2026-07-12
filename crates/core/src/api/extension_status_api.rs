@@ -122,12 +122,24 @@ mod tests {
             regs.add_plugin(plugin);
         }
         let cp = crate::control::ControlPlane::new(store, regs).await;
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            cp.store().clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        std::mem::forget(config);
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp,
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             control_token: "t".into(),
         }
     }
