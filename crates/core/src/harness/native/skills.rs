@@ -5,7 +5,7 @@
 //! model up front; the full body is fetched on demand via the `skill` tool.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One discovered skill.
 #[derive(Debug, Clone)]
@@ -13,6 +13,10 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub body: String,
+    /// The leaf directory this skill was discovered in (i.e. the directory
+    /// containing its `SKILL.md`), used to resolve companion files the skill
+    /// ships alongside its instructions.
+    pub dir: PathBuf,
 }
 
 /// The set of available skills.
@@ -42,13 +46,8 @@ impl SkillRegistry {
             // Check if this is a leaf skill dir (SKILL.md at the base).
             if base.join("SKILL.md").is_file() {
                 // This is a leaf: parse it as a single skill.
-                let dir_name = base
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
                 if let Ok(text) = std::fs::read_to_string(base.join("SKILL.md")) {
-                    let skill = parse_skill(&dir_name, &text);
+                    let skill = parse_skill(base, &text);
                     skills.entry(skill.name.clone()).or_insert(skill);
                 }
             } else {
@@ -117,16 +116,21 @@ fn read_skills(base: &Path) -> Vec<Skill> {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .filter_map(|e| {
-            let dir_name = e.file_name().to_string_lossy().to_string();
-            let text = std::fs::read_to_string(e.path().join("SKILL.md")).ok()?;
-            Some(parse_skill(&dir_name, &text))
+            let path = e.path();
+            let text = std::fs::read_to_string(path.join("SKILL.md")).ok()?;
+            Some(parse_skill(&path, &text))
         })
         .collect()
 }
 
-fn parse_skill(dir_name: &str, text: &str) -> Skill {
+fn parse_skill(dir: &Path, text: &str) -> Skill {
     let (frontmatter, body) = super::agents::split_frontmatter_pub(text);
-    let mut name = dir_name.to_string();
+    let dir_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let mut name = dir_name.clone();
     let mut description = format!("Skill `{dir_name}`");
     for (key, value) in frontmatter {
         match key.as_str() {
@@ -139,6 +143,7 @@ fn parse_skill(dir_name: &str, text: &str) -> Skill {
         name,
         description,
         body: body.trim().to_string(),
+        dir: dir.to_path_buf(),
     }
 }
 
@@ -160,6 +165,7 @@ mod tests {
         let s = reg.get("pdf").unwrap();
         assert_eq!(s.description, "Work with PDFs");
         assert!(s.body.contains("pdftotext"));
+        assert_eq!(s.dir, skill_dir);
         assert!(reg.guidance().unwrap().contains("pdf: Work with PDFs"));
     }
 
@@ -227,6 +233,7 @@ mod tests {
                 name: "x".into(),
                 description: "a".repeat(200),
                 body: String::new(),
+                dir: std::path::PathBuf::new(),
             },
         );
         let g = SkillRegistry { skills }.guidance().unwrap();
@@ -242,10 +249,11 @@ mod tests {
 
     #[test]
     fn parse_skill_falls_back_to_dir_name() {
-        let s = parse_skill("mytool", "No frontmatter, just a body.");
+        let s = parse_skill(Path::new("mytool"), "No frontmatter, just a body.");
         assert_eq!(s.name, "mytool");
         assert!(s.description.contains("mytool"));
         assert_eq!(s.body, "No frontmatter, just a body.");
+        assert_eq!(s.dir, Path::new("mytool"));
     }
 
     #[test]
@@ -276,6 +284,7 @@ mod tests {
         let s = reg.get("github-triage").unwrap();
         assert_eq!(s.description, "Triage GitHub issues");
         assert!(s.body.contains("Label and assign"));
+        assert_eq!(s.dir, plugin_skill);
         // Check that both skills are present (there may be other global skills too).
         let names = reg.names();
         assert!(
@@ -316,5 +325,6 @@ mod tests {
         let s = reg.get("github-triage").unwrap();
         assert_eq!(s.description, "Triage GitHub issues");
         assert!(s.body.contains("Label and assign"));
+        assert_eq!(s.dir, plugin_skill);
     }
 }

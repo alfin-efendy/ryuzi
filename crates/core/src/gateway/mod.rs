@@ -209,6 +209,7 @@ mod tests {
             approver_role_ids: vec![],
             started_by: None,
             timeout_ms: None,
+            principal: None,
         };
         let decision = gw.request_approval(&surface, &req).await.unwrap();
         assert_eq!(decision, ApprovalDecision::AllowOnce);

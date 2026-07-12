@@ -377,6 +377,23 @@ pub struct AttachmentRef {
     pub size: u64,
 }
 
+/// Identifies the plugin an approvable action originates from — attribution
+/// only, so an operator can see "this MCP tool belongs to plugin X" instead
+/// of guessing from a substring match between the MCP server name and a
+/// manifest id. `None` (everywhere this is optional) means the action is the
+/// core agent itself (a built-in tool), not a plugin. Resolved at the
+/// mcp-server→plugin binding (`ControlPlane::attach_plugin_mcp_servers`),
+/// never by parsing the tool/server name string.
+///
+/// Carries no gating semantics: this is visibility/attribution metadata for
+/// the approval prompt, not an input to the permission DECISION.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Principal {
+    pub plugin_id: String,
+    pub plugin_name: String,
+}
+
 /// A tool-approval request surfaced to a gateway / UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -394,6 +411,9 @@ pub struct ApprovalRequest {
     /// Optional approval timeout, in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Which plugin's MCP tool this approval is for, if any (see [`Principal`]).
+    #[serde(default)]
+    pub principal: Option<Principal>,
 }
 
 /// The user's decision on a tool-approval request from the native runtime's
@@ -650,6 +670,10 @@ pub enum CoreEvent {
         /// Raw kind-specific payload: the tool's input JSON (Tool), the plan
         /// markdown (Plan), or the questions spec (Question).
         input: serde_json::Value,
+        /// Which plugin this approval's MCP tool belongs to, if any (see
+        /// [`Principal`]). `None` for built-in tools and Plan/Question prompts.
+        #[serde(default)]
+        principal: Option<Principal>,
     },
     Error {
         session_pk: String,

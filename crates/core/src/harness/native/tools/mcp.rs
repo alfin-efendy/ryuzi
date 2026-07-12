@@ -2,6 +2,7 @@
 //! `mcp__<server>__<tool>`, executing it through an [`McpCaller`].
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
+use crate::domain::Principal;
 use crate::harness::native::mcp_client::{render_tool_result, McpCaller};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -16,6 +17,11 @@ pub struct McpTool {
     description: String,
     schema: Value,
     caller: Arc<dyn McpCaller>,
+    /// The plugin that attached this tool's MCP server, if any — resolved by
+    /// the caller from the mcp-server→plugin binding built in
+    /// `ControlPlane::attach_plugin_mcp_servers`, never parsed from
+    /// `full_name`/`server`. `None` for a DB-configured (non-plugin) server.
+    principal: Option<Principal>,
 }
 
 impl McpTool {
@@ -25,6 +31,7 @@ impl McpTool {
         description: &str,
         schema: Value,
         caller: Arc<dyn McpCaller>,
+        principal: Option<Principal>,
     ) -> McpTool {
         McpTool {
             full_name: format!("mcp__{server}__{tool_name}"),
@@ -32,6 +39,7 @@ impl McpTool {
             description: description.to_string(),
             schema,
             caller,
+            principal,
         }
     }
 }
@@ -57,6 +65,7 @@ impl Tool for McpTool {
         // server. `key_to_policy_tool` passes unknown keys through
         // unchanged, so this needs no other plumbing changes.
         PermissionSpec::new(self.full_name.clone(), format!("run {}", self.full_name))
+            .with_principal(self.principal.clone())
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
         match self.caller.call(&self.tool_name, input).await {
@@ -106,6 +115,7 @@ mod tests {
             "Search Notion",
             json!({ "type": "object" }),
             caller,
+            None,
         );
         assert_eq!(tool.name(), "mcp__notion__search");
         let out = tool.execute(&ctx, json!({ "q": "x" })).await.unwrap();
@@ -122,8 +132,16 @@ mod tests {
             "Search Notion",
             json!({}),
             caller.clone(),
+            None,
         );
-        let fetch = McpTool::new("github", "fetch_issue", "Fetch issue", json!({}), caller);
+        let fetch = McpTool::new(
+            "github",
+            "fetch_issue",
+            "Fetch issue",
+            json!({}),
+            caller,
+            None,
+        );
 
         let search_key = search.permission(&json!({})).key;
         let fetch_key = fetch.permission(&json!({})).key;
@@ -142,9 +160,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx_at(dir.path()).await;
         let caller = Arc::new(FakeCaller { reply: json!({}) });
-        let tool = McpTool::new("s", "boom", "d", json!({}), caller);
+        let tool = McpTool::new("s", "boom", "d", json!({}), caller, None);
         let out = tool.execute(&ctx, json!({})).await.unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("server exploded"));
+    }
+
+    #[tokio::test]
+    async fn permission_carries_the_resolved_plugin_principal() {
+        let caller = Arc::new(FakeCaller { reply: json!({}) });
+        let principal = Principal {
+            plugin_id: "acme-connector".into(),
+            plugin_name: "Acme Connector".into(),
+        };
+        let tool = McpTool::new(
+            "notion",
+            "search",
+            "Search Notion",
+            json!({}),
+            caller,
+            Some(principal.clone()),
+        );
+        assert_eq!(tool.permission(&json!({})).principal, Some(principal));
+    }
+
+    #[tokio::test]
+    async fn permission_principal_is_none_when_the_server_has_no_plugin_binding() {
+        // Built-in tools and DB-configured (non-plugin) MCP servers resolve to
+        // `principal = None` — the connector only passes `Some(..)` when the
+        // mcp-server→plugin binding map has an entry for that server name.
+        let caller = Arc::new(FakeCaller { reply: json!({}) });
+        let tool = McpTool::new("acme", "search", "Search", json!({}), caller, None);
+        assert_eq!(tool.permission(&json!({})).principal, None);
     }
 }

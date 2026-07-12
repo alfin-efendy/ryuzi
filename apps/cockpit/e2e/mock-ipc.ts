@@ -329,6 +329,20 @@ const FIXTURES: Record<string, unknown> = {
   list_skills: [],
   plugin_doctor: [],
   plugins_restart_required: false,
+  // The Browse tab's status line calls `catalog_status` on Plugins-view
+  // mount (not just `list_`/`refresh_`-prefixed calls, which already
+  // fall back to `[]` above) — without a fixture the unmocked-command
+  // fallback returns `null`, and the store renders `catalogStatus` from
+  // `null`, crashing the view. `refresh_catalog` shares the same
+  // `CatalogStatus` shape.
+  catalog_status: { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
+  refresh_catalog: { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 },
+  // An extension-capable plugin's detail view calls `extension_status` on
+  // mount (Track D observability, DT8) — same "without a fixture the
+  // unmocked fallback returns `null` and the view crashes" lesson as
+  // `catalog_status` above. Empty list is a safe default (no plugin in these
+  // fixtures declares an `extension` capability).
+  extension_status: [],
   get_setting: null,
   backdrop_capability: "none",
   system_accent_color: null,

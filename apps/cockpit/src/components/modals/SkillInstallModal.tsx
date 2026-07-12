@@ -1,12 +1,13 @@
 import { CircleAlert, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
+import { Badge, Button, FormField, Input, Modal, ModalFooter } from "@ryuzi/ui";
 import { commands, type TrustPromptDto } from "@/bindings";
 import { StatusDot } from "@/components/common/bits";
 import { usePlugins } from "@/store-plugins";
 
 const WARN = "#F59E0B";
+const DANGER = "#EF4444";
 
 type Step = "source" | "checking" | "trust";
 
@@ -130,8 +131,24 @@ export function SkillInstallModal({
       {step === "trust" && trust && (
         <>
           <p className="mb-3 mt-0 text-[12.5px] text-muted-foreground">
-            This source isn't a curated pack — review what it installs before Cockpit trusts it.
+            {trust.curated
+              ? "This is a curated pack, but it runs code — review what it installs before Cockpit trusts it."
+              : "This source isn't a curated pack — review what it installs before Cockpit trusts it."}
           </p>
+
+          {trust.runsCode && (
+            <div
+              className="mb-3 flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-[12.5px] font-medium"
+              style={{ borderColor: DANGER, color: DANGER }}
+            >
+              <CircleAlert aria-hidden size={16} strokeWidth={2} className="shrink-0" />
+              <span className="flex items-center gap-2">
+                <Badge variant="destructive">Runs code</Badge>
+                This plugin runs code in a supervised subprocess — review it carefully before trusting it.
+              </span>
+            </div>
+          )}
+
           <div className="flex flex-col gap-2 rounded-md border border-border px-4 py-3 text-[12.5px]">
             <div>
               <span className="font-medium">Source: </span>

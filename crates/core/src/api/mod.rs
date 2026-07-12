@@ -8,12 +8,14 @@ pub mod apps_api;
 pub mod audit;
 pub mod connections_api;
 pub mod endpoint_api;
+pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
 pub mod learning_api;
 pub mod native_api;
 pub mod orch_api;
 pub mod plugins_api;
+pub mod remote_catalog_api;
 pub mod scheduler_api;
 pub mod session_io_api;
 pub mod sessions;
@@ -90,6 +92,12 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
         m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
         m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
+        m if remote_catalog_api::HANDLES.contains(&m) => {
+            remote_catalog_api::dispatch(state, m, p).await
+        }
+        m if extension_status_api::HANDLES.contains(&m) => {
+            extension_status_api::dispatch(state, m, p).await
+        }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }

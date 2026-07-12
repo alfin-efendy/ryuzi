@@ -3,6 +3,7 @@
 use super::{jail, truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::{Component, Path, PathBuf};
 
 /// 2 MiB read cap, matching Cockpit's `read_file` command.
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
@@ -49,6 +50,61 @@ fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Resolve a virtual `skills/<skill-name>/<relative-path>` read path to the
+/// companion file it names, alongside that skill's `SKILL.md`.
+///
+/// Returns `None` when `path` isn't shaped like a skill virtual path (i.e.
+/// its first component isn't exactly `skills`), in which case the caller
+/// falls back to the normal worktree/attachment resolution. Returns
+/// `Some(Err(_))` for anything that starts with `skills/` but is malformed,
+/// names an unknown skill, or escapes the skill's directory — callers must
+/// NOT silently fall back to a same-named worktree path in that case.
+fn skill_companion_path(ctx: &ToolCtx, path: &str) -> Option<anyhow::Result<PathBuf>> {
+    let mut components = Path::new(path).components();
+    match components.next() {
+        Some(Component::Normal(first)) if first.to_str() == Some("skills") => {}
+        _ => return None,
+    }
+    let malformed =
+        || anyhow::anyhow!("read: {path}: expected `skills/<skill-name>/<relative-path>`");
+    let skill_name = match components.next() {
+        Some(Component::Normal(name)) => match name.to_str() {
+            Some(s) => s,
+            None => {
+                return Some(Err(anyhow::anyhow!(
+                    "read: {path}: skill name is not valid UTF-8"
+                )))
+            }
+        },
+        _ => return Some(Err(malformed())),
+    };
+    let rest: PathBuf = components.as_path().to_path_buf();
+    if rest.as_os_str().is_empty() {
+        return Some(Err(malformed()));
+    }
+    let relative = match rest.to_str() {
+        Some(s) => s,
+        None => {
+            return Some(Err(anyhow::anyhow!(
+                "read: {path}: relative path is not valid UTF-8"
+            )))
+        }
+    };
+    let registry = crate::harness::native::skills::SkillRegistry::load_with(
+        &ctx.work_dir,
+        &ctx.extra_skill_dirs,
+    );
+    let skill = match registry.get(skill_name) {
+        Some(s) => s,
+        None => {
+            return Some(Err(anyhow::anyhow!(
+                "read: {path}: unknown skill `{skill_name}`"
+            )))
+        }
+    };
+    Some(jail(&skill.dir, relative))
+}
+
 pub struct Read;
 
 #[async_trait]
@@ -59,7 +115,9 @@ impl Tool for Read {
     fn description(&self) -> &str {
         "Read a UTF-8 text file or image (png/jpg/gif/webp) from the working \
          directory or an attachment path from the conversation. Text supports \
-         optional line offset/limit; lines are prefixed with 1-based numbers."
+         optional line offset/limit; lines are prefixed with 1-based numbers. \
+         `skills/<skill-name>/<relative-path>` reads a companion file bundled \
+         alongside a discovered skill's SKILL.md."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -84,6 +142,15 @@ impl Tool for Read {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("read: `path` is required"))?;
+        // Skill virtual paths (`skills/<name>/<rel>`) resolve to a companion
+        // file beside that skill's SKILL.md; malformed/unknown ones error
+        // outright rather than falling back to a same-named worktree path.
+        if let Some(result) = skill_companion_path(ctx, path) {
+            return match result {
+                Ok(resolved) => finish_read(ctx, path, &resolved, &input).await,
+                Err(e) => Ok(ToolOutput::error(e.to_string())),
+            };
+        }
         // Primary root: the worktree. Fallback root: the session's attachment
         // folder — the manifest hands the model ABSOLUTE paths there, which
         // the worktree jail (correctly) rejects.
@@ -100,77 +167,88 @@ impl Tool for Read {
                 }
             }
         };
-        let meta = match tokio::fs::metadata(&resolved).await {
-            Ok(m) => m,
-            Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
-        };
-        if let Some(media_type) = image_media_type_for_ext(path) {
-            if meta.len() > IMAGE_READ_MAX_BYTES {
-                return Ok(ToolOutput::error(format!(
-                    "read: {path} is {:.1} MB — too large to attach (5 MB limit). \
-                     Ask the user for a smaller version.",
-                    meta.len() as f64 / (1024.0 * 1024.0)
-                )));
-            }
-            if meta.len() == 0 {
-                return Ok(ToolOutput::error(format!(
-                    "read: {path} is empty — not a valid image"
-                )));
-            }
-            use base64::Engine as _;
-            let bytes = match tokio::fs::read(&resolved).await {
-                Ok(b) => b,
-                Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
-            };
-            match sniff_image_media_type(&bytes) {
-                Some(sniffed) if sniffed == media_type => {}
-                _ => {
-                    return Ok(ToolOutput::error(format!(
-                        "read: {path} does not contain valid {media_type} data — \
-                         possibly a git-lfs pointer; try 'git lfs pull'"
-                    )));
-                }
-            }
-            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-            return Ok(ToolOutput {
-                for_model: format!(
-                    "[image {path} ({media_type}, {} bytes) attached]",
-                    meta.len()
-                ),
-                model_blocks: Some(vec![json!({
-                    "type": "image",
-                    "source": { "type": "base64", "media_type": media_type, "data": data }
-                })]),
-                display: None,
-                is_error: false,
-            });
-        }
-        if meta.len() > MAX_READ_BYTES {
+        finish_read(ctx, path, &resolved, &input).await
+    }
+}
+
+/// Finish reading `resolved` (already jailed/verified) — shared by both the
+/// worktree/attachment path and the skill-companion path.
+async fn finish_read(
+    ctx: &ToolCtx,
+    path: &str,
+    resolved: &Path,
+    input: &Value,
+) -> anyhow::Result<ToolOutput> {
+    let meta = match tokio::fs::metadata(resolved).await {
+        Ok(m) => m,
+        Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+    };
+    if let Some(media_type) = image_media_type_for_ext(path) {
+        if meta.len() > IMAGE_READ_MAX_BYTES {
             return Ok(ToolOutput::error(format!(
-                "read: {path} is {} bytes, over the {MAX_READ_BYTES} byte cap",
-                meta.len()
+                "read: {path} is {:.1} MB — too large to attach (5 MB limit). \
+                 Ask the user for a smaller version.",
+                meta.len() as f64 / (1024.0 * 1024.0)
             )));
         }
-        let content = match tokio::fs::read_to_string(&resolved).await {
-            Ok(c) => c,
+        if meta.len() == 0 {
+            return Ok(ToolOutput::error(format!(
+                "read: {path} is empty — not a valid image"
+            )));
+        }
+        use base64::Engine as _;
+        let bytes = match tokio::fs::read(resolved).await {
+            Ok(b) => b,
             Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
         };
-        let offset = input
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            .max(1) as usize;
-        let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
-        let numbered = content
-            .lines()
-            .enumerate()
-            .skip(offset - 1)
-            .take(limit)
-            .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(ToolOutput::ok(truncate(&numbered, &ctx.caps)))
+        match sniff_image_media_type(&bytes) {
+            Some(sniffed) if sniffed == media_type => {}
+            _ => {
+                return Ok(ToolOutput::error(format!(
+                    "read: {path} does not contain valid {media_type} data — \
+                     possibly a git-lfs pointer; try 'git lfs pull'"
+                )));
+            }
+        }
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        return Ok(ToolOutput {
+            for_model: format!(
+                "[image {path} ({media_type}, {} bytes) attached]",
+                meta.len()
+            ),
+            model_blocks: Some(vec![json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": data }
+            })]),
+            display: None,
+            is_error: false,
+        });
     }
+    if meta.len() > MAX_READ_BYTES {
+        return Ok(ToolOutput::error(format!(
+            "read: {path} is {} bytes, over the {MAX_READ_BYTES} byte cap",
+            meta.len()
+        )));
+    }
+    let content = match tokio::fs::read_to_string(resolved).await {
+        Ok(c) => c,
+        Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+    };
+    let offset = input
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as usize;
+    let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
+    let numbered = content
+        .lines()
+        .enumerate()
+        .skip(offset - 1)
+        .take(limit)
+        .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ToolOutput::ok(truncate(&numbered, &ctx.caps)))
 }
 
 #[cfg(test)]
@@ -316,5 +394,97 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("too large"), "{}", out.for_model);
+    }
+
+    fn write_skill(work: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let skill_dir = work.join(".ryuzi/skills").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test skill\n---\nBody."),
+        )
+        .unwrap();
+        skill_dir
+    }
+
+    #[tokio::test]
+    async fn reads_a_companion_file_beside_a_discovered_skill() {
+        let work = tempfile::tempdir().unwrap();
+        let skill_dir = write_skill(work.path(), "mytool");
+        std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+        std::fs::write(skill_dir.join("assets/notes.txt"), "companion body\n").unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "skills/mytool/assets/notes.txt"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("companion body"));
+    }
+
+    #[tokio::test]
+    async fn skill_companion_traversal_escape_is_rejected() {
+        let work = tempfile::tempdir().unwrap();
+        write_skill(work.path(), "mytool");
+        std::fs::write(work.path().join(".ryuzi/skills/secret.txt"), "nope").unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "skills/mytool/../secret.txt"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_virtual_path_does_not_fall_back_to_worktree() {
+        // A worktree file that happens to share the virtual skill's relative
+        // path must NOT be served when the named skill doesn't exist.
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("skills/ghost")).unwrap();
+        std::fs::write(
+            work.path().join("skills/ghost/notes.txt"),
+            "should not read",
+        )
+        .unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "skills/ghost/notes.txt"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(!out.for_model.contains("should not read"));
+    }
+
+    #[tokio::test]
+    async fn malformed_skill_virtual_path_is_an_error() {
+        let work = tempfile::tempdir().unwrap();
+        write_skill(work.path(), "mytool");
+        let ctx = ctx_at(work.path()).await;
+        // Missing a relative path component after the skill name.
+        let out = Read
+            .execute(&ctx, json!({"path": "skills/mytool"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        // Missing the skill name entirely.
+        let out2 = Read.execute(&ctx, json!({"path": "skills"})).await.unwrap();
+        assert!(out2.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_companion_symlink_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let work = tempfile::tempdir().unwrap();
+        let skill_dir = write_skill(work.path(), "mytool");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+        symlink(outside.path(), skill_dir.join("escape")).unwrap();
+        let ctx = ctx_at(work.path()).await;
+        let out = Read
+            .execute(&ctx, json!({"path": "skills/mytool/escape/secret.txt"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
     }
 }

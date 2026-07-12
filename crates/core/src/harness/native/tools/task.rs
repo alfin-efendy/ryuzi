@@ -61,31 +61,51 @@ impl Tool for Task {
          subtasks don't depend on each other. Sub-agents do not see this \
          conversation, so each prompt must be fully self-contained. Sub-agents \
          cannot use `task` or `memory` themselves (unless the target agent is \
-         a delegator like `orchestrator`). Add `background: true` (single \
-         form) to dispatch without blocking — the result re-enters the chat \
-         on completion."
+         a delegator like `orchestrator`). Choose exactly one form per call: \
+         never send a top-level `prompt` together with `tasks`. Add \
+         `background: true` (single form) to dispatch without blocking — the \
+         result re-enters the chat on completion."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {
-                "description": {"type": "string", "description": "A short (3-5 word) label for the subtask."},
-                "prompt": {"type": "string", "description": "Single form: the full, self-contained task."},
-                "subagent_type": {"type": "string", "description": "Single form: which sub-agent to use."},
-                "background": {"type": "boolean", "description": "Single form only: run the subtask in the BACKGROUND — it does not block this turn; its result re-enters the chat when it finishes. Rejected (with a note) if too many background subagents are already running."},
-                "tasks": {
-                    "type": "array",
-                    "description": "Batch form: independent subtasks run in parallel.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "subagent_type": {"type": "string"},
-                            "prompt": {"type": "string"}
-                        },
-                        "required": ["prompt"]
+            "oneOf": [
+                {
+                    "properties": {
+                        "description": {"type": "string", "description": "A short (3-5 word) label for the subtask."},
+                        "prompt": {"type": "string", "description": "Single form: the full, self-contained task."},
+                        "subagent_type": {"type": "string", "description": "Single form: which sub-agent to use."},
+                        "background": {"type": "boolean", "description": "Single form only: run the subtask in the BACKGROUND — it does not block this turn; its result re-enters the chat when it finishes. Rejected (with a note) if too many background subagents are already running."}
+                    },
+                    "required": ["prompt"],
+                    "not": {"required": ["tasks"]}
+                },
+                {
+                    "properties": {
+                        "description": {"type": "string", "description": "A short (3-5 word) label for the subtask."},
+                        "tasks": {
+                            "type": "array",
+                            "description": "Batch form: independent subtasks run in parallel.",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "subagent_type": {"type": "string"},
+                                    "prompt": {"type": "string"}
+                                },
+                                "required": ["prompt"]
+                            }
+                        }
+                    },
+                    "required": ["tasks"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["prompt"]},
+                            {"required": ["subagent_type"]}
+                        ]
                     }
                 }
-            }
+            ]
         })
     }
     fn kind(&self) -> &'static str {
@@ -353,5 +373,31 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("cannot spawn"));
+    }
+
+    #[test]
+    fn input_schema_requires_exactly_one_task_form() {
+        let schema = Task.input_schema();
+        let alts = schema["oneOf"].as_array().expect("oneOf array");
+        assert_eq!(alts.len(), 2);
+
+        let single = alts
+            .iter()
+            .find(|a| a["required"] == json!(["prompt"]))
+            .expect("single-form alternative with required == [\"prompt\"]");
+        assert_eq!(single["not"]["required"], json!(["tasks"]));
+
+        let batch = alts
+            .iter()
+            .find(|a| a["required"] == json!(["tasks"]))
+            .expect("batch-form alternative with required == [\"tasks\"]");
+        let not_any_of = batch["not"]["anyOf"].as_array().expect("not.anyOf array");
+        assert!(not_any_of.contains(&json!({"required": ["prompt"]})));
+        assert!(not_any_of.contains(&json!({"required": ["subagent_type"]})));
+        assert_eq!(batch["properties"]["tasks"]["minItems"], json!(1));
+        assert_eq!(
+            batch["properties"]["tasks"]["items"]["required"],
+            json!(["prompt"])
+        );
     }
 }

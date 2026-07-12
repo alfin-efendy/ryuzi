@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_31_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -996,7 +996,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_31_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1051,7 +1051,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_30_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_31_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1069,6 +1069,32 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // Migration 31 — Remote catalog cache (from origin/main #113, renumbered
+        // to the tail here since Phase 4/5/6 also appended #28/#29/#30).
+        // `plugin_catalog_cache` holds the
+        // entries of the last verified signed feed (id, manifest TOML, semver,
+        // feed sequence, blocked flag+reason); `catalog_feed_state` is a single
+        // KV row tracking the last-accepted sequence + fetch outcome for
+        // anti-rollback and status. Appended as the tail after migration 30
+        // (Phase 6 audit columns). IF NOT EXISTS: the rewind-and-replay test re-runs
+        // this on an already-migrated DB, so it must be a no-op on replay.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_catalog_cache (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                manifest_toml TEXT NOT NULL,\
+                version TEXT NOT NULL,\
+                sequence INTEGER NOT NULL,\
+                blocked INTEGER NOT NULL DEFAULT 0,\
+                blocked_reason TEXT,\
+                fetched_at INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS catalog_feed_state (\
+                id INTEGER PRIMARY KEY CHECK (id = 1),\
+                sequence INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                outcome TEXT NOT NULL\
+            );",
+        ),
     ])
 }
 
@@ -1388,6 +1414,21 @@ pub struct PluginAttachStatus {
     pub last_attach_at: i64,
     pub outcome: String,
     pub reason: Option<String>,
+}
+
+/// One row of `plugin_catalog_cache`: an entry from the last verified signed
+/// remote catalog feed. `sequence` is the feed's monotonic anti-rollback
+/// counter at the time this entry was accepted; `blocked` + `blocked_reason`
+/// carry a publisher-issued denylist entry for this plugin id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCatalogRow {
+    pub id: String,
+    pub manifest_toml: String,
+    pub version: String,
+    pub sequence: u64,
+    pub blocked: bool,
+    pub blocked_reason: Option<String>,
+    pub fetched_at: i64,
 }
 
 /// Check out a pooled connection and run `f` on its dedicated blocking
@@ -3737,6 +3778,34 @@ impl Store {
         .await
     }
 
+    /// Replace the entire cached remote catalog with `rows` in one
+    /// transaction. Called after a signed feed fetch verifies successfully;
+    /// an empty slice clears the cache.
+    pub async fn upsert_remote_catalog(&self, rows: &[RemoteCatalogRow]) -> anyhow::Result<()> {
+        let rows = rows.to_vec();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM plugin_catalog_cache", [])?;
+            for r in &rows {
+                tx.execute(
+                    "INSERT INTO plugin_catalog_cache(id, manifest_toml, version, sequence, \
+                         blocked, blocked_reason, fetched_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        r.id,
+                        r.manifest_toml,
+                        r.version,
+                        r.sequence as i64,
+                        r.blocked as i64,
+                        r.blocked_reason,
+                        r.fetched_at
+                    ],
+                )?;
+            }
+            tx.commit()
+        })
+        .await
+    }
+
     /// The orch task whose worker (or judge) session is `session_pk`, if any.
     /// The `orch_block` tool's runtime guard (Task E6, spec §8): a session
     /// with no matching row here is not an orchestrated worker turn, so the
@@ -3754,6 +3823,61 @@ impl Store {
                 ),
                 params![session_pk],
                 crate::orch::task_from,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_remote_catalog(&self) -> anyhow::Result<Vec<RemoteCatalogRow>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, manifest_toml, version, sequence, blocked, blocked_reason, fetched_at \
+                 FROM plugin_catalog_cache ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(RemoteCatalogRow {
+                        id: r.get(0)?,
+                        manifest_toml: r.get(1)?,
+                        version: r.get(2)?,
+                        sequence: r.get::<_, i64>(3)? as u64,
+                        blocked: r.get::<_, i64>(4)? != 0,
+                        blocked_reason: r.get(5)?,
+                        fetched_at: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Last-accepted feed sequence, or 0 if no feed has ever been accepted.
+    /// Used by the anti-rollback check before applying a newly fetched feed.
+    pub async fn get_catalog_feed_sequence(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .get_catalog_feed_state()
+            .await?
+            .map(|(seq, _, _)| seq)
+            .unwrap_or(0))
+    }
+
+    /// Returns `(sequence, updated_at, outcome)` for the single
+    /// `catalog_feed_state` row, or `None` if a feed fetch has never
+    /// completed.
+    pub async fn get_catalog_feed_state(&self) -> anyhow::Result<Option<(u64, i64, String)>> {
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT sequence, updated_at, outcome FROM catalog_feed_state WHERE id=1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()
         })
@@ -3792,6 +3916,24 @@ impl Store {
                         ELSE steer_note || char(10) || ?2 END \
                  WHERE id=?1 AND root_id IS NULL",
                 params![root_id, text],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Record the outcome of a feed fetch attempt (`"ok"`, or an error
+    /// classification) alongside the sequence that was accepted or last
+    /// known-good.
+    pub async fn set_catalog_feed_state(&self, sequence: u64, outcome: &str) -> anyhow::Result<()> {
+        let outcome = outcome.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO catalog_feed_state(id, sequence, updated_at, outcome) \
+                 VALUES (1, ?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET \
+                   sequence=excluded.sequence, updated_at=excluded.updated_at, outcome=excluded.outcome",
+                params![sequence as i64, updated_at, outcome],
             )
             .map(|_| ())
         })
@@ -5669,7 +5811,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 30, "forward migration must land at v30");
+        assert_eq!(user_version, 31, "forward migration must land at v31");
     }
 
     #[tokio::test]
@@ -5855,7 +5997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_30_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_31_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -5874,19 +6016,20 @@ mod tests {
         // 26 session_runtime_settings; 27 background_events + jobs.model_override;
         // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs;
         // 29 messages.speaker + orch_tasks home/breaker/steer columns;
-        // 30 audit.session_pk + audit.origin —
+        // 30 audit.session_pk + audit.origin;
+        // 31 plugin_catalog_cache + catalog_feed_state —
         // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 30
-        // defined, wind back eighteen.
+        // this test starts failing its assertions). With migrations through 31
+        // defined, wind back nineteen.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 18)
+            c.pragma_update(None, "user_version", v - 19)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5943,14 +6086,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back ten, and reopen so 21 (and the tail
-        // migrations 22–30) replay against it. Back TEN: the fully migrated
-        // tail is now v30, so rewinding to v20 is what makes migration 21
+        // wind user_version back eleven, and reopen so 21 (and the tail
+        // migrations 22–31) replay against it. Back ELEVEN: the fully migrated
+        // tail is now v31, so rewinding to v20 is what makes migration 21
         // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 10)
+            c.pragma_update(None, "user_version", v - 11)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6088,7 +6231,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 30, "forward migration must land at v30");
+        assert_eq!(uv, 31, "forward migration must land at v31");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6114,7 +6257,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 30, "forward migration must land at v30");
+        assert_eq!(uv, 31, "forward migration must land at v31");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
@@ -7130,5 +7273,30 @@ mod tests {
         }
         assert_eq!(store.list_curator_runs(2).await.unwrap().len(), 2);
         assert_eq!(store.list_curator_runs(100).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn migration_24_creates_catalog_tables_and_roundtrips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert_eq!(store.get_catalog_feed_sequence().await.unwrap(), 0);
+        let rows = vec![RemoteCatalogRow {
+            id: "acme".into(),
+            manifest_toml: "id=\"acme\"".into(),
+            version: "1.2.0".into(),
+            sequence: 5,
+            blocked: false,
+            blocked_reason: None,
+            fetched_at: 100,
+        }];
+        store.upsert_remote_catalog(&rows).await.unwrap();
+        store.set_catalog_feed_state(5, "ok").await.unwrap();
+        assert_eq!(store.get_catalog_feed_sequence().await.unwrap(), 5);
+        let got = store.list_remote_catalog().await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].version, "1.2.0");
+        // replace-all semantics: a second upsert with fewer rows clears the old set
+        store.upsert_remote_catalog(&[]).await.unwrap();
+        assert!(store.list_remote_catalog().await.unwrap().is_empty());
     }
 }

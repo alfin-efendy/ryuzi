@@ -941,9 +941,33 @@ impl ControlPlane {
         // `ConnectorCtx.project_id` isn't read by any connector today, so the
         // session id is a harmless, uniquely-scoped stand-in.
         let scope_id = project.map(|p| p.project_id.as_str()).unwrap_or(session_pk);
-        self.attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
+        let mcp_principals = self
+            .attach_plugin_mcp_servers(scope_id, work_dir, &settings, &mut mcp_servers)
             .await;
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        // Track D: thread the daemon's extension host in only when it has
+        // something spawned — `None` keeps every hook fire site a true
+        // no-op (zero extra dispatch/await) for the common case, and for
+        // every test `ControlPlane` (which never calls `spawn_extensions`).
+        let extension_host_empty = self.extension_host.is_empty().await;
+        let extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>> =
+            if extension_host_empty {
+                None
+            } else {
+                Some(self.extension_host.clone()
+                    as Arc<dyn crate::plugins::extension::ExtensionEvents>)
+            };
+        // DT6: the tool-provision sibling to `extension_events` above — same
+        // guard, same source (`self.extension_host`), so a daemon with no
+        // extensions spawned pays nothing extra building either the hook
+        // dispatch path or the session's tool registry.
+        let extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>> =
+            if extension_host_empty {
+                None
+            } else {
+                Some(self.extension_host.clone()
+                    as Arc<dyn crate::plugins::extension::ExtensionTools>)
+            };
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
         // cold-resume, crash-resume) has already inserted the row before
@@ -991,7 +1015,10 @@ impl ControlPlane {
             effort,
             resume,
             mcp_servers,
+            mcp_principals,
             extra_skill_dirs,
+            extension_events,
+            extension_tools,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             background: self.background.clone(),
@@ -1027,15 +1054,27 @@ impl ControlPlane {
     /// failure) is also recorded via [`Self::record_attach`] for
     /// `plugin_doctor` to surface later — recording is best-effort and never
     /// changes this loop's control flow or its warn-and-continue discipline.
+    ///
+    /// Returns the `McpServerSpec.name` → owning-plugin [`Principal`] binding
+    /// for every server this call actually attached — resolved HERE, at the
+    /// only place a server name is definitively known to belong to a given
+    /// `CorePlugin`, rather than reconstructed later from a substring match
+    /// on the server/tool name. A server that lost the `names.insert` race
+    /// (a DB-configured or earlier plugin's same-named server won) gets no
+    /// entry, mirroring its exclusion from `mcp_servers` itself.
+    ///
+    /// [`Principal`]: crate::domain::Principal
     async fn attach_plugin_mcp_servers(
         &self,
         project_id: &str,
         work_dir: &Path,
         settings: &SettingsStore,
         mcp_servers: &mut Vec<crate::domain::McpServerSpec>,
-    ) {
+    ) -> std::collections::HashMap<String, crate::domain::Principal> {
         let mut names: std::collections::HashSet<String> =
             mcp_servers.iter().map(|s| s.name.clone()).collect();
+        let mut principals: std::collections::HashMap<String, crate::domain::Principal> =
+            std::collections::HashMap::new();
         for plugin in self.registries.plugins.list() {
             let Some(connector) = &plugin.connector else {
                 continue;
@@ -1068,6 +1107,13 @@ impl ControlPlane {
                         if !names.insert(spec.name.clone()) {
                             continue; // a DB-configured (or earlier plugin's) server wins
                         }
+                        principals.insert(
+                            spec.name.clone(),
+                            crate::domain::Principal {
+                                plugin_id: id.clone(),
+                                plugin_name: plugin.manifest.name.clone(),
+                            },
+                        );
                         mcp_servers.push(spec);
                     }
                     self.record_attach(id, "ok", None).await;
@@ -1079,6 +1125,7 @@ impl ControlPlane {
                 }
             }
         }
+        principals
     }
 
     /// Best-effort record of a plugin's session-attach outcome into
@@ -1453,6 +1500,9 @@ impl ControlPlane {
             // The review fork is never a top-level interactive session — no
             // app-control facade, mirroring the primary builder's default.
             app_control: None,
+            // Isolated background session: no extension host/event sink, like
+            // sub-agent and test builders.
+            extension_events: None,
             // A fresh, unshared `NudgeState`: the review fork's own tool
             // iterations must never feed the PARENT's nudge counters (that
             // would be a feedback loop), and it drives under

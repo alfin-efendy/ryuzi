@@ -35,6 +35,7 @@ use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPr
 use crate::plugins::{CorePlugin, PluginSource};
 use async_trait::async_trait;
 use ryuzi_plugin_sdk::PluginManifest;
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -72,8 +73,14 @@ impl Default for NativeHarness {
 /// each stdio handshake is independent), so total startup latency is the
 /// slowest server, not the sum. Failures are logged and skipped; `join_all`
 /// preserves input order, so tool order stays deterministic.
+///
+/// `principals` is the `SessionCtx.mcp_principals` binding map
+/// (`McpServerSpec.name` → owning plugin); a server absent from it (a
+/// DB-configured, non-plugin server) resolves every one of its tools to
+/// `principal = None`.
 async fn connect_mcp_tools(
     mcp_servers: &[crate::domain::McpServerSpec],
+    principals: &std::collections::HashMap<String, crate::domain::Principal>,
 ) -> Vec<Arc<dyn tools::Tool>> {
     let connections = futures::future::join_all(mcp_servers.iter().map(|spec| async move {
         if !matches!(spec.transport, crate::domain::McpTransport::Stdio { .. }) {
@@ -90,6 +97,7 @@ async fn connect_mcp_tools(
     .await;
     let mut extra: Vec<Arc<dyn tools::Tool>> = Vec::new();
     for conn in connections.into_iter().flatten() {
+        let principal = principals.get(&conn.server_name).cloned();
         for t in &conn.tools {
             extra.push(Arc::new(tools::mcp::McpTool::new(
                 &conn.server_name,
@@ -97,6 +105,7 @@ async fn connect_mcp_tools(
                 &t.description,
                 t.input_schema.clone(),
                 conn.clone(),
+                principal.clone(),
             )));
         }
     }
@@ -144,6 +153,28 @@ async fn seed_nudge_state(
     })
 }
 
+/// Gather every currently-provided extension tool (Track D, DT6) from the
+/// daemon-global extension host and wrap each as a native `Tool` — the
+/// extension analogue of `connect_mcp_tools`, called at the same session-
+/// start point. `None` (the common case: no extensions spawned, and every
+/// bare test `SessionCtx`) is a true zero-cost no-op — no await, no extra
+/// tools — mirroring how `ctx.extension_events: None` keeps every hook fire
+/// site inert.
+async fn connect_extension_tools(
+    extension_tools: Option<&Arc<dyn crate::plugins::extension::ExtensionTools>>,
+) -> Vec<Arc<dyn tools::Tool>> {
+    let Some(host) = extension_tools else {
+        return Vec::new();
+    };
+    host.session_tools()
+        .await
+        .into_iter()
+        .map(|binding| {
+            Arc::new(tools::extension::ExtensionTool::from_binding(binding)) as Arc<dyn tools::Tool>
+        })
+        .collect()
+}
+
 async fn resolve_native_model(
     store: &crate::store::Store,
     configured: Option<String>,
@@ -185,10 +216,30 @@ impl Harness for NativeHarness {
             .as_deref()
             .and_then(|name| agents.get(name))
             .unwrap_or_else(|| agents.default_agent());
+        // Plugin hooks: observational — a `session.start` hook is notified but
+        // cannot block startup (only `tool.before` gates). Fires to both the
+        // on-disk script sink and (Track D) any subscribed extensions.
+        let _ = hooks::fire_hook(
+            &ctx.work_dir,
+            ctx.extension_events.as_ref(),
+            hooks::HookEvent::SessionStart,
+            &json!({
+                "session": ctx.session_pk.clone(),
+                "project": ctx.project_id.clone(),
+                "model": model.clone(),
+                "work_dir": ctx.work_dir.display().to_string(),
+            }),
+        )
+        .await;
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
-        let mcp_tools = connect_mcp_tools(&ctx.mcp_servers).await;
-        let tools = Arc::new(tools::ToolRegistry::with_extra(mcp_tools));
+        let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
+        // Track D, DT6: fold in every currently-provided extension tool
+        // alongside the MCP ones — both flow into the SAME registry, so the
+        // runner dispatches either through the identical `deps.tools.get(name)`
+        // path with no special-casing.
+        extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
+        let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
         let project_id = ctx.project_id.clone();
         let model_name = model.as_deref().unwrap_or("");
         let mut effort_policy = if let Some(project_id) = project_id.as_deref() {
@@ -231,6 +282,7 @@ impl Harness for NativeHarness {
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
                 extra_skill_dirs: ctx.extra_skill_dirs,
+                extension_events: ctx.extension_events,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
                 meta,
@@ -325,6 +377,19 @@ impl HarnessSession for NativeSession {
         if let Some(tok) = self.live_cancel.lock().unwrap().as_ref() {
             tok.cancel();
         }
+        // Plugin hooks: observational `session.end`. `end()` is called from
+        // exactly one place — `ControlPlane::end_session`'s teardown, the
+        // sole path that removes the live handle from `running` — so this
+        // fires once per real session end, never on a `stop_session`
+        // interrupt (which cancels but does not `end()`). Fires to both the
+        // on-disk script sink and (Track D) any subscribed extensions.
+        let _ = hooks::fire_hook(
+            &self.deps.work_dir,
+            self.deps.extension_events.as_ref(),
+            hooks::HookEvent::SessionEnd,
+            &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
+        )
+        .await;
         Ok(())
     }
 
@@ -398,11 +463,13 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
             homepage: None,
             icon: Some("cpu".to_string()),
             categories: vec!["runtime".to_string()],
+            slot: None,
             verified: true,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         },
@@ -411,6 +478,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
         ))),
         gateway: None,
         connector: None,
+        extension: None,
         source: PluginSource::Builtin,
     }
 }
@@ -448,7 +516,10 @@ mod tests {
             effort: None,
             resume: None,
             mcp_servers: vec![],
+            mcp_principals: std::collections::HashMap::new(),
             extra_skill_dirs: vec![],
+            extension_events: None,
+            extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
@@ -478,6 +549,91 @@ mod tests {
         assert!(plugin.harness.is_some());
         assert!(plugin.gateway.is_none());
         assert!(plugin.connector.is_none());
+    }
+
+    /// Feature C1b: `start_session` must fire the `session.start` hook
+    /// (observational) once the model/agent are resolved, carrying the
+    /// session id, project id, model, and work_dir. This exercises the real
+    /// `NativeHarness::start_session` call site, not just `hooks::run`'s
+    /// dispatcher contract (covered separately in `hooks.rs`).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn start_session_fires_the_session_start_hook() {
+        use serde_json::Value;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let hook_dir = dir.path().join(".ryuzi/hooks/session.start");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let capture = dir.path().join("captured.json");
+        let script = hook_dir.join("capture.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let factory = Arc::new(ScriptedFactory { turns: vec![] });
+        let plugin = native_plugin_with_llm_factory(factory);
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let _session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        assert_eq!(captured["session"], "sess");
+        assert_eq!(captured["work_dir"], dir.path().display().to_string());
+        // `project`/`model` are present regardless of what they resolve to —
+        // the shape of the payload is what this test asserts, not the native
+        // model-routing outcome for a fresh store with no connections.
+        assert!(captured.get("project").is_some());
+        assert!(captured.get("model").is_some());
+    }
+
+    /// Feature C1c: the session-teardown seam is `NativeSession::end()` —
+    /// the only place `HarnessSession::end` is invoked is
+    /// `ControlPlane::end_session`'s real teardown (never the
+    /// interrupt-only `stop_session` path), so firing `session.end` there
+    /// fires exactly once per real session end. Also proves the hook is NOT
+    /// fired merely by starting a session.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn end_fires_the_session_end_hook() {
+        use serde_json::Value;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let hook_dir = dir.path().join(".ryuzi/hooks/session.end");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let capture = dir.path().join("captured.json");
+        let script = hook_dir.join("capture.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {}\n", capture.display())).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let factory = Arc::new(ScriptedFactory { turns: vec![] });
+        let plugin = native_plugin_with_llm_factory(factory);
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let session = harness
+            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .await
+            .unwrap();
+
+        assert!(!capture.exists(), "session.end must not fire before end()");
+        session.end().await.unwrap();
+
+        let captured: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
+        assert_eq!(captured["session"], "sess");
+        assert_eq!(captured["reason"], "ended");
     }
 
     #[tokio::test]
@@ -992,7 +1148,122 @@ mod tests {
                 },
             },
         ];
-        let tools = connect_mcp_tools(&specs).await;
+        let tools = connect_mcp_tools(&specs, &std::collections::HashMap::new()).await;
         assert!(tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_extension_tools_is_a_no_op_with_no_host() {
+        assert!(connect_extension_tools(None).await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_extension_tools_wraps_a_running_provides_tools_extension_and_executes_it() {
+        // Track D, DT6 end-to-end: a real (hermetic `sh -c`) fake extension
+        // declares `provides_tools` and hands back one tool def at init;
+        // `connect_extension_tools` must wrap it as a native `Tool` named
+        // `ext__<extension>__<tool>`, and calling `execute` on it must
+        // dispatch `tool/call` over the real subprocess pipe and render the
+        // reply exactly like an MCP tool would.
+        use crate::plugins::extension::{
+            ExtensionCtx as ExtCtx, ExtensionFactory, ExtensionHost, ExtensionSpec, ExtensionTools,
+        };
+        use crate::plugins::host::PluginHost;
+        use crate::settings::SettingsStore;
+        use std::time::Duration;
+
+        struct FakeExtFactory {
+            spec: ExtensionSpec,
+        }
+        #[async_trait]
+        impl ExtensionFactory for FakeExtFactory {
+            async fn extensions(&self, _ctx: &ExtCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
+                Ok(vec![self.spec.clone()])
+            }
+        }
+
+        let manifest = PluginManifest {
+            contract: 1,
+            id: "linter-plugin".into(),
+            name: "Linter Plugin".into(),
+            version: String::new(),
+            publisher: String::new(),
+            description: String::new(),
+            homepage: None,
+            icon: None,
+            categories: vec![],
+            slot: None,
+            verified: false,
+            experimental: false,
+            auth: None,
+            settings: vec![],
+            mcp: vec![],
+            extensions: vec![],
+            skills: vec![],
+            provider: None,
+        };
+
+        // Reads the `extension/initialize` request, acks it with one tool
+        // def ("lint"), then reads the follow-up `tool/call` request and
+        // replies with an MCP-shaped result — proving `render_tool_result`'s
+        // content flattening is reused end to end.
+        let body = "IFS= read -r line; \
+             id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
+             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true,\"events\":[],\"tools\":[{\"name\":\"lint\",\"description\":\"lint code\"}]}}\\n' \"$id\"; \
+             IFS= read -r line2; \
+             id2=$(printf '%s' \"$line2\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
+             printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"0 problems\"}]}}\\n' \"$id2\"";
+
+        let spec = ExtensionSpec {
+            name: "linter".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), body.into()],
+            events: vec![],
+            provides_tools: true,
+            timeout: Duration::from_millis(500),
+            env: vec![],
+        };
+
+        let mut plugin_host = PluginHost::new();
+        plugin_host.add(CorePlugin {
+            manifest,
+            harness: None,
+            gateway: None,
+            connector: None,
+            extension: Some(Arc::new(FakeExtFactory { spec })),
+            source: PluginSource::Builtin,
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        store
+            .set_setting_raw("plugin.linter-plugin.enabled", "true")
+            .await
+            .unwrap();
+        let settings = SettingsStore::new(store.clone());
+
+        let ext_host = Arc::new(ExtensionHost::new());
+        ext_host.spawn_all(&plugin_host, &ExtCtx { settings }).await;
+
+        let extension_tools = Some(ext_host.clone() as Arc<dyn ExtensionTools>);
+        let wrapped = connect_extension_tools(extension_tools.as_ref()).await;
+        assert_eq!(
+            wrapped.len(),
+            1,
+            "one provides_tools extension tool must be wrapped"
+        );
+        assert_eq!(wrapped[0].name(), "ext__linter__lint");
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool_ctx = tools::testutil::ctx_at(dir.path()).await;
+        let out = wrapped[0]
+            .execute(&tool_ctx, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.for_model, "0 problems");
+
+        ext_host.shutdown_all(Duration::from_millis(200)).await;
     }
 }

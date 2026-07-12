@@ -232,6 +232,30 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
     let updater = build_updater(Arc::clone(&daemon), dir.clone());
     updater.start();
 
+    // Track D: spawn every enabled extension-capable plugin's subprocess(es)
+    // now that the daemon is genuinely running. Deliberately a DETACHED
+    // background task, not awaited inline: a slow/hanging extension
+    // handshake (up to 25s each, one at a time) must never delay the
+    // "daemon: running" status above, which already landed, or eat into the
+    // connect-timeout budget `build_and_start` was raced against.
+    // `build_daemon` itself never does this — see
+    // `ControlPlane::spawn_extensions`'s hermeticity doc — so `cargo test`'s
+    // composition root stays free of real subprocess spawns.
+    {
+        let cp = daemon.cp.clone();
+        tokio::spawn(async move {
+            cp.spawn_extensions().await;
+        });
+    }
+
+    let catalog_mgr = ryuzi_core::plugins::remote_catalog::RemoteCatalogManager::new(
+        daemon.store.clone(),
+        SettingsStore::new(daemon.store.clone()),
+        daemon.cp.clone(),
+        Arc::new(ryuzi_core::plugins::remote_catalog::ReqwestCatalogHttp::new()),
+    );
+    catalog_mgr.start();
+
     // Signal handlers are deliberately installed only AFTER connect succeeds: a signal during
     // the connect window falls back to default kill; the stale "connecting" file is benign — derive_state
     // treats a dead pid as stopped.
@@ -663,6 +687,15 @@ impl CanaryHost for ProdCanaryHost {
         let guard = self.daemon.lock().await;
         let daemon = guard.as_ref().expect("open_db succeeded before promote");
         daemon.start().await?; // claims gateways + fires reconcile() for interrupted sessions
+
+        // Track D: same detached-task spawn as `run_daemon` — see its
+        // comment for why this must never be awaited inline here.
+        {
+            let cp = daemon.cp.clone();
+            tokio::spawn(async move {
+                cp.spawn_extensions().await;
+            });
+        }
 
         // On failure here, just propagate `Err`: the canary flow's applier
         // (see `apply_update`/`ApplierHost`) handles rollback of a failed

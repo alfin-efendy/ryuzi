@@ -33,9 +33,16 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 message: message.to_string(),
             })?,
         ),
+        // Gated single-call install: only completes immediately for the same
+        // "curated AND doesn't run code" condition `begin_skill_install`'s
+        // curated-immediate branch allows. Anything else (an arbitrary
+        // source, or a manifest declaring `[[extension]]`) errors out
+        // instead of installing — this RPC has no confirmation step of its
+        // own, so it must never be a way to skip the two-phase trust gate.
+        // Use `begin_skill_install`/`confirm_skill_install` for those.
         "install_skill" => {
             let a: SourceP = params(p)?;
-            let pack = crate::skills_install::install_skill_source(&a.source)
+            let pack = crate::skills_install::install_skill_source_gated(&a.source, cp.store())
                 .await
                 .map_err(|message| ApiError {
                     status: 500,

@@ -1284,6 +1284,47 @@ async listAudit(limit: number) : Promise<Result<AuditRow[], CmdError>> {
 }
 },
 /**
+ * Force an out-of-cadence catalog fetch right now — `RemoteCatalogManager`'s
+ * background timer lives daemon-side and is not otherwise user-triggerable.
+ * Returns the same snapshot shape as `catalog_status`.
+ */
+async refreshCatalog() : Promise<Result<CatalogStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_catalog") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Last accepted feed's sequence/outcome plus cached entry/blocked counts.
+ * Read-only, never mutates state.
+ */
+async catalogStatus() : Promise<Result<CatalogStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("catalog_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Per-extension live state (running/starting/restarting/failed/stopped/
+ * not-running), restart count, and sanitized last error — one entry per
+ * extension the daemon's `ExtensionHost` currently knows about, across
+ * every enabled extension-capable plugin. Read-only, never mutates state
+ * (no spawn/restart/shutdown). `PluginDetailView` calls this for an
+ * extension-capable plugin and filters the result down to its own `id`.
+ */
+async extensionStatus() : Promise<Result<ExtensionStatusEntry[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("extension_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -1507,6 +1548,15 @@ export type CatalogEntry = { id: string; name: string;
  * provider card; the entry whose id == family is the display head.
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
+/**
+ * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
+ * `catalog_feed_state` row plus counts from the cached
+ * `plugin_catalog_cache` table (`crate::store::RemoteCatalogRow`). `sequence`
+ * stays a `u64` for the same reason `TrustPromptDto.total_bytes` does: no
+ * bindings-shape cost, since `export_bindings`'s `BigIntExportBehavior::Number`
+ * already renders it as a plain TS `number`.
+ */
+export type CatalogStatus = { sequence: number; lastFetchAt: number | null; outcome: string | null; entries: number; blocked: number }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
 export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[]; 
 /**
@@ -1532,7 +1582,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1626,12 +1676,54 @@ export type DoctorFinding = { pluginId: string;
  */
 severity: string; 
 /**
- * `reconnect-required` | `missing-binary` | `attach-failed`.
+ * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked` |
+ * `slot-conflict` | `not-running` | `crashed` | `restart-exhausted` |
+ * `init-failed` (the last four are Track D extension findings — DT8,
+ * see `crate::plugins::doctor::plugin_doctor`'s extension section).
  */
 kind: string; message: string; suggestedAction: string }
 export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
+/**
+ * `extension_status` rpc result — one entry per extension (Track D "code
+ * plugin") the daemon's `ExtensionHost` currently knows about (DT8). Mirrors
+ * `plugins::extension::{ExtensionSnapshot, ExtensionStatus}` flattened into
+ * a specta-able, UI-friendly shape (same rationale as `DoctorFinding`
+ * mirroring `plugins::doctor::DoctorFinding`) rather than deriving `Type` on
+ * the core enum directly. `crate::api::extension_status_api` builds these
+ * field by field (no `From` impl) since `ExtensionStatus::Failed`'s reason
+ * needs to fan out into both `status` (the canned string) and `last_error`
+ * (the sanitized detail) — a single `From` conversion would need the same
+ * branching anyway.
+ */
+export type ExtensionStatusEntry = { pluginId: string; 
+/**
+ * The manifest's `[[extension]] name` — unique within its own plugin,
+ * not globally (mirrors `ExtensionSnapshot::name`'s own namespace note).
+ */
+name: string; 
+/**
+ * `running` | `starting` | `restarting` | `failed` | `stopped` |
+ * `not-running` (the last one has no `ExtensionStatus` counterpart — it
+ * means the plugin declares an extension and is enabled, but the host
+ * has no spawned entry for it at all, e.g. a still-pending spawn or a
+ * resolution failure prior to ever reaching `Failed`).
+ */
+status: string; 
+/**
+ * Lifetime count of restart attempts DT4's supervisor has made for this
+ * entry. Always `0` for an entry that has never needed a restart
+ * (including the synthetic `not-running` entries, which were never
+ * spawned at all).
+ */
+restartCount: number; 
+/**
+ * Present only when `status == "failed"` — `ExtensionStatus::Failed`'s
+ * already-sanitized reason (`proc::sanitize_init_error`/the
+ * `restart-exhausted: ...` marker), never extension-supplied raw text.
+ */
+lastError: string | null; confirmedEvents: string[]; toolCount: number }
 /**
  * One `messages_fts` match, joined against its owning session — the unit
  * the `session_search` native tool's DISCOVERY action returns, and (Task
@@ -1820,8 +1912,42 @@ export type PluginFieldInfo = { key: string; label: string; help: string; secret
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.
  */
-valueSet: boolean }
-export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; verified: boolean; experimental: boolean; enabled: boolean; 
+valueSet: boolean; 
+/**
+ * `string` | `int` | `bool` — the value shape Cockpit renders (see
+ * `ryuzi_plugin_sdk::FieldKind`). A plain camelCase-friendly `String`
+ * mirror rather than the SDK enum itself, matching this module's
+ * existing convention (`auth_kind_label`/`mcp_transport_label`) of
+ * never crossing specta's `Type` boundary with an SDK type directly.
+ */
+kind: string; 
+/**
+ * Non-empty makes this field an enum/choice — the value must be one of
+ * these members (see `ryuzi_plugin_sdk::SettingField::options`).
+ */
+options: string[]; 
+/**
+ * Pre-filled/effective value to show when `value_set` is `false`. Safe
+ * to return even for a `secret` field: it comes from the manifest, not
+ * a persisted credential.
+ */
+default: string | null }
+export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; 
+/**
+ * The exclusive capability slot this plugin's manifest claims (e.g.
+ * `"memory"`), mirroring `ryuzi_plugin_sdk::PluginManifest::slot`.
+ * `None` when the manifest declares no slot.
+ */
+slot: string | null; 
+/**
+ * Whether this plugin currently WON its `slot` claim
+ * (first-registration-wins — see `crate::plugins::PluginHost::
+ * slot_owner`). Always `false` when `slot` is `None`. A plugin whose
+ * claim lost still has `slot` set (its own manifest is unaffected) but
+ * `owns_slot: false`; see `plugin_doctor`'s `"slot-conflict"` finding
+ * for the observable signal naming both the winner and the loser.
+ */
+ownsSlot: boolean; verified: boolean; experimental: boolean; enabled: boolean; 
 /**
  * Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
  * !reconnect_required; else a persisted `auth.setting` row or `auth.env`
@@ -1868,7 +1994,23 @@ pinned: boolean;
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
  * label) — the Provenance card in Cockpit renders it only when present.
  */
-sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null }
+sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null; 
+/**
+ * `embedded` | `remote` — which catalog source won for this id.
+ * `None` for builtins and skill packs (never from either catalog).
+ */
+catalogSource: string | null; 
+/**
+ * The remote catalog feed's `version` for this id, when a cached
+ * `plugin_catalog_cache` row matches. `None` when the id was never seen
+ * in a fetched feed.
+ */
+catalogVersion: string | null; 
+/**
+ * Set when the remote catalog's signed feed blocked (revoked) this id —
+ * mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
+ */
+blockedReason: string | null }
 export type PluginInstallBeginResult = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.
@@ -1923,6 +2065,19 @@ export type PluginOauthBeginResult = { stateToken: string; authorizeUrl: string;
  * failure — the flow entry survives failures so manual paste still works.
  */
 export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: string | null }
+/**
+ * Identifies the plugin an approvable action originates from — attribution
+ * only, so an operator can see "this MCP tool belongs to plugin X" instead
+ * of guessing from a substring match between the MCP server name and a
+ * manifest id. `None` (everywhere this is optional) means the action is the
+ * core agent itself (a built-in tool), not a plugin. Resolved at the
+ * mcp-server→plugin binding (`ControlPlane::attach_plugin_mcp_servers`),
+ * never by parsing the tool/server name string.
+ * 
+ * Carries no gating semantics: this is visibility/attribution metadata for
+ * the approval prompt, not an input to the permission DECISION.
+ */
+export type Principal = { pluginId: string; pluginName: string }
 export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
@@ -2024,7 +2179,21 @@ export type ToolPolicyRow = { projectId: string; tool: string; decision: string 
  * renders any bigint-sized field as a plain TS `number`, so there's no
  * bindings-shape cost to keeping the wider type.
  */
-export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number }
+export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number; 
+/**
+ * Mirrors `TrustPrompt::runs_code`: true when the staged manifest
+ * declares `[[extension]]` (code execution, Track D) — the wizard must
+ * show a distinct warning for this, not just fold it into the
+ * hook-script list.
+ */
+runsCode: boolean; 
+/**
+ * Mirrors `TrustPrompt::curated`: true when the source is one of the
+ * curated skill packs, so this prompt only exists because `runs_code`
+ * is true — the wizard uses this to avoid the misleading "this source
+ * isn't curated" framing for a curated-but-code-running install.
+ */
+curated: boolean }
 /**
  * Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
  * `#[serde(tag = "kind", content = "detail")]` shape so the discriminated

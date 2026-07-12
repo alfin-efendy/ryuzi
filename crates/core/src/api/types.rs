@@ -490,6 +490,17 @@ pub struct PluginInfo {
     pub description: String,
     pub icon: Option<String>,
     pub categories: Vec<String>,
+    /// The exclusive capability slot this plugin's manifest claims (e.g.
+    /// `"memory"`), mirroring `ryuzi_plugin_sdk::PluginManifest::slot`.
+    /// `None` when the manifest declares no slot.
+    pub slot: Option<String>,
+    /// Whether this plugin currently WON its `slot` claim
+    /// (first-registration-wins — see `crate::plugins::PluginHost::
+    /// slot_owner`). Always `false` when `slot` is `None`. A plugin whose
+    /// claim lost still has `slot` set (its own manifest is unaffected) but
+    /// `owns_slot: false`; see `plugin_doctor`'s `"slot-conflict"` finding
+    /// for the observable signal naming both the winner and the loser.
+    pub owns_slot: bool,
     pub verified: bool,
     pub experimental: bool,
     pub enabled: bool,
@@ -528,6 +539,16 @@ pub struct PluginInfo {
     pub installed_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub trust_tier: Option<String>,
+    /// `embedded` | `remote` — which catalog source won for this id.
+    /// `None` for builtins and skill packs (never from either catalog).
+    pub catalog_source: Option<String>,
+    /// The remote catalog feed's `version` for this id, when a cached
+    /// `plugin_catalog_cache` row matches. `None` when the id was never seen
+    /// in a fetched feed.
+    pub catalog_version: Option<String>,
+    /// Set when the remote catalog's signed feed blocked (revoked) this id —
+    /// mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -590,6 +611,19 @@ pub struct PluginFieldInfo {
     pub required: bool,
     /// A persisted (non-empty) row exists for `key`. Never the value itself.
     pub value_set: bool,
+    /// `string` | `int` | `bool` — the value shape Cockpit renders (see
+    /// `ryuzi_plugin_sdk::FieldKind`). A plain camelCase-friendly `String`
+    /// mirror rather than the SDK enum itself, matching this module's
+    /// existing convention (`auth_kind_label`/`mcp_transport_label`) of
+    /// never crossing specta's `Type` boundary with an SDK type directly.
+    pub kind: String,
+    /// Non-empty makes this field an enum/choice — the value must be one of
+    /// these members (see `ryuzi_plugin_sdk::SettingField::options`).
+    pub options: Vec<String>,
+    /// Pre-filled/effective value to show when `value_set` is `false`. Safe
+    /// to return even for a `secret` field: it comes from the manifest, not
+    /// a persisted credential.
+    pub default: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -642,6 +676,16 @@ pub struct TrustPromptDto {
     pub skills: Vec<String>,
     pub hook_scripts: Vec<String>,
     pub total_bytes: u64,
+    /// Mirrors `TrustPrompt::runs_code`: true when the staged manifest
+    /// declares `[[extension]]` (code execution, Track D) — the wizard must
+    /// show a distinct warning for this, not just fold it into the
+    /// hook-script list.
+    pub runs_code: bool,
+    /// Mirrors `TrustPrompt::curated`: true when the source is one of the
+    /// curated skill packs, so this prompt only exists because `runs_code`
+    /// is true — the wizard uses this to avoid the misleading "this source
+    /// isn't curated" framing for a curated-but-code-running install.
+    pub curated: bool,
 }
 
 impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
@@ -654,6 +698,8 @@ impl From<crate::skills_install::TrustPrompt> for TrustPromptDto {
             skills: p.skills,
             hook_scripts: p.hook_scripts,
             total_bytes: p.total_bytes,
+            runs_code: p.runs_code,
+            curated: p.curated,
         }
     }
 }
@@ -737,10 +783,65 @@ pub struct DoctorFinding {
     pub plugin_id: String,
     /// `warn` | `error`.
     pub severity: String,
-    /// `reconnect-required` | `missing-binary` | `attach-failed`.
+    /// `reconnect-required` | `missing-binary` | `attach-failed` | `blocked` |
+    /// `slot-conflict` | `not-running` | `crashed` | `restart-exhausted` |
+    /// `init-failed` (the last four are Track D extension findings — DT8,
+    /// see `crate::plugins::doctor::plugin_doctor`'s extension section).
     pub kind: String,
     pub message: String,
     pub suggested_action: String,
+}
+
+/// `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
+/// `catalog_feed_state` row plus counts from the cached
+/// `plugin_catalog_cache` table (`crate::store::RemoteCatalogRow`). `sequence`
+/// stays a `u64` for the same reason `TrustPromptDto.total_bytes` does: no
+/// bindings-shape cost, since `export_bindings`'s `BigIntExportBehavior::Number`
+/// already renders it as a plain TS `number`.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogStatus {
+    pub sequence: u64,
+    pub last_fetch_at: Option<i64>,
+    pub outcome: Option<String>,
+    pub entries: u32,
+    pub blocked: u32,
+}
+
+/// `extension_status` rpc result — one entry per extension (Track D "code
+/// plugin") the daemon's `ExtensionHost` currently knows about (DT8). Mirrors
+/// `plugins::extension::{ExtensionSnapshot, ExtensionStatus}` flattened into
+/// a specta-able, UI-friendly shape (same rationale as `DoctorFinding`
+/// mirroring `plugins::doctor::DoctorFinding`) rather than deriving `Type` on
+/// the core enum directly. `crate::api::extension_status_api` builds these
+/// field by field (no `From` impl) since `ExtensionStatus::Failed`'s reason
+/// needs to fan out into both `status` (the canned string) and `last_error`
+/// (the sanitized detail) — a single `From` conversion would need the same
+/// branching anyway.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStatusEntry {
+    pub plugin_id: String,
+    /// The manifest's `[[extension]] name` — unique within its own plugin,
+    /// not globally (mirrors `ExtensionSnapshot::name`'s own namespace note).
+    pub name: String,
+    /// `running` | `starting` | `restarting` | `failed` | `stopped` |
+    /// `not-running` (the last one has no `ExtensionStatus` counterpart — it
+    /// means the plugin declares an extension and is enabled, but the host
+    /// has no spawned entry for it at all, e.g. a still-pending spawn or a
+    /// resolution failure prior to ever reaching `Failed`).
+    pub status: String,
+    /// Lifetime count of restart attempts DT4's supervisor has made for this
+    /// entry. Always `0` for an entry that has never needed a restart
+    /// (including the synthetic `not-running` entries, which were never
+    /// spawned at all).
+    pub restart_count: u32,
+    /// Present only when `status == "failed"` — `ExtensionStatus::Failed`'s
+    /// already-sanitized reason (`proc::sanitize_init_error`/the
+    /// `restart-exhausted: ...` marker), never extension-supplied raw text.
+    pub last_error: Option<String>,
+    pub confirmed_events: Vec<String>,
+    pub tool_count: u32,
 }
 
 impl From<crate::plugins::doctor::DoctorFinding> for DoctorFinding {

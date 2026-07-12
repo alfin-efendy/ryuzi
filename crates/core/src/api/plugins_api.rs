@@ -39,9 +39,11 @@ use crate::plugins::providers;
 use crate::plugins::{CorePlugin, PluginSource};
 use crate::serve::ApiState;
 use crate::settings::SettingsStore;
-use crate::store::{PluginOauthClient, Store};
+use crate::store::{PluginOauthClient, RemoteCatalogRow, Store};
 use reqwest::Url;
-use ryuzi_plugin_sdk::{AuthKind, AuthSpec, McpServerDef, McpTransportDef, SettingField};
+use ryuzi_plugin_sdk::{
+    AuthKind, AuthSpec, FieldKind, McpServerDef, McpTransportDef, SettingField,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -295,7 +297,7 @@ async fn update_all_plugins(cp: &ControlPlane) -> anyhow::Result<Vec<UpdateOutco
 fn source_label(source: &PluginSource) -> &'static str {
     match source {
         PluginSource::Builtin => "builtin",
-        PluginSource::Catalog => "catalog",
+        PluginSource::Catalog | PluginSource::RemoteCatalog => "catalog",
         PluginSource::SkillPack(_) => "skill-pack",
     }
 }
@@ -323,6 +325,18 @@ fn derive_kind(plugin: &CorePlugin) -> Option<&'static str> {
         return Some("gateway");
     }
     Some("integration")
+}
+
+/// `PluginInfo.catalogSource` for a plugin's binding source: `embedded` for
+/// the compiled-in catalog, `remote` for a signed-feed entry that won a
+/// version-gated merge (`crate::plugins::catalog::merged_catalog_plugins`),
+/// `None` for builtins and skill packs — neither catalog ever produces them.
+fn catalog_source_label(source: &PluginSource) -> Option<String> {
+    match source {
+        PluginSource::Catalog => Some("embedded".to_string()),
+        PluginSource::RemoteCatalog => Some("remote".to_string()),
+        PluginSource::Builtin | PluginSource::SkillPack(_) => None,
+    }
 }
 
 /// Family head id for a provider plugin (`anthropic-oauth` → `anthropic`).
@@ -390,22 +404,37 @@ impl InstallLedgerFields {
     }
 }
 
+/// Enrichment inputs `plugin_info` needs beyond the plugin itself: the
+/// install ledger row, the cached remote-catalog row, and whether this
+/// plugin currently owns its manifest-claimed `slot` (Feature C2). Bundled
+/// into one struct so `plugin_info` doesn't creep past clippy's
+/// too-many-arguments lint as fields get added over time.
+struct PluginInfoContext<'a> {
+    install: Option<&'a crate::store::PluginInstallRecord>,
+    remote: Option<&'a RemoteCatalogRow>,
+    owns_slot: bool,
+}
+
 fn plugin_info(
     plugin: &CorePlugin,
     enabled: bool,
     configured: bool,
     kind: &str,
     installed: bool,
-    install: Option<&crate::store::PluginInstallRecord>,
+    ctx: PluginInfoContext<'_>,
 ) -> PluginInfo {
     let m = &plugin.manifest;
-    let ledger = InstallLedgerFields::from_option(install);
+    let ledger = InstallLedgerFields::from_option(ctx.install);
+    let remote = ctx.remote;
+    let owns_slot = ctx.owns_slot;
     PluginInfo {
         id: m.id.clone(),
         name: m.name.clone(),
         description: m.description.clone(),
         icon: m.icon.clone(),
         categories: m.categories.clone(),
+        slot: m.slot.clone(),
+        owns_slot,
         verified: m.verified,
         experimental: m.experimental,
         enabled,
@@ -425,6 +454,9 @@ fn plugin_info(
         installed_at: ledger.installed_at,
         updated_at: ledger.updated_at,
         trust_tier: ledger.trust_tier,
+        catalog_source: catalog_source_label(&plugin.source),
+        catalog_version: remote.map(|r| r.version.clone()),
+        blocked_reason: remote.and_then(|r| r.blocked_reason.clone()),
     }
 }
 
@@ -434,6 +466,16 @@ fn auth_kind_label(kind: AuthKind) -> &'static str {
         AuthKind::ApiKey => "api-key",
         AuthKind::Token => "token",
         AuthKind::Oauth => "oauth",
+    }
+}
+
+/// `ryuzi_plugin_sdk::FieldKind` -> the camelCase-friendly label
+/// `PluginFieldInfo.kind` carries across the Tauri IPC boundary.
+fn field_kind_label(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::String => "string",
+        FieldKind::Int => "int",
+        FieldKind::Bool => "bool",
     }
 }
 
@@ -917,6 +959,9 @@ async fn build_settings_info(
             secret: f.secret,
             required: f.required,
             value_set: field_value_set(persisted.as_deref()),
+            kind: field_kind_label(f.kind).to_string(),
+            options: f.options.clone(),
+            default: f.default.clone(),
         });
     }
     Ok(out)
@@ -1125,10 +1170,23 @@ async fn install_ledger_index(
         .collect())
 }
 
+/// Fetch every cached `plugin_catalog_cache` row ONCE and index it by plugin
+/// id — mirrors [`install_ledger_index`]'s O(1)-round-trip shape, so list
+/// assembly never issues a per-plugin remote-catalog query.
+async fn remote_catalog_index(store: &Store) -> anyhow::Result<HashMap<String, RemoteCatalogRow>> {
+    Ok(store
+        .list_remote_catalog()
+        .await?
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect())
+}
+
 async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
     let settings = SettingsStore::new(cp.store().clone());
     let ctx = installed_ctx(cp.store()).await?;
     let installs = install_ledger_index(cp.store()).await?;
+    let remote = remote_catalog_index(cp.store()).await?;
     let mut out = Vec::new();
     for plugin in cp.plugins().list() {
         let Some(kind) = derive_kind(&plugin) else {
@@ -1147,8 +1205,23 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
         let installed =
             compute_installed(cp.store(), &plugin, kind, enabled, configured, &ctx).await?;
         let record = installs.get(&plugin.manifest.id);
+        let remote_row = remote.get(&plugin.manifest.id);
+        let owns_slot = plugin
+            .manifest
+            .slot
+            .as_deref()
+            .is_some_and(|s| cp.plugins().slot_owner(s) == Some(plugin.manifest.id.as_str()));
         out.push(plugin_info(
-            &plugin, enabled, configured, kind, installed, record,
+            &plugin,
+            enabled,
+            configured,
+            kind,
+            installed,
+            PluginInfoContext {
+                install: record,
+                remote: remote_row,
+                owns_slot,
+            },
         ));
     }
     for pack in crate::skills_install::curated_skill_packs() {
@@ -1166,6 +1239,9 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             description: pack.description.to_string(),
             icon: Some("sparkles".to_string()),
             categories: vec!["skills".to_string()],
+            // A synthesized curated pack has no manifest to declare a slot.
+            slot: None,
+            owns_slot: false,
             verified: true,
             experimental: false,
             // A synthesized pack isn't a registered plugin, so `enabled` /
@@ -1184,6 +1260,11 @@ async fn assemble_list(cp: &ControlPlane) -> anyhow::Result<Vec<PluginInfo>> {
             installed_at: ledger.installed_at,
             updated_at: ledger.updated_at,
             trust_tier: ledger.trust_tier,
+            // A synthesized curated pack is never sourced from either
+            // catalog (it resolves via git clone, not a manifest feed).
+            catalog_source: None,
+            catalog_version: None,
+            blocked_reason: None,
         });
     }
     Ok(out)
@@ -1211,6 +1292,17 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
     // Single-plugin lookup is fine here — unlike `assemble_list`, there is
     // only ever one id to resolve for a detail view.
     let record = cp.store().get_plugin_install(id).await?;
+    let remote_row = cp
+        .store()
+        .list_remote_catalog()
+        .await?
+        .into_iter()
+        .find(|r| r.id == id);
+
+    let owns_slot = m
+        .slot
+        .as_deref()
+        .is_some_and(|s| cp.plugins().slot_owner(s) == Some(id));
 
     Ok(PluginDetail {
         info: plugin_info(
@@ -1219,7 +1311,11 @@ async fn assemble_detail(cp: &ControlPlane, id: &str) -> anyhow::Result<PluginDe
             configured,
             kind,
             installed,
-            record.as_ref(),
+            PluginInfoContext {
+                install: record.as_ref(),
+                remote: remote_row.as_ref(),
+                owns_slot,
+            },
         ),
         auth,
         settings: settings_info,
@@ -1584,11 +1680,13 @@ mod tests {
             homepage: None,
             icon: None,
             categories: vec![],
+            slot: None,
             verified: false,
             experimental: false,
             auth: None,
             settings: vec![],
             mcp: vec![],
+            extensions: vec![],
             skills: vec![],
             provider: None,
         }
@@ -1600,6 +1698,7 @@ mod tests {
             harness: Some(Arc::new(FakeHarnessFactory)),
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -1610,6 +1709,7 @@ mod tests {
             harness: None,
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
+            extension: None,
             source: PluginSource::Catalog,
         }
     }
@@ -1620,6 +1720,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
+            extension: None,
             source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
         }
     }
@@ -1641,6 +1742,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
     }
@@ -1674,6 +1776,7 @@ mod tests {
             harness: None,
             gateway: None,
             connector: None,
+            extension: None,
             source: PluginSource::Builtin,
         }
         .capabilities()
@@ -1808,10 +1911,18 @@ mod tests {
 
     // ---------- plugin_info ----------
 
+    fn no_ctx(owns_slot: bool) -> PluginInfoContext<'static> {
+        PluginInfoContext {
+            install: None,
+            remote: None,
+            owns_slot,
+        }
+    }
+
     #[test]
     fn plugin_info_maps_identity_and_enabled_flag_through() {
         let plugin = harness_only("native");
-        let info = plugin_info(&plugin, true, false, "integration", false, None);
+        let info = plugin_info(&plugin, true, false, "integration", false, no_ctx(false));
         assert_eq!(info.id, "native");
         assert_eq!(info.name, "Plugin native");
         assert!(info.enabled);
@@ -1824,9 +1935,119 @@ mod tests {
         // No `plugin_installs` ledger row → ledger fields carry their defaults.
         assert!(!info.pinned);
         assert!(info.source_spec.is_none());
+        // Builtin source, no cached remote-catalog row → all three enrichment
+        // fields stay unset.
+        assert!(info.catalog_source.is_none());
+        assert!(info.catalog_version.is_none());
+        assert!(info.blocked_reason.is_none());
+        // No manifest `slot` claim → neither field is set.
+        assert!(info.slot.is_none());
+        assert!(!info.owns_slot);
 
-        let info_disabled = plugin_info(&plugin, false, false, "integration", false, None);
+        let info_disabled = plugin_info(&plugin, false, false, "integration", false, no_ctx(false));
         assert!(!info_disabled.enabled);
+    }
+
+    #[test]
+    fn plugin_info_reports_slot_and_owns_slot() {
+        let plugin = CorePlugin {
+            manifest: PluginManifest {
+                slot: Some("memory".to_string()),
+                ..manifest("mem0")
+            },
+            ..harness_only("mem0")
+        };
+        let owner = plugin_info(&plugin, true, false, "integration", false, no_ctx(true));
+        assert_eq!(owner.slot.as_deref(), Some("memory"));
+        assert!(owner.owns_slot);
+
+        let loser = plugin_info(&plugin, true, false, "integration", false, no_ctx(false));
+        assert_eq!(
+            loser.slot.as_deref(),
+            Some("memory"),
+            "the claim itself is still reported even when the plugin lost arbitration"
+        );
+        assert!(!loser.owns_slot);
+    }
+
+    // ---------- catalog_source_label ----------
+
+    #[test]
+    fn catalog_source_label_maps_catalog_sources_only() {
+        assert_eq!(
+            catalog_source_label(&PluginSource::Catalog).as_deref(),
+            Some("embedded")
+        );
+        assert_eq!(
+            catalog_source_label(&PluginSource::RemoteCatalog).as_deref(),
+            Some("remote")
+        );
+        assert!(catalog_source_label(&PluginSource::Builtin).is_none());
+        assert!(
+            catalog_source_label(&PluginSource::SkillPack(std::path::PathBuf::from("/x")))
+                .is_none()
+        );
+    }
+
+    // ---------- remote-catalog enrichment (assemble_list) ----------
+
+    // A plugin whose `CorePlugin.source` is `RemoteCatalog` (the merged-catalog
+    // path a real daemon boot takes via `catalog::merged_catalog_plugins`) must
+    // report `catalogSource: "remote"`, and a matching (blocked) cached row
+    // must surface as `catalogVersion`/`blockedReason` on the SAME list entry —
+    // exercising the `remote_catalog_index` lookup `assemble_list` builds once,
+    // not a per-plugin query.
+    #[tokio::test]
+    async fn assemble_list_enriches_remote_catalog_plugin_with_blocked_reason() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let mut regs = Registries::new();
+        let mut plugin = gateway_only("acme-remote");
+        plugin.source = PluginSource::RemoteCatalog;
+        regs.add_plugin(plugin);
+        let cp = ControlPlane::new(store, regs).await;
+
+        cp.store()
+            .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
+                id: "acme-remote".to_string(),
+                manifest_toml: String::new(),
+                version: "2.0.0".to_string(),
+                sequence: 1,
+                blocked: true,
+                blocked_reason: Some("revoked: CVE-2026-0001".to_string()),
+                fetched_at: 0,
+            }])
+            .await
+            .unwrap();
+
+        let list = assemble_list(&cp).await.unwrap();
+        let info = list
+            .iter()
+            .find(|p| p.id == "acme-remote")
+            .expect("acme-remote present in the list");
+        assert_eq!(info.catalog_source.as_deref(), Some("remote"));
+        assert_eq!(info.catalog_version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            info.blocked_reason.as_deref(),
+            Some("revoked: CVE-2026-0001")
+        );
+    }
+
+    // An embedded-catalog plugin with NO matching cached remote row must still
+    // report `catalogSource: "embedded"`, with the version/blocked fields left
+    // unset — the remote cache only ever adds detail, never required for the
+    // embedded label.
+    #[tokio::test]
+    async fn assemble_list_labels_embedded_catalog_plugin_without_remote_row() {
+        let cp = test_cp().await;
+        let list = assemble_list(&cp).await.unwrap();
+        // `test_cp` registers the embedded catalog via `install_builtins`;
+        // "notion" is a catalog-sourced integration (see
+        // `plugin_info_configured_for_oauth_requires_stored_token_without_reconnect`).
+        let notion = list.iter().find(|p| p.id == "notion").expect("notion");
+        assert_eq!(notion.catalog_source.as_deref(), Some("embedded"));
+        assert!(notion.catalog_version.is_none());
+        assert!(notion.blocked_reason.is_none());
     }
 
     // ---------- auth_kind_label / auth_configured ----------
@@ -1837,6 +2058,68 @@ mod tests {
         assert_eq!(auth_kind_label(AuthKind::ApiKey), "api-key");
         assert_eq!(auth_kind_label(AuthKind::Token), "token");
         assert_eq!(auth_kind_label(AuthKind::Oauth), "oauth");
+    }
+
+    #[test]
+    fn field_kind_label_maps_every_variant() {
+        assert_eq!(field_kind_label(FieldKind::String), "string");
+        assert_eq!(field_kind_label(FieldKind::Int), "int");
+        assert_eq!(field_kind_label(FieldKind::Bool), "bool");
+    }
+
+    // ---------- build_settings_info (Feature C3: kind/options/default) ----------
+
+    #[tokio::test]
+    async fn build_settings_info_carries_kind_options_and_default() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let fields = vec![
+            SettingField {
+                key: "plugin.acme.tier".to_string(),
+                label: "Tier".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::String,
+                options: vec!["free".to_string(), "pro".to_string()],
+                default: Some("free".to_string()),
+            },
+            SettingField {
+                key: "plugin.acme.retries".to_string(),
+                label: "Retries".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Int,
+                options: vec![],
+                default: Some("3".to_string()),
+            },
+            SettingField {
+                key: "plugin.acme.verbose".to_string(),
+                label: "Verbose".to_string(),
+                help: String::new(),
+                secret: false,
+                required: false,
+                kind: FieldKind::Bool,
+                options: vec![],
+                default: None,
+            },
+        ];
+
+        let out = build_settings_info(&store, &fields).await.unwrap();
+        assert_eq!(out.len(), 3);
+
+        assert_eq!(out[0].kind, "string");
+        assert_eq!(out[0].options, vec!["free".to_string(), "pro".to_string()]);
+        assert_eq!(out[0].default.as_deref(), Some("free"));
+
+        assert_eq!(out[1].kind, "int");
+        assert!(out[1].options.is_empty());
+        assert_eq!(out[1].default.as_deref(), Some("3"));
+
+        assert_eq!(out[2].kind, "bool");
+        assert!(out[2].options.is_empty());
+        assert_eq!(out[2].default, None);
     }
 
     #[test]

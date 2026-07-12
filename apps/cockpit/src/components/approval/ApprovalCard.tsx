@@ -4,6 +4,7 @@ import { Check, ChevronDown, ShieldAlert } from "lucide-react";
 import { useStore, type PendingApproval } from "@/store";
 import type { ApprovalResponse } from "@/bindings";
 import { Markdown } from "@/components/transcript/Markdown";
+import { Pill } from "@/components/common/bits";
 
 type Question = {
   question: string;
@@ -119,6 +120,7 @@ export function ApprovalCard({
   const [feedback, setFeedback] = useState("");
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
   const [others, setOthers] = useState<Record<string, string>>({});
+  const [step, setStep] = useState(0);
 
   const questions = useMemo<Question[]>(() => {
     if (approval.kind !== "question") return [];
@@ -126,7 +128,23 @@ export function ApprovalCard({
     return Array.isArray(raw) ? raw : [];
   }, [approval]);
 
+  // A new approval (new requestId) is a clean slate: reset the question
+  // stepper, all picked answers/Other text, and the plan-rejection feedback
+  // state so leftover input from a previous approval never leaks in.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally keyed on requestId only, to reset on a new approval
+  useEffect(() => {
+    setStep(0);
+    setAnswers({});
+    setOthers({});
+    setFeedback("");
+    setRejecting(false);
+  }, [approval.requestId]);
+
   const resolve = (response: ApprovalResponse) => void resolveApproval(approval.requestId, response);
+
+  const activeStep = questions.length === 0 ? 0 : Math.min(step, questions.length - 1);
+  const activeQuestion = questions[activeStep];
+  const isLastQuestion = activeStep >= questions.length - 1;
 
   const submitQuestions = () => {
     const merged: Record<string, string[]> = {};
@@ -142,8 +160,11 @@ export function ApprovalCard({
   // resubscribing on every keystroke of the answers/feedback state.
   const primaryRef = useRef<() => void>(() => {});
   primaryRef.current = () => {
-    if (approval.kind === "question") submitQuestions();
-    else if (approval.kind === "plan") {
+    if (approval.kind === "question") {
+      if (questions.length === 0) return;
+      if (isLastQuestion) submitQuestions();
+      else setStep((s) => s + 1);
+    } else if (approval.kind === "plan") {
       // While the reject-with-feedback panel is open, the hotkey must submit
       // that rejection — not approve the plan. Otherwise a user typing
       // feedback and pressing Ctrl/Cmd+Enter would invert their intent and
@@ -183,7 +204,14 @@ export function ApprovalCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[13px] font-semibold">{title}</div>
-          <div className="truncate text-[11.5px] text-muted-foreground">{approval.tool}</div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate text-[11.5px] text-muted-foreground">{approval.tool}</span>
+            {approval.principal && (
+              <Pill variant="secondary" className="shrink-0">
+                via {approval.principal.pluginName}
+              </Pill>
+            )}
+          </div>
         </div>
         {showSession && session && (
           <Badge variant="secondary" className="max-w-[180px] truncate">
@@ -198,44 +226,71 @@ export function ApprovalCard({
             <Markdown text={String((approval.input as { plan?: string } | null)?.plan ?? "")} />
           </div>
         ) : approval.kind === "question" ? (
-          <div className="space-y-4">
-            {questions.map((q) => (
-              <div key={q.question} className="space-y-1.5">
-                <div className="flex items-center gap-2">
-                  <Badge variant="outline">{q.header}</Badge>
-                  <span className="text-[13px]">{q.question}</span>
+          questions.length === 0 ? (
+            <div className="text-[13px] text-muted-foreground">No questions were provided.</div>
+          ) : (
+            (() => {
+              const q = activeQuestion;
+              if (q === undefined) return null;
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11.5px] text-muted-foreground">
+                      Question {activeStep + 1} of {questions.length}
+                    </span>
+                    <div
+                      role="progressbar"
+                      aria-label="Question progress"
+                      aria-valuenow={activeStep + 1}
+                      aria-valuemin={1}
+                      aria-valuemax={questions.length}
+                      className="flex items-center gap-1"
+                    >
+                      {questions.map((question, i) => (
+                        <span key={question.question} className={`h-1.5 w-4 rounded-full ${i <= activeStep ? "bg-primary" : "bg-muted"}`} />
+                      ))}
+                    </div>
+                  </div>
+                  <div key={q.question} className="space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline">{q.header}</Badge>
+                      <h3 className="text-[13px] font-normal">{q.question}</h3>
+                    </div>
+                    <div className="space-y-1">
+                      {q.options.map((o) => {
+                        const selected = (answers[q.question] ?? []).includes(o.label);
+                        return (
+                          <Button
+                            key={o.label}
+                            variant={selected ? "secondary" : "ghost"}
+                            aria-pressed={selected}
+                            className="h-auto w-full justify-start px-2.5 py-1.5 text-left"
+                            onClick={() => toggle(q, o.label)}
+                          >
+                            <span className="flex w-4 shrink-0 justify-center">{selected && <Check size={13} />}</span>
+                            <span className="min-w-0">
+                              <span className="block text-[12.5px]">{o.label}</span>
+                              {o.description && <span className="block text-[11px] text-muted-foreground">{o.description}</span>}
+                            </span>
+                          </Button>
+                        );
+                      })}
+                      <Input
+                        aria-label={`Other answer for ${q.header}`}
+                        placeholder="Other…"
+                        value={others[q.question] ?? ""}
+                        onChange={(e) => setOthers((p) => ({ ...p, [q.question]: e.target.value }))}
+                      />
+                    </div>
+                  </div>
                 </div>
-                <div className="space-y-1">
-                  {q.options.map((o) => {
-                    const selected = (answers[q.question] ?? []).includes(o.label);
-                    return (
-                      <Button
-                        key={o.label}
-                        variant={selected ? "secondary" : "ghost"}
-                        className="h-auto w-full justify-start px-2.5 py-1.5 text-left"
-                        onClick={() => toggle(q, o.label)}
-                      >
-                        <span className="flex w-4 shrink-0 justify-center">{selected && <Check size={13} />}</span>
-                        <span className="min-w-0">
-                          <span className="block text-[12.5px]">{o.label}</span>
-                          {o.description && <span className="block text-[11px] text-muted-foreground">{o.description}</span>}
-                        </span>
-                      </Button>
-                    );
-                  })}
-                  <Input
-                    aria-label={`Other answer for ${q.header}`}
-                    placeholder="Other…"
-                    value={others[q.question] ?? ""}
-                    onChange={(e) => setOthers((p) => ({ ...p, [q.question]: e.target.value }))}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
+              );
+            })()
+          )
         ) : (
           <ToolBody approval={approval} />
         )}
+
         {rejecting && (
           <div className="mt-3">
             <Textarea
@@ -285,9 +340,24 @@ export function ApprovalCard({
             <Button size="sm" variant="outline" onClick={() => resolve(once(false))}>
               Dismiss
             </Button>
-            <Button size="sm" onClick={submitQuestions}>
-              Submit
-            </Button>
+            {questions.length > 0 && (
+              <>
+                {activeStep > 0 && (
+                  <Button size="sm" variant="outline" onClick={() => setStep((s) => Math.max(s - 1, 0))}>
+                    Back
+                  </Button>
+                )}
+                {isLastQuestion ? (
+                  <Button size="sm" onClick={submitQuestions}>
+                    Submit
+                  </Button>
+                ) : (
+                  <Button size="sm" onClick={() => setStep((s) => Math.min(s + 1, questions.length - 1))}>
+                    Next
+                  </Button>
+                )}
+              </>
+            )}
           </>
         ) : (
           <>
