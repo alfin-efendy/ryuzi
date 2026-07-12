@@ -96,6 +96,7 @@ where
 fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     BuildDaemonOpts {
         db_path: deps.db_path.clone(),
+        config_root: ryuzi_core::paths::config_dir(),
         telemetry: None,
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
         // `discord` feature (see `gateway::discord::mod`'s doc on why the

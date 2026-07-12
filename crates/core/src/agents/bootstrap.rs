@@ -38,6 +38,9 @@ pub enum BootstrapReason {
     Existing,
     FreshInstall,
     FirstUpgrade,
+    /// Bootstrap filesystem committed, but legacy SQL cleanup/final marker did
+    /// not. This phase never repeats destructive filesystem work.
+    FirstUpgradeCleanup,
     Reset,
     Recovery,
 }
@@ -164,12 +167,18 @@ pub async fn initialize_agent_registry(
             BootstrapReason::FirstUpgrade
         }
         (None, false) => BootstrapReason::FreshInstall,
+        (None, true) if legacy_agent_data_exists(&config_root, &store).await? => {
+            BootstrapReason::FirstUpgradeCleanup
+        }
         (None, true) => BootstrapReason::Existing,
         (Some(other), _) => anyhow::bail!("unsupported agent persistence schema `{other}`"),
     };
     match reason {
         BootstrapReason::FreshInstall | BootstrapReason::FirstUpgrade => {
             bootstrap_defaults(config_root, store, reason).await
+        }
+        BootstrapReason::FirstUpgradeCleanup => {
+            finish_first_upgrade_cleanup(config_root, store).await
         }
         BootstrapReason::Existing | BootstrapReason::Recovery => {
             load_existing(config_root, store, reason).await
@@ -247,19 +256,37 @@ async fn bootstrap_defaults(
     let transaction = transaction.with_failpoint(testing::current(&config_root));
     transaction.commit()?;
 
+    let registry = Arc::new(AgentRegistry::load(config_root.clone(), store.clone()).await?);
+    ensure_knowledge_bundles(&config_root, &registry).await?;
+
     if destructive {
         store.delete_legacy_agent_settings().await?;
     }
-
-    let registry = Arc::new(AgentRegistry::load(config_root.clone(), store.clone()).await?);
-    ensure_knowledge_bundles(&config_root, &registry).await?;
     // Marker last: a crash anywhere above leaves either the old state (the
-    // transaction rolled back) or valid new files that the next startup
-    // adopts as `Existing` and re-marks.
+    // transaction rolled back) or valid new files whose remaining SQL cleanup
+    // the next startup completes without replacing the filesystem graph.
     store
         .set_setting_raw(AGENT_PERSISTENCE_MARKER, AGENT_PERSISTENCE_SCHEMA)
         .await?;
     Ok(AgentBootstrap { registry, reason })
+}
+
+async fn finish_first_upgrade_cleanup(
+    config_root: PathBuf,
+    store: Arc<Store>,
+) -> anyhow::Result<AgentBootstrap> {
+    // The registry and knowledge defaults committed on the prior attempt.
+    // Adopt them exactly as they are and perform only the outstanding SQL
+    // cleanup before writing the marker last.
+    let registry = Arc::new(AgentRegistry::load(config_root, store.clone()).await?);
+    store.delete_legacy_agent_settings().await?;
+    store
+        .set_setting_raw(AGENT_PERSISTENCE_MARKER, AGENT_PERSISTENCE_SCHEMA)
+        .await?;
+    Ok(AgentBootstrap {
+        registry,
+        reason: BootstrapReason::FirstUpgradeCleanup,
+    })
 }
 
 async fn load_existing(
@@ -687,6 +714,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_cleanup_failure_continues_without_replacing_new_registry_or_operational_data() {
+        let fixture = BootstrapFixture::legacy().await;
+        fixture
+            .store
+            .set_setting_raw("agent_model", "smart")
+            .await
+            .unwrap();
+        fixture.insert_project_provider_and_session().await;
+        fixture.store.fail_next_legacy_agent_settings_delete();
+        assert!(
+            initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+                .await
+                .is_err()
+        );
+        let profile = fixture.config_root().join("agents/ryuzi/agent.yaml");
+        let mut customized = std::fs::read_to_string(&profile).unwrap();
+        customized = customized.replace("name: Ryuzi", "name: Ryuzi Customized");
+        std::fs::write(&profile, &customized).unwrap();
+        std::fs::write(
+            fixture
+                .config_root()
+                .join("agents/ryuzi/knowledge/memory/user/new.md"),
+            "post-upgrade data",
+        )
+        .unwrap();
+
+        let resumed = initialize_agent_registry(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert_eq!(resumed.reason, BootstrapReason::FirstUpgradeCleanup);
+        assert!(std::fs::read_to_string(profile)
+            .unwrap()
+            .contains("Ryuzi Customized"));
+        assert!(fixture
+            .config_root()
+            .join("agents/ryuzi/knowledge/memory/user/new.md")
+            .exists());
+        fixture.assert_project_provider_and_session_survive().await;
+        assert_eq!(
+            fixture.store.get_setting("agent_model").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_setting(AGENT_PERSISTENCE_MARKER)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
     async fn failed_bootstrap_does_not_set_marker_and_retries() {
         let fixture = BootstrapFixture::fresh().await;
         fixture
@@ -824,12 +905,18 @@ mod tests {
             "learning/skills",
             "learning/reviews",
             "learning/journey",
-            "learning/curator",
-            "learning/curator-history",
+            "curator",
+            "curator/history",
         ] {
             assert!(bundle.join(directory).is_dir(), "missing {directory}");
         }
-        for generated in ["memory/index.md", "learning/index.md", "log.md"] {
+        for generated in [
+            "index.md",
+            "memory/index.md",
+            "learning/index.md",
+            "curator/index.md",
+            "log.md",
+        ] {
             let path = bundle.join(generated);
             assert!(path.is_file(), "missing {generated}");
             assert!(std::fs::read_to_string(&path).unwrap().is_empty());

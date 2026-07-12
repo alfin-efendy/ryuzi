@@ -1175,6 +1175,8 @@ fn migrations() -> Migrations<'static> {
 
 pub struct Store {
     pool: Pool,
+    #[cfg(test)]
+    fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1600,7 +1602,11 @@ impl Store {
             )
         })
         .await?;
-        Ok(Store { pool })
+        Ok(Store {
+            pool,
+            #[cfg(test)]
+            fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Run a closure against a pooled connection. Domain modules (agents,
@@ -2877,11 +2883,24 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_legacy_agent_settings_delete(&self) {
+        self.fail_next_legacy_agent_settings_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Delete exactly the legacy single-agent settings keys (`agent_model`
     /// and `agent_perm_mode`) in one transaction. Used by agent bootstrap's
     /// first-upgrade/reset cleanup after the registry filesystem commit; no
     /// other settings row is touched.
     pub async fn delete_legacy_agent_settings(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_legacy_agent_settings_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected legacy agent settings cleanup failure");
+        }
         self.with_conn(|c| {
             let tx = c.transaction()?;
             tx.execute(

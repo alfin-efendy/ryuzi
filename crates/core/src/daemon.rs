@@ -39,6 +39,9 @@ use tokio::task::{JoinHandle, JoinSet};
 pub struct BuildDaemonOpts {
     /// Path to the sqlite database (created/migrated by `Store::open`).
     pub db_path: PathBuf,
+    /// Canonical root for YAML agent profiles and OKF knowledge. It must be
+    /// supplied independently of the SQLite location.
+    pub config_root: PathBuf,
     /// Override the telemetry backend (used by tests). `None` selects
     /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
@@ -298,14 +301,11 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
-    let config_root = opts
-        .db_path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(crate::paths::config_dir);
-    let persistence =
-        crate::agents::bootstrap::initialize_agent_persistence(config_root, Arc::clone(&store))
-            .await?;
+    let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+        opts.config_root,
+        Arc::clone(&store),
+    )
+    .await?;
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
     // the atomicity/idempotency/degraded-state contract.
@@ -911,6 +911,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: None,
@@ -955,6 +956,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -1031,6 +1033,7 @@ mod tests {
         std::env::set_var("HOME", fake_home.path());
         let result = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -1991,6 +1994,7 @@ mod tests {
         // Console silently and still build successfully end-to-end.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: None,
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -2025,6 +2029,7 @@ mod tests {
         // here would be awkward/flaky.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: None,
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -2056,6 +2061,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -2123,6 +2129,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -2184,10 +2191,35 @@ mod tests {
     // ---------- (j) daemon hosts scheduler + orch + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
 
     #[tokio::test]
+    async fn daemon_uses_injected_config_root_not_database_parent() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("nested/store.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            config_root: config.path().to_path_buf(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let persistence = daemon.cp.agent_persistence().unwrap();
+        assert!(Arc::ptr_eq(&daemon.agents, &persistence.registry));
+        assert!(Arc::ptr_eq(&daemon.agent_knowledge, &persistence.knowledge));
+        assert!(Arc::ptr_eq(&daemon.learning_queue, &persistence.learning));
+        assert!(config.path().join("agents/index.yaml").exists());
+        assert!(!db_path.parent().unwrap().join("agents").exists());
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
     async fn dropping_daemon_without_stop_aborts_owned_workers() {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -2214,6 +2246,7 @@ mod tests {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,

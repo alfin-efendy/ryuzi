@@ -6,15 +6,12 @@
 //! (`build_learning_graph`) over their outputs — no new SQL.
 
 use super::{ok, params, ApiError};
-use crate::agents::knowledge::AgentKnowledgeStore;
-use crate::agents::registry::AgentRegistry;
 use crate::api::types::{CuratorStatus, LearningGraph, LearningGraphEdge, LearningGraphNode};
 use crate::domain::SkillUsage;
 use crate::harness::native::memory::{MemoryScope, MemoryStore};
 use crate::serve::ApiState;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::Arc;
 
 pub(crate) const HANDLES: &[&str] = &[
     "read_memory",
@@ -66,16 +63,8 @@ struct SetPinnedP {
 }
 
 async fn default_memory(state: &ApiState) -> anyhow::Result<MemoryStore> {
-    let agent_id = AgentRegistry::default_agent_id_or_builtin(
-        crate::paths::config_dir(),
-        state.cp.store().clone(),
-    )
-    .await;
-    MemoryStore::for_agent(
-        Arc::new(AgentKnowledgeStore::new(crate::paths::config_dir())),
-        &agent_id,
-        None,
-    )
+    let agent_id = state.agents.default_agent_id().await;
+    MemoryStore::for_agent(state.agent_knowledge.clone(), &agent_id, None)
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {

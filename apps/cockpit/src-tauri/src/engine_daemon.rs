@@ -59,6 +59,7 @@ async fn run_inner() -> i32 {
 
     let opts = BuildDaemonOpts {
         db_path,
+        config_root: ryuzi_core::paths::config_dir(),
         telemetry: None,
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         // Native-only: production uses the real in-process native harness.
