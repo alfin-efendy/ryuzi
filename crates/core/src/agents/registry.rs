@@ -12,8 +12,16 @@ use crate::llm_router::{model_capabilities, routes};
 use crate::paths;
 use crate::store::Store;
 
+#[cfg(test)]
+use super::transaction::TransactionFailpoint;
+use super::transaction::{recover_transactions, AgentTransaction};
 use super::types::*;
-use super::yaml::{parse_agent_index, parse_agent_profile, parse_subagent_config};
+use super::yaml::{
+    parse_agent_index, parse_agent_index_document, parse_agent_profile,
+    parse_agent_profile_document, parse_subagent_config, parse_subagent_config_document,
+    render_agent_index, render_agent_index_document, render_agent_profile,
+    render_agent_profile_document, render_subagent_config, render_subagent_config_document,
+};
 
 pub struct AgentRegistry {
     // Task 3's transaction layer persists validated candidates beneath this root.
@@ -22,6 +30,8 @@ pub struct AgentRegistry {
     store: Arc<Store>,
     state: RwLock<Arc<RegistryState>>,
     mutations: Mutex<()>,
+    #[cfg(test)]
+    failpoint: std::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug)]
@@ -73,6 +83,7 @@ impl From<anyhow::Error> for AgentRegistryError {
 
 impl AgentRegistry {
     pub async fn load(config_root: PathBuf, store: Arc<Store>) -> anyhow::Result<Self> {
+        let transaction_recovery = recover_transactions(&config_root)?;
         let agents_root = paths::agents_dir_in(&config_root);
         let index_path = agents_root.join("index.yaml");
         let parsed_index = read_to_string(&index_path)
@@ -121,13 +132,11 @@ impl AgentRegistry {
         )
         .with_context(|| format!("failed to parse {}", subagents_path.display()))?;
 
-        let recovery = recovering
-            .then(|| AgentRecoveryNotice {
-                code: "index-rebuilt".into(),
-                message: "Recovered agent registry order from agent directories.".into(),
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut recovery = transaction_recovery;
+        recovery.extend(recovering.then(|| AgentRecoveryNotice {
+            code: "index-rebuilt".into(),
+            message: "Recovered agent registry order from agent directories.".into(),
+        }));
 
         let mut index = parsed_index.unwrap_or_else(|_| AgentIndex {
             schema_version: AGENT_SCHEMA_VERSION,
@@ -190,6 +199,8 @@ impl AgentRegistry {
                 repairs,
             })),
             mutations: Mutex::new(()),
+            #[cfg(test)]
+            failpoint: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -226,7 +237,14 @@ impl AgentRegistry {
         index.order.push(id.clone());
         self.validate_mutation(&index, &profiles, &state.subagents, &id)
             .await?;
-        Err(transaction_unavailable())
+        let snapshot = self
+            .commit_candidate(index, profiles, state.subagents.clone(), Vec::new())
+            .await?;
+        Ok(snapshot
+            .agents
+            .into_iter()
+            .find(|agent| agent.profile.id == id)
+            .expect("committed agent"))
     }
 
     pub async fn update(
@@ -243,7 +261,19 @@ impl AgentRegistry {
         profiles.insert(agent_id.into(), profile_from_input(agent_id.into(), input));
         self.validate_mutation(&state.index, &profiles, &state.subagents, agent_id)
             .await?;
-        Err(transaction_unavailable())
+        let snapshot = self
+            .commit_candidate(
+                state.index.clone(),
+                profiles,
+                state.subagents.clone(),
+                Vec::new(),
+            )
+            .await?;
+        Ok(snapshot
+            .agents
+            .into_iter()
+            .find(|agent| agent.profile.id == agent_id)
+            .expect("committed updated agent"))
     }
 
     pub async fn duplicate(&self, agent_id: &str) -> Result<AgentSnapshot, AgentRegistryError> {
@@ -263,7 +293,14 @@ impl AgentRegistry {
         index.order.push(id.clone());
         self.validate_mutation(&index, &profiles, &state.subagents, &id)
             .await?;
-        Err(transaction_unavailable())
+        let snapshot = self
+            .commit_candidate(index, profiles, state.subagents.clone(), Vec::new())
+            .await?;
+        Ok(snapshot
+            .agents
+            .into_iter()
+            .find(|agent| agent.profile.id == id)
+            .expect("committed duplicate"))
     }
 
     pub async fn delete(
@@ -287,7 +324,13 @@ impl AgentRegistry {
         }
         self.validate_candidate(&index, &profiles, &state.subagents)
             .await?;
-        Err(transaction_unavailable())
+        self.commit_candidate(
+            index,
+            profiles,
+            state.subagents.clone(),
+            vec![agent_id.into()],
+        )
+        .await
     }
 
     pub async fn set_default(
@@ -303,7 +346,13 @@ impl AgentRegistry {
         index.default_agent_id = agent_id.into();
         self.validate_candidate(&index, &typed_profiles(&state), &state.subagents)
             .await?;
-        Err(transaction_unavailable())
+        self.commit_candidate(
+            index,
+            typed_profiles(&state),
+            state.subagents.clone(),
+            Vec::new(),
+        )
+        .await
     }
 
     pub async fn set_subagent_model(
@@ -322,7 +371,111 @@ impl AgentRegistry {
         if !issues.is_empty() {
             return Err(AgentRegistryError::Invalid(issues));
         }
-        Err(transaction_unavailable())
+        self.commit_candidate(
+            state.index.clone(),
+            typed_profiles(&state),
+            subagents,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn commit_candidate(
+        &self,
+        index: AgentIndex,
+        profiles: IndexMap<AgentId, AgentProfile>,
+        subagents: SubagentConfig,
+        deleted_agent_ids: Vec<AgentId>,
+    ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
+        self.validate_candidate(&index, &profiles, &subagents)
+            .await?;
+        let disk_image =
+            self.render_disk_image(&index, &profiles, &subagents, deleted_agent_ids)?;
+        let transaction = AgentTransaction::prepare(&self.config_root, &disk_image)?;
+        #[cfg(test)]
+        let transaction = transaction.with_failpoint(
+            match self.failpoint.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => TransactionFailpoint::BeforeIndexReplace,
+                2 => TransactionFailpoint::AfterIndexReplaceBeforeCommitMarker,
+                _ => TransactionFailpoint::None,
+            },
+        );
+        transaction.commit()?;
+        let agents = profiles
+            .into_iter()
+            .map(|(id, profile)| {
+                (
+                    id,
+                    Arc::new(AgentSnapshot {
+                        profile,
+                        executable: true,
+                        validation: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        let next = Arc::new(RegistryState {
+            index,
+            agents,
+            subagents,
+            recovery: self.state.read().await.recovery.clone(),
+            repairs: Vec::new(),
+        });
+        let snapshot = snapshot_from_state(&next);
+        *self.state.write().await = next;
+        Ok(snapshot)
+    }
+
+    fn render_disk_image(
+        &self,
+        index: &AgentIndex,
+        profiles: &IndexMap<AgentId, AgentProfile>,
+        subagents: &SubagentConfig,
+        deleted_agent_ids: Vec<AgentId>,
+    ) -> anyhow::Result<RegistryDiskImage> {
+        let index_path = paths::agents_dir_in(&self.config_root).join("index.yaml");
+        let index_yaml = match std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|raw| parse_agent_index_document(&raw).ok())
+        {
+            Some(mut document) => {
+                document.merge_typed(index.clone());
+                render_agent_index_document(&document)?
+            }
+            None => render_agent_index(index)?,
+        };
+        let subagents_path = paths::agents_dir_in(&self.config_root).join("subagents.yaml");
+        let subagents_yaml = match std::fs::read_to_string(&subagents_path)
+            .ok()
+            .and_then(|raw| parse_subagent_config_document(&raw).ok())
+        {
+            Some(mut document) => {
+                document.merge_typed(subagents.clone());
+                render_subagent_config_document(&document)?
+            }
+            None => render_subagent_config(subagents)?,
+        };
+        let mut agents = IndexMap::new();
+        for (id, profile) in profiles {
+            let profile_path = paths::agent_dir_in(&self.config_root, id).join("agent.yaml");
+            let yaml = match std::fs::read_to_string(&profile_path)
+                .ok()
+                .and_then(|raw| parse_agent_profile_document(&raw).ok())
+            {
+                Some(mut document) => {
+                    document.merge_typed(profile.clone());
+                    render_agent_profile_document(&document)?
+                }
+                None => render_agent_profile(profile)?,
+            };
+            agents.insert(id.clone(), yaml);
+        }
+        Ok(RegistryDiskImage {
+            index_yaml,
+            subagents_yaml,
+            agents,
+            deleted_agent_ids,
+        })
     }
 
     async fn validate_mutation(
@@ -762,10 +915,6 @@ fn snapshot_from_state(state: &RegistryState) -> AgentRegistrySnapshot {
     }
 }
 
-fn transaction_unavailable() -> AgentRegistryError {
-    AgentRegistryError::Io(anyhow!("agent transaction layer is not initialized"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1003,7 +1152,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn candidate_mutation_validates_then_stops_at_transaction_seam() {
+    async fn failure_after_index_replace_restores_disk_and_cache() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        registry
+            .failpoint
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(registry
+            .update("ryuzi", mutation_input("Not Active"))
+            .await
+            .is_err());
+        assert_eq!(registry.get("ryuzi").await.unwrap().profile.name, "Ryuzi");
+        let raw =
+            std::fs::read_to_string(fixture.root.path().join("agents/ryuzi/agent.yaml")).unwrap();
+        assert!(raw.contains("name: Ryuzi"));
+    }
+
+    #[tokio::test]
+    async fn update_commits_disk_before_publishing_cache_and_preserves_extensions() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_raw(
+            "agents/index.yaml",
+            "schema_version: 1\norder: [ryuzi]\ndefault_agent_id: ryuzi\nx_sync: manual\n",
+        );
+        fixture.write_raw(
+            "agents/ryuzi/agent.yaml",
+            &format!(
+                "{}x_vendor:\n  retained: true\n",
+                profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high"))
+            ),
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let mut input = mutation_input("Ryuzi Prime");
+        input.description = "Committed description".into();
+        let updated = registry.update("ryuzi", input).await.unwrap();
+        assert_eq!(updated.profile.name, "Ryuzi Prime");
+        let raw =
+            std::fs::read_to_string(fixture.root.path().join("agents/ryuzi/agent.yaml")).unwrap();
+        let index = std::fs::read_to_string(fixture.root.path().join("agents/index.yaml")).unwrap();
+        assert!(raw.contains("x_vendor:"));
+        assert!(index.contains("x_sync: manual"));
+    }
+
+    #[tokio::test]
+    async fn all_mutations_commit_complete_images_and_preserve_extensions() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_raw(
+            "agents/index.yaml",
+            "schema_version: 1\norder: [ryuzi]\ndefault_agent_id: ryuzi\nx_sync: manual\n",
+        );
+        fixture.write_raw(
+            "agents/subagents.yaml",
+            "schema_version: 1\nmodel: { name: anthropic/claude-opus-4-8, effort: high }\nx_vendor: retained\n",
+        );
+        fixture.write_raw(
+            "agents/ryuzi/agent.yaml",
+            &format!(
+                "{}x_vendor:\n  retained: true\n",
+                profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high"))
+            ),
+        );
+        fixture.write_raw("agents/ryuzi/knowledge/note.md", "keep me");
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+
+        let created = registry.create(mutation_input("Worker")).await.unwrap();
+        let duplicate = registry.duplicate("ryuzi").await.unwrap();
+        assert_eq!(duplicate.profile.name, "Ryuzi Copy");
+        registry.set_default(&created.profile.id).await.unwrap();
+        registry
+            .set_subagent_model(AgentModel::Concrete {
+                name: "anthropic/claude-opus-4-5".into(),
+                effort: Some("high".into()),
+            })
+            .await
+            .unwrap();
+        registry.delete("ryuzi").await.unwrap();
+
+        let agents_root = fixture.root.path().join("agents");
+        assert!(!agents_root.join("ryuzi").exists());
+        assert!(agents_root
+            .join(&created.profile.id)
+            .join("agent.yaml")
+            .exists());
+        assert!(agents_root
+            .join(&duplicate.profile.id)
+            .join("agent.yaml")
+            .exists());
+        assert!(std::fs::read_to_string(agents_root.join("index.yaml"))
+            .unwrap()
+            .contains("x_sync: manual"));
+        assert!(std::fs::read_to_string(agents_root.join("subagents.yaml"))
+            .unwrap()
+            .contains("x_vendor: retained"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_serialize_and_keep_unique_names() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = Arc::new(
+            AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+                .await
+                .unwrap(),
+        );
+
+        let (first, second) = tokio::join!(
+            registry.create(mutation_input("Worker")),
+            registry.create(mutation_input("worker"))
+        );
+
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .into_iter()
+                .filter(|ok| *ok)
+                .count(),
+            1
+        );
+        assert_eq!(registry.snapshot().await.agents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_final_agent_fails_without_creating_a_journal() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_single(profile_yaml(
+            "ryuzi",
+            "Ryuzi",
+            "anthropic/claude-opus-4-8",
+            Some("high"),
+        ));
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry.delete("ryuzi").await,
+            Err(AgentRegistryError::LastAgent)
+        ));
+        assert!(!fixture.root.path().join("agents/.transactions").exists());
+    }
+
+    fn mutation_input(name: &str) -> AgentMutationInput {
+        AgentMutationInput {
+            name: name.into(),
+            description: "Updated".into(),
+            avatar: AgentAvatar {
+                color: "blue".into(),
+            },
+            model: AgentModel::Concrete {
+                name: "anthropic/claude-opus-4-8".into(),
+                effort: Some("high".into()),
+            },
+            permissions: AgentPermissions {
+                mode: crate::PermMode::Default,
+                rules: Vec::new(),
+            },
+            skills: Vec::new(),
+            tools: AgentTools {
+                native: vec!["read".into()],
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+            loop_settings: AgentLoop {
+                max_turns: 10,
+                max_tool_rounds: 20,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_mutation_commits_after_validation() {
         let fixture = RegistryFixture::new().await;
         fixture.write_single(profile_yaml(
             "ryuzi",
@@ -1040,9 +1373,9 @@ mod tests {
                 max_tool_rounds: 20,
             },
         };
-        let error = registry.update("ryuzi", input).await.unwrap_err();
-        assert!(matches!(error, AgentRegistryError::Io(_)));
-        assert_eq!(registry.snapshot().await, before);
+        let updated = registry.update("ryuzi", input).await.unwrap();
+        assert_eq!(updated.profile.name, "Ryuzi Updated");
+        assert_ne!(registry.snapshot().await, before);
         assert_eq!(registry.config_root, fixture.config_root());
     }
 }
