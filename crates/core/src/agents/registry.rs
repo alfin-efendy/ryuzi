@@ -387,9 +387,12 @@ impl AgentRegistry {
         self.validate_candidate(&index, &profiles, &state.subagents)
             .await?;
         let queue = self.learning_queue.get().and_then(Weak::upgrade);
-        if let Some(queue) = &queue {
+        let apply_fence = if let Some(queue) = &queue {
             queue.block(agent_id).await?;
-        }
+            Some(queue.acquire_apply_fence(agent_id).await?)
+        } else {
+            None
+        };
         let result = self
             .commit_candidate(
                 index,
@@ -399,13 +402,22 @@ impl AgentRegistry {
             )
             .await;
         match result {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
                 if let Some(queue) = &queue {
-                    queue.discard_unconsumed(agent_id).await?;
+                    if let Err(error) = queue.discard_unconsumed(agent_id).await {
+                        snapshot.recovery.push(AgentRecoveryNotice {
+                            code: "learning_cleanup_pending".into(),
+                            message: format!(
+                                "agent `{agent_id}` was deleted, but learning queue cleanup is pending: {error}"
+                            ),
+                        });
+                    }
                 }
+                drop(apply_fence);
                 Ok(snapshot)
             }
             Err(error) => {
+                drop(apply_fence);
                 if let Some(queue) = &queue {
                     queue.unblock(agent_id).await?;
                 }
@@ -1274,6 +1286,169 @@ mod tests {
         assert!(
             matches!(error, AgentRegistryError::Invalid(issues) if issues.iter().any(|issue| issue.field == "model.name"))
         );
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_active_apply_then_removes_bundle_and_keeps_queue_blocked() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["ryuzi", "worker"], "ryuzi");
+        fixture.write_profile(
+            "ryuzi",
+            profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile(
+            "worker",
+            profile_yaml(
+                "worker",
+                "Worker",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        let registry = Arc::new(
+            AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+                .await
+                .unwrap(),
+        );
+        let knowledge = Arc::new(AgentKnowledgeStore::new(fixture.config_root()));
+        let learning = Arc::new(LearningQueue::new(fixture.store.clone(), knowledge));
+        registry
+            .attach_learning_queue(Arc::downgrade(&learning))
+            .unwrap();
+        let event = learning
+            .enqueue(
+                "worker",
+                LearningEventPayload::Review(ReviewEvent {
+                    title: "active".into(),
+                    description: "active apply".into(),
+                    body: "must finish before deletion".into(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        let claimed = learning
+            .claim_next("worker", "worker-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let (apply_entered, release_apply) = learning.pause_next_apply_for_test();
+        let apply_queue = Arc::clone(&learning);
+        let apply = tokio::spawn(async move { apply_queue.apply_claimed(&claimed).await });
+        apply_entered.notified().await;
+
+        let delete_registry = Arc::clone(&registry);
+        let delete = tokio::spawn(async move { delete_registry.delete("worker").await });
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished(), "delete must drain the active apply");
+
+        release_apply.notify_one();
+        apply.await.unwrap().unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(!fixture.root.path().join("agents/worker").exists());
+        assert!(learning
+            .enqueue(
+                "worker",
+                LearningEventPayload::Review(ReviewEvent {
+                    title: "late".into(),
+                    description: "late".into(),
+                    body: "late".into(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .is_err());
+        assert!(learning
+            .claim_next("worker", "worker-2")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!fixture.root.path().join("agents/worker").exists());
+        assert_ne!(event.event_id, "");
+    }
+
+    #[tokio::test]
+    async fn committed_delete_reports_cleanup_warning_and_retry_converges() {
+        let fixture = RegistryFixture::new().await;
+        fixture.write_index(&["ryuzi", "worker"], "ryuzi");
+        fixture.write_profile(
+            "ryuzi",
+            profile_yaml("ryuzi", "Ryuzi", "anthropic/claude-opus-4-8", Some("high")),
+        );
+        fixture.write_profile(
+            "worker",
+            profile_yaml(
+                "worker",
+                "Worker",
+                "anthropic/claude-opus-4-8",
+                Some("high"),
+            ),
+        );
+        let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
+            .await
+            .unwrap();
+        let knowledge = Arc::new(AgentKnowledgeStore::new(fixture.config_root()));
+        let learning = Arc::new(LearningQueue::new(fixture.store.clone(), knowledge));
+        registry
+            .attach_learning_queue(Arc::downgrade(&learning))
+            .unwrap();
+        learning
+            .enqueue(
+                "worker",
+                LearningEventPayload::Review(ReviewEvent {
+                    title: "pending".into(),
+                    description: "pending".into(),
+                    body: "pending".into(),
+                    tags: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        learning.fail_next_discard_for_test();
+
+        let outcome = registry.delete("worker").await.unwrap();
+        assert!(!fixture.root.path().join("agents/worker").exists());
+        assert!(outcome.recovery.iter().any(|notice| {
+            notice.code == "learning_cleanup_pending" && notice.message.contains("worker")
+        }));
+        assert!(learning
+            .blocked_agents()
+            .await
+            .unwrap()
+            .contains(&"worker".into()));
+        let rows_before_retry: i64 = fixture
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM agent_learning_queue \
+                     WHERE agent_id='worker' AND status IN ('pending','claimed')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows_before_retry, 1);
+
+        learning.discard_unconsumed("worker").await.unwrap();
+        let rows_after_retry: i64 = fixture
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM agent_learning_queue \
+                     WHERE agent_id='worker' AND status IN ('pending','claimed')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows_after_retry, 0);
+        assert!(learning
+            .blocked_agents()
+            .await
+            .unwrap()
+            .contains(&"worker".into()));
     }
 
     #[tokio::test]

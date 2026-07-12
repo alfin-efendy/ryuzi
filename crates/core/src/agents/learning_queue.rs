@@ -118,6 +118,10 @@ pub struct LearningQueue {
     store: Arc<Store>,
     knowledge: Arc<AgentKnowledgeStore>,
     stale_after_ms: i64,
+    #[cfg(test)]
+    apply_pause: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    fail_next_discard: std::sync::atomic::AtomicBool,
 }
 
 impl LearningQueue {
@@ -126,6 +130,10 @@ impl LearningQueue {
             store,
             knowledge,
             stale_after_ms: DEFAULT_STALE_AFTER_MS,
+            #[cfg(test)]
+            apply_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_discard: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -312,16 +320,51 @@ impl LearningQueue {
     /// event-id check, the writes, index regeneration, and log append,
     /// and replaying an already-recorded event is a converging no-op.
     pub async fn apply_claimed(&self, event: &LearningEvent) -> anyhow::Result<()> {
+        let fence = self.knowledge.write_fence(&event.agent_id)?;
+        let _guard = fence.lock().await;
+        if self.is_blocked(&event.agent_id).await? {
+            bail!(
+                "agent `{}` no longer accepts learning events",
+                event.agent_id
+            );
+        }
+        #[cfg(test)]
+        let pause = { self.apply_pause.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
         let store = self.knowledge.for_agent(&event.agent_id)?;
         let agent_id = event.agent_id.clone();
         let event_id = event.event_id.clone();
         let payload = event.payload.clone();
-        store
-            .apply_learning_event(&event.event_id, move |scan| {
-                plan_learning_writes(&agent_id, &event_id, &payload, scan)
-            })
-            .await?;
+        store.apply_learning_event_fenced(&event.event_id, move |scan| {
+            plan_learning_writes(&agent_id, &event_id, &payload, scan)
+        })?;
         Ok(())
+    }
+
+    pub(crate) async fn acquire_apply_fence(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+        Ok(self.knowledge.write_fence(agent_id)?.lock_owned().await)
+    }
+
+    async fn is_blocked(&self, agent_id: &str) -> anyhow::Result<bool> {
+        let agent = agent_id.to_owned();
+        self.store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT enqueue_blocked FROM agent_learning_state WHERE agent_id=?1",
+                    params![agent],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map(|blocked| blocked.unwrap_or(0) != 0)
+            })
+            .await
     }
 
     /// Acknowledges a claimed event as durably applied. Re-acknowledging
@@ -426,18 +469,43 @@ impl LearningQueue {
     /// Drops every pending or claimed row for the agent; delivered rows
     /// stay as the audit trail of what was actually applied.
     pub async fn discard_unconsumed(&self, agent_id: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_discard
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected learning queue discard failure");
+        }
         validate_agent_id(agent_id).map_err(|issue| anyhow!(issue.message))?;
         let agent = agent_id.to_owned();
         self.store
             .with_conn(move |c| {
                 c.execute(
                     "DELETE FROM agent_learning_queue \
-                     WHERE agent_id=?1 AND status != 'delivered'",
+                     WHERE agent_id=?1 AND status IN ('pending','claimed')",
                     params![agent],
                 )
                 .map(|_| ())
             })
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_apply_for_test(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pause = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.apply_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_discard_for_test(&self) {
+        self.fail_next_discard
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn set_blocked(&self, agent_id: &str, blocked: bool) -> anyhow::Result<()> {

@@ -122,15 +122,22 @@ impl AgentKnowledgeStore {
         }
     }
 
-    pub fn for_agent(&self, agent_id: &str) -> anyhow::Result<KnowledgeStore> {
+    /// Acquires the write fence shared by every knowledge mutation for this
+    /// agent. Deletion uses it to drain an active queue apply and prevent any
+    /// later apply from racing the filesystem commit.
+    pub(crate) fn write_fence(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Arc<tokio::sync::Mutex<()>>> {
         validate_agent_id(agent_id).map_err(|issue| anyhow!(issue.message))?;
-        let write_lock = self
-            .locks
+        self.locks
             .lock()
-            .map_err(|_| anyhow!("knowledge lock registry is poisoned"))?
-            .entry(agent_id.to_owned())
-            .or_default()
-            .clone();
+            .map_err(|_| anyhow!("knowledge lock registry is poisoned"))
+            .map(|mut locks| locks.entry(agent_id.to_owned()).or_default().clone())
+    }
+
+    pub fn for_agent(&self, agent_id: &str) -> anyhow::Result<KnowledgeStore> {
+        let write_lock = self.write_fence(agent_id)?;
         Ok(KnowledgeStore {
             agent_id: agent_id.to_owned(),
             root: paths::agent_knowledge_dir_in(&self.config_root, agent_id),
@@ -388,10 +395,21 @@ impl KnowledgeStore {
     where
         F: FnOnce(&KnowledgeScan) -> anyhow::Result<LearningEventWrites>,
     {
+        let _guard = self.write_lock.lock().await;
+        self.apply_learning_event_fenced(event_id, plan)
+    }
+
+    pub(crate) fn apply_learning_event_fenced<F>(
+        &self,
+        event_id: &str,
+        plan: F,
+    ) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&KnowledgeScan) -> anyhow::Result<LearningEventWrites>,
+    {
         if event_id.trim().is_empty() {
             bail!("learning event id must not be blank");
         }
-        let _guard = self.write_lock.lock().await;
         ensure_bundle_at(&self.root)?;
         let scan = scan_bundle(&self.root)?;
         if scan

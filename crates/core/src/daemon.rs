@@ -95,11 +95,9 @@ pub struct Daemon {
     /// tracked for the same reason as `scheduler_handle`/`orch_handle` — the
     /// daemon is the single always-on engine host for it too.
     rail_handle: JoinHandle<()>,
-    /// The learning worker's loop (`learning::spawn_runner`, Task 8), tracked
-    /// for the same reason as `rail_handle`. It claims `kind='learning'` rows
-    /// the rail drainer deliberately skips (see `learning.rs`'s module doc)
-    /// and drives a review fork per row — a separate daemon-hosted loop, not
-    /// a delivery path the rail drainer itself takes.
+    /// The durable per-agent learning queue worker (`learning::spawn_runner`),
+    /// tracked for the same reason as `rail_handle`. It claims pending queue
+    /// rows and applies them to the owning agent's OKF bundle.
     learning_handle: JoinHandle<()>,
     /// The curator's weekly skill-lifecycle loop (`curator::spawn_runner`,
     /// Task 10), tracked for the same reason as `learning_handle`. Unlike
@@ -214,6 +212,18 @@ impl Daemon {
         // `ControlPlane::shutdown_extensions`'s doc.
         self.cp.shutdown_extensions().await;
         self.telemetry.shutdown();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.router_handle.abort();
+        self.fanout_handle.abort();
+        self.scheduler_handle.abort();
+        self.orch_handle.abort();
+        self.rail_handle.abort();
+        self.learning_handle.abort();
+        self.curator_handle.abort();
     }
 }
 
@@ -2172,6 +2182,32 @@ mod tests {
     }
 
     // ---------- (j) daemon hosts scheduler + orch + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
+
+    #[tokio::test]
+    async fn dropping_daemon_without_stop_aborts_owned_workers() {
+        let (_guard, db_path) = temp_db_path();
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let learning = daemon.learning_handle.abort_handle();
+        let scheduler = daemon.scheduler_handle.abort_handle();
+        assert!(!learning.is_finished());
+        assert!(!scheduler.is_finished());
+
+        drop(daemon);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !learning.is_finished() || !scheduler.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the daemon must cancel its owned workers");
+    }
 
     #[tokio::test]
     async fn daemon_hosts_and_stop_aborts_scheduler_orch_rail_learning_and_curator_loops() {
