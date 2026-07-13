@@ -527,16 +527,23 @@ impl ControlPlane {
                         .await
                     {
                         Ok(session) => {
-                            if let Err(error) = crate::automation::link_run_session(
+                            match crate::automation::link_run_session(
                                 &self.store,
                                 &run.id,
                                 &session.session_pk,
                             )
                             .await
                             {
-                                tracing::warn!(run_id = %run.id, "automation session link failed: {error}");
+                                Ok(true) => self.emit_automation_run_changed(
+                                    &run.hook_id,
+                                    &run.id,
+                                    "running",
+                                ),
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::warn!(run_id = %run.id, "automation session link failed: {error}");
+                                }
                             }
-                            self.emit_automation_run_changed(&run.hook_id, &run.id, "running");
                         }
                         Err(error) => {
                             self.finish_automation_run(
@@ -674,13 +681,19 @@ impl ControlPlane {
         session_pk: Option<&str>,
         error: Option<&str>,
     ) {
-        if let Err(error) =
-            crate::automation::finish_run(&self.store, run_id, status, session_pk, error).await
-        {
-            tracing::warn!(run_id, "automation run finalization failed: {error}");
-            return;
+        let changed =
+            match crate::automation::finish_run(&self.store, run_id, status, session_pk, error)
+                .await
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    tracing::warn!(run_id, "automation run finalization failed: {error}");
+                    return;
+                }
+            };
+        if changed {
+            self.emit_automation_run_changed(hook_id, run_id, status);
         }
-        self.emit_automation_run_changed(hook_id, run_id, status);
     }
 
     fn emit_automation_run_changed(&self, hook_id: &str, run_id: &str, status: &str) {

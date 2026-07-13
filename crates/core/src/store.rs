@@ -6172,7 +6172,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 35, "forward migration must land at v35");
+        assert_eq!(user_version, 36, "forward migration must land at v36");
     }
 
     #[tokio::test]

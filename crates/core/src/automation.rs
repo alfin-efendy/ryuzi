@@ -843,7 +843,7 @@ pub async fn finish_run(
     status: &str,
     session_pk: Option<&str>,
     error: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let run_id = run_id.to_string();
     let status = status.to_string();
     let session_pk = session_pk.map(ToString::to_string);
@@ -857,8 +857,8 @@ pub async fn finish_run(
                      started_at=COALESCE(started_at, ?5), finished_at=?5
                  WHERE id=?1 AND status IN ('queued', 'running')",
                 params![run_id, status, session_pk, error, now],
-            )?;
-            Ok(())
+            )
+            .map(|changed| changed > 0)
         })
         .await
 }
@@ -881,7 +881,11 @@ pub async fn mark_run_queued_not_dispatched(
         .await
 }
 
-pub async fn link_run_session(store: &Store, run_id: &str, session_pk: &str) -> anyhow::Result<()> {
+pub async fn link_run_session(
+    store: &Store,
+    run_id: &str,
+    session_pk: &str,
+) -> anyhow::Result<bool> {
     let run_id = run_id.to_string();
     let session_pk = session_pk.to_string();
     let now = now_ms();
@@ -892,8 +896,8 @@ pub async fn link_run_session(store: &Store, run_id: &str, session_pk: &str) -> 
              SET status='running', session_pk=?2, started_at=?3
              WHERE id=?1 AND status='queued'",
                 params![run_id, session_pk, now],
-            )?;
-            Ok(())
+            )
+            .map(|changed| changed > 0)
         })
         .await
 }
@@ -1139,10 +1143,10 @@ mod tests {
 
         // Link is the normal start path; stop/end finalizes it as failed. The
         // delayed startup link and successful turn completion must both lose.
-        link_run_session(&store, &run.id, "session-1")
+        assert!(link_run_session(&store, &run.id, "session-1")
             .await
-            .unwrap();
-        finish_run(
+            .unwrap());
+        assert!(finish_run(
             &store,
             &run.id,
             "failed",
@@ -1150,13 +1154,15 @@ mod tests {
             Some("session cancelled"),
         )
         .await
-        .unwrap();
-        link_run_session(&store, &run.id, "session-2")
+        .unwrap());
+        assert!(!link_run_session(&store, &run.id, "session-2")
             .await
-            .unwrap();
-        finish_run(&store, &run.id, "success", Some("session-2"), None)
-            .await
-            .unwrap();
+            .unwrap());
+        assert!(
+            !finish_run(&store, &run.id, "success", Some("session-2"), None)
+                .await
+                .unwrap()
+        );
 
         let stored = list_runs(&store, &hook.id).await.unwrap();
         assert_eq!(stored[0].status, "failed");

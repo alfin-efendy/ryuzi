@@ -1346,6 +1346,11 @@ impl ControlPlane {
         self.store
             .update_status(session_pk, SessionStatus::Ended, Some(now_ms()))
             .await?;
+        // A cancelled hook-origin turn can still return Ok while its handle is
+        // unwinding. Terminally fail its run before cancellation so that late
+        // completion loses the guarded transition.
+        self.finish_automation_session(session_pk, "failed", Some("session cancelled"))
+            .await;
         let handle = self.running.lock().unwrap().remove(session_pk);
         if let Some(handle) = handle {
             // Interrupt any in-flight turn first so teardown doesn't race a

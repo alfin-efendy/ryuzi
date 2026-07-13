@@ -575,6 +575,79 @@ async fn gateway_status_adapter_dispatches_only_matching_hook() {
 }
 
 #[tokio::test]
+async fn ending_a_hook_session_preserves_failed_run_and_never_emits_late_success() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let cp = test_control_plane(store, registries(true)).await;
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = cp
+        .connect_project(project_dir.path(), "automation")
+        .await
+        .unwrap();
+    let hook = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "end race",
+            crate::automation::TriggerKind::ToolAfter,
+            &project.project_id,
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let mut events = cp.subscribe();
+
+    cp.dispatch_automation_event(
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::ToolAfter,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("tool", "test"),
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await;
+
+    let run = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let session_pk = run.session_pk.clone().expect("run is linked to a session");
+    wait_for_running_handle(&cp, &session_pk).await;
+
+    // The fake returns Ok only after cancellation, reproducing the late-success
+    // path that used to overwrite and emit success after end_session.
+    cp.end_session(&session_pk).await.unwrap();
+    for _ in 0..400 {
+        if cp.running_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(cp.running_count(), 0, "cancelled prompt must finish");
+
+    let stored = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap();
+    assert_eq!(stored[0].status, "failed");
+    assert_eq!(stored[0].error.as_deref(), Some("session cancelled"));
+
+    let mut run_statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::AutomationHookRunChanged { run_id, status, .. } = event {
+            if run_id == run.id {
+                run_statuses.push(status);
+            }
+        }
+    }
+    assert_eq!(run_statuses, ["running", "failed"]);
+    drop(db_guard);
+}
+
+#[tokio::test]
 #[serial]
 async fn start_session_emits_session_run_count_and_harness_run_span() {
     let _guard = StateDirGuard::new();
