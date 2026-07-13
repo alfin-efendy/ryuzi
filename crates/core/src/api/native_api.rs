@@ -10,13 +10,25 @@ use super::{ok, params, ApiError};
 use crate::api::types::*;
 use crate::control::ControlPlane;
 use crate::harness::native::agents::AgentRegistry;
-use crate::harness::native::commands::CommandRegistry;
+use crate::harness::native::commands::{
+    delete_project_command, list_project_commands, read_project_command, write_project_command,
+    CommandFileError, CommandRegistry,
+};
 use crate::serve::ApiState;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
 
-pub(crate) const HANDLES: &[&str] = &["native_agents", "native_commands", "session_todos"];
+pub(crate) const HANDLES: &[&str] = &[
+    "native_agents",
+    "native_commands",
+    "session_todos",
+    "list_project_commands",
+    "read_project_command",
+    "create_project_command",
+    "update_project_command",
+    "delete_project_command",
+];
 
 #[derive(Deserialize)]
 struct ProjectIdP {
@@ -25,6 +37,37 @@ struct ProjectIdP {
 #[derive(Deserialize)]
 struct SessionPkP {
     session_pk: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCommandCreateP {
+    project_id: String,
+    input: ProjectCommandInputDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCommandReadP {
+    project_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCommandUpdateP {
+    project_id: String,
+    name: String,
+    revision: String,
+    input: ProjectCommandMutationDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectCommandDeleteP {
+    project_id: String,
+    name: String,
+    revision: String,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
@@ -37,6 +80,27 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "native_commands" => {
             let a: ProjectIdP = params(p)?;
             ok(native_commands(cp, &a.project_id).await?)
+        }
+        "list_project_commands" => {
+            let a: ProjectIdP = params(p)?;
+            ok(list_commands(cp, &a.project_id).await?)
+        }
+        "read_project_command" => {
+            let a: ProjectCommandReadP = params(p)?;
+            ok(read_command(cp, &a.project_id, &a.name).await?)
+        }
+        "create_project_command" => {
+            let a: ProjectCommandCreateP = params(p)?;
+            ok(create_command(cp, &a.project_id, a.input).await?)
+        }
+        "update_project_command" => {
+            let a: ProjectCommandUpdateP = params(p)?;
+            ok(update_command(cp, &a.project_id, &a.name, &a.revision, a.input).await?)
+        }
+        "delete_project_command" => {
+            let a: ProjectCommandDeleteP = params(p)?;
+            delete_command(cp, &a.project_id, &a.name, &a.revision).await?;
+            ok(())
         }
         "session_todos" => {
             let a: SessionPkP = params(p)?;
@@ -75,6 +139,74 @@ async fn native_agents(cp: &ControlPlane, project_id: &str) -> Result<Vec<AgentI
         .collect())
 }
 
+async fn list_commands(
+    cp: &ControlPlane,
+    project_id: &str,
+) -> Result<Vec<ProjectCommandInfo>, ApiError> {
+    let workdir = project_workdir(cp, project_id).await?;
+    list_project_commands(Path::new(&workdir))
+        .map(|commands| commands.into_iter().map(Into::into).collect())
+        .map_err(command_file_error)
+}
+
+async fn read_command(
+    cp: &ControlPlane,
+    project_id: &str,
+    name: &str,
+) -> Result<ProjectCommandInfo, ApiError> {
+    let workdir = project_workdir(cp, project_id).await?;
+    read_project_command(Path::new(&workdir), name)
+        .map(Into::into)
+        .map_err(command_file_error)
+}
+
+async fn create_command(
+    cp: &ControlPlane,
+    project_id: &str,
+    input: ProjectCommandInputDto,
+) -> Result<ProjectCommandInfo, ApiError> {
+    let workdir = project_workdir(cp, project_id).await?;
+    write_project_command(Path::new(&workdir), input.into(), None)
+        .map(Into::into)
+        .map_err(command_file_error)
+}
+
+async fn update_command(
+    cp: &ControlPlane,
+    project_id: &str,
+    name: &str,
+    revision: &str,
+    input: ProjectCommandMutationDto,
+) -> Result<ProjectCommandInfo, ApiError> {
+    let workdir = project_workdir(cp, project_id).await?;
+    write_project_command(Path::new(&workdir), input.with_name(name), Some(revision))
+        .map(Into::into)
+        .map_err(command_file_error)
+}
+
+async fn delete_command(
+    cp: &ControlPlane,
+    project_id: &str,
+    name: &str,
+    revision: &str,
+) -> Result<(), ApiError> {
+    let workdir = project_workdir(cp, project_id).await?;
+    delete_project_command(Path::new(&workdir), name, revision).map_err(command_file_error)
+}
+
+fn command_file_error(error: CommandFileError) -> ApiError {
+    match error {
+        CommandFileError::InvalidName(message) => ApiError::bad_request(message),
+        CommandFileError::NotFound(name) => {
+            ApiError::not_found(format!("project command not found: {name}"))
+        }
+        CommandFileError::RevisionConflict => ApiError::conflict(error.to_string()),
+        CommandFileError::Io(error) => ApiError {
+            status: 500,
+            message: error.to_string(),
+        },
+    }
+}
 /// The slash commands available for a project.
 async fn native_commands(
     cp: &ControlPlane,
@@ -89,6 +221,8 @@ async fn native_commands(
             name: c.name,
             description: c.description,
             agent: c.agent,
+            model: c.model,
+            subtask: c.subtask,
         })
         .collect())
 }
@@ -108,11 +242,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_agents_unknown_project_is_not_found() {
-        let s = state().await;
-        let err = dispatch(&s, "native_agents", json!({"project_id": "nope"}))
+    async fn project_command_rpc_crud_enforces_revision_conflicts() {
+        use crate::domain::{PermMode, Project};
+
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state().await;
+        state
+            .cp
+            .store()
+            .insert_project(Project {
+                project_id: "p1".into(),
+                name: "demo".into(),
+                workdir: workdir.path().display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
             .await
-            .unwrap_err();
-        assert_eq!(err.status, 404);
+            .unwrap();
+        let input = json!({
+            "name": "review/security",
+            "description": "Review security changes",
+            "template": "Review $ARGUMENTS",
+            "agent": "plan",
+            "model": "anthropic/claude-sonnet-4-5",
+            "subtask": true
+        });
+
+        let created = dispatch(
+            &state,
+            "create_project_command",
+            json!({"project_id": "p1", "input": input}),
+        )
+        .await
+        .unwrap();
+        let revision = created["revision"].as_str().unwrap().to_string();
+        assert_eq!(created["model"], "anthropic/claude-sonnet-4-5");
+        assert_eq!(created["subtask"], true);
+
+        let listed = dispatch(&state, "list_project_commands", json!({"project_id": "p1"}))
+            .await
+            .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let read = dispatch(
+            &state,
+            "read_project_command",
+            json!({"project_id": "p1", "name": "review/security"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["revision"], revision);
+
+        let conflict = dispatch(
+            &state,
+            "update_project_command",
+            json!({
+                "project_id": "p1",
+                "name": "review/security",
+                "revision": "stale",
+                "input": {
+                    "description": "Updated review",
+                    "template": "Updated $ARGUMENTS",
+                    "agent": null,
+                    "model": null,
+                    "subtask": false
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.status, 409);
+
+        let invalid = dispatch(
+            &state,
+            "read_project_command",
+            json!({"project_id": "p1", "name": "../escape"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.status, 400);
     }
 }

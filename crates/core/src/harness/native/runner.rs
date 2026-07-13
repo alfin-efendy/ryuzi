@@ -191,6 +191,30 @@ impl RunnerDeps {
     }
 }
 
+/// Normal-turn metadata that affects runtime execution without changing the
+/// prompt text persisted or sent to the model.
+#[derive(Debug, Clone, Default)]
+struct TurnOptions {
+    subtask: bool,
+}
+
+/// Return the resolved command's normal-turn runtime metadata. Kept separate
+/// from prompt expansion so the flag cannot leak into model-visible text.
+fn turn_options(command: &super::commands::ResolvedCommand) -> TurnOptions {
+    TurnOptions {
+        subtask: command.subtask,
+    }
+}
+
+async fn max_provider_turns(deps: &RunnerDeps, options: &TurnOptions) -> usize {
+    if options.subtask {
+        SUBAGENT_MAX_ITERS
+    } else {
+        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
+            .await
+    }
+}
+
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
 /// (end_turn / cancellation); the control plane then emits `CoreEvent::Result`.
 ///
@@ -204,18 +228,37 @@ pub async fn run_turn(
     let trimmed = prompt.display.trim();
     let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
 
-    // Slash-command resolution on the raw user text.
-    let (agent_text, agent) = if manual_compact {
-        (prompt.agent.clone(), deps.agent.clone())
+    // Slash-command resolution on the raw user text. Command metadata stays
+    // outside the expanded prompt and is applied only to this turn.
+    let (agent_text, agent, command_model, options) = if manual_compact {
+        (
+            prompt.agent.clone(),
+            deps.agent.clone(),
+            None,
+            TurnOptions::default(),
+        )
     } else {
         match deps.commands.resolve(&prompt.display) {
-            Some((expanded, override_agent)) => {
-                let agent = override_agent
-                    .and_then(|n| deps.agents.get(&n))
+            Some(resolved) => {
+                let agent = resolved
+                    .agent
+                    .as_deref()
+                    .and_then(|name| deps.agents.get(name))
                     .unwrap_or_else(|| deps.agent.clone());
-                (merge_agent_prompt_suffix(expanded, &prompt), agent)
+                let options = turn_options(&resolved);
+                (
+                    merge_agent_prompt_suffix(resolved.prompt, &prompt),
+                    agent,
+                    resolved.model,
+                    options,
+                )
             }
-            None => (prompt.agent.clone(), deps.agent.clone()),
+            None => (
+                prompt.agent.clone(),
+                deps.agent.clone(),
+                None,
+                TurnOptions::default(),
+            ),
         }
     };
 
@@ -237,7 +280,7 @@ pub async fn run_turn(
     // generation, and the sub-agent spawner — shares this immutable snapshot;
     // the original `deps` is never mutated, so in-flight turns and running
     // subagents keep the configuration they started with.
-    let turn_deps = refresh_turn_configuration(deps).await;
+    let turn_deps = refresh_turn_configuration(deps, command_model).await;
     let deps = &turn_deps;
 
     // /compact is an action, but it still snapshots the same complete turn
@@ -305,9 +348,7 @@ pub async fn run_turn(
     // `while budget.try_consume()` loop caps at exactly this many provider
     // turns per window, and each auto-continue re-grants a fresh window of the
     // same size (drive() re-reads the setting for that grant).
-    let max_provider_turns =
-        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
-            .await;
+    let max_provider_turns = max_provider_turns(deps, &options).await;
     let budget = IterationBudget::new(max_provider_turns);
     drive(
         deps,
@@ -419,24 +460,34 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
     }
 }
 
-/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the freshest
-/// resolution of the project's pinned model. Falls back to the session-start
-/// model when no project row is reachable (bare tests, ephemeral contexts) or
-/// when nothing resolves at all (empty store / no routable connection), so
-/// those contexts behave exactly as before. When the pinned model fails
-/// routing and a substitute is resolved, a status row announces the
-/// substitution — no silent swap.
-async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
+/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the command
+/// model override when present, otherwise the freshest project/session model.
+/// A command override wins only for this turn; it never changes persisted
+/// project or session settings. Falls back to the session-start model when no
+/// project row is reachable (bare tests, ephemeral contexts) or when nothing
+/// resolves at all (empty store / no routable connection), so those contexts
+/// behave exactly as before. When the chosen model fails routing and a
+/// substitute is resolved, a status row announces the substitution — no silent
+/// swap.
+async fn refresh_turn_configuration(
+    deps: &RunnerDeps,
+    command_model: Option<String>,
+) -> RunnerDeps {
     let project_pin = project_pinned_model(deps).await;
     let session_pin = if project_pin.is_none() {
         chat_session_pinned_model(&deps.store, &deps.session_pk).await
     } else {
         None
     };
-    let pinned = match project_pin.clone() {
-        Some(pinned) => pinned,
-        None => session_pin.clone().or_else(|| deps.model.clone()),
-    };
+    let has_command_model = command_model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty());
+    let pinned = command_model
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| match project_pin.clone() {
+            Some(pinned) => pinned,
+            None => session_pin.clone().or_else(|| deps.model.clone()),
+        });
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
         if !pinned.trim().is_empty() && pinned != resolved {
@@ -460,7 +511,7 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
         turn.model = resolved;
     }
     let model = turn.model.as_deref().unwrap_or("");
-    if project_pin.is_some() || session_pin.is_some() {
+    if has_command_model || project_pin.is_some() || session_pin.is_some() {
         turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
     }
     let policy = if let Some(project_id) = turn.project_id.as_deref() {
@@ -2447,7 +2498,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refreshed = refresh_turn_configuration(&deps).await;
+        let refreshed = refresh_turn_configuration(&deps, None).await;
         assert_eq!(refreshed.model.as_deref(), Some("anthropic/model-b"));
         assert_eq!(refreshed.meta.context_window, 222_222);
     }
@@ -3422,6 +3473,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_subtask_uses_subagent_turn_budget() {
+        use testutil::ScriptedLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "7",
+            )
+            .await
+            .unwrap();
+        let options = turn_options(&super::super::commands::ResolvedCommand {
+            prompt: "Ship now".into(),
+            agent: None,
+            model: None,
+            subtask: true,
+        });
+
+        assert_eq!(
+            max_provider_turns(&deps, &options).await,
+            SUBAGENT_MAX_ITERS
+        );
+        assert_eq!(
+            max_provider_turns(&deps, &TurnOptions::default()).await,
+            7,
+            "plain turns keep the configured normal budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_model_overrides_the_project_model_for_one_turn() {
+        use crate::domain::{PermMode, Project, Session, SessionKind, SessionStatus};
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".ryuzi/commands/ship.md"),
+            "---\nmodel: anthropic/model-b\nsubtask: true\n---\nShip $ARGUMENTS",
+        )
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("p".into());
+        deps.commands = Arc::new(CommandRegistry::load(dir.path()));
+        add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
+        deps.store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "project".into(),
+                workdir: dir.path().display().to_string(),
+                source: None,
+                model: Some("anthropic/model-a".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        deps.store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: Some("p".into()),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("/ship now", "/ship now"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/model-b");
+        assert!(!body.to_string().contains("subtask"));
+    }
+    #[tokio::test]
     async fn refresh_turn_configuration_reloads_model_effort_preferences_defaults_and_meta() {
         use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
         use crate::llm_router::model_effort::{
@@ -3564,7 +3713,10 @@ mod tests {
             }));
         }
         assert_eq!(
-            refresh_turn_configuration(&deps).await.meta.context_window,
+            refresh_turn_configuration(&deps, None)
+                .await
+                .meta
+                .context_window,
             222_222
         );
     }

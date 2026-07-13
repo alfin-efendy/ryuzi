@@ -5,6 +5,7 @@
 //! byte-identical to the source it was moved from.
 
 use crate::domain::SessionGitOptions;
+use crate::harness::native::commands::{ProjectCommandInput, ProjectCommandRead};
 use crate::llm_router::model_effort::{
     EffectiveEffortSource, SelectableModelInfo, StoredEffortStatus,
 };
@@ -597,6 +598,77 @@ pub struct CommandInfo {
     pub name: String,
     pub description: String,
     pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub subtask: bool,
+}
+
+/// Editable fields for a project-owned slash command. The command name is
+/// supplied separately for updates so a save cannot rename a file by accident.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectCommandMutationDto {
+    pub description: String,
+    pub template: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub subtask: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectCommandInputDto {
+    pub name: String,
+    #[serde(flatten)]
+    pub command: ProjectCommandMutationDto,
+}
+
+impl ProjectCommandMutationDto {
+    pub fn with_name(self, name: &str) -> ProjectCommandInput {
+        ProjectCommandInput {
+            name: name.to_string(),
+            description: self.description,
+            template: self.template,
+            agent: self.agent,
+            model: self.model,
+            subtask: self.subtask,
+        }
+    }
+}
+
+impl From<ProjectCommandInputDto> for ProjectCommandInput {
+    fn from(value: ProjectCommandInputDto) -> Self {
+        value.command.with_name(&value.name)
+    }
+}
+
+/// A project command and the revision that must accompany update or delete.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCommandInfo {
+    pub name: String,
+    pub description: String,
+    pub template: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub subtask: bool,
+    pub revision: String,
+}
+
+impl From<ProjectCommandRead> for ProjectCommandInfo {
+    fn from(value: ProjectCommandRead) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            template: value.template,
+            agent: value.agent,
+            model: value.model,
+            subtask: value.subtask,
+            revision: value.revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
