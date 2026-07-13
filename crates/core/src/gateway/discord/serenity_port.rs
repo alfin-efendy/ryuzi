@@ -38,10 +38,9 @@
 //!   is fetched first. Deliberate divergence from the original TS
 //!   implementation (which silently no-opped when a channel lookup came
 //!   back empty): this port's
-//!   `edit_message`/`send_message`/`create_thread`/`create_text_channel`
-//!   let a missing-channel HTTP error propagate as an `anyhow::Error` —
-//!   only `request_approval` has an explicit "missing channel" tuple
-//!   return, so only that method does an explicit existence check first.
+//!   `edit_message`/`send_message`/`create_thread`/`create_text_channel`/
+//!   `request_approval` propagate a missing-channel HTTP error as an
+//!   `anyhow::Error`, so a lost surface cannot be mistaken for a denial.
 //! - `EventHandler::{ready, message, interaction_create}` take `(&self, ctx:
 //!   Context, ..data)` (macro-generated; default no-op bodies, so only the
 //!   three actually used are overridden here).
@@ -424,28 +423,28 @@ impl DiscordPort for SerenityDiscordPort {
     }
 
     /// Sends the Approve/Deny buttons, then collects component interactions
-    /// against a total timeout via a `Stream::next()` loop
-    /// (`ComponentInteractionCollector` is a `Stream`, not an event
-    /// emitter) — `stream.next() == None` means the timeout elapsed with no
-    /// settled decision; each `Some` item is one button click. The loop
-    /// processes items strictly one at a time, so no "already settled"
-    /// guard flag is needed — returning ends the loop and drops the stream
-    /// (which unregisters the collector), so no later item can ever be
-    /// processed after a decision. The decision is computed and ready to
-    /// return BEFORE the (fallible, swallowed-error) `UpdateMessage` edit —
-    /// straight-line sequencing guarantees the decision is locked before
-    /// the edit can fail.
+    /// through a `Stream::next()` loop (`ComponentInteractionCollector` is a
+    /// `Stream`, not an event emitter). With `Some(timeout)`, `stream.next()
+    /// == None` means that timeout elapsed without a settled decision; with
+    /// `None`, stream termination is an unavailable collector and returns an
+    /// error. Each `Some` item is one button click. The loop processes items
+    /// strictly one at a time, so no "already settled" guard flag is needed —
+    /// returning ends the loop and drops the stream (which unregisters the
+    /// collector), so no later item can ever be processed after a decision.
+    /// The decision is computed and ready to return BEFORE the (fallible,
+    /// swallowed-error) `UpdateMessage` edit — straight-line sequencing
+    /// guarantees the decision is locked before the edit can fail.
     async fn request_approval(
         &self,
         conversation_id: &str,
         req: &PortApprovalRequest,
     ) -> anyhow::Result<(bool, String)> {
-        let Some(channel_id) = channel_id_from_str(conversation_id) else {
-            return Ok((false, "no-channel".to_string()));
-        };
-        if self.http.get_channel(channel_id).await.is_err() {
-            return Ok((false, "no-channel".to_string()));
-        }
+        let channel_id =
+            channel_id_from_str(conversation_id).context("invalid Discord approval channel id")?;
+        self.http
+            .get_channel(channel_id)
+            .await
+            .context("Discord approval channel is unavailable")?;
 
         let content = format!("🔐 Approve **{}**?\n```\n{}\n```", req.tool, req.summary);
         let components = vec![CreateActionRow::Buttons(vec![
@@ -481,7 +480,10 @@ impl DiscordPort for SerenityDiscordPort {
 
         loop {
             let Some(interaction) = stream.next().await else {
-                return Ok((false, "timeout".to_string()));
+                if req.timeout_ms.is_some() {
+                    return Ok((false, "timeout".to_string()));
+                }
+                anyhow::bail!("Discord approval interaction collector ended unexpectedly");
             };
 
             let clicker_role_ids: Vec<String> = interaction
@@ -510,8 +512,9 @@ impl DiscordPort for SerenityDiscordPort {
             } else if interaction.data.custom_id.ends_with(":deny") {
                 false
             } else {
-                // Unexpected custom_id — ignore (fail-closed; a timeout
-                // denies if nothing valid ever arrives).
+                // Unexpected custom_id — ignore. With Some(timeout), the
+                // collector eventually returns a timeout denial; without one,
+                // only an explicit valid decision settles the request.
                 continue;
             };
 

@@ -483,8 +483,8 @@ fn spawn_approval_fanout(
 ///   loop over `futures::future::select_all`: a per-gateway `Err` REMOVES
 ///   that future from the race (so one erroring gateway can never out-race a
 ///   slower legitimate human approval on another surface) and the remaining
-///   futures keep racing; only once every future has errored does the race
-///   resolve to a deny.
+///   futures keep racing. If every gateway errors, the request stays pending
+///   so Cockpit can still provide the explicit response.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_approval(
     cp: &Arc<ControlPlane>,
@@ -551,8 +551,8 @@ pub(crate) async fn handle_approval(
         .collect();
 
     // Loop over `select_all`, dropping any future that resolves `Err` from
-    // the race instead of treating it as an instant deny vote — only once
-    // every future has errored (the pool is empty) do we fall back to deny.
+    // the race instead of treating it as an instant deny vote. If every
+    // gateway errors, leave the approval pending for another surface.
     let race = async move {
         let mut futs = futs;
         loop {
@@ -567,15 +567,15 @@ pub(crate) async fn handle_approval(
         }
     };
 
-    let decision = race.await.unwrap_or(ApprovalDecision::RejectOnce);
-
-    cp.resolve_approval_bool(
-        request_id,
-        matches!(
-            decision,
-            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
-        ),
-    );
+    if let Some(decision) = race.await {
+        cp.resolve_approval_bool(
+            request_id,
+            matches!(
+                decision,
+                ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+            ),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -722,9 +722,9 @@ mod tests {
         Allow,
         SleepThenAllow(u64),
         /// Returns `Err` the instant it's called — used to prove a
-        /// per-gateway error no longer wins the race outright (it must be
-        /// removed from the race instead), and that all-erroring surfaces
-        /// still deny.
+        /// per-gateway error no longer wins the race outright. The failed
+        /// surface is removed so another surface, including Cockpit, can
+        /// resolve the request.
         ErrImmediately,
     }
 
@@ -1212,36 +1212,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_approval_denies_only_once_every_gateway_has_errored() {
-        let (lines, telemetry) = capturing_console_telemetry();
-        let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
+    async fn handle_approval_an_unavailable_gateway_leaves_request_pending_for_cockpit() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
-        store.add_surface("err-gw-1", "c1", "s1").await.unwrap();
-        store.add_surface("err-gw-2", "c2", "s1").await.unwrap();
+        // The persisted Discord surface can become unavailable after session
+        // setup (for example, the channel was deleted or permissions changed).
+        store
+            .add_surface("discord", "deleted-channel", "s1")
+            .await
+            .unwrap();
 
-        let gw1 = FakeGateway::new("err-gw-1", GwBehavior::ErrImmediately);
-        let gw2 = FakeGateway::new("err-gw-2", GwBehavior::ErrImmediately);
-        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw1), Arc::new(gw2)];
+        let discord = FakeGateway::new("discord", GwBehavior::ErrImmediately);
+        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(discord)];
+        let mut approval = cp.approvals_for_test_register("req-unavailable-discord");
 
         handle_approval(
             &cp,
             &store,
             &gateways,
             "s1",
-            "req-race-2",
+            "req-unavailable-discord",
             "Bash",
             "ls",
             None,
         )
         .await;
 
-        let parsed = parse_telemetry_lines(&lines);
         assert!(
-            parsed
-                .iter()
-                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
-            "once every gateway in the race has errored, the approval must deny, got: {parsed:?}"
+            tokio::time::timeout(Duration::from_millis(50), &mut approval)
+                .await
+                .is_err(),
+            "an unavailable Discord surface must leave the approval pending for Cockpit"
+        );
+        assert!(
+            cp.resolve_approval_bool("req-unavailable-discord", true),
+            "Cockpit must be able to resolve an approval after Discord is unavailable"
+        );
+        assert!(
+            approval.await.unwrap().allowed(),
+            "the explicit Cockpit approval must reach the waiting tool"
         );
     }
 
