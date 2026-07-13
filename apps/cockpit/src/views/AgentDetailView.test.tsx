@@ -1,0 +1,159 @@
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AgentDetailInfo, AgentMutationInfo, AgentRegistryInfo, SelectableModelInfo } from "@/bindings";
+import { LOCAL_RUNNER } from "@/lib/session-key";
+
+const updateAgent = mock(async (_runner: string | null, _id: string, input: AgentMutationInfo) => ({
+  status: "ok" as const,
+  data: detail({ ...input, modelInfo: null }),
+}));
+
+mock.module("@/bindings", () => ({ commands: { updateAgent }, events: {} }));
+
+const { AgentDetailView } = await import("./AgentDetailView");
+const { useAgents } = await import("@/store-agents");
+const { useNav } = await import("@/store-nav");
+
+const routeInfo: SelectableModelInfo = {
+  kind: "namedRoute",
+  requestValue: "smart",
+  displayName: "Smart",
+  preferenceKey: null,
+  supported: [],
+  configuredDefault: null,
+  resolvedDefault: null,
+  defaultSource: "none",
+};
+const opusInfo: SelectableModelInfo = {
+  kind: "concrete",
+  requestValue: "anthropic/claude-opus-4-8",
+  displayName: "Claude Opus",
+  preferenceKey: null,
+  supported: ["low", "medium", "high", "max", "xhigh"].map((value) => ({
+    value,
+    label: value === "xhigh" ? "XHigh" : value[0].toUpperCase() + value.slice(1),
+    description: null,
+  })),
+  configuredDefault: null,
+  resolvedDefault: "high",
+  defaultSource: "provider",
+};
+
+function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
+  return {
+    summary: {
+      id: "reviewer",
+      name: "Reviewer",
+      description: "Reviews implementation quality.",
+      avatarColor: "violet",
+      model: { kind: "route", route: "smart" },
+      permissionMode: "ask",
+      skillCount: 1,
+      toolCount: 3,
+      knowledgeCount: 12,
+      executable: true,
+      validation: [],
+      isDefault: false,
+    },
+    permissionRules: [],
+    skills: ["requesting-code-review"],
+    nativeTools: ["read", "grep", "bash"],
+    pluginTools: [],
+    apps: [],
+    maxTurns: 50,
+    maxToolRounds: 100,
+    modelInfo: routeInfo,
+    ...overrides,
+  };
+}
+
+const registry: AgentRegistryInfo = {
+  agents: [detail().summary, { ...detail().summary, id: "ryuzi", name: "Ryuzi", isDefault: true }],
+  defaultAgentId: "ryuzi",
+  recovery: [],
+  subagentModel: { kind: "route", route: "fast" },
+};
+
+function seed(value = detail()) {
+  useAgents.setState({ registry, detail: value, models: [routeInfo, opusInfo], loaded: true, loading: false, saving: false });
+  useNav.setState({ history: { back: [], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
+}
+
+beforeEach(() => {
+  updateAgent.mockClear();
+  seed();
+});
+afterEach(cleanup);
+
+test("detail has Back, identity, actions, six tabs, and overview metrics", () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  expect(screen.getByRole("button", { name: "Back to Agents" })).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Actions for Reviewer" })).toBeTruthy();
+  for (const tab of ["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]) {
+    expect(screen.getByRole("button", { name: tab })).toBeTruthy();
+  }
+  expect(screen.getByText("12 readable concepts")).toBeTruthy();
+  expect(screen.getByText("1 enabled skill")).toBeTruthy();
+  expect(screen.getByText("3 enabled tools")).toBeTruthy();
+  expect(screen.getByText("No owned sessions yet.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Start chat" })).toBeNull();
+});
+
+test("Back uses navigation history", () => {
+  useNav.setState({ history: { back: [{ kind: "models" }], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Back to Agents" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "models" });
+});
+
+test("concrete model renders resolver-supported effort values and route has no effort", async () => {
+  const concrete = detail({
+    summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
+    modelInfo: opusInfo,
+  });
+  seed(concrete);
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent effort" }));
+  for (const label of ["Model default", "Low", "Medium", "High", "Max", "XHigh"]) {
+    expect(await screen.findByRole("option", { name: label })).toBeTruthy();
+  }
+  cleanup();
+  seed();
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  expect(screen.queryByRole("combobox", { name: "Agent effort" })).toBeNull();
+});
+
+test("explicit permission rule editing persists typed rules", async () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Rule tool" }));
+  fireEvent.click(await screen.findByRole("option", { name: "bash" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Rule decision" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Allow" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Command prefix" }), { target: { value: "cargo test" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "reviewer",
+      expect.objectContaining({
+        permissionRules: [expect.objectContaining({ tool: "bash", decision: "allow", commandPrefix: "cargo test" })],
+      }),
+    ),
+  );
+});
+
+test("skills and advanced tabs expose stable-ID and loop controls", () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
+  expect(screen.getByRole("textbox", { name: "Skill ID" })).toBeTruthy();
+  expect(screen.getByRole("textbox", { name: "Native tool ID" })).toBeTruthy();
+  expect(screen.getByRole("textbox", { name: "Plugin tool ID" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  expect(screen.getByRole("textbox", { name: "Max turns" })).toBeTruthy();
+  expect(screen.getByText("Danger zone")).toBeTruthy();
+});

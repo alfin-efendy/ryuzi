@@ -26,6 +26,7 @@ import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
 import { LearningView } from "./views/LearningView";
 import { AgentsView } from "./views/AgentsView";
+import { AgentDetailView } from "./views/AgentDetailView";
 import { SettingsView } from "./views/SettingsView";
 import { Toaster } from "@ryuzi/ui";
 
@@ -62,11 +63,10 @@ function MainView() {
       return <LearningView />;
     case "settings":
       return <SettingsView />;
-    // AgentDetailView lands in Plan 3 Task 7.
     case "agents":
       return <AgentsView />;
     case "agentDetail":
-      return null;
+      return <AgentDetailView agentId={view.agentId} />;
   }
 }
 
