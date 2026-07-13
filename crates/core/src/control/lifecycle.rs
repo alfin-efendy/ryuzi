@@ -65,8 +65,8 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
 
-        // A project without a pinned MODEL inherits the agent's default model
-        // (Settings → Agent, stored under the `agent_model` settings key).
+        // A project without a pinned MODEL inherits the legacy agent default
+        // stored under the `agent_model` settings key.
         //
         // Permission mode is per-session: this new session's mode comes from
         // `perm_mode` above (the picker) or falls back to the project's own

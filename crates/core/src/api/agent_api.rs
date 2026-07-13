@@ -1091,6 +1091,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
 
 #[cfg(test)]
 mod tests {
+    use crate::agents::yaml::parse_agent_profile_document;
     use crate::api::{
         dispatch,
         tests_support::{state, state_with_agents},
@@ -1113,6 +1114,50 @@ mod tests {
             "maxTurns": 50,
             "maxToolRounds": 100
         })
+    }
+
+    #[tokio::test]
+    async fn update_agent_preserves_profile_extensions_through_rpc() {
+        let mut s = state_with_agents().await;
+        let agent_id = s.agents.default_agent_id().await;
+        let profile_path = s
+            .agent_knowledge
+            .for_agent(&agent_id)
+            .unwrap()
+            .root()
+            .parent()
+            .unwrap()
+            .join("agent.yaml");
+        let mut seeded = std::fs::read_to_string(&profile_path).unwrap();
+        seeded.push_str("x-vendor:\n  review_profile: strict\n");
+        std::fs::write(&profile_path, seeded).unwrap();
+        let config_root = profile_path.ancestors().nth(3).unwrap().to_path_buf();
+        s.agents = std::sync::Arc::new(
+            crate::agents::registry::AgentRegistry::load(config_root, s.cp.store().clone())
+                .await
+                .unwrap(),
+        );
+
+        let mut input = reviewer_input("Ryuzi");
+        input["description"] = json!("Reviews safety and regressions.");
+        let updated = dispatch(
+            &s,
+            "update_agent",
+            json!({"agent_id": agent_id, "input": input}),
+        )
+        .await
+        .unwrap();
+
+        let raw = std::fs::read_to_string(profile_path).unwrap();
+        let persisted = parse_agent_profile_document(&raw).unwrap();
+        assert_eq!(
+            persisted.extensions()["x-vendor"]["review_profile"],
+            "strict"
+        );
+        assert_eq!(
+            updated["summary"]["description"],
+            "Reviews safety and regressions."
+        );
     }
 
     #[tokio::test]

@@ -57,7 +57,7 @@ const selectable: SelectableModelInfo = {
 
 function detail(input: AgentMutationInfo): AgentDetailInfo {
   return {
-    summary: summary("architect", input.name, {
+    summary: summary(input.name.trim().toLowerCase().replace(/\s+/g, "-"), input.name, {
       description: input.description,
       avatarColor: input.avatarColor,
       model: input.model,
@@ -111,6 +111,18 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+test("management flow creates through the generated command store and opens detail", async () => {
+  useAgents.setState({ registry: { ...registry(), agents: [ryuzi] } });
+  render(<AgentsView />);
+  fireEvent.click(screen.getByRole("button", { name: "New agent" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Reviewer" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Description" }), { target: { value: "Reviews changes" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+  await waitFor(() => expect(createAgent).toHaveBeenCalledWith(LOCAL_RUNNER, expect.objectContaining({ name: "Reviewer", description: "Reviews changes" })));
+  await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" }));
+});
 
 test("Main Agent tab renders roster metadata and opens dedicated detail", () => {
   render(<AgentsView />);

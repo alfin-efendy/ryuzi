@@ -12,8 +12,16 @@ const updateAgent = mock(async (_runner: string | null, _id: string, input: Agen
   status: "ok" as const,
   data: detail({ ...input, modelInfo: null }),
 }));
+const duplicateAgent = mock(async (_runner: string | null, _id: string) => ({
+  status: "ok" as const,
+  data: detail({ summary: { ...detail().summary, id: "reviewer-copy", name: "Reviewer Copy" } }),
+}));
+const deleteAgent = mock(async (_runner: string | null, _id: string) => ({
+  status: "ok" as const,
+  data: { ...registry, agents: registry.agents.filter((agent) => agent.id !== "reviewer-copy") },
+}));
 
-mock.module("@/bindings", () => ({ commands: { getAgent, listApps, updateAgent }, events: {} }));
+mock.module("@/bindings", () => ({ commands: { deleteAgent, duplicateAgent, getAgent, listApps, updateAgent }, events: {} }));
 mock.module("@/components/agents/AgentLearningTab", () => ({
   AgentLearningTab: ({ agentId }: { agentId: string }) => <div>Learning for {agentId}</div>,
 }));
@@ -97,12 +105,38 @@ function seed(value = detail()) {
 }
 
 beforeEach(() => {
+  deleteAgent.mockClear();
+  duplicateAgent.mockClear();
   listApps.mockClear();
   updateAgent.mockClear();
   useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
   seed();
 });
 afterEach(cleanup);
+
+test("management flow inspects, duplicates, starts chat with, and deletes through the generated command store", async () => {
+  const { unmount } = render(<AgentDetailView agentId="reviewer" />);
+  expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Duplicate" }));
+  await waitFor(() => expect(duplicateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer"));
+  await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer-copy" }));
+
+  unmount();
+  seed(detail({ summary: { ...detail().summary, id: "reviewer-copy", name: "Reviewer Copy" } }));
+  render(<AgentDetailView agentId="reviewer-copy" />);
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer Copy" }));
+  fireEvent.click(screen.getByRole("button", { name: "Start chat" }));
+  expect(useNav.getState().pendingPrimaryAgentId).toBe("reviewer-copy");
+  expect(useNav.getState().history.current).toEqual({ kind: "home" });
+
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer Copy" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  await screen.findByRole("dialog", { name: "Delete Reviewer Copy?" });
+  fireEvent.click(screen.getByRole("button", { name: "Delete agent" }));
+  await waitFor(() => expect(deleteAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer-copy"));
+});
 
 test("detail has Back, identity, actions, six tabs, and overview metrics", () => {
   render(<AgentDetailView agentId="reviewer" />);
