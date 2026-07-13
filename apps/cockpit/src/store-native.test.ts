@@ -1,4 +1,5 @@
 import { test, expect, spyOn } from "bun:test";
+import type { ProjectCommandInfo } from "./bindings";
 import { useNative } from "./store-native";
 import { commands } from "./bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
@@ -7,8 +8,18 @@ const s1 = sessKey(LOCAL_RUNNER, "s1");
 const s2 = sessKey(LOCAL_RUNNER, "s2");
 
 function reset() {
-  useNative.setState({ agentsByProject: {}, commandsByProject: {}, todosBySession: {} });
+  useNative.setState({ agentsByProject: {}, commandsByProject: {}, projectCommandsByProject: {}, todosBySession: {} });
 }
+
+const projectCommand: ProjectCommandInfo = {
+  name: "review",
+  description: "Review the change",
+  template: "Review $ARGUMENTS",
+  agent: null,
+  model: null,
+  subtask: false,
+  revision: "rev-1",
+};
 
 test("loadAgents caches the project's agents", async () => {
   reset();
@@ -23,6 +34,94 @@ test("loadAgents caches the project's agents", async () => {
   expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
   expect(useNative.getState().agentsByProject.p1.map((a) => a.name)).toEqual(["build", "explore"]);
   spy.mockRestore();
+});
+
+test("project command CRUD calls the generated APIs and updates only that project's cache", async () => {
+  reset();
+  const listed = spyOn(commands, "listProjectCommands").mockResolvedValue({ status: "ok", data: [projectCommand] });
+  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: projectCommand });
+  const updated = spyOn(commands, "updateProjectCommand").mockResolvedValue({
+    status: "ok",
+    data: { ...projectCommand, description: "Updated" },
+  });
+  const deleted = spyOn(commands, "deleteProjectCommand").mockResolvedValue({ status: "ok", data: null });
+
+  await useNative.getState().loadProjectCommands(LOCAL_RUNNER, "p1");
+  expect(listed).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
+  expect(useNative.getState().projectCommandsByProject.p1).toEqual([projectCommand]);
+
+  await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", {
+    name: "review",
+    description: "Review the change",
+    template: "Review $ARGUMENTS",
+    agent: null,
+    model: null,
+    subtask: false,
+  });
+  expect(created).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", expect.objectContaining({ name: "review" }));
+
+  await useNative.getState().updateProjectCommand(LOCAL_RUNNER, "p1", projectCommand, {
+    description: "Updated",
+    template: projectCommand.template,
+    agent: null,
+    model: null,
+    subtask: false,
+  });
+  expect(updated).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "review", "rev-1", expect.objectContaining({ description: "Updated" }));
+  expect(useNative.getState().projectCommandsByProject.p1[0]?.description).toBe("Updated");
+
+  await useNative.getState().deleteProjectCommand(LOCAL_RUNNER, "p1", { ...projectCommand, description: "Updated" });
+  expect(deleted).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "review", "rev-1");
+  expect(useNative.getState().projectCommandsByProject.p1).toEqual([]);
+
+  listed.mockRestore();
+  created.mockRestore();
+  updated.mockRestore();
+  deleted.mockRestore();
+});
+test("a successful command mutation invalidates a deferred stale load", async () => {
+  reset();
+  type CommandsResult = Awaited<ReturnType<typeof commands.listProjectCommands>>;
+  const resolvers: Array<(result: CommandsResult) => void> = [];
+  const listed = spyOn(commands, "listProjectCommands").mockImplementation(
+    () => new Promise<CommandsResult>((resolve) => resolvers.push(resolve)),
+  );
+  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: { ...projectCommand, name: "ship" } });
+
+  const staleLoad = useNative.getState().loadProjectCommands(LOCAL_RUNNER, "p1");
+  await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", { ...projectCommand, name: "ship" });
+  resolvers[0]({ status: "ok", data: [projectCommand] });
+  await staleLoad;
+
+  expect(useNative.getState().projectCommandsByProject.p1.map((command) => command.name)).toEqual(["ship"]);
+  listed.mockRestore();
+  created.mockRestore();
+});
+
+test("command conflicts return structured outcomes and reload the latest project cache", async () => {
+  reset();
+  const listed = spyOn(commands, "listProjectCommands").mockResolvedValue({
+    status: "ok",
+    data: [{ ...projectCommand, description: "Latest", revision: "rev-2" }],
+  });
+  const updated = spyOn(commands, "updateProjectCommand").mockResolvedValue({
+    status: "error",
+    error: { message: "revision conflict" },
+  });
+
+  const result = await useNative.getState().updateProjectCommand(LOCAL_RUNNER, "p1", projectCommand, {
+    description: "Mine",
+    template: projectCommand.template,
+    agent: null,
+    model: null,
+    subtask: false,
+  });
+
+  expect(result).toEqual({ status: "conflict", message: "revision conflict" });
+  expect(listed).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
+  expect(useNative.getState().projectCommandsByProject.p1[0]?.description).toBe("Latest");
+  listed.mockRestore();
+  updated.mockRestore();
 });
 
 test("loadTodos caches a session's todo list", async () => {

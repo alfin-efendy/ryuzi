@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Segmented, SettingsCard } from "@ryuzi/ui";
+import { CommandsTab } from "./CommandsTab";
 import { SchedulerView } from "./SchedulerView";
 
 type AutomationTab = "scheduler" | "hooks" | "commands";
@@ -30,7 +31,7 @@ export function AutomationsView({ initialTab = "scheduler" }: { initialTab?: Aut
           <Segmented options={TABS} value={tab} onChange={setTab} />
         </div>
       </div>
-      {tab === "scheduler" ? <SchedulerView /> : <UnavailableTab name={tab === "hooks" ? "Hooks" : "Commands"} />}
+      {tab === "scheduler" ? <SchedulerView /> : tab === "commands" ? <CommandsTab /> : <UnavailableTab name="Hooks" />}
     </div>
   );
 }

@@ -77,7 +77,7 @@ test("initializes the requested placeholder tab and changes tabs locally", () =>
 
   expect(screen.getByText("Hooks are not available yet.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Commands" }));
-  expect(screen.getByText("Commands are not available yet.")).toBeTruthy();
+  expect(screen.getByText("Select a project to manage project commands")).toBeTruthy();
 });
 
 test("uses the requested initial tab after a keyed route change", async () => {
