@@ -1036,6 +1036,14 @@ async listModelRoutes(runnerId: string | null) : Promise<Result<ModelRouteInfo[]
     else return { status: "error", error: e  as any };
 }
 },
+async listModelRouteTargetCapabilities(runnerId: string | null) : Promise<Result<ModelRouteTargetCapability[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_route_target_capabilities", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async saveModelRoute(runnerId: string | null, route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_model_route", { runnerId, route }) };
@@ -2000,6 +2008,7 @@ provider: string; model: string;
  * Explicit effort policy; `None` uses the model default.
  */
 effort?: string | null }
+export type ModelRouteTargetCapability = { provider: string; model: string; supported: ReasoningEffortOption[]; providerDefault: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
