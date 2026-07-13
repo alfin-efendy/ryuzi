@@ -11,6 +11,8 @@ use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 fn migration_24_codex_models(
     tx: &rusqlite::Transaction<'_>,
@@ -1190,6 +1192,11 @@ pub struct Store {
     pool: Pool,
     #[cfg(test)]
     fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_session_prompt_claim_recovery: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    session_prompt_claim_recovery_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl Clone for Store {
@@ -1199,6 +1206,13 @@ impl Clone for Store {
             #[cfg(test)]
             fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool::new(
                 self.fail_next_legacy_agent_settings_delete
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            #[cfg(test)]
+            session_prompt_claim_recovery_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_session_prompt_claim_recovery: std::sync::atomic::AtomicBool::new(
+                self.fail_next_session_prompt_claim_recovery
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         }
@@ -1632,6 +1646,10 @@ impl Store {
             pool,
             #[cfg(test)]
             fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_session_prompt_claim_recovery: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            session_prompt_claim_recovery_pause: std::sync::Mutex::new(None),
         })
     }
 
@@ -2600,6 +2618,24 @@ impl Store {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_next_session_prompt_claim_recovery_for_test(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pause = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.session_prompt_claim_recovery_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_session_prompt_claim_recovery_for_test(&self) {
+        self.fail_next_session_prompt_claim_recovery
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Recover prompts claimed by a process that died before it could complete
     /// or restore them.
     ///
@@ -2610,6 +2646,25 @@ impl Store {
     /// order. The update is idempotent: a subsequent call returns zero until a
     /// new claim is abandoned.
     pub(crate) async fn recover_abandoned_session_prompt_claims(&self) -> anyhow::Result<usize> {
+        #[cfg(test)]
+        if self
+            .fail_next_session_prompt_claim_recovery
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected session prompt claim recovery failure");
+        }
+        #[cfg(test)]
+        let pause = {
+            self.session_prompt_claim_recovery_pause
+                .lock()
+                .unwrap()
+                .take()
+        };
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.with_conn(move |c| {
             c.execute(
                 "UPDATE session_prompt_queue SET status='pending' WHERE status='claimed'",

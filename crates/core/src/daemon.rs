@@ -616,6 +616,7 @@ mod tests {
     use serial_test::serial;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::task::Poll;
     use std::time::Duration;
 
     // ---------- shared test plumbing ----------
@@ -638,6 +639,36 @@ mod tests {
         .unwrap();
         std::mem::forget(config);
         persistence
+    }
+
+    async fn prompt_recovery_test_daemon(store: Arc<Store>) -> Daemon {
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            Registries::new(),
+            Arc::new(NoopTelemetry),
+        )
+        .await;
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![],
+            router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            orch_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+        }
     }
 
     fn capturing_console_telemetry() -> (Arc<Mutex<Vec<String>>>, Arc<dyn Telemetry>) {
@@ -1752,6 +1783,98 @@ mod tests {
                 prompts: self.prompts.clone(),
             }))
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_start_recovers_abandoned_prompt_claims_once_under_concurrency() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "queued".into(),
+                session_pk: "s1".into(),
+                agent: "queued".into(),
+                display: "queued".into(),
+                attachments: vec![],
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "queued"
+        );
+
+        let daemon = prompt_recovery_test_daemon(store.clone()).await;
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let first = daemon.start();
+        tokio::pin!(first);
+        assert!(matches!(futures::poll!(first.as_mut()), Poll::Pending));
+        recovery_entered.notified().await;
+
+        let mut second = Box::pin(daemon.start());
+        assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
+        release_recovery.notify_one();
+
+        first.await.unwrap();
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "queued"
+        );
+        second.await.unwrap();
+        assert!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the second concurrent boot recovery must not reset the live claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_retries_prompt_claim_recovery_after_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "queued".into(),
+                session_pk: "s1".into(),
+                agent: "queued".into(),
+                display: "queued".into(),
+                attachments: vec![],
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        store.claim_next_session_prompt("s1").await.unwrap();
+
+        let daemon = prompt_recovery_test_daemon(store.clone()).await;
+        store.fail_next_session_prompt_claim_recovery_for_test();
+        assert!(daemon.start().await.is_err());
+        assert!(!*daemon.prompt_claim_recovery_complete.lock().await);
+
+        daemon.start().await.unwrap();
+        assert!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt.id == "queued"),
+            "a retry after recovery failure must restore the abandoned claim"
+        );
     }
 
     #[tokio::test]
