@@ -2102,6 +2102,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(s.kind, crate::domain::SessionKind::Worker);
+        assert_eq!(s.primary_agent_id.as_deref(), Some("ryuzi"));
+        assert_eq!(
+            s.primary_agent_snapshot
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
+            Some("ryuzi")
+        );
         assert_eq!(s.agent.as_deref(), Some("plan"));
         assert_eq!(s.speaker.as_deref(), Some("plan"));
         assert_eq!(s.parent_session_pk.as_deref(), Some("home-42"));

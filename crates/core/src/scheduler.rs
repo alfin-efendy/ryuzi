@@ -1017,6 +1017,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_model_override_is_session_scoped_without_mutating_primary_profile() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(
+                store.clone(),
+                crate::plugins::Registries::new(),
+                persistence,
+            )
+            .await
+        };
+        store
+            .insert_project(crate::domain::Project {
+                project_id: "p-override".into(),
+                name: "override".into(),
+                workdir: std::env::temp_dir().to_string_lossy().into_owned(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let primary_id = cp.registry().default_agent_id().await;
+        let profile_before = cp.registry().resolved_snapshot(&primary_id).await.unwrap();
+        let session = cp
+            .start_session_with_prompt(
+                "p-override",
+                crate::harness::TurnPrompt::text("run", "run"),
+                "scheduler",
+                &[],
+                None,
+                None,
+                Some("scheduled/model".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_session_runtime_settings(&session.session_pk)
+                .await
+                .unwrap()
+                .and_then(|settings| settings.model),
+            Some("scheduled/model".into())
+        );
+        assert_eq!(
+            cp.registry()
+                .resolved_snapshot(&primary_id)
+                .await
+                .unwrap()
+                .profile,
+            profile_before.profile
+        );
+    }
+    #[tokio::test]
     async fn job_model_override_roundtrips() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());

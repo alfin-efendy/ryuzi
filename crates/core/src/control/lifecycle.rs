@@ -75,6 +75,7 @@ impl ControlPlane {
             attachments,
             git,
             None,
+            None,
         )
         .await
     }
@@ -88,6 +89,7 @@ impl ControlPlane {
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
         worker: Option<WorkerBinding>,
+        model_override: Option<String>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -151,7 +153,16 @@ impl ControlPlane {
             agent: worker.as_ref().map(|binding| binding.agent.clone()),
             parent_session_pk: worker.and_then(|binding| binding.home_session_pk),
         };
-        let (resolved_model, resolved_effort) = agent_model_parts(&primary_agent.profile.model);
+        let model_override = model_override.filter(|model| !model.trim().is_empty());
+        let (resolved_model, resolved_effort) = model_override
+            .as_ref()
+            .map(|model| {
+                (
+                    Some(model.clone()),
+                    agent_model_parts(&primary_agent.profile.model).1,
+                )
+            })
+            .unwrap_or_else(|| agent_model_parts(&primary_agent.profile.model));
         let run = NewAgentRun {
             run_id: uuid::Uuid::new_v4().to_string(),
             session_pk: session_pk.clone(),
@@ -170,6 +181,11 @@ impl ControlPlane {
             .store
             .insert_owned_session_with_primary_run(session.clone(), identity, run)
             .await?;
+        if let Some(model) = model_override {
+            self.store
+                .update_session_runtime_settings(&session_pk, Some(model), None)
+                .await?;
+        }
         self.delegation
             .activate_persisted_primary(stored_run.clone(), primary_agent.clone())
             .await?;
@@ -265,13 +281,10 @@ impl ControlPlane {
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
         _perm_mode: Option<PermMode>,
-        _model_override: Option<String>,
+        model_override: Option<String>,
         worker: Option<WorkerBinding>,
     ) -> anyhow::Result<Session> {
-        let primary_agent_id = match worker.as_ref() {
-            Some(binding) => binding.agent.clone(),
-            None => self.registry.default_agent_id().await,
-        };
+        let primary_agent_id = self.registry.default_agent_id().await;
         self.start_owned_agent_session_with_prompt(
             Some(project_id),
             &primary_agent_id,
@@ -280,6 +293,7 @@ impl ControlPlane {
             attachments,
             git,
             worker,
+            model_override,
         )
         .await
     }
@@ -1067,7 +1081,16 @@ impl ControlPlane {
         };
         let primary_agent = primary_turn.agent;
         let run_id = primary_turn.run_id;
-        let (model, effort) = agent_model_parts(&primary_agent.profile.model);
+        let runtime = self.store.get_session_runtime_settings(session_pk).await?;
+        let (model, effort) = (
+            runtime
+                .as_ref()
+                .and_then(|settings| settings.model.clone())
+                .or_else(|| agent_model_parts(&primary_agent.profile.model).0),
+            runtime
+                .and_then(|settings| settings.effort)
+                .or_else(|| agent_model_parts(&primary_agent.profile.model).1),
+        );
         let perm_mode = primary_agent.profile.permissions.mode;
         let kind = session_row
             .as_ref()
@@ -1595,6 +1618,7 @@ impl ControlPlane {
             agent: runner::review_agent(payload.system.clone()),
             agents: Arc::new(AgentRegistry::builtin()),
             commands: Arc::new(CommandRegistry::builtin()),
+            allowed_skills: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),

@@ -21,6 +21,30 @@ type R<T> = Result<T, CmdError>;
 // `"local"`) before proxying.
 type Engine<'a> = State<'a, Arc<EngineManager>>;
 
+fn session_start_params(
+    project_id: String,
+    primary_agent_id: String,
+    turn: TurnInput,
+) -> serde_json::Value {
+    serde_json::json!({
+        "projectId": project_id,
+        "primaryAgentId": primary_agent_id,
+        "turn": turn,
+    })
+}
+
+fn chat_session_start_params(primary_agent_id: String, turn: TurnInput) -> serde_json::Value {
+    serde_json::json!({ "primaryAgentId": primary_agent_id, "turn": turn })
+}
+
+fn session_continue_params(session_pk: String, turn: TurnInput) -> serde_json::Value {
+    serde_json::json!({ "sessionPk": session_pk, "turn": turn })
+}
+
+fn agent_sessions_params(agent_id: String, limit: u32) -> serde_json::Value {
+    serde_json::json!({ "agentId": agent_id, "limit": limit })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn get_setting(
@@ -358,11 +382,7 @@ pub async fn start_session(
     client
         .rpc(
             "start_session",
-            serde_json::json!({
-                "project_id": project_id,
-                "primary_agent_id": primary_agent_id,
-                "turn": turn,
-            }),
+            session_start_params(project_id, primary_agent_id, turn),
         )
         .await
 }
@@ -379,7 +399,7 @@ pub async fn start_chat_session(
     client
         .rpc(
             "start_chat_session",
-            serde_json::json!({ "primary_agent_id": primary_agent_id, "turn": turn }),
+            chat_session_start_params(primary_agent_id, turn),
         )
         .await
 }
@@ -396,7 +416,7 @@ pub async fn continue_session(
     client
         .rpc(
             "continue_session",
-            serde_json::json!({ "session_pk": session_pk, "turn": turn }),
+            session_continue_params(session_pk, turn),
         )
         .await
 }
@@ -413,7 +433,7 @@ pub async fn list_agent_sessions(
     client
         .rpc(
             "list_agent_sessions",
-            serde_json::json!({ "agent_id": agent_id, "limit": limit }),
+            agent_sessions_params(agent_id, limit),
         )
         .await
 }
@@ -636,4 +656,29 @@ pub fn backdrop_capability(
     state: State<'_, crate::backdrop::BackdropState>,
 ) -> crate::backdrop::BackdropCapability {
     state.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ownership_proxy_payloads_use_rpc_camel_case_keys() {
+        let turn = TurnInput::default();
+        let start = session_start_params("project".into(), "primary".into(), turn.clone());
+        let chat = chat_session_start_params("primary".into(), turn.clone());
+        let continued = session_continue_params("session".into(), turn);
+        let listed = agent_sessions_params("primary".into(), 25);
+
+        assert_eq!(start["projectId"], "project");
+        assert_eq!(start["primaryAgentId"], "primary");
+        assert!(start.get("project_id").is_none());
+        assert!(start.get("primary_agent_id").is_none());
+        assert_eq!(chat["primaryAgentId"], "primary");
+        assert!(chat.get("primary_agent_id").is_none());
+        assert_eq!(continued["sessionPk"], "session");
+        assert!(continued.get("session_pk").is_none());
+        assert_eq!(listed["agentId"], "primary");
+        assert!(listed.get("agent_id").is_none());
+    }
 }

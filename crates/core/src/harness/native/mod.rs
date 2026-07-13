@@ -42,6 +42,53 @@ use tokio_util::sync::CancellationToken;
 /// The native runtime harness id — the sole in-process agent runtime.
 pub const NATIVE_ID: &str = "native";
 
+#[derive(Debug)]
+struct AdaptedPrimary {
+    agent: agents::Agent,
+    allowed_skills: Option<Vec<String>>,
+}
+
+fn adapt_primary_profile(
+    profile: &crate::agents::types::AgentProfile,
+) -> anyhow::Result<AdaptedPrimary> {
+    if !profile.tools.plugins.is_empty() {
+        anyhow::bail!(
+            "primary agent `{}` configures plugin tools, which the native runtime cannot enforce",
+            profile.id
+        );
+    }
+    if !profile.tools.apps.is_empty() {
+        anyhow::bail!(
+            "primary agent `{}` configures app tools, which the native runtime cannot enforce",
+            profile.id
+        );
+    }
+    if !profile.permissions.rules.is_empty() {
+        anyhow::bail!(
+            "primary agent `{}` configures permission rules, which the native runtime cannot enforce",
+            profile.id
+        );
+    }
+
+    let tools = if profile.tools.native.is_empty() {
+        agents::ToolFilter::All
+    } else {
+        agents::ToolFilter::Only(profile.tools.native.clone())
+    };
+    Ok(AdaptedPrimary {
+        agent: agents::Agent {
+            name: profile.id.clone(),
+            description: profile.description.clone(),
+            mode: agents::AgentMode::Primary,
+            prompt: None,
+            tools,
+            can_delegate: false,
+            builtin: false,
+        },
+        allowed_skills: (!profile.skills.is_empty()).then(|| profile.skills.clone()),
+    })
+}
+
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
 /// loop in-process via [`runner::run_turn`].
 pub struct NativeHarness {
@@ -208,12 +255,11 @@ impl Harness for NativeHarness {
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
-        // The immutable primary profile, not a worktree-local legacy agent
-        // declaration, selects the actual native persona for this session.
-        let agent = agents
-            .get(&ctx.primary_agent.profile.id)
-            .or_else(|| agents.get("build"))
-            .unwrap_or_else(|| agents.default_agent());
+        // The durable snapshot owns this session's native persona. Legacy
+        // worktree agents remain available only for slash-command/subagent
+        // selection; they must never replace a durable primary by name.
+        let adapted_primary = adapt_primary_profile(&ctx.primary_agent.profile)?;
+        let agent = adapted_primary.agent;
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
@@ -293,6 +339,7 @@ impl Harness for NativeHarness {
                 agent,
                 agents,
                 commands,
+                allowed_skills: adapted_primary.allowed_skills,
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
@@ -558,6 +605,39 @@ mod tests {
     }
 
     #[test]
+    fn durable_primary_adapter_uses_the_profile_id_and_native_tools() {
+        let profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        let adapted = adapt_primary_profile(&profile).unwrap();
+
+        assert_eq!(adapted.agent.name, "ryuzi");
+        assert!(adapted.agent.tools.allows("bash"));
+        assert_eq!(adapted.allowed_skills, None);
+    }
+
+    #[test]
+    fn durable_primary_adapter_filters_profile_tools_and_skills_without_build_fallback() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        profile.tools.native = vec!["read".into()];
+        profile.skills = vec!["release".into()];
+        let adapted = adapt_primary_profile(&profile).unwrap();
+
+        assert_eq!(adapted.agent.name, "ryuzi");
+        assert!(adapted.agent.tools.allows("read"));
+        assert!(!adapted.agent.tools.allows("bash"));
+        assert_eq!(adapted.allowed_skills, Some(vec!["release".into()]));
+    }
+
+    #[test]
+    fn durable_primary_adapter_rejects_profile_capabilities_native_cannot_enforce() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        profile.tools.plugins = vec!["github.search".into()];
+
+        assert!(adapt_primary_profile(&profile)
+            .unwrap_err()
+            .to_string()
+            .contains("plugin tools"));
+    }
+    #[test]
     fn native_plugin_manifest_has_expected_identity() {
         let plugin = native_plugin();
         assert_eq!(plugin.manifest.contract, 1);
@@ -732,14 +812,11 @@ mod tests {
         let _guard = StateDirGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let work_dir = dir.path().to_path_buf();
-        let mem = memory::MemoryStore::for_agent(
-            Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
-                work_dir.join(".agent-config"),
-            )),
-            "ryuzi",
-            None,
-        )
-        .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let ctx = ctx_for(store.clone(), work_dir).await;
+        let mem =
+            memory::MemoryStore::for_agent(ctx.agent_knowledge.clone(), "ryuzi", None).unwrap();
         mem.add(
             memory::MemoryScope::Global,
             "the deploy key lives in 1Password",
@@ -749,9 +826,6 @@ mod tests {
         mem.add(memory::MemoryScope::User, "prefers terse answers")
             .await
             .unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
         let llm = Arc::new(RecordingLlm::new(vec![vec![
             text_delta("ok"),
@@ -767,10 +841,7 @@ mod tests {
         let plugin = native_plugin_with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
         let harness = plugin.harness.unwrap().create().unwrap();
         // ctx_for's SessionCtx carries project_id: None — the chat-session shape.
-        let session = harness
-            .start_session(ctx_for(store.clone(), work_dir).await)
-            .await
-            .unwrap();
+        let session = harness.start_session(ctx).await.unwrap();
         session
             .send_prompt(TurnPrompt::text("hi", "hi"))
             .await
@@ -876,7 +947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_turn_keeps_first_snapshot_and_next_lock_holder_refreshes() {
+    async fn concurrent_turn_keeps_primary_snapshot_despite_project_runtime_changes() {
         use crate::domain::{Project, Session, SessionStatus};
         use crate::llm_router::connections;
         use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -1012,9 +1083,9 @@ mod tests {
         let policies = llm.policies.lock().unwrap();
         assert_eq!(policies.len(), 2);
         assert_eq!(policies[0].requested_model, "anthropic/model-a");
-        assert_eq!(policies[0].project_override.as_deref(), Some("low"));
-        assert_eq!(policies[1].requested_model, "anthropic/model-b");
-        assert_eq!(policies[1].project_override.as_deref(), Some("high"));
+        assert_eq!(policies[0].project_override, None);
+        assert_eq!(policies[1].requested_model, "anthropic/model-a");
+        assert_eq!(policies[1].project_override, None);
     }
 
     fn conn_for_resolution_tests(

@@ -144,6 +144,10 @@ pub struct RunnerDeps {
     pub agents: Arc<AgentRegistry>,
     /// Available slash commands.
     pub commands: Arc<CommandRegistry>,
+    /// Names of skills the durable primary profile permits. `None` leaves the
+    /// native runtime's normal unrestricted discovery in place. Subagents reset
+    /// this to `None` so their established unrestricted behavior remains.
+    pub allowed_skills: Option<Vec<String>>,
     /// Persistent memory (None in contexts without a session row, e.g. bare
     /// tests, and always None inside sub-agents).
     pub memory: Option<Arc<super::memory::MemoryStore>>,
@@ -593,7 +597,12 @@ async fn drive(
                 Some(memory) => memory.snapshot().await?,
                 None => None,
             };
-            context::assemble_system(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref())
+            context::assemble_system(
+                &deps.work_dir,
+                &deps.extra_skill_dirs,
+                memory.as_deref(),
+                deps.allowed_skills.as_deref(),
+            )
         }
     };
     // Tools restricted to what this agent may use — UNLESS a review fork
@@ -1298,6 +1307,7 @@ async fn max_spawn_depth(store: &Store) -> u8 {
 fn deps_for_subagent(deps: &RunnerDeps) -> RunnerDeps {
     let mut child = deps.clone();
     child.memory = None;
+    child.allowed_skills = None;
     child.app_control = None;
     child
 }
@@ -1395,7 +1405,8 @@ impl RunnerSpawner {
                     context::assemble_system(
                         &self.deps.work_dir,
                         &self.deps.extra_skill_dirs,
-                        None
+                        None,
+                        None,
                     )
                 ),
             });
@@ -2480,6 +2491,7 @@ mod tests {
             agent,
             agents,
             commands: Arc::new(CommandRegistry::builtin()),
+            allowed_skills: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
