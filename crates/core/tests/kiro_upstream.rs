@@ -87,6 +87,38 @@ async fn mock_kiro_upstream_ok() -> (u16, tokio::task::JoinHandle<()>) {
     (port, h)
 }
 
+async fn mock_kiro_upstream_capture() -> (
+    u16,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::Mutex<Vec<Value>>>,
+) {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::Response;
+    use axum::{routing::post, Json, Router};
+
+    async fn capture(
+        axum::extract::State(captured): axum::extract::State<Arc<std::sync::Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        captured.lock().unwrap().push(body);
+        Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+            .body(Body::from(three_frame_body()))
+            .unwrap()
+    }
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(KIRO_PATH, post(capture))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, h, captured)
+}
+
 /// Mock: one `toolUseEvent` (tool-call-only, no text) then
 /// `messageStopEvent` — used by the non-stream tool-only-content test.
 async fn mock_kiro_upstream_tool_only() -> (u16, tokio::task::JoinHandle<()>) {
@@ -253,6 +285,62 @@ async fn setup_kiro(kiro_port: u16) -> (Arc<Store>, String, u16, RouterServer) {
 // ---------------------------------------------------------------------------
 // Step 1: three-frame success, all three client formats
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn all_public_kiro_surfaces_strip_caller_effort_before_translation() {
+    let (up_port, _h, captured) = mock_kiro_upstream_capture().await;
+    let (_store, key, port, srv) = setup_kiro(up_port).await;
+    let client = reqwest::Client::new();
+
+    for (path, body) in [
+        (
+            "/v1/messages",
+            json!({
+                "model": "kiro/claude-sonnet-4.5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"}
+            }),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": "kiro/claude-sonnet-4.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "medium"
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({
+                "model": "kiro/claude-sonnet-4.5",
+                "input": "hi",
+                "reasoning": {"effort": "high"}
+            }),
+        ),
+    ] {
+        let response = client
+            .post(format!("http://127.0.0.1:{port}{path}"))
+            .header("x-api-key", &key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{path}: {response:?}");
+        let _ = response.bytes().await.unwrap();
+    }
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 3);
+    for request in captured.iter() {
+        assert!(request["inferenceConfig"].get("maxTokens").is_some());
+        assert!(request.pointer("/output_config/effort").is_none());
+        assert!(request.get("reasoning_effort").is_none());
+        assert!(request.pointer("/reasoning/effort").is_none());
+    }
+
+    srv.stop().await;
+}
 
 #[tokio::test]
 async fn anthropic_client_streams_kiro_three_frames() {

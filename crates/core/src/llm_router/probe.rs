@@ -201,6 +201,7 @@ pub async fn probe_model(
         store: store.clone(),
         http: http.clone(),
         oauth_token_url_override: None,
+        kiro_base_override: None,
         mimo_bootstrap_url_override: None,
     };
     probe_model_with_ctx(&ctx, desc, conn, model).await
@@ -476,6 +477,7 @@ mod tests {
             store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: Some(format!("http://127.0.0.1:{port}/bootstrap")),
         };
         let conn = mk_conn(
@@ -539,6 +541,7 @@ mod tests {
             store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: Some(format!("http://127.0.0.1:{port}/bootstrap")),
         };
         let conn = mk_conn(
@@ -588,6 +591,7 @@ mod tests {
             store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: Some("http://127.0.0.1:1/never".into()),
         };
         let conn = mk_conn(

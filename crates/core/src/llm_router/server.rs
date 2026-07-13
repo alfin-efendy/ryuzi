@@ -64,6 +64,7 @@ impl AppState {
             store: self.store.clone(),
             http: self.http.clone(),
             oauth_token_url_override: self.oauth_token_url_override.clone(),
+            kiro_base_override: self.kiro_base_override.clone(),
             mimo_bootstrap_url_override: None,
         }
     }
@@ -305,6 +306,10 @@ fn apply_responses_effort(
     effort
 }
 
+fn apply_kiro_effort_policy(body: &mut Value) {
+    crate::llm_router::client::strip_kiro_effort(body);
+}
+
 /// Client speaks Anthropic. `client_fmt` differs from `handle_chat` only in
 /// error shape + translation direction.
 async fn handle_messages(
@@ -351,9 +356,12 @@ async fn handle_messages(
     };
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::Anthropic, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::Anthropic, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -518,9 +526,12 @@ async fn handle_chat(
     };
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::OpenAi, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::OpenAi, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -671,9 +682,12 @@ async fn handle_responses(
 
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::Responses, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::Responses, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -2343,6 +2357,21 @@ mod tests {
             kiro_endpoints("idc", "eu-west-1")[0],
             "https://codewhisperer.eu-west-1.amazonaws.com/generateAssistantResponse"
         );
+    }
+
+    #[test]
+    fn kiro_request_body_ignores_client_effort_fields() {
+        let data = ConnectionData::default();
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "low"},
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "high"}
+        });
+
+        let out = kiro_request_body(&body, ClientFormat::OpenAi, "m", &data, "c1");
+
+        assert_eq!(out["inferenceConfig"], json!({"maxTokens": 32000}));
     }
 
     #[test]

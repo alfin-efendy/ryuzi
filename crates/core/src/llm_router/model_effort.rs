@@ -149,9 +149,6 @@ impl DiscoveredModelMeta {
         {
             base.default_reasoning_effort = None;
         }
-        if base.default_reasoning_effort.is_none() && base.reasoning_efforts.len() == 1 {
-            base.default_reasoning_effort = Some(base.reasoning_efforts[0].value.clone());
-        }
         base
     }
 }
@@ -904,13 +901,59 @@ mod tests {
             default_effort: Some("invalid".into()),
             ..Default::default()
         };
+        assert_eq!(invalid.merge_over(fallback).default_reasoning_effort, None);
+    }
+
+    #[test]
+    fn merge_does_not_guess_default_from_a_single_unadvertised_option() {
+        let discovered = DiscoveredModelMeta {
+            effort_options: Some(vec![option("high", "High", None)]),
+            ..Default::default()
+        };
+
         assert_eq!(
-            invalid
-                .merge_over(fallback)
-                .default_reasoning_effort
-                .as_deref(),
-            Some("ultra")
+            discovered
+                .merge_over(crate::llm_router::model_meta::FALLBACK.clone())
+                .default_reasoning_effort,
+            None
         );
+    }
+
+    #[test]
+    fn selection_omits_unadvertised_discovery_default_after_no_target_or_global() {
+        let surface = ExecutionSurfaceKey {
+            provider_id: "openai".into(),
+            connection_id: Some("openai-connection".into()),
+            model: "gpt-single".into(),
+        };
+        let policy = TurnEffortPolicy {
+            requested_model: "openai/gpt-single".into(),
+            caller_override: None,
+            route_targets: Default::default(),
+            configured: Default::default(),
+            surfaces: HashMap::from([(
+                surface.clone(),
+                ExecutionModelEffortCapabilities {
+                    surface: surface.clone(),
+                    model_display_name: "GPT Single".into(),
+                    supported: vec![option("high", "High", None)],
+                    provider_default: None,
+                },
+            )]),
+        };
+
+        let resolved = resolve_for_target(
+            &policy,
+            None,
+            &ModelPreferenceKey {
+                family: "openai".into(),
+                model: "gpt-single".into(),
+            },
+            &surface,
+        );
+
+        assert_eq!(resolved.value, None);
+        assert_eq!(resolved.source, EffectiveEffortSource::None);
     }
 
     #[tokio::test]

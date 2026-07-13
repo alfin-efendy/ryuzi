@@ -653,6 +653,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_target_effort_rejects_kiro_metadata_without_wire_support() {
+        let store = mem_store().await;
+        connections::add_connection(
+            &store,
+            connections::ConnectionRow {
+                id: "kiro".into(),
+                provider: "kiro".into(),
+                auth_type: "oauth".into(),
+                label: "Kiro".into(),
+                priority: 0,
+                enabled: true,
+                data: connections::ConnectionData {
+                    models_override: Some(vec!["claude-sonnet-4.5".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "claude-sonnet-4.5".into(),
+                        crate::llm_router::model_effort::DiscoveredModelMeta {
+                            display_name: None,
+                            effort_options: Some(vec![ReasoningEffortOption {
+                                value: "high".into(),
+                                label: "High".into(),
+                                description: None,
+                            }]),
+                            default_effort_advertised: true,
+                            default_effort: Some("high".into()),
+                        },
+                    )])),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let mut route = route("kiro");
+        route.targets[0] = ModelRouteTarget {
+            provider: "kiro".into(),
+            model: "claude-sonnet-4.5".into(),
+            effort: Some("high".into()),
+        };
+
+        assert!(save_model_route(&store, route).await.is_err());
+    }
+
+    #[tokio::test]
     async fn route_target_effort_rejects_unsupported_unknown_and_empty_values() {
         let store = mem_store().await;
         let mut unsupported = route("unsupported");

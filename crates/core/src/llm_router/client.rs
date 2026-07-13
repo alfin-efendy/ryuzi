@@ -39,6 +39,9 @@ pub struct UpstreamCtx {
     /// (post-401) refresh path. `None` in production, which uses each
     /// provider's static `registry::oauth_config` token_url.
     pub oauth_token_url_override: Option<String>,
+    /// Test-only override for Kiro's hard-coded `generateAssistantResponse`
+    /// endpoint. `None` uses the production endpoint selection.
+    pub kiro_base_override: Option<String>,
     /// Test-only override for the MiMo free-tier bootstrap endpoint that
     /// mints the anti-abuse JWT. `None` in production
     /// ([`mimo::BOOTSTRAP_URL`]).
@@ -52,6 +55,7 @@ impl UpstreamCtx {
             store,
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: None,
         }
     }
@@ -1015,6 +1019,18 @@ fn strip_thinking(body: &mut Value) {
     }
 }
 
+pub(crate) fn strip_kiro_effort(body: &mut Value) {
+    if let Some(output) = body.get_mut("output_config").and_then(Value::as_object_mut) {
+        output.remove("effort");
+    }
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.remove("effort");
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+}
+
 pub(crate) fn target_effort(
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
@@ -1901,6 +1917,7 @@ pub async fn anthropic_messages_stream(
         // fallback target, matching the other providers' behavior.
         if target.conn.provider == "kiro" {
             strip_thinking(&mut attempt_body);
+            strip_kiro_effort(&mut attempt_body);
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
                 Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
@@ -2413,10 +2430,12 @@ pub(crate) fn kiro_upstream_request(
 ) -> reqwest::RequestBuilder {
     let data = &target.conn.data;
     let auth_method = connections::kiro_auth_method(data);
-    let url = kiro_endpoints(&auth_method, &connections::kiro_region(data))
-        .into_iter()
-        .next()
-        .expect("kiro_endpoints always returns at least one URL");
+    let url = ctx.kiro_base_override.clone().unwrap_or_else(|| {
+        kiro_endpoints(&auth_method, &connections::kiro_region(data))
+            .into_iter()
+            .next()
+            .expect("kiro_endpoints always returns at least one URL")
+    });
     let token = data.access_token.clone().unwrap_or_default();
     let mut req = ctx
         .http
@@ -2769,6 +2788,23 @@ mod tests {
     }
 
     #[test]
+    fn kiro_protocol_strips_all_client_effort_fields() {
+        let mut body = json!({
+            "output_config": {"effort": "low", "other": true},
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "high", "summary": "detailed"}
+        });
+
+        strip_kiro_effort(&mut body);
+
+        assert!(body["output_config"].get("effort").is_none());
+        assert_eq!(body["output_config"]["other"], true);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body["reasoning"].get("effort").is_none());
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
     fn single_option_without_advertised_default_is_omitted_from_wire() {
         let anthropic = RouteTarget {
             conn: mk_conn("a1", "anthropic", "api_key", ConnectionData::default()),
@@ -3031,6 +3067,102 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    #[tokio::test]
+    async fn native_kiro_stream_strips_all_client_effort_fields_before_translation() {
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::response::Response;
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Mutex as StdMutex;
+
+        fn frame(event_type: &str, payload: &str) -> Vec<u8> {
+            let name = ":event-type";
+            let mut headers = Vec::new();
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7);
+            headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+            headers.extend_from_slice(event_type.as_bytes());
+            let payload = payload.as_bytes();
+            let total = 12 + headers.len() + payload.len() + 4;
+            let mut out = Vec::with_capacity(total);
+            out.extend_from_slice(&(total as u32).to_be_bytes());
+            out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&headers);
+            out.extend_from_slice(payload);
+            out.extend_from_slice(&[0; 4]);
+            out
+        }
+
+        async fn capture(
+            State(captured): State<Arc<StdMutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            captured.lock().unwrap().push(body);
+            let mut response = frame("assistantResponseEvent", r#"{"content":"ok"}"#);
+            response.extend(frame("messageStopEvent", "{}"));
+            Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                .body(Body::from(response))
+                .unwrap()
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/generateAssistantResponse", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut ctx = test_ctx().await;
+        ctx.kiro_base_override = Some(format!("http://127.0.0.1:{port}/generateAssistantResponse"));
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "kiro-native",
+                "kiro",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("kiro-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 86_400_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    models_override: Some(vec!["claude-sonnet-4.5".into()]),
+                    provider_specific: Some(json!({"authMethod": "builder-id"})),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": "kiro/claude-sonnet-4.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"},
+                "reasoning_effort": "medium",
+                "reasoning": {"effort": "high"}
+            }),
+            utility_policy(&ctx, "kiro/claude-sonnet-4.5")
+                .await
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        let _ = collect_stream(routed.events).await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0]["inferenceConfig"].get("maxTokens").is_some());
+        assert!(captured[0].pointer("/output_config/effort").is_none());
+        assert!(captured[0].get("reasoning_effort").is_none());
+        assert!(captured[0].pointer("/reasoning/effort").is_none());
     }
 
     async fn utility_policy(ctx: &UpstreamCtx, model: &str) -> Arc<model_effort::TurnEffortPolicy> {
