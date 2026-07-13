@@ -83,11 +83,13 @@ async fn load_model_routes(store: &Store) -> anyhow::Result<Vec<ModelRouteInfo>>
     Ok(routes)
 }
 
-pub fn parse_legacy_openai_route_suffix(model: &str) -> Option<(String, String)> {
+pub(crate) fn parse_legacy_openai_route_suffix(model: &str) -> Option<(String, String)> {
     let model = model.strip_suffix("-review").unwrap_or(model);
     for effort in ["minimal", "medium", "xhigh", "ultra", "high", "low"] {
         if let Some(base) = model.strip_suffix(&format!("-{effort}")) {
-            return Some((base.to_string(), effort.to_string()));
+            if !base.is_empty() {
+                return Some((base.to_string(), effort.to_string()));
+            }
         }
     }
     None
@@ -99,15 +101,26 @@ async fn migrate_legacy_openai_route_efforts(store: &Store) -> anyhow::Result<()
     }
 
     let mut inventory = BTreeSet::new();
-    let openai = registry::descriptor("openai").expect("OpenAI must be in the registry");
-    inventory.extend(openai.models.iter().map(|model| (*model).to_string()));
+    for descriptor in registry::CATALOG
+        .iter()
+        .filter(|descriptor| descriptor.family == "openai")
+    {
+        inventory.extend(descriptor.models.iter().map(|model| (*model).to_string()));
+    }
     for connection in connections::list_connections(store).await? {
-        if connection.provider == "openai" {
-            inventory.extend(connections::effective_models(openai, &connection));
+        let Some(descriptor) = registry::descriptor(&connection.provider) else {
+            continue;
+        };
+        if descriptor.family == "openai" {
+            inventory.extend(connections::effective_models(descriptor, &connection));
         }
     }
 
-    let mut routes = load_model_routes(store).await?;
+    let Some(raw_routes) = store.get_setting(SETTING_KEY).await? else {
+        return write_effort_migration_marker(store).await;
+    };
+    let mut routes: Vec<ModelRouteInfo> = serde_json::from_str(&raw_routes)?;
+    let mut transformed = false;
     for route in &mut routes {
         for target in &mut route.targets {
             if target.provider != "openai"
@@ -133,8 +146,13 @@ async fn migrate_legacy_openai_route_efforts(store: &Store) -> anyhow::Result<()
             if resolved.supports(&effort) {
                 target.model = base;
                 target.effort = Some(effort);
+                transformed = true;
             }
         }
+    }
+
+    if !transformed {
+        return write_effort_migration_marker(store).await;
     }
 
     store
@@ -150,7 +168,19 @@ async fn migrate_legacy_openai_route_efforts(store: &Store) -> anyhow::Result<()
             transaction.commit()
         })
         .await
-        .map_err(Into::into)
+}
+
+async fn write_effort_migration_marker(store: &Store) -> anyhow::Result<()> {
+    store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, '1') \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [EFFORT_MIGRATION_KEY],
+            )
+            .map(|_| ())
+        })
+        .await
 }
 
 pub async fn list_model_route_target_capabilities(
@@ -664,6 +694,7 @@ mod tests {
             Some(("gpt-test-review".into(), "xhigh".into()))
         );
         assert_eq!(parse_legacy_openai_route_suffix("gpt-test-review"), None);
+        assert_eq!(parse_legacy_openai_route_suffix("-high"), None);
         assert_eq!(parse_legacy_openai_route_suffix("gpt-test-max"), None);
         assert_eq!(
             parse_legacy_openai_route_suffix("gpt-test-low-high"),
@@ -714,6 +745,74 @@ mod tests {
         assert_eq!(targets[6], target("anthropic", "gpt-custom-high", None));
         assert_eq!(targets[7], target("openai", "gpt-custom-high", None));
         assert_eq!(targets[8], target("openai", "gpt-custom-unknown", None));
+        assert_eq!(
+            store
+                .get_setting(EFFORT_MIGRATION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_uses_openai_family_connection_inventory() {
+        let store = mem_store().await;
+        connections::add_connection(
+            &store,
+            connection("codex", "openai-oauth", vec!["gpt-custom"], &["high"]),
+        )
+        .await
+        .unwrap();
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                SETTING_KEY,
+                &routes_with_targets(vec![target("openai", "gpt-custom-high", None)]),
+            )
+            .await
+            .unwrap();
+
+        let routes = list_model_routes(&store).await.unwrap();
+
+        assert_eq!(
+            routes[0].targets,
+            vec![target("openai", "gpt-custom", Some("high"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_uneligible_routes_json_and_marks_completion() {
+        let store = mem_store().await;
+        let raw = r#" [ { "id":"legacy", "name":"legacy", "enabled":true, "strategy":"fallback", "targets":[{"provider":"anthropic","model":"claude-high"}], "createdAt":1, "updatedAt":1 } ] "#;
+        store
+            .set_setting(crate::domain::WriteOrigin::User, SETTING_KEY, raw)
+            .await
+            .unwrap();
+
+        list_model_routes(&store).await.unwrap();
+
+        assert_eq!(
+            store.get_setting(SETTING_KEY).await.unwrap().as_deref(),
+            Some(raw)
+        );
+        assert_eq!(
+            store
+                .get_setting(EFFORT_MIGRATION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_does_not_create_absent_routes_setting() {
+        let store = mem_store().await;
+
+        list_model_routes(&store).await.unwrap();
+
+        assert!(store.get_setting(SETTING_KEY).await.unwrap().is_none());
         assert_eq!(
             store
                 .get_setting(EFFORT_MIGRATION_KEY)
@@ -795,9 +894,18 @@ mod tests {
         models: Vec<&str>,
         efforts: &[&str],
     ) -> connections::ConnectionRow {
+        connection(id, "openai", models, efforts)
+    }
+
+    fn connection(
+        id: &str,
+        provider: &str,
+        models: Vec<&str>,
+        efforts: &[&str],
+    ) -> connections::ConnectionRow {
         connections::ConnectionRow {
             id: id.into(),
-            provider: "openai".into(),
+            provider: provider.into(),
             auth_type: "api_key".into(),
             label: "OpenAI".into(),
             priority: 0,
