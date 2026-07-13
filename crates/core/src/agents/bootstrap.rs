@@ -705,6 +705,8 @@ mod tests {
             self.store
                 .insert_session(Session {
                     session_pk: "sess-1".into(),
+                    primary_agent_id: None,
+                    primary_agent_snapshot: None,
                     project_id: Some("proj-1".into()),
                     agent_session_id: None,
                     worktree_path: None,

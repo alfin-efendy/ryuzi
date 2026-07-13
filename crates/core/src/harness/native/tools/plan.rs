@@ -197,6 +197,8 @@ mod tests {
         ctx.store
             .insert_session(Session {
                 session_pk: ctx.session_pk.clone(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,

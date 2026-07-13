@@ -261,6 +261,8 @@ mod tests {
         cp.store()
             .insert_session(Session {
                 session_pk: pk.into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -336,6 +338,8 @@ mod tests {
         cp.store()
             .insert_session(Session {
                 session_pk: "busy".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,

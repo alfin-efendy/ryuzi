@@ -262,6 +262,12 @@ pub struct CuratorRun {
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub session_pk: String,
+    /// The immutable stable ID of the agent selected when this session began.
+    /// `None` with `primary_agent_snapshot == None` identifies legacy history.
+    pub primary_agent_id: Option<String>,
+    /// The display identity captured when the session began; never derived from
+    /// the mutable registry after persistence.
+    pub primary_agent_snapshot: Option<AgentIdentitySnapshot>,
     /// `None` for chat-first sessions (`kind != Project`); a project-bound
     /// session always has this set.
     pub project_id: Option<String>,
@@ -290,6 +296,133 @@ pub struct Session {
     pub agent: Option<String>,
     /// The session this one was spawned from (`Worker`/`Review` lineage).
     pub parent_session_pk: Option<String>,
+}
+
+/// An immutable identity captured when an agent becomes the primary owner of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIdentitySnapshot {
+    pub id: String,
+    pub name: String,
+    pub avatar_color: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRunKind {
+    Primary,
+    MainDelegate,
+    Subagent,
+}
+
+impl AgentRunKind {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::MainDelegate => "main-delegate",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    pub fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "main-delegate" => Ok(Self::MainDelegate),
+            "subagent" => Ok(Self::Subagent),
+            _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("invalid agent run kind `{value}`").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentRunStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl AgentRunStatus {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("invalid agent run status `{value}`").into(),
+            )),
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRun {
+    pub run_id: String,
+    pub session_pk: String,
+    pub parent_run_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub primary_agent_id: String,
+    pub executing_agent_id: Option<String>,
+    pub executing_agent_name_snapshot: String,
+    pub agent_kind: AgentRunKind,
+    pub task: String,
+    pub status: AgentRunStatus,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub tool_count: u32,
+    pub resolved_model: Option<String>,
+    pub resolved_effort: Option<String>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAgentRun {
+    pub run_id: String,
+    pub session_pk: String,
+    pub parent_run_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub primary_agent_id: String,
+    pub executing_agent_id: Option<String>,
+    pub executing_agent_name_snapshot: String,
+    pub agent_kind: AgentRunKind,
+    pub task: String,
+    pub status: AgentRunStatus,
+    pub resolved_model: Option<String>,
+    pub resolved_effort: Option<String>,
 }
 
 /// How a new session's git workspace is prepared (branch controls).

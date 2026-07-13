@@ -734,6 +734,8 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: session_pk.to_string(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: Some(project_id.to_string()),
                 agent_session_id: None,
                 worktree_path: None,
@@ -1748,6 +1750,8 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: Some("p1".into()),
                 agent_session_id: Some("acp-123".into()),
                 worktree_path: None,

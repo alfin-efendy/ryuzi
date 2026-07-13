@@ -657,6 +657,8 @@ async fn seed_session(
     store
         .insert_session(Session {
             session_pk: session_pk.to_string(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: Some(project_id.to_string()),
             agent_session_id: agent_session_id.map(|s| s.to_string()),
             worktree_path: None,
@@ -1430,6 +1432,8 @@ async fn resume_session_resumes_a_chat_session() {
     store
         .insert_session(Session {
             session_pk: "chat-1".to_string(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: None,
             agent_session_id: Some("agent-1".to_string()),
             worktree_path: None,
@@ -1690,6 +1694,8 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     let session_pk = crate::paths::new_id();
     let session = Session {
         session_pk: session_pk.clone(),
+        primary_agent_id: None,
+        primary_agent_snapshot: None,
         project_id: Some(project.project_id.clone()),
         agent_session_id: None,
         worktree_path: None,
@@ -3539,6 +3545,8 @@ async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_wr
     cp.store()
         .insert_session(Session {
             session_pk: "parent-1".into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: None,
             agent_session_id: None,
             worktree_path: None,

@@ -409,6 +409,8 @@ mod tests {
         s.cp.store()
             .insert_session(crate::domain::Session {
                 session_pk: "chat-x".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -492,6 +494,8 @@ mod tests {
         cp.store()
             .insert_session(crate::domain::Session {
                 session_pk: session_pk.into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: Some(worktree.into()),

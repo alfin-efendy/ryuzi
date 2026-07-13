@@ -110,6 +110,8 @@ impl ControlPlane {
         // of any git options passed.
         let session = Session {
             session_pk: session_pk.clone(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: Some(project.project_id.clone()),
             agent_session_id: None,
             worktree_path: None,
@@ -194,6 +196,8 @@ impl ControlPlane {
         let title: String = prompt.display.chars().take(80).collect();
         let session = Session {
             session_pk: session_pk.clone(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: None,
             agent_session_id: None,
             worktree_path: None,
@@ -1448,6 +1452,8 @@ impl ControlPlane {
         self.store
             .insert_session(Session {
                 session_pk: review_pk.clone(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: project_id.clone(),
                 agent_session_id: None,
                 worktree_path: None,

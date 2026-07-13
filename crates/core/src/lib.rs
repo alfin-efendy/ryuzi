@@ -31,6 +31,7 @@ pub mod registry;
 pub mod router;
 pub mod scheduler;
 pub mod serve;
+pub mod sessions;
 pub mod settings;
 pub mod skills_install;
 pub mod stdio_jsonrpc;

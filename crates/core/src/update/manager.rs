@@ -291,6 +291,8 @@ mod tests {
     fn sess(pk: &str, status: SessionStatus) -> Session {
         Session {
             session_pk: pk.into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: None,

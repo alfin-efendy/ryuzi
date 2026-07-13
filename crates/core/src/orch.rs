@@ -2234,6 +2234,8 @@ mod tests {
         cp.store()
             .insert_session(crate::domain::Session {
                 session_pk: pk.into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: Some(project_id.into()),
                 agent_session_id: None,
                 worktree_path: None,
