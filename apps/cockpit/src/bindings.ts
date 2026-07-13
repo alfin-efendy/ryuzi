@@ -315,22 +315,6 @@ async orchSteer(sessionPk: string, text: string) : Promise<Result<string, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
-async getAgentSettings(runnerId: string | null) : Promise<Result<AgentSettingsInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings", { runnerId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setAgentSettings(runnerId: string | null, model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { runnerId, model, permMode }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listSelectableModels(runnerId: string | null) : Promise<Result<SelectableModelInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_selectable_models", { runnerId }) };
@@ -1677,11 +1661,6 @@ export type AgentMutationInfo = { name: string; description: string; avatarColor
  */
 export type AgentRecoveryInfo = { code: string; message: string }
 export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
-export type AgentSettingsInfo = { model: string | null; 
-/**
- * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
- */
-permMode: string | null }
 export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
 export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
 export type AgentValidationInfo = { field: string; message: string }

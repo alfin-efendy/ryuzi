@@ -2,7 +2,7 @@ import { afterAll, test, expect, mock, spyOn } from "bun:test";
 import { useStore, markFocusedSessionReadOnEvent, drainQueueOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
-import { useAgent } from "./store-agent";
+import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import type { QueuedMessage } from "./lib/queue";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
@@ -208,7 +208,7 @@ test("failed_runtime_save_rolls_back_both_snapshots", async () => {
 test("global_preference_and_metadata_refresh_refetch_loaded_project_runtime_status", async () => {
   reset();
   useStore.setState({ projectRuntimeById: { p1: runtimeSnapshot } });
-  const reload = spyOn(useAgent.getState(), "load").mockResolvedValue(undefined);
+  const reload = spyOn(useAgents.getState(), "load").mockResolvedValue(undefined);
   const fresh = { ...runtimeSnapshot, storedEffortStatus: "unsupported" as const, effectiveEffort: "medium" };
   const info = spyOn(commands, "projectRuntimeInfo").mockResolvedValue({ status: "ok", data: fresh });
   await useStore.getState().refreshModelConfiguration();
@@ -226,7 +226,7 @@ test("older_model_configuration_refresh_cannot_overwrite_newer_state", async () 
   const olderGate = new Promise<void>((resolve) => {
     releaseOlder = resolve;
   });
-  const reload = spyOn(useAgent.getState(), "load")
+  const reload = spyOn(useAgents.getState(), "load")
     .mockImplementationOnce(async () => {
       await olderGate;
       return undefined;
@@ -262,7 +262,7 @@ test("configuration_refresh_started_before_mutation_cannot_overwrite_mutation", 
     isGit: true,
   };
   useStore.setState({ projects: [project], projectRuntimeById: { p1: runtimeSnapshot } });
-  const fetchList = spyOn(useAgent.getState(), "load").mockResolvedValue(undefined);
+  const fetchList = spyOn(useAgents.getState(), "load").mockResolvedValue(undefined);
   let resolveRefresh!: (value: unknown) => void;
   const info = spyOn(commands, "projectRuntimeInfo").mockImplementation(
     () =>

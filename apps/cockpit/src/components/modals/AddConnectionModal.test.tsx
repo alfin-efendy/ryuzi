@@ -6,8 +6,13 @@ import { LOCAL_RUNNER } from "@/lib/session-key";
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
 const listRuntimes = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
-const getAgentSettings = mock(() => Promise.resolve({ status: "ok" as const, data: { model: null, permMode: null } }));
 const listSelectableModels = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const listAgents = mock(() =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: { agents: [], defaultAgentId: "", recovery: [], subagentModel: { kind: "route" as const, route: "smart" } },
+  }),
+);
 // refreshModelConfiguration() (fired after every successful account mutation)
 // also re-fetches runtime info for any project already tracked in
 // `projectRuntimeById` — stubbed so a leftover entry from state that outlives
@@ -22,7 +27,7 @@ const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string;
 });
 
 mock.module("@/bindings", () => ({
-  commands: { addConnection, connectOauth, listRuntimes, getAgentSettings, listSelectableModels, projectRuntimeInfo },
+  commands: { addConnection, connectOauth, listRuntimes, listSelectableModels, listAgents, projectRuntimeInfo },
   events: { oauthAuthorizeUrlMsg: { listen: listenOauthAuthorizeUrl } },
 }));
 

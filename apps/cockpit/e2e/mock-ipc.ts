@@ -312,7 +312,6 @@ const FIXTURES: Record<string, unknown> = {
   list_providers: [],
   list_provider_catalog: PROVIDER_CATALOG,
   list_connections: CONNECTIONS,
-  get_agent_settings: { model: null, permMode: "ask" },
   list_selectable_models: NATIVE_RUNTIME.selectableModels,
   list_runtimes: [NATIVE_RUNTIME],
   refresh_runtimes: [NATIVE_RUNTIME],

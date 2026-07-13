@@ -66,8 +66,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::orch_retry,
             commands::orch_answer_block,
             commands::orch_steer,
-            agent_cmd::get_agent_settings,
-            agent_cmd::set_agent_settings,
             agent_cmd::list_selectable_models,
             agent_cmd::list_agents,
             agent_cmd::get_agent,

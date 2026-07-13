@@ -109,7 +109,7 @@ export const PROVIDER_DEVICE_SUBTITLE: Record<string, string> = {
   "github-copilot": "Sign in with your GitHub account to use your Copilot subscription.",
 };
 
-// The one (native, in-process) agent. Identity only — model/perm-mode state
-// lives in store-agent. These values are the native agent's identity, defined
-// only here now that the runtime concept is gone.
+// The one (native, in-process) agent. Identity only — model and permission
+// state live in the agent registry. These values define the native agent's
+// display identity now that the runtime concept is gone.
 export const NATIVE_AGENT = { id: "native", name: "Ryuzi", color: "#7C5CFF", initial: "R" } as const;

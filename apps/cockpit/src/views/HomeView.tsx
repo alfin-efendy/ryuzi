@@ -9,7 +9,7 @@ import { useNav } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
-import { useAgent } from "@/store-agent";
+import { useAgents } from "@/store-agents";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
@@ -67,7 +67,7 @@ export function HomeView() {
   );
   const isGit = project?.isGit ?? false;
   // Ryuzi-only: every session runs the native agent; the user picks a model.
-  const agentModels = useAgent((s) => s.models);
+  const agentModels = useAgents((s) => s.models);
   const setComposerModel = useNav((s) => s.setComposerModel);
   const setComposerEffort = useNav((s) => s.setComposerEffort);
   const previousProjectId = useRef(projectId);

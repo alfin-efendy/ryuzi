@@ -328,16 +328,7 @@ pub struct TodoItem {
 
 // --- agent_api (moved verbatim from apps/cockpit/src-tauri/src/agent_cmd.rs) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentSettingsInfo {
-    pub model: Option<String>,
-    /// "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
-    pub perm_mode: Option<String>,
-}
-
 // --- endpoint_api (moved verbatim from apps/cockpit/src-tauri/src/endpoint_cmd.rs) ---
-
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointStatusInfo {

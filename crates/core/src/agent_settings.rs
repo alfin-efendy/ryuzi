@@ -30,8 +30,8 @@ pub async fn get(store: &Store) -> anyhow::Result<AgentSettings> {
 
 /// Persist the settings: `Some(v)` upserts the key, `None` deletes it, so a
 /// cleared field falls back to the engine default instead of pinning "".
-/// Only reached from the `set_agent_settings` API command (Cockpit/CLI), so
-/// this always writes as `WriteOrigin::User`.
+/// Retained temporarily for the session lifecycle fallback until profile
+/// snapshots replace it. Writes remain attributed to `WriteOrigin::User`.
 pub async fn set(store: &Store, s: &AgentSettings) -> anyhow::Result<()> {
     match &s.model {
         Some(v) => {

@@ -1,10 +1,9 @@
-//! Settings → Agent commands: thin proxies to the engine daemon's agent RPC
-//! family — the YAML agent registry CRUD (Plan 3), the subagent model, the
-//! legacy native-agent settings KV (kept until Task 10 migrates its
-//! consumers), plus the selectable-model list the composer and Settings
-//! share. Registry commands are runner-aware (`runner_id: Option<String>`,
-//! defaulting to `"local"`); the payload helpers below exist so the exact
-//! snake_case RPC contract is unit-testable without a live engine.
+//! Agent registry commands: thin proxies to the engine daemon's YAML agent
+//! registry CRUD, subagent model, learning surface, and selectable-model list
+//! shared by agent detail and composer model pickers. Registry commands are
+//! runner-aware (`runner_id: Option<String>`, defaulting to `"local"`); the
+//! payload helpers below keep the snake_case RPC contract unit-testable
+//! without a live engine.
 
 use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
@@ -21,8 +20,8 @@ use ryuzi_core::api::types::{
 // emits these via the command type graph either way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    AgentRecoveryInfo, AgentSettingsInfo, AgentSkillUsageInfo, AgentSummaryInfo,
-    AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
+    AgentRecoveryInfo, AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo,
+    CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
     JourneyMilestoneInfo, LearningReviewInfo, PermissionRuleInfo,
 };
 
@@ -333,35 +332,6 @@ pub async fn rollback_agent_learning(
         .rpc(
             "rollback_agent_learning",
             rollback_learning_params(&agent_id, &snapshot_id),
-        )
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn get_agent_settings(
-    engine: Engine<'_>,
-    runner_id: Option<String>,
-) -> R<AgentSettingsInfo> {
-    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client
-        .rpc("get_agent_settings", serde_json::json!({}))
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn set_agent_settings(
-    engine: Engine<'_>,
-    runner_id: Option<String>,
-    model: Option<String>,
-    perm_mode: Option<String>,
-) -> R<()> {
-    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
-    client
-        .rpc(
-            "set_agent_settings",
-            serde_json::json!({ "model": model, "perm_mode": perm_mode }),
         )
         .await
 }

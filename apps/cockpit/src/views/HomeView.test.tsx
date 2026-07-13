@@ -80,7 +80,7 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { useAgent } = await import("@/store-agent");
+const { useAgents } = await import("@/store-agents");
 const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
 
@@ -146,10 +146,8 @@ beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1", projectRuntimeById: { p1: runtimeInfo } });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
-  useAgent.setState({
+  useAgents.setState({
     models: [selectable("anthropic/claude-opus-4"), selectable("anthropic/claude-sonnet-4")],
-    model: null,
-    permMode: "ask",
   });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
@@ -168,7 +166,7 @@ afterEach(() => {
   cleanup();
   useStore.setState({ projects: [], selectedProjectId: null, projectRuntimeById: {} });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
-  useAgent.setState({ models: [], model: null, permMode: null });
+  useAgents.setState({ models: [] });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
 });
@@ -219,7 +217,7 @@ test("composer model chip opens the structured model and effort menu", async () 
 
 test("chat-first composer keeps model and effort in durable nav state", async () => {
   useStore.setState({ selectedProjectId: null, projectRuntimeById: {} });
-  useAgent.setState({
+  useAgents.setState({
     models: [
       {
         ...selectable("anthropic/claude-opus-4"),
@@ -231,8 +229,6 @@ test("chat-first composer keeps model and effort in durable nav state", async ()
         defaultSource: "provider",
       },
     ],
-    model: null,
-    permMode: "ask",
   });
   useNav.setState({ composerModel: null, composerEffort: null });
   render(<HomeView />);

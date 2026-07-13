@@ -1,17 +1,13 @@
 import { ACCENTS, Button, Input, type Mode, SettingsCard as Card, SettingsCardRow as CardRow, Switch, useTheme } from "@ryuzi/ui";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { toast } from "sonner";
 import { commands } from "@/bindings";
 import { AuditCard } from "@/components/AuditCard";
 import { LOCAL_RUNNER } from "@/lib/session-key";
-import { ModelPicker } from "@/components/ModelPicker";
-import { PermissionsCard } from "@/components/PermissionsCard";
 import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
-import { agentModelValues, useAgent } from "@/store-agent";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
-import { normalizeLoopSetting } from "@/lib/loop-settings";
 import { ensurePermission } from "@/lib/notify";
 import { useUi } from "@/store-ui";
 // Canonical brand assets (assets/brand/README.md). Explicit light/dark variants:
@@ -177,135 +173,7 @@ function AccentRow() {
   );
 }
 
-// ——— Agent (native) settings ———
-// The default model, persisted in the engine settings KV via store-agent.
-// The permission-mode knob that used to live in this card was dropped per
-// review (dead at runtime — the composer's per-session permission control at
-// @/constants' PERM_MODES / uiPermToCore is the one that actually gates
-// tool calls). The picker stays inert until store-agent finishes hydrating,
-// so an early interaction can't round-trip null model/permMode and wipe the
-// persisted settings.
-
-function AgentSection() {
-  const selectableModels = useAgent((s) => s.models);
-  const models = useMemo(() => agentModelValues(selectableModels), [selectableModels]);
-  const model = useAgent((s) => s.model);
-  const loaded = useAgent((s) => s.loaded);
-  const setModel = useAgent((s) => s.setModel);
-
-  useEffect(() => {
-    void useAgent.getState().load();
-  }, []);
-
-  return (
-    <>
-      <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">Agent</div>
-      <Card>
-        <CardRow>
-          <span className="w-[110px] shrink-0 text-[13px] font-medium">Default model</span>
-          {models.length > 0 ? (
-            <ModelPicker
-              ariaLabel="Default model"
-              variant="field"
-              models={models}
-              leading={[{ value: "", label: "Router default (first usable provider)" }]}
-              value={model ?? ""}
-              onValueChange={(v) => void setModel(v === "" ? null : v)}
-              disabled={!loaded}
-            />
-          ) : (
-            <span className="flex-1 truncate text-xs text-muted-foreground">
-              Add an enabled provider connection in Models → Providers to pick a model.
-            </span>
-          )}
-        </CardRow>
-      </Card>
-    </>
-  );
-}
-
-// ——— Agent loop settings ———
-// Batch-3 knobs; rendered as a second card under the same "Agent" heading as
-// AgentSection above (a single heading — the Settings test asserts exactly
-// one "Agent" section title).
-
-const LOOP_SETTINGS = [
-  {
-    key: "agent.max_provider_turns",
-    label: "Max provider turns",
-    desc: "Model/tool round-trips per message before pausing.",
-    placeholder: "50",
-    min: 1,
-  },
-  {
-    key: "agent.auto_continue_budget",
-    label: "Auto-continues",
-    desc: "Automatic continues after the turn limit. 0 disables.",
-    placeholder: "4",
-    min: 0,
-  },
-] as const;
-
-function AgentLoopCard() {
-  const [values, setValues] = useState<Record<string, string>>({});
-  // Last confirmed-persisted value per key, separate from `values` (which
-  // tracks the live input and is mutated on every keystroke). A failed save
-  // must roll back to this — not to whatever the user just typed.
-  const [saved, setSaved] = useState<Record<string, string>>({});
-  useEffect(() => {
-    for (const s of LOOP_SETTINGS) {
-      void commands.getSetting(LOCAL_RUNNER, s.key).then((res) => {
-        if (res.status === "ok" && res.data) {
-          setValues((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
-          setSaved((cur) => ({ ...cur, [s.key]: res.data ?? "" }));
-        }
-      });
-    }
-  }, []);
-
-  const commit = async (key: string, min: number, raw: string) => {
-    const normalized = normalizeLoopSetting(raw, min);
-    if (normalized === null) {
-      if (raw.trim() !== "") toast.error(`Enter a whole number of at least ${min}.`);
-      return;
-    }
-    setValues((cur) => ({ ...cur, [key]: normalized }));
-    const res = await commands.setSetting(LOCAL_RUNNER, key, normalized);
-    if (res.status === "error") {
-      setValues((cur) => ({ ...cur, [key]: saved[key] ?? "" }));
-      toast.error("Couldn't save setting: " + res.error.message);
-    } else {
-      setSaved((cur) => ({ ...cur, [key]: normalized }));
-    }
-  };
-
-  return (
-    <Card className="mt-3">
-      {LOOP_SETTINGS.map((s) => (
-        <div key={s.key} className="flex items-center gap-3.5 border-b border-border px-[18px] py-4 last:border-b-0">
-          <div className="min-w-0 flex-1">
-            <div className="text-[13.5px] font-semibold">{s.label}</div>
-            <div className="mt-0.5 text-[12.5px] text-muted-foreground">{s.desc}</div>
-          </div>
-          <Input
-            aria-label={s.label}
-            inputMode="numeric"
-            placeholder={s.placeholder}
-            value={values[s.key] ?? ""}
-            onChange={(e) => setValues((cur) => ({ ...cur, [s.key]: e.target.value }))}
-            onBlur={(e) => void commit(s.key, s.min, e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void commit(s.key, s.min, e.currentTarget.value);
-            }}
-            className="w-24 text-right tabular-nums"
-          />
-        </div>
-      ))}
-    </Card>
-  );
-}
-
-// ——— View ———
+// View
 
 export function SettingsView() {
   const mode = useTheme((s) => s.mode);
@@ -402,10 +270,6 @@ export function SettingsView() {
           </CardRow>
         </Card>
 
-        <AgentSection />
-
-        <AgentLoopCard />
-
         <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">System</div>
 
         <Card>
@@ -466,7 +330,6 @@ export function SettingsView() {
           </div>
         </Card>
 
-        <PermissionsCard />
         <AuditCard />
 
         <div className="mb-4 mt-7 text-[15px] font-semibold tracking-[-0.01em]">About</div>

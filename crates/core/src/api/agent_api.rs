@@ -1,11 +1,8 @@
-//! Settings → Agent RPC family: the native agent's default model and
-//! permission mode (settings KV via `crate::agent_settings`) plus the
-//! selectable-model list the composer and Settings share, and the YAML
-//! agent registry surface (CRUD, duplicate, default selection, and the
-//! shared subagent model) backed by `state.agents`.
+//! Agent registry RPC family: YAML-backed CRUD, duplicate/default selection,
+//! per-agent capabilities and learning, the shared subagent model, and the
+//! selectable-model list consumed by agent detail and composer model pickers.
 
 use super::{ok, params, ApiError};
-use crate::agent_settings::{self, AgentSettings};
 use crate::agents::knowledge::AgentLearningSnapshot;
 use crate::agents::learning_queue::{LearningEventPayload, RollbackEvent};
 use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
@@ -15,8 +12,8 @@ use crate::agents::types::{
 };
 use crate::api::types::{
     AgentDetailInfo, AgentLearningInfo, AgentModelInfo, AgentMutationInfo, AgentRecoveryInfo,
-    AgentRegistryInfo, AgentSettingsInfo, AgentSkillUsageInfo, AgentSummaryInfo,
-    AgentValidationInfo, CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
+    AgentRegistryInfo, AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo,
+    CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
     JourneyMilestoneInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, LearningReviewInfo,
     PermissionRuleInfo, SessionRuntimeInfo,
 };
@@ -32,8 +29,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub(crate) const HANDLES: &[&str] = &[
-    "get_agent_settings",
-    "set_agent_settings",
     "list_selectable_models",
     "update_project_perm_mode",
     "project_runtime_info",
@@ -59,12 +54,6 @@ pub(crate) const HANDLES: &[&str] = &[
     "delete_invalid_agent_concept",
     "rollback_agent_learning",
 ];
-
-#[derive(Deserialize)]
-struct SetAgentSettingsP {
-    model: Option<String>,
-    perm_mode: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct ProjectP {
@@ -826,25 +815,6 @@ async fn agent_learning_info(
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
     match method {
-        "get_agent_settings" => {
-            let s = agent_settings::get(cp.store()).await?;
-            ok(AgentSettingsInfo {
-                model: s.model,
-                perm_mode: s.perm_mode,
-            })
-        }
-        "set_agent_settings" => {
-            let a: SetAgentSettingsP = params(p)?;
-            agent_settings::set(
-                cp.store(),
-                &AgentSettings {
-                    model: a.model,
-                    perm_mode: a.perm_mode,
-                },
-            )
-            .await?;
-            ok(())
-        }
         "list_selectable_models" => {
             ok(crate::llm_router::client::selectable_native_models(cp.store()).await?)
         }
@@ -1813,21 +1783,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status, 400);
-    }
-
-    #[tokio::test]
-    async fn set_then_get_round_trips_via_rpc() {
-        let s = state().await;
-        dispatch(
-            &s,
-            "set_agent_settings",
-            json!({"model": "smart", "perm_mode": "plan"}),
-        )
-        .await
-        .unwrap();
-        let got = dispatch(&s, "get_agent_settings", json!({})).await.unwrap();
-        assert_eq!(got["model"], "smart");
-        assert_eq!(got["permMode"], "plan");
     }
 
     #[tokio::test]
