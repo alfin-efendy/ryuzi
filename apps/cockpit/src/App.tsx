@@ -3,6 +3,7 @@ import { MonitorUp } from "lucide-react";
 import { SettingsCard as Card } from "@ryuzi/ui";
 import { useStore } from "./store";
 import { useAgent } from "./store-agent";
+import { useAgents } from "./store-agents";
 import { useModelStatuses } from "./store-model-statuses";
 import { useNav } from "./store-nav";
 import { usePlugins } from "./store-plugins";
@@ -60,6 +61,12 @@ function MainView() {
       return <LearningView />;
     case "settings":
       return <SettingsView />;
+    // AgentsView and AgentDetailView land in Plan 3 Tasks 6–7; the routes
+    // exist now so store-nav contracts (openAgentChat, history) are testable.
+    case "agents":
+      return null;
+    case "agentDetail":
+      return null;
   }
 }
 
@@ -80,6 +87,9 @@ export default function App() {
     // domain store's `load()` is — visiting the Plugins hub first is not a
     // precondition for the restart banner below to be accurate.
     if (!usePlugins.getState().loaded) void usePlugins.getState().load();
+    // Agent registry (Plan 3): guarded the same way so the roster is warm
+    // before the Agents views (Tasks 6–7) first render.
+    if (!useAgents.getState().loaded) void useAgents.getState().load();
   }, [init, loadAgent, hydrateModelStatuses]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">

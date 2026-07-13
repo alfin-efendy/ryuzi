@@ -150,3 +150,26 @@ test("sanitizeRightTab accepts agents, keeps file/review, falls back on unknown"
   expect(sanitizeRightTab("bogus")).toBe("review");
   expect(sanitizeRightTab(null)).toBe("review");
 });
+
+test("agent detail participates in browser-style history", () => {
+  const agentsStart: NavHistory = { back: [], current: { kind: "agents" } as View, forward: [] };
+  const next = navigateHistory(agentsStart, { kind: "agentDetail", agentId: "reviewer" });
+  expect(next.back).toEqual([{ kind: "agents" }]);
+  expect(goBackHistory(next).current).toEqual({ kind: "agents" });
+});
+
+test("openAgentChat records the primary agent and opens New session", () => {
+  useNav.setState({ history: { back: [], current: { kind: "agents" }, forward: [] }, pendingPrimaryAgentId: null });
+  useNav.getState().openAgentChat("reviewer");
+  expect(useNav.getState().pendingPrimaryAgentId).toBe("reviewer");
+  expect(useNav.getState().history.current).toEqual({ kind: "home" });
+  // the hub stays reachable via back
+  expect(useNav.getState().history.back).toEqual([{ kind: "agents" }]);
+});
+
+test("consumePendingPrimaryAgentId is a one-shot handoff", () => {
+  useNav.setState({ pendingPrimaryAgentId: "reviewer" });
+  expect(useNav.getState().consumePendingPrimaryAgentId()).toBe("reviewer");
+  expect(useNav.getState().pendingPrimaryAgentId).toBeNull();
+  expect(useNav.getState().consumePendingPrimaryAgentId()).toBeNull();
+});

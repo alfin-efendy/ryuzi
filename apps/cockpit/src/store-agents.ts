@@ -57,6 +57,28 @@ function patchRoster(registry: AgentRegistryInfo, agentId: string, detail: Agent
   return { ...registry, agents: registry.agents.map((a) => (a.id === agentId ? detail.summary : a)) };
 }
 
+/** Optimistically patch only the mutation-representable summary fields of one
+ *  roster entry. Used when the focused detail belongs to a different agent, so
+ *  the target row still previews the edit without borrowing another agent's
+ *  summary (or any server-derived fields like counts and validation). */
+function patchRosterFields(registry: AgentRegistryInfo, agentId: string, input: AgentMutationInfo): AgentRegistryInfo {
+  return {
+    ...registry,
+    agents: registry.agents.map((a) =>
+      a.id === agentId
+        ? {
+            ...a,
+            name: input.name,
+            description: input.description,
+            avatarColor: input.avatarColor,
+            model: input.model,
+            permissionMode: input.permissionMode,
+          }
+        : a,
+    ),
+  };
+}
+
 export const useAgents = create<AgentsState>((set, get) => ({
   registry: null,
   detail: null,
@@ -139,10 +161,18 @@ export const useAgents = create<AgentsState>((set, get) => ({
             maxToolRounds: input.maxToolRounds,
           }
         : prev.detail;
+    // Roster patch: use the optimistic detail's summary only when it really is
+    // the target agent's detail — a focused detail for a *different* agent must
+    // never be painted into the target row. Otherwise patch just the
+    // representable summary fields from the mutation input.
     set({
       saving: true,
       detail: optimistic,
-      registry: prev.registry && optimistic ? patchRoster(prev.registry, agentId, optimistic) : prev.registry,
+      registry: prev.registry
+        ? optimistic && optimistic.summary.id === agentId
+          ? patchRoster(prev.registry, agentId, optimistic)
+          : patchRosterFields(prev.registry, agentId, input)
+        : prev.registry,
     });
     try {
       const res = await commands.updateAgent(LOCAL_RUNNER, agentId, input);
@@ -200,36 +230,45 @@ export const useAgents = create<AgentsState>((set, get) => ({
 
   setDefault: async (agentId) => {
     const prev = get().registry;
-    if (prev) {
-      set({
-        registry: {
-          ...prev,
-          defaultAgentId: agentId,
-          agents: prev.agents.map((a) => ({ ...a, isDefault: a.id === agentId })),
-        },
-      });
+    set({
+      saving: true,
+      registry: prev
+        ? {
+            ...prev,
+            defaultAgentId: agentId,
+            agents: prev.agents.map((a) => ({ ...a, isDefault: a.id === agentId })),
+          }
+        : prev,
+    });
+    try {
+      const res = await commands.setDefaultAgent(LOCAL_RUNNER, agentId);
+      if (res.status === "error") {
+        set({ registry: prev });
+        toast.error(`Default agent failed: ${res.error.message}`);
+        return false;
+      }
+      set({ registry: res.data });
+      return true;
+    } finally {
+      set({ saving: false });
     }
-    const res = await commands.setDefaultAgent(LOCAL_RUNNER, agentId);
-    if (res.status === "error") {
-      set({ registry: prev });
-      toast.error(`Default agent failed: ${res.error.message}`);
-      return false;
-    }
-    set({ registry: res.data });
-    return true;
   },
 
   updateSubagentModel: async (model) => {
     const prev = get().registry;
-    if (prev) set({ registry: { ...prev, subagentModel: model } });
-    const res = await commands.updateSubagentModel(LOCAL_RUNNER, model);
-    if (res.status === "error") {
-      set({ registry: prev });
-      toast.error(`Subagent model failed: ${res.error.message}`);
-      return false;
+    set({ saving: true, registry: prev ? { ...prev, subagentModel: model } : prev });
+    try {
+      const res = await commands.updateSubagentModel(LOCAL_RUNNER, model);
+      if (res.status === "error") {
+        set({ registry: prev });
+        toast.error(`Subagent model failed: ${res.error.message}`);
+        return false;
+      }
+      set({ registry: res.data });
+      return true;
+    } finally {
+      set({ saving: false });
     }
-    set({ registry: res.data });
-    return true;
   },
 
   loadLearning: async (agentId) => {

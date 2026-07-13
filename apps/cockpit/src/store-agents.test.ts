@@ -317,6 +317,35 @@ test("failed update rolls optimistic detail and roster back", async () => {
   toastSpy.mockRestore();
 });
 
+test("update while a different agent's detail is focused never paints that detail into the target row", async () => {
+  // Focused detail belongs to ryuzi; the update targets reviewer. The
+  // optimistic window must patch the reviewer row from the mutation input,
+  // never from ryuzi's summary — and must leave the focused detail alone.
+  let resolveUpdate: (r: Result<AgentDetailInfo, CmdError>) => void = () => {};
+  updateAgent.mockReturnValueOnce(
+    new Promise<Result<AgentDetailInfo, CmdError>>((resolve) => {
+      resolveUpdate = resolve;
+    }),
+  );
+  useAgents.setState({ registry: registry(), detail: detailOf(ryuziSummary()), loaded: true });
+  const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead" });
+
+  const during = useAgents.getState();
+  expect(during.saving).toBe(true);
+  const reviewerRow = during.registry?.agents.find((a) => a.id === "reviewer");
+  expect(reviewerRow?.id).toBe("reviewer");
+  expect(reviewerRow?.name).toBe("Lead"); // representable field previews the edit
+  expect(reviewerRow?.isDefault).toBe(false); // server-derived field untouched
+  expect(during.registry?.agents.map((a) => a.id)).toEqual(["ryuzi", "reviewer"]);
+  expect(during.detail?.summary.id).toBe("ryuzi");
+  expect(during.detail?.summary.name).toBe("Ryuzi"); // focused detail untouched
+
+  resolveUpdate(ok(detailOf(summary("reviewer", "Lead"))));
+  expect(await pending).toBe(true);
+  expect(useAgents.getState().registry?.agents[1]?.name).toBe("Lead");
+  expect(useAgents.getState().detail?.summary.id).toBe("ryuzi");
+});
+
 // ---------- remove ----------
 
 test("remove commits the server roster and clears a matching detail", async () => {
@@ -339,7 +368,10 @@ test("failed delete keeps the agent visible", async () => {
 
 test("setDefault flips the default optimistically and keeps the server registry", async () => {
   useAgents.setState({ registry: registry(), loaded: true });
-  expect(await useAgents.getState().setDefault("reviewer")).toBe(true);
+  const pending = useAgents.getState().setDefault("reviewer");
+  expect(useAgents.getState().saving).toBe(true);
+  expect(await pending).toBe(true);
+  expect(useAgents.getState().saving).toBe(false);
   expect(setDefaultAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer");
   const reg = useAgents.getState().registry;
   expect(reg?.defaultAgentId).toBe("reviewer");
