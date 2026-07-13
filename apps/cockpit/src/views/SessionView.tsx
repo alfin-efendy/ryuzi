@@ -402,10 +402,12 @@ export function SessionView() {
             <OpenInMenu runnerId={runnerId} sessionPk={session.sessionPk} />
           </div>
 
-          {/* Transcript, with the floating plan panel overlaying it */}
+          {/* Transcript, with the TODO List overlaying it */}
           <div className="relative flex min-h-0 flex-1 flex-col">
             {/* Pinned orchestration task strip — only for a home chat with a live run */}
             {orchRootId && <TaskStrip rootId={orchRootId} />}
+            {/* TODO List (todowrite) — floating overlay within the transcript area */}
+            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
               <Transcript
                 runnerId={runnerId}
@@ -422,8 +424,6 @@ export function SessionView() {
                 ))}
               </Transcript>
             </TranscriptFileContext.Provider>
-            {/* Agent plan (todowrite) — floating rounded panel */}
-            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
           </div>
 
           {/* Session composer */}

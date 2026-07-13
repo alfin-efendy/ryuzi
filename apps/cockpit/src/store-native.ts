@@ -14,7 +14,7 @@ type NativeState = {
   commandsByProject: Record<string, CommandInfo[]>;
   todosBySession: Record<string, TodoItem[]>;
   queuedBySession: Record<string, QueuedMessageInfo[]>;
-  // Whether the floating plan panel is collapsed to a pill, per session.
+  // Whether the floating TODO List panel is collapsed to a pill, per session.
   planCollapsed: Record<string, boolean>;
   loadAgents: (runnerId: string, projectId: string) => Promise<void>;
   loadCommands: (runnerId: string, projectId: string) => Promise<void>;
