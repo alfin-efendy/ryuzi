@@ -1231,6 +1231,7 @@ mod tests {
         tests_support::{state, state_with_agents},
     };
     use crate::domain::{PermMode, Project};
+    use crate::llm_router::connections;
     use serde_json::{json, Value};
 
     fn reviewer_input(name: &str) -> Value {
@@ -1596,6 +1597,56 @@ mod tests {
         );
         let got = dispatch(&s, "get_subagent_model", json!({})).await.unwrap();
         assert_eq!(got, json!({"kind":"route","route":"smart"}));
+    }
+
+    #[tokio::test]
+    async fn default_routes_allow_agent_and_subagent_model_changes() {
+        let s = state().await;
+        connections::add_connection(
+            s.cp.store(),
+            connections::ConnectionRow {
+                id: "anthropic-live".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let agent_id = s.agents.default_agent_id().await;
+
+        let updated = dispatch(
+            &s,
+            "update_agent",
+            json!({"agent_id": agent_id, "input": reviewer_input("Ryuzi")}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated["summary"]["model"],
+            json!({"kind":"route","route":"smart"})
+        );
+
+        let subagents = dispatch(
+            &s,
+            "update_subagent_model",
+            json!({"model": {"kind":"route","route":"smart"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            subagents["subagentModel"],
+            json!({"kind":"route","route":"smart"})
+        );
     }
 
     async fn default_agent_id(s: &crate::serve::ApiState) -> String {

@@ -573,6 +573,7 @@ impl AgentRegistry {
         model: AgentModel,
     ) -> Result<AgentRegistrySnapshot, AgentRegistryError> {
         let _guard = self.mutations.lock().await;
+        crate::agents::bootstrap::ensure_default_routes(&self.store).await?;
         let state = self.state.read().await.clone();
         let subagents = SubagentConfig {
             schema_version: AGENT_SCHEMA_VERSION,
@@ -745,6 +746,7 @@ impl AgentRegistry {
         subagents: &SubagentConfig,
         id: &str,
     ) -> Result<(), AgentRegistryError> {
+        crate::agents::bootstrap::ensure_default_routes(&self.store).await?;
         let issues = validate_registry_candidate(&self.store, index, profiles, subagents).await;
         let current = issues.get(id).cloned().unwrap_or_default();
         if let Some(issue) = current
