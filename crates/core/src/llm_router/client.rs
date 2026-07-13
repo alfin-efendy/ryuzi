@@ -1015,7 +1015,7 @@ fn strip_thinking(body: &mut Value) {
     }
 }
 
-fn target_effort(
+pub(crate) fn target_effort(
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
 ) -> model_effort::EffectiveEffort {
@@ -1086,7 +1086,7 @@ fn accepted_reason(
         .unwrap_or(origin)
 }
 
-fn apply_anthropic_effort(
+pub(crate) fn apply_anthropic_effort(
     body: &mut Value,
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
@@ -1098,7 +1098,7 @@ fn apply_anthropic_effort(
     }
 }
 
-fn apply_openai_effort(
+pub(crate) fn apply_openai_effort(
     body: &mut Value,
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
@@ -1106,7 +1106,7 @@ fn apply_openai_effort(
 ) {
     if let Some(effort) = target_effort(target, policy).value {
         body["reasoning_effort"] = json!(effort);
-    } else if !caller_supplied_thinking {
+    } else if target.route_target_key.is_some() || !caller_supplied_thinking {
         if let Some(object) = body.as_object_mut() {
             object.remove("reasoning_effort");
         }

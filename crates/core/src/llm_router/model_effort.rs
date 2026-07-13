@@ -486,6 +486,14 @@ pub async fn build_session_effort_policy(
     build_effort_policy(store, session_override, requested_model).await
 }
 
+pub async fn build_request_effort_policy(
+    store: &Store,
+    requested_model: &str,
+    caller_effort: Option<String>,
+) -> anyhow::Result<TurnEffortPolicy> {
+    build_effort_policy(store, caller_effort, requested_model).await
+}
+
 pub async fn build_utility_effort_policy(
     store: &Store,
     requested_model: &str,
