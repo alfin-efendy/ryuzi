@@ -527,6 +527,54 @@ fn parse_telemetry_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Val
 }
 
 #[tokio::test]
+async fn gateway_status_adapter_dispatches_only_matching_hook() {
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let matching = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::outbound(
+            "gateway status",
+            crate::automation::TriggerKind::GatewayStatusChanged,
+            "https://example.com/status",
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let other = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::outbound(
+            "session end",
+            crate::automation::TriggerKind::SessionEnd,
+            "https://example.com/end",
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    // The gateway table has no operational status column and its only writer
+    // (`gateways::upsert_row`) persists configuration. This adapter is thus the
+    // producer boundary until a core runtime status writer exists.
+    cp.observe_gateway_status_transition("discord", "connecting", "ready")
+        .await;
+
+    let matching_runs = crate::automation::list_runs(&store, &matching.id)
+        .await
+        .unwrap();
+    assert_eq!(matching_runs.len(), 1);
+    assert_eq!(matching_runs[0].status, "queued");
+    assert_eq!(matching_runs[0].envelope["source"]["kind"], "gateway");
+    assert_eq!(
+        matching_runs[0].envelope["data"]["previousStatus"],
+        "connecting"
+    );
+    assert!(crate::automation::list_runs(&store, &other.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 #[serial]
 async fn start_session_emits_session_run_count_and_harness_run_span() {
     let _guard = StateDirGuard::new();

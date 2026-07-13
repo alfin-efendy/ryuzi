@@ -132,6 +132,9 @@ pub struct RunnerDeps {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<CoreEvent>,
     pub approvals: Arc<ApprovalHub>,
+    /// Observational UI automation sink. It is deliberately separate from
+    /// native script/extension hook dispatch, so it can never gate a tool.
+    pub automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     pub llm: Arc<dyn LlmStream>,
     pub tools: Arc<ToolRegistry>,
     /// The selected primary agent for this session.
@@ -1692,6 +1695,12 @@ async fn run_tool_call(
         &json!({ "tool": t.name, "input": input }),
     )
     .await;
+    crate::automation::dispatch_lifecycle_observation(
+        deps.automation_events.clone(),
+        crate::automation::TriggerKind::ToolBefore,
+        deps.session_pk.clone(),
+        json!({ "tool": t.name, "input": input }),
+    );
     if !hook.allowed {
         let msg = hook
             .message
@@ -1806,13 +1815,20 @@ async fn run_tool_call(
     };
     // Observational: never gates, result ignored. Fires for both Ok and Err
     // outcomes now that the `ToolOutput` (or its error) has resolved.
+    let after_payload = json!({ "tool": t.name, "input": hook_input, "result": after_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolAfter,
-        &json!({ "tool": t.name, "input": hook_input, "result": after_summary }),
+        &after_payload,
     )
     .await;
+    crate::automation::dispatch_lifecycle_observation(
+        deps.automation_events.clone(),
+        crate::automation::TriggerKind::ToolAfter,
+        deps.session_pk.clone(),
+        after_payload,
+    );
     tool_use_result
 }
 
@@ -2584,6 +2600,7 @@ mod tests {
             store,
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
             agent,
@@ -2658,6 +2675,24 @@ mod tests {
         reason: &'static str,
     }
 
+    struct BlockingAutomationSink {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::automation::AutomationEventSink for BlockingAutomationSink {
+        async fn observe_lifecycle(
+            &self,
+            _trigger: crate::automation::TriggerKind,
+            _session_pk: String,
+            _data: Value,
+        ) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::plugins::extension::ExtensionEvents for FixedExtensionEvents {
         async fn dispatch(
@@ -2674,6 +2709,43 @@ mod tests {
                 crate::harness::native::hooks::HookResult::allow()
             }
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_lifecycle_sink_does_not_change_native_tool_gate_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection = route_selection("a", "Primary");
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let sink = Arc::new(BlockingAutomationSink {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        deps.automation_events = Some(sink.clone());
+        deps.extension_events = Some(Arc::new(FixedExtensionEvents {
+            deny_event: crate::harness::native::hooks::HookEvent::ToolBefore,
+            reason: "blocked by policy extension",
+        }));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let tool_call = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("a tool_call row must exist");
+        assert_eq!(tool_call.payload["output"], "blocked by policy extension");
+        sink.entered.notified().await;
+        sink.release.notify_waiters();
     }
 
     #[tokio::test]

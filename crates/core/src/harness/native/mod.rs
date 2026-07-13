@@ -231,6 +231,15 @@ impl Harness for NativeHarness {
             }),
         )
         .await;
+        crate::automation::dispatch_lifecycle_observation(
+            ctx.automation_events.clone(),
+            crate::automation::TriggerKind::SessionStart,
+            ctx.session_pk.clone(),
+            json!({
+                "model": model.clone(),
+                "workDir": ctx.work_dir.display().to_string(),
+            }),
+        );
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
@@ -277,6 +286,7 @@ impl Harness for NativeHarness {
         let nudge = seed_nudge_state(&ctx.store, &ctx.session_pk).await;
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
+            automation_events: ctx.automation_events.clone(),
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
@@ -296,6 +306,7 @@ impl Harness for NativeHarness {
                 store: ctx.store,
                 events: ctx.events,
                 approvals: ctx.approvals,
+                automation_events: ctx.automation_events,
                 llm,
                 tools,
                 agent,
@@ -347,6 +358,7 @@ impl Harness for NativeHarness {
 pub struct NativeSession {
     deps: runner::RunnerDeps,
     session_pk: String,
+    automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     /// The in-flight turn's cancellation token, set for the duration of
     /// `send_prompt` so `cancel`/`end` can trip it.
     live_cancel: Mutex<Option<CancellationToken>>,
@@ -400,6 +412,12 @@ impl HarnessSession for NativeSession {
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
         .await;
+        crate::automation::dispatch_lifecycle_observation(
+            self.automation_events.clone(),
+            crate::automation::TriggerKind::SessionEnd,
+            self.session_pk.clone(),
+            json!({ "reason": "ended" }),
+        );
         Ok(())
     }
 
@@ -540,6 +558,7 @@ mod tests {
             extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            automation_events: None,
             background: super::background::BackgroundRegistry::new(),
             agent_knowledge: knowledge,
             learning_queue,

@@ -1212,6 +1212,16 @@ fn migrations() -> Migrations<'static> {
                 FOREIGN KEY(run_id) REFERENCES automation_hook_runs(id)\
             );",
         ),
+        // 36: immutable origin for hook-created sessions.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_automation_origins (\
+                session_pk TEXT PRIMARY KEY NOT NULL,\
+                kind TEXT NOT NULL,\
+                hook_id TEXT NOT NULL,\
+                run_id TEXT NOT NULL,\
+                depth INTEGER NOT NULL\
+            );",
+        ),
     ])
 }
 
@@ -1890,6 +1900,38 @@ impl Store {
             tx.commit()
         })
         .await
+    }
+
+    pub async fn insert_hook_origin(
+        &self,
+        session_pk: &str,
+        origin: &crate::automation::HookOrigin,
+    ) -> anyhow::Result<()> {
+        let session_pk = session_pk.to_string();
+        let origin = origin.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO session_automation_origins(session_pk,kind,hook_id,run_id,depth) VALUES(?1,?2,?3,?4,?5)",
+                params![session_pk, origin.kind, origin.hook_id, origin.run_id, origin.depth],
+            )?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn hook_origin(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<crate::automation::HookOrigin>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT kind,hook_id,run_id,depth FROM session_automation_origins WHERE session_pk=?1",
+                params![session_pk],
+                |row| Ok(crate::automation::HookOrigin {
+                    kind: row.get(0)?, hook_id: row.get(1)?, run_id: row.get(2)?, depth: row.get(3)?,
+                }),
+            ).optional()
+        }).await.map_err(Into::into)
     }
 
     pub async fn get_session(&self, pk: &str) -> anyhow::Result<Option<Session>> {
@@ -6347,7 +6389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_34_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_36_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -6368,20 +6410,20 @@ mod tests {
         // 29 messages.speaker + orch_tasks home/breaker/steer columns;
         // 30 audit.session_pk + audit.origin;
         // 31 plugin_catalog_cache + catalog_feed_state;
-        // 34 agent_learning_state + agent_learning_queue — CREATE TABLE
-        // IF NOT EXISTS —
-        // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
-        // re-run on next open.
+        // 34 agent_learning_state + agent_learning_queue and 35 automation
+        // hooks use CREATE TABLE IF NOT EXISTS; 36 session_automation_origins
+        // does too, so every migration through the latest version re-runs
+        // safely on the next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 34
-        // defined, wind back twenty-two.
+        // this test starts failing its assertions). With migrations through 36
+        // defined, wind back twenty-four.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 22)
+            c.pragma_update(None, "user_version", v - 24)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6583,7 +6625,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 35, "forward migration must land at v35");
+        assert_eq!(uv, 36, "forward migration must land at v36");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6609,7 +6651,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 35, "forward migration must land at v35");
+        assert_eq!(uv, 36, "forward migration must land at v36");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 

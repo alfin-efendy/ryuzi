@@ -2,6 +2,7 @@
 //! a background loop starts an agent session with the job's prompt when a
 //! schedule fires, and the run row closes when that session's turn completes.
 
+use crate::automation::{AutomationEnvelope, AutomationSource, TriggerKind};
 use crate::control::ControlPlane;
 use crate::domain::CoreEvent;
 use crate::store::Store;
@@ -504,6 +505,40 @@ pub async fn execute_job_scheduled(
     run_job(cp, job, prompt).await
 }
 
+async fn emit_scheduler_terminal_automation(
+    cp: &Arc<ControlPlane>,
+    job_id: &str,
+    run_id: &str,
+    session_pk: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+) {
+    let trigger = match status {
+        "success" => TriggerKind::SchedulerRunSuccess,
+        "failed" => TriggerKind::SchedulerRunFailed,
+        _ => {
+            tracing::warn!(run_id, status, "scheduler run has a non-terminal status");
+            return;
+        }
+    };
+    cp.dispatch_automation_event(
+        AutomationEnvelope::new(
+            trigger,
+            chrono::Utc::now().to_rfc3339(),
+            AutomationSource::new("scheduler.run", run_id),
+            serde_json::json!({
+                "jobId": job_id,
+                "runId": run_id,
+                "sessionPk": session_pk,
+                "status": status,
+                "error": error,
+            }),
+        ),
+        None,
+    )
+    .await;
+}
+
 async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow::Result<String> {
     let store = cp.store().clone();
     let run_id = format!("r-{}", &crate::paths::new_id()[..8]);
@@ -568,6 +603,15 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
                 &job.gateway,
                 "error",
                 &format!("job {} run {run_id} failed to start: {e}", job.name),
+            )
+            .await;
+            emit_scheduler_terminal_automation(
+                cp,
+                &job.id,
+                &run_id,
+                None,
+                "failed",
+                Some(&e.to_string()),
             )
             .await;
             let _ = cp.send_event(CoreEvent::JobRunChanged {
@@ -685,6 +729,15 @@ async fn run_job(cp: &Arc<ControlPlane>, job: &JobRow, prompt: String) -> anyhow
             };
             let _ = crate::gateways::add_event(cp2.store(), &gateway, level, &text).await;
         }
+        emit_scheduler_terminal_automation(
+            &cp2,
+            &job_id,
+            &run_id2,
+            Some(&session_pk),
+            status,
+            error.as_deref(),
+        )
+        .await;
         let _ = cp2.send_event(CoreEvent::JobRunChanged {
             job_id,
             run_id: run_id2,
@@ -811,6 +864,42 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scheduler_terminal_helper_emits_failed_trigger() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        let hook = crate::automation::create_hook(
+            cp.store(),
+            crate::automation::HookInput::outbound(
+                "scheduler failure",
+                TriggerKind::SchedulerRunFailed,
+                "https://example.com/scheduler",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        emit_scheduler_terminal_automation(
+            &cp,
+            "job-1",
+            "run-1",
+            None,
+            "failed",
+            Some("start failed"),
+        )
+        .await;
+
+        let runs = crate::automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].envelope["event"], "scheduler.run.failed");
+        assert_eq!(runs[0].envelope["data"]["status"], "failed");
+        assert_eq!(runs[0].envelope["data"]["error"], "start failed");
+    }
 
     #[test]
     fn natural_phrases_map_to_cron() {

@@ -1,5 +1,9 @@
 use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
+use crate::automation::{
+    AutomationEnvelope, AutomationSource, Dispatcher, HookActionInput, HookOrigin, RateVerdict,
+    TriggerKind,
+};
 use crate::domain::{
     ApprovalResponse, CoreEvent, Message, PermMode, Project, Session, ToolPolicyRow,
 };
@@ -40,8 +44,27 @@ pub(crate) fn basename_of(path: &str) -> String {
     }
 }
 
+pub struct ControlPlaneAutomationSink(std::sync::Weak<ControlPlane>);
+
+#[async_trait::async_trait]
+impl crate::automation::AutomationEventSink for ControlPlaneAutomationSink {
+    async fn observe_lifecycle(
+        &self,
+        trigger: TriggerKind,
+        session_pk: String,
+        data: serde_json::Value,
+    ) {
+        if let Some(control) = self.0.upgrade() {
+            control
+                .observe_native_automation(trigger, session_pk, data)
+                .await;
+        }
+    }
+}
+
 pub struct ControlPlane {
     store: Arc<Store>,
+    automation: crate::automation::Dispatcher,
     /// Extension registries (harness slot/gateway/connector/plugins).
     registries: Registries,
     events: broadcast::Sender<CoreEvent>,
@@ -150,8 +173,9 @@ impl ControlPlane {
         // explicitly after construction; no test path ever does. See that
         // method's doc comment.
 
-        Arc::new(ControlPlane {
+        let control = Arc::new(ControlPlane {
             store,
+            automation: Dispatcher::new(),
             registries,
             events,
             approvals: Arc::new(ApprovalHub::new()),
@@ -168,7 +192,8 @@ impl ControlPlane {
             )),
             extension_host: Arc::new(ExtensionHost::new()),
             agent_persistence: std::sync::OnceLock::new(),
-        })
+        });
+        control
     }
 
     /// One-time, best-effort startup maintenance for the install ledger and
@@ -352,7 +377,320 @@ impl ControlPlane {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Public event injection — used by `UpdateManager`'s notify path to
+    /// Dispatch one normalized automation event. Event sources call this narrow
+    /// method directly; there is intentionally no background subscriber on the
+    /// core-event bus, which would outlive short-lived control planes in tests.
+    pub async fn dispatch_automation_event(
+        self: &Arc<Self>,
+        envelope: AutomationEnvelope,
+        origin: Option<HookOrigin>,
+    ) {
+        let envelope = envelope.capped();
+        let depth = origin.as_ref().map_or(0, |origin| origin.depth);
+        let envelope_json = match serde_json::to_value(&envelope) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("automation envelope serialization failed: {error}");
+                return;
+            }
+        };
+        let hooks = match crate::automation::list_enabled_hooks(&self.store, envelope.event).await {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                tracing::warn!("automation hook lookup failed: {error}");
+                return;
+            }
+        };
+
+        for hook in hooks {
+            let run = match crate::automation::create_run(
+                &self.store,
+                &hook.id,
+                envelope_json.clone(),
+            )
+            .await
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    tracing::warn!(hook_id = %hook.id, "automation run creation failed: {error}");
+                    continue;
+                }
+            };
+            let verdict = self
+                .automation
+                .rate_verdict(&hook.id, envelope.event, depth);
+            if verdict != RateVerdict::Accepted {
+                let reason = match verdict {
+                    RateVerdict::HookLimited => "hook rate limit exceeded",
+                    RateVerdict::EngineLimited => "engine rate limit exceeded",
+                    RateVerdict::DepthLimited => "automation origin depth limit exceeded",
+                    RateVerdict::Accepted => unreachable!(),
+                };
+                self.finish_automation_run(&run.hook_id, &run.id, "skipped", None, Some(reason))
+                    .await;
+                continue;
+            }
+
+            match &run.snapshot.action {
+                HookActionInput::WebhookOutbound(_) => {
+                    // Outbound delivery is deliberately deferred to Task 4. The
+                    // durable queued row makes the lack of delivery explicit and
+                    // never reports a fabricated success.
+                    if let Err(error) = crate::automation::mark_run_queued_not_dispatched(
+                        &self.store,
+                        &run.id,
+                        "outbound delivery is not implemented",
+                    )
+                    .await
+                    {
+                        tracing::warn!(run_id = %run.id, "automation outbound queue update failed: {error}");
+                    }
+                    self.emit_automation_run_changed(&run.hook_id, &run.id, "queued");
+                }
+                HookActionInput::AgentRun(action) => {
+                    if action.gateway_id != "local" {
+                        self.finish_automation_run(
+                            &run.hook_id,
+                            &run.id,
+                            "failed",
+                            None,
+                            Some("agent.run target gateway is not local"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    if self
+                        .store
+                        .get_project(&action.project_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        self.finish_automation_run(
+                            &run.hook_id,
+                            &run.id,
+                            "failed",
+                            None,
+                            Some("agent.run target project no longer exists"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    let event_json = match serde_json::to_string_pretty(&run.envelope) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            self.finish_automation_run(
+                                &run.hook_id,
+                                &run.id,
+                                "failed",
+                                None,
+                                Some(&format!("could not serialize event envelope: {error}")),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+                    let prompt = format!(
+                        "{}\n\n[UNTRUSTED AUTOMATION EVENT — JSON]\n{}\n[END UNTRUSTED AUTOMATION EVENT]",
+                        action.prompt, event_json
+                    );
+                    let git =
+                        (!action.branch.is_empty()).then(|| crate::domain::SessionGitOptions {
+                            use_worktree: true,
+                            create_branch: false,
+                            branch_name: None,
+                            base_branch: Some(action.branch.clone()),
+                        });
+                    let worker =
+                        action
+                            .agent_id
+                            .as_ref()
+                            .map(|agent| crate::control::WorkerBinding {
+                                agent: agent.clone(),
+                                home_session_pk: None,
+                            });
+                    let hook_origin =
+                        HookOrigin::new(&run.hook_id, &run.id, depth.saturating_add(1));
+                    match self
+                        .start_session_with_prompt_and_origin(
+                            &action.project_id,
+                            crate::harness::TurnPrompt::text(prompt.clone(), prompt),
+                            "automation",
+                            &[],
+                            git,
+                            None,
+                            action.model_override.clone(),
+                            worker,
+                            Some(hook_origin),
+                        )
+                        .await
+                    {
+                        Ok(session) => {
+                            if let Err(error) = crate::automation::link_run_session(
+                                &self.store,
+                                &run.id,
+                                &session.session_pk,
+                            )
+                            .await
+                            {
+                                tracing::warn!(run_id = %run.id, "automation session link failed: {error}");
+                            }
+                            self.emit_automation_run_changed(&run.hook_id, &run.id, "running");
+                        }
+                        Err(error) => {
+                            self.finish_automation_run(
+                                &run.hook_id,
+                                &run.id,
+                                "failed",
+                                None,
+                                Some(&error.to_string()),
+                            )
+                            .await
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// No core gateway runtime currently persists operational status; gateway
+    /// config writes and router status messages are view/config state, not a status
+    /// transition producer. Keep this adapter as the narrow integration boundary
+    /// for the future runtime writer rather than falsely dispatching from polling.
+    pub async fn observe_gateway_status_transition(
+        self: &Arc<Self>,
+        gateway_id: &str,
+        previous_status: &str,
+        status: &str,
+    ) {
+        self.dispatch_automation_event(
+            AutomationEnvelope::new(
+                TriggerKind::GatewayStatusChanged,
+                chrono::Utc::now().to_rfc3339(),
+                AutomationSource::new("gateway", gateway_id),
+                serde_json::json!({
+                    "gatewayId": gateway_id,
+                    "previousStatus": previous_status,
+                    "status": status,
+                }),
+            ),
+            None,
+        )
+        .await;
+    }
+
+    /// Native lifecycle adapter. Hook-origin sessions never emit lifecycle
+    /// automations, preventing recursive cascades while preserving existing
+    /// script and extension hook behavior. `session.end` observes the persisted
+    /// terminal session row, because teardown persists it before the native
+    /// session dispatches this adapter.
+    pub async fn observe_native_automation(
+        self: &Arc<Self>,
+        trigger: TriggerKind,
+        session_pk: String,
+        mut data: serde_json::Value,
+    ) {
+        let origin = match self.store.hook_origin(&session_pk).await {
+            Ok(origin) => origin,
+            Err(error) => {
+                tracing::warn!(session_pk, "automation origin lookup failed: {error}");
+                return;
+            }
+        };
+        if origin.is_some() {
+            return;
+        }
+        let session = match self.store.get_session(&session_pk).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(session_pk, "automation session lookup failed: {error}");
+                return;
+            }
+        };
+        let object = data
+            .as_object_mut()
+            .expect("native lifecycle data is an object");
+        object.insert(
+            "sessionPk".into(),
+            serde_json::Value::String(session_pk.clone()),
+        );
+        object.insert(
+            "projectId".into(),
+            session
+                .project_id
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        object.insert(
+            "gatewayId".into(),
+            serde_json::Value::String("local".into()),
+        );
+        object.insert(
+            "agentId".into(),
+            serde_json::Value::String(session.agent.unwrap_or_else(|| "native".into())),
+        );
+        object.insert(
+            "status".into(),
+            serde_json::Value::String(session.status.as_str().into()),
+        );
+        self.dispatch_automation_event(
+            AutomationEnvelope::new(
+                trigger,
+                chrono::Utc::now().to_rfc3339(),
+                AutomationSource::new("session", session_pk),
+                data,
+            ),
+            None,
+        )
+        .await;
+    }
+
+    pub(crate) async fn finish_automation_session(
+        &self,
+        session_pk: &str,
+        status: &str,
+        error: Option<&str>,
+    ) {
+        let Ok(Some(origin)) = self.store.hook_origin(session_pk).await else {
+            return;
+        };
+        self.finish_automation_run(
+            &origin.hook_id,
+            &origin.run_id,
+            status,
+            Some(session_pk),
+            error,
+        )
+        .await;
+    }
+
+    async fn finish_automation_run(
+        &self,
+        hook_id: &str,
+        run_id: &str,
+        status: &str,
+        session_pk: Option<&str>,
+        error: Option<&str>,
+    ) {
+        if let Err(error) =
+            crate::automation::finish_run(&self.store, run_id, status, session_pk, error).await
+        {
+            tracing::warn!(run_id, "automation run finalization failed: {error}");
+            return;
+        }
+        self.emit_automation_run_changed(hook_id, run_id, status);
+    }
+
+    fn emit_automation_run_changed(&self, hook_id: &str, run_id: &str, status: &str) {
+        let _ = self.events.send(CoreEvent::AutomationHookRunChanged {
+            hook_id: hook_id.to_string(),
+            run_id: run_id.to_string(),
+            status: status.to_string(),
+        });
+    }
+
     /// broadcast update-lifecycle events through the same channel as
     /// session events.
     pub fn emit(&self, e: CoreEvent) {

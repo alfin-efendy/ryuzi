@@ -3,15 +3,349 @@
 use crate::paths::{new_id, now_ms};
 use crate::store::Store;
 use anyhow::{bail, Context};
+use futures::FutureExt;
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
+use std::collections::VecDeque;
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 const MAX_RUNS: u32 = 20;
 const MAX_DETAIL_ATTEMPTS: u32 = 3;
+const MAX_TOOL_VALUE_BYTES: usize = 64 * 1024;
+pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
+const TRUNCATED_SUFFIX: &str = "…[truncated]";
+
+/// Stable, untrusted event input for automation dispatch. `event`, `source`,
+/// and `data` deliberately remain the only externally visible shape so the
+/// outbound webhook delivery added later can reuse this exact payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationEnvelope {
+    pub event: TriggerKind,
+    pub occurred_at: String,
+    pub source: AutomationSource,
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationSource {
+    pub kind: String,
+    pub id: String,
+}
+
+impl AutomationSource {
+    pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            id: id.into(),
+        }
+    }
+}
+
+impl AutomationEnvelope {
+    pub fn new(
+        event: TriggerKind,
+        occurred_at: impl Into<String>,
+        source: AutomationSource,
+        data: Value,
+    ) -> Self {
+        Self {
+            event,
+            occurred_at: occurred_at.into(),
+            source,
+            data,
+        }
+    }
+
+    /// Cap an envelope before it reaches persistence, a prompt, or an eventual
+    /// outbound delivery. Object keys are considered lexically, making the
+    /// retained prefix deterministic across runs.
+    pub fn capped(mut self) -> Self {
+        cap_tool_values(&mut self.data);
+        self.occurred_at = cap_metadata_string(self.occurred_at);
+        self.source.kind = cap_metadata_string(self.source.kind);
+        self.source.id = cap_metadata_string(self.source.id);
+        while serde_json::to_vec(&self).map_or(true, |bytes| bytes.len() > MAX_ENVELOPE_BYTES) {
+            let before = serde_json::to_vec(&self.data).map_or(usize::MAX, |bytes| bytes.len());
+            self.data = shrink_json(self.data);
+            if serde_json::to_vec(&self.data).is_ok_and(|bytes| bytes.len() < before) {
+                continue;
+            }
+            if shrink_metadata_string(&mut self.occurred_at)
+                || shrink_metadata_string(&mut self.source.kind)
+                || shrink_metadata_string(&mut self.source.id)
+            {
+                continue;
+            }
+            self.data = Value::Null;
+            break;
+        }
+        self
+    }
+}
+
+fn shrink_metadata_string(value: &mut String) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let next = if value.len() <= TRUNCATED_SUFFIX.len() {
+        String::new()
+    } else {
+        truncate_string(value, value.len().saturating_div(2))
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    if next == *value {
+        return false;
+    }
+    *value = next;
+    true
+}
+
+fn cap_metadata_string(value: String) -> String {
+    let max_bytes = MAX_ENVELOPE_BYTES
+        .saturating_sub(serde_json::to_vec(&TriggerKind::WebhookInbound).map_or(0, |v| v.len()))
+        .saturating_div(4);
+    truncate_string(&value, max_bytes)
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+fn cap_tool_values(value: &mut Value) {
+    let Value::Object(data) = value else { return };
+    for key in ["input", "result"] {
+        if let Some(value) = data.remove(key) {
+            data.insert(key.to_string(), cap_json(value, MAX_TOOL_VALUE_BYTES));
+        }
+    }
+}
+
+fn cap_json(value: Value, max_bytes: usize) -> Value {
+    match value {
+        Value::String(value) => truncate_string(&value, max_bytes.saturating_div(2)),
+        Value::Array(values) => {
+            let mut out = Vec::new();
+            for value in values {
+                let value = cap_json(value, max_bytes);
+                if serde_json::to_vec(&out).map_or(usize::MAX, |v| v.len()) >= max_bytes {
+                    break;
+                }
+                out.push(value);
+            }
+            Value::Array(out)
+        }
+        Value::Object(values) => {
+            let mut out = serde_json::Map::new();
+            let mut keys: Vec<_> = values.into_iter().collect();
+            keys.sort_by(|left, right| left.0.cmp(&right.0));
+            for (key, value) in keys {
+                let value = cap_json(value, max_bytes);
+                out.insert(key.clone(), value);
+                if serde_json::to_vec(&out).map_or(usize::MAX, |v| v.len()) > max_bytes {
+                    out.remove(&key);
+                    break;
+                }
+            }
+            Value::Object(out)
+        }
+        value => value,
+    }
+}
+
+fn shrink_json(value: Value) -> Value {
+    match value {
+        Value::String(value) => truncate_string(&value, value.len().saturating_div(2)),
+        Value::Array(mut values) => {
+            values.pop();
+            Value::Array(values)
+        }
+        Value::Object(mut values) => {
+            let Some(key) = values.keys().max().cloned() else {
+                return Value::String(TRUNCATED_SUFFIX.to_string());
+            };
+            values.remove(&key);
+            Value::Object(values)
+        }
+        _ => Value::String(TRUNCATED_SUFFIX.to_string()),
+    }
+}
+
+fn truncate_string(value: &str, max_bytes: usize) -> Value {
+    if value.len() <= max_bytes {
+        return Value::String(value.to_string());
+    }
+    let budget = max_bytes.saturating_sub(TRUNCATED_SUFFIX.len());
+    let mut end = budget.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Value::String(format!("{}{}", &value[..end], TRUNCATED_SUFFIX))
+}
+
+/// Immutable provenance for hook-created sessions. It is persisted separately
+/// from the general session shape to avoid treating external event data as a
+/// user-editable session attribute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookOrigin {
+    pub kind: String,
+    pub hook_id: String,
+    pub run_id: String,
+    pub depth: u8,
+}
+
+impl HookOrigin {
+    pub fn new(hook_id: impl Into<String>, run_id: impl Into<String>, depth: u8) -> Self {
+        Self {
+            kind: "hook".into(),
+            hook_id: hook_id.into(),
+            run_id: run_id.into(),
+            depth,
+        }
+    }
+
+    pub const fn allows_dispatch(&self) -> bool {
+        self.depth < 3
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateVerdict {
+    Accepted,
+    HookLimited,
+    EngineLimited,
+    DepthLimited,
+}
+
+#[async_trait::async_trait]
+pub trait AutomationEventSink: Send + Sync {
+    /// Observe a native lifecycle event after the script/extension hook sinks
+    /// have run. Implementations must not affect the native hook outcome.
+    async fn observe_lifecycle(&self, trigger: TriggerKind, session_pk: String, data: Value);
+}
+
+/// Schedule an observational lifecycle dispatch after the native hook result is
+/// known. A bounded queue keeps lifecycle persistence/agent starts out of the
+/// session and tool paths; a dropped task panic is observed and logged.
+pub fn dispatch_lifecycle_observation(
+    sink: Option<Arc<dyn AutomationEventSink>>,
+    trigger: TriggerKind,
+    session_pk: String,
+    data: Value,
+) {
+    let Some(sink) = sink else { return };
+    lifecycle_dispatcher().dispatch(sink, trigger, session_pk, data);
+}
+
+struct LifecycleDispatch {
+    sender: tokio::sync::mpsc::Sender<LifecycleObservation>,
+}
+
+struct LifecycleObservation {
+    sink: Arc<dyn AutomationEventSink>,
+    trigger: TriggerKind,
+    session_pk: String,
+    data: Value,
+}
+
+impl LifecycleDispatch {
+    fn dispatch(
+        &self,
+        sink: Arc<dyn AutomationEventSink>,
+        trigger: TriggerKind,
+        session_pk: String,
+        data: Value,
+    ) {
+        if self
+            .sender
+            .try_send(LifecycleObservation {
+                sink,
+                trigger,
+                session_pk,
+                data,
+            })
+            .is_err()
+        {
+            tracing::warn!("automation lifecycle observation dropped because the queue is full");
+        }
+    }
+}
+
+fn lifecycle_dispatcher() -> &'static LifecycleDispatch {
+    static DISPATCHER: OnceLock<LifecycleDispatch> = OnceLock::new();
+    DISPATCHER.get_or_init(|| {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            while let Some(observation) = receiver.recv().await {
+                let LifecycleObservation {
+                    sink,
+                    trigger,
+                    session_pk,
+                    data,
+                } = observation;
+                if let Err(error) =
+                    std::panic::AssertUnwindSafe(sink.observe_lifecycle(trigger, session_pk, data))
+                        .catch_unwind()
+                        .await
+                {
+                    tracing::error!(?error, "automation lifecycle observer panicked");
+                }
+            }
+        });
+        LifecycleDispatch { sender }
+    })
+}
+
+/// Process-local rolling-window limiter. Runs themselves are persisted before
+/// execution, so a verdict of anything other than `Accepted` has durable
+/// history without pretending an action ran.
+pub struct Dispatcher {
+    accepted: std::sync::Mutex<VecDeque<(std::time::Instant, String, TriggerKind)>>,
+}
+
+impl Dispatcher {
+    pub fn new() -> Self {
+        Self {
+            accepted: std::sync::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn rate_verdict(&self, hook_id: &str, trigger: TriggerKind, depth: u8) -> RateVerdict {
+        if depth >= 3 {
+            return RateVerdict::DepthLimited;
+        }
+        let now = std::time::Instant::now();
+        let mut accepted = self.accepted.lock().unwrap();
+        accepted.retain(|(at, _, _)| now.duration_since(*at) < std::time::Duration::from_secs(60));
+        if accepted.len() >= 1000 {
+            return RateVerdict::EngineLimited;
+        }
+        let lifecycle = matches!(trigger, TriggerKind::ToolBefore | TriggerKind::ToolAfter);
+        if lifecycle
+            && accepted
+                .iter()
+                .filter(|(_, id, kind)| id == hook_id && *kind == trigger)
+                .count()
+                >= 60
+        {
+            return RateVerdict::HookLimited;
+        }
+        accepted.push_back((now, hook_id.to_string(), trigger));
+        RateVerdict::Accepted
+    }
+}
+
+impl Default for Dispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub enum TriggerKind {
@@ -485,6 +819,89 @@ pub async fn list_hooks(store: &Store) -> anyhow::Result<Vec<HookRow>> {
         .await
 }
 
+pub async fn list_enabled_hooks(
+    store: &Store,
+    trigger: TriggerKind,
+) -> anyhow::Result<Vec<HookRow>> {
+    let trigger = trigger.as_str().to_string();
+    store
+        .with_conn(move |c| {
+            let mut statement = c.prepare(&format!(
+                "SELECT {HOOK_COLUMNS} FROM automation_hooks WHERE enabled=1 AND trigger_kind=?1 ORDER BY created_at DESC"
+            ))?;
+            let hooks = statement
+                .query_map(params![trigger], hook_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(hooks)
+        })
+        .await
+}
+
+pub async fn finish_run(
+    store: &Store,
+    run_id: &str,
+    status: &str,
+    session_pk: Option<&str>,
+    error: Option<&str>,
+) -> anyhow::Result<()> {
+    let run_id = run_id.to_string();
+    let status = status.to_string();
+    let session_pk = session_pk.map(ToString::to_string);
+    let error = error.map(|value| sanitize_error(value));
+    let now = now_ms();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE automation_hook_runs
+                 SET status=?2, session_pk=COALESCE(?3, session_pk), error=?4,
+                     started_at=COALESCE(started_at, ?5), finished_at=?5
+                 WHERE id=?1 AND status IN ('queued', 'running')",
+                params![run_id, status, session_pk, error, now],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+pub async fn mark_run_queued_not_dispatched(
+    store: &Store,
+    run_id: &str,
+    error: &str,
+) -> anyhow::Result<()> {
+    let run_id = run_id.to_string();
+    let error = sanitize_error(error);
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE automation_hook_runs SET status='queued', error=?2 WHERE id=?1",
+                params![run_id, error],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+pub async fn link_run_session(store: &Store, run_id: &str, session_pk: &str) -> anyhow::Result<()> {
+    let run_id = run_id.to_string();
+    let session_pk = session_pk.to_string();
+    let now = now_ms();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE automation_hook_runs
+             SET status='running', session_pk=?2, started_at=?3
+             WHERE id=?1 AND status='queued'",
+                params![run_id, session_pk, now],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+fn sanitize_error(error: &str) -> String {
+    error.chars().take(1024).collect()
+}
+
 pub async fn delete_hook(store: &Store, id: &str) -> anyhow::Result<()> {
     let id = id.to_string();
     store
@@ -642,10 +1059,163 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn envelope_caps_values_and_truncates_object_keys_lexically() {
+        let envelope = AutomationEnvelope::new(
+            TriggerKind::ToolAfter,
+            "2026-07-10T00:00:00Z",
+            AutomationSource::new("session", "s-1"),
+            json!({
+                "input": {
+                    "z": "z".repeat(80 * 1024),
+                    "a": "a".repeat(80 * 1024),
+                },
+            }),
+        )
+        .capped();
+
+        let serialized = serde_json::to_vec(&envelope).unwrap();
+        assert!(serialized.len() <= MAX_ENVELOPE_BYTES);
+        assert!(envelope.data["input"]["a"]
+            .as_str()
+            .unwrap()
+            .ends_with("…[truncated]"));
+        assert!(envelope.data["input"].get("z").is_none());
+    }
+
+    #[test]
+    fn envelope_caps_metadata_and_data_under_the_hard_limit() {
+        let envelope = AutomationEnvelope::new(
+            TriggerKind::ToolAfter,
+            "t".repeat(MAX_ENVELOPE_BYTES),
+            AutomationSource::new(
+                "k".repeat(MAX_ENVELOPE_BYTES),
+                "i".repeat(MAX_ENVELOPE_BYTES),
+            ),
+            json!({ "z": "z".repeat(MAX_ENVELOPE_BYTES) }),
+        )
+        .capped();
+
+        let serialized = serde_json::to_vec(&envelope).unwrap();
+        assert!(serialized.len() <= MAX_ENVELOPE_BYTES);
+        assert!(envelope.source.kind.ends_with(TRUNCATED_SUFFIX));
+        assert!(envelope.source.id.ends_with(TRUNCATED_SUFFIX));
+        assert!(envelope.occurred_at.ends_with(TRUNCATED_SUFFIX));
+    }
+
+    #[test]
+    fn envelope_hard_cap_includes_json_escaped_metadata() {
+        let envelope = AutomationEnvelope::new(
+            TriggerKind::ToolAfter,
+            "\0".repeat(MAX_ENVELOPE_BYTES),
+            AutomationSource::new(
+                "\0".repeat(MAX_ENVELOPE_BYTES),
+                "\0".repeat(MAX_ENVELOPE_BYTES),
+            ),
+            json!({ "z": "\0".repeat(MAX_ENVELOPE_BYTES) }),
+        )
+        .capped();
+
+        assert!(serde_json::to_vec(&envelope).unwrap().len() <= MAX_ENVELOPE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminal_status_survives_end_link_and_late_finish_race() {
+        let (store, _db) = mem_store().await;
+        let hook = create_hook(
+            &store,
+            HookInput::agent_run(
+                "Monotonic",
+                TriggerKind::SessionEnd,
+                "project-1",
+                "main",
+                "local",
+                "run",
+            ),
+        )
+        .await
+        .unwrap();
+        let run = create_run(&store, &hook.id, json!({})).await.unwrap();
+
+        // Link is the normal start path; stop/end finalizes it as failed. The
+        // delayed startup link and successful turn completion must both lose.
+        link_run_session(&store, &run.id, "session-1")
+            .await
+            .unwrap();
+        finish_run(
+            &store,
+            &run.id,
+            "failed",
+            Some("session-1"),
+            Some("session cancelled"),
+        )
+        .await
+        .unwrap();
+        link_run_session(&store, &run.id, "session-2")
+            .await
+            .unwrap();
+        finish_run(&store, &run.id, "success", Some("session-2"), None)
+            .await
+            .unwrap();
+
+        let stored = list_runs(&store, &hook.id).await.unwrap();
+        assert_eq!(stored[0].status, "failed");
+        assert_eq!(stored[0].error.as_deref(), Some("session cancelled"));
+        assert_eq!(stored[0].session_pk.as_deref(), Some("session-1"));
+    }
+    #[test]
+    fn rate_verdict_skips_the_sixty_first_tool_lifecycle_execution() {
+        let dispatcher = Dispatcher::new();
+        for _ in 0..60 {
+            assert_eq!(
+                dispatcher.rate_verdict("hook-1", TriggerKind::ToolBefore, 0),
+                RateVerdict::Accepted
+            );
+        }
+        assert_eq!(
+            dispatcher.rate_verdict("hook-1", TriggerKind::ToolBefore, 0),
+            RateVerdict::HookLimited
+        );
+    }
+
+    #[test]
+    fn hook_origin_depth_three_is_not_dispatchable() {
+        assert!(HookOrigin::new("hook-1", "run-1", 2).allows_dispatch());
+        assert!(!HookOrigin::new("hook-1", "run-1", 3).allows_dispatch());
+    }
+
     async fn mem_store() -> (Store, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db.path()).await.unwrap();
         (store, db)
+    }
+
+    #[tokio::test]
+    async fn queued_not_dispatched_keeps_queued_status_and_sanitizes_error() {
+        let (store, _db) = mem_store().await;
+        let hook = create_hook(
+            &store,
+            HookInput::outbound(
+                "Queued outbound",
+                TriggerKind::SessionEnd,
+                "https://example.com/hook",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let run = create_run(&store, &hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        mark_run_queued_not_dispatched(&store, &run.id, &format!("{}\nignored", "x".repeat(2048)))
+            .await
+            .unwrap();
+
+        let stored = list_runs(&store, &hook.id).await.unwrap();
+        assert_eq!(stored[0].status, "queued");
+        assert!(stored[0].finished_at.is_none());
+        assert_eq!(stored[0].error.as_deref().unwrap().chars().count(), 1024);
     }
 
     #[tokio::test]
