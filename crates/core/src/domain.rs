@@ -675,6 +675,9 @@ pub enum CoreEvent {
         /// Speaker label for a group-chat bubble (`None` for normal rows).
         speaker: Option<String>,
     },
+    SessionQueueChanged {
+        session_pk: String,
+    },
     Result {
         session_pk: String,
     },

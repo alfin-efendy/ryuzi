@@ -2116,7 +2116,7 @@ impl Store {
     /// A session already marked `Interrupted` or `Ended` is left untouched.
     /// Also resets `resume_attempts` to 0 — a turn that reaches a normal (or
     /// errored-but-demoted) end clears the auto-resume cap.
-    pub async fn demote_if_running(&self, pk: &str, last_active: i64) -> anyhow::Result<()> {
+    pub async fn demote_if_running(&self, pk: &str, last_active: i64) -> anyhow::Result<bool> {
         let pk = pk.to_string();
         self.with_conn(move |c| {
             c.execute(
@@ -2128,9 +2128,9 @@ impl Store {
                     SessionStatus::Running.as_str()
                 ],
             )
+            .map(|changed| changed > 0)
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Backfill the workspace columns once background startup has prepared

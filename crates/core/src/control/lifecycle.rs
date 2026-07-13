@@ -331,6 +331,45 @@ impl ControlPlane {
             .await
     }
 
+    /// Claim and deliver one durable queued prompt after a session becomes idle.
+    /// A claimed row stays claimed until the continuation has been accepted;
+    /// a failed start restores the row at its original FIFO position.
+    pub async fn deliver_next_queued_session_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+    ) -> anyhow::Result<()> {
+        let Some(queued) = self.store.claim_next_session_prompt(session_pk).await? else {
+            return Ok(());
+        };
+        let id = queued.id.clone();
+        let attachments = queued.attachments.clone();
+        let prompt = queued.into_turn_prompt();
+
+        match self
+            .continue_session_with_prompt(session_pk, prompt, &attachments)
+            .await
+        {
+            Ok(()) => {
+                self.store.complete_claimed_session_prompt(&id).await?;
+                let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                    session_pk: session_pk.to_string(),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.store.restore_claimed_session_prompt(&id).await?;
+                // `continue_session_with_prompt` optimistically marks the
+                // session Running before cold-resume setup. Roll that write
+                // back so the restored head remains deliverable later.
+                let _ = self.store.demote_if_running(session_pk, now_ms()).await;
+                let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                    session_pk: session_pk.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
     pub async fn continue_session_with_prompt(
         self: &Arc<Self>,
         session_pk: &str,
@@ -1225,7 +1264,14 @@ impl ControlPlane {
                     let _ = me.events.send(CoreEvent::Result {
                         session_pk: session_pk.clone(),
                     });
-                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
+                    if me
+                        .store
+                        .demote_if_running(&session_pk, now_ms())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        let _ = me.deliver_next_queued_session_prompt(&session_pk).await;
+                    }
                 }
                 Err(e) => {
                     let message = e.to_string();
