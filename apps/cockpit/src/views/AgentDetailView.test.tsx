@@ -233,14 +233,18 @@ test("changing agent resets the local tab to Overview", async () => {
   expect(screen.queryByText("Explicit rules")).toBeNull();
 });
 
-test("future tabs remain Task 7 placeholders", () => {
+test("Skills & Tools and Advanced tabs render their owned settings", () => {
   render(<AgentDetailView agentId="reviewer" />);
-  for (const [tab, copy] of [
-    ["Skills & Tools", "Skills & Tools settings are coming in Task 8."],
-    ["Learning", "Per-agent learning controls are coming in Task 9."],
-    ["Advanced", "Advanced settings are coming in Task 8."],
-  ]) {
-    fireEvent.click(screen.getByRole("button", { name: tab }));
-    expect(screen.getByText(copy)).toBeTruthy();
-  }
+  fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
+  expect(screen.getByRole("textbox", { name: "Skill ID" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Save skills and tools" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  expect(screen.getByRole("textbox", { name: "Max turns" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Delete Reviewer" })).toBeTruthy();
+});
+
+test("Learning remains a Task 9 placeholder", () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Learning" }));
+  expect(screen.getByText("Per-agent learning controls are coming in Task 9.")).toBeTruthy();
 });

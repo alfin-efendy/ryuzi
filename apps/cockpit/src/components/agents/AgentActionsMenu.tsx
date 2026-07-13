@@ -6,13 +6,39 @@ import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
+export function DeleteAgentModal({
+  agent,
+  open,
+  trigger,
+  onClose,
+}: {
+  agent: AgentSummaryInfo;
+  open: boolean;
+  trigger: HTMLElement | null;
+  onClose: () => void;
+}) {
+  const registry = useAgents((state) => state.registry);
+  const canDelete = (registry?.agents.length ?? 0) > 1;
+  return (
+    <ConfirmActionModal
+      open={open}
+      title={`Delete ${agent.name}?`}
+      description="Configuration and isolated knowledge will be permanently removed. Historical sessions remain readable."
+      confirmLabel="Delete agent"
+      busyLabel="Deleting…"
+      confirmDisabled={!canDelete}
+      trigger={trigger}
+      onClose={onClose}
+      onConfirm={() => useAgents.getState().remove(agent.id)}
+    />
+  );
+}
+
 export function AgentActionsMenu({ agent }: { agent: AgentSummaryInfo }) {
   const [open, setOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const registry = useAgents((s) => s.registry);
   const saving = useAgents((s) => s.saving);
-  const canDelete = (registry?.agents.length ?? 0) > 1;
   const nav = useNav();
 
   const duplicate = async () => {
@@ -65,17 +91,7 @@ export function AgentActionsMenu({ agent }: { agent: AgentSummaryInfo }) {
           </div>
         </MenuPanel>
       )}
-      <ConfirmActionModal
-        open={deleteOpen}
-        title={`Delete ${agent.name}?`}
-        description={`Configuration and isolated knowledge will be permanently removed. Historical sessions remain readable.`}
-        confirmLabel="Delete agent"
-        busyLabel="Deleting…"
-        confirmDisabled={!canDelete}
-        trigger={triggerRef.current}
-        onClose={() => setDeleteOpen(false)}
-        onConfirm={() => useAgents.getState().remove(agent.id)}
-      />
+      <DeleteAgentModal agent={agent} open={deleteOpen} trigger={triggerRef.current} onClose={() => setDeleteOpen(false)} />
     </span>
   );
 }

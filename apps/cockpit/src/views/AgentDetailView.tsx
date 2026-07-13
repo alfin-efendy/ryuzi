@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, ArrowLeft } from "lucide-react";
 import { Badge, Button, Segmented, SettingsCard, SettingsCardTitle } from "@ryuzi/ui";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
+import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
+import { AgentSkillsToolsTab } from "@/components/agents/AgentSkillsToolsTab";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
@@ -114,24 +116,14 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         ) : null}
         {tab === "model" ? <AgentModelTab detail={detail} /> : null}
         {tab === "permissions" ? <AgentPermissionsTab detail={detail} /> : null}
-        {tab === "capabilities" ? (
-          <SettingsCard className="px-[18px] py-5">
-            <SettingsCardTitle>Skills &amp; Tools</SettingsCardTitle>
-            <p className="mb-0 mt-2 text-xs text-muted-foreground">Skills &amp; Tools settings are coming in Task 8.</p>
-          </SettingsCard>
-        ) : null}
+        {tab === "capabilities" ? <AgentSkillsToolsTab detail={detail} /> : null}
         {tab === "learning" ? (
           <SettingsCard className="px-[18px] py-5">
             <SettingsCardTitle>Learning</SettingsCardTitle>
             <p className="mb-0 mt-2 text-xs text-muted-foreground">Per-agent learning controls are coming in Task 9.</p>
           </SettingsCard>
         ) : null}
-        {tab === "advanced" ? (
-          <SettingsCard className="px-[18px] py-5">
-            <SettingsCardTitle>Advanced</SettingsCardTitle>
-            <p className="mb-0 mt-2 text-xs text-muted-foreground">Advanced settings are coming in Task 8.</p>
-          </SettingsCard>
-        ) : null}
+        {tab === "advanced" ? <AgentAdvancedTab detail={detail} /> : null}
       </div>
     </div>
   );
