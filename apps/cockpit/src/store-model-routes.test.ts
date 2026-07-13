@@ -39,8 +39,40 @@ const targetCapabilities: ModelRouteTargetCapability[] = [
 ];
 
 function reset() {
-  useModelRoutes.setState({ routes: [], targetCapabilities: [], loaded: false });
+  useModelRoutes.setState({ routes: [], targetCapabilities: [], targetCapabilitiesLoaded: false, loaded: false });
 }
+
+test("hydrate retries failed target capabilities without reloading routes", async () => {
+  reset();
+  const routesCommand = spyOn(commands, "listModelRoutes").mockResolvedValueOnce({ status: "ok", data: [route] });
+  const capabilitiesCommand = spyOn(commands, "listModelRouteTargetCapabilities")
+    .mockRejectedValueOnce(new Error("capabilities unavailable"))
+    .mockResolvedValueOnce({ status: "ok", data: targetCapabilities });
+  const toastSpy = spyOn(toast, "error");
+
+  await useModelRoutes.getState().hydrate();
+
+  expect(useModelRoutes.getState()).toMatchObject({
+    routes: [route],
+    targetCapabilities: [],
+    loaded: true,
+    targetCapabilitiesLoaded: false,
+  });
+
+  await useModelRoutes.getState().hydrate();
+
+  expect(useModelRoutes.getState()).toMatchObject({
+    routes: [route],
+    targetCapabilities,
+    loaded: true,
+    targetCapabilitiesLoaded: true,
+  });
+  expect(routesCommand).toHaveBeenCalledTimes(1);
+  expect(capabilitiesCommand).toHaveBeenCalledTimes(2);
+  routesCommand.mockRestore();
+  capabilitiesCommand.mockRestore();
+  toastSpy.mockRestore();
+});
 
 test("hydrate retains target capabilities when route loading rejects", async () => {
   reset();
@@ -53,7 +85,12 @@ test("hydrate retains target capabilities when route loading rejects", async () 
 
   await useModelRoutes.getState().hydrate();
 
-  expect(useModelRoutes.getState()).toMatchObject({ routes: [], targetCapabilities, loaded: true });
+  expect(useModelRoutes.getState()).toMatchObject({
+    routes: [],
+    targetCapabilities,
+    loaded: false,
+    targetCapabilitiesLoaded: true,
+  });
   expect(toastSpy.mock.calls.some(([message]) => String(message).includes("Routes failed: routes unavailable"))).toBe(true);
   routesCommand.mockRestore();
   capabilitiesCommand.mockRestore();

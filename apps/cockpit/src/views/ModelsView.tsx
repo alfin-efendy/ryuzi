@@ -661,7 +661,7 @@ function RouteCard({
 }
 
 function RouteTab() {
-  const { routes, targetCapabilities, loaded, hydrate, save, remove } = useModelRoutes();
+  const { routes, targetCapabilities, targetCapabilitiesLoaded, loaded, hydrate, save, remove } = useModelRoutes();
   const catalog = useConnections((s) => s.catalog);
   const connections = useConnections((s) => s.connections);
   const [editing, setEditing] = useState<ModelRouteInfo | null>(null);
@@ -670,8 +670,8 @@ function RouteTab() {
   const targets = useMemo(() => routeTargetOptions(catalog, connections), [catalog, connections]);
 
   useEffect(() => {
-    if (!loaded) void hydrate();
-  }, [loaded, hydrate]);
+    if (!loaded || !targetCapabilitiesLoaded) void hydrate();
+  }, [loaded, targetCapabilitiesLoaded, hydrate]);
 
   const beginNew = () => setEditing(newRoute(targets));
   const saveRoute = async (route: ModelRouteInfo) => {
