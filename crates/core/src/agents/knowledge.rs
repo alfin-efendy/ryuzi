@@ -232,7 +232,26 @@ impl AgentKnowledgeStore {
                 _ => {}
             }
         }
+        let concepts = scan
+            .valid
+            .iter()
+            .filter(|concept| is_memory_relative_path(&concept.relative_path))
+            .cloned()
+            .collect();
+        let invalid = scan
+            .invalid
+            .iter()
+            .filter(|concept| is_memory_relative_path(&concept.relative_path))
+            .cloned()
+            .collect();
         curator_concepts.sort_by_key(|concept| concept.timestamp);
+        curator_history.sort_by(|left, right| {
+            right
+                .concept
+                .timestamp
+                .cmp(&left.concept.timestamp)
+                .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
+        });
         let curator_concept = curator_concepts.pop();
         let curator = CuratorState {
             last_event_id: curator_concept
@@ -241,8 +260,8 @@ impl AgentKnowledgeStore {
             concept: curator_concept,
         };
         Ok(AgentLearningSnapshot {
-            concepts: scan.valid,
-            invalid: scan.invalid,
+            concepts,
+            invalid,
             journey,
             skill_usage,
             reviews,
@@ -250,6 +269,12 @@ impl AgentKnowledgeStore {
             curator_history,
         })
     }
+}
+
+fn is_memory_relative_path(relative_path: &str) -> bool {
+    relative_path.starts_with("memory/global/")
+        || relative_path.starts_with("memory/user/")
+        || relative_path.starts_with("memory/projects/")
 }
 
 fn extension_string(concept: &KnowledgeConcept, key: &str) -> Option<String> {
@@ -447,6 +472,36 @@ impl KnowledgeStore {
         })
     }
 
+    /// Replaces an invalid document at `relative_path` with raw Markdown that
+    /// must parse as a valid concept. The invalid-file ownership check and
+    /// replacement happen under the same per-agent write fence.
+    pub async fn replace_invalid_raw(
+        &self,
+        relative_path: &str,
+        raw: &str,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        validate_concept_relative_path(relative_path)?;
+        let concept = parse_concept(relative_path, raw)?;
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let target = stage.join(relative_path);
+            let existing = fs::read_to_string(&target)
+                .with_context(|| format!("`{relative_path}` does not exist"))?;
+            if parse_concept(relative_path, &existing).is_ok() {
+                bail!("`{relative_path}` is not an invalid concept");
+            }
+            atomic_write(&target, render_concept(&concept)?.as_bytes())?;
+            Ok((
+                concept.clone(),
+                vec![(
+                    "replace".into(),
+                    concept.id.clone(),
+                    relative_path.to_owned(),
+                )],
+            ))
+        })
+    }
+
     /// Deletes a document that failed parsing. The path must still be a
     /// well-formed concept path so traversal can never delete other files.
     pub async fn delete_invalid(&self, relative_path: &str) -> anyhow::Result<()> {
@@ -454,8 +509,10 @@ impl KnowledgeStore {
         let _guard = self.write_lock.lock().await;
         self.commit_staged_mutation(|stage| {
             let target = stage.join(relative_path);
-            if !target.is_file() {
-                bail!("`{relative_path}` does not exist");
+            let existing = fs::read_to_string(&target)
+                .with_context(|| format!("`{relative_path}` does not exist"))?;
+            if parse_concept(relative_path, &existing).is_ok() {
+                bail!("`{relative_path}` is not an invalid concept");
             }
             fs::remove_file(target)?;
             let stem = concept_id_of(relative_path);
@@ -1616,7 +1673,7 @@ mod tests {
         assert_eq!(snapshot.skill_usage[0].successes, 2);
         assert_eq!(snapshot.curator.concept.as_ref().unwrap().id, curator.id);
         assert_eq!(snapshot.curator_history.len(), 1);
-        assert_eq!(snapshot.concepts.len(), 5);
+        assert!(snapshot.concepts.is_empty());
         assert!(snapshot.invalid.is_empty());
     }
 }

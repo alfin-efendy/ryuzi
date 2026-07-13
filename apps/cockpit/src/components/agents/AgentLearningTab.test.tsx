@@ -44,6 +44,7 @@ function seedLearning(snapshot: AgentLearningInfo) {
     byAgent: { reviewer: snapshot },
     loading: {},
     rollingBack: {},
+    requestGeneration: {},
     load,
     createConcept,
     updateConcept,
@@ -90,6 +91,18 @@ test("changing raw markdown after validation disables Replace again", async () =
   await waitFor(() => expect(screen.getByRole("button", { name: "Replace file" }).hasAttribute("disabled")).toBe(false));
   fireEvent.change(raw, { target: { value: `${validRaw}\nchanged` } });
   expect(screen.getByRole("button", { name: "Replace file" }).hasAttribute("disabled")).toBe(true);
+});
+
+test("memory editor requires a trimmed description before saving", () => {
+  render(<AgentLearningTab agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Add memory" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Title" }), { target: { value: "New memory" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Description" }), { target: { value: "   " } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Body" }), { target: { value: "Body" } });
+  const save = screen.getByRole("button", { name: "Save memory" });
+  expect(save.hasAttribute("disabled")).toBe(true);
+  fireEvent.click(save);
+  expect(createConcept).not.toHaveBeenCalled();
 });
 
 test("rollback requires explicit confirmation with the non-agent-file warning", async () => {

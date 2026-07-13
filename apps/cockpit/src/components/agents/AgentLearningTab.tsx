@@ -75,7 +75,14 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
     );
   };
   const save = async () => {
-    if (!editing || !draft.title.trim() || !draft.body.trim() || (draft.scope === "project" && !draft.projectId)) return;
+    if (
+      !editing ||
+      !draft.title.trim() ||
+      !draft.description.trim() ||
+      !draft.body.trim() ||
+      (draft.scope === "project" && !draft.projectId)
+    )
+      return;
     const input = {
       ...draft,
       title: draft.title.trim(),
@@ -123,7 +130,7 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
       <section aria-labelledby="memory-heading">
         <SettingsCard>
           <SettingsCardHeader>
-            <SettingsCardTitle>Memory</SettingsCardTitle>
+            <SettingsCardTitle id="memory-heading">Memory</SettingsCardTitle>
             <span className="ml-auto text-xs text-muted-foreground">{snapshot.concepts.length}</span>
             <Button type="button" size="sm" onClick={() => openEditor()}>
               <Plus aria-hidden size={12} /> Add memory
@@ -308,7 +315,9 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
               Cancel
             </Button>
             <Button
-              disabled={!draft.title.trim() || !draft.body.trim() || (draft.scope === "project" && !draft.projectId)}
+              disabled={
+                !draft.title.trim() || !draft.description.trim() || !draft.body.trim() || (draft.scope === "project" && !draft.projectId)
+              }
               onClick={() => void save()}
             >
               Save memory

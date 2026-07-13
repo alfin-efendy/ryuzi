@@ -624,15 +624,70 @@ async fn require_agent(state: &ApiState, agent_id: &str) -> Result<String, ApiEr
     Ok(agent_id)
 }
 
-/// Knowledge-store failures are caller mistakes, not server faults: missing
-/// concepts/paths surface as 404, everything else (parse and validation
-/// failures) as 400.
+fn knowledge_store(
+    state: &ApiState,
+    agent_id: &str,
+) -> Result<crate::agents::knowledge::KnowledgeStore, ApiError> {
+    state
+        .agent_knowledge
+        .for_agent(agent_id)
+        .map_err(knowledge_api_error)
+}
+
+async fn require_memory_concept(
+    knowledge: &crate::agents::knowledge::KnowledgeStore,
+    concept_id: &str,
+) -> Result<(), ApiError> {
+    let concept = knowledge
+        .read(concept_id)
+        .await
+        .map_err(knowledge_api_error)?;
+    if concept.scope.is_none() || !concept.relative_path.starts_with("memory/") {
+        return Err(ApiError::not_found("memory concept was not found"));
+    }
+    Ok(())
+}
+
+fn require_memory_path(relative_path: &str) -> Result<(), ApiError> {
+    if !is_memory_relative_path(relative_path) {
+        return Err(ApiError::not_found("memory concept was not found"));
+    }
+    Ok(())
+}
+
+async fn require_invalid_memory_path(
+    knowledge: &crate::agents::knowledge::KnowledgeStore,
+    relative_path: &str,
+) -> Result<(), ApiError> {
+    require_memory_path(relative_path)?;
+    let scan = knowledge.scan().await.map_err(knowledge_api_error)?;
+    if !scan
+        .invalid
+        .iter()
+        .any(|invalid| invalid.relative_path == relative_path)
+    {
+        return Err(ApiError::not_found("invalid memory concept was not found"));
+    }
+    Ok(())
+}
+
+fn is_memory_relative_path(relative_path: &str) -> bool {
+    relative_path.starts_with("memory/global/")
+        || relative_path.starts_with("memory/user/")
+        || relative_path.starts_with("memory/projects/")
+}
+
+/// Knowledge-store failures may include host filesystem paths in their error
+/// chains. Log the full diagnostic server-side, but return only stable,
+/// path-free messages to callers. Missing resources remain 404s; validation
+/// and mutation failures use the existing 400 contract.
 fn knowledge_api_error(error: anyhow::Error) -> ApiError {
-    let message = format!("{error:#}");
-    if message.contains("was not found") || message.contains("does not exist") {
-        ApiError::not_found(message)
+    let diagnostic = format!("{error:#}");
+    tracing::warn!(error = %diagnostic, "agent knowledge operation failed");
+    if diagnostic.contains("was not found") || diagnostic.contains("does not exist") {
+        ApiError::not_found("knowledge resource was not found")
     } else {
-        ApiError::bad_request(message)
+        ApiError::bad_request("knowledge operation failed")
     }
 }
 
@@ -774,7 +829,11 @@ async fn agent_learning_info(
     agent_id: &str,
 ) -> Result<AgentLearningInfo, ApiError> {
     Ok(learning_info(
-        state.agent_knowledge.learning_snapshot(agent_id).await?,
+        state
+            .agent_knowledge
+            .learning_snapshot(agent_id)
+            .await
+            .map_err(knowledge_api_error)?,
     ))
 }
 
@@ -978,7 +1037,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: CreateConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
             let input = concept_input_from_mutation(a.input)?;
-            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let knowledge = knowledge_store(state, &agent_id)?;
             let concept = knowledge.create(input).await.map_err(knowledge_api_error)?;
             ok(concept_info(concept))
         }
@@ -986,7 +1045,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: UpdateConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
             let input = concept_input_from_mutation(a.input)?;
-            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let knowledge = knowledge_store(state, &agent_id)?;
+            require_memory_concept(&knowledge, &a.concept_id).await?;
             let concept = knowledge
                 .update(&a.concept_id, input)
                 .await
@@ -996,7 +1056,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "delete_agent_concept" => {
             let a: ConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
-            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let knowledge = knowledge_store(state, &agent_id)?;
+            require_memory_concept(&knowledge, &a.concept_id).await?;
             knowledge
                 .delete(&a.concept_id)
                 .await
@@ -1006,7 +1067,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "validate_agent_concept_raw" => {
             let a: RawConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
-            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let knowledge = knowledge_store(state, &agent_id)?;
+            require_invalid_memory_path(&knowledge, &a.relative_path).await?;
             let concept = knowledge
                 .validate_raw(&a.relative_path, &a.raw_markdown)
                 .await
@@ -1016,9 +1078,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "replace_agent_concept_raw" => {
             let a: RawConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
-            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let knowledge = knowledge_store(state, &agent_id)?;
+            require_invalid_memory_path(&knowledge, &a.relative_path).await?;
             let concept = knowledge
-                .replace_raw(&a.relative_path, &a.raw_markdown)
+                .replace_invalid_raw(&a.relative_path, &a.raw_markdown)
                 .await
                 .map_err(knowledge_api_error)?;
             ok(concept_info(concept))
@@ -1026,7 +1089,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "delete_invalid_agent_concept" => {
             let a: InvalidConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
-            let knowledge = state.agent_knowledge.for_agent(&agent_id)?;
+            let knowledge = knowledge_store(state, &agent_id)?;
+            require_invalid_memory_path(&knowledge, &a.relative_path).await?;
             knowledge
                 .delete_invalid(&a.relative_path)
                 .await
@@ -1040,7 +1104,11 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             // Reject unknown snapshots before enqueueing: a rollback event
             // that can never apply would otherwise sit at the head of the
             // durable queue and block every later Learning event.
-            let snapshot = state.agent_knowledge.learning_snapshot(&agent_id).await?;
+            let snapshot = state
+                .agent_knowledge
+                .learning_snapshot(&agent_id)
+                .await
+                .map_err(knowledge_api_error)?;
             if !snapshot
                 .curator_history
                 .iter()
@@ -1248,6 +1316,126 @@ mod tests {
             "projectId": null,
             "tags": ["communication"]
         })
+    }
+
+    #[tokio::test]
+    async fn learning_exposes_and_mutates_only_memory_owned_concepts() {
+        let s = state_with_agents().await;
+        let id = default_agent_id(&s).await;
+        let knowledge = s.agent_knowledge.for_agent(&id).unwrap();
+        knowledge
+            .replace_raw(
+                "learning/journey/internal.md",
+                "---\ntype: Journey\ntitle: Internal milestone\ndescription: Must remain owned by Learning.\ntimestamp: 2026-08-01T00:00:00Z\n---\n\nInternal body.\n",
+            )
+            .await
+            .unwrap();
+
+        let learning = dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+            .await
+            .unwrap();
+        assert!(learning["concepts"].as_array().unwrap().is_empty());
+        assert_eq!(learning["journey"][0]["title"], "Internal milestone");
+
+        for method in ["update_agent_concept", "delete_agent_concept"] {
+            let params = if method == "update_agent_concept" {
+                json!({"agent_id": id, "concept_id": "internal", "input": user_concept_input()})
+            } else {
+                json!({"agent_id": id, "concept_id": "internal"})
+            };
+            let error = dispatch(&s, method, params).await.unwrap_err();
+            assert_eq!(error.status, 404);
+        }
+        for method in [
+            "validate_agent_concept_raw",
+            "replace_agent_concept_raw",
+            "delete_invalid_agent_concept",
+        ] {
+            let params = if method == "delete_invalid_agent_concept" {
+                json!({"agent_id": id, "relative_path": "learning/journey/internal.md"})
+            } else {
+                json!({
+                    "agent_id": id,
+                    "relative_path": "learning/journey/internal.md",
+                    "raw_markdown": "---\ntype: Journey\ntitle: Replaced\ndescription: Must remain owned by Learning.\ntimestamp: 2026-08-01T00:00:00Z\n---\n\nReplacement.\n"
+                })
+            };
+            let error = dispatch(&s, method, params).await.unwrap_err();
+            assert_eq!(
+                error.status, 404,
+                "{method} must reject Learning-owned paths"
+            );
+        }
+
+        knowledge
+            .replace_raw(
+                "memory/user/owned.md",
+                "---\ntype: Memory\ntitle: Owned memory\ndescription: Must use memory CRUD.\ntimestamp: 2026-08-01T00:00:00Z\nscope: user\n---\n\nOwned body.\n",
+            )
+            .await
+            .unwrap();
+        for method in ["replace_agent_concept_raw", "delete_invalid_agent_concept"] {
+            let params = if method == "delete_invalid_agent_concept" {
+                json!({"agent_id": id, "relative_path": "memory/user/owned.md"})
+            } else {
+                json!({
+                    "agent_id": id,
+                    "relative_path": "memory/user/owned.md",
+                    "raw_markdown": "---\ntype: Memory\ntitle: Replaced\ndescription: Must use memory CRUD.\ntimestamp: 2026-08-01T00:00:00Z\nscope: user\n---\n\nReplacement.\n"
+                })
+            };
+            let error = dispatch(&s, method, params).await.unwrap_err();
+            assert_eq!(error.status, 404, "{method} must reject valid memory files");
+        }
+
+        let preserved = knowledge.read("internal").await.unwrap();
+        assert_eq!(preserved.concept_type, "Journey");
+        assert_eq!(preserved.relative_path, "learning/journey/internal.md");
+    }
+
+    #[tokio::test]
+    async fn curator_history_is_newest_first_with_snapshot_id_tie_break() {
+        let s = state_with_agents().await;
+        let id = default_agent_id(&s).await;
+        let knowledge = s.agent_knowledge.for_agent(&id).unwrap();
+        for (snapshot_id, timestamp) in [
+            ("z-old", "2026-01-01T00:00:00Z"),
+            ("a-new", "2026-12-01T00:00:00Z"),
+            ("z-new", "2026-12-01T00:00:00Z"),
+        ] {
+            knowledge
+                .replace_raw(
+                    &format!("curator/history/{snapshot_id}.md"),
+                    &format!("---\ntype: CuratorHistory\ntitle: {snapshot_id}\ndescription: Snapshot.\ntimestamp: {timestamp}\n---\n\nBody.\n"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let learning = dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+            .await
+            .unwrap();
+        let ids = learning["curatorHistory"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["snapshotId"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["z-new", "a-new", "z-old"]);
+    }
+
+    #[tokio::test]
+    async fn knowledge_errors_do_not_expose_absolute_paths() {
+        for leaked in [
+            "/home/alice/.config/ryuzi/agents/reviewer/knowledge/.knowledge-transactions/tx-1",
+            r"C:\Users\Alice\AppData\Roaming\ryuzi\agents\reviewer\knowledge\.knowledge-transactions\tx-1",
+        ] {
+            let error =
+                super::knowledge_api_error(anyhow::anyhow!("transaction failed at {leaked}"));
+            assert!(!error.message.contains(leaked));
+            assert!(!error.message.contains("/home/alice"));
+            assert!(!error.message.contains(r"C:\Users\Alice"));
+        }
     }
 
     #[tokio::test]
