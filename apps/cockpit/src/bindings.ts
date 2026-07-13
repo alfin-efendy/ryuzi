@@ -491,7 +491,7 @@ async addGateway(runnerId: string | null, name: string, host: string, port: numb
  * off `ryuzi pair`'s printout on the REMOTE host and enters them here.
  * Three steps, all in Cockpit's Tauri backend (never core — core stays
  * free of outbound HTTP to arbitrary hosts):
- * 
+ *
  * 1. Pair over a pinned-TLS client trusting `fingerprint` (TOFU):
  * `POST https://{host}:{port}/pair {code, device_name}` ->
  * `{device_token}` ([`crate::engine::pair_over_pinned_tls`]).
@@ -499,7 +499,7 @@ async addGateway(runnerId: string | null, name: string, host: string, port: numb
  * (encrypts `device_token` at rest — see `gateways_api::save_runner`).
  * 3. Live-add the runner to the [`EngineManager`] (pinned client + SSE
  * bridge) so it's usable immediately, no Cockpit restart required.
- * 
+ *
  * SECURITY: `device_token` never leaves this function — it's consumed by
  * step 1's caller and handed straight to steps 2 and 3, never placed on
  * the `Vec<GatewayInfo>` this command returns (that DTO has no token
@@ -604,6 +604,62 @@ async runJobNow(runnerId: string | null, id: string) : Promise<Result<JobInfo[],
  */
 async parseNaturalSchedule(text: string) : Promise<string | null> {
     return await TAURI_INVOKE("parse_natural_schedule", { text });
+},
+async listAutomationHooks(runnerId: string | null) : Promise<Result<AutomationHookInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_automation_hooks", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async automationHookDetail(runnerId: string | null, id: string) : Promise<Result<AutomationHookDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("automation_hook_detail", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createAutomationHook(runnerId: string | null, input: AutomationHookInput) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_automation_hook", { runnerId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAutomationHook(runnerId: string | null, id: string, input: AutomationHookInput) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_automation_hook", { runnerId, id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleAutomationHook(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_automation_hook", { runnerId, id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteAutomationHook(runnerId: string | null, id: string) : Promise<Result<AutomationHookInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_automation_hook", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async testAutomationHook(runnerId: string | null, id: string) : Promise<Result<AutomationHookDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_automation_hook", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async listApps(runnerId: string | null) : Promise<Result<AppInfo[], CmdError>> {
     try {
@@ -1167,6 +1223,46 @@ async sessionTodos(runnerId: string | null, sessionPk: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
+async listProjectCommands(runnerId: string | null, projectId: string) : Promise<Result<ProjectCommandInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_project_commands", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readProjectCommand(runnerId: string | null, projectId: string, name: string) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_project_command", { runnerId, projectId, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createProjectCommand(runnerId: string | null, projectId: string, input: ProjectCommandInputDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_project_command", { runnerId, projectId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string, input: ProjectCommandMutationDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_command", { runnerId, projectId, name, revision, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_project_command", { runnerId, projectId, name, revision }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listSkills(runnerId: string | null) : Promise<Result<InstalledSkillInfo[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_skills", { runnerId }) };
@@ -1628,11 +1724,12 @@ termOutputMsg: "term-output-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
-export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null; 
+export type ActionKind = "agent.run" | "webhook.outbound"
+export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null;
 /**
  * stdio | http
  */
-transport: string; command: string | null; args: string[]; 
+transport: string; command: string | null; args: string[];
 /**
  * KEY=VALUE pairs.
  */
@@ -1673,15 +1770,15 @@ export type ApprovalDecision = "allowOnce" | "allowAlways" | "rejectOnce" | "rej
 /**
  * What a pending approval is asking the user for.
  */
-export type ApprovalKind = 
+export type ApprovalKind =
 /**
  * Permission to run one tool call.
  */
-"tool" | 
+"tool" |
 /**
  * Review of an `exitplanmode` plan.
  */
-"plan" | 
+"plan" |
 /**
  * An `askuserquestion` form.
  */
@@ -1696,11 +1793,11 @@ export type ApprovalResponse = { decision: ApprovalDecision; scope: ApprovalScop
 /**
  * Where an `AllowAlways`/`RejectAlways` decision is remembered.
  */
-export type ApprovalScope = 
+export type ApprovalScope =
 /**
  * In-memory for the current session only.
  */
-"session" | 
+"session" |
 /**
  * Persisted to the project's `tool_policies` row.
  */
@@ -1708,27 +1805,39 @@ export type ApprovalScope =
 /**
  * One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
  */
-export type AuditRow = { id: number; tool: string; action: string; decision: string; 
+export type AuditRow = { id: number; tool: string; action: string; decision: string;
 /**
  * The initiating `WriteOrigin` as a string (`user`|`agent`|`background_review`).
  */
-origin: string; sessionPk: string | null; 
+origin: string; sessionPk: string | null;
 /**
  * Unix ms.
  */
 at: number }
+export type AutomationActionInfo = { kind: "agent.run"; config: AutomationAgentRunActionInput } | { kind: "webhook.outbound"; config: AutomationWebhookOutboundActionInfo }
+export type AutomationActionInput = { kind: "agent.run"; config: AutomationAgentRunActionInput } | { kind: "webhook.outbound"; config: AutomationWebhookOutboundActionInput }
+export type AutomationAgentRunActionInput = { projectId: string; branch: string; gatewayId: string; prompt: string; agentId: string | null; modelOverride: string | null; subtask: boolean }
+export type AutomationHookAttemptInfo = { runId: string; ordinal: number; startedAt: number; finishedAt: number | null; httpStatus: number | null; error: string | null }
+export type AutomationHookDetail = { hook: AutomationHookInfo; action: AutomationActionInfo; runs: AutomationHookRunInfo[] }
+export type AutomationHookInfo = { id: string; name: string; triggerKind: TriggerKind; actionKind: ActionKind; enabled: boolean; inboundPath: string | null; createdAt: number; updatedAt: number }
+export type AutomationHookInput = { name: string; triggerKind: TriggerKind; action: AutomationActionInput; enabled?: boolean }
+export type AutomationHookRunInfo = { id: string; hookId: string; status: string; sessionPk: string | null; error: string | null; attemptCount: number; lastHttpStatus: number | null; queuedAt: number; startedAt: number | null; finishedAt: number | null; attempts: AutomationHookAttemptInfo[] }
+export type AutomationWebhookHeaderInfo = { name: string; configured: boolean }
+export type AutomationWebhookHeaderInput = { name: string; value: string }
+export type AutomationWebhookOutboundActionInfo = { url: string; method: string; headers: AutomationWebhookHeaderInfo[]; payloadTemplate: string | null }
+export type AutomationWebhookOutboundActionInput = { url: string; method: string; headers?: AutomationWebhookHeaderInput[]; payloadTemplate: string | null }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
-export type BranchList = { 
+export type BranchList = {
 /**
  * Local branch names — current first, then alphabetical.
  */
-branches: string[]; 
+branches: string[];
 /**
  * Branch checked out in the project workdir; a short commit id when
  * HEAD is detached, "HEAD" when the repo has no commits yet.
  */
 current: string; detached: boolean }
-export type CatalogEntry = { id: string; name: string; 
+export type CatalogEntry = { id: string; name: string;
 /**
  * Vendor family id (a catalog id). Entries sharing a family render as one
  * provider card; the entry whose id == family is the display head.
@@ -1744,11 +1853,11 @@ family: string; color: string; initial: string; category: string; format: string
  */
 export type CatalogStatus = { sequence: number; lastFetchAt: number | null; outcome: string | null; entries: number; blocked: number }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
-export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[]; 
+export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[];
 /**
  * None => engine default (worktree ON, new engine-named branch from HEAD).
  */
-git: GitOptions | null; 
+git: GitOptions | null;
 /**
  * Initial permission mode for the session being started (new-chat
  * picker). `None` ⇒ inherit the project default.
@@ -1758,8 +1867,8 @@ export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
-export type CommandInfo = { name: string; description: string; agent: string | null }
-export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[]; 
+export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean }
+export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and
  * the user needs to reconnect via the browser/paste flow again.
@@ -1768,44 +1877,48 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
  */
-{ kind: "notice"; session_pk: string; text: string } | { kind: "sessionEnded"; session_pk: string } | 
+{ kind: "notice"; session_pk: string; text: string } | { kind: "sessionEnded"; session_pk: string } |
+/**
+ * A Hook run changed state (queued|running|success|failed|skipped).
+ */
+{ kind: "automationHookRunChanged"; hook_id: string; run_id: string; status: string } |
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
-{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string } | 
+{ kind: "jobRunChanged"; job_id: string; run_id: string; status: string } |
 /**
  * An orchestrated task changed status (todo|ready|running|done|failed|
  * cancelled; roots also decomposing|waiting|judging).
  */
-{ kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } | 
+{ kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } |
 /**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
  */
-{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; output_tokens: number } | 
+{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; output_tokens: number } |
 /**
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
  */
-{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } | 
+{ kind: "contextCompacted"; session_pk: string; trigger: string; before_tokens: number; after_tokens: number; window_number: number } |
 /**
  * A provider OAuth flow produced its authorize URL. Surfaces open it
  * (Cockpit maps this onto the legacy OauthAuthorizeUrlMsg Tauri event).
  */
-{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } | 
+{ kind: "oauthAuthorizeUrl"; provider: string; authorize_url: string } |
 /**
  * Same for a plugin OAuth flow.
  */
-{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } | 
+{ kind: "pluginOauthAuthorizeUrl"; plugin_id: string; authorize_url: string } |
 /**
  * Per-session accumulated cost: total USD and a per-model token+dollar
  * breakdown. Emitted alongside `ContextUsage`.
- * 
+ *
  * Like its sibling context-telemetry variants above, this variant's own
  * fields stay snake_case (`session_pk`, `total_usd`): the enum-level
  * `rename_all = "camelCase"` on `CoreEvent` only renames the `kind` tag
@@ -1837,11 +1950,11 @@ export type DirEntryInfo = { name: string; dir: boolean }
  * the source (see that module's doc comment) — this DTO adds no new fields,
  * just the specta `Type` the core struct doesn't derive.
  */
-export type DoctorFinding = { pluginId: string; 
+export type DoctorFinding = { pluginId: string;
 /**
  * `warn` | `error`.
  */
-severity: string; 
+severity: string;
 /**
  * `reconnect-required` | `missing-binary` | `attach-failed` | `blocked` |
  * `slot-conflict` | `not-running` | `crashed` | `restart-exhausted` |
@@ -1864,12 +1977,12 @@ export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: stri
  * (the sanitized detail) — a single `From` conversion would need the same
  * branching anyway.
  */
-export type ExtensionStatusEntry = { pluginId: string; 
+export type ExtensionStatusEntry = { pluginId: string;
 /**
  * The manifest's `[[extension]] name` — unique within its own plugin,
  * not globally (mirrors `ExtensionSnapshot::name`'s own namespace note).
  */
-name: string; 
+name: string;
 /**
  * `running` | `starting` | `restarting` | `failed` | `stopped` |
  * `not-running` (the last one has no `ExtensionStatus` counterpart — it
@@ -1877,14 +1990,14 @@ name: string;
  * has no spawned entry for it at all, e.g. a still-pending spawn or a
  * resolution failure prior to ever reaching `Failed`).
  */
-status: string; 
+status: string;
 /**
  * Lifetime count of restart attempts DT4's supervisor has made for this
  * entry. Always `0` for an entry that has never needed a restart
  * (including the synthetic `not-running` entries, which were never
  * spawned at all).
  */
-restartCount: number; 
+restartCount: number;
 /**
  * Present only when `status == "failed"` — `ExtensionStatus::Failed`'s
  * already-sanitized reason (`proc::sanitize_init_error`/the
@@ -1899,11 +2012,11 @@ lastError: string | null; confirmedEvents: string[]; toolCount: number }
  */
 export type FtsHit = { sessionPk: string; seq: number; snippet: string; title: string | null; kind: string; createdAt: number }
 export type GatewayEventInfo = { at: number; level: string; text: string }
-export type GatewayInfo = { id: string; name: string; badge: string; 
+export type GatewayInfo = { id: string; name: string; badge: string;
 /**
  * local | wsl | ssh
  */
-kind: string; detail: string; metaLine: string; 
+kind: string; detail: string; metaLine: string;
 /**
  * connected | offline
  */
@@ -1921,7 +2034,7 @@ export type InstalledSkillPack = { id: string; name: string; source: string; plu
  * so the UI can offer repair instead of silently dropping it.
  */
 export type InvalidKnowledgeConceptInfo = { relativePath: string; error: string; rawMarkdown: string }
-export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[]; 
+export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[];
 /**
  * Model id this job's session starts with, overriding the project/agent
  * default. `None` when the job uses ordinary model resolution. Not yet
@@ -1930,7 +2043,7 @@ export type JobInfo = { id: string; name: string; cron: string; mode: string; na
  * read and round-trip it without another DTO change.
  */
 modelOverride?: string | null }
-export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean; 
+export type JobInput = { name: string; mode: string; natural: string; cron: string; projectId: string; branch: string; gateway: string; prompt: string; notifySuccess: boolean; notifyFail: boolean;
 /**
  * See `JobInfo::model_override`.
  */
@@ -1942,17 +2055,17 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
  * (via a later task's DTO mapping) so users know whether their secrets are
  * protected by the OS keychain or a weaker fallback.
  */
-export type KeychainStatus = 
+export type KeychainStatus =
 /**
  * Master key is stored in (and was read from, or freshly provisioned
  * into) the OS keychain.
  */
-"ok" | 
+"ok" |
 /**
  * The OS keychain is unavailable (headless/locked/no D-Bus session), so
  * the master key lives in a permission-restricted file instead.
  */
-"fileFallback" | 
+"fileFallback" |
 /**
  * Neither the keychain nor the fallback file could be used reliably;
  * an ephemeral in-memory key is in play and secrets will not survive a
@@ -1973,7 +2086,7 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry, one row per native-runtime event block.
  */
-export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number; 
+export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
  * Group-chat attribution: the agent name for a labeled worker/orchestrator
  * bubble. `None` for ordinary user/assistant rows.
@@ -1989,13 +2102,13 @@ export type ModelDefaultSource = "configured" | "provider" | "variesByTarget" | 
 export type ModelPreferenceKey = { family: string; model: string }
 export type ModelRouteInfo = { id: string; name: string; enabled: boolean; strategy: ModelRouteStrategy; targets: ModelRouteTarget[]; createdAt: number; updatedAt: number }
 export type ModelRouteStrategy = "fallback" | "round-robin"
-export type ModelRouteTarget = { 
+export type ModelRouteTarget = {
 /**
  * A family id (registry family head), e.g. "anthropic" — NOT a
  * connection id. The router expands this to every enabled account in
  * the family serving `model`, at request time.
  */
-provider: string; model: string; 
+provider: string; model: string;
 /**
  * Compatibility-only storage for legacy Codex virtual model suffixes.
  * New route writes cannot edit this value directly.
@@ -2015,53 +2128,53 @@ export type OpenTarget = { id: string; name: string }
 /**
  * One row of the orchestrated task graph.
  */
-export type OrchTask = { id: string; 
+export type OrchTask = { id: string;
 /**
  * `None` for a root (goal) task.
  */
-rootId: string | null; projectId: string; title: string; body: string; 
+rootId: string | null; projectId: string; title: string; body: string;
 /**
  * Recorded from the decomposer and resolved by name against
  * `AgentRegistry` when the worker session starts (falling back to the
  * registry's default agent for an unknown/blank name).
  */
-agent: string; status: string; sessionPk: string | null; result: string | null; error: string | null; createdAt: number; finishedAt: number | null; 
+agent: string; status: string; sessionPk: string | null; result: string | null; error: string | null; createdAt: number; finishedAt: number | null;
 /**
  * The originating chat session (root only) — where worker bubbles post
  * and the aggregate outcome re-enters over the rail. `None` for goals
  * submitted without a home chat (CLI/tests).
  */
-homeSessionPk: string | null; 
+homeSessionPk: string | null;
 /**
  * Consecutive failed attempts for this child (circuit breaker input).
  */
-consecutiveFailures: number; 
+consecutiveFailures: number;
 /**
  * The breaker tripped: this child exhausted its retries and stays failed.
  */
-gaveUp: boolean; 
+gaveUp: boolean;
 /**
  * Accumulated mid-run user guidance (root only), fed to the judge prompt.
  */
 steerNote: string | null }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PermissionRuleInfo = { id: string; tool: string; decision: string; commandPrefix: string | null }
-export type PluginAuthInfo = { 
+export type PluginAuthInfo = {
 /**
  * `none` | `api-key` | `token` | `oauth`.
  */
-kind: string; setting: string | null; env: string | null; helpUrl: string | null; 
+kind: string; setting: string | null; env: string | null; helpUrl: string | null;
 /**
  * A persisted (non-empty) row exists for `setting`, OR `env` is set in
  * the process environment. Never reveals the value itself.
  */
 configured: boolean; oauthConnectAvailable: boolean; oauthConnectError: string | null; oauthTokenStored: boolean; oauthReconnectRequired: boolean }
 export type PluginDetail = { info: PluginInfo; auth: PluginAuthInfo | null; settings: PluginFieldInfo[]; mcp: PluginMcpInfo[]; models: string[]; homepage: string | null; publisher: string }
-export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean; 
+export type PluginFieldInfo = { key: string; label: string; help: string; secret: boolean; required: boolean;
 /**
  * A persisted (non-empty) row exists for `key`. Never the value itself.
  */
-valueSet: boolean; 
+valueSet: boolean;
 /**
  * `string` | `int` | `bool` — the value shape Cockpit renders (see
  * `ryuzi_plugin_sdk::FieldKind`). A plain camelCase-friendly `String`
@@ -2069,25 +2182,25 @@ valueSet: boolean;
  * existing convention (`auth_kind_label`/`mcp_transport_label`) of
  * never crossing specta's `Type` boundary with an SDK type directly.
  */
-kind: string; 
+kind: string;
 /**
  * Non-empty makes this field an enum/choice — the value must be one of
  * these members (see `ryuzi_plugin_sdk::SettingField::options`).
  */
-options: string[]; 
+options: string[];
 /**
  * Pre-filled/effective value to show when `value_set` is `false`. Safe
  * to return even for a `secret` field: it comes from the manifest, not
  * a persisted credential.
  */
 default: string | null }
-export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[]; 
+export type PluginInfo = { id: string; name: string; description: string; icon: string | null; categories: string[];
 /**
  * The exclusive capability slot this plugin's manifest claims (e.g.
  * `"memory"`), mirroring `ryuzi_plugin_sdk::PluginManifest::slot`.
  * `None` when the manifest declares no slot.
  */
-slot: string | null; 
+slot: string | null;
 /**
  * Whether this plugin currently WON its `slot` claim
  * (first-registration-wins — see `crate::plugins::PluginHost::
@@ -2096,7 +2209,7 @@ slot: string | null;
  * `owns_slot: false`; see `plugin_doctor`'s `"slot-conflict"` finding
  * for the observable signal naming both the winner and the loser.
  */
-ownsSlot: boolean; verified: boolean; experimental: boolean; enabled: boolean; 
+ownsSlot: boolean; verified: boolean; experimental: boolean; enabled: boolean;
 /**
  * Same semantics as `PluginAuthInfo.configured` (oauth: token stored &&
  * !reconnect_required; else a persisted `auth.setting` row or `auth.env`
@@ -2105,101 +2218,101 @@ ownsSlot: boolean; verified: boolean; experimental: boolean; enabled: boolean;
  * Install/Open split needs it — note this adds per-plugin store lookups
  * to list assembly.
  */
-configured: boolean; 
+configured: boolean;
 /**
  * `builtin` | `catalog` | `skill-pack`.
  */
-source: string; 
+source: string;
 /**
  * Any of `provider` | `runtime` | `gateway` | `connector`.
  */
-capabilities: string[]; 
+capabilities: string[];
 /**
  * `integration` | `provider` | `gateway` | `skill-pack`. There is no
  * `runtime` kind: the native agent is built-in engine behavior, not an
  * installable/listed plugin, so it never appears in this payload.
  */
-kind: string; 
+kind: string;
 /**
  * Kind-specific "already set up" flag: integration = configured ||
  * enabled; provider = ≥1 connection in the provider's family; gateway =
  * all manifest settings present; skill-pack = installed on disk.
  */
-installed: boolean; 
+installed: boolean;
 /**
  * Provider family head id (providers only) — the Models `providerDetail`
  * navigation target. `None` for other kinds.
  */
-family: string | null; 
+family: string | null;
 /**
  * Mirrors `crate::store::PluginInstallRecord.pinned` — `false` when the
  * plugin has no `plugin_installs` ledger row (never installed via the
  * tracked git-clone path, e.g. builtins/catalog integrations with no
  * skill-pack install).
  */
-pinned: boolean; 
+pinned: boolean;
 /**
  * The ledger row's git origin (`PluginInstallRecord.source_spec`).
  * Distinct from `source` (the stable builtin/catalog/skill-pack enum
  * label) — the Provenance card in Cockpit renders it only when present.
  */
-sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null; 
+sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null;
 /**
  * `embedded` | `remote` — which catalog source won for this id.
  * `None` for builtins and skill packs (never from either catalog).
  */
-catalogSource: string | null; 
+catalogSource: string | null;
 /**
  * The remote catalog feed's `version` for this id, when a cached
  * `plugin_catalog_cache` row matches. `None` when the id was never seen
  * in a fetched feed.
  */
-catalogVersion: string | null; 
+catalogVersion: string | null;
 /**
  * Set when the remote catalog's signed feed blocked (revoked) this id —
  * mirrors `RemoteCatalogRow.blocked_reason`. `None` when not blocked.
  */
 blockedReason: string | null }
-export type PluginInstallBeginResult = { 
+export type PluginInstallBeginResult = {
 /**
  * `none` | `api-key` | `token` | `oauth`.
  */
-authKind: string; 
+authKind: string;
 /**
  * `auth.env` is declared AND set in the environment.
  */
-envVarPresent: boolean; envVarName: string | null; 
+envVarPresent: boolean; envVarName: string | null;
 /**
  * Endpoints + client id resolved; the browser flow started.
  */
-oauthAvailable: boolean; 
+oauthAvailable: boolean;
 /**
  * OAuth brokered outside Cockpit (kind=oauth, no `auth.resource`, no
  * manifest `authorize_url` — google-workspace).
  */
-oauthExternal: boolean; 
+oauthExternal: boolean;
 /**
  * oauth, endpoints may be known, but no client id and DCR not
  * applicable / failed.
  */
-needsClientId: boolean; 
+needsClientId: boolean;
 /**
  * This call performed a successful registration.
  */
-dcrSucceeded: boolean; 
+dcrSucceeded: boolean;
 /**
  * `auto` (callback server bound) | `manual` (bind failed → paste).
  */
-callbackMode: string; oauthBegin: PluginOauthBeginResult | null; 
+callbackMode: string; oauthBegin: PluginOauthBeginResult | null;
 /**
  * Discovery/DCR failure detail (shown on the manual client id form).
  */
 dcrError: string | null }
-export type PluginMcpInfo = { name: string; 
+export type PluginMcpInfo = { name: string;
 /**
  * `stdio` | `http`.
  */
-transport: string; 
+transport: string;
 /**
  * The raw manifest string (command for stdio, url for http) — no
  * `${auth}` substitution, matching `ryuzi plugins info`'s output.
@@ -2222,17 +2335,27 @@ export type PluginOauthCompletedMsg = { pluginId: string; ok: boolean; error: st
  * core agent itself (a built-in tool), not a plugin. Resolved at the
  * mcp-server→plugin binding (`ControlPlane::attach_plugin_mcp_servers`),
  * never by parsing the tool/server name string.
- * 
+ *
  * Carries no gating semantics: this is visibility/attribution metadata for
  * the approval prompt, not an input to the permission DECISION.
  */
 export type Principal = { pluginId: string; pluginName: string }
-export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null; 
+export type Project = { projectId: string; name: string; workdir: string; source: string | null; model: string | null; effort: string | null; permMode: PermMode; createdAt: number | null;
 /**
  * Computed at read time (`git2::Repository::open` probe on `workdir`) —
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
+/**
+ * A project command and the revision that must accompany update or delete.
+ */
+export type ProjectCommandInfo = { name: string; description: string; template: string; agent: string | null; model: string | null; subtask: boolean; revision: string }
+export type ProjectCommandInputDto = ({ description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }) & { name: string }
+/**
+ * Editable fields for a project-owned slash command. The command name is
+ * supplied separately for updates so a save cannot rename a file by accident.
+ */
+export type ProjectCommandMutationDto = { description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }
 export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaCapability = "claude" | "codex"
@@ -2243,33 +2366,33 @@ export type RefreshModelsResult = { connectionId: string; label: string; ok: boo
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
 export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
 export type SelectableModelKind = "concrete" | "namedRoute"
-export type Session = { sessionPk: string; 
+export type Session = { sessionPk: string;
 /**
  * `None` for chat-first sessions (`kind != Project`); a project-bound
  * session always has this set.
  */
-projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus; 
+projectId: string | null; agentSessionId: string | null; worktreePath: string | null; branch: string | null; title: string | null; status: SessionStatus;
 /**
  * Per-session permission mode. Copied from the project (or the new-chat
  * picker) at creation; changing it affects THIS session only.
  */
-permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
+permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number;
 /**
  * True when the engine auto-generated the branch name (`harness/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
-branchOwned: boolean; kind: SessionKind; 
+branchOwned: boolean; kind: SessionKind;
 /**
  * Who is speaking in this session (chat-first; e.g. a Discord user id
  * or `"cockpit"`). Unused for `Project` sessions.
  */
-speaker: string | null; 
+speaker: string | null;
 /**
  * Which agent persona/config is driving this session. Unused for
  * `Project` sessions.
  */
-agent: string | null; 
+agent: string | null;
 /**
  * The session this one was spawned from (`Worker`/`Review` lineage).
  */
@@ -2300,17 +2423,17 @@ export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | nu
 export type SkillUsage = { name: string; createdBy: string | null; useCount: number; viewCount: number; patchCount: number; lastUsedAt: number | null; lastViewedAt: number | null; lastPatchedAt: number | null; state: string; pinned: boolean; archivedAt: number | null; createdAt: number | null }
 export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
-export type TermOutputMsg = { id: string; 
+export type TermOutputMsg = { id: string;
 /**
  * UTF-8 chunk (lossy) of PTY output.
  */
 data: string }
-export type TestResult = { 
+export type TestResult = {
 /**
  * Legacy pass/fail, kept for existing call sites (connection-level
  * test, toasts). Always derived: `status == "valid"`.
  */
-ok: boolean; 
+ok: boolean;
 /**
  * Tri-state probe verdict: "valid" | "invalid" | "unknown".
  */
@@ -2321,6 +2444,7 @@ export type ToolInfo = { name: string; desc: string; perm: string }
  * One persisted "don't ask again" rule (Settings → Permissions).
  */
 export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
+export type TriggerKind = "session.start" | "tool.before" | "tool.after" | "session.end" | "scheduler.run.success" | "scheduler.run.failed" | "gateway.status.changed" | "webhook.inbound"
 /**
  * Mirror of `crate::skills_install::TrustPrompt`. `total_bytes` stays a
  * `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's
@@ -2328,14 +2452,14 @@ export type ToolPolicyRow = { projectId: string; tool: string; decision: string 
  * renders any bigint-sized field as a plain TS `number`, so there's no
  * bindings-shape cost to keeping the wider type.
  */
-export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number; 
+export type TrustPromptDto = { token: string; sourceSpec: string; ownerRepo: string; resolvedCommit: string | null; skills: string[]; hookScripts: string[]; totalBytes: number;
 /**
  * Mirrors `TrustPrompt::runs_code`: true when the staged manifest
  * declares `[[extension]]` (code execution, Track D) — the wizard must
  * show a distinct warning for this, not just fold it into the
  * hook-script list.
  */
-runsCode: boolean; 
+runsCode: boolean;
 /**
  * Mirrors `TrustPrompt::curated`: true when the source is one of the
  * curated skill packs, so this prompt only exists because `runs_code`
@@ -2358,11 +2482,11 @@ export type UpdateOutcomeDto = { kind: "updated" } | { kind: "alreadyCurrent" } 
 export type UpdateOutcomeEntry = { id: string; outcome: UpdateOutcomeDto }
 export type UsagePoint = { day: string; requests: number; inputTokens: number; outputTokens: number }
 export type UsageSeries = { days: UsagePoint[]; todayRequests: number; todayInputTokens: number; todayOutputTokens: number }
-export type WorktreeState = { 
+export type WorktreeState = {
 /**
  * Uncommitted work (staged, unstaged, or untracked).
  */
-dirty: boolean; 
+dirty: boolean;
 /**
  * Commits reachable only from the session branch — deleting the branch
  * would strand them.

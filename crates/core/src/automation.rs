@@ -899,7 +899,20 @@ pub async fn record_outbound_attempt(
 }
 
 pub async fn deliver_outbound(store: &Store, run: &HookRunRow) -> anyhow::Result<()> {
-    deliver_outbound_with_retry(store, run, &OUTBOUND_RETRY_DELAYS, tokio::time::sleep).await
+    deliver_outbound_with_retry(
+        store,
+        run,
+        &OUTBOUND_RETRY_DELAYS,
+        tokio::time::sleep,
+        false,
+    )
+    .await
+}
+
+/// Deliver an explicit Cockpit test using the same request, retry, and attempt
+/// history path as normal outbound automation delivery.
+pub async fn deliver_outbound_test(store: &Store, run: &HookRunRow) -> anyhow::Result<()> {
+    deliver_outbound_with_retry(store, run, &OUTBOUND_RETRY_DELAYS, tokio::time::sleep, true).await
 }
 
 async fn deliver_outbound_with_retry<F, Fut>(
@@ -907,6 +920,7 @@ async fn deliver_outbound_with_retry<F, Fut>(
     run: &HookRunRow,
     retry_delays: &[std::time::Duration],
     mut sleep: F,
+    test: bool,
 ) -> anyhow::Result<()>
 where
     F: FnMut(std::time::Duration) -> Fut,
@@ -920,7 +934,7 @@ where
             "id": run.id,
             "hookId": run.hook_id,
             "attempt": ordinal,
-            "test": false,
+            "test": test,
         });
         let payload = render_outbound_payload(
             action.payload_template.as_deref(),
@@ -1523,10 +1537,15 @@ mod tests {
             .await
             .unwrap();
 
-        let error =
-            deliver_outbound_with_retry(&store, &run, &[std::time::Duration::ZERO], |_| async {})
-                .await
-                .unwrap_err();
+        let error = deliver_outbound_with_retry(
+            &store,
+            &run,
+            &[std::time::Duration::ZERO],
+            |_| async {},
+            false,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.to_string(), "outbound webhook delivery failed");
         assert_eq!(redirected.load(Ordering::SeqCst), 0);
         let _ = shutdown.send(());
@@ -1561,6 +1580,7 @@ mod tests {
                 std::time::Duration::ZERO,
             ],
             |_| async {},
+            false,
         )
         .await
         .unwrap_err();
@@ -1603,7 +1623,7 @@ mod tests {
             .await
             .unwrap();
 
-        deliver_outbound_with_retry(&store, &run, &OUTBOUND_RETRY_DELAYS, |_| async {})
+        deliver_outbound_with_retry(&store, &run, &OUTBOUND_RETRY_DELAYS, |_| async {}, false)
             .await
             .unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 1);

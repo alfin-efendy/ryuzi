@@ -7,7 +7,10 @@ use crate::error::CmdError;
 use std::sync::Arc;
 use tauri::State;
 
-pub use ryuzi_core::api::types::{AgentInfo, CommandInfo, TodoItem};
+pub use ryuzi_core::api::types::{
+    AgentInfo, CommandInfo, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto,
+    TodoItem,
+};
 
 type R<T> = Result<T, CmdError>;
 type Engine<'a> = State<'a, Arc<EngineManager>>;
@@ -59,6 +62,102 @@ pub async fn session_todos(
         .rpc(
             "session_todos",
             serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_project_commands(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+) -> R<Vec<ProjectCommandInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "list_project_commands",
+            serde_json::json!({ "project_id": project_id }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn read_project_command(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    name: String,
+) -> R<ProjectCommandInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "read_project_command",
+            serde_json::json!({ "project_id": project_id, "name": name }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn create_project_command(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    input: ProjectCommandInputDto,
+) -> R<ProjectCommandInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "create_project_command",
+            serde_json::json!({ "project_id": project_id, "input": input }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_project_command(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    name: String,
+    revision: String,
+    input: ProjectCommandMutationDto,
+) -> R<ProjectCommandInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "update_project_command",
+            serde_json::json!({
+                "project_id": project_id,
+                "name": name,
+                "revision": revision,
+                "input": input,
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_project_command(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    project_id: String,
+    name: String,
+    revision: String,
+) -> R<()> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "delete_project_command",
+            serde_json::json!({
+                "project_id": project_id,
+                "name": name,
+                "revision": revision,
+            }),
         )
         .await
 }

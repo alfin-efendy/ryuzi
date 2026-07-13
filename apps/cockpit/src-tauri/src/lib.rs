@@ -2,6 +2,7 @@ mod accent;
 mod agent_cmd;
 mod apps_cmd;
 mod audit_cmd;
+mod automation_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
@@ -98,6 +99,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             scheduler_cmd::delete_job,
             scheduler_cmd::run_job_now,
             scheduler_cmd::parse_natural_schedule,
+            automation_cmd::list_automation_hooks,
+            automation_cmd::automation_hook_detail,
+            automation_cmd::create_automation_hook,
+            automation_cmd::update_automation_hook,
+            automation_cmd::toggle_automation_hook,
+            automation_cmd::delete_automation_hook,
+            automation_cmd::test_automation_hook,
             apps_cmd::list_apps,
             apps_cmd::add_app,
             apps_cmd::remove_app,
@@ -158,6 +166,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            native_cmd::list_project_commands,
+            native_cmd::read_project_command,
+            native_cmd::create_project_command,
+            native_cmd::update_project_command,
+            native_cmd::delete_project_command,
             skills_cmd::list_skills,
             skills_cmd::install_skill,
             skills_cmd::remove_skill,
@@ -223,6 +236,15 @@ pub fn export_bindings(out: &std::path::Path) {
             out,
         )
         .expect("export bindings");
+    // specta may leave a trailing space after multiline union members. Normalize
+    // generated output here so every generation path satisfies `git diff --check`.
+    let contents = std::fs::read_to_string(out).expect("read generated bindings");
+    let normalized = contents
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(out, format!("{normalized}\n")).expect("normalize generated bindings");
 }
 
 pub fn run() {
