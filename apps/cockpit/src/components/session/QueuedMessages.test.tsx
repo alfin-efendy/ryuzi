@@ -7,9 +7,17 @@ const { QueuedMessages } = await import("./QueuedMessages");
 
 const KEY = sessKey(LOCAL_RUNNER, "s1");
 const loadQueue = mock(() => Promise.resolve());
-const realRemoveQueueMessage = useNative.getState().removeQueueMessage;
+const initialQueueState = {
+  loadQueue: useNative.getState().loadQueue,
+  removeQueueMessage: useNative.getState().removeQueueMessage,
+  queuedBySession: useNative.getState().queuedBySession,
+};
+const realRemoveQueueMessage = initialQueueState.removeQueueMessage;
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  useNative.setState(initialQueueState);
+});
 beforeEach(() => {
   useNative.setState({ queuedBySession: {}, loadQueue, removeQueueMessage: realRemoveQueueMessage });
   loadQueue.mockClear();
