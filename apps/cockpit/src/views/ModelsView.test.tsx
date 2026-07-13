@@ -212,7 +212,8 @@ mock.module("@/bindings", () => ({
           modelInfo: null,
         },
       }),
-    listAgents: () => Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "smart" } } }),
+    listAgents: () =>
+      Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "smart" } } }),
     listSelectableModels: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
