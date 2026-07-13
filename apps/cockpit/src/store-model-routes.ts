@@ -36,16 +36,29 @@ export const useModelRoutes = create<ModelRoutesState>((set) => ({
   loaded: false,
 
   hydrate: async () => {
-    const [routes, targetCapabilities] = await Promise.all([
+    const [routesResult, targetCapabilitiesResult] = await Promise.allSettled([
       commands.listModelRoutes("local"),
       commands.listModelRouteTargetCapabilities("local"),
     ]);
-    if (routes.status === "ok") set({ routes: routes.data, loaded: true });
-    else {
-      set({ loaded: true });
-      toast.error(`Routes failed: ${routes.error.message}`);
+    set({ loaded: true });
+
+    if (routesResult.status === "fulfilled") {
+      if (routesResult.value.status === "ok") set({ routes: routesResult.value.data });
+      else toast.error(`Routes failed: ${routesResult.value.error.message}`);
+    } else {
+      toast.error(`Routes failed: ${routesResult.reason instanceof Error ? routesResult.reason.message : String(routesResult.reason)}`);
     }
-    applyTargetCapabilities(set, targetCapabilities);
+
+    if (targetCapabilitiesResult.status === "fulfilled") applyTargetCapabilities(set, targetCapabilitiesResult.value);
+    else {
+      toast.error(
+        `Route target capabilities failed: ${
+          targetCapabilitiesResult.reason instanceof Error
+            ? targetCapabilitiesResult.reason.message
+            : String(targetCapabilitiesResult.reason)
+        }`,
+      );
+    }
   },
   save: async (route) => apply(set, await commands.saveModelRoute("local", route), "Save route"),
   remove: async (id) => apply(set, await commands.deleteModelRoute("local", id), "Delete route"),

@@ -757,7 +757,8 @@ test("route target model change preserves compatible effort and clears incompati
   expect(screen.getByRole("combobox", { name: "Target 1 effort" }).textContent).toContain("Model default");
 });
 
-test("historical explicit target effort stays readable and can reset to model default", async () => {
+test("historical explicit target effort can reset to model default", async () => {
+  saveModelRoute.mockClear();
   useModelRoutes.setState({
     routes: [{ ...routes[0], targets: [{ provider: "openai", model: "gpt-4.1", effort: "high" }] }],
     targetCapabilities: historicalEffortCapabilities,
@@ -771,9 +772,12 @@ test("historical explicit target effort stays readable and can reset to model de
   const effort = await screen.findByRole("combobox", { name: "Target 1 effort" });
   expect(effort.textContent).toContain("high");
   fireEvent.click(effort);
-  expect(screen.getByRole("option", { name: "Model default" })).toBeTruthy();
-  expect(screen.getByRole("option", { name: "Low" })).toBeTruthy();
-  fireEvent.keyDown(effort, { key: "Escape" });
+  fireEvent.click(await screen.findByRole("option", { name: "Model default" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save route" }));
+
+  await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
+  const [, savedRoute] = saveModelRoute.mock.calls[saveModelRoute.mock.calls.length - 1] as [string, ModelRouteInfo];
+  expect(savedRoute.targets[0]?.effort).toBeNull();
 });
 
 test("route target model default saves null and cards summarize only explicit overrides", async () => {

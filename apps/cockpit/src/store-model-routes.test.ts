@@ -1,8 +1,9 @@
-import { test, expect, spyOn } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { toast } from "sonner";
 import { useModelRoutes } from "./store-model-routes";
 import { useStore } from "./store";
 import { useConnections } from "./store-connections";
-import { commands, type ConnectionInfo, type ModelRouteInfo } from "./bindings";
+import { commands, type ConnectionInfo, type ModelRouteInfo, type ModelRouteTargetCapability } from "./bindings";
 
 const route: ModelRouteInfo = {
   id: "r1",
@@ -28,9 +29,55 @@ const connection: ConnectionInfo = {
   needsRelogin: false,
 };
 
+const targetCapabilities: ModelRouteTargetCapability[] = [
+  {
+    provider: "anthropic",
+    model: "claude-opus-4",
+    supported: [{ value: "high", label: "High", description: null }],
+    providerDefault: null,
+  },
+];
+
 function reset() {
-  useModelRoutes.setState({ routes: [], loaded: false });
+  useModelRoutes.setState({ routes: [], targetCapabilities: [], loaded: false });
 }
+
+test("hydrate retains target capabilities when route loading rejects", async () => {
+  reset();
+  const routesCommand = spyOn(commands, "listModelRoutes").mockRejectedValueOnce(new Error("routes unavailable"));
+  const capabilitiesCommand = spyOn(commands, "listModelRouteTargetCapabilities").mockResolvedValueOnce({
+    status: "ok",
+    data: targetCapabilities,
+  });
+  const toastSpy = spyOn(toast, "error");
+
+  await useModelRoutes.getState().hydrate();
+
+  expect(useModelRoutes.getState()).toMatchObject({ routes: [], targetCapabilities, loaded: true });
+  expect(toastSpy.mock.calls.some(([message]) => String(message).includes("Routes failed: routes unavailable"))).toBe(true);
+  routesCommand.mockRestore();
+  capabilitiesCommand.mockRestore();
+  toastSpy.mockRestore();
+});
+
+test("hydrate retains routes when target capability loading rejects", async () => {
+  reset();
+  const routesCommand = spyOn(commands, "listModelRoutes").mockResolvedValueOnce({ status: "ok", data: [route] });
+  const capabilitiesCommand = spyOn(commands, "listModelRouteTargetCapabilities").mockRejectedValueOnce(
+    new Error("capabilities unavailable"),
+  );
+  const toastSpy = spyOn(toast, "error");
+
+  await useModelRoutes.getState().hydrate();
+
+  expect(useModelRoutes.getState()).toMatchObject({ routes: [route], targetCapabilities: [], loaded: true });
+  expect(
+    toastSpy.mock.calls.some(([message]) => String(message).includes("Route target capabilities failed: capabilities unavailable")),
+  ).toBe(true);
+  routesCommand.mockRestore();
+  capabilitiesCommand.mockRestore();
+  toastSpy.mockRestore();
+});
 
 test("successful_connection_and_route_mutations_reload_structured_models_once", async () => {
   reset();
