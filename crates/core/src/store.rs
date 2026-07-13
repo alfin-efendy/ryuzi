@@ -1170,6 +1170,48 @@ fn migrations() -> Migrations<'static> {
             CREATE INDEX IF NOT EXISTS idx_agent_learning_delivery \
                 ON agent_learning_queue(agent_id, status, sequence);",
         ),
+        // 35: Automations Hub hook configuration and immutable run history.
+        // Runs intentionally do not reference automation_hooks: deleting a hook
+        // must retain every historical run and attempt.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS automation_hooks (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,\
+                trigger_kind TEXT NOT NULL,\
+                action_kind TEXT NOT NULL,\
+                enabled INTEGER NOT NULL DEFAULT 1,\
+                inbound_path TEXT UNIQUE,\
+                config_json TEXT NOT NULL,\
+                created_at INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS automation_hook_runs (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                hook_id TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                envelope_json TEXT NOT NULL,\
+                snapshot_json TEXT NOT NULL,\
+                session_pk TEXT,\
+                error TEXT,\
+                attempt_count INTEGER NOT NULL DEFAULT 0,\
+                last_http_status INTEGER,\
+                queued_at INTEGER NOT NULL,\
+                started_at INTEGER,\
+                finished_at INTEGER\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_automation_hook_runs_hook \
+                ON automation_hook_runs(hook_id, queued_at DESC);\
+            CREATE TABLE IF NOT EXISTS automation_hook_attempts (\
+                run_id TEXT NOT NULL,\
+                ordinal INTEGER NOT NULL,\
+                started_at INTEGER NOT NULL,\
+                finished_at INTEGER,\
+                http_status INTEGER,\
+                error TEXT,\
+                PRIMARY KEY(run_id, ordinal),\
+                FOREIGN KEY(run_id) REFERENCES automation_hook_runs(id)\
+            );",
+        ),
     ])
 }
 
@@ -4279,6 +4321,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automation_tables_exist_after_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let tables = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type='table' AND name LIKE 'automation_hook%' ORDER BY name",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tables,
+            [
+                "automation_hook_attempts",
+                "automation_hook_runs",
+                "automation_hooks"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -6060,7 +6130,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 34, "forward migration must land at v34");
+        assert_eq!(user_version, 35, "forward migration must land at v35");
     }
 
     #[tokio::test]
@@ -6513,7 +6583,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 34, "forward migration must land at v34");
+        assert_eq!(uv, 35, "forward migration must land at v35");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6539,7 +6609,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 34, "forward migration must land at v34");
+        assert_eq!(uv, 35, "forward migration must land at v35");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
