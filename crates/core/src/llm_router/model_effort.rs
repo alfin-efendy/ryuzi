@@ -376,7 +376,7 @@ async fn selection_capabilities(
     if let Some(route) = routes::route_by_name(&route_list, requested_model) {
         let mut keys = Vec::new();
         let mut surfaces = Vec::new();
-        let mut compatibility = HashMap::new();
+        let mut route_targets = HashMap::new();
         for (index, target) in route.targets.iter().enumerate() {
             let key = ModelPreferenceKey {
                 family: target.provider.clone(),
@@ -385,7 +385,7 @@ async fn selection_capabilities(
             surfaces.extend(capabilities_for_preference(store, &key).await?);
             keys.push(key);
             if let Some(effort) = &target.effort {
-                compatibility.insert(
+                route_targets.insert(
                     RouteTargetEffortKey {
                         route_id: route.id.clone(),
                         target_index: index as u32,
@@ -394,7 +394,7 @@ async fn selection_capabilities(
                 );
             }
         }
-        return Ok(Some((keys, surfaces, compatibility, true)));
+        return Ok(Some((keys, surfaces, route_targets, true)));
     }
     let Some((family, model)) = requested_model.split_once('/') else {
         return Ok(None);
