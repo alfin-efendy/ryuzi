@@ -80,6 +80,8 @@ export function SessionView() {
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
+  const submitInFlight = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
 
   const rows = (focusedSession && transcripts[refKey(focusedSession)]) || [];
@@ -291,24 +293,31 @@ export function SessionView() {
 
   const submit = async () => {
     const t = draft.trim();
-    if (!t && composerFiles.attachments.length === 0) return;
-    const options: ChatRequestOptions = {
-      model: null,
-      effort: null,
-      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments: composerFiles.attachments,
-      git: null,
-      permMode: null,
-    };
-    const sent = running
-      ? await enqueueQueueMessage(runnerId, session.sessionPk, t, options)
-      : await send(runnerId, session.sessionPk, t, options);
-    if (!sent) return;
+    if ((!t && composerFiles.attachments.length === 0) || submitInFlight.current) return;
+    submitInFlight.current = true;
+    setSubmitting(true);
+    try {
+      const options: ChatRequestOptions = {
+        model: null,
+        effort: null,
+        context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+        attachments: composerFiles.attachments,
+        git: null,
+        permMode: null,
+      };
+      const sent = running
+        ? await enqueueQueueMessage(runnerId, session.sessionPk, t, options)
+        : await send(runnerId, session.sessionPk, t, options);
+      if (!sent) return;
 
-    useNav.getState().clearDraft(draftKey);
-    historyRef.current = HISTORY_IDLE;
-    composerFiles.clear();
-    setContextRefs([]);
+      useNav.getState().clearDraft(draftKey);
+      historyRef.current = HISTORY_IDLE;
+      composerFiles.clear();
+      setContextRefs([]);
+    } finally {
+      submitInFlight.current = false;
+      setSubmitting(false);
+    }
   };
 
   const pickContext = (path: string) => {
@@ -540,7 +549,7 @@ export function SessionView() {
                     <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
                   </Button>
                 ) : (
-                  <Button size="icon" title="Send" onClick={() => void submit()} className="rounded-full">
+                  <Button size="icon" title="Send" onClick={() => void submit()} disabled={submitting} className="rounded-full">
                     <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
                   </Button>
                 )}

@@ -104,6 +104,22 @@ const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
 const realSend = useStore.getState().send;
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function project(overrides: Partial<Project> = {}): Project {
   return {
     projectId: "p1",
@@ -230,6 +246,67 @@ test("remote session with the bottom panel closed: toggling it stays a no-op (di
 
   expect(useNav.getState().bottomOpen).toBe(false);
   expect(screen.queryByTestId("bottom-terminal-drawer")).toBeNull();
+});
+
+test("running queue accepts one rapid Enter submission and clears after durable enqueue", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  const queued = deferred<{ status: "ok"; data: { id: string; text: string } }>();
+  seed(runnerId, "running");
+  useNav.setState({ drafts: { [draftKey]: "queue this" } });
+  enqueueSessionMessage.mockImplementationOnce(() => queued.promise);
+
+  render(<SessionView />);
+  const composer = screen.getByPlaceholderText("Enter to queue");
+  fireEvent.keyDown(composer, { key: "Enter" });
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledTimes(1));
+  expect((screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+
+  queued.resolve({ status: "ok", data: { id: "q1", text: "queue this" } });
+  await waitFor(() => expect(useNav.getState().drafts[draftKey]).toBeUndefined());
+});
+
+test("idle composer accepts one Enter and click submission while send is pending", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  const sent = deferred<boolean>();
+  const send = mock(() => sent.promise);
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "send this" } });
+  useStore.setState({ send });
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
+  const sendButton = screen.getByRole("button", { name: "Send" });
+  fireEvent.click(sendButton);
+
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  expect((sendButton as HTMLButtonElement).disabled).toBe(true);
+
+  sent.resolve(true);
+  await waitFor(() => expect(useNav.getState().drafts[draftKey]).toBeUndefined());
+  await waitFor(() => expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(false));
+});
+
+test("a failed submission retains the draft and allows a retry", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  const send = mock(() => Promise.resolve(false));
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "retry this" } });
+  useStore.setState({ send });
+
+  render(<SessionView />);
+  const composer = screen.getByPlaceholderText("Ask for follow-up changes");
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
 });
 
 test("running queue success clears the runner-qualified draft", async () => {
