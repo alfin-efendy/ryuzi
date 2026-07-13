@@ -11,7 +11,6 @@ const MODES = [
   { value: "full", label: "Full access" },
   { value: "plan", label: "Plan only" },
 ];
-const TOOLS = ["bash", "read", "write", "edit", "grep", "glob"].map((value) => ({ value, label: value }));
 
 export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
   const saving = useAgents((state) => state.saving);
@@ -25,7 +24,8 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
 
   const patch = (id: string, values: Partial<PermissionRuleInfo>) =>
     setRules((current) => current.map((rule) => (rule.id === id ? { ...rule, ...values } : rule)));
-  const add = () => setRules((current) => [...current, { id: crypto.randomUUID(), tool: "bash", decision: "allow", commandPrefix: null }]);
+  const add = () => setRules((current) => [...current, { id: crypto.randomUUID(), tool: "", decision: "allow", commandPrefix: null }]);
+  const hasInvalidRule = rules.some((rule) => rule.tool.trim() === "");
 
   return (
     <div className="flex flex-col gap-3">
@@ -62,12 +62,12 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
         ) : (
           rules.map((rule) => (
             <SettingsCardRow key={rule.id} className="gap-2">
-              <Combobox
-                aria-label="Rule tool"
-                className="w-[150px]"
-                options={TOOLS}
+              <Input
+                aria-label="Rule tool ID"
+                className="w-[190px]"
+                placeholder="Stable tool ID"
                 value={rule.tool}
-                onValueChange={(tool) => patch(rule.id, { tool })}
+                onChange={(event) => patch(rule.id, { tool: event.target.value })}
               />
               <Combobox
                 aria-label="Rule decision"
@@ -99,12 +99,16 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
         )}
         <div className="flex justify-end border-t border-border px-[18px] py-3">
           <Button
-            disabled={saving}
+            disabled={saving || hasInvalidRule}
             onClick={() =>
               void useAgents.getState().update(detail.summary.id, {
                 ...mutationFromDetail(detail),
                 permissionMode: mode,
-                permissionRules: rules.map((rule) => ({ ...rule, commandPrefix: rule.commandPrefix?.trim() || null })),
+                permissionRules: rules.map((rule) => ({
+                  ...rule,
+                  tool: rule.tool.trim(),
+                  commandPrefix: rule.commandPrefix?.trim() || null,
+                })),
               })
             }
           >

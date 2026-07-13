@@ -2,10 +2,8 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, ArrowLeft } from "lucide-react";
 import { Badge, Button, Segmented, SettingsCard, SettingsCardTitle } from "@ryuzi/ui";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
-import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
-import { AgentSkillsToolsTab } from "@/components/agents/AgentSkillsToolsTab";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
@@ -32,6 +30,10 @@ function metric(value: number, singular: string, plural: string) {
 }
 
 export function AgentDetailView({ agentId }: { agentId: string }) {
+  return <AgentDetailContent key={agentId} agentId={agentId} />;
+}
+
+function AgentDetailContent({ agentId }: { agentId: string }) {
   const detail = useAgents((state) => (state.detail?.summary.id === agentId ? state.detail : null));
   const loading = useAgents((state) => state.loading);
   const [tab, setTab] = useState<Tab>("overview");
@@ -75,7 +77,7 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
           </Badge>
           <AgentActionsMenu agent={summary} />
         </header>
-        <div className="my-4 overflow-x-auto">
+        <div className="my-4 overflow-x-auto" data-testid="agent-detail-tabs">
           <Segmented options={[...TABS]} value={tab} onChange={setTab} />
         </div>
         {summary.validation.length > 0 ? (
@@ -112,14 +114,24 @@ export function AgentDetailView({ agentId }: { agentId: string }) {
         ) : null}
         {tab === "model" ? <AgentModelTab detail={detail} /> : null}
         {tab === "permissions" ? <AgentPermissionsTab detail={detail} /> : null}
-        {tab === "capabilities" ? <AgentSkillsToolsTab detail={detail} /> : null}
+        {tab === "capabilities" ? (
+          <SettingsCard className="px-[18px] py-5">
+            <SettingsCardTitle>Skills &amp; Tools</SettingsCardTitle>
+            <p className="mb-0 mt-2 text-xs text-muted-foreground">Skills &amp; Tools settings are coming in Task 8.</p>
+          </SettingsCard>
+        ) : null}
         {tab === "learning" ? (
           <SettingsCard className="px-[18px] py-5">
             <SettingsCardTitle>Learning</SettingsCardTitle>
             <p className="mb-0 mt-2 text-xs text-muted-foreground">Per-agent learning controls are coming in Task 9.</p>
           </SettingsCard>
         ) : null}
-        {tab === "advanced" ? <AgentAdvancedTab detail={detail} /> : null}
+        {tab === "advanced" ? (
+          <SettingsCard className="px-[18px] py-5">
+            <SettingsCardTitle>Advanced</SettingsCardTitle>
+            <p className="mb-0 mt-2 text-xs text-muted-foreground">Advanced settings are coming in Task 8.</p>
+          </SettingsCard>
+        ) : null}
       </div>
     </div>
   );

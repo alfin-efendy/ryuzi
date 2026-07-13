@@ -1,14 +1,18 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { AgentDetailInfo, AgentMutationInfo, AgentRegistryInfo, SelectableModelInfo } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
+const getAgent = mock(async (_runner: string | null, id: string) => ({
+  status: "ok" as const,
+  data: detail({ summary: { ...detail().summary, id, name: id === "ryuzi" ? "Ryuzi" : "Reviewer", isDefault: id === "ryuzi" } }),
+}));
 const updateAgent = mock(async (_runner: string | null, _id: string, input: AgentMutationInfo) => ({
   status: "ok" as const,
   data: detail({ ...input, modelInfo: null }),
 }));
 
-mock.module("@/bindings", () => ({ commands: { updateAgent }, events: {} }));
+mock.module("@/bindings", () => ({ commands: { getAgent, updateAgent }, events: {} }));
 
 const { AgentDetailView } = await import("./AgentDetailView");
 const { useAgents } = await import("@/store-agents");
@@ -37,6 +41,14 @@ const opusInfo: SelectableModelInfo = {
   configuredDefault: null,
   resolvedDefault: "high",
   defaultSource: "provider",
+};
+
+const miniInfo: SelectableModelInfo = {
+  ...opusInfo,
+  requestValue: "anthropic/claude-haiku-4-5",
+  displayName: "Claude Haiku",
+  supported: [{ value: "low", label: "Low", description: null }],
+  resolvedDefault: "low",
 };
 
 function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
@@ -75,7 +87,7 @@ const registry: AgentRegistryInfo = {
 };
 
 function seed(value = detail()) {
-  useAgents.setState({ registry, detail: value, models: [routeInfo, opusInfo], loaded: true, loading: false, saving: false });
+  useAgents.setState({ registry, detail: value, models: [routeInfo, opusInfo, miniInfo], loaded: true, loading: false, saving: false });
   useNav.setState({ history: { back: [], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
 }
 
@@ -90,9 +102,12 @@ test("detail has Back, identity, actions, six tabs, and overview metrics", () =>
   expect(screen.getByRole("button", { name: "Back to Agents" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Actions for Reviewer" })).toBeTruthy();
-  for (const tab of ["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]) {
-    expect(screen.getByRole("button", { name: tab })).toBeTruthy();
-  }
+  const tabs = screen.getByTestId("agent-detail-tabs");
+  expect(
+    within(tabs)
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]);
   expect(screen.getByText("12 readable concepts")).toBeTruthy();
   expect(screen.getByText("1 enabled skill")).toBeTruthy();
   expect(screen.getByText("3 enabled tools")).toBeTruthy();
@@ -130,8 +145,7 @@ test("explicit permission rule editing persists typed rules", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
   fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-  fireEvent.click(screen.getByRole("combobox", { name: "Rule tool" }));
-  fireEvent.click(await screen.findByRole("option", { name: "bash" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Rule tool ID" }), { target: { value: "bash" } });
   fireEvent.click(screen.getByRole("combobox", { name: "Rule decision" }));
   fireEvent.click(await screen.findByRole("option", { name: "Allow" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Command prefix" }), { target: { value: "cargo test" } });
@@ -147,13 +161,86 @@ test("explicit permission rule editing persists typed rules", async () => {
   );
 });
 
-test("skills and advanced tabs expose stable-ID and loop controls", () => {
+test("permission rules preserve unknown stable tool IDs and allow editing them", async () => {
+  seed(detail({ permissionRules: [{ id: "custom-rule", tool: "plugin__acme__deploy", decision: "deny", commandPrefix: null }] }));
   render(<AgentDetailView agentId="reviewer" />);
-  fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
-  expect(screen.getByRole("textbox", { name: "Skill ID" })).toBeTruthy();
-  expect(screen.getByRole("textbox", { name: "Native tool ID" })).toBeTruthy();
-  expect(screen.getByRole("textbox", { name: "Plugin tool ID" })).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-  expect(screen.getByRole("textbox", { name: "Max turns" })).toBeTruthy();
-  expect(screen.getByText("Danger zone")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
+  const toolId = screen.getByRole("textbox", { name: "Rule tool ID" });
+  expect((toolId as HTMLInputElement).value).toBe("plugin__acme__deploy");
+  fireEvent.change(toolId, { target: { value: "mcp__github__create_issue" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", {
+      name: "Reviewer",
+      description: "Reviews implementation quality.",
+      avatarColor: "violet",
+      model: { kind: "route", route: "smart" },
+      permissionMode: "ask",
+      permissionRules: [{ id: "custom-rule", tool: "mcp__github__create_issue", decision: "deny", commandPrefix: null }],
+      skills: ["requesting-code-review"],
+      nativeTools: ["read", "grep", "bash"],
+      pluginTools: [],
+      apps: [],
+      maxTurns: 50,
+      maxToolRounds: 100,
+    }),
+  );
+});
+
+test("model transitions preserve supported effort, clear unsupported effort, and save a complete mutation", async () => {
+  const concrete = detail({
+    summary: { ...detail().summary, model: { kind: "concrete", name: opusInfo.requestValue, effort: "high" } },
+    modelInfo: opusInfo,
+  });
+  seed(concrete);
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Agent model" }));
+  fireEvent.click(await screen.findByRole("option", { name: miniInfo.requestValue }));
+  expect((screen.getByRole("combobox", { name: "Agent effort" }) as HTMLButtonElement).textContent).toContain("Model default");
+
+  fireEvent.click(screen.getByRole("button", { name: "Save model" }));
+  await waitFor(() =>
+    expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", {
+      name: "Reviewer",
+      description: "Reviews implementation quality.",
+      avatarColor: "violet",
+      model: { kind: "concrete", name: miniInfo.requestValue, effort: null },
+      permissionMode: "ask",
+      permissionRules: [],
+      skills: ["requesting-code-review"],
+      nativeTools: ["read", "grep", "bash"],
+      pluginTools: [],
+      apps: [],
+      maxTurns: 50,
+      maxToolRounds: 100,
+    }),
+  );
+});
+
+test("changing agent resets the local tab to Overview", async () => {
+  const { rerender } = render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
+  expect(screen.getByText("Explicit rules")).toBeTruthy();
+
+  const ryuzi = detail({ summary: { ...detail().summary, id: "ryuzi", name: "Ryuzi", isDefault: true } });
+  act(() => {
+    useAgents.setState({ detail: ryuzi });
+    rerender(<AgentDetailView agentId="ryuzi" />);
+  });
+  await waitFor(() => expect(screen.getByText("Recent sessions")).toBeTruthy());
+  expect(screen.queryByText("Explicit rules")).toBeNull();
+});
+
+test("future tabs remain Task 7 placeholders", () => {
+  render(<AgentDetailView agentId="reviewer" />);
+  for (const [tab, copy] of [
+    ["Skills & Tools", "Skills & Tools settings are coming in Task 8."],
+    ["Learning", "Per-agent learning controls are coming in Task 9."],
+    ["Advanced", "Advanced settings are coming in Task 8."],
+  ]) {
+    fireEvent.click(screen.getByRole("button", { name: tab }));
+    expect(screen.getByText(copy)).toBeTruthy();
+  }
 });
