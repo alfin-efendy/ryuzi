@@ -1,6 +1,6 @@
 use crate::domain::{
-    CuratorRun, Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, Session,
-    SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
+    CuratorRun, Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn,
+    QueuedSessionPrompt, Session, SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -1170,6 +1170,19 @@ fn migrations() -> Migrations<'static> {
             CREATE INDEX IF NOT EXISTS idx_agent_learning_delivery \
                 ON agent_learning_queue(agent_id, status, sequence);",
         ),
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_prompt_queue (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                session_pk TEXT NOT NULL,\
+                position INTEGER NOT NULL,\
+                payload TEXT NOT NULL,\
+                status TEXT NOT NULL CHECK(status IN ('pending','claimed')) DEFAULT 'pending',\
+                created_at INTEGER NOT NULL,\
+                UNIQUE(session_pk, position)\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_session_prompt_queue_pending \
+                ON session_prompt_queue(session_pk, status, position);",
+        ),
     ])
 }
 
@@ -1177,6 +1190,19 @@ pub struct Store {
     pool: Pool,
     #[cfg(test)]
     fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool,
+}
+
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        Store {
+            pool: self.pool.clone(),
+            #[cfg(test)]
+            fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool::new(
+                self.fail_next_legacy_agent_settings_delete
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2508,6 +2534,133 @@ impl Store {
                 params![t.session_pk, t.role, payload, created],
                 |r| r.get::<_, i64>(0),
             )
+        })
+        .await
+    }
+
+    /// List pending session prompts in FIFO order.
+    pub async fn list_session_prompt_queue(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Vec<QueuedSessionPrompt>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT payload FROM session_prompt_queue \
+                 WHERE session_pk=?1 AND status='pending' ORDER BY position",
+            )?;
+            let items = stmt
+                .query_map(params![session_pk], |row| {
+                    let payload: String = row.get(0)?;
+                    serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    /// Add a session prompt at the end of its FIFO queue.
+    pub async fn enqueue_session_prompt(&self, prompt: QueuedSessionPrompt) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(&prompt)?;
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO session_prompt_queue(id, session_pk, position, payload, created_at) \
+                 VALUES (?1, ?2, \
+                    (SELECT COALESCE(MAX(position), 0) + 1 FROM session_prompt_queue WHERE session_pk=?2), \
+                    ?3, ?4)",
+                params![prompt.id, prompt.session_pk, payload, prompt.created_at],
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+
+    /// Remove a pending session prompt owned by `session_pk`.
+    pub async fn remove_session_prompt(&self, session_pk: &str, id: &str) -> anyhow::Result<bool> {
+        let session_pk = session_pk.to_string();
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "DELETE FROM session_prompt_queue \
+                 WHERE session_pk=?1 AND id=?2 AND status='pending'",
+                params![session_pk, id],
+            )?;
+            tx.commit()?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Atomically claim the next pending prompt for one session.
+    pub async fn claim_next_session_prompt(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<QueuedSessionPrompt>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let row = tx
+                .query_row(
+                    "SELECT id, payload FROM session_prompt_queue \
+                     WHERE session_pk=?1 AND status='pending' ORDER BY position LIMIT 1",
+                    params![session_pk],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let result = match row {
+                Some((id, payload)) => {
+                    tx.execute(
+                        "UPDATE session_prompt_queue SET status='claimed' \
+                         WHERE id=?1 AND status='pending'",
+                        params![id],
+                    )?;
+                    Some(serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?)
+                }
+                None => None,
+            };
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Return a claimed prompt to its original FIFO position.
+    pub async fn restore_claimed_session_prompt(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE session_prompt_queue SET status='pending' WHERE id=?1 AND status='claimed'",
+                params![id],
+            )
+            .map(|changed| changed > 0)
+        })
+        .await
+    }
+
+    /// Delete a successfully delivered claimed prompt.
+    pub async fn complete_claimed_session_prompt(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM session_prompt_queue WHERE id=?1 AND status='claimed'",
+                params![id],
+            )
+            .map(|changed| changed > 0)
         })
         .await
     }
@@ -4256,7 +4409,7 @@ pub fn quarantine_legacy_db(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project, WriteOrigin};
+    use crate::domain::{AttachmentRef, NewMessage, PermMode, Project, WriteOrigin};
     use crate::domain::{Session, SessionStatus};
     use crate::llm_router::provenance::{
         RouteFailureCategory, RouteSelection, RouteSelectionReason,
@@ -6277,7 +6430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_34_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_35_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -6298,7 +6451,7 @@ mod tests {
         // 29 messages.speaker + orch_tasks home/breaker/steer columns;
         // 30 audit.session_pk + audit.origin;
         // 31 plugin_catalog_cache + catalog_feed_state;
-        // 34 agent_learning_state + agent_learning_queue — CREATE TABLE
+        // 34 agent_learning_state + agent_learning_queue; 35 session_prompt_queue — CREATE TABLE
         // IF NOT EXISTS —
         // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
@@ -6306,12 +6459,12 @@ mod tests {
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 34
-        // defined, wind back twenty-two.
+        // this test starts failing its assertions). With migrations through 35
+        // defined, wind back twenty-three.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 22)
+            c.pragma_update(None, "user_version", v - 23)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -7649,6 +7802,158 @@ mod tests {
 
         // Revoking an unknown device id is a no-op, not an error.
         assert!(!store.revoke_device("no-such-device").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn queued_session_prompt_preserves_all_persisted_fields_and_turn_text() {
+        let prompt = QueuedSessionPrompt {
+            id: "queued-1".into(),
+            session_pk: "session-1".into(),
+            agent: "agent-visible prompt".into(),
+            display: "displayed prompt".into(),
+            attachments: vec![AttachmentRef {
+                name: "note.txt".into(),
+                url: "file:///queue/note.txt".into(),
+                content_type: Some("text/plain".into()),
+                size: 7,
+            }],
+            created_at: 42,
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.enqueue_session_prompt(prompt.clone()).await.unwrap();
+
+        let persisted = store
+            .list_session_prompt_queue("session-1")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(persisted, prompt);
+        let turn = persisted.into_turn_prompt();
+        assert_eq!(turn.agent, "agent-visible prompt");
+        assert_eq!(turn.display, "displayed prompt");
+        assert!(turn.blocks.is_empty());
+        assert!(turn.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_queue_persists_fifo_and_claim_lifecycle() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let first = QueuedSessionPrompt {
+            id: "first".into(),
+            session_pk: "s1".into(),
+            agent: "agent first".into(),
+            display: "first".into(),
+            attachments: vec![],
+            created_at: 1,
+        };
+        let second = QueuedSessionPrompt {
+            id: "second".into(),
+            session_pk: "s1".into(),
+            agent: "agent second".into(),
+            display: "second".into(),
+            attachments: vec![],
+            created_at: 2,
+        };
+
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.enqueue_session_prompt(first.clone()).await.unwrap();
+            store.enqueue_session_prompt(second.clone()).await.unwrap();
+            assert_eq!(
+                store
+                    .list_session_prompt_queue("s1")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|prompt| prompt.id)
+                    .collect::<Vec<_>>(),
+                ["first", "second"]
+            );
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        assert!(!store
+            .remove_session_prompt("other", "second")
+            .await
+            .unwrap());
+        assert!(store
+            .claim_next_session_prompt("s1")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert!(store.restore_claimed_session_prompt("first").await.unwrap());
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "first"
+        );
+        assert!(store
+            .complete_claimed_session_prompt("first")
+            .await
+            .unwrap());
+        assert!(store.remove_session_prompt("s1", "second").await.unwrap());
+        assert!(store
+            .list_session_prompt_queue("s1")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_queue_concurrent_claims_return_one_item() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "one".into(),
+                session_pk: "s1".into(),
+                agent: "one".into(),
+                display: "one".into(),
+                attachments: vec![],
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+
+        let one = store.clone();
+        let two = store.clone();
+        let (first, second) = tokio::join!(
+            one.claim_next_session_prompt("s1"),
+            two.claim_next_session_prompt("s1")
+        );
+        assert_eq!(
+            [first.unwrap().is_some(), second.unwrap().is_some()]
+                .into_iter()
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

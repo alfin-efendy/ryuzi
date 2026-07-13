@@ -377,6 +377,26 @@ pub struct AttachmentRef {
     pub size: u64,
 }
 
+/// A persisted prompt waiting for a session to become available. Attachment
+/// references remain durable inputs; turn blocks and display metadata are
+/// reconstructed only when the prompt is delivered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedSessionPrompt {
+    pub id: String,
+    pub session_pk: String,
+    pub agent: String,
+    pub display: String,
+    pub attachments: Vec<AttachmentRef>,
+    pub created_at: i64,
+}
+
+impl QueuedSessionPrompt {
+    pub fn into_turn_prompt(self) -> crate::harness::TurnPrompt {
+        crate::harness::TurnPrompt::text(self.agent, self.display)
+    }
+}
+
 /// Identifies the plugin an approvable action originates from — attribution
 /// only, so an operator can see "this MCP tool belongs to plugin X" instead
 /// of guessing from a substring match between the MCP server name and a
