@@ -215,10 +215,16 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "remove_session_message" => {
             let a: RemoveSessionMessageP = params(p)?;
             ensure_session_exists(cp, &a.session_pk).await?;
-            ok(cp
+            let removed = cp
                 .store()
                 .remove_session_prompt(&a.session_pk, &a.id)
-                .await?)
+                .await?;
+            if removed {
+                cp.emit(crate::domain::CoreEvent::SessionQueueChanged {
+                    session_pk: a.session_pk,
+                });
+            }
+            ok(removed)
         }
         "steer" => {
             let a: SteerP = params(p)?;
@@ -428,6 +434,9 @@ async fn enqueue_session_message(
         created_at: crate::paths::now_ms(),
     };
     cp.store().enqueue_session_prompt(queued).await?;
+    cp.emit(crate::domain::CoreEvent::SessionQueueChanged {
+        session_pk: session_pk.to_string(),
+    });
     Ok(QueuedMessageInfo {
         id,
         text: prompt.to_string(),
@@ -642,6 +651,7 @@ mod tests {
             .await
             .unwrap();
 
+        let mut events = s.cp.subscribe();
         let first = dispatch(
             &s,
             "enqueue_session_message",
@@ -649,6 +659,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            crate::domain::CoreEvent::SessionQueueChanged {
+                session_pk: "s1".into(),
+            }
+        );
         let second = dispatch(
             &s,
             "enqueue_session_message",
@@ -671,6 +687,32 @@ mod tests {
         .unwrap()
         .as_bool()
         .unwrap());
+        assert_eq!(
+            events.recv().await.unwrap(),
+            crate::domain::CoreEvent::SessionQueueChanged {
+                session_pk: "s1".into(),
+            }
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            crate::domain::CoreEvent::SessionQueueChanged {
+                session_pk: "s1".into(),
+            }
+        );
+        assert_eq!(
+            dispatch(
+                &s,
+                "remove_session_message",
+                json!({"session_pk": "s1", "id": "missing"}),
+            )
+            .await
+            .unwrap(),
+            json!(false)
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         assert_eq!(
             dispatch(&s, "session_queue", json!({"session_pk": "s1"}))
                 .await

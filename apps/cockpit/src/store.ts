@@ -705,37 +705,41 @@ export const useStore = create<State>((set, get) => ({
     return true;
   },
   send: async (runnerId, sessionPk, prompt, options) => {
-    // A typed message while THIS chat drives a live orchestration steers it
-    // instead of running as a normal chat turn — e.g. "cancel" cancels the
-    // tree, anything else is noted as guidance for the judge. `orch_steer`
-    // returns exactly one of three wire strings: "noted"/"cancelled" when the
-    // orchestration actually consumed the message, or "noOrchestration" when
-    // there's no live root bound to this session (the store keeps no
-    // client-side cache of that binding — the backend check is authoritative).
-    // Only the two positive outcomes short-circuit the normal turn; ANYTHING
-    // else — "noOrchestration", a thrown IPC error, or an unexpected/null
-    // payload from a backend that doesn't implement steering — MUST fall
-    // through to the normal send path so a steer-check never swallows the
-    // user's message.
     try {
-      const steer = await commands.orchSteer(sessionPk, prompt);
-      if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
+      // A typed message while THIS chat drives a live orchestration steers it
+      // instead of running as a normal chat turn — e.g. "cancel" cancels the
+      // tree, anything else is noted as guidance for the judge. `orch_steer`
+      // returns exactly one of three wire strings: "noted"/"cancelled" when the
+      // orchestration actually consumed the message, or "noOrchestration" when
+      // there's no live root bound to this session (the store keeps no
+      // client-side cache of that binding — the backend check is authoritative).
+      // Only the two positive outcomes short-circuit the normal turn; ANYTHING
+      // else — "noOrchestration", a thrown IPC error, or an unexpected/null
+      // payload from a backend that doesn't implement steering — MUST fall
+      // through to the normal send path so a steer-check never swallows the
+      // user's message.
+      try {
+        const steer = await commands.orchSteer(sessionPk, prompt);
+        if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
+      } catch {
+        // fall through to the normal send path
+      }
+      // A session already RUNNING a turn gets steered — the message is
+      // injected into that turn's next tool-result batch instead of racing a
+      // whole new turn onto the session. Any other status (idle, interrupted,
+      // ended) starts a normal continue. Matched within the correct runner.
+      const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
+      const res = isRunning
+        ? await commands.steerSession(runnerId, sessionPk, prompt)
+        : await commands.continueSession(runnerId, sessionPk, prompt, toChatRequestOptions(options));
+      if (res.status === "error") {
+        toast.error("Couldn't send message: " + res.error.message);
+      }
+      await get().refresh();
+      return res.status === "ok";
     } catch {
-      // fall through to the normal send path
+      return false;
     }
-    // A session already RUNNING a turn gets steered — the message is
-    // injected into that turn's next tool-result batch instead of racing a
-    // whole new turn onto the session. Any other status (idle, interrupted,
-    // ended) starts a normal continue. Matched within the correct runner.
-    const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
-    const res = isRunning
-      ? await commands.steerSession(runnerId, sessionPk, prompt)
-      : await commands.continueSession(runnerId, sessionPk, prompt, toChatRequestOptions(options));
-    if (res.status === "error") {
-      toast.error("Couldn't send message: " + res.error.message);
-    }
-    await get().refresh();
-    return res.status === "ok";
   },
   stop: async (runnerId, sessionPk) => {
     const res = await commands.stopSession(runnerId, sessionPk);

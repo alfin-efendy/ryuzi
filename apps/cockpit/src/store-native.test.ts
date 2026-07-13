@@ -183,6 +183,28 @@ test("loadQueue drops an out-of-order stale response", async () => {
   spy.mockRestore();
 });
 
+test("a successful enqueue does not duplicate an id already loaded from the server", async () => {
+  reset();
+  type QueueResult = Awaited<ReturnType<typeof commands.sessionQueue>>;
+  let resolveFetch!: (value: QueueResult) => void;
+  const queue = spyOn(commands, "sessionQueue").mockImplementation(
+    () =>
+      new Promise<QueueResult>((resolve) => {
+        resolveFetch = resolve;
+      }),
+  );
+  const enqueue = spyOn(commands, "enqueueSessionMessage").mockResolvedValue({ status: "ok", data: { id: "new", text: "new message" } });
+
+  const load = useNative.getState().loadQueue(LOCAL_RUNNER, "s1");
+  resolveFetch({ status: "ok", data: [{ id: "new", text: "new message" }] });
+  await load;
+  expect(await useNative.getState().enqueueQueueMessage(LOCAL_RUNNER, "s1", "new message", null)).toBe(true);
+
+  expect(useNative.getState().queuedBySession[s1]).toEqual([{ id: "new", text: "new message" }]);
+  queue.mockRestore();
+  enqueue.mockRestore();
+});
+
 test("a stale queue fetch cannot overwrite a successful enqueue", async () => {
   reset();
   type QueueResult = Awaited<ReturnType<typeof commands.sessionQueue>>;

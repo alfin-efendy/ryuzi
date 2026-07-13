@@ -1,12 +1,5 @@
 import { create } from "zustand";
-import {
-  commands,
-  type AgentInfo,
-  type ChatRequestOptions,
-  type CommandInfo,
-  type QueuedMessageInfo,
-  type TodoItem,
-} from "./bindings";
+import { commands, type AgentInfo, type ChatRequestOptions, type CommandInfo, type QueuedMessageInfo, type TodoItem } from "./bindings";
 import { sessKey } from "./lib/session-key";
 
 // Native-runtime metadata: the agents and slash commands available to a
@@ -93,7 +86,11 @@ export const useNative = create<NativeState>((set) => ({
       if (res.status !== "ok") return false;
       const key = sessKey(runnerId, sessionPk);
       queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
-      set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: [...(s.queuedBySession[key] ?? []), res.data] } }));
+      set((s) => {
+        const queued = s.queuedBySession[key] ?? [];
+        const next = queued.some((message) => message.id === res.data.id) ? queued : [...queued, res.data];
+        return { queuedBySession: { ...s.queuedBySession, [key]: next } };
+      });
       return true;
     } catch {
       return false;

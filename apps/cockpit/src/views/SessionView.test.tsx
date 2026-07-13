@@ -18,9 +18,12 @@ const nativeCommands = mock(() => Promise.resolve({ status: "ok" as const, data:
 // so its effect resolves cleanly; TodoPanel itself renders null for an empty list.
 const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const sessionQueue = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
-const enqueueSessionMessage = mock<(...args: Parameters<(typeof import("@/bindings").commands)["enqueueSessionMessage"]>) => ReturnType<(typeof import("@/bindings").commands)["enqueueSessionMessage"]>>(() =>
-  Promise.resolve({ status: "ok" as const, data: { id: "q1", text: "queued" } }),
-);
+const continueSession = mock(() => Promise.resolve({ status: "ok" as const, data: null }));
+const enqueueSessionMessage = mock<
+  (
+    ...args: Parameters<typeof import("@/bindings").commands["enqueueSessionMessage"]>
+  ) => ReturnType<typeof import("@/bindings").commands["enqueueSessionMessage"]>
+>(() => Promise.resolve({ status: "ok" as const, data: { id: "q1", text: "queued" } }));
 // loadProjectRuntime (always fired on mount for a project-bound session) fires
 // this too — stubbed with a minimal valid ProjectRuntimeInfo so its effect
 // resolves cleanly; the model/effort UI isn't under test here.
@@ -57,6 +60,7 @@ mock.module("@/bindings", () => ({
     nativeCommands,
     sessionTodos,
     sessionQueue,
+    continueSession,
     enqueueSessionMessage,
     removeSessionMessage: async () => ({ status: "ok" as const, data: true }),
     projectRuntimeInfo,
@@ -155,6 +159,8 @@ beforeEach(() => {
   drawerMounts.length = 0;
   listOpenTargets.mockClear();
   sessionQueue.mockClear();
+  continueSession.mockClear();
+  continueSession.mockResolvedValue({ status: "ok", data: null });
   enqueueSessionMessage.mockClear();
   enqueueSessionMessage.mockResolvedValue({ status: "ok", data: { id: "q1", text: "queued" } });
   useNative.setState({ queuedBySession: {} });
@@ -285,4 +291,18 @@ test("idle send failure leaves the runner-qualified draft", async () => {
   await waitFor(() => expect(send).toHaveBeenCalled());
   expect(useNav.getState().drafts[draftKey]).toBe("retry this");
   expect(useNav.getState().drafts.s1).toBe("other session");
+});
+
+test("a rejected idle send keeps the draft without an unhandled rejection", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "retry this" } });
+  continueSession.mockRejectedValueOnce(new Error("IPC unavailable"));
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
+
+  await waitFor(() => expect(continueSession).toHaveBeenCalledWith(runnerId, "s1", "retry this", expect.anything()));
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
 });
