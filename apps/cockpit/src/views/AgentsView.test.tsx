@@ -120,7 +120,9 @@ test("management flow creates through the generated command store and opens deta
   fireEvent.change(screen.getByRole("textbox", { name: "Description" }), { target: { value: "Reviews changes" } });
   fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
-  await waitFor(() => expect(createAgent).toHaveBeenCalledWith(LOCAL_RUNNER, expect.objectContaining({ name: "Reviewer", description: "Reviews changes" })));
+  await waitFor(() =>
+    expect(createAgent).toHaveBeenCalledWith(LOCAL_RUNNER, expect.objectContaining({ name: "Reviewer", description: "Reviews changes" })),
+  );
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" }));
 });
 
