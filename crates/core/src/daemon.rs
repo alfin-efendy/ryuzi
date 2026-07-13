@@ -108,8 +108,11 @@ pub struct Daemon {
 
 impl Daemon {
     /// Start every gateway, then fire-and-forget `cp.reconcile()` (resumes
-    /// any session a dead process left `Running`). Reconcile runs in the
-    /// background so a slow/hanging resume can't block daemon startup.
+    /// any session a dead process left `Running`). Before either, synchronously
+    /// recover prompt claims abandoned by a previous process. This recovery is
+    /// deliberately boot-only: running it later could disrupt an active
+    /// continuation. Reconcile runs in the background so a slow/hanging resume
+    /// can't block daemon startup.
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
@@ -137,6 +140,8 @@ impl Daemon {
     /// server must not prevent the rest of the daemon (gateways, sessions)
     /// from coming up.
     pub async fn start(&self) -> anyhow::Result<()> {
+        self.store.recover_abandoned_session_prompt_claims().await?;
+
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
                 if !self.stopped.swap(true, Ordering::SeqCst) {
@@ -581,7 +586,9 @@ pub(crate) async fn handle_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project, Session, SessionKind, SessionStatus};
+    use crate::domain::{
+        NewMessage, PermMode, Project, QueuedSessionPrompt, Session, SessionKind, SessionStatus,
+    };
     use crate::gateway::MessageRef;
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::telemetry::NoopTelemetry;
@@ -1763,13 +1770,45 @@ mod tests {
             .await
             .unwrap();
 
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "queued-first".into(),
+                session_pk: "s1".into(),
+                agent: "first".into(),
+                display: "first".into(),
+                attachments: vec![],
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "queued-second".into(),
+                session_pk: "s1".into(),
+                agent: "second".into(),
+                display: "second".into(),
+                attachments: vec![],
+                created_at: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "queued-first"
+        );
+
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways: vec![],
-            router_server: Arc::new(RouterServer::new(store)),
+            router_server: Arc::new(RouterServer::new(store.clone())),
             agents: persistence.registry,
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
@@ -1785,6 +1824,18 @@ mod tests {
         };
 
         daemon.start().await.unwrap();
+
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["queued-first", "queued-second"],
+            "Daemon::start must recover abandoned prompt claims before it starts work"
+        );
 
         for _ in 0..400 {
             if !prompts.lock().unwrap().is_empty() {

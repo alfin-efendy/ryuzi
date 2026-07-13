@@ -2600,6 +2600,25 @@ impl Store {
         .await
     }
 
+    /// Recover prompts claimed by a process that died before it could complete
+    /// or restore them.
+    ///
+    /// **BOOT-ONLY:** call this exactly once during daemon startup, before any
+    /// gateway or control-plane work begins. Calling it in a live process
+    /// would incorrectly return an active continuation's claimed prompt.
+    /// Positions are intentionally untouched, so recovered prompts retain FIFO
+    /// order. The update is idempotent: a subsequent call returns zero until a
+    /// new claim is abandoned.
+    pub async fn recover_abandoned_session_prompt_claims(&self) -> anyhow::Result<usize> {
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE session_prompt_queue SET status='pending' WHERE status='claimed'",
+                [],
+            )
+        })
+        .await
+    }
+
     /// Atomically claim the next pending prompt for one session.
     pub async fn claim_next_session_prompt(
         &self,
@@ -7831,6 +7850,70 @@ mod tests {
         assert_eq!(turn.display, "displayed prompt");
         assert!(turn.blocks.is_empty());
         assert!(turn.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_queue_recovers_abandoned_claims_in_fifo_order() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for (id, created_at) in [("first", 1), ("second", 2)] {
+            store
+                .enqueue_session_prompt(QueuedSessionPrompt {
+                    id: id.into(),
+                    session_pk: "s1".into(),
+                    agent: format!("agent {id}"),
+                    display: id.into(),
+                    attachments: vec![],
+                    created_at,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "first"
+        );
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+
+        assert_eq!(
+            store
+                .recover_abandoned_session_prompt_claims()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            store
+                .recover_abandoned_session_prompt_claims()
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
