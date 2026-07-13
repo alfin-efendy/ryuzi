@@ -330,13 +330,15 @@ async fn all_public_kiro_surfaces_strip_caller_effort_before_translation() {
         let _ = response.bytes().await.unwrap();
     }
 
-    let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 3);
-    for request in captured.iter() {
-        assert!(request["inferenceConfig"].get("maxTokens").is_some());
-        assert!(request.pointer("/output_config/effort").is_none());
-        assert!(request.get("reasoning_effort").is_none());
-        assert!(request.pointer("/reasoning/effort").is_none());
+    {
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        for request in captured.iter() {
+            assert!(request["inferenceConfig"].get("maxTokens").is_some());
+            assert!(request.pointer("/output_config/effort").is_none());
+            assert!(request.get("reasoning_effort").is_none());
+            assert!(request.pointer("/reasoning/effort").is_none());
+        }
     }
 
     srv.stop().await;
