@@ -24,7 +24,6 @@ import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
-import { enqueue, dequeue, removeById, type QueuedMessage } from "@/lib/queue";
 import { LOCAL_RUNNER, sessKey, refKey, isSession, sameRef, refOf, type SessionRef, type UiSession } from "@/lib/session-key";
 
 export type PendingApproval = {
@@ -80,16 +79,10 @@ type State = {
   sessionRuntimeById: Record<string, SessionRuntimeInfo>;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
-  /** Per-session in-memory type-ahead queue (messages typed while running). */
-  queued: Record<string, QueuedMessage[]>;
   /** Live orchestration task graph, keyed by root task id — the task strip's
    *  data source. Upserted piecemeal by `orchTaskChanged` events and seeded
    *  in bulk by `loadOrchTasks`. */
   orchTasks: Record<string, OrchTask[]>;
-  enqueueMessage: (runnerId: string, sessionPk: string, msg: QueuedMessage) => void;
-  removeQueued: (runnerId: string, sessionPk: string, id: string) => void;
-  /** Send the head of a session's queue; on send-failure re-queue it at the front. */
-  sendNextQueued: (runnerId: string, sessionPk: string) => Promise<void>;
   /** `runnerId` is the runner that produced the event (from the CoreEventMsg
    *  wrapper). */
   applyCoreEvent: (e: CoreEvent, runnerId: string) => void;
@@ -192,7 +185,6 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   transcripts: {},
   pendingApprovals: [],
-  queued: {},
   focusedSession: null,
   selectedProjectId: null,
   lastSeq: {},
@@ -745,28 +737,6 @@ export const useStore = create<State>((set, get) => ({
     await get().refresh();
     return res.status === "ok";
   },
-  enqueueMessage: (runnerId, sessionPk, msg) =>
-    set((st) => {
-      const key = sessKey(runnerId, sessionPk);
-      return { queued: { ...st.queued, [key]: enqueue(st.queued[key], msg) } };
-    }),
-  removeQueued: (runnerId, sessionPk, id) =>
-    set((st) => {
-      const key = sessKey(runnerId, sessionPk);
-      return { queued: { ...st.queued, [key]: removeById(st.queued[key], id) } };
-    }),
-  sendNextQueued: async (runnerId, sessionPk) => {
-    const key = sessKey(runnerId, sessionPk);
-    const { head, rest } = dequeue(get().queued[key]);
-    if (!head) return;
-    // Remove the head BEFORE awaiting so a second `result` can't re-send it.
-    set((st) => ({ queued: { ...st.queued, [key]: rest } }));
-    const ok = await get().send(runnerId, sessionPk, head.text, head.options);
-    if (!ok) {
-      // Command-level rejection: put it back at the front so it stays visible.
-      set((st) => ({ queued: { ...st.queued, [key]: [head, ...(st.queued[key] ?? [])] } }));
-    }
-  },
   stop: async (runnerId, sessionPk) => {
     const res = await commands.stopSession(runnerId, sessionPk);
     if (res.status === "error") {
@@ -808,7 +778,7 @@ export const useStore = create<State>((set, get) => ({
           intent,
           get().sessions.find((s) => isSession(s, { runnerId: intent.runnerId, pk: intent.sessionPk })),
         );
-      drainQueueOnEvent(event, runnerId);
+      if (event.kind === "sessionQueueChanged") void useNative.getState().loadQueue(runnerId, event.session_pk);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
@@ -828,16 +798,4 @@ export function markFocusedSessionReadOnEvent(event: CoreEvent, runnerId: string
   if (activePk && focusedSession && sameRef({ runnerId, pk: activePk }, focusedSession)) {
     useUi.getState().markRead(sessKey(runnerId, activePk), Date.now());
   }
-}
-
-/**
- * Drain one queued message when a session's turn finishes *successfully*.
- * Keyed on `result` only: an `error` turn emits no `result`, so the queue
- * stays put (structural pause). Extracted so the decision is testable without
- * a real Tauri event subscription.
- */
-export function drainQueueOnEvent(event: CoreEvent, runnerId: string): void {
-  if (event.kind !== "result") return;
-  const pk = (event as { session_pk?: string }).session_pk;
-  if (pk) void useStore.getState().sendNextQueued(runnerId, pk);
 }

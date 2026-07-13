@@ -1,36 +1,38 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useStore } from "@/store";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useNative } from "@/store-native";
+import { commands } from "@/bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const { QueuedMessages } = await import("./QueuedMessages");
 
 const KEY = sessKey(LOCAL_RUNNER, "s1");
+const loadQueue = mock(() => Promise.resolve());
 
 afterEach(cleanup);
 beforeEach(() => {
-  useStore.setState({ queued: {} });
+  useNative.setState({ queuedBySession: {}, loadQueue });
+  loadQueue.mockClear();
 });
 
-test("renders one row per queued message", () => {
-  useStore.setState({
-    queued: {
-      [KEY]: [
-        { id: "a", text: "first message", options: null },
-        { id: "b", text: "second message", options: null },
-      ],
-    },
-  });
+test("loads and renders durable queued messages", () => {
+  useNative.setState({ queuedBySession: { [KEY]: [{ id: "a", text: "first message" }, { id: "b", text: "second message" }] }, loadQueue });
   render(<QueuedMessages runnerId={LOCAL_RUNNER} sessionPk="s1" />);
+  expect(loadQueue).toHaveBeenCalledWith(LOCAL_RUNNER, "s1");
   expect(screen.getByText("first message")).toBeTruthy();
   expect(screen.getByText("second message")).toBeTruthy();
 });
 
-test("× removes the message from the queue", () => {
-  useStore.setState({ queued: { [KEY]: [{ id: "a", text: "hello", options: null }] } });
+test("removal invokes the backend and removes its durable message", async () => {
+  useNative.setState({ queuedBySession: { [KEY]: [{ id: "a", text: "hello" }] }, loadQueue });
+  const remove = spyOn(commands, "removeSessionMessage").mockResolvedValue({ status: "ok", data: true });
   render(<QueuedMessages runnerId={LOCAL_RUNNER} sessionPk="s1" />);
+
   fireEvent.click(screen.getByRole("button", { name: /remove from queue/i }));
-  expect(useStore.getState().queued[KEY]).toEqual([]);
+
+  await waitFor(() => expect(remove).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "a"));
+  await waitFor(() => expect(useNative.getState().queuedBySession[KEY]).toEqual([]));
+  remove.mockRestore();
 });
 
 test("empty queue renders nothing", () => {
