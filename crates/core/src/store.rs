@@ -4389,12 +4389,34 @@ impl Store {
         .await
     }
 
-    pub async fn interrupt_incomplete_agent_runs(&self, reason: &str) -> anyhow::Result<u64> {
+    pub async fn interrupt_incomplete_agent_runs(
+        &self,
+        reason: &str,
+    ) -> anyhow::Result<Vec<AgentRun>> {
         let reason = reason.to_string();
         let at = now_ms();
         self.with_conn(move |c| {
-            c.execute("UPDATE agent_runs SET status='interrupted', finished_at=?1, error=?2 WHERE status IN ('queued','running')", params![at, reason]).map(|count| count as u64)
-        }).await
+            let tx = c.transaction()?;
+            let mut stmt = tx.prepare(
+                "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE status IN ('queued','running') ORDER BY rowid",
+            )?;
+            let mut runs = stmt
+                .query_map([], row_to_agent_run)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            tx.execute(
+                "UPDATE agent_runs SET status='interrupted', finished_at=?1, error=?2 WHERE status IN ('queued','running')",
+                params![at, reason.clone()],
+            )?;
+            for run in &mut runs {
+                run.status = AgentRunStatus::Interrupted;
+                run.finished_at = Some(at);
+                run.error = Some(reason.clone());
+            }
+            tx.commit()?;
+            Ok(runs)
+        })
+        .await
     }
 
     pub async fn insert_run_message(
@@ -4499,6 +4521,14 @@ fn validate_agent_run(
     root: bool,
 ) -> rusqlite::Result<()> {
     if root {
+        if run.agent_kind != AgentRunKind::Primary
+            || run.parent_run_id.is_some()
+            || run.retry_of.is_some()
+        {
+            return Err(to_sql_json_error(
+                "a primary agent run must be a parentless, non-retry root",
+            ));
+        }
         return Ok(());
     }
     if run.agent_kind == AgentRunKind::Primary || run.parent_run_id.is_none() {
@@ -6480,6 +6510,43 @@ mod tests {
             .unwrap();
         assert!(cols.iter().any(|c| c == "session_pk"), "cols: {cols:?}");
         assert!(cols.iter().any(|c| c == "origin"), "cols: {cols:?}");
+    }
+
+    #[tokio::test]
+    async fn insert_primary_agent_run_rejects_non_primary_and_non_root_shapes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        let valid_root = NewAgentRun {
+            run_id: "root".into(),
+            session_pk: "s1".into(),
+            parent_run_id: None,
+            retry_of: None,
+            primary_agent_id: "ada".into(),
+            executing_agent_id: Some("ada".into()),
+            executing_agent_name_snapshot: "Ada".into(),
+            agent_kind: AgentRunKind::Primary,
+            task: "root".into(),
+            status: AgentRunStatus::Queued,
+            resolved_model: None,
+            resolved_effort: None,
+        };
+        for (run_id, agent_kind, parent_run_id, retry_of) in [
+            ("delegate", AgentRunKind::MainDelegate, None, None),
+            ("parented", AgentRunKind::Primary, Some("root".into()), None),
+            ("retry", AgentRunKind::Primary, None, Some("root".into())),
+        ] {
+            let mut invalid = valid_root.clone();
+            invalid.run_id = run_id.into();
+            invalid.agent_kind = agent_kind;
+            invalid.parent_run_id = parent_run_id;
+            invalid.retry_of = retry_of;
+            assert!(
+                store.insert_primary_agent_run(invalid).await.is_err(),
+                "{run_id} must not be accepted as a primary root"
+            );
+        }
+        assert!(store.insert_primary_agent_run(valid_root).await.is_ok());
     }
 
     #[tokio::test]

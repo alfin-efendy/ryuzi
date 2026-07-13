@@ -45,6 +45,8 @@ pub struct DelegationRuntime {
     events: broadcast::Sender<CoreEvent>,
     admission: Mutex<()>,
     live: Mutex<HashMap<String, InFlightRun>>,
+    terminal: Mutex<HashMap<String, AgentRun>>,
+    terminal_events: broadcast::Sender<AgentRun>,
 }
 
 impl DelegationRuntime {
@@ -53,19 +55,33 @@ impl DelegationRuntime {
         registry: Arc<AgentRegistry>,
         events: broadcast::Sender<CoreEvent>,
     ) -> Arc<Self> {
+        let (terminal_events, _) = broadcast::channel(1024);
         Arc::new(Self {
             store,
             registry,
             events,
             admission: Mutex::new(()),
             live: Mutex::new(HashMap::new()),
+            terminal: Mutex::new(HashMap::new()),
+            terminal_events,
         })
     }
 
     pub async fn recover_after_restart(&self) -> anyhow::Result<u64> {
-        self.store
+        let interrupted = self
+            .store
             .interrupt_incomplete_agent_runs(RESTART_INTERRUPTION_REASON)
-            .await
+            .await?;
+        for run in &interrupted {
+            self.emit(
+                &run.session_pk,
+                &run.run_id,
+                run.parent_run_id.clone(),
+                run.status,
+            );
+            self.record_terminal(run.clone()).await;
+        }
+        Ok(interrupted.len() as u64)
     }
 
     pub async fn begin_primary(
@@ -258,6 +274,8 @@ impl DelegationRuntime {
         {
             bail!("only terminal child runs in this session can be retried");
         }
+        let (_, _, root) = self.tree(&previous.run_id).await?;
+        self.ensure_capacity(&root).await?;
         let snapshot = match previous.executing_agent_id.as_deref() {
             Some(id) => Some(self.registry.resolved_snapshot(id).await?),
             None => None,
@@ -375,9 +393,66 @@ impl DelegationRuntime {
             self.emit(&run.session_pk, &run.run_id, run.parent_run_id.clone(), to);
             if to.is_terminal() {
                 self.live.lock().await.remove(run_id);
+                self.record_terminal(run).await;
             }
         }
         Ok(())
+    }
+
+    async fn record_terminal(&self, run: AgentRun) {
+        self.terminal
+            .lock()
+            .await
+            .insert(run.run_id.clone(), run.clone());
+        let _ = self.terminal_events.send(run);
+    }
+
+    /// Wait for a child run's persisted terminal record. This is the delivery
+    /// endpoint for the immediate delegating tool caller; it never writes a
+    /// session message or creates a user turn.
+    pub async fn await_terminal(&self, run_id: &str) -> anyhow::Result<AgentRun> {
+        let mut events = self.terminal_events.subscribe();
+        if let Some(run) = self.terminal.lock().await.get(run_id).cloned() {
+            return Ok(run);
+        }
+        if let Some(run) = self.store.get_agent_run(run_id).await? {
+            if run.status.is_terminal() {
+                return Ok(run);
+            }
+        } else {
+            bail!("unknown agent run");
+        }
+        loop {
+            let run = events.recv().await?;
+            if run.run_id == run_id {
+                return Ok(run);
+            }
+        }
+    }
+
+    /// Read terminal child outcomes for a root run. The root primary can use
+    /// this to consume results from any nested delegation without a user turn.
+    pub async fn terminal_outcomes_for_root(
+        &self,
+        root_run_id: &str,
+    ) -> anyhow::Result<Vec<AgentRun>> {
+        let root = self
+            .store
+            .get_agent_run(root_run_id)
+            .await?
+            .ok_or_else(|| anyhow!("unknown agent run"))?;
+        if root.parent_run_id.is_some() {
+            bail!("terminal outcomes are only available to root runs");
+        }
+        let mut outcomes = self
+            .store
+            .list_descendant_agent_runs(root_run_id)
+            .await?
+            .into_iter()
+            .filter(|run| run.status.is_terminal())
+            .collect::<Vec<_>>();
+        outcomes.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        Ok(outcomes)
     }
 
     fn emit(
@@ -895,6 +970,150 @@ mod tests {
                 .status,
             AgentRunStatus::Queued,
             "the event must follow the committed database row"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_a_terminal_child_when_eight_descendants_are_active() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, _) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let terminal = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id.clone(),
+                subagent_type: "terminal".into(),
+                task: "terminal".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        runtime
+            .complete(&terminal.run.run_id, "done")
+            .await
+            .unwrap();
+        for number in 0..MAX_ACTIVE_CHILD_RUNS {
+            runtime
+                .queue_subagent(SubagentRunRequest {
+                    parent_run_id: root.run.run_id.clone(),
+                    subagent_type: format!("active-{number}"),
+                    task: "active".into(),
+                    context: None,
+                    background: false,
+                })
+                .await
+                .unwrap();
+        }
+
+        let error = runtime
+            .retry_child("s", &terminal.run.run_id)
+            .await
+            .expect_err("retry must count as the ninth active descendant");
+        assert!(error.to_string().contains("active child run limit"));
+    }
+
+    #[tokio::test]
+    async fn terminal_child_outcome_reaches_its_immediate_caller_and_root_without_user_turns() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, second) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let parent = runtime
+            .queue_main(MainDelegationRequest {
+                parent_run_id: root.run.run_id.clone(),
+                target_agent_id: second.profile.id.clone(),
+                task: "parent".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        let child = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: parent.run.run_id.clone(),
+                subagent_type: "nested".into(),
+                task: "child".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        let waiter_runtime = runtime.clone();
+        let child_id = child.run.run_id.clone();
+        let waiter = tokio::spawn(async move { waiter_runtime.await_terminal(&child_id).await });
+        tokio::task::yield_now().await;
+
+        runtime
+            .fail(&child.run.run_id, "nested failure")
+            .await
+            .unwrap();
+        let delivered = waiter.await.unwrap().unwrap();
+        assert_eq!(delivered.run_id, child.run.run_id);
+        assert_eq!(delivered.status, AgentRunStatus::Failed);
+        assert_eq!(delivered.error.as_deref(), Some("nested failure"));
+        assert_eq!(
+            runtime
+                .terminal_outcomes_for_root(&root.run.run_id)
+                .await
+                .unwrap(),
+            vec![delivered]
+        );
+        assert!(runtime.store.list_messages("s").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_emits_every_committed_interruption_with_its_persisted_reason() {
+        let (runtime, registry, mut events, _directory) = runtime().await;
+        let (first, _) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let child = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id.clone(),
+                subagent_type: "child".into(),
+                task: "child".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        runtime.mark_running(&child.run.run_id).await.unwrap();
+        while events.try_recv().is_ok() {}
+
+        assert_eq!(runtime.recover_after_restart().await.unwrap(), 2);
+        let mut changed = Vec::new();
+        for _ in 0..2 {
+            let CoreEvent::AgentRunChanged {
+                session_pk,
+                run_id,
+                parent_run_id,
+                status,
+            } = events.recv().await.unwrap()
+            else {
+                panic!("recovery must emit AgentRunChanged");
+            };
+            let persisted = runtime.store.get_agent_run(&run_id).await.unwrap().unwrap();
+            assert_eq!(persisted.status, AgentRunStatus::Interrupted);
+            assert_eq!(
+                persisted.error.as_deref(),
+                Some(RESTART_INTERRUPTION_REASON)
+            );
+            changed.push((session_pk, run_id, parent_run_id, status));
+        }
+        assert_eq!(
+            changed,
+            vec![
+                (
+                    "s".into(),
+                    root.run.run_id.clone(),
+                    None,
+                    AgentRunStatus::Interrupted.as_db().into(),
+                ),
+                (
+                    "s".into(),
+                    child.run.run_id.clone(),
+                    Some(root.run.run_id),
+                    AgentRunStatus::Interrupted.as_db().into(),
+                ),
+            ]
         );
     }
 

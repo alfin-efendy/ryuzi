@@ -466,31 +466,26 @@ mod tests {
 
     async fn test_server(token: &str) -> (String, Arc<ryuzi_core::ControlPlane>) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(ryuzi_core::Store::open(tmp.path()).await.unwrap());
         std::mem::forget(tmp);
-        let cp = {
-            let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(
-                std::sync::Arc::new(store.clone()),
-            )
+        let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(store.clone())
             .await
             .unwrap();
-            ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new(), persistence).await
-        };
-        let persistence = ryuzi_core::agents::bootstrap::initialize_agent_persistence(
-            tempfile::tempdir().unwrap().keep(),
-            cp.store().clone(),
+        let handles = persistence.handles();
+        let cp = ryuzi_core::ControlPlane::new(
+            store.clone(),
+            ryuzi_core::Registries::new(),
+            persistence,
         )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        .await;
         let state = ryuzi_core::serve::ApiState {
             router_server: Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp: cp.clone(),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents: handles.registry,
+            agent_knowledge: handles.knowledge,
+            learning_queue: handles.learning,
             control_token: token.to_string(),
         };
         let opts = ryuzi_core::serve::ServeOpts {
@@ -663,33 +658,28 @@ mod tests {
     async fn test_tls_server(token: &str) -> (String, String, std::sync::Arc<ryuzi_core::Store>) {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("ryuzi.sqlite");
-        let store = ryuzi_core::Store::open(&db_path).await.unwrap();
-        let cp = {
-            let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(
-                std::sync::Arc::new(store.clone()),
-            )
+        let store = Arc::new(ryuzi_core::Store::open(&db_path).await.unwrap());
+        let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(store.clone())
             .await
             .unwrap();
-            ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new(), persistence).await
-        };
+        let handles = persistence.handles();
+        let cp = ryuzi_core::ControlPlane::new(
+            store.clone(),
+            ryuzi_core::Registries::new(),
+            persistence,
+        )
+        .await;
         let material = ryuzi_core::tls::load_or_generate(tmp.path()).unwrap();
         let tls_cfg = ryuzi_core::tls::server_config(&material).unwrap();
-        let store_handle = cp.store().clone();
-        let persistence = ryuzi_core::agents::bootstrap::initialize_agent_persistence(
-            tmp.path().join("agent-config"),
-            store_handle.clone(),
-        )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let store_handle = store;
         let state = ryuzi_core::serve::ApiState {
             router_server: Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
                 store_handle.clone(),
             )),
             cp: cp.clone(),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents: handles.registry,
+            agent_knowledge: handles.knowledge,
+            learning_queue: handles.learning,
             control_token: token.to_string(),
         };
         let opts = ryuzi_core::serve::ServeOpts {
