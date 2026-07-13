@@ -410,6 +410,16 @@ impl ControlPlane {
         self.store.list_sessions(project_id).await
     }
 
+    pub async fn list_agent_sessions(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Session>> {
+        self.store
+            .list_recent_sessions_for_agent(agent_id, limit)
+            .await
+    }
+
     /// Bind an existing session to a project (`app_projects`'s "attach"
     /// action, spec §9.1). Validates both rows exist, then persists the
     /// association — see [`Store::set_session_project`] for the caveat that a

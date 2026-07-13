@@ -208,13 +208,11 @@ impl Harness for NativeHarness {
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
-        // Agent-per-task: a worker session carries its assignee in `ctx.agent`
-        // (Phase 2 threaded the column through). Fall back to the default when
-        // unset (ordinary project/chat sessions) or unknown (stale roster).
-        let agent = ctx
-            .agent
-            .as_deref()
-            .and_then(|name| agents.get(name))
+        // The immutable primary profile, not a worktree-local legacy agent
+        // declaration, selects the actual native persona for this session.
+        let agent = agents
+            .get(&ctx.primary_agent.profile.id)
+            .or_else(|| agents.get("build"))
             .unwrap_or_else(|| agents.default_agent());
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates). Fires to both the
@@ -240,20 +238,11 @@ impl Harness for NativeHarness {
         // path with no special-casing.
         extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
-        let project_id = ctx.project_id.clone();
         let model_name = model.as_deref().unwrap_or("");
-        let mut effort_policy = if let Some(project_id) = project_id.as_deref() {
-            crate::llm_router::model_effort::build_turn_effort_policy(
-                &ctx.store, project_id, model_name,
-            )
-            .await?
-        } else {
+        let mut effort_policy =
             crate::llm_router::model_effort::build_utility_effort_policy(&ctx.store, model_name)
-                .await?
-        };
-        if project_id.is_none() {
-            effort_policy.project_override = ctx.effort;
-        }
+                .await?;
+        effort_policy.project_override = ctx.effort;
         // Persistent memory is unconditional: a chat (project-less) session
         // still gets GLOBAL + USER memory, while a project session gets
         // global + user + project scope. `at_default(None)` sets the global
@@ -280,6 +269,9 @@ impl Harness for NativeHarness {
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
+                primary_agent: ctx.primary_agent,
+                run_id: ctx.run_id,
+                delegation: ctx.delegation,
                 main_agent_id: ctx.main_agent_id,
                 learning_queue: ctx.learning_queue,
                 kind: ctx.kind,
@@ -514,15 +506,24 @@ mod tests {
 
     async fn ctx_for(store: Arc<Store>, work_dir: std::path::PathBuf) -> SessionCtx {
         let (events, _rx) = broadcast::channel(64);
-        let knowledge = Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
-            work_dir.join(".agent-config"),
-        ));
-        let learning_queue = Arc::new(crate::agents::learning_queue::LearningQueue::new(
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
+        let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
-            knowledge.clone(),
-        ));
+            persistence.registry.clone(),
+            events.clone(),
+        );
         SessionCtx {
             session_pk: "sess".into(),
+            primary_agent,
+            run_id: "run".into(),
+            delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: crate::domain::SessionKind::Chat,
@@ -541,8 +542,8 @@ mod tests {
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
-            agent_knowledge: knowledge,
-            learning_queue,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             store,
             app_control: None,
         }

@@ -6,7 +6,6 @@
 use super::{ok, params, ApiError};
 use crate::api::types::*;
 use crate::branches::BranchList;
-use crate::control::ControlPlane;
 use crate::domain::{AttachmentRef, Session, SessionGitOptions};
 use crate::harness::TurnPrompt;
 use crate::serve::ApiState;
@@ -21,6 +20,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "update_session_perm_mode",
     "list_projects",
     "list_sessions",
+    "list_agent_sessions",
     "connect_project",
     "clone_project",
     "list_branches",
@@ -79,21 +79,29 @@ struct ProjectIdP {
     project_id: String,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartP {
     project_id: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: String,
+    turn: TurnInput,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartChatP {
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: String,
+    turn: TurnInput,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ContinueP {
     session_pk: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    turn: TurnInput,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSessionsP {
+    agent_id: String,
+    limit: u32,
 }
 #[derive(Deserialize)]
 struct SessionPkP {
@@ -149,6 +157,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: ProjectIdOpt = params(p)?;
             ok(cp.list_sessions(a.project_id.as_deref()).await?)
         }
+        "list_agent_sessions" => {
+            let a: AgentSessionsP = params(p)?;
+            ok(cp.list_agent_sessions(&a.agent_id, a.limit).await?)
+        }
         "connect_project" => {
             let a: ConnectP = params(p)?;
             ok(cp
@@ -167,28 +179,27 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "start_session" => {
             let a: StartP = params(p)?;
-            ok(start_session(state, &a.project_id, &a.prompt, a.options).await?)
+            ok(start_session(state, &a.project_id, &a.primary_agent_id, a.turn).await?)
         }
         "start_chat_session" => {
             let a: StartChatP = params(p)?;
-            let options = a.options.unwrap_or_default();
-            let attachments = attachment_refs_from_paths(&options.attachments).await?;
-            let agent_prompt = chat_agent_prompt(&a.prompt, options.context.as_ref());
+            let attachments = attachment_refs_from_paths(&a.turn.attachments).await?;
+            let agent_prompt = chat_agent_prompt(&a.turn.text, a.turn.context.as_ref());
             ok(state
                 .cp
-                .start_chat_session_with_runtime(
-                    TurnPrompt::text(agent_prompt, a.prompt),
+                .start_agent_session_with_prompt(
+                    None,
+                    &a.primary_agent_id,
+                    TurnPrompt::text(agent_prompt, a.turn.text),
                     "cockpit",
                     &attachments,
-                    options.model,
-                    options.effort,
-                    options.perm_mode,
+                    None,
                 )
                 .await?)
         }
         "continue_session" => {
             let a: ContinueP = params(p)?;
-            ok(continue_session(state, &a.session_pk, &a.prompt, a.options).await?)
+            ok(continue_session(state, &a.session_pk, a.turn).await?)
         }
         "steer" => {
             let a: SteerP = params(p)?;
@@ -223,32 +234,6 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
-}
-
-/// Persist the composer's model choice on the project row. `model: None`
-/// keeps the project's pinned model instead of clearing it — the composer
-/// sends null when the user didn't touch the picker.
-async fn apply_model_choice(
-    cp: &ControlPlane,
-    project_id: &str,
-    model: Option<&str>,
-) -> Result<(), ApiError> {
-    let model = model
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string);
-    let Some(project) = cp.store().get_project(project_id).await? else {
-        return Err(ApiError::not_found(format!(
-            "unknown project: {project_id}"
-        )));
-    };
-    let next_model = model.or_else(|| project.model.clone());
-    if project.model != next_model {
-        cp.store()
-            .update_project(project_id, next_model, project.perm_mode)
-            .await?;
-    }
-    Ok(())
 }
 
 async fn attachment_refs_from_paths(paths: &[String]) -> Result<Vec<AttachmentRef>, ApiError> {
@@ -305,25 +290,21 @@ async fn list_branches(state: &ApiState, project_id: &str) -> Result<BranchList,
 async fn start_session(
     state: &ApiState,
     project_id: &str,
-    prompt: &str,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: &str,
+    turn: TurnInput,
 ) -> Result<Session, ApiError> {
     let cp = &state.cp;
-    let options = options.unwrap_or_default();
-    apply_model_choice(cp, project_id, options.model.as_deref()).await?;
-    let git: Option<SessionGitOptions> = options.git.clone().map(Into::into);
-    let attachments = attachment_refs_from_paths(&options.attachments).await?;
-    let agent_prompt = chat_agent_prompt(prompt, options.context.as_ref());
+    let git: Option<SessionGitOptions> = turn.git.clone().map(Into::into);
+    let attachments = attachment_refs_from_paths(&turn.attachments).await?;
+    let agent_prompt = chat_agent_prompt(&turn.text, turn.context.as_ref());
     Ok(cp
-        .start_session_with_prompt(
-            project_id,
-            TurnPrompt::text(agent_prompt, prompt),
+        .start_agent_session_with_prompt(
+            Some(project_id),
+            primary_agent_id,
+            TurnPrompt::text(agent_prompt, turn.text),
             "cockpit",
             &attachments,
             git,
-            options.perm_mode,
-            None,
-            None,
         )
         .await?)
 }
@@ -331,20 +312,19 @@ async fn start_session(
 async fn continue_session(
     state: &ApiState,
     session_pk: &str,
-    prompt: &str,
-    options: Option<ChatRequestOptions>,
+    turn: TurnInput,
 ) -> Result<(), ApiError> {
-    let cp = &state.cp;
-    let options = options.unwrap_or_default();
-    let attachments = attachment_refs_from_paths(&options.attachments).await?;
-    let agent_prompt = chat_agent_prompt(prompt, options.context.as_ref());
-    Ok(cp
-        .continue_session_with_prompt(
+    let attachments = attachment_refs_from_paths(&turn.attachments).await?;
+    let agent_prompt = chat_agent_prompt(&turn.text, turn.context.as_ref());
+    state
+        .cp
+        .continue_agent_session_with_prompt(
             session_pk,
-            TurnPrompt::text(agent_prompt, prompt),
+            TurnPrompt::text(agent_prompt, turn.text),
             &attachments,
         )
-        .await?)
+        .await?;
+    Ok(())
 }
 
 /// Write pasted bytes into the attachments staging area and return the
@@ -390,29 +370,22 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn start_chat_session_dispatches() {
+    async fn start_chat_session_dispatches_owned_turn_input() {
         let s = crate::api::tests_support::state_with_fake_native().await;
+        let primary_agent_id = s.cp.registry().default_agent_id().await;
         let out = dispatch(
             &s,
             "start_chat_session",
-            json!({"prompt": "hi", "options": {
-                "model": "openai/gpt-5.5", "effort": "high", "permMode": "plan",
-                "context": null, "attachments": [], "git": null
-            }}),
+            json!({
+                "primaryAgentId": primary_agent_id,
+                "turn": { "text": "hi", "attachments": [] }
+            }),
         )
         .await
         .unwrap();
         assert_eq!(out["projectId"], serde_json::Value::Null);
         assert_eq!(out["kind"], "chat");
-        assert_eq!(out["permMode"], "plan");
-        let runtime =
-            s.cp.store()
-                .get_session_runtime_settings(out["sessionPk"].as_str().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(runtime.model.as_deref(), Some("openai/gpt-5.5"));
-        assert_eq!(runtime.effort.as_deref(), Some("high"));
+        assert!(out["primaryAgentId"].is_string());
     }
 
     #[tokio::test]
@@ -446,51 +419,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, json!("v1"));
-    }
-
-    #[tokio::test]
-    async fn start_session_decodes_camel_case_options() {
-        // Params come from the Tauri proxy as the SAME camelCase JSON the
-        // frontend already sends — the DTOs' serde attrs must accept it.
-        // Native-only: a legacy `runtimeId` is ignored, never deserialized.
-        let opts: crate::api::types::ChatRequestOptions = serde_json::from_value(json!({
-            "runtimeId": "native",
-            "model": "fable",
-            "git": {"useWorktree": false, "createBranch": false, "branchName": null, "baseBranch": null}
-        }))
-        .unwrap();
-        assert_eq!(opts.model.as_deref(), Some("fable"));
-        assert!(!opts.git.unwrap().use_worktree);
-    }
-
-    #[tokio::test]
-    async fn apply_model_choice_keeps_the_pinned_model_when_none_is_sent() {
-        use crate::domain::{PermMode, Project};
-
-        let s = state().await;
-        s.cp.store()
-            .insert_project(Project {
-                project_id: "p1".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
-                source: None,
-                model: Some("openrouter/qwen3:free".into()),
-                effort: None,
-                perm_mode: PermMode::Default,
-                created_at: None,
-                is_git: false,
-            })
-            .await
-            .unwrap();
-
-        // The composer may send model: null; the pinned model must survive.
-        super::apply_model_choice(&s.cp, "p1", None).await.unwrap();
-
-        let got = s.cp.store().get_project("p1").await.unwrap().unwrap();
-        assert_eq!(
-            got.model.as_deref(),
-            Some("openrouter/qwen3:free"),
-            "model:null must not clear the pinned model"
-        );
     }
 }

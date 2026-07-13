@@ -2014,6 +2014,26 @@ impl Store {
         .await
     }
 
+    pub async fn list_recent_sessions_for_agent(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Session>> {
+        let agent_id = agent_id.to_string();
+        let limit = limit.clamp(1, 50);
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE primary_agent_id=?1 \
+                 ORDER BY last_active DESC, created_at DESC, session_pk DESC LIMIT ?2"
+            ))?;
+            let rows = stmt
+                .query_map(params![agent_id, limit], row_to_session)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     pub async fn update_status(
         &self,
         pk: &str,

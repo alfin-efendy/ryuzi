@@ -95,6 +95,10 @@ pub struct LearningPayload {
 #[derive(Clone)]
 pub struct RunnerDeps {
     pub session_pk: String,
+    /// Immutable primary identity and root run for this dispatched turn.
+    pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
+    pub run_id: String,
+    pub delegation: Arc<crate::delegation::DelegationRuntime>,
     /// Main agent whose isolated knowledge bundle owns this session's memory.
     pub main_agent_id: String,
     /// Durable learning queue shared with the daemon worker.
@@ -427,16 +431,7 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// routing and a substitute is resolved, a status row announces the
 /// substitution — no silent swap.
 async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
-    let project_pin = project_pinned_model(deps).await;
-    let session_pin = if project_pin.is_none() {
-        chat_session_pinned_model(&deps.store, &deps.session_pk).await
-    } else {
-        None
-    };
-    let pinned = match project_pin.clone() {
-        Some(pinned) => pinned,
-        None => session_pin.clone().or_else(|| deps.model.clone()),
-    };
+    let pinned = deps.model.clone();
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
         if !pinned.trim().is_empty() && pinned != resolved {
@@ -460,57 +455,22 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
         turn.model = resolved;
     }
     let model = turn.model.as_deref().unwrap_or("");
-    if project_pin.is_some() || session_pin.is_some() {
-        turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
-    }
-    let policy = if let Some(project_id) = turn.project_id.as_deref() {
-        crate::llm_router::model_effort::build_turn_effort_policy(&turn.store, project_id, model)
-            .await
-    } else {
-        crate::llm_router::model_effort::build_session_effort_policy(
-            &turn.store,
-            &turn.session_pk,
-            model,
-        )
-        .await
-    };
-    if let Ok(policy) = policy {
+    turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
+    if let Ok(policy) =
+        crate::llm_router::model_effort::build_utility_effort_policy(&turn.store, model).await
+    {
+        let mut policy = policy;
+        policy.project_override = agent_effort(&turn.primary_agent.profile.model);
         turn.turn_effort_policy = Arc::new(policy);
     }
     turn
 }
 
-/// `Some(project.model)` when the session's project row is reachable — the
-/// inner Option is the pin itself, which may legitimately be unset. `None`
-/// when there is no session/project row to read, or the session has no
-/// bound project (chat-first sessions).
-async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
-    let session = deps
-        .store
-        .get_session(&deps.session_pk)
-        .await
-        .ok()
-        .flatten()?;
-    let project = deps
-        .store
-        .get_project(&session.project_id?)
-        .await
-        .ok()
-        .flatten()?;
-    Some(project.model)
-}
-
-async fn chat_session_pinned_model(store: &Store, session_pk: &str) -> Option<String> {
-    let session = store.get_session(session_pk).await.ok().flatten()?;
-    if session.kind != crate::domain::SessionKind::Chat {
-        return None;
+fn agent_effort(model: &crate::agents::types::AgentModel) -> Option<String> {
+    match model {
+        crate::agents::types::AgentModel::Concrete { effort, .. } => effort.clone(),
+        crate::agents::types::AgentModel::Route { .. } => None,
     }
-    store
-        .get_session_runtime_settings(session_pk)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|runtime| runtime.model)
 }
 
 /// If this session has no title yet, generate a terse one from the first
@@ -1486,7 +1446,7 @@ impl RunnerSpawner {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
             Ok(text) => result(SubtaskStatus::Completed, cap_report(&text)),
-            Err(e) => result(SubtaskStatus::Error, e.to_string()),
+            Err(error) => result(SubtaskStatus::Error, error.to_string()),
         }
     }
 }
@@ -2358,91 +2318,49 @@ mod tests {
     use serial_test::serial;
 
     #[tokio::test]
-    async fn chat_turn_model_reads_the_durable_session_runtime() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store
-            .insert_session(Session {
-                session_pk: "chat-model".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-        store
-            .update_session_runtime_settings(
-                "chat-model",
-                Some("openai/gpt-5.5".into()),
-                Some("high".into()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            chat_session_pinned_model(&store, "chat-model").await,
-            Some("openai/gpt-5.5".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_turn_model_change_refreshes_model_metadata() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+    async fn primary_agent_model_drives_turn_configuration() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentPermissions, AgentProfile, AgentSnapshot,
+            AgentTools,
+        };
         use testutil::RecordingLlm;
 
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(RecordingLlm::new(vec![]));
-        let deps = deps_at(dir.path(), llm).await;
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.primary_agent = Arc::new(AgentSnapshot {
+            profile: AgentProfile {
+                schema_version: 1,
+                id: "primary".into(),
+                name: "Primary".into(),
+                description: String::new(),
+                avatar: AgentAvatar {
+                    color: "blue".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/model-b".into(),
+                    effort: Some("high".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::Default,
+                    rules: vec![],
+                },
+                skills: vec![],
+                tools: AgentTools {
+                    native: vec![],
+                    plugins: vec![],
+                    apps: vec![],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            },
+            executable: true,
+            validation: vec![],
+        });
+        deps.model = Some("anthropic/model-b".into());
         add_anthropic_conn(&deps.store, &["model-b"]).await;
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-        deps.store
-            .update_session_runtime_settings(
-                "s1",
-                Some("anthropic/model-b".into()),
-                Some("high".into()),
-            )
-            .await
-            .unwrap();
         deps.store
             .set_setting_raw(
                 "models.meta.anthropic/model-b",
@@ -2454,6 +2372,10 @@ mod tests {
         let refreshed = refresh_turn_configuration(&deps).await;
         assert_eq!(refreshed.model.as_deref(), Some("anthropic/model-b"));
         assert_eq!(refreshed.meta.context_window, 222_222);
+        assert_eq!(
+            refreshed.turn_effort_policy.project_override.as_deref(),
+            Some("high")
+        );
     }
     use crate::store::Store;
 
@@ -2512,8 +2434,24 @@ mod tests {
             store.clone(),
             knowledge,
         ));
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
+        let delegation = crate::delegation::DelegationRuntime::new(
+            store.clone(),
+            persistence.registry,
+            events.clone(),
+        );
         RunnerDeps {
             session_pk: "s1".into(),
+            primary_agent,
+            run_id: "r1".into(),
+            delegation,
             main_agent_id: "ryuzi".into(),
             learning_queue,
             kind: SessionKind::Chat,

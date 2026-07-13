@@ -10,13 +10,8 @@ use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
-// Cockpit's DTOs for these now live in `ryuzi_core::api::types`; only
-// `ChatRequestOptions` is referenced by name here (as a command param), but
-// specta's TS generation walks the type graph from every collected command,
-// so `ChatContextArg`/`GitOptions` are still emitted to `bindings.ts` as
-// fields of `ChatRequestOptions` without needing a local import.
-pub use ryuzi_core::api::types::ChatRequestOptions;
-pub use ryuzi_core::api::types::SessionRuntimeInfo;
+// Cockpit's DTOs for these now live in `ryuzi_core::api::types`.
+pub use ryuzi_core::api::types::{SessionRuntimeInfo, TurnInput};
 
 type R<T> = Result<T, CmdError>;
 // The old in-process `ControlPlane` state extractor is gone: every engine
@@ -356,15 +351,17 @@ pub async fn start_session(
     engine: Engine<'_>,
     runner_id: Option<String>,
     project_id: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: String,
+    turn: TurnInput,
 ) -> R<Session> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "start_session",
             serde_json::json!({
-                "project_id": project_id, "prompt": prompt, "options": options,
+                "project_id": project_id,
+                "primary_agent_id": primary_agent_id,
+                "turn": turn,
             }),
         )
         .await
@@ -375,14 +372,14 @@ pub async fn start_session(
 pub async fn start_chat_session(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: String,
+    turn: TurnInput,
 ) -> R<Session> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "start_chat_session",
-            serde_json::json!({ "prompt": prompt, "options": options }),
+            serde_json::json!({ "primary_agent_id": primary_agent_id, "turn": turn }),
         )
         .await
 }
@@ -393,16 +390,30 @@ pub async fn continue_session(
     engine: Engine<'_>,
     runner_id: Option<String>,
     session_pk: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    turn: TurnInput,
 ) -> R<()> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "continue_session",
-            serde_json::json!({
-                "session_pk": session_pk, "prompt": prompt, "options": options,
-            }),
+            serde_json::json!({ "session_pk": session_pk, "turn": turn }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_agent_sessions(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    agent_id: String,
+    limit: u32,
+) -> R<Vec<Session>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "list_agent_sessions",
+            serde_json::json!({ "agent_id": agent_id, "limit": limit }),
         )
         .await
 }

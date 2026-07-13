@@ -362,6 +362,29 @@ fn temp_db_path() -> (tempfile::NamedTempFile, std::path::PathBuf) {
 
 async fn test_control_plane(store: Store, registries: Registries) -> Arc<ControlPlane> {
     let store = Arc::new(store);
+    crate::llm_router::connections::add_connection(
+        &store,
+        crate::llm_router::connections::ConnectionRow {
+            id: "test-anthropic".into(),
+            provider: "anthropic".into(),
+            auth_type: "api_key".into(),
+            label: "Test Anthropic".into(),
+            priority: 0,
+            enabled: true,
+            data: crate::llm_router::connections::ConnectionData {
+                api_key: Some("test-key".into()),
+                models_override: Some(vec!["claude-opus-4-8".into()]),
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .await
+    .unwrap();
+    crate::agents::bootstrap::ensure_default_routes(&store)
+        .await
+        .unwrap();
     let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
         .await
         .unwrap();
@@ -399,22 +422,219 @@ async fn test_control_plane_full(
 }
 
 #[tokio::test]
+async fn recent_sessions_filter_by_stable_owner_and_sort_by_last_activity_with_a_clamped_limit() {
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let snapshot = crate::domain::AgentIdentitySnapshot {
+        id: "ada".into(),
+        name: "Ada".into(),
+        avatar_color: "violet".into(),
+    };
+    for (session_pk, agent_id, last_active) in [
+        ("old", "ada", 10),
+        ("new", "ada", 30),
+        ("middle", "ada", 20),
+        ("other", "bob", 40),
+    ] {
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: session_pk.into(),
+                primary_agent_id: Some(agent_id.into()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: agent_id.into(),
+                    ..snapshot.clone()
+                }),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(last_active),
+                last_active: Some(last_active),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let all = cp.list_agent_sessions("ada", 50).await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|session| session.session_pk.as_str())
+            .collect::<Vec<_>>(),
+        vec!["new", "middle", "old"],
+    );
+    assert_eq!(cp.list_agent_sessions("ada", 0).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_run_per_turn() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let agent_id = cp.registry().default_agent_id().await;
+
+    let session = cp
+        .start_agent_session_with_prompt(
+            None,
+            &agent_id,
+            TurnPrompt::text("first", "first"),
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.primary_agent_id.as_deref(), Some(agent_id.as_str()));
+    let creation_identity = session.primary_agent_snapshot.clone().unwrap();
+    let profile = cp
+        .registry()
+        .resolved_snapshot(&agent_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: "Renamed primary".into(),
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: profile.tools,
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+
+    let run_id = cp
+        .continue_agent_session_with_prompt(
+            &session.session_pk,
+            TurnPrompt::text("second", "second"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|run| run.parent_run_id.is_none()));
+    assert!(runs
+        .iter()
+        .all(|run| run.agent_kind == crate::domain::AgentRunKind::Primary));
+    assert!(runs.iter().any(|run| run.run_id == run_id));
+    assert_eq!(
+        store
+            .get_session(&session.session_pk)
+            .await
+            .unwrap()
+            .unwrap()
+            .primary_agent_snapshot,
+        Some(creation_identity),
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn agent_session_continuation_rejects_non_executable_owners_before_user_message() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let now = now_ms();
+    for (session_pk, primary_agent_id, primary_agent_snapshot) in [
+        ("legacy", None, None),
+        (
+            "deleted",
+            Some("deleted"),
+            Some(crate::domain::AgentIdentitySnapshot {
+                id: "deleted".into(),
+                name: "Deleted".into(),
+                avatar_color: "gray".into(),
+            }),
+        ),
+        ("invalid", Some("ryuzi"), None),
+    ] {
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: session_pk.into(),
+                primary_agent_id: primary_agent_id.map(str::to_string),
+                primary_agent_snapshot,
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(cp
+            .continue_agent_session_with_prompt(
+                session_pk,
+                TurnPrompt::text("must not persist", "must not persist"),
+                &[],
+            )
+            .await
+            .is_err());
+        assert!(store.list_messages(session_pk).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime() {
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let cp = test_control_plane(store, Registries::new()).await;
-    let registry = cp.registry();
-    let snapshot = registry
-        .resolved_snapshot(&registry.default_agent_id().await)
-        .await
-        .unwrap();
+    let agent_id = cp.registry().default_agent_id().await;
+    let snapshot = cp.registry().resolved_snapshot(&agent_id).await.unwrap();
     cp.store()
-        .with_conn(|connection| {
-            connection.execute(
-                "INSERT INTO sessions(session_pk,status,perm_mode,kind,branch_owned,resume_attempts) VALUES ('delegation','idle','default','chat',0,0)",
-                [],
-            )?;
-            Ok(())
+        .insert_session(Session {
+            session_pk: "delegation".into(),
+            primary_agent_id: Some(agent_id.clone()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: snapshot.profile.id.clone(),
+                name: snapshot.profile.name.clone(),
+                avatar_color: snapshot.profile.avatar.color.clone(),
+            }),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: SessionStatus::Idle,
+            perm_mode: PermMode::Default,
+            started_by: None,
+            created_at: None,
+            last_active: None,
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         })
         .await
         .unwrap();
@@ -424,7 +644,7 @@ async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime()
         .begin_primary("delegation", snapshot, "task")
         .await
         .unwrap();
-    assert_eq!(run.run.primary_agent_id, registry.default_agent_id().await);
+    assert_eq!(run.run.primary_agent_id, agent_id);
     drop(db_guard);
 }
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
@@ -689,8 +909,12 @@ async fn seed_session(
     store
         .insert_session(Session {
             session_pk: session_pk.to_string(),
-            primary_agent_id: None,
-            primary_agent_snapshot: None,
+            primary_agent_id: Some("ryuzi".into()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: "ryuzi".into(),
+                name: "Ryuzi".into(),
+                avatar_color: "violet".into(),
+            }),
             project_id: Some(project_id.to_string()),
             agent_session_id: agent_session_id.map(|s| s.to_string()),
             worktree_path: None,
@@ -1464,8 +1688,12 @@ async fn resume_session_resumes_a_chat_session() {
     store
         .insert_session(Session {
             session_pk: "chat-1".to_string(),
-            primary_agent_id: None,
-            primary_agent_snapshot: None,
+            primary_agent_id: Some("ryuzi".into()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: "ryuzi".into(),
+                name: "Ryuzi".into(),
+                avatar_color: "violet".into(),
+            }),
             project_id: None,
             agent_session_id: Some("agent-1".to_string()),
             worktree_path: None,
@@ -1756,6 +1984,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         TurnPrompt::text("go", "go"),
         Vec::new(),
         &cancel,
+        None,
     )
     .await;
 
@@ -2911,10 +3140,17 @@ async fn provision_project_named_route_legacy_effort_requires_no_target_preferen
     )
     .await
     .unwrap();
+    let existing_smart = crate::llm_router::routes::list_model_routes(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|route| route.name == "smart");
     crate::llm_router::routes::save_model_route(
         &store,
         crate::llm_router::routes::ModelRouteInfo {
-            id: "smart-route".into(),
+            id: existing_smart
+                .map(|route| route.id)
+                .unwrap_or_else(|| "smart-route".into()),
             name: "smart".into(),
             enabled: true,
             strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,

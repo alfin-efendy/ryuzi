@@ -30,6 +30,7 @@ fn make_builder() -> Builder<tauri::Wry> {
         .commands(collect_commands![
             commands::list_projects,
             commands::list_sessions,
+            commands::list_agent_sessions,
             commands::list_messages,
             commands::connect_project,
             commands::clone_project,

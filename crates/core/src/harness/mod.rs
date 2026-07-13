@@ -13,6 +13,12 @@ use tokio::sync::broadcast;
 /// (Spec 3 wiring) and passed to `Harness::start_session`.
 pub struct SessionCtx {
     pub session_pk: String,
+    /// The immutable resolved primary profile driving this harness instance.
+    pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
+    /// The root primary run associated with this dispatched turn.
+    pub run_id: String,
+    /// Shared lifecycle for this session's primary/delegated runs.
+    pub delegation: Arc<crate::delegation::DelegationRuntime>,
     /// Temporary Plan 2 identity seam. Plan 4 replaces default selection with
     /// the session's persisted owner while retaining this boundary.
     pub main_agent_id: String,
@@ -210,8 +216,24 @@ mod tests {
             store.clone(),
             knowledge.clone(),
         ));
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
+        let delegation = crate::delegation::DelegationRuntime::new(
+            store.clone(),
+            persistence.registry,
+            events.clone(),
+        );
         SessionCtx {
             session_pk: "s1".into(),
+            primary_agent,
+            run_id: "r1".into(),
+            delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: SessionKind::Chat,

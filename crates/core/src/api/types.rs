@@ -45,19 +45,25 @@ impl From<GitOptions> for SessionGitOptions {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMention {
+    pub agent_id: String,
+    pub label_snapshot: String,
+    pub start_utf16: u32,
+    pub end_utf16: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct ChatRequestOptions {
-    pub model: Option<String>,
-    pub effort: Option<String>,
+pub struct TurnInput {
+    pub text: String,
+    #[serde(default)]
+    pub mentions: Vec<AgentMention>,
     pub context: Option<ChatContextArg>,
     #[serde(default)]
     pub attachments: Vec<String>,
-    /// None => engine default (worktree ON, new engine-named branch from HEAD).
     pub git: Option<GitOptions>,
-    /// Initial permission mode for the session being started (new-chat
-    /// picker). `None` ⇒ inherit the project default.
-    pub perm_mode: Option<crate::domain::PermMode>,
 }
 
 pub(crate) fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
@@ -1100,6 +1106,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_mention_and_turn_input_use_camel_case_fields() {
+        let turn: TurnInput = serde_json::from_value(serde_json::json!({
+            "text": "ask Ada",
+            "mentions": [{
+                "agentId": "ada",
+                "labelSnapshot": "Ada",
+                "startUtf16": 4,
+                "endUtf16": 7
+            }],
+            "attachments": []
+        }))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&turn.mentions[0]).unwrap(),
+            serde_json::json!({
+                "agentId": "ada",
+                "labelSnapshot": "Ada",
+                "startUtf16": 4,
+                "endUtf16": 7
+            })
+        );
+    }
+
+    #[test]
     fn chat_agent_prompt_appends_context_without_changing_display_text() {
         let out = chat_agent_prompt(
             "/review auth",
@@ -1125,38 +1156,6 @@ mod tests {
         );
         assert!(out.contains("- Referenced file: src/main.rs"));
         assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
-    }
-
-    #[test]
-    fn chat_request_options_deserializes_model_and_ignores_legacy_runtime_id() {
-        // Native-only: a legacy `runtimeId` key is accepted but ignored.
-        let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
-                .unwrap();
-        assert_eq!(opts.model.as_deref(), Some("fable"));
-    }
-
-    #[test]
-    fn chat_request_options_git_defaults_to_none_and_deserializes() {
-        // Old payloads (no `git` key) keep parsing.
-        let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"model": "fable"})).unwrap();
-        assert!(opts.git.is_none());
-
-        let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({
-            "git": {
-                "useWorktree": false,
-                "createBranch": true,
-                "branchName": "feat/x",
-                "baseBranch": null
-            }
-        }))
-        .unwrap();
-        let git = opts.git.unwrap();
-        assert!(!git.use_worktree);
-        assert!(git.create_branch);
-        assert_eq!(git.branch_name.as_deref(), Some("feat/x"));
-        assert_eq!(git.base_branch, None);
     }
 
     #[test]
