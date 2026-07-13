@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_34_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_35_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1068,7 +1068,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_34_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_35_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1123,7 +1123,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_34_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_35_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -6213,7 +6213,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 34, "forward migration must land at v34");
+        assert_eq!(user_version, 35, "forward migration must land at v35");
     }
 
     #[tokio::test]
@@ -6519,16 +6519,12 @@ mod tests {
 
     #[tokio::test]
     async fn migration_21_drops_the_runtime_concept() {
-        // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
-        // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back fourteen, and reopen so 21 (and the tail
-        // migrations 22–34) replay against it. Back FOURTEEN: the fully
-        // migrated tail is now v34, so rewinding to v20 is what makes
-        // migration 21 (native-only) replay.
+        // Set user_version to the exact predecessor so migration 21 (and the
+        // later migrations) replay against it without depending on the number
+        // of migrations currently at the tail.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
-            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 14)
+            c.pragma_update(None, "user_version", 20)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6666,7 +6662,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 34, "forward migration must land at v34");
+        assert_eq!(uv, 35, "forward migration must land at v35");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6692,7 +6688,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 34, "forward migration must land at v34");
+        assert_eq!(uv, 35, "forward migration must land at v35");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
