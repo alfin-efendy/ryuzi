@@ -821,6 +821,13 @@ pub enum CoreEvent {
     SessionEnded {
         session_pk: String,
     },
+    /// A delegation run changed after its persisted status commit.
+    AgentRunChanged {
+        session_pk: String,
+        run_id: String,
+        parent_run_id: Option<String>,
+        status: String,
+    },
     /// A scheduled job run started or finished (status: running|success|failed).
     JobRunChanged {
         job_id: String,

@@ -253,10 +253,15 @@ pub(crate) mod tests {
     /// store's pooled connections need a real path, not `:memory:`).
     pub async fn test_cp_with_catalog() -> std::sync::Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         crate::plugins::install_builtins(&mut regs);
-        ControlPlane::new(store, regs).await
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        }
     }
 
     /// A manifest-only plugin (no harness/gateway/connector capability)
@@ -298,11 +303,16 @@ pub(crate) mod tests {
     /// conflict has to come from synthetic plugins like these two).
     async fn test_cp_with_slot_conflict() -> std::sync::Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         regs.add_plugin(manifest_only_with_slot("mem0", "memory"));
         regs.add_plugin(manifest_only_with_slot("cavemem", "memory"));
-        ControlPlane::new(store, regs).await
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        }
     }
 
     #[tokio::test]
@@ -514,10 +524,16 @@ pub(crate) mod tests {
         /// `cp.extension_host()` directly.
         async fn test_cp_with_enabled_extension_plugin(id: &str) -> std::sync::Arc<ControlPlane> {
             let tmp = tempfile::NamedTempFile::new().unwrap();
-            let store = crate::store::Store::open(tmp.path()).await.unwrap();
+            let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
             let mut regs = Registries::new();
             regs.add_plugin(extension_plugin(id));
-            let cp = ControlPlane::new(store, regs).await;
+            let cp = {
+                let persistence =
+                    crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                        .await
+                        .unwrap();
+                ControlPlane::new(store, regs, persistence).await
+            };
             cp.store()
                 .set_setting_raw(&format!("plugin.{id}.enabled"), "true")
                 .await
@@ -645,11 +661,17 @@ pub(crate) mod tests {
             // `not-running` to mean anything (see `extensions_active`'s doc
             // on `plugin_doctor`).
             let tmp = tempfile::NamedTempFile::new().unwrap();
-            let store = crate::store::Store::open(tmp.path()).await.unwrap();
+            let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
             let mut regs = Registries::new();
             regs.add_plugin(extension_plugin("unspawned-ext"));
             regs.add_plugin(extension_plugin("sibling-ext"));
-            let cp = ControlPlane::new(store, regs).await;
+            let cp = {
+                let persistence =
+                    crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                        .await
+                        .unwrap();
+                ControlPlane::new(store, regs, persistence).await
+            };
             cp.store()
                 .set_setting_raw("plugin.unspawned-ext.enabled", "true")
                 .await

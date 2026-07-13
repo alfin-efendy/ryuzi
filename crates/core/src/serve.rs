@@ -659,8 +659,13 @@ mod tests {
 
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-        ControlPlane::new(store, Registries::new()).await
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, Registries::new(), persistence).await
+        }
     }
 
     /// The control token every test `ApiState` uses — there is no
@@ -679,7 +684,6 @@ mod tests {
         )
         .await
         .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         std::mem::forget(config);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -739,7 +743,7 @@ mod tests {
     /// exercise.
     async fn test_cp_with_plugins() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         crate::plugins::install_builtins(&mut regs);
         regs.add_plugin(CorePlugin {
@@ -750,7 +754,12 @@ mod tests {
             extension: None,
             source: PluginSource::Builtin,
         });
-        ControlPlane::new(store, regs).await
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        }
     }
 
     #[tokio::test]

@@ -243,11 +243,13 @@ mod tests {
         harness: Arc<dyn HarnessFactory>,
     ) -> (Arc<ControlPlane>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(db.path()).await.unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
         let mut regs = Registries::new();
         regs.harness = harness;
-        let cp = ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = ControlPlane::new(store, regs, persistence).await;
         (cp, db)
     }
 

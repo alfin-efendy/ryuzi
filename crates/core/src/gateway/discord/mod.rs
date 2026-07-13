@@ -723,8 +723,14 @@ mod tests {
 
     async fn minimal_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        ControlPlane::new(store, Registries::new()).await
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        {
+            let persistence =
+                crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+                    .await
+                    .unwrap();
+            ControlPlane::new(store, Registries::new(), persistence).await
+        }
     }
 
     // ---------- Test 1: output methods delegate to the port ----------
@@ -970,17 +976,20 @@ mod tests {
         tempfile::NamedTempFile,
     ) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(db_guard.path()).await.unwrap();
+        let store = Arc::new(Store::open(db_guard.path()).await.unwrap());
         let mut regs = Registries::new();
         regs.harness = Arc::new(OneShotHarnessFactory);
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
         let cp = ControlPlane::new_full(
-            Arc::new(store),
+            store.clone(),
             regs,
             Arc::new(NoopTelemetry),
             Arc::new(StubFetcher),
+            persistence,
         )
         .await;
-        cp.attach_test_agent_persistence().await;
         let store_ref = cp.store().clone();
         SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())

@@ -51,6 +51,7 @@ pub struct AgentBootstrap {
     pub reason: BootstrapReason,
 }
 
+#[derive(Clone)]
 pub struct AgentPersistence {
     pub registry: Arc<AgentRegistry>,
     pub knowledge: Arc<AgentKnowledgeStore>,
@@ -66,6 +67,12 @@ pub struct AgentPersistenceHandles {
 }
 
 impl AgentPersistence {
+    /// Builds an isolated persistence graph for tests and short-lived embedding hosts.
+    /// The temporary root is intentionally outside the user's configuration directory.
+    pub async fn temporary(store: Arc<Store>) -> anyhow::Result<Self> {
+        initialize_agent_persistence(tempfile::tempdir()?.keep(), store).await
+    }
+
     pub fn handles(&self) -> AgentPersistenceHandles {
         AgentPersistenceHandles {
             registry: self.registry.clone(),

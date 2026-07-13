@@ -468,7 +468,14 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
         std::mem::forget(tmp);
-        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        let cp = {
+            let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(
+                std::sync::Arc::new(store.clone()),
+            )
+            .await
+            .unwrap();
+            ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new(), persistence).await
+        };
         let persistence = ryuzi_core::agents::bootstrap::initialize_agent_persistence(
             tempfile::tempdir().unwrap().keep(),
             cp.store().clone(),
@@ -657,7 +664,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("ryuzi.sqlite");
         let store = ryuzi_core::Store::open(&db_path).await.unwrap();
-        let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        let cp = {
+            let persistence = ryuzi_core::agents::bootstrap::AgentPersistence::temporary(
+                std::sync::Arc::new(store.clone()),
+            )
+            .await
+            .unwrap();
+            ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new(), persistence).await
+        };
         let material = ryuzi_core::tls::load_or_generate(tmp.path()).unwrap();
         let tls_cfg = ryuzi_core::tls::server_config(&material).unwrap();
         let store_handle = cp.store().clone();

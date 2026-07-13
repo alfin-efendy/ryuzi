@@ -360,18 +360,12 @@ fn temp_db_path() -> (tempfile::NamedTempFile, std::path::PathBuf) {
     (f, path)
 }
 
-/// Attach the same YAML/OKF persistence graph production composition roots
-/// install before starting sessions. Control-plane unit tests use isolated
-/// config roots so they exercise the real session dependency without touching
-/// the operator's config directory.
-async fn attach_test_agent_persistence(cp: &Arc<ControlPlane>) {
-    cp.attach_test_agent_persistence().await;
-}
-
 async fn test_control_plane(store: Store, registries: Registries) -> Arc<ControlPlane> {
-    let cp = ControlPlane::new(store, registries).await;
-    attach_test_agent_persistence(&cp).await;
-    cp
+    let store = Arc::new(store);
+    let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+        .await
+        .unwrap();
+    ControlPlane::new(store, registries, persistence).await
 }
 
 async fn test_control_plane_with_telemetry(
@@ -379,9 +373,10 @@ async fn test_control_plane_with_telemetry(
     registries: Registries,
     telemetry: Arc<dyn crate::telemetry::Telemetry>,
 ) -> Arc<ControlPlane> {
-    let cp = ControlPlane::new_with_telemetry(store, registries, telemetry).await;
-    attach_test_agent_persistence(&cp).await;
-    cp
+    let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+        .await
+        .unwrap();
+    ControlPlane::new_with_telemetry(store, registries, telemetry, persistence).await
 }
 
 async fn test_control_plane_full(
@@ -390,11 +385,48 @@ async fn test_control_plane_full(
     telemetry: Arc<dyn crate::telemetry::Telemetry>,
     attachment_fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
 ) -> Arc<ControlPlane> {
-    let cp = ControlPlane::new_full(store, registries, telemetry, attachment_fetcher).await;
-    attach_test_agent_persistence(&cp).await;
-    cp
+    let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+        .await
+        .unwrap();
+    ControlPlane::new_full(
+        store,
+        registries,
+        telemetry,
+        attachment_fetcher,
+        persistence,
+    )
+    .await
 }
 
+#[tokio::test]
+async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let cp = test_control_plane(store, Registries::new()).await;
+    let registry = cp.registry();
+    let snapshot = registry
+        .resolved_snapshot(&registry.default_agent_id().await)
+        .await
+        .unwrap();
+    cp.store()
+        .with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO sessions(session_pk,status,perm_mode,kind,branch_owned,resume_attempts) VALUES ('delegation','idle','default','chat',0,0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let run = cp
+        .delegation()
+        .begin_primary("delegation", snapshot, "task")
+        .await
+        .unwrap();
+    assert_eq!(run.run.primary_agent_id, registry.default_agent_id().await);
+    drop(db_guard);
+}
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
 /// the cold-resume rollback path in `continue_session`.
 struct FailingHarnessFactory;
@@ -2586,7 +2618,7 @@ async fn provision_project_git_url_flow_derives_name_and_records_source() {
     std::fs::create_dir_all(&upstream_dir).unwrap();
     init_repo(&upstream_dir);
 
-    let git_url = format!("{}/.git", upstream_dir.display());
+    let git_url = format!("{}/.git", upstream_dir.display()).replace('\\', "/");
     let mut req = provision_req("fake", "ws1", "u1");
     req.git_url = Some(git_url.clone());
     // A trailing "/.git" strips to the parent dir name ("upstream-repo") via basename.

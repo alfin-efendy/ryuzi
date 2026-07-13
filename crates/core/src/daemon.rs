@@ -345,10 +345,14 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         registries.harness = factory;
     }
 
-    let cp =
-        ControlPlane::new_with_telemetry(Arc::clone(&store), registries, Arc::clone(&telemetry))
-            .await;
-    cp.attach_agent_persistence(persistence.handles())?;
+    let cp = ControlPlane::new_with_telemetry(
+        Arc::clone(&store),
+        registries,
+        Arc::clone(&telemetry),
+        persistence.clone(),
+    )
+    .await;
+    cp.delegation().recover_after_restart().await?;
     let settings = SettingsStore::new(Arc::clone(&store));
 
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
@@ -700,10 +704,15 @@ mod tests {
         telemetry: Arc<dyn Telemetry>,
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let (guard, path) = temp_db_path();
-        let store = Store::open(&path).await.unwrap();
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), Registries::new(), telemetry).await;
-        let store = cp.store().clone();
+        let store = Arc::new(Store::open(&path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            Registries::new(),
+            telemetry,
+            persistence,
+        )
+        .await;
         (cp, store, guard)
     }
 
@@ -1261,14 +1270,15 @@ mod tests {
     #[tokio::test]
     async fn daemon_start_rolls_back_started_gateways_and_aborts_handles_on_later_failure() {
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
         let cp = ControlPlane::new_with_telemetry(
-            Arc::new(store),
+            store.clone(),
             Registries::new(),
             Arc::new(NoopTelemetry),
+            persistence.clone(),
         )
         .await;
-        let store = cp.store().clone();
 
         let gw_a = FakeGateway::new("gw-a", GwBehavior::Allow);
         let stops_a = gw_a.stops.clone();
@@ -1314,8 +1324,6 @@ mod tests {
             }
         });
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
@@ -1469,13 +1477,17 @@ mod tests {
     async fn approval_fanout_allows_a_blocked_turn_to_complete_end_to_end() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
         let mut regs = Registries::new();
         regs.harness = Arc::new(PermFakeHarnessFactory);
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        cp.attach_test_agent_persistence().await;
-        let store = cp.store().clone();
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
 
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -1620,21 +1632,24 @@ mod tests {
     async fn approval_fanout_times_out_plan_kind_requests_to_cancel() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
         // Keep the test fast: the fan-out's own timeout — not any gateway or
         // `handle_approval` call — must be what resolves this.
-        SettingsStore::new(Arc::new(store))
+        SettingsStore::new(store.clone())
             .set("approval_timeout_ms", "50")
             .await
             .unwrap();
-        let store = Store::open(&db_path).await.unwrap();
 
         let mut regs = Registries::new();
         regs.harness = Arc::new(PlanFakeHarnessFactory);
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        cp.attach_test_agent_persistence().await;
-        let store = cp.store().clone();
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
 
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -1736,15 +1751,20 @@ mod tests {
     #[tokio::test]
     async fn daemon_start_fires_reconcile_and_resumes_running_sessions() {
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let mut regs = Registries::new();
         regs.harness = Arc::new(ResumeFakeHarnessFactory {
             prompts: prompts.clone(),
         });
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        let store = cp.store().clone();
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence.clone(),
+        )
+        .await;
         seed_project(&store, "p1").await;
         let now = crate::paths::now_ms();
         store
@@ -1772,8 +1792,6 @@ mod tests {
             .await
             .unwrap();
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
@@ -1813,14 +1831,15 @@ mod tests {
     #[tokio::test]
     async fn daemon_stop_is_idempotent_and_stops_each_gateway_once() {
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
         let cp = ControlPlane::new_with_telemetry(
-            Arc::new(store),
+            store.clone(),
             Registries::new(),
             Arc::new(NoopTelemetry),
+            persistence.clone(),
         )
         .await;
-        let store = cp.store().clone();
 
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let stops = gw.stops.clone();
@@ -1865,8 +1884,6 @@ mod tests {
             }
         });
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
@@ -2211,7 +2228,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let persistence = daemon.cp.agent_persistence().unwrap();
+        let persistence = daemon.cp.agent_persistence();
         assert!(Arc::ptr_eq(&daemon.agents, &persistence.registry));
         assert!(Arc::ptr_eq(&daemon.agent_knowledge, &persistence.knowledge));
         assert!(Arc::ptr_eq(&daemon.learning_queue, &persistence.learning));

@@ -1007,9 +1007,7 @@ impl ControlPlane {
             SessionKind::Project | SessionKind::Chat => Some(self.build_app_control()),
             SessionKind::Worker | SessionKind::Review => None,
         };
-        let persistence = self.agent_persistence().ok_or_else(|| {
-            anyhow::anyhow!("agent persistence was not attached to the control plane")
-        })?;
+        let persistence = self.agent_persistence();
         let main_agent_id = persistence.registry.default_agent_id().await;
         let ctx = SessionCtx {
             session_pk: session_pk.to_string(),
@@ -1479,9 +1477,7 @@ impl ControlPlane {
             crate::llm_router::model_effort::build_utility_effort_policy(&store, &model).await?;
         let llm = self.review_llm_factory().create(store.clone());
 
-        let persistence = self.agent_persistence().ok_or_else(|| {
-            anyhow::anyhow!("agent persistence was not attached to the control plane")
-        })?;
+        let persistence = self.agent_persistence();
         let deps = RunnerDeps {
             session_pk: review_pk.clone(),
             main_agent_id: persistence.registry.default_agent_id().await,

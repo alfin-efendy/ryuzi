@@ -150,17 +150,16 @@ pub(crate) mod tests_support {
     /// since each test process exits shortly after.
     pub(crate) async fn state() -> ApiState {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            cp.store().clone(),
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = crate::control::ControlPlane::new(
+            store,
+            crate::plugins::Registries::new(),
+            persistence.clone(),
         )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
-        std::mem::forget(config);
+        .await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -184,7 +183,7 @@ pub(crate) mod tests_support {
             self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         for name in ["smart", "fast"] {
             routes::save_model_route(
                 &store,
@@ -205,16 +204,15 @@ pub(crate) mod tests_support {
             .await
             .unwrap();
         }
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            cp.store().clone(),
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = crate::control::ControlPlane::new(
+            store,
+            crate::plugins::Registries::new(),
+            persistence.clone(),
         )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
-        std::mem::forget(config);
+        .await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -301,19 +299,13 @@ pub(crate) mod tests_support {
         std::mem::forget(dir);
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let mut registries = crate::plugins::Registries::new();
         registries.harness = Arc::new(FakeHarnessFactory);
-        let cp = crate::control::ControlPlane::new(store, registries).await;
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            cp.store().clone(),
-        )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
-        std::mem::forget(config);
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = crate::control::ControlPlane::new(store, registries, persistence.clone()).await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(

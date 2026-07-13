@@ -226,12 +226,19 @@ mod tests {
     /// fakes, which aren't visible from a sibling module.
     async fn test_control_plane() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         // Keep the backing file alive for the process; the test's OS temp
         // dir is cleaned up on process exit either way (same shortcut
         // `crate::orch::tests`' own harness-plumbing helper uses).
         std::mem::forget(tmp);
-        ControlPlane::new(store, crate::plugins::Registries::new()).await
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(
+                std::sync::Arc::clone(&store),
+            )
+            .await
+            .unwrap();
+            ControlPlane::new(store, crate::plugins::Registries::new(), persistence).await
+        }
     }
 
     #[tokio::test]

@@ -907,8 +907,14 @@ mod tests {
     #[tokio::test]
     async fn tick_records_scheduler_liveness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(store, crate::plugins::Registries::new(), persistence)
+                .await
+        };
         tick(&cp).await;
         let val = cp
             .store()
@@ -922,7 +928,7 @@ mod tests {
     #[tokio::test]
     async fn job_and_run_crud_roundtrip() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
 
         let job = JobRow {
             id: "j1".into(),
@@ -1013,7 +1019,7 @@ mod tests {
     #[tokio::test]
     async fn job_model_override_roundtrips() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
         let mut job = sample_job("j-mo");
         job.model_override = Some("cheap/haiku".into());
         upsert_job(&store, job.clone()).await.unwrap();
@@ -1151,11 +1157,15 @@ mod tests {
     async fn completed_job_delivers_to_its_home_session_via_rail() {
         let _guard = SchedulerStateDirGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
         let mut regs = crate::plugins::Registries::new();
         regs.harness = std::sync::Arc::new(FakeJobHarnessFactory);
-        let cp = crate::control::ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
 
         // A non-git project the job runs against — the fake harness needs no
         // real repo, so any workdir will do.

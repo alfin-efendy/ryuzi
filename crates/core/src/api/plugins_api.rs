@@ -1883,7 +1883,7 @@ mod tests {
         // installed-ness must track `enabled` — otherwise it could never leave
         // Browse. `gateway_only` builds a manifest with empty `settings`.
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let plugin = gateway_only("bare-gateway");
         let ctx = InstalledCtx {
             connections: vec![],
@@ -2000,12 +2000,17 @@ mod tests {
     #[tokio::test]
     async fn assemble_list_enriches_remote_catalog_plugin_with_blocked_reason() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         let mut plugin = gateway_only("acme-remote");
         plugin.source = PluginSource::RemoteCatalog;
         regs.add_plugin(plugin);
-        let cp = ControlPlane::new(store, regs).await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
 
         cp.store()
             .upsert_remote_catalog(&[crate::store::RemoteCatalogRow {
@@ -2072,7 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn build_settings_info_carries_kind_options_and_default() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let fields = vec![
             SettingField {
                 key: "plugin.acme.tier".to_string(),
@@ -2142,7 +2147,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_oauth_authorize_url_uses_pkce_scopes_and_client_id_from_settings() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         store
             .set_setting_raw("plugin.acme.client_id", "acme-client-123")
             .await
@@ -2205,7 +2210,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_plugin_oauth_orders_row_then_setting_then_external_auth_setting() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         store
             .set_setting_raw("plugin.gw.client_id", "setting-client")
             .await
@@ -2273,7 +2278,7 @@ mod tests {
     #[tokio::test]
     async fn begin_result_prefers_table_endpoints_over_manifest() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         store
             .upsert_plugin_oauth_client(&PluginOauthClient {
                 plugin_id: "acme-table".into(),
@@ -2352,7 +2357,7 @@ mod tests {
 
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         // Mirror the composition root: the `discord` gateway and the `native`
         // runtime are registered explicitly before `install_builtins` adds
@@ -2361,7 +2366,13 @@ mod tests {
         regs.add_plugin(crate::plugins::builtin::discord_plugin());
         regs.add_plugin(crate::harness::native::native_plugin());
         crate::plugins::install_builtins(&mut regs);
-        ControlPlane::new(store, regs).await
+        {
+            let persistence =
+                crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+                    .await
+                    .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        }
     }
 
     #[tokio::test]

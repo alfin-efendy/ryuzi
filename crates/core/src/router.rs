@@ -352,6 +352,7 @@ impl Router {
             }
             CoreEvent::SessionCreated { .. }
             | CoreEvent::ApprovalRequested { .. }
+            | CoreEvent::AgentRunChanged { .. }
             | CoreEvent::JobRunChanged { .. }
             | CoreEvent::OrchTaskChanged { .. }
             // Context telemetry has no Discord rendering (yet) — the
@@ -571,9 +572,13 @@ mod tests {
     /// after the path is unlinked.
     async fn test_control_plane() -> (Arc<ControlPlane>, Arc<Store>) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        let cp = ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        cp.attach_test_agent_persistence().await;
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, crate::plugins::Registries::new(), persistence).await
+        };
         let store_ref = cp.store().clone();
         (cp, store_ref)
     }
@@ -934,11 +939,15 @@ mod tests {
         harness: Arc<dyn crate::harness::HarnessFactory>,
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(db_guard.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(db_guard.path()).await.unwrap());
         let mut regs = crate::plugins::Registries::new();
         regs.harness = harness;
-        let cp = ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
         let store_ref = cp.store().clone();
         crate::settings::SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())

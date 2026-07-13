@@ -1676,7 +1676,7 @@ mod tests {
                 .unwrap();
         }
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         std::mem::forget(tmp);
         store
             .insert_project(crate::domain::Project {
@@ -1694,8 +1694,13 @@ mod tests {
             .unwrap();
         let mut regs = crate::plugins::Registries::new();
         regs.harness = Arc::new(EchoHarnessFactory);
-        let cp = ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let cp = {
+            let persistence =
+                crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+                    .await
+                    .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
         (cp, repo)
     }
 

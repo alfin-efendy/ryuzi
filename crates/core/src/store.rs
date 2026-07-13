@@ -4232,6 +4232,17 @@ impl Store {
         .await
     }
 
+    pub async fn insert_primary_agent_run(&self, run: NewAgentRun) -> anyhow::Result<AgentRun> {
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            validate_agent_run(&tx, &run, true)?;
+            let stored = insert_agent_run_row(&tx, run)?;
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+    }
+
     pub async fn insert_agent_run(&self, run: NewAgentRun) -> anyhow::Result<AgentRun> {
         self.with_conn(move |c| {
             let tx = c.transaction()?;

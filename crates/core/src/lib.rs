@@ -12,6 +12,7 @@ pub mod curator;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod daemon_status;
+pub mod delegation;
 pub mod domain;
 pub mod fsview;
 pub mod gateway;

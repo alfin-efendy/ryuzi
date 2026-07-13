@@ -42,6 +42,10 @@ pub(crate) fn basename_of(path: &str) -> String {
 
 pub struct ControlPlane {
     store: Arc<Store>,
+    /// Plan 2 agent registry shared by all delegated and primary runs.
+    registry: Arc<crate::agents::registry::AgentRegistry>,
+    /// Bounded delegation lifecycle for the process.
+    delegation: Arc<crate::delegation::DelegationRuntime>,
     /// Extension registries (harness slot/gateway/connector/plugins).
     registries: Registries,
     events: broadcast::Sender<CoreEvent>,
@@ -100,14 +104,18 @@ pub struct ControlPlane {
     /// `SessionCtx.extension_events` (threaded in
     /// `lifecycle::start_harness_session`).
     extension_host: Arc<ExtensionHost>,
-    /// Shared Plan 2 persistence graph, attached exactly once by the composition
-    /// root before any native session starts.
-    agent_persistence: std::sync::OnceLock<crate::agents::bootstrap::AgentPersistenceHandles>,
+    /// Shared Plan 2 persistence graph, injected at construction and immutable
+    /// for the lifetime of the control plane.
+    agent_persistence: crate::agents::bootstrap::AgentPersistenceHandles,
 }
 
 impl ControlPlane {
-    pub async fn new(store: Store, registries: Registries) -> Arc<ControlPlane> {
-        Self::new_with_telemetry(Arc::new(store), registries, Arc::new(NoopTelemetry)).await
+    pub async fn new(
+        store: Arc<Store>,
+        registries: Registries,
+        persistence: crate::agents::bootstrap::AgentPersistence,
+    ) -> Arc<ControlPlane> {
+        Self::new_with_telemetry(store, registries, Arc::new(NoopTelemetry), persistence).await
     }
 
     /// Like `new`, but with an explicit telemetry backend — used by the
@@ -123,8 +131,16 @@ impl ControlPlane {
         store: Arc<Store>,
         registries: Registries,
         telemetry: Arc<dyn Telemetry>,
+        persistence: crate::agents::bootstrap::AgentPersistence,
     ) -> Arc<ControlPlane> {
-        Self::new_full(store, registries, telemetry, Arc::new(UreqFetcher)).await
+        Self::new_full(
+            store,
+            registries,
+            telemetry,
+            Arc::new(UreqFetcher),
+            persistence,
+        )
+        .await
     }
 
     /// Like `new_with_telemetry`, but with an explicit attachment fetcher —
@@ -135,8 +151,15 @@ impl ControlPlane {
         registries: Registries,
         telemetry: Arc<dyn Telemetry>,
         attachment_fetcher: Arc<dyn AttachmentFetcher>,
+        persistence: crate::agents::bootstrap::AgentPersistence,
     ) -> Arc<ControlPlane> {
         let (events, _) = broadcast::channel(1024);
+        let registry = persistence.registry.clone();
+        let delegation = crate::delegation::DelegationRuntime::new(
+            Arc::clone(&store),
+            Arc::clone(&registry),
+            events.clone(),
+        );
 
         // Startup maintenance (install-ledger backfill + crash-leftover
         // sweep) deliberately does NOT run here. Both touch the operator's
@@ -152,6 +175,8 @@ impl ControlPlane {
 
         Arc::new(ControlPlane {
             store,
+            registry,
+            delegation,
             registries,
             events,
             approvals: Arc::new(ApprovalHub::new()),
@@ -167,7 +192,7 @@ impl ControlPlane {
                 crate::harness::native::llm::RouterLlmStreamFactory,
             )),
             extension_host: Arc::new(ExtensionHost::new()),
-            agent_persistence: std::sync::OnceLock::new(),
+            agent_persistence: persistence.handles(),
         })
     }
 
@@ -200,41 +225,20 @@ impl ControlPlane {
     /// Track D's extension host — every spawned extension subprocess across
     /// every plugin (see [`crate::plugins::extension::ExtensionHost`]).
     /// Empty until [`Self::spawn_extensions`] is called.
+    pub fn registry(&self) -> &Arc<crate::agents::registry::AgentRegistry> {
+        &self.registry
+    }
+
+    pub fn delegation(&self) -> &Arc<crate::delegation::DelegationRuntime> {
+        &self.delegation
+    }
+
     pub fn extension_host(&self) -> &Arc<ExtensionHost> {
         &self.extension_host
     }
 
-    pub fn attach_agent_persistence(
-        &self,
-        persistence: crate::agents::bootstrap::AgentPersistenceHandles,
-    ) -> anyhow::Result<()> {
-        self.agent_persistence
-            .set(persistence)
-            .map_err(|_| anyhow::anyhow!("agent persistence is already attached"))
-    }
-
-    pub(crate) fn agent_persistence(
-        &self,
-    ) -> Option<&crate::agents::bootstrap::AgentPersistenceHandles> {
-        self.agent_persistence.get()
-    }
-
-    /// Attach an isolated YAML/OKF persistence graph for crate unit tests that
-    /// exercise session lifecycle paths. Production composition roots attach
-    /// their shared graph explicitly; this helper prevents test constructors
-    /// from silently omitting that required dependency.
-    #[cfg(test)]
-    pub(crate) async fn attach_test_agent_persistence(&self) {
-        let config = tempfile::tempdir().expect("agent persistence tempdir");
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            self.store.clone(),
-        )
-        .await
-        .expect("initialize test agent persistence");
-        self.attach_agent_persistence(persistence.handles())
-            .expect("attach test agent persistence");
-        std::mem::forget(config);
+    pub(crate) fn agent_persistence(&self) -> &crate::agents::bootstrap::AgentPersistenceHandles {
+        &self.agent_persistence
     }
 
     /// Spawn every enabled extension-capable plugin's subprocess(es) (Track
