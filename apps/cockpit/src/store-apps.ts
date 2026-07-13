@@ -8,6 +8,7 @@ import { commands, type AddAppInput, type AppInfo, type CmdError, type Result } 
 type AppsState = {
   apps: AppInfo[];
   loaded: boolean;
+  hydrating: boolean;
   probing: string | null;
   hydrate: () => Promise<void>;
   add: (input: AddAppInput) => Promise<boolean>;
@@ -31,10 +32,17 @@ function applyResult(set: (partial: Partial<AppsState>) => void, res: Result<App
 export const useApps = create<AppsState>((set, get) => ({
   apps: [],
   loaded: false,
+  hydrating: false,
   probing: null,
 
   hydrate: async () => {
-    applyResult(set, await commands.listApps("local"), "App list");
+    if (get().hydrating) return;
+    set({ hydrating: true });
+    try {
+      applyResult(set, await commands.listApps("local"), "App list");
+    } finally {
+      set({ hydrating: false });
+    }
   },
 
   add: async (input) => applyResult(set, await commands.addApp("local", input), "Add app"),

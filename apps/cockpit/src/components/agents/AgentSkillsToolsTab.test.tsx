@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AgentDetailInfo, AgentMutationInfo, AppInfo } from "@/bindings";
 
-mock.module("@/bindings", () => ({ commands: {}, events: {} }));
+const listApps = mock(async () => ({ status: "ok" as const, data: [github] }));
+mock.module("@/bindings", () => ({ commands: { listApps }, events: {} }));
 
 const { AgentSkillsToolsTab } = await import("./AgentSkillsToolsTab");
 const { useAgents } = await import("@/store-agents");
@@ -61,29 +62,48 @@ const github = {
 
 beforeEach(() => {
   updateAgent.mockClear();
+  listApps.mockClear();
   useAgents.setState({ saving: false, update: updateAgent });
   useApps.setState({ apps: [github], loaded: true });
   usePlugins.setState({ plugins: [], loaded: true });
 });
 afterEach(cleanup);
 
-test("capability switches save stable IDs in separate lists", () => {
+test("a fresh store hydrates the app catalog once and resolves configured app IDs", async () => {
+  useApps.setState({ apps: [], loaded: false, hydrating: false });
+
+  render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, apps: ["github"] }} />);
+
+  await waitFor(() => expect(screen.getByText("GitHub")).toBeTruthy());
+  expect(screen.queryByText("Unavailable")).toBeNull();
+  expect(listApps).toHaveBeenCalledTimes(1);
+  expect(listApps).toHaveBeenCalledWith("local");
+});
+
+test("capability switches save a complete mutation with stable IDs in separate lists", () => {
   render(<AgentSkillsToolsTab detail={reviewerDetail} />);
   fireEvent.change(screen.getByRole("textbox", { name: "Skill ID" }), { target: { value: " systematic-debugging " } });
   fireEvent.click(screen.getByRole("button", { name: "Add skill" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Native tool ID" }), { target: { value: "glob" } });
   fireEvent.click(screen.getByRole("button", { name: "Add native tool" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Plugin tool ID" }), { target: { value: "github.search" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add plugin tool" }));
   fireEvent.click(screen.getByRole("switch", { name: "Enable app github" }));
   fireEvent.click(screen.getByRole("button", { name: "Save skills and tools" }));
-  expect(updateAgent).toHaveBeenCalledWith(
-    "reviewer",
-    expect.objectContaining({
-      skills: ["requesting-code-review", "systematic-debugging"],
-      nativeTools: ["read", "grep", "bash", "glob"],
-      pluginTools: [],
-      apps: ["github"],
-    }),
-  );
+  expect(updateAgent).toHaveBeenCalledWith("reviewer", {
+    name: "Reviewer",
+    description: "Reviews implementation quality.",
+    avatarColor: "violet",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    permissionRules: [],
+    skills: ["requesting-code-review", "systematic-debugging"],
+    nativeTools: ["read", "grep", "bash", "glob"],
+    pluginTools: ["github.search"],
+    apps: ["github"],
+    maxTurns: 50,
+    maxToolRounds: 100,
+  });
 });
 
 test("blank and duplicate IDs are rejected while removals are explicit", () => {
@@ -98,12 +118,26 @@ test("blank and duplicate IDs are rejected while removals are explicit", () => {
   expect(screen.queryByText("requesting-code-review")).toBeNull();
 });
 
-test("apps use the catalog and preserve unavailable YAML IDs in order", () => {
-  render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, apps: ["retired-app", "github"] }} />);
-  expect(screen.getByRole("combobox", { name: "App catalog" })).toBeTruthy();
+test("unknown stable IDs and plugin tools remain ordered until explicitly removed", () => {
+  render(
+    <AgentSkillsToolsTab
+      detail={{
+        ...reviewerDetail,
+        skills: ["retired-skill", "requesting-code-review"],
+        pluginTools: ["retired.tool", "github.search"],
+        apps: ["retired-app", "github"],
+      }}
+    />,
+  );
   const rows = screen.getByTestId("agent-app-rows");
   expect(rows.textContent).toContain("retired-appUnavailableGitHub");
-  expect(screen.getByRole("button", { name: "Remove unavailable app retired-app" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Save skills and tools" }));
-  expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ apps: ["retired-app", "github"] }));
+  expect(updateAgent).toHaveBeenCalledWith(
+    "reviewer",
+    expect.objectContaining({
+      skills: ["retired-skill", "requesting-code-review"],
+      pluginTools: ["retired.tool", "github.search"],
+      apps: ["retired-app", "github"],
+    }),
+  );
 });

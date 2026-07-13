@@ -71,6 +71,8 @@ function StableIdGroup({ title, singular, inputLabel, values, input, saving, onI
 export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
   const saving = useAgents((state) => state.saving);
   const catalogApps = useApps((state) => state.apps);
+  const appsLoaded = useApps((state) => state.loaded);
+  const hydrateApps = useApps((state) => state.hydrate);
   const plugins = usePlugins((state) => state.plugins);
   const [skills, setSkills] = useState(detail.skills);
   const [nativeTools, setNativeTools] = useState(detail.nativeTools);
@@ -79,6 +81,10 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
   const [skillInput, setSkillInput] = useState("");
   const [nativeInput, setNativeInput] = useState("");
   const [pluginInput, setPluginInput] = useState("");
+
+  useEffect(() => {
+    if (!appsLoaded) void hydrateApps();
+  }, [appsLoaded, hydrateApps]);
 
   useEffect(() => {
     setSkills(detail.skills);
