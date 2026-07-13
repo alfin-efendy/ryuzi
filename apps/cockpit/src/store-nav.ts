@@ -16,7 +16,6 @@ export type View =
   | { kind: "gateways" }
   | { kind: "gatewayDetail"; id: string }
   | { kind: "pluginDetail"; id: string }
-  | { kind: "learning" }
   | { kind: "settings" }
   | { kind: "agents" }
   | { kind: "agentDetail"; agentId: string };

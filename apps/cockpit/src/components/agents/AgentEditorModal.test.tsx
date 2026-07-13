@@ -21,7 +21,6 @@ beforeEach(() => {
     registry,
     detail: null,
     models: [],
-    learningByAgent: {},
     loaded: true,
     loading: false,
     saving: false,

@@ -14,6 +14,9 @@ const updateAgent = mock(async (_runner: string | null, _id: string, input: Agen
 }));
 
 mock.module("@/bindings", () => ({ commands: { getAgent, listApps, updateAgent }, events: {} }));
+mock.module("@/components/agents/AgentLearningTab", () => ({
+  AgentLearningTab: ({ agentId }: { agentId: string }) => <div>Learning for {agentId}</div>,
+}));
 
 const { AgentDetailView } = await import("./AgentDetailView");
 const { useAgents } = await import("@/store-agents");
@@ -247,8 +250,8 @@ test("Skills & Tools and Advanced tabs render their owned settings", () => {
   expect(screen.getByRole("button", { name: "Delete Reviewer" })).toBeTruthy();
 });
 
-test("Learning remains a Task 9 placeholder", () => {
+test("Learning renders the selected agent's Learning tab", () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("Per-agent learning controls are coming in Task 9.")).toBeTruthy();
+  expect(screen.getByText("Learning for reviewer")).toBeTruthy();
 });

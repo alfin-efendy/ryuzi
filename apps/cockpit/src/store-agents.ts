@@ -3,21 +3,16 @@ import { toast } from "sonner";
 import {
   commands,
   type AgentDetailInfo,
-  type AgentLearningInfo,
   type AgentModelInfo,
   type AgentMutationInfo,
   type AgentRegistryInfo,
-  type KnowledgeConceptInfo,
-  type KnowledgeConceptMutationInfo,
   type SelectableModelInfo,
 } from "./bindings";
 import { LOCAL_RUNNER } from "./lib/session-key";
 
-// Agent domain store (Plan 3 Task 5): the YAML agent registry (roster +
-// default + subagent model), the focused agent's full detail, the shared
-// selectable-model list, and each agent's Learning snapshot keyed by agent
-// id. Registry/detail commands are runner-aware (LOCAL_RUNNER today);
-// Learning commands are local-engine-only and take no runner argument.
+// Agent domain store (Plan 3): the YAML agent registry (roster + default +
+// subagent model), the focused agent's full detail, and the shared selectable-
+// model list. Per-agent Learning UI state lives exclusively in store-learning.
 
 type AgentsState = {
   registry: AgentRegistryInfo | null;
@@ -25,9 +20,6 @@ type AgentsState = {
   detail: AgentDetailInfo | null;
   /** Provider-driven selectable models, shared by the model pickers. */
   models: SelectableModelInfo[];
-  /** Per-agent Learning snapshots, keyed by agent id so switching between
-   *  agents never shows another agent's concepts while a load is in flight. */
-  learningByAgent: Record<string, AgentLearningInfo>;
   /** True only after a successful registry load. */
   loaded: boolean;
   loading: boolean;
@@ -41,15 +33,6 @@ type AgentsState = {
   remove: (agentId: string) => Promise<boolean>;
   setDefault: (agentId: string) => Promise<boolean>;
   updateSubagentModel: (model: AgentModelInfo) => Promise<boolean>;
-
-  loadLearning: (agentId: string) => Promise<void>;
-  createConcept: (agentId: string, input: KnowledgeConceptMutationInfo) => Promise<boolean>;
-  updateConcept: (agentId: string, conceptId: string, input: KnowledgeConceptMutationInfo) => Promise<boolean>;
-  removeConcept: (agentId: string, conceptId: string) => Promise<boolean>;
-  validateConceptRaw: (agentId: string, relativePath: string, rawMarkdown: string) => Promise<KnowledgeConceptInfo | null>;
-  replaceConceptRaw: (agentId: string, relativePath: string, rawMarkdown: string) => Promise<boolean>;
-  removeInvalidConcept: (agentId: string, relativePath: string) => Promise<boolean>;
-  rollbackLearning: (agentId: string, snapshotId: string) => Promise<boolean>;
 };
 
 /** Patch one roster entry in place (identity-preserving for the rest). */
@@ -83,7 +66,6 @@ export const useAgents = create<AgentsState>((set, get) => ({
   registry: null,
   detail: null,
   models: [],
-  learningByAgent: {},
   loaded: false,
   loading: false,
   saving: false,
@@ -269,82 +251,5 @@ export const useAgents = create<AgentsState>((set, get) => ({
     } finally {
       set({ saving: false });
     }
-  },
-
-  loadLearning: async (agentId) => {
-    const res = await commands.getAgentLearning(agentId);
-    if (res.status === "ok") set((s) => ({ learningByAgent: { ...s.learningByAgent, [agentId]: res.data } }));
-    else toast.error(`Learning load failed: ${res.error.message}`);
-  },
-
-  createConcept: async (agentId, input) => {
-    const res = await commands.createAgentConcept(agentId, input);
-    if (res.status === "error") {
-      toast.error(`Create concept failed: ${res.error.message}`);
-      return false;
-    }
-    await get().loadLearning(agentId);
-    return true;
-  },
-
-  updateConcept: async (agentId, conceptId, input) => {
-    const res = await commands.updateAgentConcept(agentId, conceptId, input);
-    if (res.status === "error") {
-      toast.error(`Update concept failed: ${res.error.message}`);
-      return false;
-    }
-    await get().loadLearning(agentId);
-    return true;
-  },
-
-  // Delete-style commands return the refreshed AgentLearningInfo directly,
-  // so the keyed snapshot updates without a second round trip.
-  removeConcept: async (agentId, conceptId) => {
-    const res = await commands.deleteAgentConcept(agentId, conceptId);
-    if (res.status === "error") {
-      toast.error(`Delete concept failed: ${res.error.message}`);
-      return false;
-    }
-    set((s) => ({ learningByAgent: { ...s.learningByAgent, [agentId]: res.data } }));
-    return true;
-  },
-
-  validateConceptRaw: async (agentId, relativePath, rawMarkdown) => {
-    const res = await commands.validateAgentConceptRaw(agentId, relativePath, rawMarkdown);
-    if (res.status === "error") {
-      toast.error(`Concept is invalid: ${res.error.message}`);
-      return null;
-    }
-    return res.data;
-  },
-
-  replaceConceptRaw: async (agentId, relativePath, rawMarkdown) => {
-    const res = await commands.replaceAgentConceptRaw(agentId, relativePath, rawMarkdown);
-    if (res.status === "error") {
-      toast.error(`Replace concept failed: ${res.error.message}`);
-      return false;
-    }
-    await get().loadLearning(agentId);
-    return true;
-  },
-
-  removeInvalidConcept: async (agentId, relativePath) => {
-    const res = await commands.deleteInvalidAgentConcept(agentId, relativePath);
-    if (res.status === "error") {
-      toast.error(`Discard concept failed: ${res.error.message}`);
-      return false;
-    }
-    set((s) => ({ learningByAgent: { ...s.learningByAgent, [agentId]: res.data } }));
-    return true;
-  },
-
-  rollbackLearning: async (agentId, snapshotId) => {
-    const res = await commands.rollbackAgentLearning(agentId, snapshotId);
-    if (res.status === "error") {
-      toast.error(`Rollback failed: ${res.error.message}`);
-      return false;
-    }
-    set((s) => ({ learningByAgent: { ...s.learningByAgent, [agentId]: res.data } }));
-    return true;
   },
 }));

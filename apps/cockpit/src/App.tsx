@@ -24,7 +24,6 @@ import { AppDetailView } from "./views/AppDetailView";
 import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
-import { LearningView } from "./views/LearningView";
 import { AgentsView } from "./views/AgentsView";
 import { AgentDetailView } from "./views/AgentDetailView";
 import { SettingsView } from "./views/SettingsView";
@@ -59,8 +58,6 @@ function MainView() {
       return <GatewayDetailView id={view.id} />;
     case "pluginDetail":
       return <PluginDetailView id={view.id} />;
-    case "learning":
-      return <LearningView />;
     case "settings":
       return <SettingsView />;
     case "agents":

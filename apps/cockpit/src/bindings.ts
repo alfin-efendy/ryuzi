@@ -1433,49 +1433,9 @@ async pluginsRestartRequired(runnerId: string | null) : Promise<Result<boolean, 
     else return { status: "error", error: e  as any };
 }
 },
-async readMemory(scope: string) : Promise<Result<string[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("read_memory", { scope }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async writeMemory(scope: string, action: string, text: string | null, match: string | null) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("write_memory", { scope, action, text, match }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async searchSessions(query: string) : Promise<Result<FtsHit[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("search_sessions", { query }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async learningGraph() : Promise<Result<LearningGraph, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("learning_graph") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async curatorStatus() : Promise<Result<CuratorStatus, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("curator_status") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async curatorRollback(runId: string) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("curator_rollback", { runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1885,35 +1845,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 export type CoreEventMsg = { runnerId: string; event: CoreEvent }
 export type CuratorHistorySnapshotInfo = { snapshotId: string; concept: KnowledgeConceptInfo }
-/**
- * One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
- * sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
- * history view.
- */
-export type CuratorRun = { id: string; startedAt: number; finishedAt: number | null; 
-/**
- * `running` | `ok` | `error`.
- */
-status: string; 
-/**
- * How many skills the deterministic planner transitioned this run.
- */
-transitioned: number; 
-/**
- * Whether the opt-in LLM consolidation pass ran this run.
- */
-consolidated: boolean; 
-/**
- * Pre-mutation tar.gz snapshot path, set only when `consolidated`.
- */
-snapshotPath: string | null; error: string | null; log: string | null }
 export type CuratorStateInfo = { concept: KnowledgeConceptInfo | null; lastEventId: string | null }
-/**
- * `curator_status`'s response: when the curator last swept (`None` if it
- * has never run) plus its recent run history for the Learning panel's
- * curator-activity feed.
- */
-export type CuratorStatus = { lastRunAt: number | null; recent: CuratorRun[] }
 /**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll
@@ -2056,40 +1988,6 @@ export type KeychainStatus =
  */
 export type KnowledgeConceptInfo = { id: string; relativePath: string; conceptType: string; title: string; description: string; body: string; scope: string | null; projectId: string | null; tags: string[]; timestamp: string }
 export type KnowledgeConceptMutationInfo = { title: string; description: string; body: string; scope: string; projectId: string | null; tags: string[] }
-export type LearningGraph = { nodes: LearningGraphNode[]; edges: LearningGraphEdge[] }
-/**
- * One edge in the Learning panel's journey graph: `related_skills` links
- * two skills whose names share a token (a lexical relatedness signal, since
- * `skill_usage` carries no free-text description to compare); `lexical`
- * links a memory entry to a skill its text mentions by name.
- */
-export type LearningGraphEdge = { source: string; target: string; 
-/**
- * `"related_skills"` | `"lexical"`.
- */
-kind: string }
-/**
- * One node in the Learning panel's journey graph: either a skill
- * (`kind == "skill"`, `state` set from `skill_usage.state`) or a memory
- * entry (`kind == "memory"`, `scope` set to which memory file it lives in).
- * `id` is content-stable (see `learning_api::build_learning_graph`) so a
- * re-fetch after an unrelated edit doesn't reshuffle node identity —
- * unlike Hermes' fragile positional memory ids (spec §7.6).
- */
-export type LearningGraphNode = { id: string; 
-/**
- * `"skill"` | `"memory"`.
- */
-kind: string; label: string; 
-/**
- * Skill lifecycle state (`active`/`stale`/`archived`); `None` for a
- * memory node.
- */
-state: string | null; 
-/**
- * Memory scope (`global`/`user`/`project`); `None` for a skill node.
- */
-scope: string | null }
 export type LearningReviewInfo = { conceptId: string; title: string; description: string; timestamp: string }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }

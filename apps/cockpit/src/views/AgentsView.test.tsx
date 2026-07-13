@@ -94,7 +94,6 @@ function seedAgents() {
     registry: registry(),
     detail: null,
     models: [selectable],
-    learningByAgent: {},
     loaded: true,
     loading: false,
     saving: false,

@@ -18,7 +18,6 @@ import {
   Plus,
   Server,
   Settings,
-  Sparkles,
 } from "lucide-react";
 import {
   Badge,
@@ -65,7 +64,6 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
   { label: "Plugins", icon: LayoutGrid, view: { kind: "plugins" }, group: ["plugins", "appDetail", "pluginDetail"] },
   { label: "Agents", icon: Bot, view: { kind: "agents" }, group: ["agents", "agentDetail"] },
-  { label: "Learning", icon: Sparkles, view: { kind: "learning" }, group: ["learning"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },
 ];
 

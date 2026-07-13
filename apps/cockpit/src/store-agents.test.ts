@@ -2,14 +2,11 @@ import { beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { toast } from "sonner";
 import type {
   AgentDetailInfo,
-  AgentLearningInfo,
   AgentModelInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
   AgentSummaryInfo,
   CmdError,
-  KnowledgeConceptInfo,
-  KnowledgeConceptMutationInfo,
   Result,
   SelectableModelInfo,
 } from "@/bindings";
@@ -97,42 +94,6 @@ const selectable = (requestValue: string): SelectableModelInfo => ({
   defaultSource: "none",
 });
 
-function learningOf(title: string): AgentLearningInfo {
-  return {
-    concepts: title === "" ? [] : [concept(title)],
-    invalid: [],
-    journey: [],
-    skillUsage: [],
-    reviews: [],
-    curator: { concept: null, lastEventId: null },
-    curatorHistory: [],
-  };
-}
-
-function concept(id: string): KnowledgeConceptInfo {
-  return {
-    id,
-    relativePath: `concepts/${id}.md`,
-    conceptType: "insight",
-    title: id,
-    description: "",
-    body: "",
-    scope: "global",
-    projectId: null,
-    tags: [],
-    timestamp: "2026-01-01T00:00:00Z",
-  };
-}
-
-const conceptInput = (): KnowledgeConceptMutationInfo => ({
-  title: "retries",
-  description: "",
-  body: "Retry with backoff.",
-  scope: "global",
-  projectId: null,
-  tags: [],
-});
-
 // ---------- Tauri boundary mocks (mock.module pattern; the destructured
 // names below are test-local variables — production code always goes
 // through `commands.*`) ----------
@@ -159,15 +120,6 @@ const updateSubagentModel = mock(async (_r: string | null, model: AgentModelInfo
 );
 const listSelectableModels = mock(async (_r: string | null) => ok([selectable("smart"), selectable("fast")]));
 
-const getAgentLearning = mock(async (id: string) => ok(learningOf(id === "reviewer" ? "reviewer-note" : "")));
-const createAgentConcept = mock(async (_id: string, input: KnowledgeConceptMutationInfo) => ok(concept(input.title)));
-const updateAgentConcept = mock(async (_id: string, conceptId: string, _input: KnowledgeConceptMutationInfo) => ok(concept(conceptId)));
-const deleteAgentConcept = mock(async (_id: string, _conceptId: string) => ok(learningOf("")));
-const validateAgentConceptRaw = mock(async (_id: string, _path: string, _raw: string) => ok(concept("validated")));
-const replaceAgentConceptRaw = mock(async (_id: string, _path: string, _raw: string) => ok(concept("replaced")));
-const deleteInvalidAgentConcept = mock(async (_id: string, _path: string) => ok(learningOf("")));
-const rollbackAgentLearning = mock(async (_id: string, _snapshotId: string) => ok(learningOf("rolled-back")));
-
 mock.module("@/bindings", () => ({
   commands: {
     listAgents,
@@ -180,14 +132,6 @@ mock.module("@/bindings", () => ({
     getSubagentModel,
     updateSubagentModel,
     listSelectableModels,
-    getAgentLearning,
-    createAgentConcept,
-    updateAgentConcept,
-    deleteAgentConcept,
-    validateAgentConceptRaw,
-    replaceAgentConceptRaw,
-    deleteInvalidAgentConcept,
-    rollbackAgentLearning,
   },
 }));
 
@@ -204,14 +148,6 @@ const allMocks = [
   getSubagentModel,
   updateSubagentModel,
   listSelectableModels,
-  getAgentLearning,
-  createAgentConcept,
-  updateAgentConcept,
-  deleteAgentConcept,
-  validateAgentConceptRaw,
-  replaceAgentConceptRaw,
-  deleteInvalidAgentConcept,
-  rollbackAgentLearning,
 ];
 
 beforeEach(() => {
@@ -220,7 +156,6 @@ beforeEach(() => {
     registry: null,
     detail: null,
     models: [],
-    learningByAgent: {},
     loaded: false,
     loading: false,
     saving: false,
@@ -394,73 +329,4 @@ test("updateSubagentModel commits on ok and rolls back on error", async () => {
   updateSubagentModel.mockResolvedValueOnce(err("unknown route"));
   expect(await useAgents.getState().updateSubagentModel(route("bogus"))).toBe(false);
   expect(useAgents.getState().registry?.subagentModel).toEqual(route("smart"));
-});
-
-// ---------- per-agent learning (keyed by agent id; local engine only, so
-// the learning commands take no runner argument) ----------
-
-test("loadLearning keys the snapshot by agent id", async () => {
-  await useAgents.getState().loadLearning("reviewer");
-  expect(getAgentLearning).toHaveBeenCalledWith("reviewer");
-  expect(useAgents.getState().learningByAgent.reviewer).toEqual(learningOf("reviewer-note"));
-  expect(useAgents.getState().learningByAgent.ryuzi).toBeUndefined();
-});
-
-test("createConcept reloads only its agent on success", async () => {
-  useAgents.setState({ learningByAgent: { reviewer: learningOf("") } });
-  expect(await useAgents.getState().createConcept("reviewer", conceptInput())).toBe(true);
-  expect(createAgentConcept).toHaveBeenCalledWith("reviewer", conceptInput());
-  expect(getAgentLearning).toHaveBeenCalledWith("reviewer");
-  expect(useAgents.getState().learningByAgent.reviewer).toEqual(learningOf("reviewer-note"));
-});
-
-test("a failed concept mutation leaves the keyed snapshot unchanged", async () => {
-  const toastSpy = spyOn(toast, "error");
-  createAgentConcept.mockResolvedValueOnce(err("journal write failed"));
-  useAgents.setState({ learningByAgent: { reviewer: learningOf("reviewer-note") } });
-  expect(await useAgents.getState().createConcept("reviewer", conceptInput())).toBe(false);
-  expect(getAgentLearning).not.toHaveBeenCalled();
-  expect(useAgents.getState().learningByAgent.reviewer).toEqual(learningOf("reviewer-note"));
-  expect(toastSpy.mock.calls[0]?.[0]).toContain("journal write failed");
-  toastSpy.mockRestore();
-});
-
-test("removeConcept stores the returned snapshot without an extra reload", async () => {
-  useAgents.setState({ learningByAgent: { reviewer: learningOf("reviewer-note") } });
-  expect(await useAgents.getState().removeConcept("reviewer", "reviewer-note")).toBe(true);
-  expect(deleteAgentConcept).toHaveBeenCalledWith("reviewer", "reviewer-note");
-  expect(getAgentLearning).not.toHaveBeenCalled();
-  expect(useAgents.getState().learningByAgent.reviewer).toEqual(learningOf(""));
-});
-
-test("replaceConceptRaw reloads its agent; removeInvalidConcept stores the returned snapshot", async () => {
-  useAgents.setState({ learningByAgent: { reviewer: learningOf("") } });
-  expect(await useAgents.getState().replaceConceptRaw("reviewer", "concepts/x.md", "# fixed")).toBe(true);
-  expect(replaceAgentConceptRaw).toHaveBeenCalledWith("reviewer", "concepts/x.md", "# fixed");
-  expect(getAgentLearning).toHaveBeenCalledWith("reviewer");
-
-  getAgentLearning.mockClear();
-  expect(await useAgents.getState().removeInvalidConcept("reviewer", "concepts/x.md")).toBe(true);
-  expect(deleteInvalidAgentConcept).toHaveBeenCalledWith("reviewer", "concepts/x.md");
-  expect(getAgentLearning).not.toHaveBeenCalled();
-});
-
-test("validateConceptRaw returns the parsed concept, or null on error", async () => {
-  expect((await useAgents.getState().validateConceptRaw("reviewer", "concepts/x.md", "# raw"))?.id).toBe("validated");
-  validateAgentConceptRaw.mockResolvedValueOnce(err("missing title"));
-  expect(await useAgents.getState().validateConceptRaw("reviewer", "concepts/x.md", "# raw")).toBeNull();
-});
-
-test("rollbackLearning stores the returned snapshot and fails without touching state", async () => {
-  useAgents.setState({ learningByAgent: { reviewer: learningOf("reviewer-note") } });
-  expect(await useAgents.getState().rollbackLearning("reviewer", "snap-1")).toBe(true);
-  expect(rollbackAgentLearning).toHaveBeenCalledWith("reviewer", "snap-1");
-  expect(useAgents.getState().learningByAgent.reviewer).toEqual(learningOf("rolled-back"));
-
-  const toastSpy = spyOn(toast, "error");
-  rollbackAgentLearning.mockResolvedValueOnce(err("snapshot missing"));
-  expect(await useAgents.getState().rollbackLearning("reviewer", "snap-2")).toBe(false);
-  expect(useAgents.getState().learningByAgent.reviewer).toEqual(learningOf("rolled-back"));
-  expect(toastSpy.mock.calls[0]?.[0]).toContain("snapshot missing");
-  toastSpy.mockRestore();
 });

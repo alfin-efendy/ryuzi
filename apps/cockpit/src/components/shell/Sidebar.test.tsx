@@ -82,10 +82,10 @@ async function openArchiveConfirmation() {
   return await screen.findByRole("dialog", { name: "Archive session?" });
 }
 
-test("sidebar exposes Agents and retains top-level Learning", () => {
+test("sidebar exposes Agents without a top-level Learning route", () => {
   render(<Sidebar />);
   expect(screen.getByRole("button", { name: "Agents" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Learning" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Learning" })).toBeNull();
 });
 
 test("archive confirmation preserves the consequences and initially focuses Cancel", async () => {

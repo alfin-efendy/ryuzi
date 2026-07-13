@@ -3,6 +3,7 @@ import { AlertTriangle, ArrowLeft } from "lucide-react";
 import { Badge, Button, Segmented, SettingsCard, SettingsCardTitle } from "@ryuzi/ui";
 import { AgentActionsMenu } from "@/components/agents/AgentActionsMenu";
 import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
+import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
 import { AgentSkillsToolsTab } from "@/components/agents/AgentSkillsToolsTab";
@@ -117,12 +118,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         {tab === "model" ? <AgentModelTab detail={detail} /> : null}
         {tab === "permissions" ? <AgentPermissionsTab detail={detail} /> : null}
         {tab === "capabilities" ? <AgentSkillsToolsTab detail={detail} /> : null}
-        {tab === "learning" ? (
-          <SettingsCard className="px-[18px] py-5">
-            <SettingsCardTitle>Learning</SettingsCardTitle>
-            <p className="mb-0 mt-2 text-xs text-muted-foreground">Per-agent learning controls are coming in Task 9.</p>
-          </SettingsCard>
-        ) : null}
+        {tab === "learning" ? <AgentLearningTab agentId={agentId} /> : null}
         {tab === "advanced" ? <AgentAdvancedTab detail={detail} /> : null}
       </div>
     </div>
