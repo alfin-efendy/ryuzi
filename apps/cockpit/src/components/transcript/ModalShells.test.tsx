@@ -3,16 +3,22 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import type { Row } from "@/lib/transcript";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
+const tauriCore = { ...(await import("@tauri-apps/api/core")) };
+const bindings = { ...(await import("@/bindings")) };
+
 afterEach(() => {
   cleanup();
 });
 
 mock.module("@tauri-apps/api/core", () => ({
+  ...tauriCore,
   convertFileSrc: (path: string) => `asset://${path}`,
   invoke: async () => null,
 }));
 mock.module("@/bindings", () => ({
+  ...bindings,
   commands: {
+    ...bindings.commands,
     sessionWorkdir: async () => ({ status: "ok", data: "/repo" }),
     revertFile: async () => ({ status: "ok", data: null }),
     gitDiff: async () => ({ status: "ok", data: "" }),
