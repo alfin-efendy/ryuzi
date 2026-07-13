@@ -135,7 +135,8 @@ pub struct InboundInteraction {
 
 /// The approval request shape handed to `DiscordPort::request_approval`:
 /// everything a connector needs to render the approve/deny prompt and
-/// enforce the approver-role gate and timeout.
+/// enforce the approver-role gate. A timeout is optional; `None` means wait
+/// until an explicit decision or cancellation tears down the request.
 #[derive(Debug, Clone)]
 pub struct PortApprovalRequest {
     pub request_id: String,
@@ -143,7 +144,7 @@ pub struct PortApprovalRequest {
     pub summary: String,
     pub approver_role_ids: Vec<String>,
     pub started_by: Option<String>,
-    pub timeout_ms: u64,
+    pub timeout_ms: Option<u64>,
 }
 
 /// The hexagonal boundary to the real Discord connection (production:
@@ -489,7 +490,7 @@ impl Gateway for DiscordGateway {
             summary: req.summary.clone(),
             approver_role_ids: req.approver_role_ids.clone(),
             started_by: req.started_by.clone(),
-            timeout_ms: req.timeout_ms.unwrap_or(300_000),
+            timeout_ms: req.timeout_ms,
         };
         let (allow, _actor) = self
             .port
@@ -794,7 +795,7 @@ mod tests {
                     summary: "Bash: rm".to_string(),
                     approver_role_ids: vec!["r1".to_string()],
                     started_by: Some("u1".to_string()),
-                    timeout_ms: Some(1000),
+                    timeout_ms: None,
                     principal: None,
                 },
             )
@@ -803,6 +804,11 @@ mod tests {
 
         assert_eq!(dec, ApprovalDecision::RejectOnce);
         assert!(port.calls().contains(&"requestApproval:t1".to_string()));
+        assert_eq!(
+            port.last_approval().unwrap().timeout_ms,
+            None,
+            "a gateway approval must not receive a daemon timeout"
+        );
         assert_eq!(
             port.last_approval().unwrap().approver_role_ids,
             vec!["r1".to_string()]

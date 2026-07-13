@@ -47,10 +47,11 @@
 //!   three actually used are overridden here).
 //! - `ComponentInteraction{member: Option<Member>, user: User, data.custom_id}` —
 //!   matches; `Member.roles: Vec<RoleId>`.
-//! - `ComponentInteractionCollector::new(&shard).message_id(id).timeout(dur).stream()`
-//!   returns a `Stream` (not a callback-based collector) that ends when the
-//!   timeout elapses — consumed via a `.next().await` loop (see
-//!   `SerenityDiscordPort::request_approval`'s doc for the loop semantics).
+//! - `ComponentInteractionCollector::new(&shard).message_id(id).stream()`
+//!   returns a `Stream` (not a callback-based collector); when a caller
+//!   supplies a timeout, `.timeout(dur)` ends the stream after it elapses.
+//!   The daemon deliberately supplies no approval timeout, so the collector
+//!   waits for an explicit interaction or cancellation.
 //!
 //! **Disclosed design choice — `is_thread` needs an HTTP round-trip per
 //! inbound message:** this port's minimal feature set omits serenity's
@@ -470,10 +471,13 @@ impl DiscordPort for SerenityDiscordPort {
             .map(|c| c.shard.clone());
         let shard = shard.context("discord port not connected")?;
 
-        let mut stream = ComponentInteractionCollector::new(&shard)
-            .message_id(sent.id)
-            .timeout(Duration::from_millis(req.timeout_ms))
-            .stream();
+        let collector = ComponentInteractionCollector::new(&shard).message_id(sent.id);
+        let mut stream = match req.timeout_ms {
+            Some(timeout_ms) => collector
+                .timeout(Duration::from_millis(timeout_ms))
+                .stream(),
+            None => collector.stream(),
+        };
 
         loop {
             let Some(interaction) = stream.next().await else {

@@ -107,14 +107,6 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         ..BASE
     },
     ConfigField {
-        key: "approval_timeout_ms",
-        label: "Approval timeout (ms)",
-        field_type: FieldType::Int,
-        default: Some("300000"),
-        help: "How long to wait for a tool approval",
-        ..BASE
-    },
-    ConfigField {
         key: "attachment_max_bytes",
         label: "Attachment max bytes",
         field_type: FieldType::Int,

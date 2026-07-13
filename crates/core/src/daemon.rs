@@ -3,8 +3,7 @@
 //! approval fan-out.
 //!
 //! [`build_daemon`] is the single entry point; [`Daemon::start`]/`stop` drive
-//! the lifecycle. The approval fan-out — the piece that finally consumes
-//! `approval_timeout_ms` — is kept in a standalone, unit-testable
+//! the lifecycle. The approval fan-out is kept in a standalone, unit-testable
 //! `pub(crate)` function ([`handle_approval`]) separate from the broadcast
 //! loop that spawns it.
 
@@ -12,9 +11,7 @@ use crate::agents::knowledge::AgentKnowledgeStore;
 use crate::agents::learning_queue::LearningQueue;
 use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
-use crate::domain::{
-    ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Principal, Surface,
-};
+use crate::domain::{ApprovalDecision, ApprovalRequest, CoreEvent, Principal, Surface};
 use crate::gateway::{Gateway, GatewayFactory};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
@@ -31,7 +28,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -448,22 +444,7 @@ fn spawn_approval_fanout(
                     input: _,
                     principal,
                 }) => {
-                    // Gateways only render binary tool prompts. Plan/Question
-                    // prompts are Cockpit/CLI-only surfaces — a headless
-                    // daemon/gateway session has nothing that will ever answer
-                    // them. Rather than `continue` and leave the turn parked
-                    // forever, spawn a timeout into the same `inflight` set
-                    // that resolves the request to `Cancel` once
-                    // `approval_timeout_ms` elapses, so the blocked tool call
-                    // reports "no interactive surface" instead of hanging.
-                    // `resolve_approval` is a harmless no-op if a real surface
-                    // (Cockpit, CLI) already answered it first.
                     if approval_kind != crate::domain::ApprovalKind::Tool {
-                        let cp = Arc::clone(&cp);
-                        let store = Arc::clone(&store);
-                        inflight.spawn(async move {
-                            schedule_non_tool_approval_cancel(&cp, &store, &request_id).await;
-                        });
                         continue;
                     }
                     let cp = Arc::clone(&cp);
@@ -491,53 +472,19 @@ fn spawn_approval_fanout(
     })
 }
 
-/// Headless fallback for Plan/Question approvals: gateways can't render
-/// them, so there's no surface to answer the request in a daemon/gateway
-/// session. Instead of leaving the turn parked forever, sleep for
-/// `approval_timeout_ms` (same setting, same default, as [`handle_approval`])
-/// then resolve the request as `Cancel` — distinct from an ordinary reject so
-/// `exitplanmode`/`askuserquestion` can report "no interactive surface"
-/// rather than "the user rejected this". `resolve_approval` returns `false`
-/// (and does nothing) if the request was already resolved by a real surface,
-/// so racing this against Cockpit/CLI is harmless.
-pub(crate) async fn schedule_non_tool_approval_cancel(
-    cp: &Arc<ControlPlane>,
-    store: &Arc<Store>,
-    request_id: &str,
-) {
-    let settings = SettingsStore::new(Arc::clone(store));
-    let timeout_ms: u64 = settings
-        .get("approval_timeout_ms")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300_000);
-    tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-    cp.resolve_approval(
-        request_id,
-        ApprovalResponse {
-            decision: ApprovalDecision::Cancel,
-            scope: None,
-            payload: None,
-        },
-    );
-}
-
 /// Core approval fan-out decision, callable directly (no broadcast loop
-/// needed) so it's unit-testable: reads `approval_timeout_ms` /
-/// `approver_role_ids` from settings and `started_by` from the session, then
-/// resolves via `cp.resolve_approval_bool`.
+/// needed) so it's unit-testable: reads `approver_role_ids` from settings and
+/// `started_by` from the session, then resolves gateway decisions through
+/// `cp.resolve_approval_bool`.
 ///
 /// - No surfaces bound to the session (after filtering to gateways we know
-///   about) → immediate deny.
+///   about) → leaves the request pending for Cockpit.
 /// - Otherwise races `gw.request_approval` across every known surface via a
 ///   loop over `futures::future::select_all`: a per-gateway `Err` REMOVES
 ///   that future from the race (so one erroring gateway can never out-race a
 ///   slower legitimate human approval on another surface) and the remaining
 ///   futures keep racing; only once every future has errored does the race
-///   resolve to a deny. The whole race is wrapped in `tokio::time::timeout`;
-///   elapsing also denies.
+///   resolve to a deny.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_approval(
     cp: &Arc<ControlPlane>,
@@ -550,14 +497,6 @@ pub(crate) async fn handle_approval(
     principal: Option<Principal>,
 ) {
     let settings = SettingsStore::new(Arc::clone(store));
-
-    let timeout_ms: u64 = settings
-        .get("approval_timeout_ms")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300_000);
 
     let approver_role_ids = policy::parse_role_ids(
         settings
@@ -590,7 +529,6 @@ pub(crate) async fn handle_approval(
         .collect();
 
     if known_surfaces.is_empty() {
-        cp.resolve_approval_bool(request_id, false);
         return;
     }
 
@@ -600,7 +538,7 @@ pub(crate) async fn handle_approval(
         summary: summary.to_string(),
         approver_role_ids,
         started_by,
-        timeout_ms: Some(timeout_ms),
+        timeout_ms: None,
         principal,
     };
 
@@ -629,10 +567,7 @@ pub(crate) async fn handle_approval(
         }
     };
 
-    let decision = match tokio::time::timeout(Duration::from_millis(timeout_ms), race).await {
-        Ok(Some(decision)) => decision,
-        Ok(None) | Err(_) => ApprovalDecision::RejectOnce,
-    };
+    let decision = race.await.unwrap_or(ApprovalDecision::RejectOnce);
 
     cp.resolve_approval_bool(
         request_id,
@@ -654,6 +589,7 @@ mod tests {
     use serial_test::serial;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     // ---------- shared test plumbing ----------
 
@@ -1067,6 +1003,63 @@ mod tests {
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
 
     #[tokio::test]
+    async fn handle_approval_without_gateway_surface_stays_pending_until_cockpit_resolves() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s1", "p1", None).await;
+        let approval = cp.approvals_for_test_register("req-cockpit-only");
+
+        handle_approval(
+            &cp,
+            &store,
+            &[],
+            "s1",
+            "req-cockpit-only",
+            "Bash",
+            "ls",
+            None,
+        )
+        .await;
+
+        let mut approval = tokio::spawn(async move { approval.await.unwrap() });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut approval)
+                .await
+                .is_err(),
+            "a Cockpit-only approval must remain pending without a gateway surface"
+        );
+        assert!(cp.resolve_approval_bool("req-cockpit-only", true));
+        assert!(approval.await.unwrap().allowed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_fanout_keeps_question_requests_pending_until_cockpit_resolves() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
+        let _fanout = spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), vec![]);
+        let approval = cp.approvals_for_test_register("req-question");
+
+        cp.emit(CoreEvent::ApprovalRequested {
+            session_pk: "s1".into(),
+            request_id: "req-question".into(),
+            tool: "clarify".into(),
+            summary: "Choose one".into(),
+            approval_kind: crate::domain::ApprovalKind::Question,
+            input: serde_json::json!({}),
+            principal: None,
+        });
+
+        let mut approval = tokio::spawn(async move { approval.await.unwrap() });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut approval)
+                .await
+                .is_err(),
+            "a Question approval must not be auto-cancelled by the fan-out"
+        );
+        assert!(cp.resolve_approval_bool("req-question", true));
+        assert!(approval.await.unwrap().allowed());
+    }
+
+    #[tokio::test]
     async fn handle_approval_allow_resolves_true() {
         let (lines, telemetry) = capturing_console_telemetry();
         let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
@@ -1116,7 +1109,7 @@ mod tests {
             captured.approver_role_ids,
             vec!["role-a".to_string(), "role-b".to_string()]
         );
-        assert_eq!(captured.timeout_ms, Some(300_000)); // default
+        assert_eq!(captured.timeout_ms, None);
         assert_eq!(captured.tool, "Bash");
         assert_eq!(captured.summary, "ls -la");
         assert_eq!(
@@ -1128,35 +1121,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_approval_timeout_denies() {
+    async fn handle_approval_waits_for_a_slow_gateway_decision() {
         let (lines, telemetry) = capturing_console_telemetry();
         let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
         store.add_surface("discord", "chan1", "s1").await.unwrap();
-        SettingsStore::new(store.clone())
-            .set("approval_timeout_ms", "100")
-            .await
-            .unwrap();
 
-        let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(2_000));
+        let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(150));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
+        let approval = cp.approvals_for_test_register("req-2");
 
         handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep", None).await;
 
+        assert!(approval.await.unwrap().allowed());
         let parsed = parse_telemetry_lines(&lines);
         assert!(
             parsed
                 .iter()
-                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
-            "a timed-out race must deny, got: {parsed:?}"
+                .any(|v| v["kind"] == "count" && v["name"] == "approval.allow"),
+            "a gateway's explicit allow must resolve after an arbitrary delay, got: {parsed:?}"
         );
     }
 
     #[tokio::test]
-    async fn handle_approval_no_surfaces_denies_immediately() {
-        let (lines, telemetry) = capturing_console_telemetry();
-        let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
+    async fn handle_approval_without_gateway_surfaces_leaves_request_pending() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
         // Deliberately no add_surface.
@@ -1164,6 +1154,7 @@ mod tests {
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
+        let approval = cp.approvals_for_test_register("req-3");
 
         handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls", None).await;
 
@@ -1172,13 +1163,13 @@ mod tests {
             0,
             "no surfaces means the gateway must never be asked"
         );
-        let parsed = parse_telemetry_lines(&lines);
         assert!(
-            parsed
-                .iter()
-                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
-            "no surfaces must deny immediately, got: {parsed:?}"
+            tokio::time::timeout(Duration::from_millis(50), approval)
+                .await
+                .is_err(),
+            "no gateway surfaces must leave the Cockpit approval pending"
         );
+        assert!(cp.resolve_approval_bool("req-3", false));
     }
 
     // ---------- fan-out error tolerance (MUST-FIX 1) ----------
@@ -1615,18 +1606,10 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn approval_fanout_times_out_plan_kind_requests_to_cancel() {
+    async fn approval_fanout_keeps_plan_kind_requests_pending_until_cockpit_resolves() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
         let store = Store::open(&db_path).await.unwrap();
-        // Keep the test fast: the fan-out's own timeout — not any gateway or
-        // `handle_approval` call — must be what resolves this.
-        SettingsStore::new(Arc::new(store))
-            .set("approval_timeout_ms", "50")
-            .await
-            .unwrap();
-        let store = Store::open(&db_path).await.unwrap();
-
         let mut regs = Registries::new();
         regs.harness = Arc::new(PlanFakeHarnessFactory);
         let cp =
@@ -1637,10 +1620,6 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-
-        // Spawn the REAL fan-out loop under test (no gateways — Plan-kind
-        // requests never touch them) instead of driving `handle_approval`
-        // manually, so this exercises the actual skip-branch fix.
         let _fanout = spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), vec![]);
 
         let mut rx = cp.subscribe();
@@ -1649,30 +1628,36 @@ mod tests {
             .await
             .unwrap();
 
-        let mut saw_result = false;
-        for _ in 0..40 {
+        let request_id = loop {
             match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(CoreEvent::Result { .. })) => {
-                    saw_result = true;
-                    break;
-                }
+                Ok(Ok(CoreEvent::ApprovalRequested { request_id, .. })) => break request_id,
                 Ok(Ok(_)) => {}
-                Ok(Err(_)) | Err(_) => break,
+                Ok(Err(error)) => panic!("approval event receiver failed: {error}"),
+                Err(_) => panic!("the Plan approval was not requested"),
             }
-        }
-        assert!(
-            saw_result,
-            "the real spawn_approval_fanout must time out the parked Plan approval to Cancel \
-             so the blocked turn completes instead of hanging forever"
-        );
+        };
 
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let msgs = store.list_messages(&session.session_pk).await.unwrap();
         assert!(
-            msgs.iter()
+            !msgs
+                .iter()
                 .any(|m| m.role == "assistant" && m.payload["text"] == "Cancel"),
-            "expected the timed-out Plan approval to resolve with ApprovalDecision::Cancel, \
-             got: {msgs:?}"
+            "the fan-out must not auto-cancel a Plan approval"
         );
+
+        assert!(cp.resolve_approval_bool(&request_id, true));
+        for _ in 0..10 {
+            let msgs = store.list_messages(&session.session_pk).await.unwrap();
+            if msgs
+                .iter()
+                .any(|m| m.role == "assistant" && m.payload["text"] == "AllowOnce")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the Plan approval must resolve only after Cockpit responds");
     }
 
     // ---------- (e) Daemon::start fires reconcile ----------
