@@ -10,6 +10,7 @@ use specta::Type;
 use std::collections::BTreeSet;
 
 const SETTING_KEY: &str = "llm_model_routes";
+const EFFORT_MIGRATION_KEY: &str = "llm_model_route_effort_migration_v1";
 const ROUND_ROBIN_KEY_PREFIX: &str = "llm_model_route_round_robin_cursor.";
 const ACCOUNT_ROUTE_SETTING_KEY: &str = "llm_provider_account_routes";
 const ACCOUNT_ROUND_ROBIN_KEY_PREFIX: &str = "llm_provider_account_round_robin_cursor.";
@@ -69,12 +70,87 @@ pub struct ProviderAccountRouteInfo {
 }
 
 pub async fn list_model_routes(store: &Store) -> anyhow::Result<Vec<ModelRouteInfo>> {
+    migrate_legacy_openai_route_efforts(store).await?;
+    load_model_routes(store).await
+}
+
+async fn load_model_routes(store: &Store) -> anyhow::Result<Vec<ModelRouteInfo>> {
     let Some(raw) = store.get_setting(SETTING_KEY).await? else {
         return Ok(Vec::new());
     };
-    let mut routes: Vec<ModelRouteInfo> = serde_json::from_str(&raw).unwrap_or_default();
+    let mut routes: Vec<ModelRouteInfo> = serde_json::from_str(&raw)?;
     routes.sort_by_key(|r| (r.created_at, r.name.clone()));
     Ok(routes)
+}
+
+pub fn parse_legacy_openai_route_suffix(model: &str) -> Option<(String, String)> {
+    let model = model.strip_suffix("-review").unwrap_or(model);
+    for effort in ["minimal", "medium", "xhigh", "ultra", "high", "low"] {
+        if let Some(base) = model.strip_suffix(&format!("-{effort}")) {
+            return Some((base.to_string(), effort.to_string()));
+        }
+    }
+    None
+}
+
+async fn migrate_legacy_openai_route_efforts(store: &Store) -> anyhow::Result<()> {
+    if store.get_setting(EFFORT_MIGRATION_KEY).await?.is_some() {
+        return Ok(());
+    }
+
+    let mut inventory = BTreeSet::new();
+    let openai = registry::descriptor("openai").expect("OpenAI must be in the registry");
+    inventory.extend(openai.models.iter().map(|model| (*model).to_string()));
+    for connection in connections::list_connections(store).await? {
+        if connection.provider == "openai" {
+            inventory.extend(connections::effective_models(openai, &connection));
+        }
+    }
+
+    let mut routes = load_model_routes(store).await?;
+    for route in &mut routes {
+        for target in &mut route.targets {
+            if target.provider != "openai"
+                || target.effort.is_some()
+                || inventory.contains(&target.model)
+            {
+                continue;
+            }
+            let Some((base, effort)) = parse_legacy_openai_route_suffix(&target.model) else {
+                continue;
+            };
+            if !inventory.contains(&base) {
+                continue;
+            }
+            let resolved = model_capabilities::resolve_for_model(
+                store,
+                &ModelPreferenceKey {
+                    family: "openai".into(),
+                    model: base.clone(),
+                },
+            )
+            .await?;
+            if resolved.supports(&effort) {
+                target.model = base;
+                target.effort = Some(effort);
+            }
+        }
+    }
+
+    store
+        .with_conn(move |conn| {
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            persist_routes(&transaction, &routes)?;
+            transaction.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, '1') \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [EFFORT_MIGRATION_KEY],
+            )?;
+            transaction.commit()
+        })
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn list_model_route_target_capabilities(
@@ -243,6 +319,7 @@ pub async fn save_model_route(
     store: &Store,
     route: ModelRouteInfo,
 ) -> anyhow::Result<ModelRouteInfo> {
+    migrate_legacy_openai_route_efforts(store).await?;
     let route = sanitize_route(route)?;
     validate_route_target_efforts(store, &route).await?;
     store
@@ -539,6 +616,9 @@ async fn validate_route_target_efforts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    const EFFORT_MIGRATION_KEY: &str = "llm_model_route_effort_migration_v1";
 
     async fn mem_store() -> Store {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -559,6 +639,199 @@ mod tests {
             }],
             created_at: 1,
             updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn parses_one_terminal_legacy_openai_effort_suffix_after_review() {
+        for (model, expected) in [
+            ("gpt-5-review-minimal", ("gpt-5-review", "minimal")),
+            ("gpt-custom-high-review", ("gpt-custom", "high")),
+            ("gpt-test-xhigh", ("gpt-test", "xhigh")),
+            ("gpt-test-ultra", ("gpt-test", "ultra")),
+            ("gpt-test-high", ("gpt-test", "high")),
+            ("gpt-test-low", ("gpt-test", "low")),
+            ("gpt-test-high-review", ("gpt-test", "high")),
+        ] {
+            assert_eq!(
+                parse_legacy_openai_route_suffix(model),
+                Some((expected.0.into(), expected.1.into())),
+                "{model}"
+            );
+        }
+        assert_eq!(
+            parse_legacy_openai_route_suffix("gpt-test-review-xhigh"),
+            Some(("gpt-test-review".into(), "xhigh".into()))
+        );
+        assert_eq!(parse_legacy_openai_route_suffix("gpt-test-review"), None);
+        assert_eq!(parse_legacy_openai_route_suffix("gpt-test-max"), None);
+        assert_eq!(
+            parse_legacy_openai_route_suffix("gpt-test-low-high"),
+            Some(("gpt-test-low".into(), "high".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_migrates_supported_openai_legacy_suffixes_and_preserves_everything_else() {
+        let store = mem_store().await;
+        connections::add_connection(
+            &store,
+            openai_connection(
+                "custom",
+                vec!["gpt-custom", "gpt-custom-high"],
+                &["high", "ultra"],
+            ),
+        )
+        .await
+        .unwrap();
+        let original = routes_with_targets(vec![
+            target("openai", "gpt-custom-ultra", None),
+            target("openai", "gpt-custom-high", None),
+            target("openai", "gpt-custom-high-review", None),
+            target("openai", "gpt-custom-ultra", Some("low")),
+            target("openai", "gpt-missing-high", None),
+            target("openai", "gpt-custom-low", None),
+            target("anthropic", "gpt-custom-high", None),
+            target("openai", "gpt-custom-high", None),
+            target("openai", "gpt-custom-unknown", None),
+        ]);
+        store
+            .set_setting(crate::domain::WriteOrigin::User, SETTING_KEY, &original)
+            .await
+            .unwrap();
+
+        let routes = list_model_routes(&store).await.unwrap();
+        let targets = &routes[0].targets;
+        assert_eq!(targets[0], target("openai", "gpt-custom", Some("ultra")));
+        assert_eq!(targets[1], target("openai", "gpt-custom-high", None));
+        assert_eq!(targets[2], target("openai", "gpt-custom", Some("high")));
+        assert_eq!(
+            targets[3],
+            target("openai", "gpt-custom-ultra", Some("low"))
+        );
+        assert_eq!(targets[4], target("openai", "gpt-missing-high", None));
+        assert_eq!(targets[5], target("openai", "gpt-custom-low", None));
+        assert_eq!(targets[6], target("anthropic", "gpt-custom-high", None));
+        assert_eq!(targets[7], target("openai", "gpt-custom-high", None));
+        assert_eq!(targets[8], target("openai", "gpt-custom-unknown", None));
+        assert_eq!(
+            store
+                .get_setting(EFFORT_MIGRATION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_is_byte_stable_and_save_runs_it_before_writing() {
+        let store = mem_store().await;
+        connections::add_connection(
+            &store,
+            openai_connection("custom", vec!["gpt-custom"], &["high"]),
+        )
+        .await
+        .unwrap();
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                SETTING_KEY,
+                &routes_with_targets(vec![target("openai", "gpt-custom-high", None)]),
+            )
+            .await
+            .unwrap();
+
+        save_model_route(&store, route("new")).await.unwrap();
+        let first = store.get_setting(SETTING_KEY).await.unwrap().unwrap();
+        list_model_routes(&store).await.unwrap();
+        let second = store.get_setting(SETTING_KEY).await.unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::from_str::<Vec<ModelRouteInfo>>(&second).unwrap()[0].targets[0],
+            target("openai", "gpt-custom", Some("high"))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_routes_fail_without_writing_migration_marker() {
+        let store = mem_store().await;
+        store
+            .set_setting(crate::domain::WriteOrigin::User, SETTING_KEY, "not json")
+            .await
+            .unwrap();
+
+        assert!(list_model_routes(&store).await.is_err());
+        assert!(store
+            .get_setting(EFFORT_MIGRATION_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn target(provider: &str, model: &str, effort: Option<&str>) -> ModelRouteTarget {
+        ModelRouteTarget {
+            provider: provider.into(),
+            model: model.into(),
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    fn routes_with_targets(targets: Vec<ModelRouteTarget>) -> String {
+        serde_json::to_string(&vec![ModelRouteInfo {
+            id: "legacy".into(),
+            name: "legacy".into(),
+            enabled: true,
+            strategy: ModelRouteStrategy::Fallback,
+            targets,
+            created_at: 1,
+            updated_at: 1,
+        }])
+        .unwrap()
+    }
+
+    fn openai_connection(
+        id: &str,
+        models: Vec<&str>,
+        efforts: &[&str],
+    ) -> connections::ConnectionRow {
+        connections::ConnectionRow {
+            id: id.into(),
+            provider: "openai".into(),
+            auth_type: "api_key".into(),
+            label: "OpenAI".into(),
+            priority: 0,
+            enabled: true,
+            data: connections::ConnectionData {
+                models_override: Some(models.into_iter().map(str::to_string).collect()),
+                model_meta_overrides: Some(HashMap::from([
+                    ("gpt-custom".into(), discovered_efforts(efforts)),
+                    ("gpt-custom-review".into(), discovered_efforts(efforts)),
+                ])),
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn discovered_efforts(
+        efforts: &[&str],
+    ) -> crate::llm_router::model_effort::DiscoveredModelMeta {
+        crate::llm_router::model_effort::DiscoveredModelMeta {
+            display_name: None,
+            effort_options: Some(
+                efforts
+                    .iter()
+                    .map(|value| ReasoningEffortOption {
+                        value: (*value).into(),
+                        label: (*value).into(),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+            default_effort_advertised: false,
+            default_effort: None,
         }
     }
 
