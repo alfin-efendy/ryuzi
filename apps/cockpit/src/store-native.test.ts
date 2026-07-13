@@ -4,7 +4,6 @@ import { commands } from "./bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const s1 = sessKey(LOCAL_RUNNER, "s1");
-const s2 = sessKey(LOCAL_RUNNER, "s2");
 
 function reset() {
   useNative.setState({ agentsByProject: {}, commandsByProject: {}, todosBySession: {}, queuedBySession: {} });
@@ -182,4 +181,82 @@ test("loadQueue drops an out-of-order stale response", async () => {
 
   expect(useNative.getState().queuedBySession[s1]).toEqual([{ id: "new", text: "newest" }]);
   spy.mockRestore();
+});
+
+test("a stale queue fetch cannot overwrite a successful enqueue", async () => {
+  reset();
+  type QueueResult = Awaited<ReturnType<typeof commands.sessionQueue>>;
+  let resolveFetch!: (value: QueueResult) => void;
+  const queue = spyOn(commands, "sessionQueue").mockImplementation(
+    () =>
+      new Promise<QueueResult>((resolve) => {
+        resolveFetch = resolve;
+      }),
+  );
+  const enqueue = spyOn(commands, "enqueueSessionMessage").mockResolvedValue({ status: "ok", data: { id: "new", text: "new message" } });
+
+  const load = useNative.getState().loadQueue(LOCAL_RUNNER, "s1");
+  expect(await useNative.getState().enqueueQueueMessage(LOCAL_RUNNER, "s1", "new message", null)).toBe(true);
+  resolveFetch({ status: "ok", data: [{ id: "old", text: "stale message" }] });
+  await load;
+
+  expect(useNative.getState().queuedBySession[s1]).toEqual([{ id: "new", text: "new message" }]);
+  queue.mockRestore();
+  enqueue.mockRestore();
+});
+
+test("a stale queue fetch cannot restore a successfully removed message", async () => {
+  reset();
+  useNative.setState({ queuedBySession: { [s1]: [{ id: "remove", text: "remove me" }] } });
+  type QueueResult = Awaited<ReturnType<typeof commands.sessionQueue>>;
+  let resolveFetch!: (value: QueueResult) => void;
+  const queue = spyOn(commands, "sessionQueue").mockImplementation(
+    () =>
+      new Promise<QueueResult>((resolve) => {
+        resolveFetch = resolve;
+      }),
+  );
+  const remove = spyOn(commands, "removeSessionMessage").mockResolvedValue({ status: "ok", data: true });
+
+  const load = useNative.getState().loadQueue(LOCAL_RUNNER, "s1");
+  expect(await useNative.getState().removeQueueMessage(LOCAL_RUNNER, "s1", "remove")).toBe(true);
+  resolveFetch({ status: "ok", data: [{ id: "remove", text: "stale message" }] });
+  await load;
+
+  expect(useNative.getState().queuedBySession[s1]).toEqual([]);
+  queue.mockRestore();
+  remove.mockRestore();
+});
+
+test("a rejected queue load leaves cached messages unchanged", async () => {
+  reset();
+  useNative.setState({ queuedBySession: { [s1]: [{ id: "kept", text: "keep me" }] } });
+  const queue = spyOn(commands, "sessionQueue").mockRejectedValue(new Error("boom"));
+
+  await useNative.getState().loadQueue(LOCAL_RUNNER, "s1");
+
+  expect(useNative.getState().queuedBySession[s1]).toEqual([{ id: "kept", text: "keep me" }]);
+  queue.mockRestore();
+});
+
+test("a rejected queue enqueue returns false and leaves cached messages unchanged", async () => {
+  reset();
+  useNative.setState({ queuedBySession: { [s1]: [{ id: "kept", text: "keep me" }] } });
+  const enqueue = spyOn(commands, "enqueueSessionMessage").mockRejectedValue(new Error("boom"));
+
+  expect(await useNative.getState().enqueueQueueMessage(LOCAL_RUNNER, "s1", "new message", null)).toBe(false);
+
+  expect(useNative.getState().queuedBySession[s1]).toEqual([{ id: "kept", text: "keep me" }]);
+  enqueue.mockRestore();
+});
+
+test("a rejected queue removal returns false and leaves cached messages unchanged", async () => {
+  reset();
+  useNative.setState({ queuedBySession: { [s1]: [{ id: "kept", text: "keep me" }] } });
+  const remove = spyOn(commands, "removeSessionMessage").mockRejectedValue(new Error("boom"));
+
+  expect(await useNative.getState().removeQueueMessage(LOCAL_RUNNER, "s1", "kept")).toBe(false);
+
+  expect(useNative.getState().queuedBySession[s1]).toEqual([{ id: "kept", text: "keep me" }]);
+  remove.mockRestore();
 });

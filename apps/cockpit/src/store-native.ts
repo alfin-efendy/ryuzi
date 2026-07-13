@@ -77,26 +77,42 @@ export const useNative = create<NativeState>((set) => ({
     const key = sessKey(runnerId, sessionPk);
     const token = (queueFetchToken[key] ?? 0) + 1;
     queueFetchToken[key] = token;
-    const res = await commands.sessionQueue(runnerId, sessionPk);
-    if (res.status === "ok" && queueFetchToken[key] === token) {
-      set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: res.data } }));
+    try {
+      const res = await commands.sessionQueue(runnerId, sessionPk);
+      if (res.status === "ok" && queueFetchToken[key] === token) {
+        set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: res.data } }));
+      }
+    } catch {
+      // Generated IPC commands may reject; retain the last known durable queue.
     }
   },
 
   enqueueQueueMessage: async (runnerId, sessionPk, prompt, options) => {
-    const res = await commands.enqueueSessionMessage(runnerId, sessionPk, prompt, options);
-    if (res.status !== "ok") return false;
-    const key = sessKey(runnerId, sessionPk);
-    set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: [...(s.queuedBySession[key] ?? []), res.data] } }));
-    return true;
+    try {
+      const res = await commands.enqueueSessionMessage(runnerId, sessionPk, prompt, options);
+      if (res.status !== "ok") return false;
+      const key = sessKey(runnerId, sessionPk);
+      queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
+      set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: [...(s.queuedBySession[key] ?? []), res.data] } }));
+      return true;
+    } catch {
+      return false;
+    }
   },
 
   removeQueueMessage: async (runnerId, sessionPk, id) => {
-    const res = await commands.removeSessionMessage(runnerId, sessionPk, id);
-    if (res.status !== "ok") return false;
-    const key = sessKey(runnerId, sessionPk);
-    set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: (s.queuedBySession[key] ?? []).filter((message) => message.id !== id) } }));
-    return true;
+    try {
+      const res = await commands.removeSessionMessage(runnerId, sessionPk, id);
+      if (res.status !== "ok") return false;
+      const key = sessKey(runnerId, sessionPk);
+      queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
+      set((s) => ({
+        queuedBySession: { ...s.queuedBySession, [key]: (s.queuedBySession[key] ?? []).filter((message) => message.id !== id) },
+      }));
+      return true;
+    } catch {
+      return false;
+    }
   },
 
   setPlanCollapsed: (runnerId, sessionPk, collapsed) =>
