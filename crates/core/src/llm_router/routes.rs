@@ -264,6 +264,13 @@ pub async fn save_model_route_if_name_absent(
     route: ModelRouteInfo,
 ) -> anyhow::Result<Option<ModelRouteInfo>> {
     let route = sanitize_route(route)?;
+    if list_model_routes(store)
+        .await?
+        .iter()
+        .any(|existing| existing.name.eq_ignore_ascii_case(&route.name))
+    {
+        return Ok(None);
+    }
     validate_route_target_efforts(store, &route).await?;
     store
         .with_conn(move |conn| {
@@ -565,6 +572,44 @@ mod tests {
 
         assert!(inserted.is_none());
         assert_eq!(list_model_routes(&store).await.unwrap(), vec![existing]);
+    }
+
+    #[tokio::test]
+    async fn save_if_name_absent_ignores_invalid_effort_for_existing_route() {
+        let store = mem_store().await;
+        let existing = save_model_route(&store, route("Smart")).await.unwrap();
+        let mut duplicate = route("smart");
+        duplicate.targets[0] = ModelRouteTarget {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-5".into(),
+            effort: Some("max".into()),
+        };
+
+        let saved = save_model_route_if_name_absent(&store, duplicate)
+            .await
+            .unwrap();
+
+        assert!(saved.is_none());
+        assert_eq!(list_model_routes(&store).await.unwrap(), vec![existing]);
+    }
+
+    #[tokio::test]
+    async fn save_if_name_absent_rejects_invalid_effort_for_new_route() {
+        let store = mem_store().await;
+        let mut route = route("smart");
+        route.targets[0] = ModelRouteTarget {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-5".into(),
+            effort: Some("max".into()),
+        };
+
+        assert_eq!(
+            save_model_route_if_name_absent(&store, route)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "effort \"max\" is not supported for route target anthropic/claude-opus-4-5"
+        );
     }
 
     #[tokio::test]
