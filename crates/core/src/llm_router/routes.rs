@@ -70,7 +70,7 @@ pub struct ProviderAccountRouteInfo {
 }
 
 pub async fn list_model_routes(store: &Store) -> anyhow::Result<Vec<ModelRouteInfo>> {
-    migrate_legacy_openai_route_efforts(store).await?;
+    migrate_legacy_route_target_effort(store).await?;
     load_model_routes(store).await
 }
 
@@ -95,8 +95,8 @@ pub(crate) fn parse_legacy_openai_route_suffix(model: &str) -> Option<(String, S
     None
 }
 
-async fn migrate_legacy_openai_route_efforts(store: &Store) -> anyhow::Result<()> {
-    if store.get_setting(EFFORT_MIGRATION_KEY).await?.is_some() {
+pub async fn migrate_legacy_route_target_effort(store: &Store) -> anyhow::Result<()> {
+    if store.get_setting(EFFORT_MIGRATION_KEY).await?.as_deref() == Some("done") {
         return Ok(());
     }
 
@@ -161,7 +161,7 @@ async fn migrate_legacy_openai_route_efforts(store: &Store) -> anyhow::Result<()
                 conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             persist_routes(&transaction, &routes)?;
             transaction.execute(
-                "INSERT INTO settings(key, value) VALUES (?1, '1') \
+                "INSERT INTO settings(key, value) VALUES (?1, 'done') \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [EFFORT_MIGRATION_KEY],
             )?;
@@ -174,7 +174,7 @@ async fn write_effort_migration_marker(store: &Store) -> anyhow::Result<()> {
     store
         .with_conn(|conn| {
             conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?1, '1') \
+                "INSERT INTO settings(key, value) VALUES (?1, 'done') \
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [EFFORT_MIGRATION_KEY],
             )
@@ -349,7 +349,7 @@ pub async fn save_model_route(
     store: &Store,
     route: ModelRouteInfo,
 ) -> anyhow::Result<ModelRouteInfo> {
-    migrate_legacy_openai_route_efforts(store).await?;
+    migrate_legacy_route_target_effort(store).await?;
     let route = sanitize_route(route)?;
     validate_route_target_efforts(store, &route).await?;
     store
@@ -751,7 +751,45 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("1")
+            Some("done")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_effort_migration_marker_does_not_suppress_migration() {
+        let store = mem_store().await;
+        connections::add_connection(
+            &store,
+            openai_connection("custom", vec!["gpt-custom"], &["high"]),
+        )
+        .await
+        .unwrap();
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                SETTING_KEY,
+                &routes_with_targets(vec![target("openai", "gpt-custom-high", None)]),
+            )
+            .await
+            .unwrap();
+        store
+            .set_setting(crate::domain::WriteOrigin::User, EFFORT_MIGRATION_KEY, "1")
+            .await
+            .unwrap();
+
+        let routes = list_model_routes(&store).await.unwrap();
+
+        assert_eq!(
+            routes[0].targets,
+            vec![target("openai", "gpt-custom", Some("high"))]
+        );
+        assert_eq!(
+            store
+                .get_setting(EFFORT_MIGRATION_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("done")
         );
     }
 
@@ -802,7 +840,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("1")
+            Some("done")
         );
     }
 
@@ -819,7 +857,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("1")
+            Some("done")
         );
     }
 
