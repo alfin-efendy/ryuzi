@@ -94,6 +94,14 @@ const selectable = (requestValue: string): SelectableModelInfo => ({
   defaultSource: "none",
 });
 
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+
 // ---------- Tauri boundary mocks (mock.module pattern; the destructured
 // names below are test-local variables — production code always goes
 // through `commands.*`) ----------
@@ -133,9 +141,11 @@ mock.module("@/bindings", () => ({
     updateSubagentModel,
     listSelectableModels,
   },
+  events: {},
 }));
 
 const { useAgents } = await import("./store-agents");
+const { useLearning } = await import("./store-learning");
 
 const allMocks = [
   listAgents,
@@ -160,6 +170,7 @@ beforeEach(() => {
     loading: false,
     saving: false,
   });
+  useLearning.setState({ byAgent: {}, loading: {}, rollingBack: {}, requestGeneration: {} });
 });
 
 // ---------- load / loadDetail ----------
@@ -198,6 +209,89 @@ test("loadDetail replaces the focused detail", async () => {
   await useAgents.getState().loadDetail("reviewer");
   expect(getAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer");
   expect(useAgents.getState().detail).toEqual(reviewerDetail());
+});
+
+test("newest load wins and stale load cannot clear its busy state", async () => {
+  const oldRegistry = deferred<Result<AgentRegistryInfo, CmdError>>();
+  const newRegistry = deferred<Result<AgentRegistryInfo, CmdError>>();
+  listAgents.mockReturnValueOnce(oldRegistry.promise).mockReturnValueOnce(newRegistry.promise);
+
+  const oldLoad = useAgents.getState().load();
+  const newLoad = useAgents.getState().load();
+  newRegistry.resolve(ok({ ...registry(), defaultAgentId: "reviewer" }));
+  await newLoad;
+  expect(useAgents.getState().registry?.defaultAgentId).toBe("reviewer");
+  expect(useAgents.getState().loading).toBe(true);
+
+  oldRegistry.resolve(ok(registry()));
+  await oldLoad;
+  expect(useAgents.getState().registry?.defaultAgentId).toBe("reviewer");
+  expect(useAgents.getState().loading).toBe(false);
+});
+
+test("newest detail request wins when detail responses arrive out of order", async () => {
+  const oldDetail = deferred<Result<AgentDetailInfo, CmdError>>();
+  const newDetail = deferred<Result<AgentDetailInfo, CmdError>>();
+  getAgent.mockReturnValueOnce(oldDetail.promise).mockReturnValueOnce(newDetail.promise);
+
+  const first = useAgents.getState().loadDetail("ryuzi");
+  const second = useAgents.getState().loadDetail("reviewer");
+  newDetail.resolve(ok(reviewerDetail()));
+  await second;
+  oldDetail.resolve(ok(detailOf(ryuziSummary())));
+  await first;
+
+  expect(useAgents.getState().detail?.summary.id).toBe("reviewer");
+});
+
+test("a mutation fences an older load from overwriting committed state", async () => {
+  const staleRegistry = deferred<Result<AgentRegistryInfo, CmdError>>();
+  listAgents.mockReturnValueOnce(staleRegistry.promise);
+  const loading = useAgents.getState().load();
+
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+  expect(await useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead" })).toBe(true);
+  staleRegistry.resolve(ok(registry()));
+  await loading;
+
+  expect(useAgents.getState().registry?.agents[1]?.name).toBe("Lead");
+  expect(useAgents.getState().detail?.summary.name).toBe("Lead");
+});
+
+test("mutations execute in request order and saving stays true until the queue drains", async () => {
+  const firstResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(firstResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const first = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "First" });
+  const second = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Second" });
+  await Promise.resolve();
+  expect(updateAgent).toHaveBeenCalledTimes(1);
+  expect(useAgents.getState().saving).toBe(true);
+
+  firstResult.resolve(ok(detailOf(summary("reviewer", "First"))));
+  expect(await first).toBe(true);
+  expect(useAgents.getState().saving).toBe(true);
+  expect(updateAgent).toHaveBeenCalledTimes(2);
+  expect(await second).toBe(true);
+  expect(useAgents.getState().saving).toBe(false);
+  expect(useAgents.getState().detail?.summary.name).toBe("Second");
+});
+
+test("thrown load and optimistic mutation errors toast and roll back", async () => {
+  const toastSpy = spyOn(toast, "error");
+  listAgents.mockRejectedValueOnce(new Error("invoke unavailable"));
+  await useAgents.getState().load();
+  expect(useAgents.getState().loading).toBe(false);
+  expect(toastSpy.mock.calls.some(([value]) => String(value).includes("invoke unavailable"))).toBe(true);
+
+  updateAgent.mockRejectedValueOnce(new Error("transport closed"));
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+  expect(await useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead" })).toBe(false);
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(toastSpy.mock.calls.some(([value]) => String(value).includes("transport closed"))).toBe(true);
+  toastSpy.mockRestore();
 });
 
 // ---------- create / duplicate ----------
@@ -264,6 +358,7 @@ test("update while a different agent's detail is focused never paints that detai
   );
   useAgents.setState({ registry: registry(), detail: detailOf(ryuziSummary()), loaded: true });
   const pending = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Lead" });
+  await Promise.resolve();
 
   const during = useAgents.getState();
   expect(during.saving).toBe(true);
@@ -283,20 +378,40 @@ test("update while a different agent's detail is focused never paints that detai
 
 // ---------- remove ----------
 
-test("remove commits the server roster and clears a matching detail", async () => {
+test("remove commits the server roster, clears matching detail, and evicts Learning state", async () => {
   useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+  useLearning.setState({
+    byAgent: { reviewer: {} as never, ryuzi: {} as never },
+    loading: { reviewer: true, ryuzi: false },
+    rollingBack: { reviewer: "snapshot-1", ryuzi: null },
+    requestGeneration: { reviewer: 4, ryuzi: 2 },
+  });
   expect(await useAgents.getState().remove("reviewer")).toBe(true);
   expect(deleteAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer");
   expect(useAgents.getState().registry?.agents.map((a) => a.id)).toEqual(["ryuzi"]);
   expect(useAgents.getState().detail).toBeNull();
+  expect(useLearning.getState().byAgent.reviewer).toBeUndefined();
+  expect(useLearning.getState().loading.reviewer).toBeUndefined();
+  expect(useLearning.getState().rollingBack.reviewer).toBeUndefined();
+  expect(useLearning.getState().requestGeneration.reviewer).toBe(5);
+  expect(useLearning.getState().byAgent.ryuzi).toBeDefined();
+  expect(useLearning.getState().requestGeneration.ryuzi).toBe(2);
 });
 
-test("failed delete keeps the agent visible", async () => {
+test("failed delete keeps the agent and Learning state visible", async () => {
   deleteAgent.mockResolvedValueOnce(err("at least one main agent must remain"));
   useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+  useLearning.setState({
+    byAgent: { reviewer: {} as never },
+    loading: { reviewer: false },
+    rollingBack: { reviewer: null },
+    requestGeneration: { reviewer: 4 },
+  });
   expect(await useAgents.getState().remove("reviewer")).toBe(false);
   expect(useAgents.getState().registry).toEqual(registry());
   expect(useAgents.getState().detail).toEqual(reviewerDetail());
+  expect(useLearning.getState().byAgent.reviewer).toBeDefined();
+  expect(useLearning.getState().requestGeneration.reviewer).toBe(4);
 });
 
 // ---------- setDefault / updateSubagentModel ----------

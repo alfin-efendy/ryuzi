@@ -11,6 +11,7 @@ type LearningState = {
   createConcept: (agentId: string, input: KnowledgeConceptMutationInfo) => Promise<boolean>;
   updateConcept: (agentId: string, conceptId: string, input: KnowledgeConceptMutationInfo) => Promise<boolean>;
   deleteConcept: (agentId: string, conceptId: string) => Promise<boolean>;
+  evictAgent: (agentId: string) => void;
   validateRaw: (agentId: string, path: string, raw: string) => Promise<KnowledgeConceptInfo | null>;
   replaceRaw: (agentId: string, path: string, raw: string) => Promise<boolean>;
   deleteInvalid: (agentId: string, path: string) => Promise<boolean>;
@@ -103,6 +104,22 @@ export const useLearning = create<LearningState>((set, get) => {
         return false;
       }
       return installSnapshot(agentId, generation, result.data);
+    },
+
+    evictAgent: (agentId) => {
+      set((state) => {
+        const byAgent = { ...state.byAgent };
+        const loading = { ...state.loading };
+        const rollingBack = { ...state.rollingBack };
+        const requestGeneration = {
+          ...state.requestGeneration,
+          [agentId]: (state.requestGeneration[agentId] ?? 0) + 1,
+        };
+        delete byAgent[agentId];
+        delete loading[agentId];
+        delete rollingBack[agentId];
+        return { byAgent, loading, rollingBack, requestGeneration };
+      });
     },
 
     validateRaw: async (agentId, path, raw) => {

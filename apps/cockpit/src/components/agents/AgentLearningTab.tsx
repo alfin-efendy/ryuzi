@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Pencil, Plus, Trash2, Wrench } from "lucide-react";
 import {
   Badge,
@@ -37,6 +37,12 @@ const SCOPE_OPTIONS = [
 ];
 const emptyDraft: KnowledgeConceptMutationInfo = { title: "", description: "", body: "", scope: "user", projectId: null, tags: [] };
 
+type ValidationProof = {
+  agentId: string;
+  relativePath: string;
+  raw: string;
+};
+
 type Confirmation =
   | { kind: "concept"; concept: KnowledgeConceptInfo }
   | { kind: "invalid"; invalid: InvalidKnowledgeConceptInfo }
@@ -51,7 +57,8 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
   const [draft, setDraft] = useState<KnowledgeConceptMutationInfo>(emptyDraft);
   const [repair, setRepair] = useState<InvalidKnowledgeConceptInfo | null>(null);
   const [raw, setRaw] = useState("");
-  const [validatedRaw, setValidatedRaw] = useState<string | null>(null);
+  const [validationProof, setValidationProof] = useState<ValidationProof | null>(null);
+  const repairTargetRef = useRef<{ agentId: string; relativePath: string } | null>(null);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const projectOptions = useMemo(() => projects.map((project) => ({ value: project.projectId, label: projectLabel(project) })), [projects]);
 
@@ -96,20 +103,34 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
         : await useLearning.getState().updateConcept(agentId, editing.id, input);
     if (ok) setEditing(null);
   };
+  const closeRepair = () => {
+    repairTargetRef.current = null;
+    setRepair(null);
+    setValidationProof(null);
+  };
   const openRepair = (invalid: InvalidKnowledgeConceptInfo) => {
+    repairTargetRef.current = { agentId, relativePath: invalid.relativePath };
     setRepair(invalid);
     setRaw(invalid.rawMarkdown);
-    setValidatedRaw(null);
+    setValidationProof(null);
   };
   const validate = async () => {
     if (!repair) return;
-    const candidate = raw;
-    const parsed = await useLearning.getState().validateRaw(agentId, repair.relativePath, candidate);
-    setValidatedRaw(parsed ? candidate : null);
+    const proof = { agentId, relativePath: repair.relativePath, raw };
+    const parsed = await useLearning.getState().validateRaw(proof.agentId, proof.relativePath, proof.raw);
+    const target = repairTargetRef.current;
+    if (target?.agentId !== proof.agentId || target.relativePath !== proof.relativePath) return;
+    setValidationProof(parsed ? proof : null);
   };
   const replace = async () => {
-    if (!repair || validatedRaw !== raw) return;
-    if (await useLearning.getState().replaceRaw(agentId, repair.relativePath, raw)) setRepair(null);
+    if (
+      !repair ||
+      validationProof?.agentId !== agentId ||
+      validationProof.relativePath !== repair.relativePath ||
+      validationProof.raw !== raw
+    )
+      return;
+    if (await useLearning.getState().replaceRaw(agentId, repair.relativePath, raw)) closeRepair();
   };
   const confirm = async () => {
     if (!confirmation) return;
@@ -327,7 +348,7 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
       ) : null}
 
       {repair ? (
-        <Modal onClose={() => setRepair(null)} width={620}>
+        <Modal onClose={closeRepair} width={620}>
           <ModalHeader title={`Repair ${repair.relativePath}`} description={repair.error} />
           <ModalBody>
             <FormField label="Raw Markdown">
@@ -335,13 +356,18 @@ export function AgentLearningTab({ agentId }: { agentId: string }) {
             </FormField>
           </ModalBody>
           <ModalFooter>
-            <Button variant="outline" onClick={() => setRepair(null)}>
+            <Button variant="outline" onClick={closeRepair}>
               Cancel
             </Button>
             <Button variant="outline" onClick={() => void validate()}>
               Validate
             </Button>
-            <Button disabled={validatedRaw !== raw} onClick={() => void replace()}>
+            <Button
+              disabled={
+                validationProof?.agentId !== agentId || validationProof.relativePath !== repair.relativePath || validationProof.raw !== raw
+              }
+              onClick={() => void replace()}
+            >
               Replace file
             </Button>
           </ModalFooter>

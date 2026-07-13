@@ -11,11 +11,13 @@ export function DeleteAgentModal({
   open,
   trigger,
   onClose,
+  onSuccess,
 }: {
   agent: AgentSummaryInfo;
   open: boolean;
   trigger: HTMLElement | null;
   onClose: () => void;
+  onSuccess?: () => void;
 }) {
   const registry = useAgents((state) => state.registry);
   const canDelete = (registry?.agents.length ?? 0) > 1;
@@ -29,12 +31,16 @@ export function DeleteAgentModal({
       confirmDisabled={!canDelete}
       trigger={trigger}
       onClose={onClose}
-      onConfirm={() => useAgents.getState().remove(agent.id)}
+      onConfirm={async () => {
+        const removed = await useAgents.getState().remove(agent.id);
+        if (removed) onSuccess?.();
+        return removed;
+      }}
     />
   );
 }
 
-export function AgentActionsMenu({ agent }: { agent: AgentSummaryInfo }) {
+export function AgentActionsMenu({ agent, onDeleteSuccess }: { agent: AgentSummaryInfo; onDeleteSuccess?: () => void }) {
   const [open, setOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -91,7 +97,13 @@ export function AgentActionsMenu({ agent }: { agent: AgentSummaryInfo }) {
           </div>
         </MenuPanel>
       )}
-      <DeleteAgentModal agent={agent} open={deleteOpen} trigger={triggerRef.current} onClose={() => setDeleteOpen(false)} />
+      <DeleteAgentModal
+        agent={agent}
+        open={deleteOpen}
+        trigger={triggerRef.current}
+        onClose={() => setDeleteOpen(false)}
+        onSuccess={onDeleteSuccess}
+      />
     </span>
   );
 }

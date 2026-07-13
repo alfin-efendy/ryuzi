@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { AgentDetailInfo, AgentModelInfo, AgentRegistryInfo, AgentSummaryInfo } from "@/bindings";
+import type { AgentDetailInfo, AgentModelInfo, AgentRegistryInfo, AgentSummaryInfo, CmdError, Result } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const route = (r: string): AgentModelInfo => ({ kind: "route", route: r });
@@ -53,10 +53,12 @@ const duplicateAgent = mock(async (_runnerId: string | null, _agentId: string) =
   status: "ok" as const,
   data: detailOf(summary("reviewer-copy", "Reviewer copy")),
 }));
-const deleteAgent = mock(async (_runnerId: string | null, _agentId: string) => ({
-  status: "ok" as const,
-  data: { ...registry(), agents: [ryuziSummary()] },
-}));
+const deleteAgent = mock(
+  async (_runnerId: string | null, _agentId: string): Promise<Result<AgentRegistryInfo, CmdError>> => ({
+    status: "ok",
+    data: { ...registry(), agents: [ryuziSummary()] },
+  }),
+);
 
 mock.module("@/bindings", () => ({
   commands: { duplicateAgent, deleteAgent },
@@ -132,6 +134,19 @@ test("Delete confirms with the exact copy and stays on the hub after success", a
   // Deletion from the hub stays on the hub.
   expect(useNav.getState().history.current).toEqual({ kind: "agents" });
   expect(useAgents.getState().registry?.agents.map((a) => a.id)).toEqual(["ryuzi"]);
+});
+
+test("Delete failure keeps the confirmation open and stays on the hub", async () => {
+  deleteAgent.mockResolvedValueOnce({ status: "error", error: { message: "delete rejected" } });
+  render(<AgentActionsMenu agent={reviewerSummary()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Delete agent" }));
+
+  await waitFor(() => expect(deleteAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer"));
+  expect(useNav.getState().history.current).toEqual({ kind: "agents" });
+  expect(screen.getByRole("dialog", { name: "Delete Reviewer?" })).toBeTruthy();
+  expect(useAgents.getState().registry?.agents.map((agent) => agent.id)).toEqual(["ryuzi", "reviewer"]);
 });
 
 test("Delete confirmation is disabled when only one agent remains", async () => {

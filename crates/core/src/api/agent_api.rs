@@ -344,7 +344,43 @@ fn summary_info(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostCommitEnrichmentFailure {
+    Knowledge,
+    Models,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static POST_COMMIT_ENRICHMENT_FAILURE: PostCommitEnrichmentFailure;
+}
+
+#[cfg(test)]
+async fn with_post_commit_enrichment_failure<T>(
+    failure: PostCommitEnrichmentFailure,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    POST_COMMIT_ENRICHMENT_FAILURE.scope(failure, future).await
+}
+
+fn injected_post_commit_enrichment_failure(failure: PostCommitEnrichmentFailure) -> bool {
+    #[cfg(test)]
+    {
+        return POST_COMMIT_ENRICHMENT_FAILURE
+            .try_with(|active| *active == failure)
+            .unwrap_or(false);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = failure;
+        false
+    }
+}
+
 async fn knowledge_count(state: &ApiState, agent_id: &str) -> Result<u32, ApiError> {
+    if injected_post_commit_enrichment_failure(PostCommitEnrichmentFailure::Knowledge) {
+        return Err(anyhow::anyhow!("injected knowledge enrichment failure").into());
+    }
     Ok(state
         .agent_knowledge
         .learning_snapshot(agent_id)
@@ -353,23 +389,75 @@ async fn knowledge_count(state: &ApiState, agent_id: &str) -> Result<u32, ApiErr
         .len() as u32)
 }
 
+async fn agent_model_info(
+    state: &ApiState,
+    model: &AgentModel,
+) -> Result<Option<crate::llm_router::model_effort::SelectableModelInfo>, ApiError> {
+    let AgentModel::Concrete { name, .. } = model else {
+        return Ok(None);
+    };
+    if injected_post_commit_enrichment_failure(PostCommitEnrichmentFailure::Models) {
+        return Err(anyhow::anyhow!("injected model enrichment failure").into());
+    }
+    Ok(
+        crate::llm_router::client::selectable_native_models(state.cp.store())
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.request_value == *name),
+    )
+}
+
 async fn detail_info(
     state: &ApiState,
     snapshot: AgentSnapshot,
     registry: &AgentRegistrySnapshot,
 ) -> Result<AgentDetailInfo, ApiError> {
     let knowledge = knowledge_count(state, &snapshot.profile.id).await?;
-    // Concrete models are enriched with the exact selectable entry whose
-    // request value matches the canonical `family/model` name; routes match
-    // their selectable named-route entry when one is executable, else None.
-    let request_value = match &snapshot.profile.model {
-        AgentModel::Concrete { name, .. } => name.clone(),
-        AgentModel::Route { route } => route.clone(),
+    let model_info = agent_model_info(state, &snapshot.profile.model).await?;
+    Ok(detail_info_from_enrichment(
+        snapshot, registry, knowledge, model_info,
+    ))
+}
+
+async fn post_commit_detail_info(
+    state: &ApiState,
+    snapshot: AgentSnapshot,
+    registry: &AgentRegistrySnapshot,
+) -> AgentDetailInfo {
+    let agent_id = snapshot.profile.id.as_str();
+    let knowledge = match knowledge_count(state, agent_id).await {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                agent_id,
+                enrichment = "knowledge",
+                "agent mutation committed but response enrichment failed"
+            );
+            0
+        }
     };
-    let model_info = crate::llm_router::client::selectable_native_models(state.cp.store())
-        .await?
-        .into_iter()
-        .find(|candidate| candidate.request_value == request_value);
+    let model_info = match agent_model_info(state, &snapshot.profile.model).await {
+        Ok(model_info) => model_info,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                agent_id,
+                enrichment = "model",
+                "agent mutation committed but response enrichment failed"
+            );
+            None
+        }
+    };
+    detail_info_from_enrichment(snapshot, registry, knowledge, model_info)
+}
+
+fn detail_info_from_enrichment(
+    snapshot: AgentSnapshot,
+    registry: &AgentRegistrySnapshot,
+    knowledge: u32,
+    model_info: Option<crate::llm_router::model_effort::SelectableModelInfo>,
+) -> AgentDetailInfo {
     let summary = summary_info(&snapshot, registry, knowledge);
     let profile = snapshot.profile;
     let rules = profile
@@ -383,7 +471,7 @@ async fn detail_info(
             command_prefix: rule.command_prefix,
         })
         .collect();
-    Ok(AgentDetailInfo {
+    AgentDetailInfo {
         summary,
         permission_rules: rules,
         skills: profile.skills,
@@ -393,19 +481,28 @@ async fn detail_info(
         max_turns: profile.loop_settings.max_turns,
         max_tool_rounds: profile.loop_settings.max_tool_rounds,
         model_info,
-    })
+    }
 }
 
-async fn registry_info(
-    state: &ApiState,
+fn registry_info_from_counts(
     snapshot: AgentRegistrySnapshot,
-) -> Result<AgentRegistryInfo, ApiError> {
-    let mut agents = Vec::with_capacity(snapshot.agents.len());
-    for agent in &snapshot.agents {
-        let knowledge = knowledge_count(state, &agent.profile.id).await?;
-        agents.push(summary_info(agent, &snapshot, knowledge));
-    }
-    Ok(AgentRegistryInfo {
+    knowledge_counts: &std::collections::HashMap<String, u32>,
+) -> AgentRegistryInfo {
+    let agents = snapshot
+        .agents
+        .iter()
+        .map(|agent| {
+            summary_info(
+                agent,
+                &snapshot,
+                knowledge_counts
+                    .get(&agent.profile.id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    AgentRegistryInfo {
         agents,
         default_agent_id: snapshot.default_agent_id,
         recovery: snapshot
@@ -417,7 +514,44 @@ async fn registry_info(
             })
             .collect(),
         subagent_model: snapshot.subagent_model.into(),
-    })
+    }
+}
+
+async fn registry_info(
+    state: &ApiState,
+    snapshot: AgentRegistrySnapshot,
+) -> Result<AgentRegistryInfo, ApiError> {
+    let mut counts = std::collections::HashMap::with_capacity(snapshot.agents.len());
+    for agent in &snapshot.agents {
+        counts.insert(
+            agent.profile.id.clone(),
+            knowledge_count(state, &agent.profile.id).await?,
+        );
+    }
+    Ok(registry_info_from_counts(snapshot, &counts))
+}
+
+async fn post_commit_registry_info(
+    state: &ApiState,
+    snapshot: AgentRegistrySnapshot,
+) -> AgentRegistryInfo {
+    let mut counts = std::collections::HashMap::with_capacity(snapshot.agents.len());
+    for agent in &snapshot.agents {
+        match knowledge_count(state, &agent.profile.id).await {
+            Ok(count) => {
+                counts.insert(agent.profile.id.clone(), count);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    agent_id = agent.profile.id,
+                    enrichment = "knowledge",
+                    "agent mutation committed but response enrichment failed"
+                );
+            }
+        }
+    }
+    registry_info_from_counts(snapshot, &counts)
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {
@@ -945,7 +1079,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let input: AgentMutationInput = a.input.try_into()?;
             let snapshot = state.agents.create(input).await?;
             let registry = state.agents.snapshot().await;
-            ok(detail_info(state, snapshot, &registry).await?)
+            ok(post_commit_detail_info(state, snapshot, &registry).await)
         }
         "update_agent" => {
             let a: UpdateAgentP = params(p)?;
@@ -953,26 +1087,26 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let input: AgentMutationInput = a.input.try_into()?;
             let snapshot = state.agents.update(&agent_id, input).await?;
             let registry = state.agents.snapshot().await;
-            ok(detail_info(state, snapshot, &registry).await?)
+            ok(post_commit_detail_info(state, snapshot, &registry).await)
         }
         "duplicate_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let snapshot = state.agents.duplicate(&agent_id).await?;
             let registry = state.agents.snapshot().await;
-            ok(detail_info(state, snapshot, &registry).await?)
+            ok(post_commit_detail_info(state, snapshot, &registry).await)
         }
         "delete_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let snapshot = state.agents.delete(&agent_id).await?;
-            ok(registry_info(state, snapshot).await?)
+            ok(post_commit_registry_info(state, snapshot).await)
         }
         "set_default_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let snapshot = state.agents.set_default(&agent_id).await?;
-            ok(registry_info(state, snapshot).await?)
+            ok(post_commit_registry_info(state, snapshot).await)
         }
         "get_subagent_model" => {
             let snapshot = state.agents.snapshot().await;
@@ -982,7 +1116,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: UpdateSubagentModelP = params(p)?;
             let model: AgentModel = a.model.try_into()?;
             let snapshot = state.agents.set_subagent_model(model).await?;
-            ok(registry_info(state, snapshot).await?)
+            ok(post_commit_registry_info(state, snapshot).await)
         }
         "get_agent_learning" => {
             let a: AgentIdP = params(p)?;
@@ -1158,6 +1292,192 @@ mod tests {
             updated["summary"]["description"],
             "Reviews safety and regressions."
         );
+    }
+
+    #[tokio::test]
+    async fn post_commit_knowledge_failures_do_not_invert_agent_mutations() {
+        let s = state_with_agents().await;
+
+        let created = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Knowledge,
+            dispatch(
+                &s,
+                "create_agent",
+                json!({"input": reviewer_input("Reviewer")}),
+            ),
+        )
+        .await
+        .unwrap();
+        let id = created["summary"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(created["summary"]["knowledgeCount"], 0);
+
+        let updated = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Knowledge,
+            dispatch(
+                &s,
+                "update_agent",
+                json!({"agent_id": id, "input": reviewer_input("Review Lead")}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated["summary"]["name"], "Review Lead");
+
+        let duplicate = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Knowledge,
+            dispatch(&s, "duplicate_agent", json!({"agent_id": id})),
+        )
+        .await
+        .unwrap();
+        let duplicate_id = duplicate["summary"]["id"].as_str().unwrap().to_owned();
+
+        let defaulted = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Knowledge,
+            dispatch(&s, "set_default_agent", json!({"agent_id": id})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(defaulted["defaultAgentId"], id);
+
+        let subagent = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Knowledge,
+            dispatch(
+                &s,
+                "update_subagent_model",
+                json!({"model": {"kind": "route", "route": "smart"}}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(subagent["subagentModel"]["route"], "smart");
+
+        let deleted = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Knowledge,
+            dispatch(&s, "delete_agent", json!({"agent_id": duplicate_id})),
+        )
+        .await
+        .unwrap();
+        assert!(deleted["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| agent["id"] != duplicate_id));
+
+        let authoritative = s.agents.snapshot().await;
+        assert_eq!(authoritative.default_agent_id, id);
+        assert!(authoritative
+            .agents
+            .iter()
+            .any(|agent| agent.profile.id == id && agent.profile.name == "Review Lead"));
+        assert!(authoritative
+            .agents
+            .iter()
+            .all(|agent| agent.profile.id != duplicate_id));
+        assert!(matches!(
+            authoritative.subagent_model,
+            crate::agents::types::AgentModel::Route { ref route } if route == "smart"
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_commit_model_failures_degrade_concrete_mutation_details() {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+
+        let s = state_with_agents().await;
+        connections::add_connection(
+            s.cp.store(),
+            ConnectionRow {
+                id: "anthropic-live".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let mut input = reviewer_input("Reviewer");
+        input["model"] =
+            json!({"kind": "concrete", "name": "anthropic/claude-opus-4-8", "effort": null});
+
+        let created = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Models,
+            dispatch(&s, "create_agent", json!({"input": input})),
+        )
+        .await
+        .unwrap();
+        let id = created["summary"]["id"].as_str().unwrap().to_owned();
+        assert!(created["modelInfo"].is_null());
+
+        let mut update = reviewer_input("Review Lead");
+        update["model"] =
+            json!({"kind": "concrete", "name": "anthropic/claude-opus-4-8", "effort": null});
+        let updated = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Models,
+            dispatch(&s, "update_agent", json!({"agent_id": id, "input": update})),
+        )
+        .await
+        .unwrap();
+        assert!(updated["modelInfo"].is_null());
+
+        let duplicate = super::with_post_commit_enrichment_failure(
+            super::PostCommitEnrichmentFailure::Models,
+            dispatch(&s, "duplicate_agent", json!({"agent_id": id})),
+        )
+        .await
+        .unwrap();
+        assert!(duplicate["modelInfo"].is_null());
+
+        let authoritative = dispatch(&s, "get_agent", json!({"agent_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(authoritative["summary"]["name"], "Review Lead");
+        assert_eq!(
+            authoritative["modelInfo"]["requestValue"],
+            "anthropic/claude-opus-4-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_detail_never_exposes_resolver_metadata() {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+
+        let s = state_with_agents().await;
+        connections::add_connection(
+            s.cp.store(),
+            ConnectionRow {
+                id: "anthropic-route-target".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let id = s.agents.default_agent_id().await;
+        let detail = dispatch(&s, "get_agent", json!({"agent_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(detail["summary"]["model"]["kind"], "route");
+        assert!(detail["modelInfo"].is_null());
     }
 
     #[tokio::test]

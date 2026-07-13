@@ -41,6 +41,10 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   const loading = useAgents((state) => state.loading);
   const [tab, setTab] = useState<Tab>("overview");
   const nav = useNav();
+  const leaveDeletedDetail = () => {
+    if (nav.history.back.length > 0) nav.goBack();
+    else nav.navigate({ kind: "agents" });
+  };
   useEffect(() => {
     if (!detail) void useAgents.getState().loadDetail(agentId);
   }, [agentId, detail]);
@@ -78,7 +82,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
               </>
             )}
           </Badge>
-          <AgentActionsMenu agent={summary} />
+          <AgentActionsMenu agent={summary} onDeleteSuccess={leaveDeletedDetail} />
         </header>
         <div className="my-4 overflow-x-auto" data-testid="agent-detail-tabs">
           <Segmented options={[...TABS]} value={tab} onChange={setTab} />
@@ -119,7 +123,7 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
         {tab === "permissions" ? <AgentPermissionsTab detail={detail} /> : null}
         {tab === "capabilities" ? <AgentSkillsToolsTab detail={detail} /> : null}
         {tab === "learning" ? <AgentLearningTab agentId={agentId} /> : null}
-        {tab === "advanced" ? <AgentAdvancedTab detail={detail} /> : null}
+        {tab === "advanced" ? <AgentAdvancedTab detail={detail} onDeleteSuccess={leaveDeletedDetail} /> : null}
       </div>
     </div>
   );

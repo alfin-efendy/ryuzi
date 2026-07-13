@@ -101,6 +101,25 @@ test("newest same-agent load wins when responses resolve out of order", async ()
   expect(useLearning.getState().loading.reviewer).toBe(false);
 });
 
+test("eviction fences stale requests when an agent ID is recreated", async () => {
+  let resolveDeleted!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveRecreated!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveDeleted = resolve)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveRecreated = resolve)));
+
+  const deletedLoad = useLearning.getState().load("reviewer");
+  useLearning.getState().evictAgent("reviewer");
+  const recreatedLoad = useLearning.getState().load("reviewer");
+  resolveRecreated(ok(learning("Recreated agent")));
+  await recreatedLoad;
+  resolveDeleted(ok(learning("Deleted agent")));
+  await deletedLoad;
+
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Recreated agent");
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+});
+
 test("mutation refresh cannot be overwritten by an older in-flight load", async () => {
   let resolveOld!: (value: Result<AgentLearningInfo, CmdError>) => void;
   getAgentLearning

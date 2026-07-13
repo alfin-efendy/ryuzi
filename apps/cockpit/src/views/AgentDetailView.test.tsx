@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { AgentDetailInfo, AgentMutationInfo, AgentRegistryInfo, SelectableModelInfo } from "@/bindings";
+import type {
+  AgentDetailInfo,
+  AgentLearningInfo,
+  AgentMutationInfo,
+  AgentRegistryInfo,
+  CmdError,
+  Result,
+  SelectableModelInfo,
+} from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const getAgent = mock(async (_runner: string | null, id: string) => ({
@@ -16,19 +24,19 @@ const duplicateAgent = mock(async (_runner: string | null, _id: string) => ({
   status: "ok" as const,
   data: detail({ summary: { ...detail().summary, id: "reviewer-copy", name: "Reviewer Copy" } }),
 }));
-const deleteAgent = mock(async (_runner: string | null, _id: string) => ({
-  status: "ok" as const,
-  data: { ...registry, agents: registry.agents.filter((agent) => agent.id !== "reviewer-copy") },
-}));
+const deleteAgent = mock(
+  async (_runner: string | null, _id: string): Promise<Result<AgentRegistryInfo, CmdError>> => ({
+    status: "ok",
+    data: { ...registry, agents: registry.agents.filter((agent) => agent.id !== "reviewer-copy") },
+  }),
+);
 
 mock.module("@/bindings", () => ({ commands: { deleteAgent, duplicateAgent, getAgent, listApps, updateAgent }, events: {} }));
-mock.module("@/components/agents/AgentLearningTab", () => ({
-  AgentLearningTab: ({ agentId }: { agentId: string }) => <div>Learning for {agentId}</div>,
-}));
 
 const { AgentDetailView } = await import("./AgentDetailView");
 const { useAgents } = await import("@/store-agents");
 const { useApps } = await import("@/store-apps");
+const { useLearning } = await import("@/store-learning");
 const { useNav } = await import("@/store-nav");
 
 const routeInfo: SelectableModelInfo = {
@@ -99,6 +107,16 @@ const registry: AgentRegistryInfo = {
   subagentModel: { kind: "route", route: "fast" },
 };
 
+const learningSnapshot: AgentLearningInfo = {
+  concepts: [],
+  invalid: [],
+  journey: [],
+  skillUsage: [],
+  reviews: [],
+  curator: { concept: null, lastEventId: null },
+  curatorHistory: [],
+};
+
 function seed(value = detail()) {
   useAgents.setState({ registry, detail: value, models: [routeInfo, opusInfo, miniInfo], loaded: true, loading: false, saving: false });
   useNav.setState({ history: { back: [], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
@@ -110,6 +128,12 @@ beforeEach(() => {
   listApps.mockClear();
   updateAgent.mockClear();
   useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
+  useLearning.setState({
+    byAgent: { reviewer: learningSnapshot },
+    loading: {},
+    rollingBack: {},
+    requestGeneration: {},
+  });
   seed();
 });
 afterEach(cleanup);
@@ -136,6 +160,39 @@ test("management flow inspects, duplicates, starts chat with, and deletes throug
   await screen.findByRole("dialog", { name: "Delete Reviewer Copy?" });
   fireEvent.click(screen.getByRole("button", { name: "Delete agent" }));
   await waitFor(() => expect(deleteAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer-copy"));
+});
+
+test("detail header delete navigates back only after success", async () => {
+  useNav.setState({ history: { back: [{ kind: "agents" }], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Delete agent" }));
+
+  await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agents" }));
+});
+
+test("detail header delete failure keeps the detail and confirmation open", async () => {
+  deleteAgent.mockResolvedValueOnce({ status: "error", error: { message: "delete rejected" } });
+  useNav.setState({ history: { back: [{ kind: "agents" }], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Actions for Reviewer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Delete agent" }));
+
+  await waitFor(() => expect(deleteAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer"));
+  expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" });
+  expect(screen.getByRole("dialog", { name: "Delete Reviewer?" })).toBeTruthy();
+});
+
+test("Advanced delete uses the same success-only detail navigation", async () => {
+  useNav.setState({ history: { back: [], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
+  render(<AgentDetailView agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete Reviewer" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Delete agent" }));
+
+  await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agents" }));
 });
 
 test("detail has Back, identity, actions, six tabs, and overview metrics", () => {
@@ -287,5 +344,6 @@ test("Skills & Tools and Advanced tabs render their owned settings", () => {
 test("Learning renders the selected agent's Learning tab", () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Learning" }));
-  expect(screen.getByText("Learning for reviewer")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Add memory" })).toBeTruthy();
+  expect(screen.getByText("No memory concepts yet.")).toBeTruthy();
 });

@@ -32,7 +32,7 @@ const load = mock(async (_agentId: string) => {});
 const createConcept = mock(async () => true);
 const updateConcept = mock(async () => true);
 const deleteConcept = mock(async () => true);
-const validateRaw = mock(async () => parsed);
+const validateRaw = mock(async (): Promise<KnowledgeConceptInfo | null> => parsed);
 const replaceRaw = mock(async () => true);
 const deleteInvalid = mock(async () => true);
 const rollback = mock(async () => true);
@@ -103,6 +103,37 @@ test("changing raw markdown after validation disables Replace again", async () =
   await waitFor(() => expect(screen.getByRole("button", { name: "Replace file" }).hasAttribute("disabled")).toBe(false));
   fireEvent.change(raw, { target: { value: `${validRaw}\nchanged` } });
   expect(screen.getByRole("button", { name: "Replace file" }).hasAttribute("disabled")).toBe(true);
+});
+
+test("validation proof is scoped to agent, path, and raw and ignores a late previous-target result", async () => {
+  let resolveValidation!: (value: KnowledgeConceptInfo | null) => void;
+  validateRaw.mockImplementationOnce(
+    () =>
+      new Promise<KnowledgeConceptInfo | null>((resolve) => {
+        resolveValidation = resolve;
+      }),
+  );
+  const { rerender } = render(<AgentLearningTab agentId="reviewer" />);
+  fireEvent.click(screen.getByRole("button", { name: "Repair memory/user/broken.md" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Raw Markdown" }), { target: { value: validRaw } });
+  fireEvent.click(screen.getByRole("button", { name: "Validate" }));
+
+  useLearning.setState({
+    byAgent: {
+      reviewer: reviewerLearning,
+      ryuzi: {
+        ...reviewerLearning,
+        invalid: [{ relativePath: "memory/user/other.md", error: "missing title", rawMarkdown: "broken" }],
+      },
+    },
+  });
+  rerender(<AgentLearningTab agentId="ryuzi" />);
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  fireEvent.click(screen.getByRole("button", { name: "Repair memory/user/other.md" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Raw Markdown" }), { target: { value: validRaw } });
+  resolveValidation(parsed);
+
+  await waitFor(() => expect(screen.getByRole("button", { name: "Replace file" }).hasAttribute("disabled")).toBe(true));
 });
 
 test("memory editor requires a trimmed description before saving", () => {

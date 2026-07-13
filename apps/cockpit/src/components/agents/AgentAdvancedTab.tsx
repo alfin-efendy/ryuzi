@@ -11,7 +11,7 @@ export function positiveLimit(raw: string): number | null {
   return Number.isSafeInteger(value) && value >= 1 ? value : null;
 }
 
-export function AgentAdvancedTab({ detail }: { detail: AgentDetailInfo }) {
+export function AgentAdvancedTab({ detail, onDeleteSuccess }: { detail: AgentDetailInfo; onDeleteSuccess?: () => void }) {
   const saving = useAgents((state) => state.saving);
   const registry = useAgents((state) => state.registry);
   const [maxTurns, setMaxTurns] = useState(String(detail.maxTurns));
@@ -108,7 +108,13 @@ export function AgentAdvancedTab({ detail }: { detail: AgentDetailInfo }) {
           </Button>
         </SettingsCardRow>
       </SettingsCard>
-      <DeleteAgentModal agent={detail.summary} open={deleteOpen} trigger={deleteTriggerRef.current} onClose={() => setDeleteOpen(false)} />
+      <DeleteAgentModal
+        agent={detail.summary}
+        open={deleteOpen}
+        trigger={deleteTriggerRef.current}
+        onClose={() => setDeleteOpen(false)}
+        onSuccess={onDeleteSuccess}
+      />
     </div>
   );
 }

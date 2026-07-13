@@ -1,13 +1,10 @@
 //! Learning screen commands: thin proxies to the engine daemon's
-//! `crates/core/src/api/learning_api.rs` RPC family — memory read/write,
-//! cross-session recall, the Learning panel's journey graph, curator
-//! status/rollback, and skill lifecycle/pin controls (Task 11).
+//! `crates/core/src/api/learning_api.rs` RPC family for cross-session recall
+//! and skill lifecycle/pin controls.
 //!
-//! This is the legacy *global* Learning surface, retained as a compile
-//! bridge for its current frontend consumers until Plan 3 Task 9 removes
-//! both together. The per-agent Learning commands (`get_agent_learning`,
-//! concept CRUD, raw repair, rollback) live in `agent_cmd.rs` beside the
-//! agent registry family; like everything here they are local-engine-only.
+//! Per-agent Learning commands (`get_agent_learning`, concept CRUD, raw
+//! repair, rollback) live in `agent_cmd.rs`; like everything here they are
+//! local-engine-only.
 
 use crate::engine_manager::EngineManager;
 use crate::error::CmdError;

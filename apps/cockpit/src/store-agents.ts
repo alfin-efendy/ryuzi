@@ -9,6 +9,7 @@ import {
   type SelectableModelInfo,
 } from "./bindings";
 import { LOCAL_RUNNER } from "./lib/session-key";
+import { useLearning } from "./store-learning";
 
 // Agent domain store (Plan 3): the YAML agent registry (roster + default +
 // subagent model), the focused agent's full detail, and the shared selectable-
@@ -37,219 +38,281 @@ type AgentsState = {
 
 /** Patch one roster entry in place (identity-preserving for the rest). */
 function patchRoster(registry: AgentRegistryInfo, agentId: string, detail: AgentDetailInfo): AgentRegistryInfo {
-  return { ...registry, agents: registry.agents.map((a) => (a.id === agentId ? detail.summary : a)) };
+  return { ...registry, agents: registry.agents.map((agent) => (agent.id === agentId ? detail.summary : agent)) };
 }
 
-/** Optimistically patch only the mutation-representable summary fields of one
- *  roster entry. Used when the focused detail belongs to a different agent, so
- *  the target row still previews the edit without borrowing another agent's
- *  summary (or any server-derived fields like counts and validation). */
+/** Patch only fields represented by a mutation, preserving server-derived fields. */
 function patchRosterFields(registry: AgentRegistryInfo, agentId: string, input: AgentMutationInfo): AgentRegistryInfo {
   return {
     ...registry,
-    agents: registry.agents.map((a) =>
-      a.id === agentId
+    agents: registry.agents.map((agent) =>
+      agent.id === agentId
         ? {
-            ...a,
+            ...agent,
             name: input.name,
             description: input.description,
             avatarColor: input.avatarColor,
             model: input.model,
             permissionMode: input.permissionMode,
           }
-        : a,
+        : agent,
     ),
   };
 }
 
-export const useAgents = create<AgentsState>((set, get) => ({
-  registry: null,
-  detail: null,
-  models: [],
-  loaded: false,
-  loading: false,
-  saving: false,
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
-  load: async (agentId) => {
+export const useAgents = create<AgentsState>((set, get) => {
+  let loadGeneration = 0;
+  let detailGeneration = 0;
+  let pendingReads = 0;
+  let pendingMutations = 0;
+  let mutationTail: Promise<void> = Promise.resolve();
+
+  const beginRead = () => {
+    pendingReads += 1;
     set({ loading: true });
-    try {
-      // Independent fetches must not waterfall: registry, models, and the
-      // optional focused detail all go out in parallel.
-      const [reg, models, detail] = await Promise.all([
-        commands.listAgents(LOCAL_RUNNER),
-        commands.listSelectableModels(LOCAL_RUNNER),
-        agentId ? commands.getAgent(LOCAL_RUNNER, agentId) : Promise.resolve(null),
-      ]);
-      if (reg.status === "ok") set({ registry: reg.data, loaded: true });
-      else toast.error(`Couldn't load agents: ${reg.error.message}`);
-      if (models.status === "ok") set({ models: models.data });
-      else toast.error(`Couldn't load models: ${models.error.message}`);
-      if (detail) {
-        if (detail.status === "ok") set({ detail: detail.data });
-        else toast.error(`Couldn't load agent: ${detail.error.message}`);
-      }
-    } finally {
-      set({ loading: false });
-    }
-  },
-
-  loadDetail: async (agentId) => {
-    const res = await commands.getAgent(LOCAL_RUNNER, agentId);
-    if (res.status === "ok") set({ detail: res.data });
-    else toast.error(`Couldn't load agent: ${res.error.message}`);
-  },
-
-  create: async (input) => {
+  };
+  const finishRead = () => {
+    pendingReads -= 1;
+    set({ loading: pendingReads > 0 });
+  };
+  const fenceReads = () => {
+    loadGeneration += 1;
+    detailGeneration += 1;
+  };
+  const enqueueMutation = <T>(operation: () => Promise<T>): Promise<T> => {
+    pendingMutations += 1;
     set({ saving: true });
-    try {
-      const res = await commands.createAgent(LOCAL_RUNNER, input);
-      if (res.status === "error") {
-        toast.error(`Create agent failed: ${res.error.message}`);
-        return null;
-      }
-      const reg = get().registry;
-      set({
-        detail: res.data,
-        registry: reg ? { ...reg, agents: [...reg.agents, res.data.summary] } : reg,
-      });
-      return res.data;
-    } finally {
-      set({ saving: false });
-    }
-  },
-
-  update: async (agentId, input) => {
-    // Snapshot, paint the representable fields optimistically, then commit
-    // the server's authoritative detail — or restore the snapshot on error.
-    const prev = { registry: get().registry, detail: get().detail };
-    const optimistic: AgentDetailInfo | null =
-      prev.detail && prev.detail.summary.id === agentId
-        ? {
-            ...prev.detail,
-            summary: {
-              ...prev.detail.summary,
-              name: input.name,
-              description: input.description,
-              avatarColor: input.avatarColor,
-              model: input.model,
-              permissionMode: input.permissionMode,
-            },
-            permissionRules: input.permissionRules,
-            skills: input.skills,
-            nativeTools: input.nativeTools,
-            pluginTools: input.pluginTools,
-            apps: input.apps,
-            maxTurns: input.maxTurns,
-            maxToolRounds: input.maxToolRounds,
-          }
-        : prev.detail;
-    // Roster patch: use the optimistic detail's summary only when it really is
-    // the target agent's detail — a focused detail for a *different* agent must
-    // never be painted into the target row. Otherwise patch just the
-    // representable summary fields from the mutation input.
-    set({
-      saving: true,
-      detail: optimistic,
-      registry: prev.registry
-        ? optimistic && optimistic.summary.id === agentId
-          ? patchRoster(prev.registry, agentId, optimistic)
-          : patchRosterFields(prev.registry, agentId, input)
-        : prev.registry,
+    const result = mutationTail.then(operation, operation);
+    mutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result.finally(() => {
+      pendingMutations -= 1;
+      set({ saving: pendingMutations > 0 });
     });
-    try {
-      const res = await commands.updateAgent(LOCAL_RUNNER, agentId, input);
-      if (res.status === "error") {
-        set({ registry: prev.registry, detail: prev.detail });
-        toast.error(`Update agent failed: ${res.error.message}`);
-        return false;
-      }
-      const reg = get().registry;
-      set({
-        detail: get().detail?.summary.id === agentId ? res.data : get().detail,
-        registry: reg ? patchRoster(reg, agentId, res.data) : reg,
-      });
-      return true;
-    } finally {
-      set({ saving: false });
-    }
-  },
+  };
 
-  duplicate: async (agentId) => {
-    set({ saving: true });
-    try {
-      const res = await commands.duplicateAgent(LOCAL_RUNNER, agentId);
-      if (res.status === "error") {
-        toast.error(`Duplicate agent failed: ${res.error.message}`);
-        return null;
-      }
-      const reg = get().registry;
-      set({ registry: reg ? { ...reg, agents: [...reg.agents, res.data.summary] } : reg });
-      return res.data;
-    } finally {
-      set({ saving: false });
-    }
-  },
+  return {
+    registry: null,
+    detail: null,
+    models: [],
+    loaded: false,
+    loading: false,
+    saving: false,
 
-  remove: async (agentId) => {
-    // Not optimistic: deletion can be refused (last main agent), so the row
-    // stays visible until the engine confirms and returns the new roster.
-    set({ saving: true });
-    try {
-      const res = await commands.deleteAgent(LOCAL_RUNNER, agentId);
-      if (res.status === "error") {
-        toast.error(`Delete agent failed: ${res.error.message}`);
-        return false;
+    load: async (agentId) => {
+      const generation = ++loadGeneration;
+      const requestedDetail = agentId ? ++detailGeneration : null;
+      beginRead();
+      try {
+        const [registry, models, detail] = await Promise.all([
+          commands.listAgents(LOCAL_RUNNER),
+          commands.listSelectableModels(LOCAL_RUNNER),
+          agentId ? commands.getAgent(LOCAL_RUNNER, agentId) : Promise.resolve(null),
+        ]);
+        if (loadGeneration !== generation) return;
+        if (registry.status === "ok") set({ registry: registry.data, loaded: true });
+        else toast.error(`Couldn't load agents: ${registry.error.message}`);
+        if (models.status === "ok") set({ models: models.data });
+        else toast.error(`Couldn't load models: ${models.error.message}`);
+        if (detail && detailGeneration === requestedDetail) {
+          if (detail.status === "ok") set({ detail: detail.data });
+          else toast.error(`Couldn't load agent: ${detail.error.message}`);
+        }
+      } catch (error) {
+        if (loadGeneration === generation) toast.error(`Couldn't load agents: ${errorMessage(error)}`);
+      } finally {
+        finishRead();
       }
-      set((s) => ({
-        registry: res.data,
-        detail: s.detail?.summary.id === agentId ? null : s.detail,
-      }));
-      return true;
-    } finally {
-      set({ saving: false });
-    }
-  },
+    },
 
-  setDefault: async (agentId) => {
-    const prev = get().registry;
-    set({
-      saving: true,
-      registry: prev
-        ? {
-            ...prev,
-            defaultAgentId: agentId,
-            agents: prev.agents.map((a) => ({ ...a, isDefault: a.id === agentId })),
+    loadDetail: async (agentId) => {
+      const generation = ++detailGeneration;
+      beginRead();
+      try {
+        const result = await commands.getAgent(LOCAL_RUNNER, agentId);
+        if (detailGeneration !== generation) return;
+        if (result.status === "ok") set({ detail: result.data });
+        else toast.error(`Couldn't load agent: ${result.error.message}`);
+      } catch (error) {
+        if (detailGeneration === generation) toast.error(`Couldn't load agent: ${errorMessage(error)}`);
+      } finally {
+        finishRead();
+      }
+    },
+
+    create: (input) =>
+      enqueueMutation(async () => {
+        fenceReads();
+        try {
+          const result = await commands.createAgent(LOCAL_RUNNER, input);
+          if (result.status === "error") {
+            toast.error(`Create agent failed: ${result.error.message}`);
+            return null;
           }
-        : prev,
-    });
-    try {
-      const res = await commands.setDefaultAgent(LOCAL_RUNNER, agentId);
-      if (res.status === "error") {
-        set({ registry: prev });
-        toast.error(`Default agent failed: ${res.error.message}`);
-        return false;
-      }
-      set({ registry: res.data });
-      return true;
-    } finally {
-      set({ saving: false });
-    }
-  },
+          fenceReads();
+          const registry = get().registry;
+          set({
+            detail: result.data,
+            registry: registry ? { ...registry, agents: [...registry.agents, result.data.summary] } : registry,
+          });
+          return result.data;
+        } catch (error) {
+          toast.error(`Create agent failed: ${errorMessage(error)}`);
+          return null;
+        }
+      }),
 
-  updateSubagentModel: async (model) => {
-    const prev = get().registry;
-    set({ saving: true, registry: prev ? { ...prev, subagentModel: model } : prev });
-    try {
-      const res = await commands.updateSubagentModel(LOCAL_RUNNER, model);
-      if (res.status === "error") {
-        set({ registry: prev });
-        toast.error(`Subagent model failed: ${res.error.message}`);
-        return false;
-      }
-      set({ registry: res.data });
-      return true;
-    } finally {
-      set({ saving: false });
-    }
-  },
-}));
+    update: (agentId, input) =>
+      enqueueMutation(async () => {
+        fenceReads();
+        const previous = { registry: get().registry, detail: get().detail };
+        const optimistic: AgentDetailInfo | null =
+          previous.detail?.summary.id === agentId
+            ? {
+                ...previous.detail,
+                summary: {
+                  ...previous.detail.summary,
+                  name: input.name,
+                  description: input.description,
+                  avatarColor: input.avatarColor,
+                  model: input.model,
+                  permissionMode: input.permissionMode,
+                },
+                permissionRules: input.permissionRules,
+                skills: input.skills,
+                nativeTools: input.nativeTools,
+                pluginTools: input.pluginTools,
+                apps: input.apps,
+                maxTurns: input.maxTurns,
+                maxToolRounds: input.maxToolRounds,
+              }
+            : previous.detail;
+        set({
+          detail: optimistic,
+          registry: previous.registry
+            ? optimistic?.summary.id === agentId
+              ? patchRoster(previous.registry, agentId, optimistic)
+              : patchRosterFields(previous.registry, agentId, input)
+            : previous.registry,
+        });
+        try {
+          const result = await commands.updateAgent(LOCAL_RUNNER, agentId, input);
+          if (result.status === "error") {
+            set(previous);
+            toast.error(`Update agent failed: ${result.error.message}`);
+            return false;
+          }
+          fenceReads();
+          const registry = get().registry;
+          set({
+            detail: get().detail?.summary.id === agentId ? result.data : get().detail,
+            registry: registry ? patchRoster(registry, agentId, result.data) : registry,
+          });
+          return true;
+        } catch (error) {
+          set(previous);
+          toast.error(`Update agent failed: ${errorMessage(error)}`);
+          return false;
+        }
+      }),
+
+    duplicate: (agentId) =>
+      enqueueMutation(async () => {
+        fenceReads();
+        try {
+          const result = await commands.duplicateAgent(LOCAL_RUNNER, agentId);
+          if (result.status === "error") {
+            toast.error(`Duplicate agent failed: ${result.error.message}`);
+            return null;
+          }
+          fenceReads();
+          const registry = get().registry;
+          set({ registry: registry ? { ...registry, agents: [...registry.agents, result.data.summary] } : registry });
+          return result.data;
+        } catch (error) {
+          toast.error(`Duplicate agent failed: ${errorMessage(error)}`);
+          return null;
+        }
+      }),
+
+    remove: (agentId) =>
+      enqueueMutation(async () => {
+        fenceReads();
+        try {
+          const result = await commands.deleteAgent(LOCAL_RUNNER, agentId);
+          if (result.status === "error") {
+            toast.error(`Delete agent failed: ${result.error.message}`);
+            return false;
+          }
+          fenceReads();
+          useLearning.getState().evictAgent(agentId);
+          set((state) => ({
+            registry: result.data,
+            detail: state.detail?.summary.id === agentId ? null : state.detail,
+          }));
+          return true;
+        } catch (error) {
+          toast.error(`Delete agent failed: ${errorMessage(error)}`);
+          return false;
+        }
+      }),
+
+    setDefault: (agentId) =>
+      enqueueMutation(async () => {
+        fenceReads();
+        const previous = get().registry;
+        set({
+          registry: previous
+            ? {
+                ...previous,
+                defaultAgentId: agentId,
+                agents: previous.agents.map((agent) => ({ ...agent, isDefault: agent.id === agentId })),
+              }
+            : previous,
+        });
+        try {
+          const result = await commands.setDefaultAgent(LOCAL_RUNNER, agentId);
+          if (result.status === "error") {
+            set({ registry: previous });
+            toast.error(`Default agent failed: ${result.error.message}`);
+            return false;
+          }
+          fenceReads();
+          set({ registry: result.data });
+          return true;
+        } catch (error) {
+          set({ registry: previous });
+          toast.error(`Default agent failed: ${errorMessage(error)}`);
+          return false;
+        }
+      }),
+
+    updateSubagentModel: (model) =>
+      enqueueMutation(async () => {
+        fenceReads();
+        const previous = get().registry;
+        set({ registry: previous ? { ...previous, subagentModel: model } : previous });
+        try {
+          const result = await commands.updateSubagentModel(LOCAL_RUNNER, model);
+          if (result.status === "error") {
+            set({ registry: previous });
+            toast.error(`Subagent model failed: ${result.error.message}`);
+            return false;
+          }
+          fenceReads();
+          set({ registry: result.data });
+          return true;
+        } catch (error) {
+          set({ registry: previous });
+          toast.error(`Subagent model failed: ${errorMessage(error)}`);
+          return false;
+        }
+      }),
+  };
+});
