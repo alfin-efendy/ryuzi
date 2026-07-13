@@ -36,3 +36,20 @@ test("uses the shared modal shell, footer actions, close button, and restores tr
     trigger.remove();
   }
 });
+
+test("keeps confirmation enabled by default and supports explicitly disabling it", () => {
+  const common = {
+    open: true,
+    title: "Delete route?",
+    description: "This cannot be undone.",
+    confirmLabel: "Delete",
+    trigger: null,
+    onClose: () => {},
+    onConfirm: async () => true,
+  };
+  const { rerender } = render(<ConfirmActionModal {...common} />);
+  expect((screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement).disabled).toBe(false);
+
+  rerender(<ConfirmActionModal {...common} confirmDisabled />);
+  expect((screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement).disabled).toBe(true);
+});

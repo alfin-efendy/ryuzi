@@ -59,6 +59,7 @@ async fn run_inner() -> i32 {
 
     let opts = BuildDaemonOpts {
         db_path,
+        config_root: ryuzi_core::paths::config_dir(),
         telemetry: None,
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         // Native-only: production uses the real in-process native harness.
@@ -111,6 +112,9 @@ async fn run_inner() -> i32 {
         ryuzi_core::serve::ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
+            agents: daemon.agents.clone(),
+            agent_knowledge: daemon.agent_knowledge.clone(),
+            learning_queue: daemon.learning_queue.clone(),
             control_token: token,
         },
         ryuzi_core::serve::ServeOpts {

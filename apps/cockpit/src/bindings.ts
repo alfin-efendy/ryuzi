@@ -315,25 +315,145 @@ async orchSteer(sessionPk: string, text: string) : Promise<Result<string, CmdErr
     else return { status: "error", error: e  as any };
 }
 },
-async getAgentSettings(runnerId: string | null) : Promise<Result<AgentSettingsInfo, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("get_agent_settings", { runnerId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setAgentSettings(runnerId: string | null, model: string | null, permMode: string | null) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_agent_settings", { runnerId, model, permMode }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listSelectableModels(runnerId: string | null) : Promise<Result<SelectableModelInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_selectable_models", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listAgents(runnerId: string | null) : Promise<Result<AgentRegistryInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_agents", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentDetailInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createAgent(runnerId: string | null, input: AgentMutationInfo) : Promise<Result<AgentDetailInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_agent", { runnerId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAgent(runnerId: string | null, agentId: string, input: AgentMutationInfo) : Promise<Result<AgentDetailInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_agent", { runnerId, agentId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async duplicateAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentDetailInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("duplicate_agent", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentRegistryInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_agent", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setDefaultAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentRegistryInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_default_agent", { runnerId, agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getSubagentModel(runnerId: string | null) : Promise<Result<AgentModelInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_subagent_model", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateSubagentModel(runnerId: string | null, model: AgentModelInfo) : Promise<Result<AgentRegistryInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_subagent_model", { runnerId, model }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getAgentLearning(agentId: string) : Promise<Result<AgentLearningInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_learning", { agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createAgentConcept(agentId: string, input: KnowledgeConceptMutationInfo) : Promise<Result<KnowledgeConceptInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_agent_concept", { agentId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAgentConcept(agentId: string, conceptId: string, input: KnowledgeConceptMutationInfo) : Promise<Result<KnowledgeConceptInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_agent_concept", { agentId, conceptId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteAgentConcept(agentId: string, conceptId: string) : Promise<Result<AgentLearningInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_agent_concept", { agentId, conceptId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async validateAgentConceptRaw(agentId: string, relativePath: string, rawMarkdown: string) : Promise<Result<KnowledgeConceptInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("validate_agent_concept_raw", { agentId, relativePath, rawMarkdown }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async replaceAgentConceptRaw(agentId: string, relativePath: string, rawMarkdown: string) : Promise<Result<KnowledgeConceptInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("replace_agent_concept_raw", { agentId, relativePath, rawMarkdown }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteInvalidAgentConcept(agentId: string, relativePath: string) : Promise<Result<AgentLearningInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_invalid_agent_concept", { agentId, relativePath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async rollbackAgentLearning(agentId: string, snapshotId: string) : Promise<Result<AgentLearningInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rollback_agent_learning", { agentId, snapshotId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1297,49 +1417,9 @@ async pluginsRestartRequired(runnerId: string | null) : Promise<Result<boolean, 
     else return { status: "error", error: e  as any };
 }
 },
-async readMemory(scope: string) : Promise<Result<string[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("read_memory", { scope }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async writeMemory(scope: string, action: string, text: string | null, match: string | null) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("write_memory", { scope, action, text, match }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async searchSessions(query: string) : Promise<Result<FtsHit[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("search_sessions", { query }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async learningGraph() : Promise<Result<LearningGraph, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("learning_graph") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async curatorStatus() : Promise<Result<CuratorStatus, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("curator_status") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async curatorRollback(runId: string) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("curator_rollback", { runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1558,12 +1638,32 @@ transport: string; command: string | null; args: string[];
  */
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
+export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
-export type AgentSettingsInfo = { model: string | null; 
+export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: InvalidKnowledgeConceptInfo[]; journey: JourneyMilestoneInfo[]; skillUsage: AgentSkillUsageInfo[]; reviews: LearningReviewInfo[]; curator: CuratorStateInfo; curatorHistory: CuratorHistorySnapshotInfo[] }
 /**
- * "plan" | "ask" | "edit" | "full"; None = engine default ("ask").
+ * An agent's model assignment: either a concrete provider model (with an
+ * optional effort override) or a symbolic router route (`smart`, `fast`,
+ * ...). Routes never carry an effort — `deny_unknown_fields` makes a
+ * `{"kind":"route", ..., "effort": ...}` payload a decode error rather
+ * than a silently dropped field.
  */
-permMode: string | null }
+export type AgentModelInfo = { kind: "concrete"; name: string; effort: string | null } | { kind: "route"; route: string }
+/**
+ * Everything a create/update mutation may set on an agent. Server-derived
+ * fields (`id`, counts, `executable`, `validation`, `is_default`) are
+ * deliberately absent so the client can't submit them.
+ */
+export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number }
+/**
+ * One startup-recovery note surfaced to the UI (for example a quarantined
+ * agent file that failed to parse and was set aside).
+ */
+export type AgentRecoveryInfo = { code: string; message: string }
+export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
+export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
+export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
+export type AgentValidationInfo = { field: string; message: string }
 export type AppInfo = { id: string; name: string; kind: string; initial: string; color: string; desc: string; transport: string; command: string | null; args: string[]; url: string | null; scope: string; scopeGateways: string[]; status: string; statusDetail: string | null; version: string | null; publisher: string | null; authKind: string; authDetail: string | null; tools: ToolInfo[]; agentAccess: AgentAccessInfo[] }
 /**
  * The user's decision on a tool-approval request from the native runtime's
@@ -1723,34 +1823,8 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * P3-4/P3-6 route by runner.
  */
 export type CoreEventMsg = { runnerId: string; event: CoreEvent }
-/**
- * One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
- * sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
- * history view.
- */
-export type CuratorRun = { id: string; startedAt: number; finishedAt: number | null; 
-/**
- * `running` | `ok` | `error`.
- */
-status: string; 
-/**
- * How many skills the deterministic planner transitioned this run.
- */
-transitioned: number; 
-/**
- * Whether the opt-in LLM consolidation pass ran this run.
- */
-consolidated: boolean; 
-/**
- * Pre-mutation tar.gz snapshot path, set only when `consolidated`.
- */
-snapshotPath: string | null; error: string | null; log: string | null }
-/**
- * `curator_status`'s response: when the curator last swept (`None` if it
- * has never run) plus its recent run history for the Learning panel's
- * curator-activity feed.
- */
-export type CuratorStatus = { lastRunAt: number | null; recent: CuratorRun[] }
+export type CuratorHistorySnapshotInfo = { snapshotId: string; concept: KnowledgeConceptInfo }
+export type CuratorStateInfo = { concept: KnowledgeConceptInfo | null; lastEventId: string | null }
 /**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll
@@ -1842,6 +1916,11 @@ export type GitOptions = { useWorktree: boolean; createBranch: boolean; branchNa
 export type InstalledSkillEntry = { id: string; name: string }
 export type InstalledSkillInfo = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skillCount: number }
 export type InstalledSkillPack = { id: string; name: string; source: string; pluginId: string | null; installedAt: string; skills: InstalledSkillEntry[] }
+/**
+ * A knowledge file that failed OKF parsing: surfaced with its raw markdown
+ * so the UI can offer repair instead of silently dropping it.
+ */
+export type InvalidKnowledgeConceptInfo = { relativePath: string; error: string; rawMarkdown: string }
 export type JobInfo = { id: string; name: string; cron: string; mode: string; natural: string; projectId: string; projectName: string; branch: string; gateway: string; enabled: boolean; prompt: string; notifySuccess: boolean; notifyFail: boolean; nextRunMs: number | null; history: RunInfo[]; 
 /**
  * Model id this job's session starts with, overriding the project/agent
@@ -1856,6 +1935,7 @@ export type JobInput = { name: string; mode: string; natural: string; cron: stri
  * See `JobInfo::model_override`.
  */
 modelOverride?: string | null }
+export type JourneyMilestoneInfo = { conceptId: string; title: string; timestamp: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Where the process's master key actually came from. Surfaced to the UI
@@ -1879,40 +1959,15 @@ export type KeychainStatus =
  * restart, or a previously stored key was corrupt and was replaced.
  */
 "unavailable"
-export type LearningGraph = { nodes: LearningGraphNode[]; edges: LearningGraphEdge[] }
 /**
- * One edge in the Learning panel's journey graph: `related_skills` links
- * two skills whose names share a token (a lexical relatedness signal, since
- * `skill_usage` carries no free-text description to compare); `lexical`
- * links a memory entry to a skill its text mentions by name.
+ * One knowledge concept as stored in the agent's OKF tree. `timestamp` is
+ * RFC3339. `scope` is `None` for non-memory concepts and one of `global`,
+ * `user`, or `project` for memory; `project_id` is non-null only for
+ * project memory.
  */
-export type LearningGraphEdge = { source: string; target: string; 
-/**
- * `"related_skills"` | `"lexical"`.
- */
-kind: string }
-/**
- * One node in the Learning panel's journey graph: either a skill
- * (`kind == "skill"`, `state` set from `skill_usage.state`) or a memory
- * entry (`kind == "memory"`, `scope` set to which memory file it lives in).
- * `id` is content-stable (see `learning_api::build_learning_graph`) so a
- * re-fetch after an unrelated edit doesn't reshuffle node identity —
- * unlike Hermes' fragile positional memory ids (spec §7.6).
- */
-export type LearningGraphNode = { id: string; 
-/**
- * `"skill"` | `"memory"`.
- */
-kind: string; label: string; 
-/**
- * Skill lifecycle state (`active`/`stale`/`archived`); `None` for a
- * memory node.
- */
-state: string | null; 
-/**
- * Memory scope (`global`/`user`/`project`); `None` for a skill node.
- */
-scope: string | null }
+export type KnowledgeConceptInfo = { id: string; relativePath: string; conceptType: string; title: string; description: string; body: string; scope: string | null; projectId: string | null; tags: string[]; timestamp: string }
+export type KnowledgeConceptMutationInfo = { title: string; description: string; body: string; scope: string; projectId: string | null; tags: string[] }
+export type LearningReviewInfo = { conceptId: string; title: string; description: string; timestamp: string }
 export type ManualStartInfo = { authorizeUrl: string; verifier: string; state: string; redirectUri: string }
 export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
@@ -1990,6 +2045,7 @@ gaveUp: boolean;
  */
 steerNote: string | null }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
+export type PermissionRuleInfo = { id: string; tool: string; decision: string; commandPrefix: string | null }
 export type PluginAuthInfo = { 
 /**
  * `none` | `api-key` | `token` | `oauth`.

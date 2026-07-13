@@ -265,9 +265,11 @@ impl Harness for NativeHarness {
         // without a project — chat sessions have no project to scope a
         // `tool_policies` row to.
         let project_id = ctx.project_id.clone();
-        let memory_store = Some(Arc::new(memory::MemoryStore::at_default(
+        let memory_store = Some(Arc::new(memory::MemoryStore::for_agent(
+            ctx.agent_knowledge.clone(),
+            &ctx.main_agent_id,
             project_id.as_deref(),
-        )));
+        )?));
         // One buffer for the session's whole lifetime: cloned into
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
@@ -278,6 +280,8 @@ impl Harness for NativeHarness {
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
+                main_agent_id: ctx.main_agent_id,
+                learning_queue: ctx.learning_queue,
                 kind: ctx.kind,
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
@@ -510,8 +514,16 @@ mod tests {
 
     async fn ctx_for(store: Arc<Store>, work_dir: std::path::PathBuf) -> SessionCtx {
         let (events, _rx) = broadcast::channel(64);
+        let knowledge = Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+            work_dir.join(".agent-config"),
+        ));
+        let learning_queue = Arc::new(crate::agents::learning_queue::LearningQueue::new(
+            store.clone(),
+            knowledge.clone(),
+        ));
         SessionCtx {
             session_pk: "sess".into(),
+            main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: crate::domain::SessionKind::Chat,
             agent: None,
@@ -529,6 +541,8 @@ mod tests {
             events,
             approvals: Arc::new(ApprovalHub::new()),
             background: super::background::BackgroundRegistry::new(),
+            agent_knowledge: knowledge,
+            learning_queue,
             store,
             app_control: None,
         }
@@ -683,10 +697,9 @@ mod tests {
     }
 
     /// Redirect `dirs::home_dir()`/`dirs::data_dir()` into a tempdir for the
-    /// duration of a test — `MemoryStore::at_default` resolves under
-    /// `~/.config/ryuzi/memory`, so a test that exercises it for real must
-    /// not touch the developer's actual home directory. Process-global env,
-    /// so every test using this needs `#[serial]` (mirrors
+    /// duration of a test so the agent knowledge bundle resolved below cannot
+    /// touch the developer's actual config directory. Process-global env, so
+    /// every test using this needs `#[serial]` (mirrors
     /// `control::tests::StateDirGuard`).
     struct StateDirGuard {
         _dir: tempfile::TempDir,
@@ -716,16 +729,26 @@ mod tests {
     async fn chat_session_without_a_project_still_gets_global_and_user_memory() {
         use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
         let _guard = StateDirGuard::new();
-        let mem = memory::MemoryStore::at_default(None);
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().to_path_buf();
+        let mem = memory::MemoryStore::for_agent(
+            Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+                work_dir.join(".agent-config"),
+            )),
+            "ryuzi",
+            None,
+        )
+        .unwrap();
         mem.add(
             memory::MemoryScope::Global,
             "the deploy key lives in 1Password",
         )
+        .await
         .unwrap();
         mem.add(memory::MemoryScope::User, "prefers terse answers")
+            .await
             .unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
@@ -744,7 +767,7 @@ mod tests {
         let harness = plugin.harness.unwrap().create().unwrap();
         // ctx_for's SessionCtx carries project_id: None — the chat-session shape.
         let session = harness
-            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .start_session(ctx_for(store.clone(), work_dir).await)
             .await
             .unwrap();
         session

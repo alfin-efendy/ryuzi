@@ -13,8 +13,12 @@ function SettingsCardHeader({ className, children }: { className?: string; child
   return <div className={cn("flex items-center gap-2.5 border-b border-border px-[18px] py-[13px]", className)}>{children}</div>;
 }
 
-function SettingsCardTitle({ children }: { children: ReactNode }) {
-  return <span className="text-[13.5px] font-semibold">{children}</span>;
+function SettingsCardTitle({ id, children }: { id?: string; children: ReactNode }) {
+  return (
+    <span id={id} className="text-[13.5px] font-semibold">
+      {children}
+    </span>
+  );
 }
 
 function SettingsCardHint({ children }: { children: ReactNode }) {

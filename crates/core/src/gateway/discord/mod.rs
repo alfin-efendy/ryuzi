@@ -980,6 +980,7 @@ mod tests {
             Arc::new(StubFetcher),
         )
         .await;
+        cp.attach_test_agent_persistence().await;
         let store_ref = cp.store().clone();
         SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())

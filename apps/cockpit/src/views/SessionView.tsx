@@ -9,11 +9,12 @@ import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { useAgent } from "@/store-agent";
+import { useAgents } from "@/store-agents";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { headerAgentLine } from "@/lib/session-header";
 import { sessionRuntimeScope } from "@/lib/session-runtime";
+import { defaultAgentModel } from "@/lib/default-agent-model";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { NATIVE_AGENT, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
 import { composerMode } from "@/components/composerMode";
@@ -85,8 +86,8 @@ export function SessionView() {
   // Ryuzi-only: every session runs the native agent. Tolerant by
   // construction — legacy rows still saying "claude-code" (restored DBs)
   // are simply treated as native.
-  const agentModel = useAgent((s) => s.model);
-  const agentModels = useAgent((s) => s.models);
+  const agentModels = useAgents((s) => s.models);
+  const agentModel = useAgents((s) => defaultAgentModel(s.registry));
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectId = project?.projectId;
   const runtimeScope = sessionRuntimeScope(session?.kind, projectId ?? null);

@@ -212,7 +212,8 @@ mock.module("@/bindings", () => ({
           modelInfo: null,
         },
       }),
-    getAgentSettings: () => Promise.resolve({ status: "ok", data: { model: null, permMode: null } }),
+    listAgents: () =>
+      Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "smart" } } }),
     listSelectableModels: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
@@ -259,7 +260,7 @@ const { useConnections } = await import("@/store-connections");
 const { useModelRoutes } = await import("@/store-model-routes");
 const { useUsage } = await import("@/store-usage");
 const { useNav } = await import("@/store-nav");
-const { useAgent } = await import("@/store-agent");
+const { useAgents } = await import("@/store-agents");
 
 // The zustand singletons are shared across test files in one bun process, so
 // reset BEFORE each test too — an earlier file's hydration (with its own
@@ -270,7 +271,7 @@ function resetStores() {
   useModelRoutes.setState({ routes: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
-  useAgent.setState({ models: [], model: null, permMode: null, loaded: false });
+  useAgents.setState({ models: [], loaded: false });
 }
 
 beforeEach(() => {
@@ -444,7 +445,7 @@ test("provider detail shows accounts for the selected provider", async () => {
 
 test("provider detail reads dynamic effort metadata from the agent store", async () => {
   useConnections.setState({ catalog, connections: [connection], loaded: true });
-  useAgent.setState({
+  useAgents.setState({
     models: [
       {
         kind: "concrete",

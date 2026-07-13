@@ -96,6 +96,7 @@ where
 fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
     BuildDaemonOpts {
         db_path: deps.db_path.clone(),
+        config_root: ryuzi_core::paths::config_dir(),
         telemetry: None,
         // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
         // `discord` feature (see `gateway::discord::mod`'s doc on why the
@@ -156,6 +157,9 @@ async fn start_control_api(dir: &Path, daemon: &Daemon) -> anyhow::Result<Contro
     let state = ryuzi_core::serve::ApiState {
         cp: daemon.cp.clone(),
         router_server: daemon.router_server.clone(),
+        agents: daemon.agents.clone(),
+        agent_knowledge: daemon.agent_knowledge.clone(),
+        learning_queue: daemon.learning_queue.clone(),
         control_token: token,
     };
     let opts = ryuzi_core::serve::ServeOpts {
@@ -263,6 +267,15 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
         }
     };
 
+    let daemon = Arc::new(daemon);
+    let updater = build_updater(Arc::clone(&daemon), dir.clone());
+    updater.start();
+
+    // Install signal handlers before publishing Running. The status file is
+    // the readiness contract; once clients observe it they may send SIGTERM
+    // immediately and must still receive the graceful exit path.
+    install_signal_handlers(dir.clone(), Arc::clone(&daemon), Some(Arc::clone(&updater)));
+
     let _ = write_status(
         &dir,
         &DaemonStatusFile {
@@ -278,10 +291,6 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
         },
     );
     (deps.out)("daemon: running");
-
-    let daemon = Arc::new(daemon);
-    let updater = build_updater(Arc::clone(&daemon), dir.clone());
-    updater.start();
 
     // Track D: spawn every enabled extension-capable plugin's subprocess(es)
     // now that the daemon is genuinely running. Deliberately a DETACHED
@@ -306,11 +315,6 @@ async fn run_daemon(deps: &mut Deps) -> u8 {
         Arc::new(ryuzi_core::plugins::remote_catalog::ReqwestCatalogHttp::new()),
     );
     catalog_mgr.start();
-
-    // Signal handlers are deliberately installed only AFTER connect succeeds: a signal during
-    // the connect window falls back to default kill; the stale "connecting" file is benign — derive_state
-    // treats a dead pid as stopped.
-    install_signal_handlers(dir, Arc::clone(&daemon), Some(updater));
 
     // Block forever: the process only exits via a signal handler calling
     // `std::process::exit` from within `shutdown_once`.
@@ -644,7 +648,7 @@ async fn run_canary(deps: &mut Deps) -> u8 {
     // Promoted → become the live daemon: reuse run_daemon's signal handling
     // and block. NOTE: the promoted canary runs WITHOUT its own
     // UpdateManager until the next restart.
-    let daemon = host
+    let _daemon = host
         .daemon
         .lock()
         .await
@@ -661,9 +665,8 @@ async fn run_canary(deps: &mut Deps) -> u8 {
     // for the rest of its lifetime, matching `run_daemon`'s singleton-lock
     // invariant. A wedged old process just means the lock is never taken —
     // logged once, but not fatal to the now-promoted canary.
-    spawn_lock_acquire_retry(dir.clone());
+    spawn_lock_acquire_retry(dir);
 
-    install_signal_handlers(dir, Arc::new(daemon), None);
     std::future::pending::<()>().await;
     unreachable!("shutdown_once exits the process before this future can resolve")
 }
@@ -712,7 +715,7 @@ fn spawn_lock_acquire_retry(dir: PathBuf) {
 struct ProdCanaryHost {
     dir: PathBuf,
     opts: std::sync::Mutex<Option<BuildDaemonOpts>>,
-    daemon: tokio::sync::Mutex<Option<Daemon>>,
+    daemon: tokio::sync::Mutex<Option<Arc<Daemon>>>,
     version: String,
 }
 
@@ -725,7 +728,7 @@ impl CanaryHost for ProdCanaryHost {
             .unwrap()
             .take()
             .expect("open_db called once");
-        let daemon = build_daemon(opts).await?;
+        let daemon = Arc::new(build_daemon(opts).await?);
         // Real (canary) daemon startup — same one-time maintenance as
         // `build_and_start`, kept out of `build_daemon` for the same reason.
         daemon.cp.run_startup_maintenance().await;
@@ -755,6 +758,11 @@ impl CanaryHost for ProdCanaryHost {
         // (see `apply_update`/`ApplierHost`) handles rollback of a failed
         // promote, so no status write is needed on this path.
         let bound = start_control_api(&self.dir, daemon).await?;
+
+        // Promotion publishes the new PID as Running, so install graceful
+        // signal handling first. Once clients observe the status file they
+        // may immediately terminate the promoted daemon.
+        install_signal_handlers(self.dir.clone(), daemon.clone(), None);
 
         let _ = write_status(
             &self.dir,

@@ -469,11 +469,21 @@ mod tests {
         let store = ryuzi_core::Store::open(tmp.path()).await.unwrap();
         std::mem::forget(tmp);
         let cp = ryuzi_core::ControlPlane::new(store, ryuzi_core::Registries::new()).await;
+        let persistence = ryuzi_core::agents::bootstrap::initialize_agent_persistence(
+            tempfile::tempdir().unwrap().keep(),
+            cp.store().clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let state = ryuzi_core::serve::ApiState {
             router_server: Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
                 cp.store().clone(),
             )),
             cp: cp.clone(),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             control_token: token.to_string(),
         };
         let opts = ryuzi_core::serve::ServeOpts {
@@ -651,11 +661,21 @@ mod tests {
         let material = ryuzi_core::tls::load_or_generate(tmp.path()).unwrap();
         let tls_cfg = ryuzi_core::tls::server_config(&material).unwrap();
         let store_handle = cp.store().clone();
+        let persistence = ryuzi_core::agents::bootstrap::initialize_agent_persistence(
+            tmp.path().join("agent-config"),
+            store_handle.clone(),
+        )
+        .await
+        .unwrap();
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let state = ryuzi_core::serve::ApiState {
             router_server: Arc::new(ryuzi_core::llm_router::server::RouterServer::new(
                 store_handle.clone(),
             )),
             cp: cp.clone(),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             control_token: token.to_string(),
         };
         let opts = ryuzi_core::serve::ServeOpts {

@@ -1,166 +1,384 @@
-import { test, expect, spyOn } from "bun:test";
-import { useLearning, buildActivityFeed, canRollback } from "./store-learning";
-import { commands, type CuratorRun, type SkillUsage } from "./bindings";
+import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
+import { toast } from "sonner";
+import { commands } from "@/bindings";
+import type { AgentLearningInfo, CmdError, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, Result } from "@/bindings";
 
-function reset() {
-  useLearning.setState({
-    graph: { nodes: [], edges: [] },
-    graphLoaded: false,
-    skills: [],
-    skillsLoaded: false,
-    curator: null,
-    curatorLoaded: false,
-    memoryScope: "global",
-    memory: [],
-    memoryLoaded: false,
-    rollingBack: null,
-  });
-}
+const ok = <T>(data: T): Result<T, CmdError> => ({ status: "ok", data });
+const err = (message: string): Result<never, CmdError> => ({ status: "error", error: { message } });
 
-// ---------- loadGraph (Step 1 of the Task-12 brief, adapted to this repo's
-// spyOn(commands, ...) test convention — see store-native.test.ts) ----------
+const concept = (title: string): KnowledgeConceptInfo => ({
+  id: title.toLowerCase().split(" ").join("-"),
+  relativePath: `memory/user/${title}.md`,
+  conceptType: "memory",
+  title,
+  description: "",
+  body: title,
+  scope: "user",
+  projectId: null,
+  tags: [],
+  timestamp: "2026-03-01T00:00:00Z",
+});
+const learning = (title: string): AgentLearningInfo => ({
+  concepts: [concept(title)],
+  invalid: [],
+  journey: [],
+  skillUsage: [],
+  reviews: [],
+  curator: { concept: null, lastEventId: null },
+  curatorHistory: [],
+});
+const ryuziLearning = learning("Ryuzi memory");
+const reviewerLearning = learning("Reviewer memory");
+const conceptInput: KnowledgeConceptMutationInfo = {
+  title: "Prefer concise summaries",
+  description: "Keep reviews focused.",
+  body: "Lead with the finding.",
+  scope: "user",
+  projectId: null,
+  tags: ["reviews"],
+};
 
-test("loadGraph commits nodes only on ok", async () => {
-  reset();
-  const spy = spyOn(commands, "learningGraph").mockResolvedValue({
-    status: "ok",
-    data: { nodes: [{ id: "skill:deploy", kind: "skill", label: "deploy", state: "active", scope: null }], edges: [] },
-  });
-  await useLearning.getState().loadGraph();
-  expect(useLearning.getState().graph.nodes.map((n) => n.id)).toEqual(["skill:deploy"]);
-  expect(useLearning.getState().graphLoaded).toBe(true);
-  spy.mockRestore();
+const getAgentLearning = spyOn(commands, "getAgentLearning");
+const createAgentConcept = spyOn(commands, "createAgentConcept");
+const updateAgentConcept = spyOn(commands, "updateAgentConcept");
+const deleteAgentConcept = spyOn(commands, "deleteAgentConcept");
+const validateAgentConceptRaw = spyOn(commands, "validateAgentConceptRaw");
+const replaceAgentConceptRaw = spyOn(commands, "replaceAgentConceptRaw");
+const deleteInvalidAgentConcept = spyOn(commands, "deleteInvalidAgentConcept");
+const rollbackAgentLearning = spyOn(commands, "rollbackAgentLearning");
+
+const resetCommandMocks = () => {
+  getAgentLearning.mockImplementation(async (id) => ok(id === "ryuzi" ? ryuziLearning : reviewerLearning));
+  createAgentConcept.mockImplementation(async (_id, input) => ok(concept(input.title)));
+  updateAgentConcept.mockImplementation(async (_id, conceptId) => ok(concept(conceptId)));
+  deleteAgentConcept.mockImplementation(async () => ok(learning("After delete")));
+  validateAgentConceptRaw.mockImplementation(async () => ok(concept("Validated")));
+  replaceAgentConceptRaw.mockImplementation(async () => ok(concept("Replaced")));
+  deleteInvalidAgentConcept.mockImplementation(async () => ok(learning("After repair delete")));
+  rollbackAgentLearning.mockImplementation(async () => ok(learning("Rolled back")));
+};
+
+const { useLearning } = await import("./store-learning");
+const allMocks = [
+  getAgentLearning,
+  createAgentConcept,
+  updateAgentConcept,
+  deleteAgentConcept,
+  validateAgentConceptRaw,
+  replaceAgentConceptRaw,
+  deleteInvalidAgentConcept,
+  rollbackAgentLearning,
+];
+
+beforeEach(() => {
+  for (const command of allMocks) command.mockClear();
+  resetCommandMocks();
+  useLearning.setState({ byAgent: {}, loading: {}, rollingBack: {}, requestGeneration: {} });
 });
 
-test("loadGraph leaves the graph untouched on error", async () => {
-  reset();
-  const spy = spyOn(commands, "learningGraph").mockResolvedValue({ status: "error", error: { message: "boom" } });
-  await useLearning.getState().loadGraph();
-  expect(useLearning.getState().graph.nodes).toEqual([]);
-  expect(useLearning.getState().graphLoaded).toBe(false);
-  spy.mockRestore();
+afterAll(() => {
+  for (const command of allMocks) command.mockRestore();
 });
 
-test("loadCurator commits the run history only on ok", async () => {
-  reset();
-  const spy = spyOn(commands, "curatorStatus").mockResolvedValue({
-    status: "ok",
-    data: { lastRunAt: 5000, recent: [] },
-  });
-  await useLearning.getState().loadCurator();
-  expect(useLearning.getState().curator).toEqual({ lastRunAt: 5000, recent: [] });
-  spy.mockRestore();
+test("load keeps Learning snapshots keyed by agent ID", async () => {
+  await Promise.all([useLearning.getState().load("ryuzi"), useLearning.getState().load("reviewer")]);
+  expect(useLearning.getState().byAgent.ryuzi).toEqual(ryuziLearning);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
 });
 
-test("loadSkills commits the skill list only on ok", async () => {
-  reset();
-  const spy = spyOn(commands, "listSkillUsage").mockResolvedValue({ status: "ok", data: [] });
-  await useLearning.getState().loadSkills();
-  expect(useLearning.getState().skillsLoaded).toBe(true);
-  spy.mockRestore();
+test("newest same-agent load wins when responses resolve out of order", async () => {
+  let resolveOld!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveOld = resolve)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldLoad = useLearning.getState().load("reviewer");
+  const newLoad = useLearning.getState().load("reviewer");
+  resolveNew(ok(learning("Newest snapshot")));
+  await newLoad;
+  resolveOld(ok(learning("Stale snapshot")));
+  await oldLoad;
+
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest snapshot");
+  expect(useLearning.getState().loading.reviewer).toBe(false);
 });
 
-// ---------- ReviewFeed composition (Task-12 resolution #1: the activity feed
-// is composed client-side from skill_usage + curator run history, since no
-// dedicated review-notice command exists) ----------
+test("eviction fences stale requests when an agent ID is recreated", async () => {
+  let resolveDeleted!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveRecreated!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveDeleted = resolve)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveRecreated = resolve)));
 
-function skill(overrides: Partial<SkillUsage>): SkillUsage {
-  return {
-    name: "deploy",
-    createdBy: null,
-    useCount: 0,
-    viewCount: 0,
-    patchCount: 0,
-    lastUsedAt: null,
-    lastViewedAt: null,
-    lastPatchedAt: null,
-    state: "active",
-    pinned: false,
-    archivedAt: null,
-    createdAt: 1000,
-    ...overrides,
-  };
-}
+  const deletedLoad = useLearning.getState().load("reviewer");
+  useLearning.getState().evictAgent("reviewer");
+  const recreatedLoad = useLearning.getState().load("reviewer");
+  resolveRecreated(ok(learning("Recreated agent")));
+  await recreatedLoad;
+  resolveDeleted(ok(learning("Deleted agent")));
+  await deletedLoad;
 
-function run(overrides: Partial<CuratorRun>): CuratorRun {
-  return {
-    id: "run-1",
-    startedAt: 2000,
-    finishedAt: 2100,
-    status: "ok",
-    transitioned: 0,
-    consolidated: false,
-    snapshotPath: null,
-    error: null,
-    log: null,
-    ...overrides,
-  };
-}
-
-test("buildActivityFeed keeps agent-authored and patched skills, drops the rest, and sorts newest-first", () => {
-  const agentAuthored = skill({ name: "deploy", createdBy: "agent", createdAt: 1000 });
-  const humanPatched = skill({ name: "review", createdBy: null, patchCount: 2, lastPatchedAt: 5000 });
-  const untouchedHuman = skill({ name: "unused", createdBy: null, patchCount: 0 });
-  const curatorRun = run({ id: "sweep-1", startedAt: 3000 });
-
-  const feed = buildActivityFeed([agentAuthored, humanPatched, untouchedHuman], [curatorRun]);
-
-  // The untouched human-authored, never-patched skill must not appear.
-  expect(feed.some((i) => i.kind === "skill" && i.skill.name === "unused")).toBe(false);
-  // Newest first: humanPatched (5000) > curatorRun (3000) > agentAuthored (1000).
-  expect(feed.map((i) => (i.kind === "skill" ? i.skill.name : i.run.id))).toEqual(["review", "sweep-1", "deploy"]);
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Recreated agent");
+  expect(useLearning.getState().loading.reviewer).toBe(false);
 });
 
-test("buildActivityFeed falls back through lastPatchedAt -> lastUsedAt -> createdAt for its sort key", () => {
-  const onlyCreated = skill({ name: "a", createdBy: "agent", createdAt: 100, lastUsedAt: null, lastPatchedAt: null });
-  const usedNotPatched = skill({ name: "b", createdBy: "agent", createdAt: 50, lastUsedAt: 200, lastPatchedAt: null });
-  const feed = buildActivityFeed([onlyCreated, usedNotPatched], []);
-  expect(feed.map((i) => (i.kind === "skill" ? i.skill.name : i.run.id))).toEqual(["b", "a"]);
+test("mutation refresh cannot be overwritten by an older in-flight load", async () => {
+  let resolveOld!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveOld = resolve)))
+    .mockResolvedValueOnce(ok(learning("After mutation")));
+
+  const oldLoad = useLearning.getState().load("reviewer");
+  expect(await useLearning.getState().createConcept("reviewer", conceptInput)).toBe(true);
+  resolveOld(ok(learning("Before mutation")));
+  await oldLoad;
+
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("After mutation");
 });
 
-// ---------- rollback gating (Task-12 resolution #2: rollback only becomes
-// available once a consolidation run produced a snapshot to roll back to) ----------
-
-test("canRollback is true only for a consolidated run with a snapshot path", () => {
-  expect(canRollback(run({ consolidated: true, snapshotPath: "/tmp/snap.tar.gz" }))).toBe(true);
-  expect(canRollback(run({ consolidated: false, snapshotPath: null }))).toBe(false);
-  // Defensive: consolidated flag true but no snapshot recorded (should not happen, but never enable the button).
-  expect(canRollback(run({ consolidated: true, snapshotPath: null }))).toBe(false);
+test("concept mutations always send agent ID and reload only that agent", async () => {
+  await useLearning.getState().createConcept("reviewer", conceptInput);
+  expect(createAgentConcept).toHaveBeenCalledWith("reviewer", conceptInput);
+  expect(getAgentLearning).toHaveBeenLastCalledWith("reviewer");
+  expect(getAgentLearning).not.toHaveBeenCalledWith("ryuzi");
 });
 
-// ---------- memory writes ----------
-
-test("addMemory reloads the scope's entries on ok", async () => {
-  reset();
-  const writeSpy = spyOn(commands, "writeMemory").mockResolvedValue({ status: "ok", data: null });
-  const readSpy = spyOn(commands, "readMemory").mockResolvedValue({ status: "ok", data: ["prefers dark mode"] });
-  const ok = await useLearning.getState().addMemory("user", "prefers dark mode");
-  expect(ok).toBe(true);
-  expect(writeSpy).toHaveBeenCalledWith("user", "add", "prefers dark mode", null);
-  expect(useLearning.getState().memory).toEqual(["prefers dark mode"]);
-  writeSpy.mockRestore();
-  readSpy.mockRestore();
+test("all successful memory mutations refresh or replace only their agent snapshot", async () => {
+  useLearning.setState({ byAgent: { ryuzi: ryuziLearning, reviewer: reviewerLearning } });
+  expect(await useLearning.getState().updateConcept("reviewer", "memory-1", conceptInput)).toBe(true);
+  expect(updateAgentConcept).toHaveBeenCalledWith("reviewer", "memory-1", conceptInput);
+  expect(await useLearning.getState().deleteConcept("reviewer", "memory-1")).toBe(true);
+  expect(deleteAgentConcept).toHaveBeenCalledWith("reviewer", "memory-1");
+  expect(await useLearning.getState().replaceRaw("reviewer", "memory/user/broken.md", "# fixed")).toBe(true);
+  expect(replaceAgentConceptRaw).toHaveBeenCalledWith("reviewer", "memory/user/broken.md", "# fixed");
+  expect(await useLearning.getState().deleteInvalid("reviewer", "memory/user/broken.md")).toBe(true);
+  expect(deleteInvalidAgentConcept).toHaveBeenCalledWith("reviewer", "memory/user/broken.md");
+  expect(useLearning.getState().byAgent.ryuzi).toEqual(ryuziLearning);
 });
 
-test("removeMemory reports failure and does not reload on error", async () => {
-  reset();
-  const writeSpy = spyOn(commands, "writeMemory").mockResolvedValue({ status: "error", error: { message: "no entry contains `x`" } });
-  const readSpy = spyOn(commands, "readMemory");
-  const ok = await useLearning.getState().removeMemory("global", "x");
-  expect(ok).toBe(false);
-  expect(readSpy).not.toHaveBeenCalled();
-  writeSpy.mockRestore();
-  readSpy.mockRestore();
+test("validateRaw returns the parsed concept without writing or reloading", async () => {
+  expect((await useLearning.getState().validateRaw("reviewer", "memory/user/broken.md", "# fixed"))?.title).toBe("Validated");
+  expect(validateAgentConceptRaw).toHaveBeenCalledWith("reviewer", "memory/user/broken.md", "# fixed");
+  expect(replaceAgentConceptRaw).not.toHaveBeenCalled();
+  expect(getAgentLearning).not.toHaveBeenCalled();
 });
 
-test("setSkillPinned paints optimistically then reconciles from the reload", async () => {
-  reset();
-  useLearning.setState({ skills: [skill({ name: "deploy", pinned: false })] });
-  const setSpy = spyOn(commands, "setSkillPinned").mockResolvedValue({ status: "ok", data: null });
-  const listSpy = spyOn(commands, "listSkillUsage").mockResolvedValue({ status: "ok", data: [skill({ name: "deploy", pinned: true })] });
-  await useLearning.getState().setSkillPinned("deploy", true);
-  expect(setSpy).toHaveBeenCalledWith("deploy", true);
-  expect(useLearning.getState().skills[0].pinned).toBe(true);
-  setSpy.mockRestore();
-  listSpy.mockRestore();
+test("rejected load preserves the prior snapshot, clears current loading, and returns void", async () => {
+  const toastSpy = spyOn(toast, "error");
+  getAgentLearning.mockRejectedValueOnce(new Error(String.raw`unavailable at C:\Users\Alice\knowledge`));
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+
+  expect(await useLearning.getState().load("reviewer")).toBeUndefined();
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Learning load failed");
+  toastSpy.mockRestore();
+});
+
+test("a rejected stale load cannot toast or clear a newer load", async () => {
+  const toastSpy = spyOn(toast, "error");
+  let rejectOld!: (reason: Error) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning
+    .mockImplementationOnce(() => new Promise((_, reject) => (rejectOld = reject)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldLoad = useLearning.getState().load("reviewer");
+  const newLoad = useLearning.getState().load("reviewer");
+  rejectOld(new Error("stale transport failure"));
+  await oldLoad;
+  expect(useLearning.getState().loading.reviewer).toBe(true);
+  expect(toastSpy).not.toHaveBeenCalled();
+
+  resolveNew(ok(learning("Newest snapshot")));
+  await newLoad;
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest snapshot");
+  toastSpy.mockRestore();
+});
+
+test("rejected concept commands preserve the prior snapshot and return false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+  const operations = [
+    {
+      reject: () => createAgentConcept.mockRejectedValueOnce(new Error("create transport failed")),
+      run: () => useLearning.getState().createConcept("reviewer", conceptInput),
+      toast: "Create memory failed",
+    },
+    {
+      reject: () => updateAgentConcept.mockRejectedValueOnce(new Error("update transport failed")),
+      run: () => useLearning.getState().updateConcept("reviewer", "memory-1", conceptInput),
+      toast: "Update memory failed",
+    },
+    {
+      reject: () => deleteAgentConcept.mockRejectedValueOnce(new Error("delete transport failed")),
+      run: () => useLearning.getState().deleteConcept("reviewer", "memory-1"),
+      toast: "Delete memory failed",
+    },
+  ];
+
+  for (const operation of operations) {
+    operation.reject();
+    expect(await operation.run()).toBe(false);
+    expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+    expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe(operation.toast);
+  }
+  toastSpy.mockRestore();
+});
+
+test("rejected repair commands preserve the prior snapshot and return null or false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+
+  validateAgentConceptRaw.mockRejectedValueOnce(new Error("validate transport failed"));
+  expect(await useLearning.getState().validateRaw("reviewer", "memory/user/broken.md", "# fixed")).toBeNull();
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Validate knowledge failed");
+
+  replaceAgentConceptRaw.mockRejectedValueOnce(new Error("replace transport failed"));
+  expect(await useLearning.getState().replaceRaw("reviewer", "memory/user/broken.md", "# fixed")).toBe(false);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Replace knowledge failed");
+
+  deleteInvalidAgentConcept.mockRejectedValueOnce(new Error("invalid delete transport failed"));
+  expect(await useLearning.getState().deleteInvalid("reviewer", "memory/user/broken.md")).toBe(false);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Delete invalid knowledge failed");
+
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  toastSpy.mockRestore();
+});
+
+test("rejected mutation refresh preserves the prior snapshot and returns false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+  getAgentLearning.mockRejectedValueOnce(new Error("refresh transport failed"));
+
+  expect(await useLearning.getState().createConcept("reviewer", conceptInput)).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Learning load failed");
+  toastSpy.mockRestore();
+});
+
+test("rejected rollback preserves the prior snapshot, clears current rollback, and returns false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning }, loading: {}, rollingBack: {} });
+  rollbackAgentLearning.mockRejectedValueOnce(new Error("rollback transport failed"));
+
+  expect(await useLearning.getState().rollback("reviewer", "snapshot-1")).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Rollback knowledge failed");
+  toastSpy.mockRestore();
+});
+
+test("a rejected stale rollback cannot toast or clear a newer rollback", async () => {
+  const toastSpy = spyOn(toast, "error");
+  let rejectOld!: (reason: Error) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  rollbackAgentLearning
+    .mockImplementationOnce(() => new Promise((_, reject) => (rejectOld = reject)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldRollback = useLearning.getState().rollback("reviewer", "snapshot-1");
+  const newRollback = useLearning.getState().rollback("reviewer", "snapshot-2");
+  rejectOld(new Error("stale rollback failure"));
+  expect(await oldRollback).toBe(false);
+  expect(useLearning.getState().rollingBack.reviewer).toBe("snapshot-2");
+  expect(toastSpy).not.toHaveBeenCalled();
+
+  resolveNew(ok(learning("Newest rollback")));
+  expect(await newRollback).toBe(true);
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest rollback");
+  toastSpy.mockRestore();
+});
+
+test("failed mutations preserve snapshots and never put backend paths in toasts", async () => {
+  const toastSpy = spyOn(toast, "error");
+  createAgentConcept.mockResolvedValueOnce(
+    err(String.raw`journal write failed at C:\Users\Alice\AppData\Roaming\ryuzi\agents\reviewer\knowledge\tx`),
+  );
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+  expect(await useLearning.getState().createConcept("reviewer", conceptInput)).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(toastSpy.mock.calls[0]?.[0]).toBe("Create memory failed");
+  expect(toastSpy.mock.calls[0]?.[0]).not.toContain("C:\\Users");
+  toastSpy.mockRestore();
+});
+
+test("failed curator rollback preserves the prior snapshot", async () => {
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning }, loading: {}, rollingBack: {} });
+  rollbackAgentLearning.mockResolvedValueOnce(err("journal write failed"));
+  expect(await useLearning.getState().rollback("reviewer", "snapshot-1")).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+});
+
+test("rollback result wins over an older load and clears loading", async () => {
+  let resolveOld!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning.mockImplementationOnce(() => new Promise((resolve) => (resolveOld = resolve)));
+
+  const oldLoad = useLearning.getState().load("reviewer");
+  expect(await useLearning.getState().rollback("reviewer", "snapshot-1")).toBe(true);
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Rolled back");
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+
+  resolveOld(ok(learning("Before rollback")));
+  await oldLoad;
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Rolled back");
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+});
+
+test("newer rollback remains active and wins when an older rollback resolves first", async () => {
+  let resolveOld!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  rollbackAgentLearning
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveOld = resolve)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldRollback = useLearning.getState().rollback("reviewer", "snapshot-1");
+  const newRollback = useLearning.getState().rollback("reviewer", "snapshot-2");
+  resolveOld(ok(learning("Older rollback")));
+  await oldRollback;
+  expect(useLearning.getState().rollingBack.reviewer).toBe("snapshot-2");
+  expect(useLearning.getState().byAgent.reviewer).toBeUndefined();
+
+  resolveNew(ok(learning("Newest rollback")));
+  await newRollback;
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest rollback");
+});
+
+test("rollback started after a load wins when responses resolve out of order", async () => {
+  let resolveLoad!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveRollback!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning.mockImplementationOnce(() => new Promise((resolve) => (resolveLoad = resolve)));
+  rollbackAgentLearning.mockImplementationOnce(() => new Promise((resolve) => (resolveRollback = resolve)));
+
+  const load = useLearning.getState().load("reviewer");
+  const rollback = useLearning.getState().rollback("reviewer", "snapshot-1");
+  resolveLoad(ok(learning("Stale load")));
+  await load;
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+
+  resolveRollback(ok(learning("Rollback result")));
+  await rollback;
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Rollback result");
+});
+
+test("latest failed load clears loading without replacing the snapshot", async () => {
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+  getAgentLearning.mockResolvedValueOnce(err("unavailable"));
+
+  await useLearning.getState().load("reviewer");
+
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+});
+
+test("successful rollback stores the returned snapshot without a reload", async () => {
+  expect(await useLearning.getState().rollback("reviewer", "snapshot-1")).toBe(true);
+  expect(rollbackAgentLearning).toHaveBeenCalledWith("reviewer", "snapshot-1");
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Rolled back");
+  expect(getAgentLearning).not.toHaveBeenCalled();
 });

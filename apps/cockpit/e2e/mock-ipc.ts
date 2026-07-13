@@ -302,17 +302,38 @@ export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
   },
 ];
 
+const DEFAULT_AGENT = {
+  id: "ryuzi",
+  name: "Ryuzi",
+  description: "Default agent",
+  avatarColor: "#7C3AED",
+  model: { kind: "route", route: "smart" },
+  permissionMode: "ask",
+  skillCount: 0,
+  toolCount: 0,
+  knowledgeCount: 0,
+  executable: true,
+  validation: [],
+  isDefault: true,
+};
+
+const AGENT_REGISTRY = {
+  agents: [DEFAULT_AGENT],
+  defaultAgentId: DEFAULT_AGENT.id,
+  recovery: [],
+  subagentModel: { kind: "route", route: "smart" },
+};
+
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
 const FIXTURES: Record<string, unknown> = {
   list_projects: [PROJECT],
   list_sessions: [],
   list_messages: [],
-  list_agents: [],
+  list_agents: AGENT_REGISTRY,
   refresh_agents: [],
   list_providers: [],
   list_provider_catalog: PROVIDER_CATALOG,
   list_connections: CONNECTIONS,
-  get_agent_settings: { model: null, permMode: "ask" },
   list_selectable_models: NATIVE_RUNTIME.selectableModels,
   list_runtimes: [NATIVE_RUNTIME],
   refresh_runtimes: [NATIVE_RUNTIME],

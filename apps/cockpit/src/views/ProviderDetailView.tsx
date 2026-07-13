@@ -23,7 +23,7 @@ import { Chip } from "@/components/common/bits";
 import { UsageChart } from "@/components/common/UsageChart";
 import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
-import { useAgent } from "@/store-agent";
+import { useAgents } from "@/store-agents";
 import { useStore } from "@/store";
 import { AccountQuotaSummary } from "@/components/AccountQuotaSummary";
 import { usesDeviceSignin } from "@/components/modals/deviceSignin";
@@ -245,7 +245,7 @@ function ProviderModelsCard({
   const hideInvalid = useUi((s) => s.hideInvalidModels);
   const toggleHideInvalid = useUi((s) => s.toggleHideInvalidModels);
   const hydrate = useConnections((s) => s.hydrate);
-  const selectableModels = useAgent((s) => s.models);
+  const selectableModels = useAgents((s) => s.models);
   const setModelEffortPreference = useStore((s) => s.setModelEffortPreference);
   const refreshModelConfiguration = useStore((s) => s.refreshModelConfiguration);
   const models = useMemo(() => {

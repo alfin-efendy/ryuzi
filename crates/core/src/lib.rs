@@ -1,4 +1,5 @@
 pub mod agent_settings;
+pub mod agents;
 pub mod api;
 pub mod approval;
 pub mod attachments;

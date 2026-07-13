@@ -584,7 +584,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_34_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1068,7 +1068,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_34_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1123,7 +1123,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_33_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_34_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1141,11 +1141,42 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // 34: durable per-agent learning queue. `agent_learning_state` holds
+        // the per-agent monotonic sequence allocator plus the enqueue-block
+        // flag (set when an agent is being deleted); `agent_learning_queue`
+        // holds one row per learning event with strict per-agent ordering
+        // enforced by UNIQUE(agent_id, sequence). CREATE ... IF NOT EXISTS
+        // keeps the rewind-and-replay tests convergent.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS agent_learning_state (\
+                agent_id TEXT PRIMARY KEY NOT NULL,\
+                next_sequence INTEGER NOT NULL DEFAULT 1,\
+                enqueue_blocked INTEGER NOT NULL DEFAULT 0\
+            );\
+            CREATE TABLE IF NOT EXISTS agent_learning_queue (\
+                event_id TEXT PRIMARY KEY NOT NULL,\
+                agent_id TEXT NOT NULL,\
+                sequence INTEGER NOT NULL,\
+                payload TEXT NOT NULL,\
+                status TEXT NOT NULL CHECK(status IN ('pending','claimed','delivered')),\
+                claimed_by TEXT,\
+                claimed_at INTEGER,\
+                attempts INTEGER NOT NULL DEFAULT 0,\
+                last_error TEXT,\
+                created_at INTEGER NOT NULL,\
+                delivered_at INTEGER,\
+                UNIQUE(agent_id, sequence)\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_agent_learning_delivery \
+                ON agent_learning_queue(agent_id, status, sequence);",
+        ),
     ])
 }
 
 pub struct Store {
     pool: Pool,
+    #[cfg(test)]
+    fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1571,7 +1602,11 @@ impl Store {
             )
         })
         .await?;
-        Ok(Store { pool })
+        Ok(Store {
+            pool,
+            #[cfg(test)]
+            fail_next_legacy_agent_settings_delete: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Run a closure against a pooled connection. Domain modules (agents,
@@ -2846,6 +2881,35 @@ impl Store {
         self.with_conn(move |c| c.execute("DELETE FROM settings WHERE key = ?1", params![key]))
             .await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_legacy_agent_settings_delete(&self) {
+        self.fail_next_legacy_agent_settings_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Delete exactly the legacy single-agent settings keys (`agent_model`
+    /// and `agent_perm_mode`) in one transaction. Used by agent bootstrap's
+    /// first-upgrade/reset cleanup after the registry filesystem commit; no
+    /// other settings row is touched.
+    pub async fn delete_legacy_agent_settings(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_legacy_agent_settings_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected legacy agent settings cleanup failure");
+        }
+        self.with_conn(|c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "DELETE FROM settings WHERE key IN ('agent_model', 'agent_perm_mode')",
+                [],
+            )?;
+            tx.commit()
+        })
+        .await
     }
 
     /// List all persisted settings rows.
@@ -5996,7 +6060,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 33, "forward migration must land at v33");
+        assert_eq!(user_version, 34, "forward migration must land at v34");
     }
 
     #[tokio::test]
@@ -6042,6 +6106,37 @@ mod tests {
             .unwrap();
         assert!(cols.iter().any(|c| c == "session_pk"), "cols: {cols:?}");
         assert!(cols.iter().any(|c| c == "origin"), "cols: {cols:?}");
+    }
+
+    #[tokio::test]
+    async fn migration_34_creates_agent_learning_queue_and_state() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let tables: Vec<String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name LIKE 'agent_learning_%' ORDER BY name",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(tables, vec!["agent_learning_queue", "agent_learning_state"]);
+        let has_index: bool = store
+            .with_conn(|c| {
+                c.prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' \
+                     AND name='idx_agent_learning_delivery'",
+                )?
+                .exists([])
+            })
+            .await
+            .unwrap();
+        assert!(has_index, "ordered delivery index must exist");
     }
 
     #[tokio::test]
@@ -6182,7 +6277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_33_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_34_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -6202,19 +6297,21 @@ mod tests {
         // 28 messages_fts + sync triggers, skill_usage, curator_state, curator_runs;
         // 29 messages.speaker + orch_tasks home/breaker/steer columns;
         // 30 audit.session_pk + audit.origin;
-        // 31 plugin_catalog_cache + catalog_feed_state —
+        // 31 plugin_catalog_cache + catalog_feed_state;
+        // 34 agent_learning_state + agent_learning_queue — CREATE TABLE
+        // IF NOT EXISTS —
         // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 31
-        // defined, wind back nineteen.
+        // this test starts failing its assertions). With migrations through 34
+        // defined, wind back twenty-two.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 21)
+            c.pragma_update(None, "user_version", v - 22)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6271,14 +6368,14 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // manually re-create every legacy artifact migration 21 handles,
-        // wind user_version back eleven, and reopen so 21 (and the tail
-        // migrations 22–31) replay against it. Back ELEVEN: the fully migrated
-        // tail is now v31, so rewinding to v20 is what makes migration 21
-        // (native-only) replay.
+        // wind user_version back fourteen, and reopen so 21 (and the tail
+        // migrations 22–34) replay against it. Back FOURTEEN: the fully
+        // migrated tail is now v34, so rewinding to v20 is what makes
+        // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 13)
+            c.pragma_update(None, "user_version", v - 14)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6416,7 +6513,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 33, "forward migration must land at v33");
+        assert_eq!(uv, 34, "forward migration must land at v34");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6442,7 +6539,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 33, "forward migration must land at v33");
+        assert_eq!(uv, 34, "forward migration must land at v34");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 

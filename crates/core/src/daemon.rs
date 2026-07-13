@@ -8,6 +8,9 @@
 //! `pub(crate)` function ([`handle_approval`]) separate from the broadcast
 //! loop that spawns it.
 
+use crate::agents::knowledge::AgentKnowledgeStore;
+use crate::agents::learning_queue::LearningQueue;
+use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
 use crate::domain::{
     ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Principal, Surface,
@@ -36,6 +39,9 @@ use tokio::task::{JoinHandle, JoinSet};
 pub struct BuildDaemonOpts {
     /// Path to the sqlite database (created/migrated by `Store::open`).
     pub db_path: PathBuf,
+    /// Canonical root for YAML agent profiles and OKF knowledge. It must be
+    /// supplied independently of the SQLite location.
+    pub config_root: PathBuf,
     /// Override the telemetry backend (used by tests). `None` selects
     /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
@@ -62,6 +68,9 @@ pub struct Daemon {
     /// `ApiState`) can share this one instance instead of standing up its
     /// own.
     pub router_server: Arc<RouterServer>,
+    pub agents: Arc<AgentRegistry>,
+    pub agent_knowledge: Arc<AgentKnowledgeStore>,
+    pub learning_queue: Arc<LearningQueue>,
     telemetry: Arc<dyn Telemetry>,
     stopped: AtomicBool,
     /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
@@ -89,11 +98,9 @@ pub struct Daemon {
     /// tracked for the same reason as `scheduler_handle`/`orch_handle` — the
     /// daemon is the single always-on engine host for it too.
     rail_handle: JoinHandle<()>,
-    /// The learning worker's loop (`learning::spawn_runner`, Task 8), tracked
-    /// for the same reason as `rail_handle`. It claims `kind='learning'` rows
-    /// the rail drainer deliberately skips (see `learning.rs`'s module doc)
-    /// and drives a review fork per row — a separate daemon-hosted loop, not
-    /// a delivery path the rail drainer itself takes.
+    /// The durable per-agent learning queue worker (`learning::spawn_runner`),
+    /// tracked for the same reason as `rail_handle`. It claims pending queue
+    /// rows and applies them to the owning agent's OKF bundle.
     learning_handle: JoinHandle<()>,
     /// The curator's weekly skill-lifecycle loop (`curator::spawn_runner`,
     /// Task 10), tracked for the same reason as `learning_handle`. Unlike
@@ -211,6 +218,18 @@ impl Daemon {
     }
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.router_handle.abort();
+        self.fanout_handle.abort();
+        self.scheduler_handle.abort();
+        self.orch_handle.abort();
+        self.rail_handle.abort();
+        self.learning_handle.abort();
+        self.curator_handle.abort();
+    }
+}
+
 /// Given the persisted `otel_endpoint` setting, choose the telemetry backend.
 /// A pure/unit-testable split of `build_daemon`'s telemetry-selection branch:
 /// an empty/unset endpoint selects `ConsoleTelemetry` silently (the second
@@ -282,6 +301,11 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
+    let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+        opts.config_root,
+        Arc::clone(&store),
+    )
+    .await?;
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
     // the atomicity/idempotency/degraded-state contract.
@@ -324,6 +348,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let cp =
         ControlPlane::new_with_telemetry(Arc::clone(&store), registries, Arc::clone(&telemetry))
             .await;
+    cp.attach_agent_persistence(persistence.handles())?;
     let settings = SettingsStore::new(Arc::clone(&store));
 
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
@@ -371,7 +396,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
     let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
-    let learning_handle = crate::learning::spawn_runner(Arc::clone(&cp));
+    let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
 
@@ -380,6 +405,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         store,
         gateways,
         router_server,
+        agents: persistence.registry,
+        agent_knowledge: persistence.knowledge,
+        learning_queue: persistence.learning,
         telemetry,
         stopped: AtomicBool::new(false),
         router_handle,
@@ -635,6 +663,20 @@ mod tests {
         (f, path)
     }
 
+    async fn test_agent_persistence(
+        store: Arc<Store>,
+    ) -> crate::agents::bootstrap::AgentPersistence {
+        let config = tempfile::tempdir().unwrap();
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            store,
+        )
+        .await
+        .unwrap();
+        std::mem::forget(config);
+        persistence
+    }
+
     fn capturing_console_telemetry() -> (Arc<Mutex<Vec<String>>>, Arc<dyn Telemetry>) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let captured = lines.clone();
@@ -869,6 +911,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: None,
@@ -913,6 +956,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -989,6 +1033,7 @@ mod tests {
         std::env::set_var("HOME", fake_home.path());
         let result = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -1267,11 +1312,16 @@ mod tests {
             }
         });
 
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways,
             router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle,
@@ -1422,6 +1472,7 @@ mod tests {
         regs.harness = Arc::new(PermFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        cp.attach_test_agent_persistence().await;
         let store = cp.store().clone();
 
         let repo = tempfile::tempdir().unwrap();
@@ -1580,6 +1631,7 @@ mod tests {
         regs.harness = Arc::new(PlanFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        cp.attach_test_agent_persistence().await;
         let store = cp.store().clone();
 
         let repo = tempfile::tempdir().unwrap();
@@ -1716,11 +1768,16 @@ mod tests {
             .await
             .unwrap();
 
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways: vec![],
             router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
@@ -1804,11 +1861,16 @@ mod tests {
             }
         });
 
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
             gateways,
             router_server: Arc::new(RouterServer::new(store)),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             router_handle,
@@ -1934,6 +1996,7 @@ mod tests {
         // Console silently and still build successfully end-to-end.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: None,
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -1968,6 +2031,7 @@ mod tests {
         // here would be awkward/flaky.
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: None,
             extra_gateway_factories: vec![],
             harness_factory: None,
@@ -1999,6 +2063,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -2066,6 +2131,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -2127,10 +2193,62 @@ mod tests {
     // ---------- (j) daemon hosts scheduler + orch + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
 
     #[tokio::test]
+    async fn daemon_uses_injected_config_root_not_database_parent() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("nested/store.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path: db_path.clone(),
+            config_root: config.path().to_path_buf(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let persistence = daemon.cp.agent_persistence().unwrap();
+        assert!(Arc::ptr_eq(&daemon.agents, &persistence.registry));
+        assert!(Arc::ptr_eq(&daemon.agent_knowledge, &persistence.knowledge));
+        assert!(Arc::ptr_eq(&daemon.learning_queue, &persistence.learning));
+        assert!(config.path().join("agents/index.yaml").exists());
+        assert!(!db_path.parent().unwrap().join("agents").exists());
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_daemon_without_stop_aborts_owned_workers() {
+        let (_guard, db_path) = temp_db_path();
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let learning = daemon.learning_handle.abort_handle();
+        let scheduler = daemon.scheduler_handle.abort_handle();
+        assert!(!learning.is_finished());
+        assert!(!scheduler.is_finished());
+
+        drop(daemon);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !learning.is_finished() || !scheduler.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the daemon must cancel its owned workers");
+    }
+
+    #[tokio::test]
     async fn daemon_hosts_and_stop_aborts_scheduler_orch_rail_learning_and_curator_loops() {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,

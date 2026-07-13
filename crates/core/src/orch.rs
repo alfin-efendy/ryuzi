@@ -1695,6 +1695,7 @@ mod tests {
         let mut regs = crate::plugins::Registries::new();
         regs.harness = Arc::new(EchoHarnessFactory);
         let cp = ControlPlane::new(store, regs).await;
+        cp.attach_test_agent_persistence().await;
         (cp, repo)
     }
 

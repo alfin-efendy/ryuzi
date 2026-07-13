@@ -1,0 +1,1752 @@
+//! Per-agent OKF knowledge store: CRUD, batch, search, and generated
+//! index/log files over the `agents/<id>/knowledge` bundle, with canonical
+//! path containment, invalid-document tolerance, and per-agent write
+//! serialization.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, bail, Context};
+use chrono::{DateTime, SecondsFormat, Utc};
+
+use serde::{Deserialize, Serialize};
+
+use crate::paths;
+
+use super::okf::{
+    parse_concept, render_concept, validate_concept_relative_path, validate_path_component,
+    InvalidKnowledgeConcept, KnowledgeConcept, KnowledgeConceptInput, FIXED_CONCEPT_DIRECTORIES,
+    PROJECT_MEMORY_PARENT, RESERVED_FILE_NAMES,
+};
+use super::registry::validate_agent_id;
+use super::transaction::atomic_write;
+use super::types::AgentId;
+
+/// Directory the batch API stages complete bundle copies under. Never
+/// scanned as concept content.
+const TRANSACTIONS_DIR: &str = ".knowledge-transactions";
+
+const KNOWLEDGE_TXN_MANIFEST: &str = "manifest.yaml";
+const LEARNING_COMPLETIONS_DIR: &str = ".learning-events";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BundleTransactionPhase {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BundleTransactionManifest {
+    phase: BundleTransactionPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LearningCompletion {
+    event_id: String,
+    writes: Vec<(String, String)>,
+    removes: Vec<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnowledgeFailpoint {
+    None,
+    AfterBackupRename,
+    AfterActivationBeforeCommit,
+    ActivationAndRestoreFailure,
+}
+
+#[cfg(test)]
+fn knowledge_failpoints() -> &'static std::sync::Mutex<HashMap<PathBuf, KnowledgeFailpoint>> {
+    static FAILPOINTS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, KnowledgeFailpoint>>> =
+        std::sync::OnceLock::new();
+    FAILPOINTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Everything the future Learning surface needs from one agent's bundle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentLearningSnapshot {
+    pub concepts: Vec<KnowledgeConcept>,
+    pub invalid: Vec<InvalidKnowledgeConcept>,
+    pub journey: Vec<JourneyMilestone>,
+    pub skill_usage: Vec<AgentSkillUsage>,
+    pub reviews: Vec<LearningReview>,
+    pub curator: CuratorState,
+    pub curator_history: Vec<CuratorHistorySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JourneyMilestone {
+    pub concept_id: String,
+    pub title: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillUsage {
+    pub skill_id: String,
+    pub uses: u64,
+    pub successes: u64,
+    pub concept_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningReview {
+    pub concept_id: String,
+    pub title: String,
+    pub description: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CuratorState {
+    pub concept: Option<KnowledgeConcept>,
+    pub last_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CuratorHistorySnapshot {
+    pub snapshot_id: String,
+    pub concept: KnowledgeConcept,
+}
+
+/// One mutation inside an all-or-nothing [`KnowledgeStore::batch`] call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KnowledgeOperation {
+    Add(KnowledgeConceptInput),
+    Replace {
+        concept_id: String,
+        input: KnowledgeConceptInput,
+    },
+    Remove {
+        concept_id: String,
+    },
+}
+
+/// The parse result of a full bundle walk: every valid concept plus every
+/// Markdown file that failed OKF parsing, both sorted by relative path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnowledgeScan {
+    pub valid: Vec<KnowledgeConcept>,
+    pub invalid: Vec<InvalidKnowledgeConcept>,
+}
+
+/// The file mutations one learning event produces, computed under the
+/// per-agent knowledge lock by [`KnowledgeStore::apply_learning_event`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LearningEventWrites {
+    /// `(relative_path, rendered OKF markdown)` — every document must parse
+    /// and carry the applying event's `event_id` in frontmatter.
+    pub writes: Vec<(String, String)>,
+    /// Concept files to delete; already-missing paths are skipped so a
+    /// replayed event converges instead of failing.
+    pub removes: Vec<String>,
+}
+
+/// Factory handing out per-agent [`KnowledgeStore`]s that share one write
+/// lock per agent id, so all writers created from the same factory
+/// serialize their bundle mutations.
+pub struct AgentKnowledgeStore {
+    config_root: PathBuf,
+    locks: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AgentKnowledgeStore {
+    pub fn new(config_root: PathBuf) -> Self {
+        Self {
+            config_root,
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Acquires the write fence shared by every knowledge mutation for this
+    /// agent. Deletion uses it to drain an active queue apply and prevent any
+    /// later apply from racing the filesystem commit.
+    pub(crate) fn write_fence(
+        &self,
+        agent_id: &str,
+    ) -> anyhow::Result<Arc<tokio::sync::Mutex<()>>> {
+        validate_agent_id(agent_id).map_err(|issue| anyhow!(issue.message))?;
+        self.locks
+            .lock()
+            .map_err(|_| anyhow!("knowledge lock registry is poisoned"))
+            .map(|mut locks| locks.entry(agent_id.to_owned()).or_default().clone())
+    }
+
+    pub fn for_agent(&self, agent_id: &str) -> anyhow::Result<KnowledgeStore> {
+        let write_lock = self.write_fence(agent_id)?;
+        Ok(KnowledgeStore {
+            agent_id: agent_id.to_owned(),
+            root: paths::agent_knowledge_dir_in(&self.config_root, agent_id),
+            write_lock,
+        })
+    }
+
+    pub(crate) async fn recover_agent_bundle(&self, agent_id: &str) -> anyhow::Result<()> {
+        let store = self.for_agent(agent_id)?;
+        let _guard = store.write_lock.lock().await;
+        store.recover_bundle_transactions()
+    }
+
+    /// Reads one agent's bundle into the shape the Plan 3 Learning surface
+    /// consumes: journey milestones, skill usage counters, reviews, the
+    /// newest curator state, and curator history snapshots.
+    pub async fn learning_snapshot(&self, agent_id: &str) -> anyhow::Result<AgentLearningSnapshot> {
+        let scan = self.for_agent(agent_id)?.scan().await?;
+        let mut journey = Vec::new();
+        let mut skill_usage = Vec::new();
+        let mut reviews = Vec::new();
+        let mut curator_concepts = Vec::new();
+        let mut curator_history = Vec::new();
+        for concept in &scan.valid {
+            let Some((directory, _)) = concept.relative_path.rsplit_once('/') else {
+                continue;
+            };
+            match directory {
+                "learning/journey" => journey.push(JourneyMilestone {
+                    concept_id: concept.id.clone(),
+                    title: concept.title.clone(),
+                    timestamp: concept.timestamp,
+                }),
+                "learning/skills" => skill_usage.push(AgentSkillUsage {
+                    skill_id: extension_string(concept, "skill_id")
+                        .unwrap_or_else(|| concept.id.clone()),
+                    uses: extension_u64(concept, "uses"),
+                    successes: extension_u64(concept, "successes"),
+                    concept_id: concept.id.clone(),
+                }),
+                "learning/reviews" => reviews.push(LearningReview {
+                    concept_id: concept.id.clone(),
+                    title: concept.title.clone(),
+                    description: concept.description.clone(),
+                    timestamp: concept.timestamp,
+                }),
+                "curator" => curator_concepts.push(concept.clone()),
+                "curator/history" => curator_history.push(CuratorHistorySnapshot {
+                    snapshot_id: concept.id.clone(),
+                    concept: concept.clone(),
+                }),
+                _ => {}
+            }
+        }
+        let concepts = scan
+            .valid
+            .iter()
+            .filter(|concept| is_memory_relative_path(&concept.relative_path))
+            .cloned()
+            .collect();
+        let invalid = scan
+            .invalid
+            .iter()
+            .filter(|concept| is_memory_relative_path(&concept.relative_path))
+            .cloned()
+            .collect();
+        curator_concepts.sort_by_key(|concept| concept.timestamp);
+        curator_history.sort_by(|left, right| {
+            right
+                .concept
+                .timestamp
+                .cmp(&left.concept.timestamp)
+                .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
+        });
+        let curator_concept = curator_concepts.pop();
+        let curator = CuratorState {
+            last_event_id: curator_concept
+                .as_ref()
+                .and_then(|concept| concept.event_id.clone()),
+            concept: curator_concept,
+        };
+        Ok(AgentLearningSnapshot {
+            concepts,
+            invalid,
+            journey,
+            skill_usage,
+            reviews,
+            curator,
+            curator_history,
+        })
+    }
+}
+
+fn is_memory_relative_path(relative_path: &str) -> bool {
+    relative_path.starts_with("memory/global/")
+        || relative_path.starts_with("memory/user/")
+        || relative_path.starts_with("memory/projects/")
+}
+
+fn extension_string(concept: &KnowledgeConcept, key: &str) -> Option<String> {
+    match concept.extensions.get(key) {
+        Some(serde_yaml::Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn extension_u64(concept: &KnowledgeConcept, key: &str) -> u64 {
+    match concept.extensions.get(key) {
+        Some(serde_yaml::Value::Number(value)) => value.as_u64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// One agent's knowledge bundle. All writes hold the shared per-agent lock
+/// for the full write/index/log cycle and refuse any canonical path that
+/// escapes the canonical bundle root.
+pub struct KnowledgeStore {
+    agent_id: AgentId,
+    root: PathBuf,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl KnowledgeStore {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub async fn scan(&self) -> anyhow::Result<KnowledgeScan> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
+        scan_bundle(&self.root)
+    }
+
+    pub async fn read(&self, concept_id: &str) -> anyhow::Result<KnowledgeConcept> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
+        find_concept(&self.root, concept_id)?
+            .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))
+    }
+
+    pub async fn create(&self, input: KnowledgeConceptInput) -> anyhow::Result<KnowledgeConcept> {
+        let _guard = self.write_lock.lock().await;
+        let concept = self.concept_from_input(paths::new_id(), &input)?;
+        self.commit_staged_mutation(|stage| {
+            stage_concept(stage, &concept)?;
+            Ok((
+                concept.clone(),
+                vec![(
+                    "create".into(),
+                    concept.id.clone(),
+                    concept.relative_path.clone(),
+                )],
+            ))
+        })
+    }
+
+    pub async fn update(
+        &self,
+        concept_id: &str,
+        input: KnowledgeConceptInput,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        let _guard = self.write_lock.lock().await;
+        let concept = self.concept_from_input(concept_id.to_owned(), &input)?;
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+            stage_concept(stage, &concept)?;
+            if existing.relative_path != concept.relative_path {
+                fs::remove_file(stage.join(existing.relative_path))?;
+            }
+            Ok((
+                concept.clone(),
+                vec![(
+                    "update".into(),
+                    concept.id.clone(),
+                    concept.relative_path.clone(),
+                )],
+            ))
+        })
+    }
+
+    /// Updates a concept only when the concept found under the write fence is
+    /// owned by the memory area.
+    pub async fn update_memory(
+        &self,
+        concept_id: &str,
+        input: KnowledgeConceptInput,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        let _guard = self.write_lock.lock().await;
+        let concept = self.concept_from_input(concept_id.to_owned(), &input)?;
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .filter(|existing| is_memory_relative_path(&existing.relative_path))
+                .ok_or_else(|| anyhow!("memory concept `{concept_id}` was not found"))?;
+            stage_concept(stage, &concept)?;
+            if existing.relative_path != concept.relative_path {
+                fs::remove_file(stage.join(existing.relative_path))?;
+            }
+            Ok((
+                concept.clone(),
+                vec![(
+                    "update".into(),
+                    concept.id.clone(),
+                    concept.relative_path.clone(),
+                )],
+            ))
+        })
+    }
+
+    pub async fn delete(&self, concept_id: &str) -> anyhow::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+            fs::remove_file(stage.join(&existing.relative_path))?;
+            Ok((
+                (),
+                vec![(
+                    "delete".into(),
+                    concept_id.to_owned(),
+                    existing.relative_path,
+                )],
+            ))
+        })
+    }
+
+    /// Deletes a concept only when the concept found under the write fence is
+    /// owned by the memory area.
+    pub async fn delete_memory(&self, concept_id: &str) -> anyhow::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .filter(|existing| is_memory_relative_path(&existing.relative_path))
+                .ok_or_else(|| anyhow!("memory concept `{concept_id}` was not found"))?;
+            fs::remove_file(stage.join(&existing.relative_path))?;
+            Ok((
+                (),
+                vec![(
+                    "delete".into(),
+                    concept_id.to_owned(),
+                    existing.relative_path,
+                )],
+            ))
+        })
+    }
+
+    /// Case-insensitive substring match over title, description, body, and
+    /// tags of every valid concept.
+    pub async fn search(&self, query: &str) -> anyhow::Result<Vec<KnowledgeConcept>> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
+        let needle = query.to_lowercase();
+        Ok(scan_bundle(&self.root)?
+            .valid
+            .into_iter()
+            .filter(|concept| {
+                concept.title.to_lowercase().contains(&needle)
+                    || concept.description.to_lowercase().contains(&needle)
+                    || concept.body.to_lowercase().contains(&needle)
+                    || concept
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(&needle))
+            })
+            .collect())
+    }
+
+    /// Memory concepts only. `None` returns every memory scope; a project id
+    /// returns global + user + that project's memories (the set that applies
+    /// when working inside the project).
+    pub async fn list_memory(&self, project_id: Option<&str>) -> anyhow::Result<KnowledgeScan> {
+        if let Some(project_id) = project_id {
+            validate_path_component(project_id).context("invalid project id")?;
+        }
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
+        let scan = scan_bundle(&self.root)?;
+        let keep = |relative_path: &str| {
+            let Some((directory, _)) = relative_path.rsplit_once('/') else {
+                return false;
+            };
+            match project_id {
+                None => directory.starts_with("memory/"),
+                Some(project_id) => {
+                    directory == "memory/global"
+                        || directory == "memory/user"
+                        || directory == format!("{PROJECT_MEMORY_PARENT}/{project_id}")
+                }
+            }
+        };
+        Ok(KnowledgeScan {
+            valid: scan
+                .valid
+                .into_iter()
+                .filter(|concept| keep(&concept.relative_path))
+                .collect(),
+            invalid: scan
+                .invalid
+                .into_iter()
+                .filter(|invalid| keep(&invalid.relative_path))
+                .collect(),
+        })
+    }
+
+    /// Parses raw Markdown as it would live at `relative_path` without
+    /// touching the filesystem.
+    pub async fn validate_raw(
+        &self,
+        relative_path: &str,
+        raw: &str,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        validate_concept_relative_path(relative_path)?;
+        parse_concept(relative_path, raw)
+    }
+
+    /// Replaces (or repairs) the document at `relative_path` with raw
+    /// Markdown that must parse as a valid concept.
+    pub async fn replace_raw(
+        &self,
+        relative_path: &str,
+        raw: &str,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        validate_concept_relative_path(relative_path)?;
+        let concept = parse_concept(relative_path, raw)?;
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let target = stage.join(relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&target, render_concept(&concept)?.as_bytes())?;
+            Ok((
+                concept.clone(),
+                vec![(
+                    "replace".into(),
+                    concept.id.clone(),
+                    relative_path.to_owned(),
+                )],
+            ))
+        })
+    }
+
+    /// Replaces an invalid document at `relative_path` with raw Markdown that
+    /// must parse as a valid concept. The invalid-file ownership check and
+    /// replacement happen under the same per-agent write fence.
+    pub async fn replace_invalid_raw(
+        &self,
+        relative_path: &str,
+        raw: &str,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        validate_concept_relative_path(relative_path)?;
+        let concept = parse_concept(relative_path, raw)?;
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let target = stage.join(relative_path);
+            let existing = fs::read_to_string(&target)
+                .with_context(|| format!("`{relative_path}` does not exist"))?;
+            if parse_concept(relative_path, &existing).is_ok() {
+                bail!("`{relative_path}` is not an invalid concept");
+            }
+            atomic_write(&target, render_concept(&concept)?.as_bytes())?;
+            Ok((
+                concept.clone(),
+                vec![(
+                    "replace".into(),
+                    concept.id.clone(),
+                    relative_path.to_owned(),
+                )],
+            ))
+        })
+    }
+
+    /// Deletes a document that failed parsing. The path must still be a
+    /// well-formed concept path so traversal can never delete other files.
+    pub async fn delete_invalid(&self, relative_path: &str) -> anyhow::Result<()> {
+        validate_concept_relative_path(relative_path)?;
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let target = stage.join(relative_path);
+            let existing = fs::read_to_string(&target)
+                .with_context(|| format!("`{relative_path}` does not exist"))?;
+            if parse_concept(relative_path, &existing).is_ok() {
+                bail!("`{relative_path}` is not an invalid concept");
+            }
+            fs::remove_file(target)?;
+            let stem = concept_id_of(relative_path);
+            Ok((
+                (),
+                vec![("delete-invalid".into(), stem, relative_path.to_owned())],
+            ))
+        })
+    }
+
+    /// Rebuilds `memory/index.md` and `learning/index.md` from the current
+    /// valid concepts.
+    pub async fn regenerate_indexes(&self) -> anyhow::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|_| Ok(((), Vec::new())))
+    }
+
+    /// Applies one learning event's mutations while holding the per-agent
+    /// lock across the recorded-event-ID check, the write/remove
+    /// application, index regeneration, and the log append. Returns `false`
+    /// (leaving the bundle untouched) when any valid concept already records
+    /// `event_id` in frontmatter — the idempotent replay path. The `plan`
+    /// closure sees the current scan and returns the rendered documents to
+    /// write (each of which must reparse and carry `event_id`) plus the
+    /// concept files to remove.
+    pub async fn apply_learning_event<F>(&self, event_id: &str, plan: F) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&KnowledgeScan) -> anyhow::Result<LearningEventWrites>,
+    {
+        let _guard = self.write_lock.lock().await;
+        self.apply_learning_event_fenced(event_id, plan)
+    }
+
+    pub(crate) fn apply_learning_event_fenced<F>(
+        &self,
+        event_id: &str,
+        plan: F,
+    ) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&KnowledgeScan) -> anyhow::Result<LearningEventWrites>,
+    {
+        if event_id.trim().is_empty() {
+            bail!("learning event id must not be blank");
+        }
+        self.recover_bundle_transactions()?;
+        ensure_bundle_at(&self.root)?;
+        let completion_path = self
+            .root
+            .join(LEARNING_COMPLETIONS_DIR)
+            .join(format!("{event_id}.yaml"));
+        let completion = match fs::read_to_string(&completion_path) {
+            Ok(raw) => serde_yaml::from_str(&raw)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let scan = scan_bundle(&self.root)?;
+                let writes = plan(&scan)?;
+                validate_learning_writes(event_id, &writes)?;
+                LearningCompletion {
+                    event_id: event_id.to_owned(),
+                    writes: writes.writes,
+                    removes: sorted_paths(writes.removes.iter()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if completion.event_id != event_id {
+            bail!(
+                "learning completion for `{event_id}` records event `{}`",
+                completion.event_id
+            );
+        }
+        validate_learning_completion(&completion)?;
+        if completion_matches(&self.root, &completion)? {
+            return Ok(false);
+        }
+        let txn = self.prepare_bundle_transaction()?;
+        let stage = txn.join("stage");
+        for (relative_path, content) in &completion.writes {
+            let target = stage.join(relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&target, content.as_bytes())?;
+        }
+        for relative_path in &completion.removes {
+            let target = stage.join(relative_path);
+            if target.exists() {
+                fs::remove_file(target)?;
+            }
+        }
+        self.regenerate_indexes_at(&stage)?;
+        for (relative_path, _) in &completion.writes {
+            append_log_at(
+                &stage,
+                "learning-apply",
+                &concept_id_of(relative_path),
+                relative_path,
+            )?;
+        }
+        for relative_path in &completion.removes {
+            append_log_at(
+                &stage,
+                "learning-remove",
+                &concept_id_of(relative_path),
+                relative_path,
+            )?;
+        }
+        let marker = stage
+            .join(LEARNING_COMPLETIONS_DIR)
+            .join(format!("{event_id}.yaml"));
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&marker, serde_yaml::to_string(&completion)?.as_bytes())?;
+        self.activate_bundle_transaction(&txn)?;
+        Ok(true)
+    }
+
+    /// Applies every operation or none: the bundle is copied into a staging
+    /// directory, all operations are applied and every resulting document is
+    /// reparsed there, and only then are the affected files swapped into the
+    /// active bundle (still under the per-agent lock). Any failure removes
+    /// the staging copy and leaves the active bundle untouched.
+    pub async fn batch(
+        &self,
+        operations: Vec<KnowledgeOperation>,
+    ) -> anyhow::Result<Vec<KnowledgeConcept>> {
+        let _guard = self.write_lock.lock().await;
+        self.recover_bundle_transactions()?;
+        ensure_bundle_at(&self.root)?;
+        let txn = self.prepare_bundle_transaction()?;
+        let staged = match self.stage_batch(&txn.join("stage"), &operations) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&txn);
+                return Err(error);
+            }
+        };
+        self.regenerate_indexes_at(&txn.join("stage"))?;
+        for (action, concept_id, relative_path) in &staged.log_lines {
+            append_log_at(&txn.join("stage"), action, concept_id, relative_path)?;
+        }
+        self.activate_bundle_transaction(&txn)?;
+        Ok(staged.results)
+    }
+
+    fn stage_batch(
+        &self,
+        staging: &Path,
+        operations: &[KnowledgeOperation],
+    ) -> anyhow::Result<StagedBatch> {
+        copy_directory(&self.root, staging, &[TRANSACTIONS_DIR])?;
+        let mut staged = StagedBatch::default();
+        for operation in operations {
+            match operation {
+                KnowledgeOperation::Add(input) => {
+                    let concept = self.concept_from_input(paths::new_id(), input)?;
+                    stage_concept(staging, &concept)?;
+                    staged.record_write(&concept, "add");
+                    staged.results.push(concept);
+                }
+                KnowledgeOperation::Replace { concept_id, input } => {
+                    let existing = find_concept(staging, concept_id)?
+                        .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+                    let concept = self.concept_from_input(concept_id.clone(), input)?;
+                    stage_concept(staging, &concept)?;
+                    if existing.relative_path != concept.relative_path {
+                        fs::remove_file(staging.join(&existing.relative_path))?;
+                        staged.removes.push(existing.relative_path);
+                    }
+                    staged.record_write(&concept, "replace");
+                    staged.results.push(concept);
+                }
+                KnowledgeOperation::Remove { concept_id } => {
+                    let existing = find_concept(staging, concept_id)?
+                        .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+                    fs::remove_file(staging.join(&existing.relative_path))?;
+                    staged.log_lines.push((
+                        "remove".into(),
+                        concept_id.clone(),
+                        existing.relative_path.clone(),
+                    ));
+                    staged.removes.push(existing.relative_path);
+                }
+            }
+        }
+        // Reparse every document the batch produced before exposing anything.
+        for (relative_path, content) in &staged.writes {
+            parse_concept(relative_path, content)
+                .with_context(|| format!("staged `{relative_path}` failed to reparse"))?;
+        }
+        Ok(staged)
+    }
+
+    fn transaction_root(&self) -> anyhow::Result<PathBuf> {
+        let parent = self
+            .root
+            .parent()
+            .context("knowledge bundle has no parent")?;
+        let bundle_name = self
+            .root
+            .file_name()
+            .context("knowledge bundle has no directory name")?;
+        Ok(parent.join(TRANSACTIONS_DIR).join(bundle_name))
+    }
+
+    #[cfg(test)]
+    fn failpoint(&self) -> KnowledgeFailpoint {
+        knowledge_failpoints()
+            .lock()
+            .unwrap()
+            .get(&self.root)
+            .copied()
+            .unwrap_or(KnowledgeFailpoint::None)
+    }
+
+    #[cfg(test)]
+    fn set_failpoint(&self, failpoint: KnowledgeFailpoint) {
+        let mut failpoints = knowledge_failpoints().lock().unwrap();
+        if failpoint == KnowledgeFailpoint::None {
+            failpoints.remove(&self.root);
+        } else {
+            failpoints.insert(self.root.clone(), failpoint);
+        }
+    }
+
+    pub(crate) fn prepare_bundle_transaction(&self) -> anyhow::Result<PathBuf> {
+        let transaction_root = self.transaction_root()?;
+        fs::create_dir_all(&transaction_root)?;
+        let txn = transaction_root.join(paths::new_id());
+        fs::create_dir_all(&txn)?;
+        copy_directory(&self.root, &txn.join("stage"), &[TRANSACTIONS_DIR])?;
+        write_bundle_manifest(&txn, BundleTransactionPhase::Prepared)?;
+        Ok(txn)
+    }
+
+    fn activate_bundle_transaction(&self, txn: &Path) -> anyhow::Result<()> {
+        let stage = txn.join("stage");
+        let backup = txn.join("backup");
+        fs::rename(&self.root, &backup).context("failed to move active knowledge to backup")?;
+        #[cfg(test)]
+        if self.failpoint() == KnowledgeFailpoint::AfterBackupRename {
+            return Err(anyhow!(
+                "knowledge failpoint after backup rename for transaction `{}`",
+                txn.display()
+            ));
+        }
+        #[cfg(test)]
+        if self.failpoint() == KnowledgeFailpoint::ActivationAndRestoreFailure {
+            return Err(anyhow!(
+                "failed to activate staged knowledge bundle for transaction `{}`: injected activation failure; rollback failed: injected restore failure",
+                txn.display()
+            ));
+        }
+        if let Err(error) = fs::rename(&stage, &self.root) {
+            return match fs::rename(&backup, &self.root) {
+                Ok(()) => {
+                    let _ = fs::remove_dir_all(txn);
+                    Err(error).with_context(|| {
+                        format!(
+                            "failed to activate staged knowledge bundle for transaction `{}`",
+                            txn.display()
+                        )
+                    })
+                }
+                Err(rollback) => Err(anyhow!(
+                    "failed to activate staged knowledge bundle for transaction `{}`: {error}; rollback failed: {rollback}",
+                    txn.display()
+                )),
+            };
+        }
+        #[cfg(test)]
+        if self.failpoint() == KnowledgeFailpoint::AfterActivationBeforeCommit {
+            let original = anyhow!("knowledge failpoint before commit marker");
+            return self.rollback_activated_transaction(txn, &stage, &backup, original);
+        }
+        if let Err(error) = write_bundle_manifest(txn, BundleTransactionPhase::Committed) {
+            return self.rollback_activated_transaction(txn, &stage, &backup, error);
+        }
+        fs::remove_dir_all(txn)?;
+        Ok(())
+    }
+
+    fn rollback_activated_transaction(
+        &self,
+        txn: &Path,
+        stage: &Path,
+        backup: &Path,
+        original: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let restore = (|| -> anyhow::Result<()> {
+            fs::rename(&self.root, stage).context("failed to preserve activated stage")?;
+            fs::rename(backup, &self.root).context("failed to restore knowledge backup")?;
+            Ok(())
+        })();
+        match restore {
+            Ok(()) => {
+                fs::remove_dir_all(txn)?;
+                Err(original)
+            }
+            Err(rollback) => Err(anyhow!(
+                "knowledge transaction `{}` failed: {original:#}; rollback failed: {rollback:#}",
+                txn.display()
+            )),
+        }
+    }
+
+    fn recover_bundle_transactions(&self) -> anyhow::Result<()> {
+        let transaction_root = self.transaction_root()?;
+        if !transaction_root.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&transaction_root)?.filter_map(Result::ok) {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let txn = entry.path();
+            // A crash between transaction-dir creation/stage copy and the
+            // Prepared manifest write leaves a manifest-less (or partially
+            // written) directory. Nothing was activated yet — the active
+            // bundle is untouched — so treat it as un-prepared and reap it
+            // rather than blocking every read/write on the parse error.
+            let manifest = match read_bundle_manifest(&txn) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    tracing::warn!(
+                        transaction = %txn.display(),
+                        error = %error,
+                        "reaping knowledge transaction with missing or unreadable manifest"
+                    );
+                    fs::remove_dir_all(&txn)?;
+                    continue;
+                }
+            };
+            let backup = txn.join("backup");
+            let stage = txn.join("stage");
+            match manifest.phase {
+                BundleTransactionPhase::Prepared => {
+                    if backup.exists() {
+                        if self.root.exists() {
+                            fs::remove_dir_all(&self.root)?;
+                        }
+                        fs::rename(&backup, &self.root)?;
+                    }
+                    fs::remove_dir_all(&txn)?;
+                }
+                BundleTransactionPhase::Committed => {
+                    if !self.root.exists() && stage.exists() {
+                        fs::rename(&stage, &self.root)?;
+                    }
+                    fs::remove_dir_all(&txn)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_staged_mutation<T>(
+        &self,
+        mutate: impl FnOnce(&Path) -> anyhow::Result<(T, Vec<(String, String, String)>)>,
+    ) -> anyhow::Result<T> {
+        self.recover_bundle_transactions()?;
+        ensure_bundle_at(&self.root)?;
+        let txn = self.prepare_bundle_transaction()?;
+        let stage = txn.join("stage");
+        let (result, log_lines) = match mutate(&stage) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&txn);
+                return Err(error);
+            }
+        };
+        self.regenerate_indexes_at(&stage)?;
+        for (action, concept_id, relative_path) in log_lines {
+            append_log_at(&stage, &action, &concept_id, &relative_path)?;
+        }
+        self.activate_bundle_transaction(&txn)?;
+        Ok(result)
+    }
+
+    fn regenerate_indexes_at(&self, root: &Path) -> anyhow::Result<()> {
+        regenerate_indexes_at(root)
+    }
+
+    fn concept_from_input(
+        &self,
+        id: String,
+        input: &KnowledgeConceptInput,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        if input.title.trim().is_empty() {
+            bail!("concept title must not be blank");
+        }
+        if input.description.trim().is_empty() {
+            bail!("concept description must not be blank");
+        }
+        let directory = input.area.directory()?;
+        let relative_path = format!("{directory}/{id}.md");
+        validate_concept_relative_path(&relative_path)?;
+        let timestamp = DateTime::from_timestamp(Utc::now().timestamp(), 0)
+            .context("system clock is out of range")?;
+        Ok(KnowledgeConcept {
+            id,
+            relative_path,
+            concept_type: input.area.concept_type().to_owned(),
+            title: input.title.clone(),
+            description: input.description.clone(),
+            timestamp,
+            body: input.body.clone(),
+            scope: input.area.scope(),
+            agent_id: Some(self.agent_id.clone()),
+            event_id: None,
+            tags: input.tags.clone(),
+            extensions: input.extensions.clone(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct StagedBatch {
+    writes: Vec<(String, String)>,
+    removes: Vec<String>,
+    log_lines: Vec<(String, String, String)>,
+    results: Vec<KnowledgeConcept>,
+}
+
+impl StagedBatch {
+    fn record_write(&mut self, concept: &KnowledgeConcept, action: &str) {
+        // A later operation may rewrite the same path; last write wins.
+        if let Ok(rendered) = render_concept(concept) {
+            self.writes
+                .retain(|(path, _)| path != &concept.relative_path);
+            self.writes.push((concept.relative_path.clone(), rendered));
+        }
+        self.log_lines.push((
+            action.to_owned(),
+            concept.id.clone(),
+            concept.relative_path.clone(),
+        ));
+    }
+}
+
+fn stage_concept(staging: &Path, concept: &KnowledgeConcept) -> anyhow::Result<()> {
+    let target = staging.join(&concept.relative_path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(&target, render_concept(concept)?.as_bytes())
+}
+
+fn sorted_paths<'a>(paths: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut paths: Vec<String> = paths.cloned().collect();
+    paths.sort();
+    paths
+}
+
+fn validate_learning_writes(event_id: &str, writes: &LearningEventWrites) -> anyhow::Result<()> {
+    for (relative_path, content) in &writes.writes {
+        validate_concept_relative_path(relative_path)?;
+        let concept = parse_concept(relative_path, content)
+            .with_context(|| format!("learning write `{relative_path}` failed to reparse"))?;
+        if concept.event_id.as_deref() != Some(event_id) {
+            bail!("learning write `{relative_path}` does not record event `{event_id}`");
+        }
+    }
+    for relative_path in &writes.removes {
+        validate_concept_relative_path(relative_path)?;
+    }
+    Ok(())
+}
+
+fn validate_learning_completion(completion: &LearningCompletion) -> anyhow::Result<()> {
+    validate_learning_writes(
+        &completion.event_id,
+        &LearningEventWrites {
+            writes: completion.writes.clone(),
+            removes: completion.removes.clone(),
+        },
+    )
+}
+
+fn completion_matches(root: &Path, completion: &LearningCompletion) -> anyhow::Result<bool> {
+    for (relative_path, expected) in &completion.writes {
+        let raw = match fs::read_to_string(root.join(relative_path)) {
+            Ok(raw) => raw,
+            Err(_) => return Ok(false),
+        };
+        if &raw != expected {
+            return Ok(false);
+        }
+        if parse_concept(relative_path, &raw)?.event_id.as_deref()
+            != Some(completion.event_id.as_str())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(completion
+        .removes
+        .iter()
+        .all(|path| !root.join(path).exists()))
+}
+
+fn write_bundle_manifest(txn: &Path, phase: BundleTransactionPhase) -> anyhow::Result<()> {
+    let raw = serde_yaml::to_string(&BundleTransactionManifest { phase })?;
+    atomic_write(&txn.join(KNOWLEDGE_TXN_MANIFEST), raw.as_bytes())
+}
+
+fn read_bundle_manifest(txn: &Path) -> anyhow::Result<BundleTransactionManifest> {
+    let raw = fs::read_to_string(txn.join(KNOWLEDGE_TXN_MANIFEST))?;
+    Ok(serde_yaml::from_str(&raw)?)
+}
+
+fn copy_directory(source: &Path, destination: &Path, excluded: &[&str]) -> anyhow::Result<()> {
+    fs::create_dir_all(destination)?;
+    if !source.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source)?.filter_map(Result::ok) {
+        let name = entry.file_name();
+        if excluded
+            .iter()
+            .any(|excluded| name == std::ffi::OsStr::new(excluded))
+        {
+            continue;
+        }
+        let target = destination.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_directory(&entry.path(), &target, excluded)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn regenerate_indexes_at(root: &Path) -> anyhow::Result<()> {
+    let scan = scan_bundle(root)?;
+    for area in ["memory", "learning", "curator"] {
+        let prefix = format!("{area}/");
+        let mut lines: Vec<String> =
+            scan.valid
+                .iter()
+                .filter_map(|concept| {
+                    concept.relative_path.strip_prefix(&prefix).map(|link| {
+                        format!("- [{}]({link}) — {}", concept.title, concept.description)
+                    })
+                })
+                .collect();
+        lines.sort();
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        atomic_write(&root.join(area).join("index.md"), content.as_bytes())?;
+    }
+    let mut root_lines: Vec<String> = scan
+        .valid
+        .iter()
+        .map(|concept| {
+            format!(
+                "- [{}]({}) — {}",
+                concept.title, concept.relative_path, concept.description
+            )
+        })
+        .collect();
+    root_lines.sort();
+    let mut root_content = root_lines.join("\n");
+    if !root_content.is_empty() {
+        root_content.push('\n');
+    }
+    atomic_write(&root.join("index.md"), root_content.as_bytes())
+}
+
+fn append_log_at(
+    root: &Path,
+    action: &str,
+    concept_id: &str,
+    relative_path: &str,
+) -> anyhow::Result<()> {
+    let log_path = root.join("log.md");
+    let mut content = fs::read_to_string(&log_path).unwrap_or_default();
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    content.push_str(&format!(
+        "- {timestamp} {action} {concept_id} {relative_path}\n"
+    ));
+    atomic_write(&log_path, content.as_bytes())
+}
+
+/// Creates the full bundle skeleton: every fixed concept directory, the
+/// project-memory parent, and empty generated `index.md`/`log.md` files.
+/// Idempotent; never overwrites existing generated files.
+pub fn ensure_bundle_at(root: &Path) -> anyhow::Result<()> {
+    for directory in FIXED_CONCEPT_DIRECTORIES {
+        fs::create_dir_all(root.join(directory))?;
+    }
+    fs::create_dir_all(root.join(PROJECT_MEMORY_PARENT))?;
+    for generated in [
+        "index.md",
+        "memory/index.md",
+        "learning/index.md",
+        "curator/index.md",
+        "log.md",
+    ] {
+        let path = root.join(generated);
+        if !path.exists() {
+            atomic_write(&path, b"")?;
+        }
+    }
+    Ok(())
+}
+
+/// Every directory that may contain concept documents right now: the fixed
+/// areas plus each existing per-project memory directory.
+fn concept_directories(root: &Path) -> anyhow::Result<Vec<String>> {
+    let mut directories: Vec<String> = FIXED_CONCEPT_DIRECTORIES
+        .iter()
+        .map(|directory| (*directory).to_owned())
+        .collect();
+    let projects = root.join(PROJECT_MEMORY_PARENT);
+    if projects.is_dir() {
+        let mut project_ids: Vec<String> = fs::read_dir(&projects)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        project_ids.sort();
+        for project_id in project_ids {
+            directories.push(format!("{PROJECT_MEMORY_PARENT}/{project_id}"));
+        }
+    }
+    Ok(directories)
+}
+
+fn scan_bundle(root: &Path) -> anyhow::Result<KnowledgeScan> {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for directory in concept_directories(root)? {
+        let path = root.join(&directory);
+        if !path.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&path)?.filter_map(Result::ok) {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !name.ends_with(".md") || RESERVED_FILE_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let relative_path = format!("{directory}/{name}");
+            let raw = fs::read_to_string(entry.path())?;
+            match parse_concept(&relative_path, &raw) {
+                Ok(concept) => valid.push(concept),
+                Err(error) => invalid.push(InvalidKnowledgeConcept {
+                    relative_path,
+                    error: format!("{error:#}"),
+                    raw_markdown: raw,
+                }),
+            }
+        }
+    }
+    valid.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    invalid.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(KnowledgeScan { valid, invalid })
+}
+
+fn find_concept(root: &Path, concept_id: &str) -> anyhow::Result<Option<KnowledgeConcept>> {
+    validate_path_component(concept_id).context("invalid concept id")?;
+    Ok(scan_bundle(root)?
+        .valid
+        .into_iter()
+        .find(|concept| concept.id == concept_id))
+}
+
+fn concept_id_of(relative_path: &str) -> String {
+    let file_name = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    file_name
+        .strip_suffix(".md")
+        .unwrap_or(file_name)
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use indexmap::IndexMap;
+    use serde_yaml::Value;
+
+    use super::super::okf::{ConceptArea, KnowledgeConceptInput, KnowledgeScope};
+    use super::*;
+
+    fn concept_input(area: ConceptArea, title: &str) -> KnowledgeConceptInput {
+        KnowledgeConceptInput {
+            area,
+            title: title.into(),
+            description: format!("{title} description"),
+            body: format!("{title} body"),
+            tags: Vec::new(),
+            extensions: IndexMap::new(),
+        }
+    }
+
+    fn memory_input(scope: KnowledgeScope, title: &str) -> KnowledgeConceptInput {
+        concept_input(ConceptArea::Memory(scope), title)
+    }
+
+    fn fixture_store(agent_id: &str) -> (tempfile::TempDir, KnowledgeStore) {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentKnowledgeStore::new(root.path().to_path_buf())
+            .for_agent(agent_id)
+            .unwrap();
+        (root, store)
+    }
+
+    fn bundle_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(base: &Path, current: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            if !current.is_dir() {
+                return;
+            }
+            for entry in std::fs::read_dir(current).unwrap().filter_map(Result::ok) {
+                if entry.file_type().unwrap().is_dir() {
+                    walk(base, &entry.path(), out);
+                } else {
+                    out.push((
+                        entry
+                            .path()
+                            .strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        std::fs::read(entry.path()).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        walk(root, root, &mut result);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    fn event_write(event_id: &str, body: &str) -> LearningEventWrites {
+        let path = format!("learning/reviews/{event_id}.md");
+        let mut concept = KnowledgeConcept {
+            id: event_id.into(),
+            relative_path: path.clone(),
+            concept_type: "Review".into(),
+            title: "Review".into(),
+            description: "Review description".into(),
+            timestamp: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            body: body.into(),
+            scope: None,
+            agent_id: Some("a".into()),
+            event_id: Some(event_id.into()),
+            tags: vec![],
+            extensions: IndexMap::new(),
+        };
+        concept.agent_id = Some("a".into());
+        LearningEventWrites {
+            writes: vec![(path, render_concept(&concept).unwrap())],
+            removes: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_owned_mutations_reject_non_memory_concepts_without_changing_them() {
+        let (_root, store) = fixture_store("a");
+        store
+            .replace_raw(
+                "learning/journey/internal.md",
+                "---\ntype: Journey\ntitle: Internal\ndescription: Internal journey.\ntimestamp: 2026-08-01T00:00:00Z\n---\n\nOriginal.\n",
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .update_memory(
+                "internal",
+                memory_input(KnowledgeScope::User, "replacement"),
+            )
+            .await
+            .is_err());
+        assert!(store.delete_memory("internal").await.is_err());
+
+        let preserved = store.read("internal").await.unwrap();
+        assert_eq!(preserved.relative_path, "learning/journey/internal.md");
+        assert_eq!(preserved.body, "Original.");
+    }
+
+    #[tokio::test]
+    async fn activation_failure_restores_bundle_byte_identically_and_keeps_txns_outside() {
+        let (_root, store) = fixture_store("a");
+        store
+            .create(memory_input(KnowledgeScope::User, "seed"))
+            .await
+            .unwrap();
+        let before = bundle_bytes(store.root());
+        store.set_failpoint(KnowledgeFailpoint::AfterActivationBeforeCommit);
+        let result = store
+            .create(memory_input(KnowledgeScope::User, "must fail"))
+            .await;
+        store.set_failpoint(KnowledgeFailpoint::None);
+        assert!(result.is_err());
+        assert_eq!(bundle_bytes(store.root()), before);
+        let transaction_root = store.transaction_root().unwrap();
+        assert!(!transaction_root.starts_with(store.root()));
+        assert!(
+            !transaction_root.exists()
+                || std::fs::read_dir(&transaction_root)
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+        assert_eq!(store.scan().await.unwrap().valid.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_recovers_prepared_transaction_before_observing_bundle() {
+        let (_root, store) = fixture_store("a");
+        let created = store
+            .create(memory_input(KnowledgeScope::User, "original"))
+            .await
+            .unwrap();
+        let prepared = store.prepare_bundle_transaction().unwrap();
+        std::fs::rename(store.root(), prepared.join("backup")).unwrap();
+
+        assert_eq!(store.read(&created.id).await.unwrap().body, "original body");
+        assert!(store.root().is_dir());
+        assert!(!prepared.exists());
+    }
+
+    #[tokio::test]
+    async fn activation_and_restore_failure_retains_evidence_for_recovery() {
+        let (_root, store) = fixture_store("a");
+        store
+            .create(memory_input(KnowledgeScope::User, "original"))
+            .await
+            .unwrap();
+        let before = bundle_bytes(store.root());
+        store.set_failpoint(KnowledgeFailpoint::ActivationAndRestoreFailure);
+        let error = store
+            .create(memory_input(KnowledgeScope::User, "must fail"))
+            .await
+            .unwrap_err()
+            .to_string();
+        store.set_failpoint(KnowledgeFailpoint::None);
+        assert!(error.contains("failed to activate staged knowledge bundle"));
+        assert!(error.contains("rollback failed"));
+        assert!(error.contains("transaction"));
+        assert!(!store.root().exists());
+        assert!(store
+            .transaction_root()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+
+        store.recover_bundle_transactions().unwrap();
+        assert_eq!(bundle_bytes(store.root()), before);
+        assert!(store
+            .transaction_root()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_rolls_back_prepared_and_cleans_committed_transactions() {
+        let (_root, store) = fixture_store("a");
+        ensure_bundle_at(store.root()).unwrap();
+        std::fs::write(store.root().join("log.md"), "original").unwrap();
+        let prepared = store.prepare_bundle_transaction().unwrap();
+        std::fs::rename(store.root(), prepared.join("backup")).unwrap();
+        std::fs::rename(prepared.join("stage"), store.root()).unwrap();
+        std::fs::write(store.root().join("log.md"), "partial").unwrap();
+        store.recover_bundle_transactions().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("log.md")).unwrap(),
+            "original"
+        );
+
+        let committed = store.prepare_bundle_transaction().unwrap();
+        std::fs::write(committed.join("stage/log.md"), "committed").unwrap();
+        std::fs::rename(store.root(), committed.join("backup")).unwrap();
+        std::fs::rename(committed.join("stage"), store.root()).unwrap();
+        write_bundle_manifest(&committed, BundleTransactionPhase::Committed).unwrap();
+        store.recover_bundle_transactions().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("log.md")).unwrap(),
+            "committed"
+        );
+        assert!(!committed.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_reaps_transactions_with_missing_or_corrupt_manifests() {
+        let (_root, store) = fixture_store("a");
+        let created = store
+            .create(memory_input(KnowledgeScope::User, "original"))
+            .await
+            .unwrap();
+        let before = bundle_bytes(store.root());
+
+        // Crash between transaction-dir creation/stage copy and the Prepared
+        // manifest write: the directory exists but has no manifest.
+        let transaction_root = store.transaction_root().unwrap();
+        let manifest_less = transaction_root.join("txn-manifest-less");
+        std::fs::create_dir_all(manifest_less.join("stage")).unwrap();
+
+        // A manifest that exists but cannot be parsed is equally un-prepared.
+        let corrupt = transaction_root.join("txn-corrupt-manifest");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join(KNOWLEDGE_TXN_MANIFEST), "phase: [not-a-phase").unwrap();
+
+        assert_eq!(store.read(&created.id).await.unwrap().body, "original body");
+        assert!(!manifest_less.exists());
+        assert!(!corrupt.exists());
+        assert_eq!(bundle_bytes(store.root()), before);
+    }
+
+    #[tokio::test]
+    async fn replay_repairs_partial_event_artifact_instead_of_skipping() {
+        let (_root, store) = fixture_store("a");
+        assert!(store
+            .apply_learning_event("event-1", |_| Ok(event_write("event-1", "complete")))
+            .await
+            .unwrap());
+        let path = store.root().join("learning/reviews/event-1.md");
+        let partial = event_write("event-1", "partial").writes.remove(0).1;
+        std::fs::write(&path, partial).unwrap();
+        assert!(store
+            .apply_learning_event("event-1", |_| Ok(event_write("event-1", "complete")))
+            .await
+            .unwrap());
+        assert!(std::fs::read_to_string(path).unwrap().contains("complete"));
+    }
+
+    #[tokio::test]
+    async fn concepts_are_agent_and_project_isolated_and_invalid_files_remain_visible() {
+        let root = tempfile::tempdir().unwrap();
+        let store = AgentKnowledgeStore::new(root.path().to_path_buf());
+        let a = store.for_agent("a").unwrap();
+        let b = store.for_agent("b").unwrap();
+        a.create(memory_input(
+            KnowledgeScope::Project {
+                project_id: "p1".into(),
+            },
+            "A fact",
+        ))
+        .await
+        .unwrap();
+        b.create(memory_input(
+            KnowledgeScope::Project {
+                project_id: "p1".into(),
+            },
+            "B fact",
+        ))
+        .await
+        .unwrap();
+        std::fs::write(
+            a.root().join("learning/reviews/broken.md"),
+            "not frontmatter",
+        )
+        .unwrap();
+        assert_eq!(a.list_memory(Some("p1")).await.unwrap().valid.len(), 1);
+        assert_eq!(b.list_memory(Some("p1")).await.unwrap().valid.len(), 1);
+        assert_eq!(
+            a.scan().await.unwrap().invalid[0].relative_path,
+            "learning/reviews/broken.md"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escaping_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = AgentKnowledgeStore::new(root.path().to_path_buf())
+            .for_agent("a")
+            .unwrap();
+        std::fs::create_dir_all(store.root().join("memory")).unwrap();
+        symlink(outside.path(), store.root().join("memory/user")).unwrap();
+        assert!(store
+            .create(memory_input(KnowledgeScope::User, "escape"))
+            .await
+            .is_err());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_validates_every_operation_before_exposing_changes() {
+        let (_root, store) = fixture_store("a");
+        let first = store
+            .create(memory_input(KnowledgeScope::User, "first"))
+            .await
+            .unwrap();
+        let before = store.scan().await.unwrap();
+        let result = store
+            .batch(vec![
+                KnowledgeOperation::Replace {
+                    concept_id: first.id.clone(),
+                    input: memory_input(KnowledgeScope::User, "changed"),
+                },
+                KnowledgeOperation::Remove {
+                    concept_id: "missing".into(),
+                },
+            ])
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.scan().await.unwrap().valid, before.valid);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_keep_both_concepts_and_well_formed_index() {
+        let (_root, store) = fixture_store("a");
+        let store = Arc::new(store);
+        let (a, b) = tokio::join!(
+            store.create(memory_input(KnowledgeScope::Global, "one")),
+            store.create(memory_input(KnowledgeScope::Global, "two"))
+        );
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(store.list_memory(None).await.unwrap().valid.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("memory/index.md"))
+                .unwrap()
+                .matches(".md)")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_applies_all_operations_and_returns_resulting_concepts() {
+        let (_root, store) = fixture_store("a");
+        let first = store
+            .create(memory_input(KnowledgeScope::User, "first"))
+            .await
+            .unwrap();
+        let results = store
+            .batch(vec![
+                KnowledgeOperation::Add(memory_input(KnowledgeScope::Global, "added")),
+                KnowledgeOperation::Replace {
+                    concept_id: first.id.clone(),
+                    input: memory_input(KnowledgeScope::User, "changed"),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "added");
+        assert_eq!(results[1].title, "changed");
+        let scan = store.scan().await.unwrap();
+        assert_eq!(scan.valid.len(), 2);
+        assert!(scan.valid.iter().any(|c| c.title == "changed"));
+        let remove = store
+            .batch(vec![KnowledgeOperation::Remove {
+                concept_id: first.id.clone(),
+            }])
+            .await
+            .unwrap();
+        assert!(remove.is_empty());
+        assert_eq!(store.scan().await.unwrap().valid.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn crud_search_reserved_names_and_generated_files() {
+        let (_root, store) = fixture_store("a");
+        let created = store
+            .create(memory_input(KnowledgeScope::Global, "Alpha fact"))
+            .await
+            .unwrap();
+        assert_eq!(store.read(&created.id).await.unwrap().title, "Alpha fact");
+        let updated = store
+            .update(&created.id, memory_input(KnowledgeScope::User, "Beta fact"))
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.relative_path,
+            format!("memory/user/{}.md", created.id)
+        );
+        assert!(!store.root().join(&created.relative_path).exists());
+        assert_eq!(store.search("beta").await.unwrap().len(), 1);
+        assert!(store.search("alpha").await.unwrap().is_empty());
+        // Reserved generated names are never writable as concepts.
+        let raw = "---\ntype: Memory\ntitle: X\ndescription: X\ntimestamp: 2026-07-12T14:30:00Z\n---\nX\n";
+        assert!(store.replace_raw("memory/index.md", raw).await.is_err());
+        assert!(store.replace_raw("learning/log.md", raw).await.is_err());
+        let index = std::fs::read_to_string(store.root().join("memory/index.md")).unwrap();
+        assert!(index.contains(&format!(
+            "- [Beta fact](user/{}.md) — Beta fact description",
+            created.id
+        )));
+        let log = std::fs::read_to_string(store.root().join("log.md")).unwrap();
+        assert!(log.contains("create") && log.contains(&created.id));
+        assert!(!log.contains("Alpha fact body"));
+        store.delete(&created.id).await.unwrap();
+        assert!(store.read(&created.id).await.is_err());
+        assert!(
+            std::fs::read_to_string(store.root().join("memory/index.md"))
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_documents_can_be_validated_repaired_or_deleted() {
+        let (_root, store) = fixture_store("a");
+        store
+            .create(memory_input(KnowledgeScope::User, "seed"))
+            .await
+            .unwrap();
+        std::fs::write(store.root().join("learning/reviews/broken.md"), "nope").unwrap();
+        assert_eq!(store.scan().await.unwrap().invalid.len(), 1);
+        let raw = "---\ntype: Review\ntitle: Fixed\ndescription: Fixed review.\ntimestamp: 2026-07-12T14:30:00Z\n---\n\nFixed body.\n";
+        assert!(store
+            .validate_raw("learning/reviews/broken.md", "still broken")
+            .await
+            .is_err());
+        let repaired = store
+            .validate_raw("learning/reviews/broken.md", raw)
+            .await
+            .unwrap();
+        assert_eq!(repaired.title, "Fixed");
+        store
+            .replace_raw("learning/reviews/broken.md", raw)
+            .await
+            .unwrap();
+        assert!(store.scan().await.unwrap().invalid.is_empty());
+        std::fs::write(store.root().join("learning/reviews/broken2.md"), "nope").unwrap();
+        store
+            .delete_invalid("learning/reviews/broken2.md")
+            .await
+            .unwrap();
+        assert!(store.scan().await.unwrap().invalid.is_empty());
+        assert!(store.delete_invalid("../outside.md").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn learning_snapshot_maps_learning_areas() {
+        let root = tempfile::tempdir().unwrap();
+        let stores = AgentKnowledgeStore::new(root.path().to_path_buf());
+        let store = stores.for_agent("a").unwrap();
+        store
+            .create(concept_input(ConceptArea::Journey, "Milestone"))
+            .await
+            .unwrap();
+        store
+            .create(concept_input(ConceptArea::Review, "Review one"))
+            .await
+            .unwrap();
+        let mut skill = concept_input(ConceptArea::Skill, "Skill use");
+        skill
+            .extensions
+            .insert("skill_id".into(), Value::String("commit".into()));
+        skill
+            .extensions
+            .insert("uses".into(), Value::Number(3.into()));
+        skill
+            .extensions
+            .insert("successes".into(), Value::Number(2.into()));
+        store.create(skill).await.unwrap();
+        let curator = store
+            .create(concept_input(ConceptArea::CuratorState, "Curator"))
+            .await
+            .unwrap();
+        store
+            .create(concept_input(ConceptArea::CuratorHistory, "Snapshot"))
+            .await
+            .unwrap();
+        let snapshot = stores.learning_snapshot("a").await.unwrap();
+        assert_eq!(snapshot.journey.len(), 1);
+        assert_eq!(snapshot.journey[0].title, "Milestone");
+        assert_eq!(snapshot.reviews.len(), 1);
+        assert_eq!(snapshot.skill_usage.len(), 1);
+        assert_eq!(snapshot.skill_usage[0].skill_id, "commit");
+        assert_eq!(snapshot.skill_usage[0].uses, 3);
+        assert_eq!(snapshot.skill_usage[0].successes, 2);
+        assert_eq!(snapshot.curator.concept.as_ref().unwrap().id, curator.id);
+        assert_eq!(snapshot.curator_history.len(), 1);
+        assert!(snapshot.concepts.is_empty());
+        assert!(snapshot.invalid.is_empty());
+    }
+}

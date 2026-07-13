@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { MonitorUp } from "lucide-react";
 import { SettingsCard as Card } from "@ryuzi/ui";
 import { useStore } from "./store";
-import { useAgent } from "./store-agent";
+import { useAgents } from "./store-agents";
 import { useModelStatuses } from "./store-model-statuses";
 import { useNav } from "./store-nav";
 import { usePlugins } from "./store-plugins";
@@ -23,7 +23,8 @@ import { AppDetailView } from "./views/AppDetailView";
 import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
-import { LearningView } from "./views/LearningView";
+import { AgentsView } from "./views/AgentsView";
+import { AgentDetailView } from "./views/AgentDetailView";
 import { SettingsView } from "./views/SettingsView";
 import { Toaster } from "@ryuzi/ui";
 
@@ -56,10 +57,12 @@ function MainView() {
       return <GatewayDetailView id={view.id} />;
     case "pluginDetail":
       return <PluginDetailView id={view.id} />;
-    case "learning":
-      return <LearningView />;
     case "settings":
       return <SettingsView />;
+    case "agents":
+      return <AgentsView />;
+    case "agentDetail":
+      return <AgentDetailView agentId={view.agentId} />;
   }
 }
 
@@ -67,20 +70,21 @@ const WARN = "#F59E0B";
 
 export default function App() {
   const init = useStore((s) => s.init);
-  const loadAgent = useAgent((s) => s.load);
   const hydrateModelStatuses = useModelStatuses((s) => s.hydrate);
   const restartRequired = usePlugins((s) => s.restartRequired);
   useDisableContextMenu();
   useEffect(() => {
     init();
-    void loadAgent();
     void hydrateModelStatuses();
     // Read the store directly (not via the reactive selector above) so this
     // mount-time fetch runs exactly once, guarded the same way every other
     // domain store's `load()` is — visiting the Plugins hub first is not a
     // precondition for the restart banner below to be accurate.
     if (!usePlugins.getState().loaded) void usePlugins.getState().load();
-  }, [init, loadAgent, hydrateModelStatuses]);
+    // Agent registry (Plan 3): guarded the same way so the roster is warm
+    // before the Agents views (Tasks 6–7) first render.
+    if (!useAgents.getState().loaded) void useAgents.getState().load();
+  }, [init, hydrateModelStatuses]);
   return (
     <div className="relative flex h-screen flex-col overflow-hidden text-sm text-foreground antialiased">
       {/* Wallpaper behind the glass chrome; collapses to transparent when an OS backdrop is active. */}

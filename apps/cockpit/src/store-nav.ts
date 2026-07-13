@@ -16,8 +16,9 @@ export type View =
   | { kind: "gateways" }
   | { kind: "gatewayDetail"; id: string }
   | { kind: "pluginDetail"; id: string }
-  | { kind: "learning" }
-  | { kind: "settings" };
+  | { kind: "settings" }
+  | { kind: "agents" }
+  | { kind: "agentDetail"; agentId: string };
 
 export type RightTab = "review" | "file" | "agents";
 
@@ -140,6 +141,9 @@ type NavState = {
    *  or `home:{projectId}` (HomeView). Persisted so drafts survive restarts. */
   drafts: Record<string, string>;
   projectSettingsFor: string | null;
+  /** Agent id recorded by openAgentChat for the next New-session composer;
+   *  Plan 4's HomeView consumes it via consumePendingPrimaryAgentId. */
+  pendingPrimaryAgentId: string | null;
   view: () => View;
   navigate: (view: View) => void;
   goBack: () => void;
@@ -162,6 +166,10 @@ type NavState = {
   /** Refill a draft after a failed send — no-op if the user already typed anew. */
   restoreDraft: (key: string, text: string) => void;
   setProjectSettingsFor: (id: string | null) => void;
+  /** "Start chat" from the agent hub/detail: record the agent and open Home. */
+  openAgentChat: (agentId: string) => void;
+  /** Return the pending primary agent id and clear it (one-shot handoff). */
+  consumePendingPrimaryAgentId: () => string | null;
 };
 
 export const useNav = create<NavState>((set, get) => ({
@@ -184,6 +192,7 @@ export const useNav = create<NavState>((set, get) => ({
   composerEffort: null,
   drafts: readDrafts(readStored(KEY_DRAFTS)),
   projectSettingsFor: null,
+  pendingPrimaryAgentId: null,
 
   view: () => get().history.current,
   navigate: (view) => set((s) => ({ history: navigateHistory(s.history, view) })),
@@ -241,4 +250,14 @@ export const useNav = create<NavState>((set, get) => ({
     if ((get().drafts[key] ?? "") === "") get().setDraft(key, text);
   },
   setProjectSettingsFor: (id) => set({ projectSettingsFor: id }),
+  openAgentChat: (agentId) =>
+    set((s) => ({
+      pendingPrimaryAgentId: agentId,
+      history: navigateHistory(s.history, { kind: "home" }),
+    })),
+  consumePendingPrimaryAgentId: () => {
+    const id = get().pendingPrimaryAgentId;
+    if (id !== null) set({ pendingPrimaryAgentId: null });
+    return id;
+  },
 }));

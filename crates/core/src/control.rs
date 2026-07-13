@@ -100,6 +100,9 @@ pub struct ControlPlane {
     /// `SessionCtx.extension_events` (threaded in
     /// `lifecycle::start_harness_session`).
     extension_host: Arc<ExtensionHost>,
+    /// Shared Plan 2 persistence graph, attached exactly once by the composition
+    /// root before any native session starts.
+    agent_persistence: std::sync::OnceLock<crate::agents::bootstrap::AgentPersistenceHandles>,
 }
 
 impl ControlPlane {
@@ -164,6 +167,7 @@ impl ControlPlane {
                 crate::harness::native::llm::RouterLlmStreamFactory,
             )),
             extension_host: Arc::new(ExtensionHost::new()),
+            agent_persistence: std::sync::OnceLock::new(),
         })
     }
 
@@ -198,6 +202,39 @@ impl ControlPlane {
     /// Empty until [`Self::spawn_extensions`] is called.
     pub fn extension_host(&self) -> &Arc<ExtensionHost> {
         &self.extension_host
+    }
+
+    pub fn attach_agent_persistence(
+        &self,
+        persistence: crate::agents::bootstrap::AgentPersistenceHandles,
+    ) -> anyhow::Result<()> {
+        self.agent_persistence
+            .set(persistence)
+            .map_err(|_| anyhow::anyhow!("agent persistence is already attached"))
+    }
+
+    pub(crate) fn agent_persistence(
+        &self,
+    ) -> Option<&crate::agents::bootstrap::AgentPersistenceHandles> {
+        self.agent_persistence.get()
+    }
+
+    /// Attach an isolated YAML/OKF persistence graph for crate unit tests that
+    /// exercise session lifecycle paths. Production composition roots attach
+    /// their shared graph explicitly; this helper prevents test constructors
+    /// from silently omitting that required dependency.
+    #[cfg(test)]
+    pub(crate) async fn attach_test_agent_persistence(&self) {
+        let config = tempfile::tempdir().expect("agent persistence tempdir");
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            self.store.clone(),
+        )
+        .await
+        .expect("initialize test agent persistence");
+        self.attach_agent_persistence(persistence.handles())
+            .expect("attach test agent persistence");
+        std::mem::forget(config);
     }
 
     /// Spawn every enabled extension-capable plugin's subprocess(es) (Track

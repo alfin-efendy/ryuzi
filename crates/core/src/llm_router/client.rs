@@ -20,7 +20,7 @@ use crate::llm_router::provenance::{
 };
 use crate::llm_router::registry::{self, ApiFormat, AuthScheme, ProviderDescriptor};
 use crate::llm_router::{
-    capabilities, claude_cloak, connections, mimo, model_effort, model_meta, oauth, routes,
+    capabilities, claude_cloak, connections, mimo, model_capabilities, model_effort, oauth, routes,
     translate,
 };
 use crate::store::Store;
@@ -711,18 +711,14 @@ pub async fn selectable_native_models(
             model: model.clone(),
         };
         async move {
-            let metadata = model_meta::resolve_for_surface(store, &surface).await;
+            let capabilities =
+                model_capabilities::resolve_for_surface(store, &family, &surface).await;
             (
                 model_effort::ModelPreferenceKey {
                     family,
                     model: model.clone(),
                 },
-                model_effort::ExecutionModelEffortCapabilities {
-                    surface,
-                    model_display_name: metadata.display_name.unwrap_or_else(|| model.clone()),
-                    supported: metadata.reasoning_efforts,
-                    provider_default: metadata.default_reasoning_effort,
-                },
+                capabilities,
             )
         }
     };
@@ -4376,6 +4372,59 @@ mod tests {
         assert_eq!(target.conn.id, "claude");
         assert_eq!(target.conn.provider, "anthropic");
         assert_eq!(target.upstream_model, "claude-sonnet-4-5");
+    }
+
+    #[tokio::test]
+    async fn selectable_models_expose_pinned_anthropic_fallback_without_route_edits() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "anthropic-selectable".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-5".into(), "claude-opus-4-7".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let models = selectable_native_models(&store).await.unwrap();
+        let opus_45 = models
+            .iter()
+            .find(|model| model.request_value == "anthropic/claude-opus-4-5")
+            .unwrap();
+        let opus_47 = models
+            .iter()
+            .find(|model| model.request_value == "anthropic/claude-opus-4-7")
+            .unwrap();
+        assert_eq!(
+            opus_45
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"],
+        );
+        assert_eq!(
+            opus_47
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "max", "xhigh"],
+        );
+        assert_eq!(opus_47.resolved_default.as_deref(), Some("high"));
     }
 
     #[tokio::test]

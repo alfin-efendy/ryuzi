@@ -1,11 +1,13 @@
 //! Learning screen commands: thin proxies to the engine daemon's
-//! `crates/core/src/api/learning_api.rs` RPC family — memory read/write,
-//! cross-session recall, the Learning panel's journey graph, curator
-//! status/rollback, and skill lifecycle/pin controls (Task 11).
+//! `crates/core/src/api/learning_api.rs` RPC family for cross-session recall
+//! and skill lifecycle/pin controls.
+//!
+//! Per-agent Learning commands (`get_agent_learning`, concept CRUD, raw
+//! repair, rollback) live in `agent_cmd.rs`; like everything here they are
+//! local-engine-only.
 
 use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
-use ryuzi_core::api::types::{CuratorStatus, LearningGraph};
 use ryuzi_core::domain::SkillUsage;
 use ryuzi_core::store::FtsHit;
 use std::sync::Arc;
@@ -16,60 +18,10 @@ type Engine<'a> = State<'a, Arc<EngineManager>>;
 
 #[tauri::command]
 #[specta::specta]
-pub async fn read_memory(engine: Engine<'_>, scope: String) -> R<Vec<String>> {
-    let client = engine.client("local")?;
-    client
-        .rpc("read_memory", serde_json::json!({ "scope": scope }))
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn write_memory(
-    engine: Engine<'_>,
-    scope: String,
-    action: String,
-    text: Option<String>,
-    r#match: Option<String>,
-) -> R<()> {
-    let client = engine.client("local")?;
-    client
-        .rpc(
-            "write_memory",
-            serde_json::json!({ "scope": scope, "action": action, "text": text, "match": r#match }),
-        )
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
 pub async fn search_sessions(engine: Engine<'_>, query: String) -> R<Vec<FtsHit>> {
     let client = engine.client("local")?;
     client
         .rpc("search_sessions", serde_json::json!({ "query": query }))
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn learning_graph(engine: Engine<'_>) -> R<LearningGraph> {
-    let client = engine.client("local")?;
-    client.rpc("learning_graph", serde_json::json!({})).await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn curator_status(engine: Engine<'_>) -> R<CuratorStatus> {
-    let client = engine.client("local")?;
-    client.rpc("curator_status", serde_json::json!({})).await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn curator_rollback(engine: Engine<'_>, run_id: String) -> R<()> {
-    let client = engine.client("local")?;
-    client
-        .rpc("curator_rollback", serde_json::json!({ "run_id": run_id }))
         .await
 }
 

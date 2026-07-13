@@ -135,6 +135,7 @@ async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
 
     let daemon = build_daemon(BuildDaemonOpts {
         db_path,
+        config_root: tmp.path().to_path_buf(),
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
@@ -155,6 +156,9 @@ async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
         ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
+            agents: daemon.agents.clone(),
+            agent_knowledge: daemon.agent_knowledge.clone(),
+            learning_queue: daemon.learning_queue.clone(),
             control_token,
         },
         ServeOpts {
@@ -239,6 +243,7 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
 
     let daemon = build_daemon(BuildDaemonOpts {
         db_path,
+        config_root: tmp.path().to_path_buf(),
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
@@ -252,6 +257,9 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
         ApiState {
             cp: daemon.cp.clone(),
             router_server: daemon.router_server.clone(),
+            agents: daemon.agents.clone(),
+            agent_knowledge: daemon.agent_knowledge.clone(),
+            learning_queue: daemon.learning_queue.clone(),
             control_token: token.clone(),
         },
         ServeOpts {
@@ -376,6 +384,7 @@ async fn daemon_start_autostarts_the_endpoint_server_when_configured() {
 
     let daemon = build_daemon(BuildDaemonOpts {
         db_path,
+        config_root: tmp.path().to_path_buf(),
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,

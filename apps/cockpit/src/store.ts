@@ -20,7 +20,7 @@ import {
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useNative } from "./store-native";
-import { useAgent } from "./store-agent";
+import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
@@ -561,7 +561,7 @@ export const useStore = create<State>((set, get) => ({
   },
   refreshModelConfiguration: async () => {
     const generation = ++modelConfigurationGeneration;
-    await useAgent.getState().load();
+    await useAgents.getState().load();
     const projectIds = Object.keys(get().projectRuntimeById);
     const projectMutationSnapshots = new Map(
       projectIds.map((id) => [

@@ -18,11 +18,13 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+indexmap = { version = "2", features = ["serde"] }
 portable-pty = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 serial_test = "3"
 sha2 = "0.10"
 ed25519-dalek = "2"
