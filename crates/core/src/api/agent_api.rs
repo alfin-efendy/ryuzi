@@ -366,9 +366,9 @@ async fn with_post_commit_enrichment_failure<T>(
 fn injected_post_commit_enrichment_failure(failure: PostCommitEnrichmentFailure) -> bool {
     #[cfg(test)]
     {
-        return POST_COMMIT_ENRICHMENT_FAILURE
+        POST_COMMIT_ENRICHMENT_FAILURE
             .try_with(|active| *active == failure)
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(test))]
     {
