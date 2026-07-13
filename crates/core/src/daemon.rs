@@ -1766,12 +1766,21 @@ mod tests {
         )
         .await;
         seed_project(&store, "p1").await;
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
         let now = crate::paths::now_ms();
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
                 project_id: Some("p1".into()),
                 agent_session_id: Some("acp-123".into()),
                 worktree_path: None,

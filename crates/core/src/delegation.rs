@@ -223,6 +223,17 @@ impl DelegationRuntime {
         .await
     }
 
+    pub async fn interrupt(&self, run_id: &str, reason: &str) -> anyhow::Result<()> {
+        self.transition(
+            run_id,
+            &[AgentRunStatus::Queued, AgentRunStatus::Running],
+            AgentRunStatus::Interrupted,
+            None,
+            Some(reason),
+        )
+        .await
+    }
+
     pub async fn cancel_child(&self, session_pk: &str, run_id: &str) -> anyhow::Result<()> {
         let _admission = self.admission.lock().await;
         let run = self

@@ -7,7 +7,7 @@ use crate::domain::{
     AttachmentRef, CoreEvent, NewAgentRun, NewMessage, PermMode, Project, Session,
     SessionGitOptions, SessionKind, SessionStatus, WriteOrigin,
 };
-use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
+use crate::harness::{HarnessSession, PrimaryTurnConfig, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::sessions::ownership::{resolve_session_agent_access, SessionAgentAccess};
 use crate::settings::SettingsStore;
@@ -28,6 +28,12 @@ fn agent_model_parts(model: &crate::agents::types::AgentModel) -> (Option<String
 pub(super) struct PrimaryTurn {
     agent: Arc<crate::agents::types::AgentSnapshot>,
     run_id: String,
+}
+
+impl PrimaryTurn {
+    fn config(&self) -> anyhow::Result<PrimaryTurnConfig> {
+        crate::harness::native::primary_turn_config(self.agent.clone(), self.run_id.clone())
+    }
 }
 
 /// Binds a spawned session to an orchestration as a labeled worker (spec §8):
@@ -366,8 +372,14 @@ impl ControlPlane {
         }
 
         self.emit_status(session_pk, "Connecting tools…").await;
+        let Some(primary_turn) = primary_turn else {
+            self.fail_startup(session_pk, "Couldn't start the agent: missing primary turn")
+                .await;
+            return;
+        };
+        let run_id = primary_turn.run_id.clone();
         let handle = match self
-            .start_harness_session(None, session_pk, &work_dir, None, primary_turn)
+            .start_harness_session(None, session_pk, &work_dir, None, Some(primary_turn))
             .await
         {
             Ok(handle) => handle,
@@ -388,6 +400,7 @@ impl ControlPlane {
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
+            run_id,
             TurnPrompt {
                 agent: prepared.agent,
                 display: prompt.display,
@@ -439,6 +452,9 @@ impl ControlPlane {
             .get_session(session_pk)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
+
+        let primary_config = primary_turn.as_ref().map(PrimaryTurn::config).transpose()?;
+        let run_id = primary_turn.as_ref().map(|turn| turn.run_id.clone());
 
         self.store
             .update_status(session_pk, SessionStatus::Running, None)
@@ -516,6 +532,9 @@ impl ControlPlane {
                 }
             }
         };
+        if let Some(primary_config) = primary_config {
+            handle.refresh_primary_turn(primary_config).await;
+        }
         // Refresh the live session's permission mode from ITS OWN row so a
         // change made in the composer between turns takes effect NOW — and so
         // one session's change never leaks into siblings (per-session mode).
@@ -525,9 +544,11 @@ impl ControlPlane {
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
+        let run_id = run_id.ok_or_else(|| anyhow::anyhow!("missing primary turn for prompt"))?;
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
+            run_id,
             TurnPrompt {
                 agent: prepared.agent,
                 display: prompt.display,
@@ -824,8 +845,20 @@ impl ControlPlane {
         }
 
         self.emit_status(session_pk, "Connecting tools…").await;
+        let Some(primary_turn) = primary_turn else {
+            self.fail_startup(session_pk, "Couldn't start the agent: missing primary turn")
+                .await;
+            return;
+        };
+        let run_id = primary_turn.run_id.clone();
         let handle = match self
-            .start_harness_session(Some(project), session_pk, &work_dir, None, primary_turn)
+            .start_harness_session(
+                Some(project),
+                session_pk,
+                &work_dir,
+                None,
+                Some(primary_turn),
+            )
             .await
         {
             Ok(handle) => handle,
@@ -848,6 +881,7 @@ impl ControlPlane {
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
+            run_id,
             TurnPrompt {
                 agent: prepared.agent,
                 display: prompt.display,
@@ -940,13 +974,32 @@ impl ControlPlane {
             // dir still exists before the harness starts in it.
             let _ = tokio::fs::create_dir_all(&work_dir).await;
         }
+        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
+            .await?
+        {
+            SessionAgentAccess::Executable { agent_id } => agent_id,
+            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
+            SessionAgentAccess::DeletedReadOnly { .. } => {
+                anyhow::bail!("the session's primary agent was deleted")
+            }
+        };
+        let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
+        let run = self
+            .delegation
+            .begin_primary(session_pk, primary_agent.clone(), RESUME_NUDGE)
+            .await?;
+        let primary_turn = PrimaryTurn {
+            agent: primary_agent,
+            run_id: run.run.run_id,
+        };
+        let run_id = primary_turn.run_id.clone();
         match self
             .start_harness_session(
                 project.as_ref(),
                 session_pk,
                 &work_dir,
                 session.agent_session_id.clone(),
-                None,
+                Some(primary_turn),
             )
             .await
         {
@@ -954,6 +1007,7 @@ impl ControlPlane {
                 self.spawn_prompt(
                     handle,
                     session_pk.to_string(),
+                    run_id,
                     TurnPrompt::text(RESUME_NUDGE, RESUME_NUDGE),
                 );
                 Ok(())
@@ -1281,6 +1335,7 @@ impl ControlPlane {
         self: &Arc<Self>,
         handle: Arc<dyn HarnessSession>,
         session_pk: String,
+        run_id: String,
         prompt: TurnPrompt,
     ) {
         // Panic-safe in-flight turn counter: incremented synchronously here
@@ -1301,6 +1356,7 @@ impl ControlPlane {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             let _turn = TurnGuard(Arc::clone(&me));
+            let _ = me.delegation.mark_running(&run_id).await;
             let mut span = me
                 .telemetry
                 .start_span("harness.run", vec![("session_pk", session_pk.clone())]);
@@ -1312,6 +1368,7 @@ impl ControlPlane {
             span.end();
             match result {
                 Ok(()) => {
+                    let _ = me.delegation.complete(&run_id, "").await;
                     // Persist any agent session id resolved during the turn.
                     if let Some(sid) = handle.agent_session_id() {
                         let _ = me.store.update_agent_session_id(&session_pk, &sid).await;
@@ -1337,6 +1394,18 @@ impl ControlPlane {
                 }
                 Err(e) => {
                     let message = e.to_string();
+                    let cancelled = me
+                        .store
+                        .get_session(&session_pk)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|session| session.status == SessionStatus::Interrupted);
+                    if cancelled {
+                        let _ = me.delegation.interrupt(&run_id, &message).await;
+                    } else {
+                        let _ = me.delegation.fail(&run_id, &message).await;
+                    }
                     // Persist the turn error as a DURABLE transcript row
                     // (role=system, block_type=error) so it survives an app
                     // reload — the bus-terminal broadcast below is transient.

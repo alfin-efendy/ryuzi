@@ -143,13 +143,31 @@ impl TurnPrompt {
     }
 }
 
-/// A live session driven by a `Harness`. Output is emitted via `SessionCtx.events`.
+/// Immutable primary agent configuration used by one pending harness turn.
+///
+/// Replacing this config is safe only before the turn starts; a harness must
+/// snapshot it when `send_prompt` begins so an in-flight turn never changes.
+#[derive(Clone)]
+pub struct PrimaryTurnConfig {
+    pub agent: Arc<crate::agents::types::AgentSnapshot>,
+    pub run_id: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub perm_mode: PermMode,
+    pub agent_tools: crate::harness::native::agents::Agent,
+    pub allowed_skills: Option<Vec<String>>,
+}
+
 #[async_trait]
 pub trait HarnessSession: Send + Sync {
     async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()>;
     async fn cancel(&self) -> anyhow::Result<()>;
     async fn end(&self) -> anyhow::Result<()>;
     fn agent_session_id(&self) -> Option<String>;
+
+    /// Replace the primary configuration used for the next prompt. Existing
+    /// in-flight prompts retain the snapshot captured when they began.
+    async fn refresh_primary_turn(&self, _primary: PrimaryTurnConfig) {}
 
     /// Update the live permission mode for subsequent turns. Default no-op;
     /// the native session overrides this (see its `RunnerDeps`).

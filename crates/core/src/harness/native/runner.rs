@@ -435,7 +435,16 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// routing and a substitute is resolved, a status row announces the
 /// substitution — no silent swap.
 async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
-    let pinned = deps.model.clone();
+    let project_pin = project_pinned_model(deps).await;
+    let session_pin = if project_pin.is_none() {
+        chat_session_pinned_model(&deps.store, &deps.session_pk).await
+    } else {
+        None
+    };
+    let pinned = match project_pin.clone() {
+        Some(pinned) => pinned,
+        None => session_pin.clone().or_else(|| deps.model.clone()),
+    };
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
         if !pinned.trim().is_empty() && pinned != resolved {
@@ -459,15 +468,72 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
         turn.model = resolved;
     }
     let model = turn.model.as_deref().unwrap_or("");
-    turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
-    if let Ok(policy) =
-        crate::llm_router::model_effort::build_utility_effort_policy(&turn.store, model).await
+    let primary_model = agent_model_name(&turn.primary_agent.profile.model);
+    if project_pin.is_some()
+        || session_pin.is_some()
+        || turn.model != deps.model
+        || primary_model.as_deref() == Some(model)
     {
-        let mut policy = policy;
-        policy.project_override = agent_effort(&turn.primary_agent.profile.model);
+        turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
+    }
+    let policy = if let Some(project_id) = turn.project_id.as_deref() {
+        crate::llm_router::model_effort::build_turn_effort_policy(&turn.store, project_id, model)
+            .await
+    } else {
+        crate::llm_router::model_effort::build_session_effort_policy(
+            &turn.store,
+            &turn.session_pk,
+            model,
+        )
+        .await
+    };
+    if let Ok(mut policy) = policy {
+        policy.project_override = policy
+            .project_override
+            .or_else(|| agent_effort(&turn.primary_agent.profile.model));
         turn.turn_effort_policy = Arc::new(policy);
     }
     turn
+}
+
+/// `Some(project.model)` when the session's project row is reachable — the
+/// inner Option is the pin itself, which may legitimately be unset. `None`
+/// when there is no session/project row to read, or the session has no
+/// bound project (chat-first sessions).
+async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
+    let session = deps
+        .store
+        .get_session(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()?;
+    let project = deps
+        .store
+        .get_project(&session.project_id?)
+        .await
+        .ok()
+        .flatten()?;
+    Some(project.model)
+}
+
+async fn chat_session_pinned_model(store: &Store, session_pk: &str) -> Option<String> {
+    let session = store.get_session(session_pk).await.ok().flatten()?;
+    if session.kind != crate::domain::SessionKind::Chat {
+        return None;
+    }
+    store
+        .get_session_runtime_settings(session_pk)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|runtime| runtime.model)
+}
+
+fn agent_model_name(model: &crate::agents::types::AgentModel) -> Option<String> {
+    match model {
+        crate::agents::types::AgentModel::Concrete { name, .. } => Some(name.clone()),
+        crate::agents::types::AgentModel::Route { route } => Some(route.clone()),
+    }
 }
 
 fn agent_effort(model: &crate::agents::types::AgentModel) -> Option<String> {

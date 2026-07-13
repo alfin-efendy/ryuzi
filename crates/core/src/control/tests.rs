@@ -60,6 +60,8 @@ struct FakeSession {
     /// Every `steer()` call observed on this (or a sibling) fake session, in
     /// order — lets steer tests assert the live handle actually received it.
     steered: Arc<Mutex<Vec<String>>>,
+    /// Every primary-turn configuration received by this live session.
+    primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
 }
 
 #[async_trait]
@@ -136,6 +138,10 @@ impl HarnessSession for FakeSession {
     fn steer(&self, text: String) {
         self.steered.lock().unwrap().push(text);
     }
+
+    async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {
+        self.primary_turns.lock().unwrap().push(primary);
+    }
 }
 
 /// Shared counters so tests can observe the harness/session lifecycle across
@@ -152,6 +158,8 @@ struct Counters {
     prompts: Arc<Mutex<Vec<String>>>,
     /// `steer()` calls observed across every produced session, in order.
     steered: Arc<Mutex<Vec<String>>>,
+    /// Every primary-turn configuration received by a live session.
+    primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -183,6 +191,7 @@ impl Harness for FakeHarness {
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
+            primary_turns: self.counters.primary_turns.clone(),
         }))
     }
 }
@@ -224,6 +233,7 @@ impl Harness for GatedHarness {
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
+            primary_turns: self.counters.primary_turns.clone(),
         }))
     }
 }
@@ -270,6 +280,7 @@ impl Harness for LatchGatedHarness {
             ended: self.counters.ended.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
+            primary_turns: self.counters.primary_turns.clone(),
         }))
     }
 }
@@ -478,7 +489,8 @@ async fn recent_sessions_filter_by_stable_owner_and_sort_by_last_activity_with_a
 #[serial]
 async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_run_per_turn() {
     let _guard = StateDirGuard::new();
-    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_counters().await;
+    let mut run_events = cp.subscribe();
     let agent_id = cp.registry().default_agent_id().await;
 
     let session = cp
@@ -493,6 +505,26 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
         .await
         .unwrap();
     assert_eq!(session.primary_agent_id.as_deref(), Some(agent_id.as_str()));
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("session creation queues its initial primary run");
+    assert_eq!(initial_run.status, crate::domain::AgentRunStatus::Queued);
+    assert!(initial_run.started_at.is_none());
+    assert!(initial_run.finished_at.is_none());
+    assert_eq!(
+        wait_for_primary_run_statuses(&mut run_events, &session.session_pk, &initial_run.run_id)
+            .await,
+        vec!["queued", "running", "completed"],
+    );
+    let initial_run =
+        wait_for_primary_run_terminal(&store, &session.session_pk, &initial_run.run_id).await;
+    assert_eq!(initial_run.status, crate::domain::AgentRunStatus::Completed);
+    assert!(initial_run.started_at.is_some());
+    assert!(initial_run.finished_at.is_some());
     let creation_identity = session.primary_agent_snapshot.clone().unwrap();
     let profile = cp
         .registry()
@@ -508,10 +540,17 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
                 name: "Renamed primary".into(),
                 description: profile.description,
                 avatar: profile.avatar,
-                model: profile.model,
-                permissions: profile.permissions,
-                skills: profile.skills,
-                tools: profile.tools,
+                model: profile.model.clone(),
+                permissions: crate::agents::types::AgentPermissions {
+                    mode: crate::domain::PermMode::AcceptEdits,
+                    rules: vec![],
+                },
+                skills: vec!["release".into()],
+                tools: crate::agents::types::AgentTools {
+                    native: vec!["read".into()],
+                    plugins: vec![],
+                    apps: vec![],
+                },
                 loop_settings: profile.loop_settings,
             },
         )
@@ -536,6 +575,37 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
         .iter()
         .all(|run| run.agent_kind == crate::domain::AgentRunKind::Primary));
     assert!(runs.iter().any(|run| run.run_id == run_id));
+    assert_eq!(
+        wait_for_primary_run_statuses(&mut run_events, &session.session_pk, &run_id).await,
+        vec!["queued", "running", "completed"],
+    );
+    let continued_run = wait_for_primary_run_terminal(&store, &session.session_pk, &run_id).await;
+    assert_eq!(
+        continued_run.status,
+        crate::domain::AgentRunStatus::Completed
+    );
+    assert!(continued_run.started_at.is_some());
+    assert!(continued_run.finished_at.is_some());
+    let primary_turns = counters.primary_turns.lock().unwrap();
+    assert_eq!(
+        primary_turns.len(),
+        1,
+        "live session must refresh its turn config"
+    );
+    assert_eq!(primary_turns[0].agent.profile.name, "Renamed primary");
+    assert_eq!(primary_turns[0].agent.profile.model, profile.model);
+    assert_eq!(
+        primary_turns[0].agent.profile.permissions.mode,
+        crate::domain::PermMode::AcceptEdits
+    );
+    assert_eq!(
+        primary_turns[0].allowed_skills,
+        Some(vec!["release".into()])
+    );
+    assert!(primary_turns[0].agent_tools.tools.allows("read"));
+    assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
+    assert_eq!(primary_turns[0].run_id, run_id);
+    drop(primary_turns);
     assert_eq!(
         store
             .get_session(&session.session_pk)
@@ -656,7 +726,20 @@ impl HarnessFactory for FailingHarnessFactory {
     }
 }
 
-/// Build a `ControlPlane` wired to the shared-counter fake harness, plus
+async fn fake_control_plane_with_counters() -> (
+    Arc<ControlPlane>,
+    Arc<Store>,
+    Counters,
+    tempfile::NamedTempFile,
+) {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
+    let store_ref = cp.store.clone();
+    (cp, store_ref, counters, db_guard)
+}
+
 /// a clone of its internal `Store` (for seeding/asserting session state
 /// directly), the shared prompt log (for asserting exactly what text
 /// was driven on a resumed session), and the sqlite temp-file guard the
@@ -938,6 +1021,59 @@ async fn seed_session(
         .update_resume(session_pk, status, resume_attempts)
         .await
         .unwrap();
+}
+
+async fn wait_for_primary_run_statuses(
+    rx: &mut broadcast::Receiver<CoreEvent>,
+    session_pk: &str,
+    run_id: &str,
+) -> Vec<String> {
+    let mut statuses = Vec::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(CoreEvent::AgentRunChanged {
+                session_pk: event_session_pk,
+                run_id: event_run_id,
+                status,
+                ..
+            })) if event_session_pk == session_pk && event_run_id == run_id => {
+                let terminal = matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "interrupted" | "cancelled"
+                );
+                statuses.push(status);
+                if terminal {
+                    return statuses;
+                }
+            }
+            Ok(Ok(_)) => continue,
+            other => {
+                panic!("timed out waiting for primary run {run_id} lifecycle events: {other:?}")
+            }
+        }
+    }
+}
+
+async fn wait_for_primary_run_terminal(
+    store: &Store,
+    session_pk: &str,
+    run_id: &str,
+) -> crate::domain::AgentRun {
+    for _ in 0..400 {
+        if let Some(run) = store
+            .list_session_agent_runs(session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+        {
+            if run.status.is_terminal() {
+                return run;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for primary run {run_id} to reach a terminal status");
 }
 
 /// Poll the shared prompt log until it has at least `n` entries (or panic
@@ -2310,6 +2446,15 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     // Cold-resume succeeds (the factory works) — the failure happens inside
     // the fire-and-forget `spawn_prompt` turn, so this call itself is Ok.
     cp.continue_session("s1", "hi", &[]).await.unwrap();
+    let run_id = cp
+        .store
+        .list_session_agent_runs("s1")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("continuation queues a primary run")
+        .run_id;
 
     // The turn error must be persisted as a DURABLE transcript row
     // (role=system, block_type=error) — today it is broadcast-only and
@@ -2350,6 +2495,11 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     }
     let s = cp.store.get_session("s1").await.unwrap().unwrap();
     assert_eq!(s.status, SessionStatus::Idle, "must not be stuck Running");
+    let run = wait_for_primary_run_terminal(&cp.store, "s1", &run_id).await;
+    assert_eq!(run.status, crate::domain::AgentRunStatus::Failed);
+    assert!(run.started_at.is_some());
+    assert!(run.finished_at.is_some());
+    assert_eq!(run.error.as_deref(), Some("upstream quota exhausted"));
 }
 
 // ---------- Task 3: attachments wired into start/continue_session ----------

@@ -89,6 +89,28 @@ fn adapt_primary_profile(
     })
 }
 
+pub(crate) fn primary_turn_config(
+    agent: Arc<crate::agents::types::AgentSnapshot>,
+    run_id: String,
+) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
+    let adapted = adapt_primary_profile(&agent.profile)?;
+    let (model, effort) = match &agent.profile.model {
+        crate::agents::types::AgentModel::Concrete { name, effort } => {
+            (Some(name.clone()), effort.clone())
+        }
+        crate::agents::types::AgentModel::Route { route } => (Some(route.clone()), None),
+    };
+    Ok(crate::harness::PrimaryTurnConfig {
+        perm_mode: agent.profile.permissions.mode,
+        agent,
+        run_id,
+        model,
+        effort,
+        agent_tools: adapted.agent,
+        allowed_skills: adapted.allowed_skills,
+    })
+}
+
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
 /// loop in-process via [`runner::run_turn`].
 pub struct NativeHarness {
@@ -247,7 +269,8 @@ impl Harness for NativeHarness {
         // routes/models through that capability and fall back to a compatible
         // route/model when a stale project pins a target no connection
         // actually serves anymore.
-        let model = resolve_native_model(&ctx.store, ctx.model).await;
+        let primary_turn = primary_turn_config(ctx.primary_agent.clone(), ctx.run_id.clone())?;
+        let model = resolve_native_model(&ctx.store, ctx.model.clone()).await;
         let meta =
             crate::llm_router::model_meta::resolve(&ctx.store, model.as_deref().unwrap_or(""))
                 .await;
@@ -258,8 +281,7 @@ impl Harness for NativeHarness {
         // The durable snapshot owns this session's native persona. Legacy
         // worktree agents remain available only for slash-command/subagent
         // selection; they must never replace a durable primary by name.
-        let adapted_primary = adapt_primary_profile(&ctx.primary_agent.profile)?;
-        let agent = adapted_primary.agent;
+        let agent = primary_turn.agent_tools.clone();
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
@@ -313,7 +335,7 @@ impl Harness for NativeHarness {
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             steer: steer.clone(),
-            deps: runner::RunnerDeps {
+            deps: Mutex::new(runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 primary_agent: ctx.primary_agent,
                 run_id: ctx.run_id,
@@ -339,7 +361,7 @@ impl Harness for NativeHarness {
                 agent,
                 agents,
                 commands,
-                allowed_skills: adapted_primary.allowed_skills,
+                allowed_skills: primary_turn.allowed_skills.clone(),
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
@@ -375,7 +397,7 @@ impl Harness for NativeHarness {
                         crate::domain::WriteOrigin::BackgroundReview
                     }
                 },
-            },
+            }),
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
         }))
@@ -384,7 +406,7 @@ impl Harness for NativeHarness {
 
 /// A live native session. `send_prompt` runs one full turn to completion.
 pub struct NativeSession {
-    deps: runner::RunnerDeps,
+    deps: Mutex<runner::RunnerDeps>,
     session_pk: String,
     /// The in-flight turn's cancellation token, set for the duration of
     /// `send_prompt` so `cancel`/`end` can trip it.
@@ -407,9 +429,10 @@ impl HarnessSession for NativeSession {
         // `cancel()` trips only the CURRENT turn's token (the queued turn gets
         // a fresh one when it starts).
         let _turn = self.turn_lock.lock().await;
+        let deps = self.deps.lock().unwrap().clone();
         let cancel = CancellationToken::new();
         *self.live_cancel.lock().unwrap() = Some(cancel.clone());
-        let result = runner::run_turn(&self.deps, prompt, cancel).await;
+        let result = runner::run_turn(&deps, prompt, cancel).await;
         *self.live_cancel.lock().unwrap() = None;
         result
     }
@@ -432,9 +455,10 @@ impl HarnessSession for NativeSession {
         // fires once per real session end, never on a `stop_session`
         // interrupt (which cancels but does not `end()`). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
+        let deps = self.deps.lock().unwrap().clone();
         let _ = hooks::fire_hook(
-            &self.deps.work_dir,
-            self.deps.extension_events.as_ref(),
+            &deps.work_dir,
+            deps.extension_events.as_ref(),
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
@@ -442,10 +466,24 @@ impl HarnessSession for NativeSession {
         Ok(())
     }
 
+    async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {
+        // Share `turn_lock` with `send_prompt` so this can only replace the
+        // queued turn's configuration. The in-flight turn holds a cloned
+        // `RunnerDeps` snapshot until it completes.
+        let _turn = self.turn_lock.lock().await;
+        let mut deps = self.deps.lock().unwrap();
+        deps.primary_agent = primary.agent;
+        deps.run_id = primary.run_id;
+        deps.model = primary.model;
+        deps.perm_mode = Arc::new(std::sync::Mutex::new(primary.perm_mode));
+        deps.agent = primary.agent_tools;
+        deps.allowed_skills = primary.allowed_skills;
+    }
+
     fn set_perm_mode(&self, mode: crate::domain::PermMode) {
         // Live update: the next turn's tool gate reads this fresh, so a
         // composer/project-settings permission change applies without a restart.
-        self.deps.set_perm_mode(mode);
+        self.deps.lock().unwrap().set_perm_mode(mode);
     }
 
     fn agent_session_id(&self) -> Option<String> {
