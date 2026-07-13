@@ -1,9 +1,13 @@
 //! Named model routes ("combo" aliases): expose a short model id that maps to
 //! an ordered list of provider connection/model targets.
+use crate::llm_router::model_capabilities;
+use crate::llm_router::model_effort::{ModelPreferenceKey, ReasoningEffortOption};
+use crate::llm_router::{connections, registry};
 use crate::store::Store;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::collections::BTreeSet;
 
 const SETTING_KEY: &str = "llm_model_routes";
 const ROUND_ROBIN_KEY_PREFIX: &str = "llm_model_route_round_robin_cursor.";
@@ -25,10 +29,18 @@ pub struct ModelRouteTarget {
     /// the family serving `model`, at request time.
     pub provider: String,
     pub model: String,
-    /// Compatibility-only storage for legacy Codex virtual model suffixes.
-    /// New route writes cannot edit this value directly.
+    /// Explicit effort policy; `None` uses the model default.
     #[serde(default)]
     pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouteTargetCapability {
+    pub provider: String,
+    pub model: String,
+    pub supported: Vec<ReasoningEffortOption>,
+    pub provider_default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -63,6 +75,44 @@ pub async fn list_model_routes(store: &Store) -> anyhow::Result<Vec<ModelRouteIn
     let mut routes: Vec<ModelRouteInfo> = serde_json::from_str(&raw).unwrap_or_default();
     routes.sort_by_key(|r| (r.created_at, r.name.clone()));
     Ok(routes)
+}
+
+pub async fn list_model_route_target_capabilities(
+    store: &Store,
+) -> anyhow::Result<Vec<ModelRouteTargetCapability>> {
+    let mut models = BTreeSet::new();
+    for descriptor in registry::CATALOG {
+        for &model in descriptor.models {
+            models.insert((descriptor.family.to_string(), model.to_string()));
+        }
+    }
+    for connection in connections::list_connections(store).await? {
+        let Some(descriptor) = registry::descriptor(&connection.provider) else {
+            continue;
+        };
+        for model in connections::effective_models(descriptor, &connection) {
+            models.insert((descriptor.family.to_string(), model));
+        }
+    }
+
+    let mut capabilities = Vec::with_capacity(models.len());
+    for (provider, model) in models {
+        let resolved = model_capabilities::resolve_for_model(
+            store,
+            &ModelPreferenceKey {
+                family: provider.clone(),
+                model: model.clone(),
+            },
+        )
+        .await?;
+        capabilities.push(ModelRouteTargetCapability {
+            provider,
+            model,
+            supported: resolved.supported,
+            provider_default: resolved.provider_default,
+        });
+    }
+    Ok(capabilities)
 }
 
 pub async fn list_provider_account_routes(
@@ -194,6 +244,7 @@ pub async fn save_model_route(
     route: ModelRouteInfo,
 ) -> anyhow::Result<ModelRouteInfo> {
     let route = sanitize_route(route)?;
+    validate_route_target_efforts(store, &route).await?;
     store
         .with_conn(move |conn| {
             let transaction =
@@ -213,6 +264,7 @@ pub async fn save_model_route_if_name_absent(
     route: ModelRouteInfo,
 ) -> anyhow::Result<Option<ModelRouteInfo>> {
     let route = sanitize_route(route)?;
+    validate_route_target_efforts(store, &route).await?;
     store
         .with_conn(move |conn| {
             let transaction =
@@ -236,22 +288,7 @@ fn save_model_route_locked(
     routes: Vec<ModelRouteInfo>,
     route: ModelRouteInfo,
 ) -> rusqlite::Result<ModelRouteInfo> {
-    let prior = routes.iter().find(|stored| stored.id == route.id).cloned();
     let mut next = route;
-    let mut old_targets = prior.map(|route| route.targets).unwrap_or_default();
-    let mut used = vec![false; old_targets.len()];
-    for target in &mut next.targets {
-        target.effort = old_targets
-            .iter_mut()
-            .enumerate()
-            .find(|(index, old)| {
-                !used[*index] && old.provider == target.provider && old.model == target.model
-            })
-            .and_then(|(index, old)| {
-                used[index] = true;
-                old.effort.take()
-            });
-    }
     let now = crate::paths::now_ms();
     if next.id.trim().is_empty() {
         next.id = crate::paths::new_id();
@@ -440,8 +477,16 @@ fn sanitize_route(mut route: ModelRouteInfo) -> anyhow::Result<ModelRouteInfo> {
         .map(|mut target| {
             target.provider = target.provider.trim().to_string();
             target.model = target.model.trim().to_string();
-            target
+            if let Some(effort) = &mut target.effort {
+                *effort = effort.trim().to_string();
+                if effort.is_empty() {
+                    anyhow::bail!("route target effort cannot be empty; use Model default");
+                }
+            }
+            Ok(target)
         })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
         .filter(|target| !target.provider.is_empty() && !target.model.is_empty())
         .collect();
     for target in &route.targets {
@@ -455,6 +500,33 @@ fn sanitize_route(mut route: ModelRouteInfo) -> anyhow::Result<ModelRouteInfo> {
         anyhow::bail!("route needs at least one target model");
     }
     Ok(route)
+}
+
+async fn validate_route_target_efforts(
+    store: &Store,
+    route: &ModelRouteInfo,
+) -> anyhow::Result<()> {
+    for target in &route.targets {
+        let Some(effort) = &target.effort else {
+            continue;
+        };
+        let capabilities = model_capabilities::resolve_for_model(
+            store,
+            &ModelPreferenceKey {
+                family: target.provider.clone(),
+                model: target.model.clone(),
+            },
+        )
+        .await?;
+        if !capabilities.supports(effort) {
+            anyhow::bail!(
+                "effort {effort:?} is not supported for route target {}/{}",
+                target.provider,
+                target.model
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -511,36 +583,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_preserves_only_matching_stored_compatibility_effort() {
+    async fn explicit_supported_target_effort_persists_and_model_default_resets_it() {
         let store = mem_store().await;
-        let raw = r#"[{"id":"r1","name":"smart","enabled":true,"strategy":"fallback","targets":[{"provider":"openai","model":"m1","effort":"high"},{"provider":"openai","model":"m1","effort":"low"}],"createdAt":1,"updatedAt":1}]"#;
+        let mut route = route("smart");
+        route.targets[0] = ModelRouteTarget {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-7".into(),
+            effort: Some(" max ".into()),
+        };
+
+        let saved = save_model_route(&store, route).await.unwrap();
+        assert_eq!(saved.targets[0].effort.as_deref(), Some("max"));
+
+        let mut reset = saved;
+        reset.targets[0].effort = None;
+        assert_eq!(
+            save_model_route(&store, reset).await.unwrap().targets[0].effort,
+            None
+        );
+        assert_eq!(
+            list_model_routes(&store).await.unwrap()[0].targets[0].effort,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn route_target_effort_rejects_unsupported_unknown_and_empty_values() {
+        let store = mem_store().await;
+        let mut unsupported = route("unsupported");
+        unsupported.targets[0] = ModelRouteTarget {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-5".into(),
+            effort: Some("max".into()),
+        };
+        assert_eq!(
+            save_model_route(&store, unsupported)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "effort \"max\" is not supported for route target anthropic/claude-opus-4-5"
+        );
+
+        let mut unknown = route("unknown");
+        unknown.targets[0] = ModelRouteTarget {
+            provider: "anthropic".into(),
+            model: "claude-invented".into(),
+            effort: Some("high".into()),
+        };
+        assert_eq!(
+            save_model_route(&store, unknown)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "effort \"high\" is not supported for route target anthropic/claude-invented"
+        );
+
+        let mut empty = route("empty");
+        empty.targets[0].effort = Some("  ".into());
+        assert_eq!(
+            save_model_route(&store, empty)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "route target effort cannot be empty; use Model default"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_target_effort_remains_readable_but_cannot_be_saved() {
+        let store = mem_store().await;
+        let raw = r#"[{"id":"r1","name":"smart","enabled":true,"strategy":"fallback","targets":[{"provider":"anthropic","model":"claude-opus-4-5","effort":"max"}],"createdAt":1,"updatedAt":1}]"#;
         store
             .set_setting(crate::domain::WriteOrigin::User, SETTING_KEY, raw)
             .await
             .unwrap();
 
-        let mut incoming = route("smart");
-        incoming.targets = vec![
-            ModelRouteTarget {
-                provider: "openai".into(),
-                model: "m1".into(),
-                effort: Some("ignored".into()),
+        let stored = list_model_routes(&store).await.unwrap().pop().unwrap();
+        assert_eq!(stored.targets[0].effort.as_deref(), Some("max"));
+        assert_eq!(
+            save_model_route(&store, stored)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "effort \"max\" is not supported for route target anthropic/claude-opus-4-5"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_target_capabilities_use_resolver_values_without_duplicate_models() {
+        let store = mem_store().await;
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "anthropic-live".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    models_override: Some(vec!["claude-opus-4-7".into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
             },
-            ModelRouteTarget {
-                provider: "openai".into(),
-                model: "m2".into(),
-                effort: Some("ignored".into()),
-            },
-            ModelRouteTarget {
-                provider: "openai".into(),
-                model: "m1".into(),
-                effort: None,
-            },
-        ];
-        let saved = save_model_route(&store, incoming).await.unwrap();
-        assert_eq!(saved.targets[0].effort.as_deref(), Some("high"));
-        assert_eq!(saved.targets[1].effort, None);
-        assert_eq!(saved.targets[2].effort.as_deref(), Some("low"));
+        )
+        .await
+        .unwrap();
+
+        let matching = list_model_route_target_capabilities(&store)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|capability| {
+                capability.provider == "anthropic" && capability.model == "claude-opus-4-7"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(
+            matching[0]
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "max", "xhigh"]
+        );
+        assert_eq!(matching[0].provider_default.as_deref(), Some("high"));
     }
 
     #[tokio::test]
