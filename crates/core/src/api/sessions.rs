@@ -465,13 +465,34 @@ async fn queue_owned_attachments(
                 .and_then(|name| name.to_str())
                 .map(crate::api::types::sanitize_file_name)
                 .unwrap_or_else(|| "file".to_string());
-            let destination = destination_dir.join(file_name);
+            let mut queued_name = file_name.clone();
+            let mut destination = destination_dir.join(&queued_name);
+            let mut duplicate = 2;
+            while tokio::fs::try_exists(&destination)
+                .await
+                .map_err(anyhow::Error::from)?
+            {
+                let path = Path::new(&file_name);
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("file");
+                let extension = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| format!(".{extension}"))
+                    .unwrap_or_default();
+                queued_name = format!("{stem} ({duplicate}){extension}");
+                destination = destination_dir.join(&queued_name);
+                duplicate += 1;
+            }
             tokio::fs::copy(&source, &destination)
                 .await
                 .map_err(anyhow::Error::from)?;
             let destination = tokio::fs::canonicalize(&destination)
                 .await
                 .map_err(anyhow::Error::from)?;
+            attachment.name = queued_name;
             attachment.url = crate::attachments::file_url_for_path(&destination)?.to_string();
         }
         durable.push(attachment);
@@ -656,6 +677,100 @@ mod tests {
                 .unwrap(),
             json!([first])
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_session_message_preserves_same_named_staged_attachments() {
+        use crate::settings::SettingsStore;
+
+        let s = state().await;
+        s.cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: "s-duplicate-staged".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(1),
+                last_active: Some(1),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        SettingsStore::new(s.cp.store().clone())
+            .set("workdir_root", dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let first = dispatch(
+            &s,
+            "stage_attachment",
+            json!({"name": "report.txt", "data_base64": "Zmlyc3Q="}),
+        )
+        .await
+        .unwrap();
+        let second = dispatch(
+            &s,
+            "stage_attachment",
+            json!({"name": "report.txt", "data_base64": "c2Vjb25k"}),
+        )
+        .await
+        .unwrap();
+        let queued = dispatch(
+            &s,
+            "enqueue_session_message",
+            json!({
+                "session_pk": "s-duplicate-staged",
+                "prompt": "with duplicate files",
+                "options": {"attachments": [first, second]}
+            }),
+        )
+        .await
+        .unwrap();
+        let root = s.cp.attachments_root().await;
+        tokio::fs::remove_dir_all(root.join("staging"))
+            .await
+            .unwrap();
+        let prompt =
+            s.cp.store()
+                .list_session_prompt_queue("s-duplicate-staged")
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+
+        assert_eq!(prompt.id, queued["id"]);
+        assert_eq!(prompt.attachments.len(), 2);
+        assert_ne!(prompt.attachments[0].name, prompt.attachments[1].name);
+        let paths = prompt
+            .attachments
+            .iter()
+            .map(|attachment| {
+                url::Url::parse(&attachment.url)
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(paths[0], paths[1]);
+        for path in &paths {
+            assert!(path.starts_with(root.join("queue").join(queued["id"].as_str().unwrap())));
+        }
+        let mut contents = vec![
+            tokio::fs::read(&paths[0]).await.unwrap(),
+            tokio::fs::read(&paths[1]).await.unwrap(),
+        ];
+        contents.sort();
+        assert_eq!(contents, vec![b"first".to_vec(), b"second".to_vec()]);
     }
 
     #[tokio::test]
