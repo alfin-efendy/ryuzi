@@ -1015,7 +1015,7 @@ git commit -m "refactor!: remove legacy orchestration flow"
 
 **Files:**
 - Modify only for failures attributable to Tasks 1–10.
-- Verify: `docs/superpowers/plans/2026-07-12-agentic-06-integration-cleanup.md` consumed names.
+- Verify: `docs/roadmap/plan/2026-07-12-agentic-06-integration-cleanup.md` consumed names.
 
 **Interfaces:**
 - Consumes: all Plan 4 tasks and Plans 1–3.

@@ -1472,6 +1472,7 @@ mod tests {
         regs.harness = Arc::new(PermFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        cp.attach_test_agent_persistence().await;
         let store = cp.store().clone();
 
         let repo = tempfile::tempdir().unwrap();
@@ -1630,6 +1631,7 @@ mod tests {
         regs.harness = Arc::new(PlanFakeHarnessFactory);
         let cp =
             ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        cp.attach_test_agent_persistence().await;
         let store = cp.store().clone();
 
         let repo = tempfile::tempdir().unwrap();

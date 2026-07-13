@@ -219,6 +219,24 @@ impl ControlPlane {
         self.agent_persistence.get()
     }
 
+    /// Attach an isolated YAML/OKF persistence graph for crate unit tests that
+    /// exercise session lifecycle paths. Production composition roots attach
+    /// their shared graph explicitly; this helper prevents test constructors
+    /// from silently omitting that required dependency.
+    #[cfg(test)]
+    pub(crate) async fn attach_test_agent_persistence(&self) {
+        let config = tempfile::tempdir().expect("agent persistence tempdir");
+        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+            config.path().to_path_buf(),
+            self.store.clone(),
+        )
+        .await
+        .expect("initialize test agent persistence");
+        self.attach_agent_persistence(persistence.handles())
+            .expect("attach test agent persistence");
+        std::mem::forget(config);
+    }
+
     /// Spawn every enabled extension-capable plugin's subprocess(es) (Track
     /// D) and start their supervision. Call this EXACTLY ONCE, from a real
     /// long-running host's daemon entry, AFTER the daemon has genuinely

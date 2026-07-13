@@ -247,6 +247,7 @@ mod tests {
         let mut regs = Registries::new();
         regs.harness = harness;
         let cp = ControlPlane::new(store, regs).await;
+        cp.attach_test_agent_persistence().await;
         (cp, db)
     }
 

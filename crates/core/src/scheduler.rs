@@ -1155,6 +1155,7 @@ mod tests {
         let mut regs = crate::plugins::Registries::new();
         regs.harness = std::sync::Arc::new(FakeJobHarnessFactory);
         let cp = crate::control::ControlPlane::new(store, regs).await;
+        cp.attach_test_agent_persistence().await;
 
         // A non-git project the job runs against — the fake harness needs no
         // real repo, so any workdir will do.

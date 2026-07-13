@@ -729,9 +729,11 @@ mod tests {
     async fn chat_session_without_a_project_still_gets_global_and_user_memory() {
         use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
         let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().to_path_buf();
         let mem = memory::MemoryStore::for_agent(
             Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
-                crate::paths::config_dir(),
+                work_dir.join(".agent-config"),
             )),
             "ryuzi",
             None,
@@ -747,7 +749,6 @@ mod tests {
             .await
             .unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
@@ -766,7 +767,7 @@ mod tests {
         let harness = plugin.harness.unwrap().create().unwrap();
         // ctx_for's SessionCtx carries project_id: None — the chat-session shape.
         let session = harness
-            .start_session(ctx_for(store.clone(), dir.path().to_path_buf()).await)
+            .start_session(ctx_for(store.clone(), work_dir).await)
             .await
             .unwrap();
         session

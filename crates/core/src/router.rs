@@ -573,6 +573,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let cp = ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        cp.attach_test_agent_persistence().await;
         let store_ref = cp.store().clone();
         (cp, store_ref)
     }
@@ -937,6 +938,7 @@ mod tests {
         let mut regs = crate::plugins::Registries::new();
         regs.harness = harness;
         let cp = ControlPlane::new(store, regs).await;
+        cp.attach_test_agent_persistence().await;
         let store_ref = cp.store().clone();
         crate::settings::SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())

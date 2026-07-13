@@ -1105,7 +1105,7 @@ git diff main...HEAD --name-status
 git diff --check
 ```
 
-Expected: implementation history contains the eight task commits (plus a formatter/binding fix only if needed); `git diff --check` exits 0; the only uncommitted requested artifact is `docs/superpowers/plans/2026-07-12-agentic-06-integration-cleanup.md`. Preserve any unrelated pre-existing worktree entries and report them separately.
+Expected: implementation history contains the eight task commits (plus a formatter/binding fix only if needed); `git diff --check` exits 0. The tracked roadmap plan at `docs/roadmap/plan/2026-07-12-agentic-06-integration-cleanup.md` remains unchanged and is not included in the implementation commits. Preserve any unrelated pre-existing worktree entries and report them separately.
 
 - [ ] **Step 10: Commit formatter-only changes if and only if verification produced them**
 
@@ -1123,4 +1123,4 @@ git add crates/core apps/cockpit scripts package.json .github/workflows/ci.yml R
 git commit -m "style: format agentic integration cleanup"
 ```
 
-Expected: no commit when the worktree was already formatted. Never add `docs/superpowers/plans/2026-07-12-agentic-06-integration-cleanup.md`, unrelated files, lockfiles, release manifests, or release workflows to this optional commit.
+Expected: no commit when the worktree was already formatted. Never add `docs/roadmap/plan/2026-07-12-agentic-06-integration-cleanup.md`, unrelated files, lockfiles, release manifests, or release workflows to this optional commit.

@@ -344,7 +344,7 @@ async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tem
         block_until_cancel: false,
         counters: counters.clone(),
     });
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
 }
@@ -358,6 +358,41 @@ fn temp_db_path() -> (tempfile::NamedTempFile, std::path::PathBuf) {
     let f = tempfile::NamedTempFile::new().unwrap();
     let path = f.path().to_path_buf();
     (f, path)
+}
+
+/// Attach the same YAML/OKF persistence graph production composition roots
+/// install before starting sessions. Control-plane unit tests use isolated
+/// config roots so they exercise the real session dependency without touching
+/// the operator's config directory.
+async fn attach_test_agent_persistence(cp: &Arc<ControlPlane>) {
+    cp.attach_test_agent_persistence().await;
+}
+
+async fn test_control_plane(store: Store, registries: Registries) -> Arc<ControlPlane> {
+    let cp = ControlPlane::new(store, registries).await;
+    attach_test_agent_persistence(&cp).await;
+    cp
+}
+
+async fn test_control_plane_with_telemetry(
+    store: Arc<Store>,
+    registries: Registries,
+    telemetry: Arc<dyn crate::telemetry::Telemetry>,
+) -> Arc<ControlPlane> {
+    let cp = ControlPlane::new_with_telemetry(store, registries, telemetry).await;
+    attach_test_agent_persistence(&cp).await;
+    cp
+}
+
+async fn test_control_plane_full(
+    store: Arc<Store>,
+    registries: Registries,
+    telemetry: Arc<dyn crate::telemetry::Telemetry>,
+    attachment_fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
+) -> Arc<ControlPlane> {
+    let cp = ControlPlane::new_full(store, registries, telemetry, attachment_fetcher).await;
+    attach_test_agent_persistence(&cp).await;
+    cp
 }
 
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
@@ -383,7 +418,7 @@ async fn fake_control_plane() -> (
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, counters.prompts, db_guard)
 }
@@ -401,7 +436,7 @@ async fn fake_control_plane_with_telemetry(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new_with_telemetry(
+    let cp = test_control_plane_with_telemetry(
         Arc::new(store),
         registries_with(false, counters.clone()),
         telemetry,
@@ -456,7 +491,7 @@ async fn fake_control_plane_with_fetcher(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new_full(
+    let cp = test_control_plane_full(
         Arc::new(store),
         registries_with(false, counters.clone()),
         Arc::new(NoopTelemetry),
@@ -585,7 +620,7 @@ async fn control_plane_with_failing_factory(
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
     regs.harness = Arc::new(FailingHarnessFactory);
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
 }
@@ -788,7 +823,7 @@ async fn stop_immediately_after_start_is_registered() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
     // A harness whose session blocks until cancelled, so it stays Running.
-    let cp = ControlPlane::new(store, registries(true)).await;
+    let cp = test_control_plane(store, registries(true)).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -832,7 +867,7 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
     let store = crate::store::Store::open(db.path()).await.unwrap();
     // A harness whose session blocks until cancelled, so the session stays
     // Running with a live handle.
-    let cp = ControlPlane::new(store, registries(true)).await;
+    let cp = test_control_plane(store, registries(true)).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -877,7 +912,7 @@ async fn continue_reuses_the_live_session() {
     let counters = Counters::default();
     // Non-blocking session so each prompt turn completes and the handle
     // stays parked in `running` for reuse on the next turn.
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -934,7 +969,7 @@ async fn continue_cold_resumes_when_handle_absent() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -973,7 +1008,7 @@ async fn steer_session_reaches_the_live_handle_without_starting_a_new_turn() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -1023,7 +1058,7 @@ async fn steer_session_falls_back_to_a_new_turn_when_no_live_handle() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -1094,7 +1129,7 @@ async fn failed_cold_resume_rolls_back_the_running_status() {
     regs.harness = Arc::new(FailingResumeFactory {
         counters: counters.clone(),
     });
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -1124,7 +1159,7 @@ async fn failed_cold_resume_rolls_back_the_running_status() {
 async fn end_session_clears_the_stale_worktree_path() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = ControlPlane::new(store, registries(false)).await;
+    let cp = test_control_plane(store, registries(false)).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -1154,7 +1189,7 @@ async fn end_session_removes_and_ends_the_handle() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -1185,7 +1220,7 @@ async fn start_session_streams_events_and_records_agent_id() {
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = ControlPlane::new(store, registries(false)).await;
+    let cp = test_control_plane(store, registries(false)).await;
 
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1197,23 +1232,29 @@ async fn start_session_streams_events_and_records_agent_id() {
         .await
         .unwrap();
 
-    // Drain events until Result, collecting assistant text payloads.
-    let mut texts = Vec::new();
-    loop {
-        match rx.recv().await.unwrap() {
-            CoreEvent::Message {
-                role,
-                block_type,
-                payload,
-                ..
-            } if role == "assistant" && block_type == "text" => {
-                texts.push(payload["text"].as_str().unwrap_or("").to_string());
+    let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut texts = Vec::new();
+        loop {
+            match rx.recv().await.unwrap() {
+                CoreEvent::Message {
+                    role,
+                    block_type,
+                    payload,
+                    ..
+                } if role == "assistant" && block_type == "text" => {
+                    texts.push(payload["text"].as_str().unwrap_or("").to_string());
+                }
+                CoreEvent::Result { .. } => break texts,
+                CoreEvent::Error { message, .. } => {
+                    panic!("session failed before result: {message}")
+                }
+                _ => {}
             }
-            CoreEvent::Result { .. } => break,
-            _ => {}
         }
-    }
-    assert!(texts.contains(&"working".to_string()));
+    })
+    .await
+    .expect("session must emit a result or error");
+    assert!(events.contains(&"working".to_string()));
 
     let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
     assert_eq!(stored.len(), 1);
@@ -1564,7 +1605,7 @@ async fn stop_during_startup_cancels_cleanly() {
         release: release.clone(),
         counters: counters.clone(),
     });
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1637,7 +1678,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     let (_db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
-    let cp = ControlPlane::new(store, registries_with(false, counters.clone())).await;
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
     let store = cp.store().clone();
     let dir = tempfile::tempdir().unwrap(); // plain temp dir — no git init.
     let project = cp.connect_project(dir.path(), "demo").await.unwrap();
@@ -1706,7 +1747,7 @@ async fn end_during_startup_waits_for_the_startup_task_and_cleans_the_worktree()
         release: release.clone(),
         counters: counters.clone(),
     });
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let store = cp.store().clone();
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -1779,7 +1820,7 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
         open: open.clone(),
         counters: counters.clone(),
     });
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -1985,7 +2026,7 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
     regs.harness = Arc::new(ErrSendHarnessFactory);
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     seed_project(&cp.store, "p1").await;
     seed_session(
         &cp.store,
@@ -2333,7 +2374,7 @@ async fn end_session_removes_the_attachments_dest_dir() {
 async fn provisioning_control_plane() -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
-    let cp = ControlPlane::new(store, Registries::new()).await;
+    let cp = test_control_plane(store, Registries::new()).await;
     let store_ref = cp.store().clone();
     (cp, store_ref, db_guard)
 }
@@ -2899,7 +2940,7 @@ async fn provision_project_explicit_settings_override_defaults() {
 async fn restart_required_flag_defaults_false_and_latches_true() {
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
-    let cp = ControlPlane::new(store, Registries::new()).await;
+    let cp = test_control_plane(store, Registries::new()).await;
     assert!(!cp.plugins_restart_required());
     cp.mark_plugins_restart_required();
     assert!(cp.plugins_restart_required());
@@ -2909,7 +2950,7 @@ async fn restart_required_flag_defaults_false_and_latches_true() {
 async fn drain_resolves_immediately_when_nothing_is_running() {
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
-    let cp = ControlPlane::new(store, registries(false)).await;
+    let cp = test_control_plane(store, registries(false)).await;
     let t0 = std::time::Instant::now();
     cp.drain(1000).await;
     assert!(t0.elapsed() < std::time::Duration::from_millis(500));
@@ -2922,7 +2963,7 @@ async fn start_and_continue_reject_once_draining() {
     let _guard = StateDirGuard::new();
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
-    let cp = ControlPlane::new(store, registries(false)).await;
+    let cp = test_control_plane(store, registries(false)).await;
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -2946,7 +2987,7 @@ async fn drain_waits_for_an_in_flight_turn_up_to_the_timeout() {
     let _guard = StateDirGuard::new();
     let (_db, path) = temp_db_path();
     let store = Store::open(&path).await.unwrap();
-    let cp = ControlPlane::new(store, registries(true)).await; // send_prompt blocks until cancel
+    let cp = test_control_plane(store, registries(true)).await; // send_prompt blocks until cancel
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
     let project = cp.connect_project(repo.path(), "demo").await.unwrap();
@@ -3046,7 +3087,7 @@ async fn fake_control_plane_with_plugin(
     let counters = Counters::default();
     let mut regs = registries_with(false, counters.clone());
     regs.add_plugin(plugin);
-    let cp = ControlPlane::new(store, regs).await;
+    let cp = test_control_plane(store, regs).await;
     let store_ref = cp.store().clone();
     (cp, store_ref, counters, db_guard)
 }
@@ -3417,7 +3458,7 @@ async fn control_plane_exposes_a_shared_background_registry() {
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = ControlPlane::new(store, registries(false)).await;
+    let cp = test_control_plane(store, registries(false)).await;
     // The same registry the sessions receive is reachable off the control plane.
     assert_eq!(cp.background().active(), 0);
     let _r = cp.background().try_reserve(1, "s1").unwrap();
@@ -3491,7 +3532,7 @@ async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_wr
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = ControlPlane::new(store, registries(false)).await;
+    let cp = test_control_plane(store, registries(false)).await;
 
     // A real parent chat session the notice must land on.
     let now = now_ms();

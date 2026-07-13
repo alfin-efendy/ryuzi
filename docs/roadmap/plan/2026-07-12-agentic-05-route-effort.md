@@ -1118,7 +1118,7 @@ Run:
 ```sh
 rg -n "Compatibility-only|route_compatibility|RouteCompatibility|request_compatibility_effort" crates/core apps/cockpit/src
 rg -n "minimal|medium|xhigh|ultra|high|low" crates/core/src/llm_router/routes.rs
-rg -n "TBD|TODO|implement later|fill in details|similar to Task" docs/superpowers/plans/2026-07-12-agentic-05-route-effort.md
+rg -n "TBD|TODO|implement later|fill in details|similar to Task" docs/roadmap/plan/2026-07-12-agentic-05-route-effort.md
 git diff --check
 git status --short
 ```
