@@ -6,7 +6,8 @@
 
 use super::{ok, params, ApiError};
 use crate::domain::{
-    Message, NewMessage, NewProviderTurn, PermMode, Session, SessionKind, SessionStatus,
+    AgentIdentitySnapshot, Message, NewMessage, NewProviderTurn, PermMode, Session, SessionKind,
+    SessionStatus,
 };
 use crate::paths::{new_id, now_ms};
 use crate::serve::ApiState;
@@ -36,6 +37,10 @@ struct TurnExport {
 struct SessionExport {
     version: u32,
     title: Option<String>,
+    #[serde(default)]
+    primary_agent_id: Option<String>,
+    #[serde(default)]
+    primary_agent_snapshot: Option<AgentIdentitySnapshot>,
     messages: Vec<MessageExport>,
     provider_turns: Vec<TurnExport>,
 }
@@ -78,6 +83,8 @@ async fn build_export(store: &Store, session_pk: &str) -> anyhow::Result<Session
     Ok(SessionExport {
         version: 1,
         title: session.title,
+        primary_agent_id: session.primary_agent_id,
+        primary_agent_snapshot: session.primary_agent_snapshot,
         messages: messages
             .into_iter()
             .map(|m| MessageExport {
@@ -104,10 +111,17 @@ async fn apply_import(
     project_id: &str,
     export: SessionExport,
 ) -> anyhow::Result<Session> {
+    let ownership = match (export.primary_agent_id, export.primary_agent_snapshot) {
+        (None, None) => (None, None),
+        (Some(agent_id), Some(snapshot)) if agent_id == snapshot.id => {
+            (Some(agent_id), Some(snapshot))
+        }
+        _ => anyhow::bail!("session export has corrupt primary agent ownership"),
+    };
     let session = Session {
         session_pk: new_id(),
-        primary_agent_id: None,
-        primary_agent_snapshot: None,
+        primary_agent_id: ownership.0,
+        primary_agent_snapshot: ownership.1,
         project_id: Some(project_id.to_string()),
         agent_session_id: None,
         worktree_path: None,
@@ -336,6 +350,105 @@ mod tests {
             .unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].payload[0]["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn export_then_import_preserves_owned_session_identity_and_legacy_exports_remain_legacy()
+    {
+        let store = store().await;
+        store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "p".into(),
+                workdir: "/tmp".into(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: Some(0),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let identity = AgentIdentitySnapshot {
+            id: "ada".into(),
+            name: "Ada at creation".into(),
+            avatar_color: "violet".into(),
+        };
+        store
+            .insert_session(Session {
+                session_pk: "owned".into(),
+                primary_agent_id: Some("ada".into()),
+                primary_agent_snapshot: Some(identity.clone()),
+                project_id: Some("p".into()),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(0),
+                last_active: Some(0),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: PermMode::Default,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        let export = build_export(&store, "owned").await.unwrap();
+        let imported = apply_import(&store, "p", export).await.unwrap();
+        assert_eq!(imported.primary_agent_id.as_deref(), Some("ada"));
+        assert_eq!(imported.primary_agent_snapshot, Some(identity));
+
+        let legacy: SessionExport = serde_json::from_value(json!({
+            "version": 1,
+            "title": null,
+            "messages": [],
+            "provider_turns": [],
+        }))
+        .unwrap();
+        let imported_legacy = apply_import(&store, "p", legacy).await.unwrap();
+        assert_eq!(imported_legacy.primary_agent_id, None);
+        assert_eq!(imported_legacy.primary_agent_snapshot, None);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_malformed_or_mismatched_ownership() {
+        let store = store().await;
+        for (primary_agent_id, primary_agent_snapshot) in [
+            (Some("ada"), None),
+            (
+                Some("ada"),
+                Some(AgentIdentitySnapshot {
+                    id: "grace".into(),
+                    name: "Grace".into(),
+                    avatar_color: "blue".into(),
+                }),
+            ),
+        ] {
+            let error = apply_import(
+                &store,
+                "p",
+                SessionExport {
+                    version: 1,
+                    title: None,
+                    primary_agent_id: primary_agent_id.map(str::to_string),
+                    primary_agent_snapshot,
+                    messages: vec![],
+                    provider_turns: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("corrupt primary agent ownership"));
+        }
     }
 
     #[test]
