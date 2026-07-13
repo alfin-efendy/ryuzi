@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Inputs to [`build_daemon`].
@@ -69,6 +69,10 @@ pub struct Daemon {
     pub learning_queue: Arc<LearningQueue>,
     telemetry: Arc<dyn Telemetry>,
     stopped: AtomicBool,
+    /// Serializes the boot-only prompt-claim recovery and records completion
+    /// only after the recovery succeeds. Holding the mutex across the recovery
+    /// await prevents concurrent `start()` calls from resetting live claims.
+    prompt_claim_recovery_complete: AsyncMutex<bool>,
     /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
     /// can abort it. Otherwise it (and the `Arc<ControlPlane>` clone its
     /// closure holds) would keep running — and keep the control plane
@@ -140,7 +144,7 @@ impl Daemon {
     /// server must not prevent the rest of the daemon (gateways, sessions)
     /// from coming up.
     pub async fn start(&self) -> anyhow::Result<()> {
-        self.store.recover_abandoned_session_prompt_claims().await?;
+        self.recover_abandoned_prompt_claims_on_boot().await?;
 
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
@@ -185,6 +189,21 @@ impl Daemon {
                 eprintln!("[ryuzi] endpoint autostart failed: {e}");
             }
         }
+        Ok(())
+    }
+
+    /// Recover prompt claims left by a prior process once for this daemon.
+    ///
+    /// The mutex remains held while Store recovery awaits, so exactly one
+    /// concurrent `start()` performs the reset. Completion is set only after a
+    /// successful reset; an error leaves it false and a later start retries.
+    async fn recover_abandoned_prompt_claims_on_boot(&self) -> anyhow::Result<()> {
+        let mut complete = self.prompt_claim_recovery_complete.lock().await;
+        if *complete {
+            return Ok(());
+        }
+        self.store.recover_abandoned_session_prompt_claims().await?;
+        *complete = true;
         Ok(())
     }
 
@@ -411,6 +430,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         learning_queue: persistence.learning,
         telemetry,
         stopped: AtomicBool::new(false),
+        prompt_claim_recovery_complete: AsyncMutex::new(false),
         router_handle,
         fanout_handle,
         scheduler_handle,
@@ -1332,6 +1352,7 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
             router_handle,
             fanout_handle,
             scheduler_handle,
@@ -1814,6 +1835,7 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
@@ -1835,6 +1857,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["queued-first", "queued-second"],
             "Daemon::start must recover abandoned prompt claims before it starts work"
+        );
+
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "queued-first"
+        );
+        daemon.start().await.unwrap();
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["queued-second"],
+            "a repeated Daemon::start must not recover a live prompt claim"
         );
 
         for _ in 0..400 {
@@ -1919,6 +1963,7 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
             router_handle,
             fanout_handle,
             scheduler_handle,

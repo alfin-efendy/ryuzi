@@ -2609,7 +2609,7 @@ impl Store {
     /// Positions are intentionally untouched, so recovered prompts retain FIFO
     /// order. The update is idempotent: a subsequent call returns zero until a
     /// new claim is abandoned.
-    pub async fn recover_abandoned_session_prompt_claims(&self) -> anyhow::Result<usize> {
+    pub(crate) async fn recover_abandoned_session_prompt_claims(&self) -> anyhow::Result<usize> {
         self.with_conn(move |c| {
             c.execute(
                 "UPDATE session_prompt_queue SET status='pending' WHERE status='claimed'",
