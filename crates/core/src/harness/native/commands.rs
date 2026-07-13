@@ -244,8 +244,47 @@ impl CommandRegistry {
     }
 }
 
-fn project_commands_dir(work_dir: &Path) -> PathBuf {
-    work_dir.join(".ryuzi/commands")
+fn project_command_root(
+    work_dir: &Path,
+    create: bool,
+) -> Result<Option<PathBuf>, CommandFileError> {
+    let ryuzi_dir = work_dir.join(".ryuzi");
+    if !ensure_real_directory(&ryuzi_dir, create, ".ryuzi directory")? {
+        return Ok(None);
+    }
+
+    let commands_dir = ryuzi_dir.join("commands");
+    if !ensure_real_directory(&commands_dir, create, "commands directory")? {
+        return Ok(None);
+    }
+    canonical_command_root(work_dir, &ryuzi_dir, &commands_dir).map(Some)
+}
+
+fn ensure_real_directory(
+    path: &Path,
+    create: bool,
+    description: &str,
+) -> Result<bool, CommandFileError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CommandFileError::InvalidName(format!(
+                    "{description} must be a real directory"
+                )));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            ensure_real_directory(path, false, description)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn read_project_command_dir(work_dir: &Path) -> Vec<Command> {
@@ -352,11 +391,9 @@ pub fn validate_project_command_name(name: &str) -> Result<ValidatedCommandName,
 
 /// List every readable project command file, including its content revision.
 pub fn list_project_commands(work_dir: &Path) -> Result<Vec<ProjectCommandRead>, CommandFileError> {
-    let root = project_commands_dir(work_dir);
-    if !root.exists() {
+    let Some(root) = project_command_root(work_dir, false)? else {
         return Ok(Vec::new());
-    }
-    let root = canonical_command_root(&root)?;
+    };
     let mut commands = Vec::new();
     list_project_commands_recursive(&root, &root, &mut commands)?;
     commands.sort_by(|left, right| left.name.cmp(&right.name));
@@ -369,11 +406,9 @@ pub fn read_project_command(
     name: &str,
 ) -> Result<ProjectCommandRead, CommandFileError> {
     let name = validate_project_command_name(name)?;
-    let root = project_commands_dir(work_dir);
-    if !root.exists() {
+    let Some(root) = project_command_root(work_dir, false)? else {
         return Err(CommandFileError::NotFound(name.0));
-    }
-    let root = canonical_command_root(&root)?;
+    };
     read_project_command_at(&root, &name)
 }
 
@@ -384,11 +419,10 @@ pub fn write_project_command(
     expected_revision: Option<&str>,
 ) -> Result<ProjectCommandRead, CommandFileError> {
     let name = validate_project_command_name(&input.name)?;
-    let root = project_commands_dir(work_dir);
-    std::fs::create_dir_all(&root)?;
-    let root = canonical_command_root(&root)?;
+    let root = project_command_root(work_dir, true)?.expect("command root was created");
     let mut lock = command_root_lock(&root)?;
     let _guard = lock.write()?;
+    verify_locked_command_root(work_dir, &root)?;
     let path = project_command_path(&root, &name)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -420,13 +454,12 @@ pub fn delete_project_command(
     expected_revision: &str,
 ) -> Result<(), CommandFileError> {
     let name = validate_project_command_name(name)?;
-    let root = project_commands_dir(work_dir);
-    if !root.exists() {
+    let Some(root) = project_command_root(work_dir, false)? else {
         return Err(CommandFileError::NotFound(name.0));
-    }
-    let root = canonical_command_root(&root)?;
+    };
     let mut lock = command_root_lock(&root)?;
     let _guard = lock.write()?;
+    verify_locked_command_root(work_dir, &root)?;
     let current = read_project_command_at(&root, &name)?;
     if current.revision != expected_revision {
         return Err(CommandFileError::RevisionConflict);
@@ -447,14 +480,34 @@ fn command_root_lock(root: &Path) -> Result<fd_lock::RwLock<File>, CommandFileEr
     Ok(fd_lock::RwLock::new(file))
 }
 
-fn canonical_command_root(root: &Path) -> Result<PathBuf, CommandFileError> {
-    let metadata = std::fs::symlink_metadata(root)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+fn canonical_command_root(
+    work_dir: &Path,
+    ryuzi_dir: &Path,
+    commands_dir: &Path,
+) -> Result<PathBuf, CommandFileError> {
+    ensure_real_directory(ryuzi_dir, false, ".ryuzi directory")?;
+    ensure_real_directory(commands_dir, false, "commands directory")?;
+    let work_dir = work_dir.canonicalize()?;
+    let ryuzi_dir = ryuzi_dir.canonicalize()?;
+    let commands_dir = commands_dir.canonicalize()?;
+    if ryuzi_dir.parent() != Some(work_dir.as_path()) || commands_dir.parent() != Some(&ryuzi_dir) {
         return Err(CommandFileError::InvalidName(
-            "commands directory must be a real directory".into(),
+            "command paths escaped the project directory".into(),
         ));
     }
-    Ok(root.canonicalize()?)
+    Ok(commands_dir)
+}
+
+fn verify_locked_command_root(work_dir: &Path, root: &Path) -> Result<(), CommandFileError> {
+    let ryuzi_dir = work_dir.join(".ryuzi");
+    let commands_dir = ryuzi_dir.join("commands");
+    let canonical_root = canonical_command_root(work_dir, &ryuzi_dir, &commands_dir)?;
+    if canonical_root != root {
+        return Err(CommandFileError::InvalidName(
+            "commands directory changed while acquiring its lock".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn project_command_path(
@@ -699,6 +752,52 @@ mod tests {
                 "must not discover a command outside the project through a symlinked root"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_command_crud_rejects_symlinked_ryuzi_ancestor_without_mutating_outside() {
+        use std::os::unix::fs::symlink;
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_commands = outside.path().join("commands");
+        let outside_command = outside_commands.join("ship.md");
+        let outside_content = "---\ndescription: Outside\n---\nDo not change";
+        std::fs::create_dir_all(&outside_commands).unwrap();
+        std::fs::write(&outside_command, outside_content).unwrap();
+        symlink(outside.path(), work_dir.path().join(".ryuzi")).unwrap();
+
+        let input = ProjectCommandInput {
+            name: "new-command".into(),
+            description: "Must not be created outside the project".into(),
+            template: "Do not write".into(),
+            agent: None,
+            model: None,
+            subtask: false,
+        };
+
+        let listed = list_project_commands(work_dir.path());
+        let read = read_project_command(work_dir.path(), "ship");
+        let write = write_project_command(work_dir.path(), input, None);
+        let deleted = delete_project_command(
+            work_dir.path(),
+            "ship",
+            &revision(outside_content.as_bytes()),
+        );
+
+        assert!(listed.is_err(), "listing must reject a symlinked .ryuzi");
+        assert!(read.is_err(), "reading must reject a symlinked .ryuzi");
+        assert!(write.is_err(), "writing must reject a symlinked .ryuzi");
+        assert!(deleted.is_err(), "deleting must reject a symlinked .ryuzi");
+        assert_eq!(
+            std::fs::read_to_string(&outside_command).unwrap(),
+            outside_content
+        );
+        assert!(
+            !outside_commands.join("new-command.md").exists(),
+            "writing through a symlinked .ryuzi must not create outside files"
+        );
     }
 
     #[test]
