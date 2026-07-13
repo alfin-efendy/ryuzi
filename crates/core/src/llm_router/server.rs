@@ -600,7 +600,7 @@ async fn handle_responses(
             normalize_codex_responses_body(
                 &mut passthrough_body,
                 &target.upstream_model,
-                target.request_compatibility_effort.as_deref(),
+                None,
                 None,
             );
             let started = crate::paths::now_ms();
@@ -2069,7 +2069,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let kiro_body = json!({"conversationState": {}});
         let req = kiro_upstream_request(&state, &target, &kiro_body)
@@ -2152,7 +2151,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2186,7 +2184,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2215,7 +2212,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()

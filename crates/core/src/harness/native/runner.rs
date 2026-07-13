@@ -2521,8 +2521,8 @@ mod tests {
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {
                 requested_model: "test/model".into(),
-                project_override: None,
-                route_compatibility: Default::default(),
+                caller_override: None,
+                route_targets: Default::default(),
                 configured: Default::default(),
                 surfaces: Default::default(),
             }),
@@ -3547,13 +3547,13 @@ mod tests {
         {
             let policies = llm.policies.lock().unwrap();
             assert_eq!(policies[0].requested_model, "anthropic/model-a");
-            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(policies[0].caller_override.as_deref(), Some("high"));
             assert_eq!(
                 policies[0].configured.get(&key_a).map(String::as_str),
                 Some("low")
             );
             assert_eq!(policies[1].requested_model, "anthropic/model-b");
-            assert_eq!(policies[1].project_override, None);
+            assert_eq!(policies[1].caller_override, None);
             assert!(!policies[1].configured.contains_key(&key_a));
             assert_eq!(
                 policies[1].configured.get(&key_b).map(String::as_str),
@@ -4113,7 +4113,7 @@ mod tests {
             let policies = llm.policies.lock().unwrap();
             assert_eq!(policies.len(), 1, "manual compact makes one utility call");
             assert_eq!(policies[0].requested_model, "anthropic/model-a");
-            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(policies[0].caller_override.as_deref(), Some("high"));
         }
         // A notice row records it in the transcript.
         let msgs = deps.store.list_messages("s1").await.unwrap();

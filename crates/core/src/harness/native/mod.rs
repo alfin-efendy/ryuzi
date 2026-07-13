@@ -252,7 +252,7 @@ impl Harness for NativeHarness {
                 .await?
         };
         if project_id.is_none() {
-            effort_policy.project_override = ctx.effort;
+            effort_policy.caller_override = ctx.effort;
         }
         // Persistent memory is unconditional: a chat (project-less) session
         // still gets GLOBAL + USER memory, while a project session gets
@@ -1009,9 +1009,9 @@ mod tests {
         let policies = llm.policies.lock().unwrap();
         assert_eq!(policies.len(), 2);
         assert_eq!(policies[0].requested_model, "anthropic/model-a");
-        assert_eq!(policies[0].project_override.as_deref(), Some("low"));
+        assert_eq!(policies[0].caller_override.as_deref(), Some("low"));
         assert_eq!(policies[1].requested_model, "anthropic/model-b");
-        assert_eq!(policies[1].project_override.as_deref(), Some("high"));
+        assert_eq!(policies[1].caller_override.as_deref(), Some("high"));
     }
 
     fn conn_for_resolution_tests(

@@ -223,8 +223,8 @@ mod tests {
     fn policy() -> Arc<TurnEffortPolicy> {
         Arc::new(TurnEffortPolicy {
             requested_model: "test/model".into(),
-            project_override: None,
-            route_compatibility: Default::default(),
+            caller_override: None,
+            route_targets: Default::default(),
             configured: Default::default(),
             surfaces: Default::default(),
         })

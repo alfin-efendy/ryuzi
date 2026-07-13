@@ -1849,7 +1849,7 @@ severity: string;
  * see `crate::plugins::doctor::plugin_doctor`'s extension section).
  */
 kind: string; message: string; suggestedAction: string }
-export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
+export type EffectiveEffortSource = "project" | "session" | "routeTarget" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 /**
@@ -1997,8 +1997,7 @@ export type ModelRouteTarget = {
  */
 provider: string; model: string; 
 /**
- * Compatibility-only storage for legacy Codex virtual model suffixes.
- * New route writes cannot edit this value directly.
+ * Explicit effort policy; `None` uses the model default.
  */
 effort?: string | null }
 /**

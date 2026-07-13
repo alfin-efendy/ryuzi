@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn external_caller_reasoning_effort_wins_over_route_compatibility() {
+    fn external_caller_reasoning_effort_wins_over_policy_effort() {
         let mut body = json!({
             "input": [],
             "reasoning": {"effort": "low", "summary": "detailed"}
