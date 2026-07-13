@@ -1,6 +1,7 @@
 //! Named model routes ("combo" aliases): expose a short model id that maps to
 //! an ordered list of provider connection/model targets.
 use crate::store::Store;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -192,9 +193,51 @@ pub async fn save_model_route(
     store: &Store,
     route: ModelRouteInfo,
 ) -> anyhow::Result<ModelRouteInfo> {
-    let routes = list_model_routes(store).await?;
+    let route = sanitize_route(route)?;
+    store
+        .with_conn(move |conn| {
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let routes = load_routes(&transaction)?;
+            let saved = save_model_route_locked(&transaction, routes, route)?;
+            transaction.commit()?;
+            Ok(saved)
+        })
+        .await
+}
+
+/// Saves `route` only when no existing route has the same name, ignoring ASCII
+/// case. Returns `None` without writing when the name is already taken.
+pub async fn save_model_route_if_name_absent(
+    store: &Store,
+    route: ModelRouteInfo,
+) -> anyhow::Result<Option<ModelRouteInfo>> {
+    let route = sanitize_route(route)?;
+    store
+        .with_conn(move |conn| {
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let routes = load_routes(&transaction)?;
+            if routes
+                .iter()
+                .any(|existing| existing.name.eq_ignore_ascii_case(&route.name))
+            {
+                return Ok(None);
+            }
+            let saved = save_model_route_locked(&transaction, routes, route)?;
+            transaction.commit()?;
+            Ok(Some(saved))
+        })
+        .await
+}
+
+fn save_model_route_locked(
+    conn: &rusqlite::Connection,
+    routes: Vec<ModelRouteInfo>,
+    route: ModelRouteInfo,
+) -> rusqlite::Result<ModelRouteInfo> {
     let prior = routes.iter().find(|stored| stored.id == route.id).cloned();
-    let mut next = sanitize_route(route)?;
+    let mut next = route;
     let mut old_targets = prior.map(|route| route.targets).unwrap_or_default();
     let mut used = vec![false; old_targets.len()];
     for target in &mut next.targets {
@@ -223,20 +266,30 @@ pub async fn save_model_route(
         .iter()
         .any(|r| r.id != next.id && r.name.eq_ignore_ascii_case(&next.name))
     {
-        anyhow::bail!("route name already exists: {}", next.name);
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            anyhow::anyhow!("route name already exists: {}", next.name).into(),
+        ));
     }
     match routes.iter().position(|r| r.id == next.id) {
         Some(index) => routes[index] = next.clone(),
         None => routes.push(next.clone()),
     }
-    persist_routes(store, &routes).await?;
+    persist_routes(conn, &routes)?;
     Ok(next)
 }
 
 pub async fn delete_model_route(store: &Store, id: &str) -> anyhow::Result<()> {
-    let mut routes = list_model_routes(store).await?;
-    routes.retain(|r| r.id != id);
-    persist_routes(store, &routes).await
+    let id = id.to_owned();
+    store
+        .with_conn(move |conn| {
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut routes = load_routes(&transaction)?;
+            routes.retain(|route| route.id != id);
+            persist_routes(&transaction, &routes)?;
+            transaction.commit()
+        })
+        .await
 }
 
 pub fn route_by_name<'a>(
@@ -248,7 +301,7 @@ pub fn route_by_name<'a>(
     }
     routes
         .iter()
-        .find(|r| r.enabled && r.name == requested && !r.targets.is_empty())
+        .find(|r| r.enabled && r.name.eq_ignore_ascii_case(requested) && !r.targets.is_empty())
 }
 
 pub async fn ordered_targets(
@@ -336,16 +389,33 @@ pub(crate) async fn ordered_indexed_targets(
         .collect())
 }
 
-async fn persist_routes(store: &Store, routes: &[ModelRouteInfo]) -> anyhow::Result<()> {
-    let mut ordered = routes.to_vec();
-    ordered.sort_by_key(|r| (r.created_at, r.name.clone()));
-    store
-        .set_setting(
-            crate::domain::WriteOrigin::User,
-            SETTING_KEY,
-            &serde_json::to_string(&ordered)?,
+fn load_routes(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRouteInfo>> {
+    let raw = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [SETTING_KEY],
+            |row| row.get::<_, String>(0),
         )
-        .await
+        .optional()?;
+    let mut routes: Vec<ModelRouteInfo> = raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    routes.sort_by_key(|route: &ModelRouteInfo| (route.created_at, route.name.clone()));
+    Ok(routes)
+}
+
+fn persist_routes(conn: &rusqlite::Connection, routes: &[ModelRouteInfo]) -> rusqlite::Result<()> {
+    let mut ordered = routes.to_vec();
+    ordered.sort_by_key(|route| (route.created_at, route.name.clone()));
+    let value = serde_json::to_string(&ordered)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        rusqlite::params![SETTING_KEY, value],
+    )
+    .map(|_| ())
 }
 
 fn sanitize_route(mut route: ModelRouteInfo) -> anyhow::Result<ModelRouteInfo> {
@@ -411,6 +481,18 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn save_if_name_absent_preserves_case_insensitive_existing_route() {
+        let store = mem_store().await;
+        let existing = save_model_route(&store, route("Smart")).await.unwrap();
+        let inserted = save_model_route_if_name_absent(&store, route("smart"))
+            .await
+            .unwrap();
+
+        assert!(inserted.is_none());
+        assert_eq!(list_model_routes(&store).await.unwrap(), vec![existing]);
     }
 
     #[tokio::test]

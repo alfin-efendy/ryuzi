@@ -12,6 +12,7 @@ use anyhow::Context;
 use indexmap::IndexMap;
 
 use crate::agent_settings;
+use crate::llm_router::routes::{self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget};
 use crate::paths;
 use crate::store::Store;
 
@@ -161,6 +162,62 @@ pub fn default_subagent_config() -> SubagentConfig {
             route: "fast".into(),
         },
     }
+}
+
+/// Materialize a default named route with one target when the user first
+/// chooses an agent or subagent model. The target must be a selectable native
+/// model, which guarantees its provider connection is enabled, credentialed,
+/// and runnable by the native harness.
+pub(crate) async fn ensure_default_route(store: &Store, name: &str) -> anyhow::Result<()> {
+    let routes = routes::list_model_routes(store).await?;
+    if routes
+        .iter()
+        .any(|route| route.name.eq_ignore_ascii_case(name))
+    {
+        return Ok(());
+    }
+
+    let Some(model) = crate::llm_router::client::selectable_native_models(store)
+        .await?
+        .into_iter()
+        .find(|model| {
+            matches!(
+                model.kind,
+                crate::llm_router::model_effort::SelectableModelKind::Concrete
+            )
+        })
+    else {
+        return Ok(());
+    };
+    let Some((provider, model)) = model.request_value.split_once('/') else {
+        return Ok(());
+    };
+
+    routes::save_model_route_if_name_absent(
+        store,
+        ModelRouteInfo {
+            id: String::new(),
+            name: name.into(),
+            enabled: true,
+            strategy: ModelRouteStrategy::Fallback,
+            targets: vec![ModelRouteTarget {
+                provider: provider.into(),
+                model: model.into(),
+                effort: None,
+            }],
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn ensure_default_routes(store: &Store) -> anyhow::Result<()> {
+    for name in ["smart", "fast"] {
+        ensure_default_route(store, name).await?;
+    }
+    Ok(())
 }
 
 pub async fn initialize_agent_registry(
@@ -862,6 +919,60 @@ mod tests {
         assert_eq!(snapshot.agents.len(), 1);
         assert_eq!(snapshot.agents[0].profile.name, "Ryuzi");
         fixture.assert_project_provider_and_session_survive().await;
+    }
+
+    #[tokio::test]
+    async fn default_route_seeding_preserves_existing_user_routes() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "anthropic-live".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: "custom-smart".into(),
+                name: "Smart".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "custom".into(),
+                    effort: None,
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        ensure_default_routes(&store).await.unwrap();
+
+        let routes = routes::list_model_routes(&store).await.unwrap();
+        assert_eq!(routes.len(), 2);
+        let smart = routes.iter().find(|route| route.name == "Smart").unwrap();
+        assert!(smart.enabled);
+        assert_eq!(smart.targets[0].model, "custom");
+        assert!(routes::route_by_name(&routes, "smart").is_some());
+        assert!(routes::route_by_name(&routes, "fast").is_some());
     }
 
     #[tokio::test]
