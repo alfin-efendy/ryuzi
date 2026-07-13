@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Badge, Button, Input, MenuPanel, MenuPanelItem, Textarea } from "@ryuzi/ui";
 import { Check, ChevronDown, ShieldAlert } from "lucide-react";
 import { useStore, type PendingApproval } from "@/store";
@@ -22,6 +22,7 @@ const once = (allow: boolean): ApprovalResponse => ({
 
 function ToolBody({ approval }: { approval: PendingApproval }) {
   const [showFullInput, setShowFullInput] = useState(false);
+  const fullInputId = useId();
   const input = (approval.input ?? {}) as Record<string, unknown>;
   if (approval.tool === "bash" && typeof input.command === "string") {
     return (
@@ -53,11 +54,18 @@ function ToolBody({ approval }: { approval: PendingApproval }) {
       {Object.keys(input).length > 0 && (
         <div className="space-y-1.5">
           <pre className="rounded-md bg-muted/60 px-3 py-2 font-mono text-[11px] whitespace-pre-wrap break-words">{inputPreview}</pre>
-          <Button size="sm" variant="ghost" onClick={() => setShowFullInput((show) => !show)}>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-controls={fullInputId}
+            aria-expanded={showFullInput}
+            onClick={() => setShowFullInput((show) => !show)}
+          >
             {showFullInput ? "Hide full input" : "Show full input"}
           </Button>
           {showFullInput && (
             <pre
+              id={fullInputId}
               data-testid="approval-full-input"
               className="max-h-64 overflow-y-auto rounded-md bg-muted/60 px-3 py-2 font-mono text-[11px] whitespace-pre-wrap break-words"
             >

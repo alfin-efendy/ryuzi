@@ -425,18 +425,40 @@ test("generic tool previews input until the full input is requested", () => {
   );
 
   expect(screen.getByText("Fetch: https://example.com")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Show full input" })).toBeTruthy();
+  const showFullInput = screen.getByRole("button", { name: "Show full input" });
+  expect(showFullInput.getAttribute("aria-expanded")).toBe("false");
+  const fullInputId = showFullInput.getAttribute("aria-controls");
+  expect(fullInputId).toBeTruthy();
+  if (!fullInputId) {
+    throw new Error("Show full input must control the expanded input");
+  }
   expect(screen.queryByTestId("approval-full-input")).toBeNull();
   expect(screen.queryByText(tail)).toBeNull();
 
-  fireEvent.click(screen.getByRole("button", { name: "Show full input" }));
+  fireEvent.click(showFullInput);
   const fullInput = screen.getByTestId("approval-full-input");
   expect(fullInput.textContent).toContain(tail);
   expect(fullInput.className).toContain("max-h-");
   expect(fullInput.className).toContain("overflow-y-auto");
   expect(fullInput.className).toContain("whitespace-pre-wrap");
   expect(fullInput.className).toContain("break-words");
-  expect(screen.getByRole("button", { name: "Hide full input" })).toBeTruthy();
+  const hideFullInput = screen.getByRole("button", { name: "Hide full input" });
+  expect(hideFullInput.getAttribute("aria-expanded")).toBe("true");
+  expect(hideFullInput.getAttribute("aria-controls")).toBe(fullInputId);
+  expect(fullInput.id).toBe(fullInputId);
+});
+
+test("generic tool full input controls use unique IDs for each approval card", () => {
+  render(
+    <>
+      <ApprovalCard approval={approval({ requestId: "r1", tool: "webfetch", input: { body: "first" } })} />
+      <ApprovalCard approval={approval({ requestId: "r2", tool: "webfetch", input: { body: "second" } })} />
+    </>,
+  );
+
+  const fullInputButtons = screen.getAllByRole("button", { name: "Show full input" });
+  expect(fullInputButtons).toHaveLength(2);
+  expect(fullInputButtons[0].getAttribute("aria-controls")).not.toBe(fullInputButtons[1].getAttribute("aria-controls"));
 });
 
 test("bash and edit content blocks wrap with vertical scrolling", () => {
