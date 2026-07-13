@@ -7,15 +7,17 @@ const getAgent = mock(async (_runner: string | null, id: string) => ({
   status: "ok" as const,
   data: detail({ summary: { ...detail().summary, id, name: id === "ryuzi" ? "Ryuzi" : "Reviewer", isDefault: id === "ryuzi" } }),
 }));
+const listApps = mock(async () => ({ status: "ok" as const, data: [] }));
 const updateAgent = mock(async (_runner: string | null, _id: string, input: AgentMutationInfo) => ({
   status: "ok" as const,
   data: detail({ ...input, modelInfo: null }),
 }));
 
-mock.module("@/bindings", () => ({ commands: { getAgent, updateAgent }, events: {} }));
+mock.module("@/bindings", () => ({ commands: { getAgent, listApps, updateAgent }, events: {} }));
 
 const { AgentDetailView } = await import("./AgentDetailView");
 const { useAgents } = await import("@/store-agents");
+const { useApps } = await import("@/store-apps");
 const { useNav } = await import("@/store-nav");
 
 const routeInfo: SelectableModelInfo = {
@@ -92,7 +94,9 @@ function seed(value = detail()) {
 }
 
 beforeEach(() => {
+  listApps.mockClear();
   updateAgent.mockClear();
+  useApps.setState({ apps: [], loaded: false, hydrating: false, probing: null });
   seed();
 });
 afterEach(cleanup);
