@@ -304,13 +304,7 @@ impl DelegationRuntime {
                 resolved_effort,
             })
             .await?;
-        self.emit(
-            &run.session_pk,
-            &run.run_id,
-            run.parent_run_id.clone(),
-            run.status,
-        );
-        Ok(run)
+        Ok(self.register(run, snapshot).await.run)
     }
 
     async fn tree(&self, run_id: &str) -> anyhow::Result<(AgentRun, Vec<AgentRun>, AgentRun)> {
@@ -908,6 +902,83 @@ mod tests {
             Some("anthropic/claude-opus-4-8")
         );
         assert_eq!(retry.resolved_effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn retry_of_main_child_registers_updated_snapshot_and_cancellation() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, second) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let child = runtime
+            .queue_main(MainDelegationRequest {
+                parent_run_id: root.run.run_id,
+                target_agent_id: second.profile.id.clone(),
+                task: "child".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        runtime.complete(&child.run.run_id, "done").await.unwrap();
+
+        let mut profile = registry.get("second").await.unwrap().profile;
+        profile.name = "Second, retried".into();
+        registry
+            .update(
+                "second",
+                crate::agents::types::AgentMutationInput {
+                    name: profile.name,
+                    description: profile.description,
+                    avatar: profile.avatar,
+                    model: profile.model,
+                    permissions: profile.permissions,
+                    skills: profile.skills,
+                    tools: profile.tools,
+                    loop_settings: profile.loop_settings,
+                },
+            )
+            .await
+            .unwrap();
+
+        let retry = runtime.retry_child("s", &child.run.run_id).await.unwrap();
+        let snapshot = runtime
+            .execution_snapshot(&retry.run_id)
+            .await
+            .expect("a retried main-agent child must retain its resolved snapshot");
+        assert_eq!(snapshot.profile.name, "Second, retried");
+
+        let mut profile = registry.get("second").await.unwrap().profile;
+        profile.name = "Second, changed after retry".into();
+        registry
+            .update(
+                "second",
+                crate::agents::types::AgentMutationInput {
+                    name: profile.name,
+                    description: profile.description,
+                    avatar: profile.avatar,
+                    model: profile.model,
+                    permissions: profile.permissions,
+                    skills: profile.skills,
+                    tools: profile.tools,
+                    loop_settings: profile.loop_settings,
+                },
+            )
+            .await
+            .unwrap();
+        let retained_snapshot = runtime.execution_snapshot(&retry.run_id).await.unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &retained_snapshot));
+        assert_eq!(retained_snapshot.profile.name, "Second, retried");
+        let cancel = runtime
+            .live
+            .lock()
+            .await
+            .get(&retry.run_id)
+            .expect("a retried main-agent child must register a cancellation token")
+            .cancel
+            .clone();
+
+        runtime.cancel_child("s", &retry.run_id).await.unwrap();
+        assert!(cancel.is_cancelled());
     }
 
     #[tokio::test]
