@@ -25,6 +25,7 @@ import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
 import { LearningView } from "./views/LearningView";
+import { AgentsView } from "./views/AgentsView";
 import { SettingsView } from "./views/SettingsView";
 import { Toaster } from "@ryuzi/ui";
 
@@ -61,10 +62,9 @@ function MainView() {
       return <LearningView />;
     case "settings":
       return <SettingsView />;
-    // AgentsView and AgentDetailView land in Plan 3 Tasks 6–7; the routes
-    // exist now so store-nav contracts (openAgentChat, history) are testable.
+    // AgentDetailView lands in Plan 3 Task 7.
     case "agents":
-      return null;
+      return <AgentsView />;
     case "agentDetail":
       return null;
   }

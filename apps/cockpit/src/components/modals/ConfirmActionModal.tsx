@@ -8,6 +8,7 @@ export function ConfirmActionModal({
   confirmLabel,
   busyLabel,
   destructive = true,
+  confirmDisabled = false,
   trigger,
   onClose,
   onConfirm,
@@ -18,6 +19,7 @@ export function ConfirmActionModal({
   confirmLabel: string;
   busyLabel?: string;
   destructive?: boolean;
+  confirmDisabled?: boolean;
   trigger: HTMLElement | null;
   onClose: () => void;
   onConfirm: () => Promise<boolean>;
@@ -46,7 +48,7 @@ export function ConfirmActionModal({
         <Button ref={cancelRef} variant="outline" onClick={onClose} disabled={busy}>
           Cancel
         </Button>
-        <Button variant={destructive ? "destructive" : "default"} onClick={() => void confirm()} disabled={busy}>
+        <Button variant={destructive ? "destructive" : "default"} onClick={() => void confirm()} disabled={busy || confirmDisabled}>
           {busy ? (busyLabel ?? `${confirmLabel}…`) : confirmLabel}
         </Button>
       </ModalFooter>
