@@ -21,33 +21,50 @@ const once = (allow: boolean): ApprovalResponse => ({
 });
 
 function ToolBody({ approval }: { approval: PendingApproval }) {
+  const [showFullInput, setShowFullInput] = useState(false);
   const input = (approval.input ?? {}) as Record<string, unknown>;
   if (approval.tool === "bash" && typeof input.command === "string") {
-    return <pre className="overflow-x-auto rounded-md bg-muted/60 px-3 py-2 font-mono text-xs whitespace-pre-wrap">{input.command}</pre>;
+    return (
+      <pre className="max-h-64 overflow-y-auto rounded-md bg-muted/60 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-words">
+        {input.command}
+      </pre>
+    );
   }
   if (approval.tool === "edit" && typeof input.old_string === "string") {
     return (
       <div className="space-y-2">
         <div className="font-mono text-[11px] text-muted-foreground">{String(input.file_path ?? "")}</div>
-        <pre className="overflow-x-auto rounded-md border border-red-500/25 bg-red-500/10 px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+        <pre className="max-h-64 overflow-y-auto rounded-md border border-red-500/25 bg-red-500/10 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-words">
           {String(input.old_string)}
         </pre>
-        <pre className="overflow-x-auto rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+        <pre className="max-h-64 overflow-y-auto rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-words">
           {String(input.new_string ?? "")}
         </pre>
       </div>
     );
   }
+
+  const formattedInput = JSON.stringify(input, null, 2);
+  const inputPreview = formattedInput.length > 320 ? `${formattedInput.slice(0, 320)}…` : formattedInput;
+
   return (
     <div className="space-y-2">
       <div className="font-mono text-xs break-words whitespace-pre-wrap">{approval.summary}</div>
       {Object.keys(input).length > 0 && (
-        <details className="text-xs">
-          <summary className="cursor-pointer text-muted-foreground">Parameters</summary>
-          <pre className="mt-1 overflow-x-auto rounded-md bg-muted/60 px-3 py-2 font-mono text-[11px]">
-            {JSON.stringify(input, null, 2)}
-          </pre>
-        </details>
+        <div className="space-y-1.5">
+          <pre className="rounded-md bg-muted/60 px-3 py-2 font-mono text-[11px] whitespace-pre-wrap break-words">{inputPreview}</pre>
+          <Button size="sm" variant="ghost" onClick={() => setShowFullInput((show) => !show)}>
+            {showFullInput ? "Hide full input" : "Show full input"}
+          </Button>
+          {showFullInput && (
+            <pre
+              data-testid="approval-full-input"
+              className="max-h-64 overflow-y-auto rounded-md bg-muted/60 px-3 py-2 font-mono text-[11px] whitespace-pre-wrap break-words"
+            >
+              {formattedInput}
+            </pre>
+          )}
+        </div>
       )}
     </div>
   );
@@ -265,13 +282,17 @@ export function ApprovalCard({
                             key={o.label}
                             variant={selected ? "secondary" : "ghost"}
                             aria-pressed={selected}
-                            className="h-auto w-full justify-start px-2.5 py-1.5 text-left"
+                            className="h-auto w-full items-start justify-start px-2.5 py-1.5 text-left"
                             onClick={() => toggle(q, o.label)}
                           >
-                            <span className="flex w-4 shrink-0 justify-center">{selected && <Check size={13} />}</span>
-                            <span className="min-w-0">
-                              <span className="block text-[12.5px]">{o.label}</span>
-                              {o.description && <span className="block text-[11px] text-muted-foreground">{o.description}</span>}
+                            <span className="mt-0.5 flex w-4 shrink-0 self-start justify-center">{selected && <Check size={13} />}</span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-[12.5px] whitespace-normal break-words">{o.label}</span>
+                              {o.description && (
+                                <span className="block text-[11px] text-muted-foreground whitespace-normal break-words">
+                                  {o.description}
+                                </span>
+                              )}
                             </span>
                           </Button>
                         );
