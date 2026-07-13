@@ -247,15 +247,21 @@ impl DelegationRuntime {
                 )
                 .await?
             {
+                let run = self
+                    .store
+                    .get_agent_run(&run.run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("unknown agent run"))?;
                 self.emit(
                     &run.session_pk,
                     &run.run_id,
-                    run.parent_run_id,
-                    AgentRunStatus::Cancelled,
+                    run.parent_run_id.clone(),
+                    run.status,
                 );
                 if let Some(live) = self.live.lock().await.remove(&run.run_id) {
                     live.cancel.cancel();
                 }
+                self.record_terminal(run).await;
             }
         }
         Ok(())
@@ -755,6 +761,39 @@ mod tests {
             .err()
             .expect("the ninth mixed child must be refused");
         assert!(error.to_string().contains("active child run limit"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_outcome_reaches_an_already_subscribed_waiter() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, _) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let child = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id,
+                subagent_type: "child".into(),
+                task: "child".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        let waiter_runtime = runtime.clone();
+        let child_id = child.run.run_id.clone();
+        let waiter = tokio::spawn(async move { waiter_runtime.await_terminal(&child_id).await });
+        while runtime.terminal_events.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        runtime.cancel_child("s", &child.run.run_id).await.unwrap();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("the subscribed waiter must receive the cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.run_id, child.run.run_id);
+        assert_eq!(delivered.status, AgentRunStatus::Cancelled);
     }
 
     #[tokio::test]
