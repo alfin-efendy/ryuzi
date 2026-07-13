@@ -2632,9 +2632,11 @@ mod tests {
             .unwrap();
         post_router(port, &key.key, "/v1/chat/completions", request()).await;
 
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured[0]["reasoning_effort"], "medium");
-        assert_eq!(captured[1]["reasoning_effort"], "high");
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured[0]["reasoning_effort"], "medium");
+            assert_eq!(captured[1]["reasoning_effort"], "high");
+        }
         server.stop().await;
     }
 
@@ -2699,9 +2701,11 @@ mod tests {
         )
         .await;
 
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured[0]["reasoning"]["effort"], "high");
-        assert_eq!(captured[0]["reasoning"]["summary"], "detailed");
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured[0]["reasoning"]["effort"], "high");
+            assert_eq!(captured[0]["reasoning"]["summary"], "detailed");
+        }
         server.stop().await;
     }
 
