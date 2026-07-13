@@ -84,7 +84,7 @@ jobs:
           git config --global user.email "ci@ryuzi.dev"
           git config --global user.name "ryuzi CI"
       - run: bun run typecheck
-      - run: bun test
+      - run: bun test --isolate
 
   rust:
     needs: changes
