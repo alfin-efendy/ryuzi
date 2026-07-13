@@ -4548,7 +4548,7 @@ mod tests {
             project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: Some("/tmp/wt".into()),
-            branch: Some("harness/abcdef01".into()),
+            branch: Some("ryuzi/abcdef01".into()),
             title: Some("hello".into()),
             status: SessionStatus::Running,
             started_by: None,

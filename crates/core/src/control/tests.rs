@@ -1825,7 +1825,7 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .unwrap();
     assert!(stored.worktree_path.is_some(), "worktree path backfilled");
     let branch = stored.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"), "got: {branch}");
+    assert!(branch.starts_with("ryuzi/"), "got: {branch}");
     assert!(stored.branch_owned);
 
     // …and the progress rows landed in order.
@@ -1837,7 +1837,7 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .collect();
     assert_eq!(statuses[0], "Creating worktree…");
     assert!(
-        statuses[1].starts_with("Created and checked out branch harness/"),
+        statuses[1].starts_with("Created and checked out branch ryuzi/"),
         "got: {statuses:?}"
     );
     assert_eq!(statuses[2], "Connecting tools…");
@@ -3703,7 +3703,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
         .unwrap()
         .unwrap();
     let branch = stored.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"));
+    assert!(branch.starts_with("ryuzi/"));
 
     cp.end_session(&session.session_pk).await.unwrap();
 

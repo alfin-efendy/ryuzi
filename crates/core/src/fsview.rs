@@ -421,10 +421,10 @@ mod tests {
         git(&["commit", "-m", "base"]);
 
         // Clean checkout on a session branch that matches main → nothing at risk.
-        git(&["checkout", "-b", "harness/abc123"]);
+        git(&["checkout", "-b", "ryuzi/abc123"]);
         assert!(!is_dirty(&dir).await.unwrap());
         assert_eq!(
-            unmerged_commit_count(&dir, "harness/abc123").await.unwrap(),
+            unmerged_commit_count(&dir, "ryuzi/abc123").await.unwrap(),
             0
         );
 
@@ -437,7 +437,7 @@ mod tests {
         git(&["commit", "-m", "session work"]);
         assert!(!is_dirty(&dir).await.unwrap());
         assert_eq!(
-            unmerged_commit_count(&dir, "harness/abc123").await.unwrap(),
+            unmerged_commit_count(&dir, "ryuzi/abc123").await.unwrap(),
             1
         );
     }
