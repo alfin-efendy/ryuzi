@@ -758,8 +758,12 @@ export const useStore = create<State>((set, get) => ({
   },
   resolveApproval: async (runnerId, requestId, response) => {
     try {
-      await commands.resolveApproval(runnerId, requestId, response);
-      get().clearApproval(requestId);
+      const resolved = await commands.resolveApproval(runnerId, requestId, response);
+      if (resolved) {
+        get().clearApproval(requestId);
+      } else {
+        toast.error("Approval is still pending. Please try again.");
+      }
     } catch (e) {
       console.error("resolveApproval failed", e);
       toast.error("Approval failed: " + String(e));

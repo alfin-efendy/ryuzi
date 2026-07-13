@@ -665,10 +665,9 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
   expect(st.lastSeq[k1]).toBe(3);
 });
 
-test("approval.requested adds a pending approval; resolving removes it", () => {
+test("resolveApproval retains a pending approval when the backend does not resolve it", async () => {
   reset();
-  const s = useStore.getState();
-  s.applyCoreEvent(
+  useStore.getState().applyCoreEvent(
     {
       kind: "approvalRequested",
       session_pk: "s1",
@@ -680,9 +679,34 @@ test("approval.requested adds a pending approval; resolving removes it", () => {
     },
     LOCAL_RUNNER,
   );
+  const resolveApproval = spyOn(commands, "resolveApproval").mockResolvedValue(false);
+
+  await useStore.getState().resolveApproval(LOCAL_RUNNER, "r1", { decision: "allowOnce", scope: null, payload: null });
+
   expect(useStore.getState().pendingApprovals).toHaveLength(1);
-  useStore.getState().clearApproval("r1");
+  resolveApproval.mockRestore();
+});
+
+test("resolveApproval clears a pending approval when the backend resolves it", async () => {
+  reset();
+  useStore.getState().applyCoreEvent(
+    {
+      kind: "approvalRequested",
+      session_pk: "s1",
+      request_id: "r1",
+      tool: "Bash",
+      summary: "Bash: rm",
+      approval_kind: "tool",
+      input: {},
+    },
+    LOCAL_RUNNER,
+  );
+  const resolveApproval = spyOn(commands, "resolveApproval").mockResolvedValue(true);
+
+  await useStore.getState().resolveApproval(LOCAL_RUNNER, "r1", { decision: "allowOnce", scope: null, payload: null });
+
   expect(useStore.getState().pendingApprovals).toHaveLength(0);
+  resolveApproval.mockRestore();
 });
 
 test("pending approvals from different sessions both count", () => {
