@@ -1,5 +1,6 @@
 //! Persisted automation Hook configuration and dispatch history.
 
+use crate::llm_router::secrets;
 use crate::paths::{new_id, now_ms};
 use crate::store::Store;
 use anyhow::{bail, Context};
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 use std::collections::VecDeque;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
@@ -17,7 +19,70 @@ const MAX_RUNS: u32 = 20;
 const MAX_DETAIL_ATTEMPTS: u32 = 3;
 const MAX_TOOL_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
+
+const MAX_OUTBOUND_TEMPLATE_BYTES: usize = 64 * 1024;
+const OUTBOUND_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(30),
+];
 const TRUNCATED_SUFFIX: &str = "…[truncated]";
+
+/// Render the stable default delivery envelope, or replace the two permitted
+/// whole-string template values with their JSON values. This deliberately never
+/// interpolates JSON into strings, so event data cannot alter template syntax.
+pub fn render_outbound_payload(
+    template: Option<&str>,
+    event: &Value,
+    run: &Value,
+) -> anyhow::Result<Value> {
+    let Some(template) = template else {
+        return Ok(event.clone());
+    };
+    if template.len() > MAX_OUTBOUND_TEMPLATE_BYTES {
+        bail!("outbound payload template must be at most 65536 bytes");
+    }
+    let mut payload: Value =
+        serde_json::from_str(template).context("outbound payload template must be valid JSON")?;
+    replace_payload_placeholders(&mut payload, event, run)?;
+    if serde_json::to_vec(&payload)
+        .context("could not serialize outbound payload")?
+        .len()
+        > MAX_ENVELOPE_BYTES
+    {
+        bail!("rendered outbound payload must be at most 262144 bytes");
+    }
+    Ok(payload)
+}
+
+fn replace_payload_placeholders(
+    value: &mut Value,
+    event: &Value,
+    run: &Value,
+) -> anyhow::Result<()> {
+    match value {
+        Value::String(placeholder) => match placeholder.as_str() {
+            "${event}" => *value = event.clone(),
+            "${run}" => *value = run.clone(),
+            text if text.contains("${") => bail!(
+                "outbound payload placeholders must be exactly ${{event}} or ${{run}} JSON values"
+            ),
+            _ => {}
+        },
+        Value::Array(values) => {
+            for value in values {
+                replace_payload_placeholders(value, event, run)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                replace_payload_placeholders(value, event, run)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// Stable, untrusted event input for automation dispatch. `event`, `source`,
 /// and `data` deliberately remain the only externally visible shape so the
@@ -607,6 +672,63 @@ fn normalize_name(name: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn validate_outbound_url(value: &str) -> anyhow::Result<url::Url> {
+    let url = url::Url::parse(value).context("outbound URL must be valid")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("outbound URL scheme must be http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("outbound URL must not include userinfo");
+    }
+    if let Some(port) = url.port() {
+        if url.scheme() == "https" && port != 443 {
+            bail!("outbound HTTPS URLs only permit port 443");
+        }
+    }
+    // HTTP is restricted to loopback, but accepts explicit ports for local development and tests.
+    let host = url.host_str().context("outbound URL must include a host")?;
+    let ip_host = host.trim_matches(['[', ']']);
+    match ip_host.parse::<IpAddr>() {
+        Ok(ip) if url.scheme() == "http" && is_loopback_ip(ip) => {}
+        Ok(_) => bail!("outbound URL IP literals are not permitted"),
+        Err(_) if url.scheme() == "http" && host.eq_ignore_ascii_case("localhost") => {}
+        Err(_) if url.scheme() == "https" => {}
+        Err(_) => bail!("HTTP outbound URLs are only permitted for localhost"),
+    }
+    Ok(url)
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
+fn is_public_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+                || ip.octets()[0] >= 224
+                || ip == Ipv4Addr::new(0, 0, 0, 0))
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_outbound_ip(IpAddr::V4(mapped));
+            }
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local())
+        }
+    }
+}
 fn validate_action(trigger_kind: TriggerKind, action: &HookActionInput) -> anyhow::Result<()> {
     if trigger_kind == TriggerKind::WebhookInbound && action.kind() != ActionKind::AgentRun {
         bail!("webhook.inbound hooks only support agent.run");
@@ -632,10 +754,7 @@ fn validate_action(trigger_kind: TriggerKind, action: &HookActionInput) -> anyho
             if config.url.len() > 2 * 1024 {
                 bail!("outbound URL must be at most 2048 bytes");
             }
-            let url = url::Url::parse(&config.url).context("outbound URL must be valid")?;
-            if !matches!(url.scheme(), "http" | "https") {
-                bail!("outbound URL scheme must be http or https");
-            }
+            let _ = validate_outbound_url(&config.url)?;
             if config.method != "POST" {
                 bail!("outbound webhook method must be POST");
             }
@@ -652,12 +771,19 @@ fn validate_action(trigger_kind: TriggerKind, action: &HookActionInput) -> anyho
                     bail!("outbound header values must be at most 4096 bytes");
                 }
             }
-            if config
-                .payload_template
-                .as_deref()
-                .is_some_and(|template| template.len() > 64 * 1024)
-            {
-                bail!("outbound payload template must be at most 65536 bytes");
+            if let Some(template) = config.payload_template.as_deref() {
+                let representative_event = serde_json::json!({ "event": "automation.test" });
+                let representative_run = serde_json::json!({
+                    "id": "run-validation",
+                    "hookId": "hook-validation",
+                    "attempt": 1,
+                    "test": false,
+                });
+                render_outbound_payload(
+                    Some(template),
+                    &representative_event,
+                    &representative_run,
+                )?;
             }
         }
     }
@@ -682,6 +808,163 @@ fn sql_json_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> r
     rusqlite::Error::ToSqlConversionFailure(err.into())
 }
 
+pub async fn deliver_outbound_once(
+    action: &WebhookOutboundAction,
+    payload: &Value,
+) -> anyhow::Result<u16> {
+    let url = validate_outbound_url(&action.url)?;
+    let host = url.host_str().context("outbound URL must include a host")?;
+    let port = url
+        .port_or_known_default()
+        .context("outbound URL must include a port")?;
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .context("could not resolve outbound webhook host")?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        bail!("outbound webhook host did not resolve");
+    }
+    let local_http = url.scheme() == "http";
+    if local_http {
+        if addresses
+            .iter()
+            .any(|address| !is_loopback_ip(address.ip()))
+        {
+            bail!("localhost webhook resolved to a non-loopback address");
+        }
+    } else if addresses
+        .iter()
+        .any(|address| !is_public_outbound_ip(address.ip()))
+    {
+        bail!("outbound webhook host resolved to a non-public address");
+    }
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    for header in &action.headers {
+        let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())?;
+        let value = reqwest::header::HeaderValue::from_str(&header.value)
+            .context("outbound webhook header value is invalid")?;
+        headers.insert(name, value);
+    }
+    let mut client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    for address in addresses {
+        client = client.resolve(host, address);
+    }
+    let response = client
+        .build()
+        .context("could not build outbound webhook client")?
+        .post(url)
+        .headers(headers)
+        .json(payload)
+        .send()
+        .await
+        .context("outbound webhook request failed")?;
+    Ok(response.status().as_u16())
+}
+
+pub async fn record_outbound_attempt(
+    store: &Store,
+    run_id: &str,
+    ordinal: i64,
+    result: Result<u16, &anyhow::Error>,
+) -> anyhow::Result<bool> {
+    let run_id = run_id.to_string();
+    let started_at = now_ms();
+    let (status, error) = match result {
+        Ok(status) => (Some(i64::from(status)), None),
+        Err(error) => (None, Some(sanitize_error(&error.to_string()))),
+    };
+    let succeeded = status.is_some_and(|status| (200..300).contains(&status));
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "INSERT INTO automation_hook_attempts(run_id,ordinal,started_at,finished_at,http_status,error) VALUES (?1,?2,?3,?3,?4,?5)",
+                params![run_id, ordinal, started_at, status, error],
+            )?;
+            c.execute(
+                "UPDATE automation_hook_runs SET attempt_count=?2,last_http_status=?3,started_at=COALESCE(started_at,?4) WHERE id=?1",
+                params![run_id, ordinal, status, started_at],
+            )?;
+            Ok(succeeded)
+        })
+        .await
+}
+
+pub async fn deliver_outbound(store: &Store, run: &HookRunRow) -> anyhow::Result<()> {
+    deliver_outbound_with_retry(store, run, &OUTBOUND_RETRY_DELAYS, tokio::time::sleep).await
+}
+
+async fn deliver_outbound_with_retry<F, Fut>(
+    store: &Store,
+    run: &HookRunRow,
+    retry_delays: &[std::time::Duration],
+    mut sleep: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let HookActionInput::WebhookOutbound(action) = &run.snapshot.action else {
+        bail!("automation run is not an outbound webhook");
+    };
+    for ordinal in 1..=retry_delays.len() as i64 {
+        let run_value = serde_json::json!({
+            "id": run.id,
+            "hookId": run.hook_id,
+            "attempt": ordinal,
+            "test": false,
+        });
+        let payload = render_outbound_payload(
+            action.payload_template.as_deref(),
+            &run.envelope,
+            &run_value,
+        );
+        let result = match payload {
+            Ok(payload) => deliver_outbound_once(action, &payload).await,
+            Err(error) => Err(error),
+        };
+        let succeeded =
+            record_outbound_attempt(store, &run.id, ordinal, result.as_ref().copied()).await?;
+        if succeeded {
+            return Ok(());
+        }
+        if ordinal < retry_delays.len() as i64 {
+            sleep(retry_delays[ordinal as usize - 1]).await;
+        }
+    }
+    bail!("outbound webhook delivery failed")
+}
+fn encode_action_for_storage(action: &HookActionInput) -> anyhow::Result<String> {
+    let mut action = action.clone();
+    if let HookActionInput::WebhookOutbound(config) = &mut action {
+        for header in &mut config.headers {
+            header.value = secrets::encrypt_field(&header.value);
+        }
+    }
+    serde_json::to_string(&action).context("could not serialize automation hook action")
+}
+
+fn decode_action_from_storage(config_json: &str) -> anyhow::Result<HookActionInput> {
+    let mut action: HookActionInput = serde_json::from_str(config_json)
+        .context("could not deserialize automation hook action")?;
+    if let HookActionInput::WebhookOutbound(config) = &mut action {
+        for header in &mut config.headers {
+            if header.value.starts_with("enc:v1:") {
+                header.value = secrets::decrypt_field(&header.value)
+                    .context("could not decrypt outbound webhook header")?;
+            }
+        }
+    }
+    Ok(action)
+}
 fn hook_from(row: &Row<'_>) -> rusqlite::Result<HookRow> {
     let trigger: String = row.get(2)?;
     let action_kind: String = row.get(3)?;
@@ -693,10 +976,27 @@ fn hook_from(row: &Row<'_>) -> rusqlite::Result<HookRow> {
         action_kind: ActionKind::from_str(&action_kind).map_err(sql_json_error)?,
         enabled: row.get::<_, i64>(4)? != 0,
         inbound_path: row.get(5)?,
-        action: serde_json::from_str(&config_json).map_err(sql_json_error)?,
+        action: decode_action_from_storage(&config_json).map_err(sql_json_error)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
+}
+
+fn snapshot_json_for_storage(snapshot: &HookRow) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(snapshot).context("could not serialize hook snapshot")?;
+    value["action"] = serde_json::from_str(&encode_action_for_storage(&snapshot.action)?)
+        .context("could not serialize encrypted hook snapshot action")?;
+    serde_json::to_string(&value).context("could not serialize encrypted hook snapshot")
+}
+
+fn snapshot_from_storage(snapshot_json: &str) -> anyhow::Result<HookRow> {
+    let mut snapshot: HookRow =
+        serde_json::from_str(snapshot_json).context("could not deserialize hook snapshot")?;
+    snapshot.action = decode_action_from_storage(
+        &serde_json::to_string(&snapshot.action)
+            .context("could not serialize stored hook snapshot action")?,
+    )?;
+    Ok(snapshot)
 }
 
 fn run_from(row: &Row<'_>) -> rusqlite::Result<HookRunRow> {
@@ -707,7 +1007,7 @@ fn run_from(row: &Row<'_>) -> rusqlite::Result<HookRunRow> {
         hook_id: row.get(1)?,
         status: row.get(2)?,
         envelope: serde_json::from_str(&envelope_json).map_err(sql_json_error)?,
-        snapshot: serde_json::from_str(&snapshot_json).map_err(sql_json_error)?,
+        snapshot: snapshot_from_storage(&snapshot_json).map_err(sql_json_error)?,
         session_pk: row.get(5)?,
         error: row.get(6)?,
         attempt_count: row.get(7)?,
@@ -747,7 +1047,7 @@ pub async fn create_hook(store: &Store, input: HookInput) -> anyhow::Result<Hook
     let stored = hook.clone();
     store
         .with_conn(move |c| {
-            let config_json = serde_json::to_string(&stored.action)
+            let config_json = encode_action_for_storage(&stored.action)
                 .map_err(sql_json_error)?;
             c.execute(
                 "INSERT INTO automation_hooks(id,name,trigger_kind,action_kind,enabled,inbound_path,config_json,created_at,updated_at) \
@@ -776,7 +1076,7 @@ pub async fn update_hook(store: &Store, id: &str, input: HookInput) -> anyhow::R
     let now = now_ms();
     store
         .with_conn(move |c| {
-            let config_json = serde_json::to_string(&input.action)
+            let config_json = encode_action_for_storage(&input.action)
                 .map_err(sql_json_error)?;
             let changed = c.execute(
                 "UPDATE automation_hooks SET name=?2, trigger_kind=?3, action_kind=?4, enabled=?5, \
@@ -815,6 +1115,23 @@ pub async fn list_hooks(store: &Store) -> anyhow::Result<Vec<HookRow>> {
                 .query_map([], hook_from)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(hooks)
+        })
+        .await
+}
+
+pub async fn find_inbound_hook(store: &Store, path: &str) -> anyhow::Result<Option<HookRow>> {
+    let path = path.to_string();
+    store
+        .with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {HOOK_COLUMNS} FROM automation_hooks \
+                     WHERE trigger_kind='webhook.inbound' AND inbound_path=?1"
+                ),
+                params![path],
+                hook_from,
+            )
+            .optional()
         })
         .await
 }
@@ -979,7 +1296,7 @@ async fn create_run_at(
         .with_conn(move |c| {
             let envelope_json = serde_json::to_string(&stored.envelope)
                 .map_err(sql_json_error)?;
-            let snapshot_json = serde_json::to_string(&stored.snapshot)
+            let snapshot_json = snapshot_json_for_storage(&stored.snapshot)
                 .map_err(sql_json_error)?;
             c.execute(
                 "INSERT INTO automation_hook_runs(id,hook_id,status,envelope_json,snapshot_json,session_pk,error,attempt_count,last_http_status,queued_at,started_at,finished_at) \
@@ -1061,7 +1378,76 @@ pub async fn hook_detail(store: &Store, id: &str) -> anyhow::Result<Option<HookD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        http::StatusCode,
+        response::Redirect,
+        routing::{get, post},
+        Router,
+    };
     use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::oneshot;
+
+    async fn loopback_status_server(
+        statuses: Vec<StatusCode>,
+    ) -> (String, Arc<AtomicUsize>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let statuses = Arc::new(statuses);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_statuses = Arc::clone(&statuses);
+        let handler_requests = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let statuses = Arc::clone(&handler_statuses);
+                let ordinal = handler_requests.fetch_add(1, Ordering::SeqCst);
+                async move { statuses[ordinal.min(statuses.len() - 1)] }
+            }),
+        );
+        let (shutdown, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async { _ = receiver.await })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}/"), requests, shutdown)
+    }
+
+    async fn loopback_redirect_server() -> (String, Arc<AtomicUsize>, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirected = Arc::new(AtomicUsize::new(0));
+        let redirected_handler = Arc::clone(&redirected);
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { Redirect::temporary("/redirected") })
+                    .post(|| async { Redirect::temporary("/redirected") }),
+            )
+            .route(
+                "/redirected",
+                post(move || {
+                    let redirected = Arc::clone(&redirected_handler);
+                    async move {
+                        redirected.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let (shutdown, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async { _ = receiver.await })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}/"), redirected, shutdown)
+    }
 
     #[test]
     fn envelope_caps_values_and_truncates_object_keys_lexically() {
@@ -1121,6 +1507,362 @@ mod tests {
         .capped();
 
         assert!(serde_json::to_vec(&envelope).unwrap().len() <= MAX_ENVELOPE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn redirect_responses_are_not_followed() {
+        let (store, _db) = mem_store().await;
+        let (url, redirected, shutdown) = loopback_redirect_server().await;
+        let hook = create_hook(
+            &store,
+            HookInput::outbound("No redirect", TriggerKind::SessionEnd, url, None),
+        )
+        .await
+        .unwrap();
+        let run = create_run(&store, &hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        let error =
+            deliver_outbound_with_retry(&store, &run, &[std::time::Duration::ZERO], |_| async {})
+                .await
+                .unwrap_err();
+        assert_eq!(error.to_string(), "outbound webhook delivery failed");
+        assert_eq!(redirected.load(Ordering::SeqCst), 0);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn records_retry_history_without_waiting_and_marks_delivery_terminal() {
+        let (store, _db) = mem_store().await;
+        // Explicit loopback ports are intentionally allowed for local development and tests.
+        let (url, requests, shutdown) = loopback_status_server(vec![
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ])
+        .await;
+        let hook = create_hook(
+            &store,
+            HookInput::outbound("Retries", TriggerKind::SessionEnd, url, None),
+        )
+        .await
+        .unwrap();
+        let run = create_run(&store, &hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        let error = deliver_outbound_with_retry(
+            &store,
+            &run,
+            &[
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            ],
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "outbound webhook delivery failed");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        let stored = list_runs(&store, &hook.id).await.unwrap().pop().unwrap();
+        assert_eq!(stored.attempt_count, 3);
+        assert_eq!(stored.last_http_status, Some(500));
+        let detail = hook_detail(&store, &hook.id).await.unwrap().unwrap();
+        assert_eq!(
+            detail.runs[0]
+                .attempts
+                .iter()
+                .map(|attempt| (
+                    attempt.ordinal,
+                    attempt.http_status,
+                    attempt.error.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Some(500), None),
+                (2, Some(500), None),
+                (3, Some(500), None)
+            ]
+        );
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn records_successful_outbound_delivery() {
+        let (store, _db) = mem_store().await;
+        let (url, requests, shutdown) = loopback_status_server(vec![StatusCode::NO_CONTENT]).await;
+        let hook = create_hook(
+            &store,
+            HookInput::outbound("Success", TriggerKind::SessionEnd, url, None),
+        )
+        .await
+        .unwrap();
+        let run = create_run(&store, &hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+
+        deliver_outbound_with_retry(&store, &run, &OUTBOUND_RETRY_DELAYS, |_| async {})
+            .await
+            .unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let stored = list_runs(&store, &hook.id).await.unwrap().pop().unwrap();
+        assert_eq!(stored.attempt_count, 1);
+        assert_eq!(stored.last_http_status, Some(204));
+        let _ = shutdown.send(());
+    }
+
+    #[test]
+    fn renders_default_and_placeholder_only_outbound_payloads() {
+        let event = json!({ "kind": "session.end" });
+        let run = json!({ "id": "run-1", "attempt": 2, "test": false });
+
+        assert_eq!(render_outbound_payload(None, &event, &run).unwrap(), event);
+        assert_eq!(
+            render_outbound_payload(
+                Some(r#"{"payload":"${event}","delivery":"${run}"}"#),
+                &event,
+                &run,
+            )
+            .unwrap(),
+            json!({
+                "payload": { "kind": "session.end" },
+                "delivery": { "id": "run-1", "attempt": 2, "test": false }
+            })
+        );
+
+        for template in [
+            "not json",
+            r#"{"event":"before ${event}"}"#,
+            r#"{"event":"${unknown}"}"#,
+        ] {
+            assert!(render_outbound_payload(Some(template), &event, &run).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn create_and_update_reject_invalid_outbound_payload_templates() {
+        let (store, _db) = mem_store().await;
+        for template in [
+            "not json",
+            r#"{"event":"prefix ${event}"}"#,
+            r#"{"event":"${unknown}"}"#,
+        ] {
+            assert!(
+                create_hook(
+                    &store,
+                    HookInput::outbound(
+                        "Invalid template",
+                        TriggerKind::SessionEnd,
+                        "https://example.com/hook",
+                        Some(template.into()),
+                    ),
+                )
+                .await
+                .is_err(),
+                "{template:?} must be rejected"
+            );
+        }
+
+        let hook = create_hook(
+            &store,
+            HookInput::outbound(
+                "Valid template",
+                TriggerKind::SessionEnd,
+                "https://example.com/hook",
+                Some(r#"{"payload":"${event}","delivery":"${run}"}"#.into()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(update_hook(
+            &store,
+            &hook.id,
+            HookInput::outbound(
+                "Valid template",
+                TriggerKind::SessionEnd,
+                "https://example.com/hook",
+                Some(r#"{"payload":"prefix ${event}"}"#.into()),
+            ),
+        )
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn outbound_url_policy_only_permits_safe_schemes_and_hosts() {
+        for url in [
+            "ftp://example.com/hook",
+            "https://user@example.com/hook",
+            "https://example.com:444/hook",
+            "http://example.com/hook",
+            "https://127.0.0.1/hook",
+            "http://[::2]/hook",
+        ] {
+            assert!(
+                validate_outbound_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+        for url in [
+            "https://example.com/hook",
+            "http://localhost/hook",
+            "http://localhost:43123/hook", // Explicit loopback ports remain intentional.
+            "http://127.0.0.1/hook",
+            "http://[::1]/hook",
+        ] {
+            assert!(validate_outbound_url(url).is_ok(), "{url} must be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_private_nonpublic_and_ipv4_mapped_ipv6_outbound_addresses() {
+        for address in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.0.1",
+        ] {
+            assert!(
+                !is_public_outbound_ip(address.parse().unwrap()),
+                "{address} must be rejected"
+            );
+        }
+        assert!(is_public_outbound_ip("1.1.1.1".parse().unwrap()));
+        assert!(is_public_outbound_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn outbound_headers_are_encrypted_at_rest_and_legacy_rows_read() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (store, _db) = mem_store().await;
+        let mut input = HookInput::outbound(
+            "Encrypted headers",
+            TriggerKind::SessionEnd,
+            "https://example.com/hook",
+            None,
+        );
+        let HookActionInput::WebhookOutbound(action) = &mut input.action else {
+            unreachable!();
+        };
+        action.headers.push(WebhookHeader {
+            name: "Authorization".into(),
+            value: "Bearer secret-value".into(),
+        });
+        let hook = create_hook(&store, input).await.unwrap();
+
+        let hook_id = hook.id.clone();
+        let stored: String = store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT config_json FROM automation_hooks WHERE id=?1",
+                    params![hook_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(stored.contains("enc:v1:"));
+        assert!(!stored.contains("Bearer secret-value"));
+        let listed = list_hooks(&store).await.unwrap();
+        let HookActionInput::WebhookOutbound(action) = &listed[0].action else {
+            unreachable!();
+        };
+        assert_eq!(action.headers[0].value, "Bearer secret-value");
+
+        let run = create_run(&store, &hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+        let run_id = run.id.clone();
+        let snapshot: String = store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT snapshot_json FROM automation_hook_runs WHERE id=?1",
+                    params![run_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(snapshot.contains("enc:v1:"));
+        assert!(!snapshot.contains("Bearer secret-value"));
+
+        let mut literal_input = HookInput::outbound(
+            "Encrypted prefix",
+            TriggerKind::SessionStart,
+            "https://example.com/literal",
+            None,
+        );
+        let HookActionInput::WebhookOutbound(action) = &mut literal_input.action else {
+            unreachable!();
+        };
+        action.headers.push(WebhookHeader {
+            name: "X-Literal".into(),
+            value: "enc:ordinary-value".into(),
+        });
+        let literal = create_hook(&store, literal_input).await.unwrap();
+        let literal_id = literal.id.clone();
+        let stored_literal: String = store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT config_json FROM automation_hooks WHERE id=?1",
+                    params![literal_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(!stored_literal.contains("enc:ordinary-value"));
+        let HookActionInput::WebhookOutbound(action) = &list_hooks(&store)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|hook| hook.id == literal.id)
+            .unwrap()
+            .action
+        else {
+            unreachable!();
+        };
+        assert_eq!(action.headers[0].value, "enc:ordinary-value");
+
+        let legacy_id = hook.id.clone();
+        store
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE automation_hooks SET config_json=?2 WHERE id=?1",
+                    params![
+                        hook.id,
+                        r#"{"kind":"webhook.outbound","config":{"url":"https://example.com/hook","method":"POST","headers":[{"name":"X-Legacy","value":"legacy"}],"payloadTemplate":null}}"#
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let listed = list_hooks(&store).await.unwrap();
+        let HookActionInput::WebhookOutbound(action) = &listed
+            .into_iter()
+            .find(|row| row.id == legacy_id)
+            .unwrap()
+            .action
+        else {
+            unreachable!();
+        };
+        assert_eq!(action.headers[0].value, "legacy");
     }
 
     #[tokio::test]

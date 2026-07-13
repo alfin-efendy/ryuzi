@@ -1,8 +1,8 @@
 use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
 use crate::automation::{
-    AutomationEnvelope, AutomationSource, Dispatcher, HookActionInput, HookOrigin, RateVerdict,
-    TriggerKind,
+    AutomationEnvelope, AutomationSource, Dispatcher, HookActionInput, HookOrigin, HookRow,
+    RateVerdict, TriggerKind,
 };
 use crate::domain::{
     ApprovalResponse, CoreEvent, Message, PermMode, Project, Session, ToolPolicyRow,
@@ -45,6 +45,31 @@ pub(crate) fn basename_of(path: &str) -> String {
 }
 
 pub struct ControlPlaneAutomationSink(std::sync::Weak<ControlPlane>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundWebhookDispatch {
+    pub hook_id: String,
+    pub run_id: String,
+    pub session_pk: String,
+}
+
+#[derive(Debug)]
+pub enum InboundWebhookError {
+    Invalid(String),
+    RateLimited,
+    Unavailable(String),
+}
+
+impl std::fmt::Display for InboundWebhookError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) | Self::Unavailable(error) => formatter.write_str(error),
+            Self::RateLimited => formatter.write_str("automation rate limit exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for InboundWebhookError {}
 
 #[async_trait::async_trait]
 impl crate::automation::AutomationEventSink for ControlPlaneAutomationSink {
@@ -380,6 +405,94 @@ impl ControlPlane {
     /// Dispatch one normalized automation event. Event sources call this narrow
     /// method directly; there is intentionally no background subscriber on the
     /// core-event bus, which would outlive short-lived control planes in tests.
+    pub async fn dispatch_inbound_webhook(
+        self: &Arc<Self>,
+        hook: HookRow,
+        envelope: AutomationEnvelope,
+    ) -> Result<InboundWebhookDispatch, InboundWebhookError> {
+        if hook.trigger_kind != TriggerKind::WebhookInbound || !hook.enabled {
+            return Err(InboundWebhookError::Invalid(
+                "inbound webhook hook is not enabled".to_string(),
+            ));
+        }
+        let HookActionInput::AgentRun(action) = &hook.action else {
+            return Err(InboundWebhookError::Invalid(
+                "inbound webhook hook must use agent.run".to_string(),
+            ));
+        };
+        if action.gateway_id != "local" {
+            return Err(InboundWebhookError::Invalid(
+                "agent.run target gateway is not local".to_string(),
+            ));
+        }
+        if self
+            .store
+            .get_project(&action.project_id)
+            .await
+            .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?
+            .is_none()
+        {
+            return Err(InboundWebhookError::Invalid(
+                "agent.run target project no longer exists".to_string(),
+            ));
+        }
+        if self
+            .automation
+            .rate_verdict(&hook.id, TriggerKind::WebhookInbound, 0)
+            != RateVerdict::Accepted
+        {
+            return Err(InboundWebhookError::RateLimited);
+        }
+        let envelope = envelope.capped();
+        let envelope_json = serde_json::to_value(&envelope)
+            .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;
+        let run = crate::automation::create_run(&self.store, &hook.id, envelope_json)
+            .await
+            .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;
+        let event_json = serde_json::to_string_pretty(&run.envelope)
+            .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;
+        let prompt = format!(
+            "{}\n\n[UNTRUSTED AUTOMATION EVENT — JSON]\n{}\n[END UNTRUSTED AUTOMATION EVENT]",
+            action.prompt, event_json
+        );
+        let git = (!action.branch.is_empty()).then(|| crate::domain::SessionGitOptions {
+            use_worktree: true,
+            create_branch: false,
+            branch_name: None,
+            base_branch: Some(action.branch.clone()),
+        });
+        let worker = action.agent_id.as_ref().map(|agent| WorkerBinding {
+            agent: agent.clone(),
+            home_session_pk: None,
+        });
+        let session = self
+            .start_session_with_prompt_and_origin(
+                &action.project_id,
+                crate::harness::TurnPrompt::text(prompt.clone(), prompt),
+                "automation",
+                &[],
+                git,
+                None,
+                action.model_override.clone(),
+                worker,
+                Some(HookOrigin::new(&run.hook_id, &run.id, 1)),
+            )
+            .await
+            .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;
+        crate::automation::link_run_session(&self.store, &run.id, &session.session_pk)
+            .await
+            .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;
+        self.emit_automation_run_changed(&run.hook_id, &run.id, "running");
+        Ok(InboundWebhookDispatch {
+            hook_id: run.hook_id,
+            run_id: run.id,
+            session_pk: session.session_pk,
+        })
+    }
+
+    /// Dispatch one normalized automation event. Event sources call this narrow
+    /// method directly; there is intentionally no background subscriber on the
+    /// core-event bus, which would outlive short-lived control planes in tests.
     pub async fn dispatch_automation_event(
         self: &Arc<Self>,
         envelope: AutomationEnvelope,
@@ -433,19 +546,19 @@ impl ControlPlane {
 
             match &run.snapshot.action {
                 HookActionInput::WebhookOutbound(_) => {
-                    // Outbound delivery is deliberately deferred to Task 4. The
-                    // durable queued row makes the lack of delivery explicit and
-                    // never reports a fabricated success.
-                    if let Err(error) = crate::automation::mark_run_queued_not_dispatched(
-                        &self.store,
+                    let result = crate::automation::deliver_outbound(&self.store, &run).await;
+                    let (status, error) = match result {
+                        Ok(()) => ("success", None),
+                        Err(error) => ("failed", Some(error.to_string())),
+                    };
+                    self.finish_automation_run(
+                        &run.hook_id,
                         &run.id,
-                        "outbound delivery is not implemented",
+                        status,
+                        None,
+                        error.as_deref(),
                     )
-                    .await
-                    {
-                        tracing::warn!(run_id = %run.id, "automation outbound queue update failed: {error}");
-                    }
-                    self.emit_automation_run_changed(&run.hook_id, &run.id, "queued");
+                    .await;
                 }
                 HookActionInput::AgentRun(action) => {
                     if action.gateway_id != "local" {
