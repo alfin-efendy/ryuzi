@@ -1167,6 +1167,39 @@ async sessionTodos(runnerId: string | null, sessionPk: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * A session's durable queued messages.
+ */
+async sessionQueue(runnerId: string | null, sessionPk: string) : Promise<Result<QueuedMessageInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_queue", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Queue a durable message for a session.
+ */
+async enqueueSessionMessage(runnerId: string | null, sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<QueuedMessageInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("enqueue_session_message", { runnerId, sessionPk, prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove a durable queued message from a session.
+ */
+async removeSessionMessage(runnerId: string | null, sessionPk: string, id: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_session_message", { runnerId, sessionPk, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listSkills(runnerId: string | null) : Promise<Result<InstalledSkillInfo[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_skills", { runnerId }) };
@@ -1768,7 +1801,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "sessionQueueChanged"; session_pk: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -2237,6 +2270,7 @@ export type ProjectRuntimeInfo = { projectId: string; model: string | null; stor
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaCapability = "claude" | "codex"
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
+export type QueuedMessageInfo = { id: string; text: string }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
