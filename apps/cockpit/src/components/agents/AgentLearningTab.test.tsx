@@ -22,7 +22,10 @@ const reviewerLearning: AgentLearningInfo = {
   skillUsage: [{ skillId: "requesting-code-review", uses: 3, successes: 2, conceptId: "concise" }],
   reviews: [{ conceptId: "concise", title: "Review update", description: "Stored preference", timestamp: "2026-03-02T00:00:00Z" }],
   curator: { concept: parsed, lastEventId: "event-1" },
-  curatorHistory: [{ snapshotId: "snapshot-1", concept: { ...parsed, title: "Earlier knowledge" } }],
+  curatorHistory: [
+    { snapshotId: "snapshot-new", concept: { ...parsed, title: "Newest knowledge" } },
+    { snapshotId: "snapshot-old", concept: { ...parsed, title: "Earlier knowledge" } },
+  ],
 };
 
 const load = mock(async (_agentId: string) => {});
@@ -72,6 +75,15 @@ test("Learning renders memory, journey, usage, reviews, curator, and repair sect
   expect(screen.getByText("memory/user/broken.md")).toBeTruthy();
 });
 
+test("curator history preserves backend newest-first order", () => {
+  render(<AgentLearningTab agentId="reviewer" />);
+  const rollbackButtons = screen.getAllByRole("button", { name: /^Rollback / });
+  expect(rollbackButtons.map((button) => button.getAttribute("aria-label"))).toEqual([
+    "Rollback Newest knowledge",
+    "Rollback Earlier knowledge",
+  ]);
+});
+
 test("raw repair validates before Replace", async () => {
   render(<AgentLearningTab agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Repair memory/user/broken.md" }));
@@ -115,5 +127,5 @@ test("rollback requires explicit confirmation with the non-agent-file warning", 
   ).toBeTruthy();
   expect(rollback).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Restore snapshot" }));
-  await waitFor(() => expect(rollback).toHaveBeenCalledWith("reviewer", "snapshot-1"));
+  await waitFor(() => expect(rollback).toHaveBeenCalledWith("reviewer", "snapshot-old"));
 });

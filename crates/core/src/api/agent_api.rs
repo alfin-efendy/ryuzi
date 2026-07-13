@@ -634,20 +634,6 @@ fn knowledge_store(
         .map_err(knowledge_api_error)
 }
 
-async fn require_memory_concept(
-    knowledge: &crate::agents::knowledge::KnowledgeStore,
-    concept_id: &str,
-) -> Result<(), ApiError> {
-    let concept = knowledge
-        .read(concept_id)
-        .await
-        .map_err(knowledge_api_error)?;
-    if concept.scope.is_none() || !concept.relative_path.starts_with("memory/") {
-        return Err(ApiError::not_found("memory concept was not found"));
-    }
-    Ok(())
-}
-
 fn require_memory_path(relative_path: &str) -> Result<(), ApiError> {
     if !is_memory_relative_path(relative_path) {
         return Err(ApiError::not_found("memory concept was not found"));
@@ -1046,9 +1032,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let agent_id = require_agent(state, &a.agent_id).await?;
             let input = concept_input_from_mutation(a.input)?;
             let knowledge = knowledge_store(state, &agent_id)?;
-            require_memory_concept(&knowledge, &a.concept_id).await?;
             let concept = knowledge
-                .update(&a.concept_id, input)
+                .update_memory(&a.concept_id, input)
                 .await
                 .map_err(knowledge_api_error)?;
             ok(concept_info(concept))
@@ -1057,9 +1042,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: ConceptP = params(p)?;
             let agent_id = require_agent(state, &a.agent_id).await?;
             let knowledge = knowledge_store(state, &agent_id)?;
-            require_memory_concept(&knowledge, &a.concept_id).await?;
             knowledge
-                .delete(&a.concept_id)
+                .delete_memory(&a.concept_id)
                 .await
                 .map_err(knowledge_api_error)?;
             ok(agent_learning_info(state, &agent_id).await?)
@@ -1534,6 +1518,41 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn raw_validate_and_replace_reject_blank_descriptions() {
+        for method in ["validate_agent_concept_raw", "replace_agent_concept_raw"] {
+            for description in ["", "   "] {
+                let s = state_with_invalid_concept().await;
+                let id = default_agent_id(&s).await;
+                let raw = format!(
+                    "---\ntype: Memory\ntitle: Repaired\ndescription: '{description}'\ntimestamp: 2026-07-12T14:30:00Z\nscope: user\nagent_id: {id}\n---\n\nBody.\n"
+                );
+                let error = dispatch(
+                    &s,
+                    method,
+                    json!({
+                        "agent_id": id,
+                        "relative_path": "memory/user/broken.md",
+                        "raw_markdown": raw,
+                    }),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.status, 400, "{method} accepted `{description}`");
+                assert_eq!(
+                    dispatch(&s, "get_agent_learning", json!({"agent_id": id}))
+                        .await
+                        .unwrap()["invalid"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1,
+                    "{method} changed the invalid file"
+                );
+            }
+        }
     }
 
     #[tokio::test]

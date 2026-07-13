@@ -121,6 +121,9 @@ pub fn parse_concept(relative_path: &str, raw: &str) -> anyhow::Result<Knowledge
     let title = take_string(&mut fields, "title")?.context("missing required `title`")?;
     let description =
         take_string(&mut fields, "description")?.context("missing required `description`")?;
+    if description.trim().is_empty() {
+        bail!("concept description must not be blank");
+    }
     let raw_timestamp =
         take_string(&mut fields, "timestamp")?.context("missing required `timestamp`")?;
     let timestamp = DateTime::parse_from_rfc3339(&raw_timestamp)
@@ -345,6 +348,16 @@ mod tests {
             "---\ntype: Review\ntitle: A\ndescription: A\ntimestamp: yesterday\n---\nA"
         )
         .is_err());
+    }
+
+    #[test]
+    fn okf_rejects_blank_or_whitespace_description() {
+        for description in ["", "   "] {
+            let raw = format!(
+                "---\ntype: Memory\ntitle: A\ndescription: '{description}'\ntimestamp: 2026-07-12T14:30:00Z\nscope: user\n---\nA"
+            );
+            assert!(parse_concept("memory/user/a.md", &raw).is_err());
+        }
     }
 
     #[test]

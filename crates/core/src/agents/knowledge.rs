@@ -359,11 +359,59 @@ impl KnowledgeStore {
         })
     }
 
+    /// Updates a concept only when the concept found under the write fence is
+    /// owned by the memory area.
+    pub async fn update_memory(
+        &self,
+        concept_id: &str,
+        input: KnowledgeConceptInput,
+    ) -> anyhow::Result<KnowledgeConcept> {
+        let _guard = self.write_lock.lock().await;
+        let concept = self.concept_from_input(concept_id.to_owned(), &input)?;
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .filter(|existing| is_memory_relative_path(&existing.relative_path))
+                .ok_or_else(|| anyhow!("memory concept `{concept_id}` was not found"))?;
+            stage_concept(stage, &concept)?;
+            if existing.relative_path != concept.relative_path {
+                fs::remove_file(stage.join(existing.relative_path))?;
+            }
+            Ok((
+                concept.clone(),
+                vec![(
+                    "update".into(),
+                    concept.id.clone(),
+                    concept.relative_path.clone(),
+                )],
+            ))
+        })
+    }
+
     pub async fn delete(&self, concept_id: &str) -> anyhow::Result<()> {
         let _guard = self.write_lock.lock().await;
         self.commit_staged_mutation(|stage| {
             let existing = find_concept(stage, concept_id)?
                 .ok_or_else(|| anyhow!("concept `{concept_id}` was not found"))?;
+            fs::remove_file(stage.join(&existing.relative_path))?;
+            Ok((
+                (),
+                vec![(
+                    "delete".into(),
+                    concept_id.to_owned(),
+                    existing.relative_path,
+                )],
+            ))
+        })
+    }
+
+    /// Deletes a concept only when the concept found under the write fence is
+    /// owned by the memory area.
+    pub async fn delete_memory(&self, concept_id: &str) -> anyhow::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        self.commit_staged_mutation(|stage| {
+            let existing = find_concept(stage, concept_id)?
+                .filter(|existing| is_memory_relative_path(&existing.relative_path))
+                .ok_or_else(|| anyhow!("memory concept `{concept_id}` was not found"))?;
             fs::remove_file(stage.join(&existing.relative_path))?;
             Ok((
                 (),
@@ -1276,6 +1324,31 @@ mod tests {
             writes: vec![(path, render_concept(&concept).unwrap())],
             removes: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn memory_owned_mutations_reject_non_memory_concepts_without_changing_them() {
+        let (_root, store) = fixture_store("a");
+        store
+            .replace_raw(
+                "learning/journey/internal.md",
+                "---\ntype: Journey\ntitle: Internal\ndescription: Internal journey.\ntimestamp: 2026-08-01T00:00:00Z\n---\n\nOriginal.\n",
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .update_memory(
+                "internal",
+                memory_input(KnowledgeScope::User, "replacement"),
+            )
+            .await
+            .is_err());
+        assert!(store.delete_memory("internal").await.is_err());
+
+        let preserved = store.read("internal").await.unwrap();
+        assert_eq!(preserved.relative_path, "learning/journey/internal.md");
+        assert_eq!(preserved.body, "Original.");
     }
 
     #[tokio::test]

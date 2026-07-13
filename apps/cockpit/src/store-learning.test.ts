@@ -178,6 +178,43 @@ test("rollback result wins over an older load and clears loading", async () => {
   expect(useLearning.getState().loading.reviewer).toBe(false);
 });
 
+test("newer rollback remains active and wins when an older rollback resolves first", async () => {
+  let resolveOld!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  rollbackAgentLearning
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveOld = resolve)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldRollback = useLearning.getState().rollback("reviewer", "snapshot-1");
+  const newRollback = useLearning.getState().rollback("reviewer", "snapshot-2");
+  resolveOld(ok(learning("Older rollback")));
+  await oldRollback;
+  expect(useLearning.getState().rollingBack.reviewer).toBe("snapshot-2");
+  expect(useLearning.getState().byAgent.reviewer).toBeUndefined();
+
+  resolveNew(ok(learning("Newest rollback")));
+  await newRollback;
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest rollback");
+});
+
+test("rollback started after a load wins when responses resolve out of order", async () => {
+  let resolveLoad!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  let resolveRollback!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning.mockImplementationOnce(() => new Promise((resolve) => (resolveLoad = resolve)));
+  rollbackAgentLearning.mockImplementationOnce(() => new Promise((resolve) => (resolveRollback = resolve)));
+
+  const load = useLearning.getState().load("reviewer");
+  const rollback = useLearning.getState().rollback("reviewer", "snapshot-1");
+  resolveLoad(ok(learning("Stale load")));
+  await load;
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+
+  resolveRollback(ok(learning("Rollback result")));
+  await rollback;
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Rollback result");
+});
+
 test("latest failed load clears loading without replacing the snapshot", async () => {
   useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
   getAgentLearning.mockResolvedValueOnce(err("unavailable"));

@@ -13,7 +13,6 @@ export function CuratorCard({
   rollingBack: string | null;
   onRollback: (snapshot: CuratorHistorySnapshotInfo) => void;
 }) {
-  const newestFirst = [...history].reverse();
   return (
     <SettingsCard>
       <SettingsCardRow className="items-start">
@@ -23,7 +22,7 @@ export function CuratorCard({
           {curator.concept ? <SettingsCardHint>{curator.concept.description || curator.concept.body}</SettingsCardHint> : null}
         </div>
       </SettingsCardRow>
-      {newestFirst.map((snapshot) => (
+      {history.map((snapshot) => (
         <SettingsCardRow key={snapshot.snapshotId} className="items-start">
           <div className="min-w-0 flex-1">
             <div className="text-xs font-medium">{snapshot.concept.title}</div>

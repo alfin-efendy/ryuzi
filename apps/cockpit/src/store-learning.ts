@@ -20,12 +20,32 @@ type LearningState = {
 const message = (resource: string) => `${resource} failed`;
 
 export const useLearning = create<LearningState>((set, get) => {
-  const installSnapshot = (agentId: string, snapshot: AgentLearningInfo) => {
+  const beginOperation = (agentId: string) => {
+    const generation = (get().requestGeneration[agentId] ?? 0) + 1;
+    set((state) => ({
+      requestGeneration: { ...state.requestGeneration, [agentId]: generation },
+      loading: { ...state.loading, [agentId]: false },
+      rollingBack: { ...state.rollingBack, [agentId]: null },
+    }));
+    return generation;
+  };
+
+  const installSnapshot = (agentId: string, generation: number, snapshot: AgentLearningInfo) => {
+    if (get().requestGeneration[agentId] !== generation) return false;
     set((state) => ({
       byAgent: { ...state.byAgent, [agentId]: snapshot },
       loading: { ...state.loading, [agentId]: false },
-      requestGeneration: { ...state.requestGeneration, [agentId]: (state.requestGeneration[agentId] ?? 0) + 1 },
     }));
+    return true;
+  };
+
+  const refreshAfterMutation = async (agentId: string, generation: number) => {
+    const result = await commands.getAgentLearning(agentId);
+    if (result.status === "error") {
+      if (get().requestGeneration[agentId] === generation) toast.error(message("Learning load"));
+      return false;
+    }
+    return installSnapshot(agentId, generation, result.data);
   };
 
   return {
@@ -35,7 +55,7 @@ export const useLearning = create<LearningState>((set, get) => {
     requestGeneration: {},
 
     load: async (agentId) => {
-      const generation = (get().requestGeneration[agentId] ?? 0) + 1;
+      const generation = beginOperation(agentId);
       set((state) => ({
         loading: { ...state.loading, [agentId]: true },
         requestGeneration: { ...state.requestGeneration, [agentId]: generation },
@@ -56,33 +76,33 @@ export const useLearning = create<LearningState>((set, get) => {
     },
 
     createConcept: async (agentId, input) => {
+      const generation = beginOperation(agentId);
       const result = await commands.createAgentConcept(agentId, input);
       if (result.status === "error") {
-        toast.error(message("Create memory"));
+        if (get().requestGeneration[agentId] === generation) toast.error(message("Create memory"));
         return false;
       }
-      await get().load(agentId);
-      return true;
+      return refreshAfterMutation(agentId, generation);
     },
 
     updateConcept: async (agentId, conceptId, input) => {
+      const generation = beginOperation(agentId);
       const result = await commands.updateAgentConcept(agentId, conceptId, input);
       if (result.status === "error") {
-        toast.error(message("Update memory"));
+        if (get().requestGeneration[agentId] === generation) toast.error(message("Update memory"));
         return false;
       }
-      await get().load(agentId);
-      return true;
+      return refreshAfterMutation(agentId, generation);
     },
 
     deleteConcept: async (agentId, conceptId) => {
+      const generation = beginOperation(agentId);
       const result = await commands.deleteAgentConcept(agentId, conceptId);
       if (result.status === "error") {
-        toast.error(message("Delete memory"));
+        if (get().requestGeneration[agentId] === generation) toast.error(message("Delete memory"));
         return false;
       }
-      installSnapshot(agentId, result.data);
-      return true;
+      return installSnapshot(agentId, generation, result.data);
     },
 
     validateRaw: async (agentId, path, raw) => {
@@ -95,38 +115,42 @@ export const useLearning = create<LearningState>((set, get) => {
     },
 
     replaceRaw: async (agentId, path, raw) => {
+      const generation = beginOperation(agentId);
       const result = await commands.replaceAgentConceptRaw(agentId, path, raw);
       if (result.status === "error") {
-        toast.error(message("Replace knowledge"));
+        if (get().requestGeneration[agentId] === generation) toast.error(message("Replace knowledge"));
         return false;
       }
-      await get().load(agentId);
-      return true;
+      return refreshAfterMutation(agentId, generation);
     },
 
     deleteInvalid: async (agentId, path) => {
+      const generation = beginOperation(agentId);
       const result = await commands.deleteInvalidAgentConcept(agentId, path);
       if (result.status === "error") {
-        toast.error(message("Delete invalid knowledge"));
+        if (get().requestGeneration[agentId] === generation) toast.error(message("Delete invalid knowledge"));
         return false;
       }
-      installSnapshot(agentId, result.data);
-      return true;
+      return installSnapshot(agentId, generation, result.data);
     },
 
     rollback: async (agentId, snapshotId) => {
+      const generation = beginOperation(agentId);
       set((state) => ({ rollingBack: { ...state.rollingBack, [agentId]: snapshotId } }));
       try {
         const result = await commands.rollbackAgentLearning(agentId, snapshotId);
+        if (get().requestGeneration[agentId] !== generation) return false;
         if (result.status === "error") {
           toast.error(message("Rollback knowledge"));
           return false;
         }
-        installSnapshot(agentId, result.data);
+        installSnapshot(agentId, generation, result.data);
         toast.success("Knowledge snapshot restored");
         return true;
       } finally {
-        set((state) => ({ rollingBack: { ...state.rollingBack, [agentId]: null } }));
+        if (get().requestGeneration[agentId] === generation) {
+          set((state) => ({ rollingBack: { ...state.rollingBack, [agentId]: null } }));
+        }
       }
     },
   };
