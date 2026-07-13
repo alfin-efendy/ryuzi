@@ -74,7 +74,7 @@ export function JobNewView() {
   // loading. Non-git projects have no branch list to wait for — they create
   // branchless jobs.
   const canCreate = prompt.trim().length > 0 && project !== undefined && (branch !== null || !isGit) && !saving;
-  const goScheduler = () => nav.navigate({ kind: "scheduler" });
+  const goAutomations = () => nav.navigate({ kind: "automations", tab: "scheduler" });
 
   const create = async () => {
     if (!canCreate || !project) return;
@@ -94,13 +94,13 @@ export function JobNewView() {
       notifyFail,
     });
     setSaving(false);
-    if (ok) goScheduler();
+    if (ok) goAutomations();
   };
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[760px]">
-        <BackButton label="Scheduler" onClick={goScheduler} />
+        <BackButton label="Automations" onClick={goAutomations} />
 
         <h2 className="m-0 mb-1 text-[22px] font-semibold tracking-[-0.02em]">New job</h2>
         <p className="m-0 mb-5 text-[13px] text-muted-foreground">
@@ -197,7 +197,7 @@ export function JobNewView() {
         </Card>
 
         <div className="flex items-center justify-end gap-2">
-          <Button variant="outline" onClick={goScheduler}>
+          <Button variant="outline" onClick={goAutomations}>
             Cancel
           </Button>
           <Button onClick={() => void create()} disabled={!canCreate}>

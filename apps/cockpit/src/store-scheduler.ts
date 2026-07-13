@@ -13,7 +13,7 @@ type SchedulerState = {
   createJob: (input: JobInput) => Promise<boolean>;
   updateJob: (id: string, input: JobInput) => Promise<boolean>;
   toggle: (id: string, enabled: boolean) => Promise<void>;
-  remove: (id: string) => Promise<void>;
+  remove: (id: string) => Promise<boolean>;
   runNow: (id: string) => Promise<void>;
 };
 
@@ -55,9 +55,7 @@ export const useScheduler = create<SchedulerState>((set, get) => ({
     applyResult(set, await commands.toggleJob("local", id, enabled), "Toggle job");
   },
 
-  remove: async (id) => {
-    applyResult(set, await commands.deleteJob("local", id), "Delete job");
-  },
+  remove: async (id) => applyResult(set, await commands.deleteJob("local", id), "Delete job"),
 
   runNow: async (id) => {
     applyResult(set, await commands.runJobNow("local", id), "Run job");

@@ -88,6 +88,16 @@ test("sidebar exposes Agents without a top-level Learning route", () => {
   expect(screen.queryByRole("button", { name: "Learning" })).toBeNull();
 });
 
+test("sidebar opens Automations and keeps it active for legacy scheduler jobs", () => {
+  useNav.setState({ history: { back: [], current: { kind: "scheduler" }, forward: [] } });
+  render(<Sidebar />);
+
+  const automations = screen.getByRole("button", { name: "Automations" });
+  expect(automations.className).toContain("bg-sidebar-accent");
+  fireEvent.click(automations);
+  expect(useNav.getState().history.current).toEqual({ kind: "automations" });
+});
+
 test("archive confirmation preserves the consequences and initially focuses Cancel", async () => {
   const dialog = await openArchiveConfirmation();
   const cancel = screen.getByRole("button", { name: "Cancel" });
