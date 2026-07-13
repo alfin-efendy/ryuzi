@@ -8,6 +8,7 @@ import type {
   EndpointKeyInfo,
   EndpointStatusInfo,
   ModelRouteInfo,
+  ModelRouteTargetCapability,
   Result,
   UsageSeries,
 } from "@/bindings";
@@ -161,6 +162,23 @@ const usage: UsageSeries = {
   todayOutputTokens: 210,
 };
 
+const routeTargetCapabilities: ModelRouteTargetCapability[] = [
+  {
+    provider: "openai",
+    model: "gpt-4.1",
+    supported: [
+      { value: "low", label: "Low", description: null },
+      { value: "high", label: "High", description: null },
+    ],
+    providerDefault: null,
+  },
+  { provider: "openai", model: "o3", supported: [{ value: "high", label: "High", description: null }], providerDefault: null },
+];
+const historicalEffortCapabilities: ModelRouteTargetCapability[] = [
+  { ...routeTargetCapabilities[0]!, supported: [{ value: "low", label: "Low", description: null }] },
+  routeTargetCapabilities[1]!,
+];
+
 const saveModelRoute = mock((_runnerId: string, _route: ModelRouteInfo) => Promise.resolve({ status: "ok" as const, data: routes }));
 const deleteModelRoute = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
 const revokeEndpointKey = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
@@ -198,6 +216,7 @@ mock.module("@/bindings", () => ({
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
+    listModelRouteTargetCapabilities: () => Promise.resolve({ status: "ok", data: routeTargetCapabilities }),
     projectRuntimeInfo: (projectId: string) =>
       Promise.resolve({
         status: "ok" as const,
@@ -268,7 +287,7 @@ const { useAgents } = await import("@/store-agents");
 function resetStores() {
   useEndpoint.setState({ status: null, keys: [], loaded: false });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
-  useModelRoutes.setState({ routes: [], loaded: false });
+  useModelRoutes.setState({ routes: [], targetCapabilities: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
   useAgents.setState({ models: [], loaded: false });
@@ -686,6 +705,97 @@ test("route target dropdown collapses anthropic + anthropic-oauth accounts shari
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
   expect(await screen.findAllByRole("option", { name: sharedModel })).toHaveLength(1);
   expect(screen.getByText("Anthropic")).toBeTruthy();
+});
+
+test("route target effort picker exposes only model default and exact capability options", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  expect(screen.queryByText(/override/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const effort = await screen.findByRole("combobox", { name: "Target 1 effort" });
+  fireEvent.click(effort);
+
+  expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["Model default", "Low", "High"]);
+  expect(screen.getByRole("option", { name: "Model default" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "Low" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "High" })).toBeTruthy();
+});
+
+test("route target without exact supported capability has no effort picker", async () => {
+  useConnections.setState({ catalog, connections: [connection, anthropicApiConnection], loaded: true });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "New route" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  fireEvent.click(await screen.findByRole("option", { name: "claude-sonnet-4-5" }));
+
+  expect(screen.queryByRole("combobox", { name: "Target 1 effort" })).toBeNull();
+});
+
+test("route target model change preserves compatible effort and clears incompatible effort", async () => {
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const effort = await screen.findByRole("combobox", { name: "Target 1 effort" });
+  fireEvent.click(effort);
+  fireEvent.click(await screen.findByRole("option", { name: "High" }));
+
+  const target = screen.getByRole("combobox", { name: "Target 1" });
+  fireEvent.click(target);
+  fireEvent.click(await screen.findByRole("option", { name: "o3" }));
+  expect(screen.getByRole("combobox", { name: "Target 1 effort" }).textContent).toContain("High");
+
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  fireEvent.click(await screen.findByRole("option", { name: "gpt-4.1" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1 effort" }));
+  fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
+  fireEvent.click(await screen.findByRole("option", { name: "o3" }));
+  expect(screen.getByRole("combobox", { name: "Target 1 effort" }).textContent).toContain("Model default");
+});
+
+test("historical explicit target effort stays readable and can reset to model default", async () => {
+  useModelRoutes.setState({
+    routes: [{ ...routes[0], targets: [{ provider: "openai", model: "gpt-4.1", effort: "high" }] }],
+    targetCapabilities: historicalEffortCapabilities,
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  expect(screen.getByText("High override")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const effort = await screen.findByRole("combobox", { name: "Target 1 effort" });
+  expect(effort.textContent).toContain("high");
+  fireEvent.click(effort);
+  expect(screen.getByRole("option", { name: "Model default" })).toBeTruthy();
+  expect(screen.getByRole("option", { name: "Low" })).toBeTruthy();
+  fireEvent.keyDown(effort, { key: "Escape" });
+});
+
+test("route target model default saves null and cards summarize only explicit overrides", async () => {
+  saveModelRoute.mockClear();
+  useModelRoutes.setState({
+    routes: [{ ...routes[0], targets: [{ provider: "openai", model: "gpt-4.1", effort: "high" }] }],
+    targetCapabilities: routeTargetCapabilities,
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+  expect(screen.getByText("High override")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  const effort = await screen.findByRole("combobox", { name: "Target 1 effort" });
+  fireEvent.click(effort);
+  fireEvent.click(await screen.findByRole("option", { name: "Model default" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save route" }));
+
+  await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
+  const [, savedRoute] = saveModelRoute.mock.calls[0] as [string, ModelRouteInfo];
+  expect(savedRoute.targets[0]?.effort).toBeNull();
 });
 
 test("route form saves targets as {provider, model} scoped to the family, not the connection", async () => {
