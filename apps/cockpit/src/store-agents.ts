@@ -80,7 +80,15 @@ export const useAgents = create<AgentsState>((set, get) => {
   let pendingReads = 0;
   let pendingMutations = 0;
   let mutationTail: Promise<void> = Promise.resolve();
-  let stateRevision = 0;
+  let registryRevision = 0;
+  let detailRevision = 0;
+
+  const bumpRegistryRevision = () => {
+    registryRevision += 1;
+  };
+  const bumpDetailRevision = () => {
+    detailRevision += 1;
+  };
 
   const beginRead = () => {
     pendingReads += 1;
@@ -116,14 +124,17 @@ export const useAgents = create<AgentsState>((set, get) => {
         agentId ? commands.getAgent(LOCAL_RUNNER, agentId) : Promise.resolve(null),
       ]);
       if (loadGeneration !== generation) return;
-      stateRevision += 1;
-      if (registry.status === "ok") set({ registry: registry.data, loaded: true });
-      else toast.error(`Couldn't load agents: ${registry.error.message}`);
+      if (registry.status === "ok") {
+        bumpRegistryRevision();
+        set({ registry: registry.data, loaded: true });
+      } else toast.error(`Couldn't load agents: ${registry.error.message}`);
       if (models.status === "ok") set({ models: models.data });
       else toast.error(`Couldn't load models: ${models.error.message}`);
-      if (detail && detailGeneration === requestedDetail) {
-        if (detail.status === "ok") set({ detail: detail.data });
-        else toast.error(`Couldn't load agent: ${detail.error.message}`);
+      if (agentId && detail && detailGeneration === requestedDetail) {
+        if (detail.status === "ok") {
+          bumpDetailRevision();
+          set({ detail: detail.data });
+        } else toast.error(`Couldn't load agent: ${detail.error.message}`);
       }
     } catch (error) {
       if (loadGeneration === generation) toast.error(`Couldn't load agents: ${errorMessage(error)}`);
@@ -134,20 +145,27 @@ export const useAgents = create<AgentsState>((set, get) => {
     try {
       const result = await commands.getAgent(LOCAL_RUNNER, agentId);
       if (detailGeneration !== generation) return;
-      stateRevision += 1;
-      if (result.status === "ok") set({ detail: result.data });
-      else toast.error(`Couldn't load agent: ${result.error.message}`);
+      if (result.status === "ok") {
+        bumpDetailRevision();
+        set({ detail: result.data });
+      } else toast.error(`Couldn't load agent: ${result.error.message}`);
     } catch (error) {
       if (detailGeneration === generation) toast.error(`Couldn't load agent: ${errorMessage(error)}`);
     }
   };
 
-  const beginOptimisticRevision = () => {
-    stateRevision += 1;
-    return stateRevision;
-  };
-  const rollbackIfCurrent = (revision: number, snapshot: Partial<AgentsState>) => {
-    if (stateRevision === revision) set(snapshot);
+  const snapshotRevisions = (includeDetail = false) => ({
+    registry: registryRevision,
+    detail: includeDetail ? detailRevision : null,
+  });
+  const rollbackResources = (
+    revisions: ReturnType<typeof snapshotRevisions>,
+    snapshot: { registry?: AgentRegistryInfo | null; detail?: AgentDetailInfo | null },
+  ) => {
+    if (snapshot.registry !== undefined && registryRevision === revisions.registry) set({ registry: snapshot.registry });
+    if (snapshot.detail !== undefined && revisions.detail !== null && detailRevision === revisions.detail) {
+      set({ detail: snapshot.detail });
+    }
   };
 
   return {
@@ -205,7 +223,8 @@ export const useAgents = create<AgentsState>((set, get) => {
       enqueueMutation(async () => {
         fenceReads();
         const previous = { registry: get().registry, detail: get().detail };
-        const optimisticRevision = beginOptimisticRevision();
+        const affectsDetail = previous.detail?.summary.id === agentId;
+        const optimisticRevisions = snapshotRevisions(affectsDetail);
         const optimistic: AgentDetailInfo | null =
           previous.detail?.summary.id === agentId
             ? {
@@ -238,7 +257,7 @@ export const useAgents = create<AgentsState>((set, get) => {
         try {
           const result = await commands.updateAgent(LOCAL_RUNNER, agentId, input);
           if (result.status === "error") {
-            rollbackIfCurrent(optimisticRevision, previous);
+            rollbackResources(optimisticRevisions, previous);
             toast.error(`Update agent failed: ${result.error.message}`);
             return false;
           }
@@ -250,7 +269,7 @@ export const useAgents = create<AgentsState>((set, get) => {
           });
           return true;
         } catch (error) {
-          rollbackIfCurrent(optimisticRevision, previous);
+          rollbackResources(optimisticRevisions, previous);
           toast.error(`Update agent failed: ${errorMessage(error)}`);
           return false;
         }
@@ -301,7 +320,7 @@ export const useAgents = create<AgentsState>((set, get) => {
       enqueueMutation(async () => {
         fenceReads();
         const previous = get().registry;
-        const optimisticRevision = beginOptimisticRevision();
+        const optimisticRevisions = snapshotRevisions();
         set({
           registry: previous
             ? {
@@ -314,7 +333,7 @@ export const useAgents = create<AgentsState>((set, get) => {
         try {
           const result = await commands.setDefaultAgent(LOCAL_RUNNER, agentId);
           if (result.status === "error") {
-            rollbackIfCurrent(optimisticRevision, { registry: previous });
+            rollbackResources(optimisticRevisions, { registry: previous });
             toast.error(`Default agent failed: ${result.error.message}`);
             return false;
           }
@@ -322,7 +341,7 @@ export const useAgents = create<AgentsState>((set, get) => {
           set({ registry: result.data });
           return true;
         } catch (error) {
-          rollbackIfCurrent(optimisticRevision, { registry: previous });
+          rollbackResources(optimisticRevisions, { registry: previous });
           toast.error(`Default agent failed: ${errorMessage(error)}`);
           return false;
         }
@@ -332,12 +351,12 @@ export const useAgents = create<AgentsState>((set, get) => {
       enqueueMutation(async () => {
         fenceReads();
         const previous = get().registry;
-        const optimisticRevision = beginOptimisticRevision();
+        const optimisticRevisions = snapshotRevisions();
         set({ registry: previous ? { ...previous, subagentModel: model } : previous });
         try {
           const result = await commands.updateSubagentModel(LOCAL_RUNNER, model);
           if (result.status === "error") {
-            rollbackIfCurrent(optimisticRevision, { registry: previous });
+            rollbackResources(optimisticRevisions, { registry: previous });
             toast.error(`Subagent model failed: ${result.error.message}`);
             return false;
           }
@@ -345,7 +364,7 @@ export const useAgents = create<AgentsState>((set, get) => {
           set({ registry: result.data });
           return true;
         } catch (error) {
-          rollbackIfCurrent(optimisticRevision, { registry: previous });
+          rollbackResources(optimisticRevisions, { registry: previous });
           toast.error(`Subagent model failed: ${errorMessage(error)}`);
           return false;
         }

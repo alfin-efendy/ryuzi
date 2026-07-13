@@ -1,5 +1,6 @@
-import { beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
 import { toast } from "sonner";
+import { commands } from "@/bindings";
 import type {
   AgentDetailInfo,
   AgentModelInfo,
@@ -102,47 +103,36 @@ const deferred = <T>() => {
   return { promise, resolve };
 };
 
-// ---------- Tauri boundary mocks (mock.module pattern; the destructured
-// names below are test-local variables — production code always goes
-// through `commands.*`) ----------
+// ---------- Tauri boundary spies ----------
 
-const listAgents = mock(async (_r: string | null) => ok(registry()));
-const getAgent = mock(async (_r: string | null, id: string) => ok(id === "reviewer" ? reviewerDetail() : detailOf(ryuziSummary())));
-const createAgent = mock(async (_r: string | null, _input: AgentMutationInfo) => ok(detailOf(summary("lead", "Lead"))));
-const updateAgent = mock(async (_r: string | null, _id: string, input: AgentMutationInfo) => ok(detailOf(summary("reviewer", input.name))));
-const duplicateAgent = mock(async (_r: string | null, _id: string) => ok(detailOf(summary("reviewer-copy", "Reviewer copy"))));
-const deleteAgent = mock(async (_r: string | null, _id: string) =>
-  ok({ ...registry(), agents: [ryuziSummary()] } satisfies AgentRegistryInfo),
-);
-const setDefaultAgent = mock(async (_r: string | null, id: string) => {
-  const reg = registry();
-  return ok({
-    ...reg,
-    defaultAgentId: id,
-    agents: reg.agents.map((a) => ({ ...a, isDefault: a.id === id })),
-  } satisfies AgentRegistryInfo);
-});
-const getSubagentModel = mock(async (_r: string | null) => ok(route("fast")));
-const updateSubagentModel = mock(async (_r: string | null, model: AgentModelInfo) =>
-  ok({ ...registry(), subagentModel: model } satisfies AgentRegistryInfo),
-);
-const listSelectableModels = mock(async (_r: string | null) => ok([selectable("smart"), selectable("fast")]));
+const listAgents = spyOn(commands, "listAgents");
+const getAgent = spyOn(commands, "getAgent");
+const createAgent = spyOn(commands, "createAgent");
+const updateAgent = spyOn(commands, "updateAgent");
+const duplicateAgent = spyOn(commands, "duplicateAgent");
+const deleteAgent = spyOn(commands, "deleteAgent");
+const setDefaultAgent = spyOn(commands, "setDefaultAgent");
+const updateSubagentModel = spyOn(commands, "updateSubagentModel");
+const listSelectableModels = spyOn(commands, "listSelectableModels");
 
-mock.module("@/bindings", () => ({
-  commands: {
-    listAgents,
-    getAgent,
-    createAgent,
-    updateAgent,
-    duplicateAgent,
-    deleteAgent,
-    setDefaultAgent,
-    getSubagentModel,
-    updateSubagentModel,
-    listSelectableModels,
-  },
-  events: {},
-}));
+const resetCommandMocks = () => {
+  listAgents.mockImplementation(async () => ok(registry()));
+  getAgent.mockImplementation(async (_r, id) => ok(id === "reviewer" ? reviewerDetail() : detailOf(ryuziSummary())));
+  createAgent.mockImplementation(async () => ok(detailOf(summary("lead", "Lead"))));
+  updateAgent.mockImplementation(async (_r, _id, input) => ok(detailOf(summary("reviewer", input.name))));
+  duplicateAgent.mockImplementation(async () => ok(detailOf(summary("reviewer-copy", "Reviewer copy"))));
+  deleteAgent.mockImplementation(async () => ok({ ...registry(), agents: [ryuziSummary()] }));
+  setDefaultAgent.mockImplementation(async (_r, id) => {
+    const reg = registry();
+    return ok({
+      ...reg,
+      defaultAgentId: id,
+      agents: reg.agents.map((agent) => ({ ...agent, isDefault: agent.id === id })),
+    });
+  });
+  updateSubagentModel.mockImplementation(async (_r, model) => ok({ ...registry(), subagentModel: model }));
+  listSelectableModels.mockImplementation(async () => ok([selectable("smart"), selectable("fast")]));
+};
 
 const { useAgents } = await import("./store-agents");
 const { useLearning } = await import("./store-learning");
@@ -155,13 +145,13 @@ const allMocks = [
   duplicateAgent,
   deleteAgent,
   setDefaultAgent,
-  getSubagentModel,
   updateSubagentModel,
   listSelectableModels,
 ];
 
 beforeEach(() => {
-  for (const m of allMocks) m.mockClear();
+  for (const command of allMocks) command.mockClear();
+  resetCommandMocks();
   useAgents.setState({
     registry: null,
     detail: null,
@@ -171,6 +161,10 @@ beforeEach(() => {
     saving: false,
   });
   useLearning.setState({ byAgent: {}, loading: {}, rollingBack: {}, requestGeneration: {} });
+});
+
+afterAll(() => {
+  for (const command of allMocks) command.mockRestore();
 });
 
 // ---------- load / loadDetail ----------
@@ -332,6 +326,187 @@ test("reads begun during successful create and duplicate keep roster IDs unique"
   expect(useAgents.getState().registry?.agents.map((agent) => agent.id)).toEqual(["ryuzi", "reviewer", "lead", "reviewer-copy"]);
   expect(useAgents.getState().loading).toBe(false);
   expect(useAgents.getState().saving).toBe(false);
+});
+
+test("a failed registry read does not suppress failed update rollback", async () => {
+  const updateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(updateResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const updating = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Optimistic" });
+  await Promise.resolve();
+
+  listAgents.mockResolvedValueOnce(err("registry unavailable"));
+  await useAgents.getState().load();
+
+  updateResult.resolve(err("disk full"));
+  expect(await updating).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+});
+
+test("a successful registry read survives failed update while a failed detail read rolls back", async () => {
+  const updateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(updateResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const updating = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Optimistic" });
+  await Promise.resolve();
+
+  const registryTruth = { ...registry(), agents: [ryuziSummary(), summary("reviewer", "Registry truth")] };
+  listAgents.mockResolvedValueOnce(ok(registryTruth));
+  getAgent.mockResolvedValueOnce(err("detail unavailable"));
+  await useAgents.getState().load("reviewer");
+
+  updateResult.resolve(err("disk full"));
+  expect(await updating).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registryTruth);
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+});
+
+test("a failed detail-only read does not suppress failed update rollback", async () => {
+  const updateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(updateResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const updating = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Optimistic" });
+  await Promise.resolve();
+
+  getAgent.mockResolvedValueOnce(err("detail unavailable"));
+  await useAgents.getState().loadDetail("reviewer");
+
+  updateResult.resolve(err("disk full"));
+  expect(await updating).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+});
+
+test("a failed detail read does not suppress default rollback", async () => {
+  const defaultResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  setDefaultAgent.mockReturnValueOnce(defaultResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const settingDefault = useAgents.getState().setDefault("reviewer");
+  await Promise.resolve();
+  getAgent.mockResolvedValueOnce(err("detail unavailable"));
+  await useAgents.getState().loadDetail("reviewer");
+  defaultResult.resolve(err("default refused"));
+
+  expect(await settingDefault).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+});
+
+test("a successful detail read does not suppress default rollback", async () => {
+  const defaultResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  setDefaultAgent.mockReturnValueOnce(defaultResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const settingDefault = useAgents.getState().setDefault("reviewer");
+  await Promise.resolve();
+  const detailTruth = detailOf(summary("reviewer", "Detail truth"));
+  getAgent.mockResolvedValueOnce(ok(detailTruth));
+  await useAgents.getState().loadDetail("reviewer");
+  defaultResult.resolve(err("default refused"));
+
+  expect(await settingDefault).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(detailTruth);
+});
+
+test("detail reads do not suppress subagent rollback", async () => {
+  const failedReadResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  updateSubagentModel.mockReturnValueOnce(failedReadResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const firstUpdate = useAgents.getState().updateSubagentModel(route("smart"));
+  await Promise.resolve();
+  getAgent.mockResolvedValueOnce(err("detail unavailable"));
+  await useAgents.getState().loadDetail("reviewer");
+  failedReadResult.resolve(err("subagent refused"));
+  expect(await firstUpdate).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+
+  const successfulReadResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  updateSubagentModel.mockReturnValueOnce(successfulReadResult.promise);
+  const secondUpdate = useAgents.getState().updateSubagentModel(route("smart"));
+  await Promise.resolve();
+  const detailTruth = detailOf(summary("reviewer", "Detail truth"));
+  getAgent.mockResolvedValueOnce(ok(detailTruth));
+  await useAgents.getState().loadDetail("reviewer");
+  successfulReadResult.resolve(err("subagent refused"));
+
+  expect(await secondUpdate).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(detailTruth);
+});
+
+test("successful registry reads survive failed default and subagent mutations when detail reads fail", async () => {
+  const defaultResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  setDefaultAgent.mockReturnValueOnce(defaultResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const settingDefault = useAgents.getState().setDefault("reviewer");
+  await Promise.resolve();
+  const defaultRegistryTruth = { ...registry(), subagentModel: route("default-read-truth") };
+  listAgents.mockResolvedValueOnce(ok(defaultRegistryTruth));
+  getAgent.mockResolvedValueOnce(err("detail unavailable"));
+  await useAgents.getState().load("reviewer");
+  defaultResult.resolve(err("default refused"));
+
+  expect(await settingDefault).toBe(false);
+  expect(useAgents.getState().registry).toEqual(defaultRegistryTruth);
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+
+  const subagentResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  updateSubagentModel.mockReturnValueOnce(subagentResult.promise);
+  const updatingSubagent = useAgents.getState().updateSubagentModel(route("smart"));
+  await Promise.resolve();
+  const subagentRegistryTruth = { ...registry(), defaultAgentId: "reviewer" };
+  listAgents.mockResolvedValueOnce(ok(subagentRegistryTruth));
+  getAgent.mockResolvedValueOnce(err("detail unavailable"));
+  await useAgents.getState().load("reviewer");
+  subagentResult.resolve(err("subagent refused"));
+
+  expect(await updatingSubagent).toBe(false);
+  expect(useAgents.getState().registry).toEqual(subagentRegistryTruth);
+  expect(useAgents.getState().detail).toEqual(reviewerDetail());
+});
+
+test("a successful detail-only read survives failed update while registry rolls back", async () => {
+  const updateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(updateResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const updating = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Optimistic" });
+  await Promise.resolve();
+
+  const detailTruth = detailOf(summary("reviewer", "Detail truth"));
+  getAgent.mockResolvedValueOnce(ok(detailTruth));
+  await useAgents.getState().loadDetail("reviewer");
+
+  updateResult.resolve(err("disk full"));
+  expect(await updating).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(detailTruth);
+});
+
+test("a successful different-agent detail read survives failed update rollback", async () => {
+  const updateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(updateResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const updating = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Optimistic" });
+  await Promise.resolve();
+
+  const ryuziDetail = detailOf(summary("ryuzi", "Ryuzi truth"));
+  getAgent.mockResolvedValueOnce(ok(ryuziDetail));
+  await useAgents.getState().loadDetail("ryuzi");
+
+  updateResult.resolve(err("disk full"));
+  expect(await updating).toBe(false);
+  expect(useAgents.getState().registry).toEqual(registry());
+  expect(useAgents.getState().detail).toEqual(ryuziDetail);
 });
 
 test("a newer authoritative read survives failed update rollback", async () => {

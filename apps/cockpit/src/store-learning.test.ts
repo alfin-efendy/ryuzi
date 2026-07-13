@@ -1,5 +1,6 @@
-import { beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
 import { toast } from "sonner";
+import { commands } from "@/bindings";
 import type { AgentLearningInfo, CmdError, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, Result } from "@/bindings";
 
 const ok = <T>(data: T): Result<T, CmdError> => ({ status: "ok", data });
@@ -37,28 +38,25 @@ const conceptInput: KnowledgeConceptMutationInfo = {
   tags: ["reviews"],
 };
 
-const getAgentLearning = mock(async (id: string) => ok(id === "ryuzi" ? ryuziLearning : reviewerLearning));
-const createAgentConcept = mock(async (_id: string, input: KnowledgeConceptMutationInfo) => ok(concept(input.title)));
-const updateAgentConcept = mock(async (_id: string, conceptId: string, _input: KnowledgeConceptMutationInfo) => ok(concept(conceptId)));
-const deleteAgentConcept = mock(async (_id: string, _conceptId: string) => ok(learning("After delete")));
-const validateAgentConceptRaw = mock(async (_id: string, _path: string, _raw: string) => ok(concept("Validated")));
-const replaceAgentConceptRaw = mock(async (_id: string, _path: string, _raw: string) => ok(concept("Replaced")));
-const deleteInvalidAgentConcept = mock(async (_id: string, _path: string) => ok(learning("After repair delete")));
-const rollbackAgentLearning = mock(async (_id: string, _snapshotId: string) => ok(learning("Rolled back")));
+const getAgentLearning = spyOn(commands, "getAgentLearning");
+const createAgentConcept = spyOn(commands, "createAgentConcept");
+const updateAgentConcept = spyOn(commands, "updateAgentConcept");
+const deleteAgentConcept = spyOn(commands, "deleteAgentConcept");
+const validateAgentConceptRaw = spyOn(commands, "validateAgentConceptRaw");
+const replaceAgentConceptRaw = spyOn(commands, "replaceAgentConceptRaw");
+const deleteInvalidAgentConcept = spyOn(commands, "deleteInvalidAgentConcept");
+const rollbackAgentLearning = spyOn(commands, "rollbackAgentLearning");
 
-mock.module("@/bindings", () => ({
-  commands: {
-    getAgentLearning,
-    createAgentConcept,
-    updateAgentConcept,
-    deleteAgentConcept,
-    validateAgentConceptRaw,
-    replaceAgentConceptRaw,
-    deleteInvalidAgentConcept,
-    rollbackAgentLearning,
-  },
-  events: {},
-}));
+const resetCommandMocks = () => {
+  getAgentLearning.mockImplementation(async (id) => ok(id === "ryuzi" ? ryuziLearning : reviewerLearning));
+  createAgentConcept.mockImplementation(async (_id, input) => ok(concept(input.title)));
+  updateAgentConcept.mockImplementation(async (_id, conceptId) => ok(concept(conceptId)));
+  deleteAgentConcept.mockImplementation(async () => ok(learning("After delete")));
+  validateAgentConceptRaw.mockImplementation(async () => ok(concept("Validated")));
+  replaceAgentConceptRaw.mockImplementation(async () => ok(concept("Replaced")));
+  deleteInvalidAgentConcept.mockImplementation(async () => ok(learning("After repair delete")));
+  rollbackAgentLearning.mockImplementation(async () => ok(learning("Rolled back")));
+};
 
 const { useLearning } = await import("./store-learning");
 const allMocks = [
@@ -74,8 +72,12 @@ const allMocks = [
 
 beforeEach(() => {
   for (const command of allMocks) command.mockClear();
-  getAgentLearning.mockImplementation(async (id: string) => ok(id === "ryuzi" ? ryuziLearning : reviewerLearning));
+  resetCommandMocks();
   useLearning.setState({ byAgent: {}, loading: {}, rollingBack: {}, requestGeneration: {} });
+});
+
+afterAll(() => {
+  for (const command of allMocks) command.mockRestore();
 });
 
 test("load keeps Learning snapshots keyed by agent ID", async () => {
