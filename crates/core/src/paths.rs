@@ -12,10 +12,6 @@ pub fn config_dir() -> PathBuf {
         .join("ryuzi")
 }
 
-pub fn agents_dir() -> PathBuf {
-    agents_dir_in(&config_dir())
-}
-
 pub fn agents_dir_in(config_root: &Path) -> PathBuf {
     config_root.join("agents")
 }
