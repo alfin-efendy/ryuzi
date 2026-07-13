@@ -38,8 +38,8 @@ const deleteInvalid = mock(async () => true);
 const rollback = mock(async () => true);
 const setSkillPinned = mock(async () => {});
 
-mock.module("@/store", () => ({ useStore: (selector: (state: { projects: never[] }) => unknown) => selector({ projects: [] }) }));
 const { useLearning } = await import("@/store-learning");
+const { useStore } = await import("@/store");
 const { AgentLearningTab } = await import("./AgentLearningTab");
 
 function seedLearning(snapshot: AgentLearningInfo) {
@@ -62,6 +62,7 @@ function seedLearning(snapshot: AgentLearningInfo) {
 beforeEach(() => {
   for (const fn of [load, createConcept, updateConcept, deleteConcept, validateRaw, replaceRaw, deleteInvalid, rollback, setSkillPinned])
     fn.mockClear();
+  useStore.setState({ projects: [] });
   seedLearning(reviewerLearning);
 });
 afterEach(cleanup);

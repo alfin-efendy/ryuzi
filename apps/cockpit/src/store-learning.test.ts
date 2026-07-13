@@ -57,6 +57,7 @@ mock.module("@/bindings", () => ({
     deleteInvalidAgentConcept,
     rollbackAgentLearning,
   },
+  events: {},
 }));
 
 const { useLearning } = await import("./store-learning");
@@ -159,6 +160,135 @@ test("validateRaw returns the parsed concept without writing or reloading", asyn
   expect(validateAgentConceptRaw).toHaveBeenCalledWith("reviewer", "memory/user/broken.md", "# fixed");
   expect(replaceAgentConceptRaw).not.toHaveBeenCalled();
   expect(getAgentLearning).not.toHaveBeenCalled();
+});
+
+test("rejected load preserves the prior snapshot, clears current loading, and returns void", async () => {
+  const toastSpy = spyOn(toast, "error");
+  getAgentLearning.mockRejectedValueOnce(new Error(String.raw`unavailable at C:\Users\Alice\knowledge`));
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+
+  expect(await useLearning.getState().load("reviewer")).toBeUndefined();
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Learning load failed");
+  toastSpy.mockRestore();
+});
+
+test("a rejected stale load cannot toast or clear a newer load", async () => {
+  const toastSpy = spyOn(toast, "error");
+  let rejectOld!: (reason: Error) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  getAgentLearning
+    .mockImplementationOnce(() => new Promise((_, reject) => (rejectOld = reject)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldLoad = useLearning.getState().load("reviewer");
+  const newLoad = useLearning.getState().load("reviewer");
+  rejectOld(new Error("stale transport failure"));
+  await oldLoad;
+  expect(useLearning.getState().loading.reviewer).toBe(true);
+  expect(toastSpy).not.toHaveBeenCalled();
+
+  resolveNew(ok(learning("Newest snapshot")));
+  await newLoad;
+  expect(useLearning.getState().loading.reviewer).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest snapshot");
+  toastSpy.mockRestore();
+});
+
+test("rejected concept commands preserve the prior snapshot and return false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+  const operations = [
+    {
+      reject: () => createAgentConcept.mockRejectedValueOnce(new Error("create transport failed")),
+      run: () => useLearning.getState().createConcept("reviewer", conceptInput),
+      toast: "Create memory failed",
+    },
+    {
+      reject: () => updateAgentConcept.mockRejectedValueOnce(new Error("update transport failed")),
+      run: () => useLearning.getState().updateConcept("reviewer", "memory-1", conceptInput),
+      toast: "Update memory failed",
+    },
+    {
+      reject: () => deleteAgentConcept.mockRejectedValueOnce(new Error("delete transport failed")),
+      run: () => useLearning.getState().deleteConcept("reviewer", "memory-1"),
+      toast: "Delete memory failed",
+    },
+  ];
+
+  for (const operation of operations) {
+    operation.reject();
+    expect(await operation.run()).toBe(false);
+    expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+    expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe(operation.toast);
+  }
+  toastSpy.mockRestore();
+});
+
+test("rejected repair commands preserve the prior snapshot and return null or false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+
+  validateAgentConceptRaw.mockRejectedValueOnce(new Error("validate transport failed"));
+  expect(await useLearning.getState().validateRaw("reviewer", "memory/user/broken.md", "# fixed")).toBeNull();
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Validate knowledge failed");
+
+  replaceAgentConceptRaw.mockRejectedValueOnce(new Error("replace transport failed"));
+  expect(await useLearning.getState().replaceRaw("reviewer", "memory/user/broken.md", "# fixed")).toBe(false);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Replace knowledge failed");
+
+  deleteInvalidAgentConcept.mockRejectedValueOnce(new Error("invalid delete transport failed"));
+  expect(await useLearning.getState().deleteInvalid("reviewer", "memory/user/broken.md")).toBe(false);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Delete invalid knowledge failed");
+
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  toastSpy.mockRestore();
+});
+
+test("rejected mutation refresh preserves the prior snapshot and returns false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning } });
+  getAgentLearning.mockRejectedValueOnce(new Error("refresh transport failed"));
+
+  expect(await useLearning.getState().createConcept("reviewer", conceptInput)).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Learning load failed");
+  toastSpy.mockRestore();
+});
+
+test("rejected rollback preserves the prior snapshot, clears current rollback, and returns false", async () => {
+  const toastSpy = spyOn(toast, "error");
+  useLearning.setState({ byAgent: { reviewer: reviewerLearning }, loading: {}, rollingBack: {} });
+  rollbackAgentLearning.mockRejectedValueOnce(new Error("rollback transport failed"));
+
+  expect(await useLearning.getState().rollback("reviewer", "snapshot-1")).toBe(false);
+  expect(useLearning.getState().byAgent.reviewer).toEqual(reviewerLearning);
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+  expect(toastSpy.mock.calls[toastSpy.mock.calls.length - 1]?.[0]).toBe("Rollback knowledge failed");
+  toastSpy.mockRestore();
+});
+
+test("a rejected stale rollback cannot toast or clear a newer rollback", async () => {
+  const toastSpy = spyOn(toast, "error");
+  let rejectOld!: (reason: Error) => void;
+  let resolveNew!: (value: Result<AgentLearningInfo, CmdError>) => void;
+  rollbackAgentLearning
+    .mockImplementationOnce(() => new Promise((_, reject) => (rejectOld = reject)))
+    .mockImplementationOnce(() => new Promise((resolve) => (resolveNew = resolve)));
+
+  const oldRollback = useLearning.getState().rollback("reviewer", "snapshot-1");
+  const newRollback = useLearning.getState().rollback("reviewer", "snapshot-2");
+  rejectOld(new Error("stale rollback failure"));
+  expect(await oldRollback).toBe(false);
+  expect(useLearning.getState().rollingBack.reviewer).toBe("snapshot-2");
+  expect(toastSpy).not.toHaveBeenCalled();
+
+  resolveNew(ok(learning("Newest rollback")));
+  expect(await newRollback).toBe(true);
+  expect(useLearning.getState().rollingBack.reviewer).toBeNull();
+  expect(useLearning.getState().byAgent.reviewer?.concepts[0]?.title).toBe("Newest rollback");
+  toastSpy.mockRestore();
 });
 
 test("failed mutations preserve snapshots and never put backend paths in toasts", async () => {

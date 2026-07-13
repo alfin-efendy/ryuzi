@@ -294,6 +294,93 @@ test("thrown load and optimistic mutation errors toast and roll back", async () 
   toastSpy.mockRestore();
 });
 
+test("reads begun during successful create and duplicate keep roster IDs unique", async () => {
+  useAgents.setState({ registry: registry(), loaded: true });
+
+  const createResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  createAgent.mockReturnValueOnce(createResult.promise);
+  const creating = useAgents.getState().create({ ...reviewerInput(), name: "Lead" });
+  await Promise.resolve();
+
+  const lead = detailOf(summary("lead", "Lead"));
+  listAgents.mockResolvedValueOnce(ok({ ...registry(), agents: [...registry().agents, lead.summary] }));
+  const createRead = useAgents.getState().load();
+  await createRead;
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(true);
+
+  createResult.resolve(ok(lead));
+  expect((await creating)?.summary.id).toBe("lead");
+  expect(useAgents.getState().registry?.agents.map((agent) => agent.id)).toEqual(["ryuzi", "reviewer", "lead"]);
+  expect(useAgents.getState().loading).toBe(false);
+
+  listAgents.mockClear();
+  const duplicateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  duplicateAgent.mockReturnValueOnce(duplicateResult.promise);
+  const duplicating = useAgents.getState().duplicate("reviewer");
+  await Promise.resolve();
+
+  const copy = detailOf(summary("reviewer-copy", "Reviewer copy"));
+  listAgents.mockResolvedValueOnce(ok({ ...registry(), agents: [...registry().agents, lead.summary, copy.summary] }));
+  const duplicateRead = useAgents.getState().load();
+  await duplicateRead;
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(true);
+
+  duplicateResult.resolve(ok(copy));
+  expect((await duplicating)?.summary.id).toBe("reviewer-copy");
+  expect(useAgents.getState().registry?.agents.map((agent) => agent.id)).toEqual(["ryuzi", "reviewer", "lead", "reviewer-copy"]);
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(false);
+});
+
+test("a newer authoritative read survives failed update rollback", async () => {
+  const updateResult = deferred<Result<AgentDetailInfo, CmdError>>();
+  updateAgent.mockReturnValueOnce(updateResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const updating = useAgents.getState().update("reviewer", { ...reviewerInput(), name: "Optimistic" });
+  await Promise.resolve();
+
+  const readDetail = detailOf(summary("reviewer", "Read truth"));
+  listAgents.mockResolvedValueOnce(ok({ ...registry(), agents: [ryuziSummary(), readDetail.summary] }));
+  getAgent.mockResolvedValueOnce(ok(readDetail));
+  const reading = useAgents.getState().load("reviewer");
+  await reading;
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(true);
+
+  updateResult.resolve(err("disk full"));
+  expect(await updating).toBe(false);
+  expect(useAgents.getState().registry?.agents[1]?.name).toBe("Read truth");
+  expect(useAgents.getState().detail?.summary.name).toBe("Read truth");
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(false);
+});
+
+test("a read begun during a failed delete remains authoritative", async () => {
+  const deleteResult = deferred<Result<AgentRegistryInfo, CmdError>>();
+  deleteAgent.mockReturnValueOnce(deleteResult.promise);
+  useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
+
+  const deleting = useAgents.getState().remove("reviewer");
+  await Promise.resolve();
+
+  const readRegistry = { ...registry(), subagentModel: route("smart") };
+  listAgents.mockResolvedValueOnce(ok(readRegistry));
+  const reading = useAgents.getState().load();
+  await reading;
+  expect(useAgents.getState().registry).toEqual(readRegistry);
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(true);
+
+  deleteResult.resolve(err("delete refused"));
+  expect(await deleting).toBe(false);
+  expect(useAgents.getState().registry).toEqual(readRegistry);
+  expect(useAgents.getState().loading).toBe(false);
+  expect(useAgents.getState().saving).toBe(false);
+});
+
 // ---------- create / duplicate ----------
 
 test("create returns the new detail and appends it to the roster", async () => {
