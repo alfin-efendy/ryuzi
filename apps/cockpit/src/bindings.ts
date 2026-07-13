@@ -2255,7 +2255,7 @@ projectId: string | null; agentSessionId: string | null; worktreePath: string | 
  */
 permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number; 
 /**
- * True when the engine auto-generated the branch name (`harness/{short}`).
+ * True when the engine auto-generated the branch name (`ryuzi/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */

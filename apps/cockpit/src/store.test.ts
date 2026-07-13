@@ -765,7 +765,7 @@ test("result event flips the session status back to idle (so the composer leaves
 test("result event triggers a refresh so the git/harness backfill (branch, worktreePath) lands in the UI", async () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1")] });
-  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "harness/s1", worktreePath: "C:\\wt\\s1" };
+  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "ryuzi/s1", worktreePath: "C:\\wt\\s1" };
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
   const listGateways = mockGateways();
@@ -779,7 +779,7 @@ test("result event triggers a refresh so the git/harness backfill (branch, workt
 
   expect(listProjects).toHaveBeenCalled();
   expect(listSessions).toHaveBeenCalled();
-  expect(useStore.getState().sessions[0].branch).toBe("harness/s1");
+  expect(useStore.getState().sessions[0].branch).toBe("ryuzi/s1");
   expect(useStore.getState().sessions[0].worktreePath).toBe("C:\\wt\\s1");
 
   listProjects.mockRestore();
@@ -891,7 +891,7 @@ test("start forwards chat options so composer model, context, and attachments re
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
-      branch: "harness/s1",
+      branch: "ryuzi/s1",
       title: "/review",
       status: "running",
       permMode: "default",
