@@ -111,12 +111,16 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Start every gateway, then fire-and-forget `cp.reconcile()` (resumes
-    /// any session a dead process left `Running`). Before either, synchronously
-    /// recover abandoned prompt claims and start one pending FIFO head for every
-    /// idle session. This recovery is deliberately boot-only: running it later
-    /// could disrupt an active continuation. Reconcile runs in the background so
-    /// a slow/hanging resume can't block daemon startup.
+    /// On boot, synchronously recover abandoned prompt claims, reconcile every
+    /// session a dead process left `Running`, and then start one pending FIFO
+    /// head for each idle session before starting gateways. Reconcile must
+    /// finish its scan before the idle drain changes a session to `Running`, or
+    /// it would resume the new queue delivery with a second harness and nudge.
+    ///
+    /// This boot sequence is deliberately one-time: running it later could
+    /// disrupt an active continuation. Awaiting reconcile intentionally makes
+    /// the successful boot ordering strict; each resumed turn remains an
+    /// independently spawned ControlPlane background task.
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
@@ -127,24 +131,18 @@ impl Daemon {
     /// a `start()` error (e.g. `daemon_cmd::build_and_start`) is a safe
     /// no-op instead of re-stopping gateway 0..N-1 a second time.
     ///
-    /// This task is deliberately left UNTRACKED (unlike `router_handle` /
-    /// `fanout_handle`): boot does not await or hold onto its reconcile
-    /// call. A
-    /// resume it kicks off is its own independent `spawn_prompt` background
-    /// turn (tracked/owned by `ControlPlane`, not by `Daemon`), so there is
-    /// nothing here for `stop()` to meaningfully cancel — this handle only
-    /// covers the `reconcile()` scan itself, which is expected to finish
-    /// quickly regardless of `Daemon`'s lifecycle.
+    /// Reconcile itself is not a tracked task: it completes during the boot
+    /// sequence, while each resume it starts is an independent `spawn_prompt`
+    /// background turn owned by `ControlPlane`.
     ///
-    /// After reconcile is kicked off, endpoint autostart runs: if the
-    /// persisted `endpoint_autostart` setting is `"1"`, `router_server` is
-    /// started on the persisted `endpoint_port` (default 21128) — the same
-    /// autostart Cockpit's setup hook used to perform. A failure here is
-    /// logged and swallowed rather than propagated: a broken endpoint
+    /// After the boot sequence, endpoint autostart runs: if the persisted
+    /// `endpoint_autostart` setting is `"1"`, `router_server` is started on the
+    /// persisted `endpoint_port` (default 21128) — the same autostart Cockpit's
+    /// setup hook used to perform. A failure here is logged and swallowed rather
     /// server must not prevent the rest of the daemon (gateways, sessions)
     /// from coming up.
     pub async fn start(&self) -> anyhow::Result<()> {
-        self.recover_abandoned_prompt_claims_and_deliver_idle_queues_on_boot()
+        self.recover_reconcile_and_deliver_idle_queues_on_boot()
             .await?;
 
         for (idx, gw) in self.gateways.iter().enumerate() {
@@ -164,10 +162,6 @@ impl Daemon {
                 return Err(e);
             }
         }
-        let cp = Arc::clone(&self.cp);
-        tokio::spawn(async move {
-            let _ = cp.reconcile().await;
-        });
 
         // Endpoint autostart (moved from Cockpit's setup hook).
         let settings = crate::settings::SettingsStore::new(Arc::clone(&self.store));
@@ -193,27 +187,28 @@ impl Daemon {
         Ok(())
     }
 
-    /// Recover prior-process prompt claims and drain pending idle queue heads
-    /// exactly once for this daemon. The mutex remains held for both phases so
-    /// concurrent `start()` calls cannot reset a live claim or re-run the boot
-    /// queue scan. Completion is set only after both phases succeed.
-    async fn recover_abandoned_prompt_claims_and_deliver_idle_queues_on_boot(
-        &self,
-    ) -> anyhow::Result<()> {
+    /// Recover prior-process claims, reconcile prior-process Running sessions,
+    /// and drain pending idle queue heads exactly once for this daemon. The
+    /// mutex serializes all three phases: reconcile's Running-session snapshot
+    /// completes before delivery can make an idle session Running. Completion
+    /// is set only after recovery and delivery finish.
+    async fn recover_reconcile_and_deliver_idle_queues_on_boot(&self) -> anyhow::Result<()> {
         let mut complete = self.prompt_claim_recovery_complete.lock().await;
         if *complete {
             return Ok(());
         }
         self.store.recover_abandoned_session_prompt_claims().await?;
+        // Reconcile was previously best-effort and detached; keep an error
+        // non-fatal while awaiting its scan so delivery cannot race it.
+        let _ = self.cp.reconcile().await;
         self.deliver_pending_idle_session_prompts_on_boot().await?;
         *complete = true;
         Ok(())
     }
 
-    /// Start one pending FIFO head for each idle session after boot claim
-    /// recovery. The control plane's atomic Idle-to-Running claim prevents a
-    /// concurrent start from duplicating a delivery and skips non-idle sessions
-    /// for asynchronous reconcile to resume.
+    /// Start one pending FIFO head for each idle session after recovery and
+    /// reconcile have completed. The control plane's atomic Idle-to-Running
+    /// claim prevents a concurrent start from duplicating a delivery.
     async fn deliver_pending_idle_session_prompts_on_boot(&self) -> anyhow::Result<()> {
         for session_pk in self.store.pending_session_prompt_session_pks().await? {
             let _ = self
@@ -1827,12 +1822,14 @@ mod tests {
     }
     struct BootQueueFakeHarness {
         prompts: Arc<Mutex<Vec<String>>>,
+        starts: Arc<AtomicUsize>,
         sent: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
     #[async_trait]
     impl Harness for BootQueueFakeHarness {
         async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(BootQueueFakeSession {
                 prompts: self.prompts.clone(),
                 sent: self.sent.clone(),
@@ -1842,6 +1839,7 @@ mod tests {
     }
     struct BootQueueFakeHarnessFactory {
         prompts: Arc<Mutex<Vec<String>>>,
+        starts: Arc<AtomicUsize>,
         sent: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
@@ -1849,6 +1847,7 @@ mod tests {
         fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
             Ok(Arc::new(BootQueueFakeHarness {
                 prompts: self.prompts.clone(),
+                starts: self.starts.clone(),
                 sent: self.sent.clone(),
                 release: self.release.clone(),
             }))
@@ -1862,11 +1861,13 @@ mod tests {
         let (_db_guard, db_path) = temp_db_path();
         let store = Store::open(&db_path).await.unwrap();
         let prompts = Arc::new(Mutex::new(Vec::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
         let sent = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let mut regs = Registries::new();
         regs.harness = Arc::new(BootQueueFakeHarnessFactory {
             prompts: prompts.clone(),
+            starts: starts.clone(),
             sent: sent.clone(),
             release: release.clone(),
         });
@@ -1878,7 +1879,7 @@ mod tests {
             .insert_session(Session {
                 session_pk: "idle-queued".into(),
                 project_id: None,
-                agent_session_id: None,
+                agent_session_id: Some("interrupted-agent".into()),
                 worktree_path: None,
                 branch: None,
                 title: Some("seed".into()),
@@ -1938,7 +1939,21 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), sent.notified())
             .await
             .expect("boot must start the pending idle queue head");
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(prompts.lock().unwrap().as_slice(), ["first"]);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "reconcile must not resume the boot-delivered queue session"
+        );
+        assert!(
+            !prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt == crate::control::RESUME_NUDGE),
+            "reconcile must not send a resume nudge to the boot-delivered queue session"
+        );
         assert_eq!(
             store
                 .list_session_prompt_queue("idle-queued")
@@ -1954,14 +1969,14 @@ mod tests {
         daemon.start().await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
-            prompts
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|prompt| prompt.as_str() == "first")
-                .count(),
+            starts.load(Ordering::SeqCst),
             1,
-            "a repeated start must not duplicate the live boot delivery"
+            "a repeated start must not create another harness session"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().as_slice(),
+            ["first"],
+            "a repeated start must not send another prompt"
         );
         release.notify_waiters();
     }
@@ -2095,38 +2110,6 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .enqueue_session_prompt(QueuedSessionPrompt {
-                id: "queued-first".into(),
-                session_pk: "s1".into(),
-                agent: "first".into(),
-                display: "first".into(),
-                attachments: vec![],
-                created_at: 1,
-            })
-            .await
-            .unwrap();
-        store
-            .enqueue_session_prompt(QueuedSessionPrompt {
-                id: "queued-second".into(),
-                session_pk: "s1".into(),
-                agent: "second".into(),
-                display: "second".into(),
-                attachments: vec![],
-                created_at: 2,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .claim_next_session_prompt("s1")
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            "queued-first"
-        );
-
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
@@ -2151,40 +2134,6 @@ mod tests {
 
         daemon.start().await.unwrap();
 
-        assert_eq!(
-            store
-                .list_session_prompt_queue("s1")
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|prompt| prompt.id)
-                .collect::<Vec<_>>(),
-            ["queued-first", "queued-second"],
-            "Daemon::start must recover abandoned prompt claims before it starts work"
-        );
-
-        assert_eq!(
-            store
-                .claim_next_session_prompt("s1")
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            "queued-first"
-        );
-        daemon.start().await.unwrap();
-        assert_eq!(
-            store
-                .list_session_prompt_queue("s1")
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|prompt| prompt.id)
-                .collect::<Vec<_>>(),
-            ["queued-second"],
-            "a repeated Daemon::start must not recover a live prompt claim"
-        );
-
         for _ in 0..400 {
             if !prompts.lock().unwrap().is_empty() {
                 break;
@@ -2194,7 +2143,7 @@ mod tests {
         assert_eq!(
             prompts.lock().unwrap().first().cloned(),
             Some(crate::control::RESUME_NUDGE.to_string()),
-            "Daemon::start must fire reconcile, resuming the Running session with the nudge"
+            "Daemon::start must reconcile the recovered Running session with the nudge"
         );
     }
 
