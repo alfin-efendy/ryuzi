@@ -1271,6 +1271,21 @@ pub async fn list_enabled_hooks(
         .await
 }
 
+pub async fn fail_incomplete_runs_on_restart(store: &Store) -> anyhow::Result<u64> {
+    let now = now_ms();
+    store
+        .with_conn(move |c| {
+            c.execute(
+                "UPDATE automation_hook_runs
+                 SET status='failed', error='restart interrupted', finished_at=?1
+                 WHERE status IN ('queued', 'running')",
+                params![now],
+            )
+            .map(|changed| changed as u64)
+        })
+        .await
+}
+
 pub async fn finish_run(
     store: &Store,
     run_id: &str,
@@ -2065,6 +2080,97 @@ mod tests {
             unreachable!();
         };
         assert_eq!(action.headers[0].value, "legacy");
+    }
+
+    #[tokio::test]
+    async fn restart_sweep_fails_incomplete_runs_and_preserves_terminal_history() {
+        let (store, _db) = mem_store().await;
+        let outbound = create_hook(
+            &store,
+            HookInput::outbound(
+                "Queued outbound",
+                TriggerKind::SessionEnd,
+                "https://example.com/hook",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let agent = create_hook(
+            &store,
+            HookInput::agent_run(
+                "Running agent",
+                TriggerKind::SessionEnd,
+                "project-1",
+                "main",
+                "local",
+                "run",
+            ),
+        )
+        .await
+        .unwrap();
+        let queued = create_run(&store, &outbound.id, json!({})).await.unwrap();
+        let running = create_run(&store, &agent.id, json!({})).await.unwrap();
+        assert!(link_run_session(&store, &running.id, "session-1")
+            .await
+            .unwrap());
+
+        let success = create_run(&store, &outbound.id, json!({})).await.unwrap();
+        assert!(finish_run(
+            &store,
+            &success.id,
+            "success",
+            None,
+            Some("delivery complete"),
+        )
+        .await
+        .unwrap());
+        let skipped = create_run(&store, &agent.id, json!({})).await.unwrap();
+        assert!(
+            finish_run(&store, &skipped.id, "skipped", None, Some("rate limited"),)
+                .await
+                .unwrap()
+        );
+
+        let success_before = list_runs(&store, &outbound.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == success.id)
+            .unwrap();
+        let skipped_before = list_runs(&store, &agent.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == skipped.id)
+            .unwrap();
+
+        assert_eq!(fail_incomplete_runs_on_restart(&store).await.unwrap(), 2);
+
+        let outbound_runs = list_runs(&store, &outbound.id).await.unwrap();
+        let queued_after = outbound_runs
+            .iter()
+            .find(|run| run.id == queued.id)
+            .unwrap();
+        assert_eq!(queued_after.status, "failed");
+        assert_eq!(queued_after.error.as_deref(), Some("restart interrupted"));
+        assert!(queued_after.finished_at.is_some());
+        let success_after = outbound_runs
+            .into_iter()
+            .find(|run| run.id == success.id)
+            .unwrap();
+        assert_eq!(success_after, success_before);
+
+        let agent_runs = list_runs(&store, &agent.id).await.unwrap();
+        let running_after = agent_runs.iter().find(|run| run.id == running.id).unwrap();
+        assert_eq!(running_after.status, "failed");
+        assert_eq!(running_after.error.as_deref(), Some("restart interrupted"));
+        assert!(running_after.finished_at.is_some());
+        let skipped_after = agent_runs
+            .into_iter()
+            .find(|run| run.id == skipped.id)
+            .unwrap();
+        assert_eq!(skipped_after, skipped_before);
     }
 
     #[tokio::test]

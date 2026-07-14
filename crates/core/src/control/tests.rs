@@ -2007,6 +2007,49 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
 }
 
 #[tokio::test]
+async fn reconcile_fails_queued_automation_runs_while_resuming_running_sessions() {
+    let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "p1").await;
+    seed_session(
+        &store,
+        "s1",
+        "p1",
+        SessionStatus::Running,
+        Some("acp-123"),
+        0,
+    )
+    .await;
+    let hook = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::outbound(
+            "Restart queued",
+            crate::automation::TriggerKind::SessionEnd,
+            "https://example.com/hook",
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let run = crate::automation::create_run(&store, &hook.id, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    cp.reconcile().await.unwrap();
+    wait_for_prompts(&prompt_log, 1).await;
+
+    assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+    let stored = crate::automation::list_runs(&store, &hook.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|stored| stored.id == run.id)
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert_eq!(stored.error.as_deref(), Some("restart interrupted"));
+    assert!(stored.finished_at.is_some());
+}
+
+#[tokio::test]
 async fn reconcile_resumes_running_session_with_nudge_and_increments_attempts() {
     let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
     seed_project(&store, "p1").await;
