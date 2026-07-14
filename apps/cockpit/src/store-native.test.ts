@@ -1,5 +1,5 @@
-import { test, expect, spyOn } from "bun:test";
-import type { ProjectCommandInfo } from "./bindings";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import type { CommandInfo, ProjectCommandInfo } from "./bindings";
 import { useNative } from "./store-native";
 import { commands } from "./bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
@@ -11,6 +11,8 @@ function reset() {
   useNative.setState({ agentsByProject: {}, commandsByProject: {}, projectCommandsByProject: {}, todosBySession: {} });
 }
 
+afterEach(reset);
+
 const projectCommand: ProjectCommandInfo = {
   name: "review",
   description: "Review the change",
@@ -19,6 +21,16 @@ const projectCommand: ProjectCommandInfo = {
   model: null,
   subtask: false,
   revision: "rev-1",
+};
+
+const effectiveGlobalCommand: CommandInfo = {
+  name: "review",
+  description: "Global review",
+  agent: null,
+  model: null,
+  subtask: false,
+  origin: "global",
+  shadowsGlobal: false,
 };
 
 test("loadAgents caches the project's agents", async () => {
@@ -79,7 +91,76 @@ test("project command CRUD calls the generated APIs and updates only that projec
   updated.mockRestore();
   deleted.mockRestore();
 });
+test("successful project command create and delete refresh effective command cache", async () => {
+  reset();
+  const globalCommand = { ...effectiveGlobalCommand, name: "deploy" };
+  const projectDeploy = { ...projectCommand, name: "deploy" };
+  const effectiveProjectDeploy: CommandInfo = { ...globalCommand, origin: "project", shadowsGlobal: true };
+  const nativeCommands = spyOn(commands, "nativeCommands")
+    .mockResolvedValueOnce({ status: "ok", data: [globalCommand] })
+    .mockResolvedValueOnce({ status: "ok", data: [effectiveProjectDeploy] })
+    .mockResolvedValueOnce({ status: "ok", data: [globalCommand] });
+  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: projectDeploy });
+  const deleted = spyOn(commands, "deleteProjectCommand").mockResolvedValue({ status: "ok", data: null });
+
+  await useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
+  await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", projectDeploy);
+  expect(useNative.getState().commandsByProject.p1).toEqual([effectiveProjectDeploy]);
+
+  await useNative.getState().deleteProjectCommand(LOCAL_RUNNER, "p1", projectDeploy);
+  expect(useNative.getState().commandsByProject.p1).toEqual([globalCommand]);
+  expect(nativeCommands).toHaveBeenCalledTimes(3);
+
+  nativeCommands.mockRestore();
+  created.mockRestore();
+  deleted.mockRestore();
+});
+
 test("a successful command mutation invalidates a deferred stale load", async () => {
+  reset();
+  type CommandsResult = Awaited<ReturnType<typeof commands.nativeCommands>>;
+  const resolvers: Array<(result: CommandsResult) => void> = [];
+  const nativeCommands = spyOn(commands, "nativeCommands").mockImplementation(
+    () => new Promise<CommandsResult>((resolve) => resolvers.push(resolve)),
+  );
+  const createdCommand = { ...projectCommand, name: "ship" };
+  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: createdCommand });
+  const staleLoad = useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
+  const mutation = useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", createdCommand);
+
+  await Promise.resolve();
+  expect(nativeCommands).toHaveBeenCalledTimes(2);
+  resolvers[1]({ status: "ok", data: [{ ...effectiveGlobalCommand, name: "ship", origin: "project", shadowsGlobal: true }] });
+  await mutation;
+  resolvers[0]({ status: "ok", data: [effectiveGlobalCommand] });
+  await staleLoad;
+
+  expect(useNative.getState().commandsByProject.p1).toEqual([
+    { ...effectiveGlobalCommand, name: "ship", origin: "project", shadowsGlobal: true },
+  ]);
+  nativeCommands.mockRestore();
+  created.mockRestore();
+});
+
+test("a successful command create ignores a failed effective-command reload", async () => {
+  reset();
+  const cachedCommand = { ...effectiveGlobalCommand, name: "deploy" };
+  const createdCommand = { ...projectCommand, name: "deploy" };
+  const nativeCommands = spyOn(commands, "nativeCommands")
+    .mockResolvedValueOnce({ status: "ok", data: [cachedCommand] })
+    .mockRejectedValueOnce(new Error("effective commands unavailable"));
+  const created = spyOn(commands, "createProjectCommand").mockResolvedValue({ status: "ok", data: createdCommand });
+
+  await useNative.getState().loadCommands(LOCAL_RUNNER, "p1");
+  const result = await useNative.getState().createProjectCommand(LOCAL_RUNNER, "p1", createdCommand);
+
+  expect(result).toEqual({ status: "success" });
+  expect(useNative.getState().commandsByProject.p1).toEqual([cachedCommand]);
+  nativeCommands.mockRestore();
+  created.mockRestore();
+});
+
+test("a successful command mutation invalidates a deferred stale project-command load", async () => {
   reset();
   type CommandsResult = Awaited<ReturnType<typeof commands.listProjectCommands>>;
   const resolvers: Array<(result: CommandsResult) => void> = [];

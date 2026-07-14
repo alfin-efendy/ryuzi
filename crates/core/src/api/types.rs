@@ -592,6 +592,14 @@ pub struct AgentInfo {
     pub builtin: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandOriginInfo {
+    Builtin,
+    Global,
+    Project,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandInfo {
@@ -602,6 +610,8 @@ pub struct CommandInfo {
     pub model: Option<String>,
     #[serde(default)]
     pub subtask: bool,
+    pub origin: CommandOriginInfo,
+    pub shadows_global: bool,
 }
 
 /// Editable fields for a project-owned slash command. The command name is

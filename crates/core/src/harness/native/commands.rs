@@ -175,9 +175,19 @@ fn builtin_commands() -> Vec<Command> {
     ]
 }
 
+/// An effective command together with its precedence source.
+#[derive(Debug, Clone)]
+pub struct RegisteredCommand {
+    pub command: Command,
+    pub origin: CommandOrigin,
+    /// Whether the effective project command overrides a global command with
+    /// the same name.
+    pub shadows_global: bool,
+}
+
 /// The set of available slash commands.
 pub struct CommandRegistry {
-    commands: BTreeMap<String, Command>,
+    commands: BTreeMap<String, RegisteredCommand>,
 }
 
 impl CommandRegistry {
@@ -188,16 +198,40 @@ impl CommandRegistry {
         Self::load_from_dirs(work_dir, &global)
     }
 
-    fn load_from_dirs(work_dir: &Path, global_dir: &Path) -> CommandRegistry {
-        let mut commands: BTreeMap<String, Command> = BTreeMap::new();
-        for cmd in read_command_dir(global_dir) {
-            commands.insert(cmd.name.clone(), cmd);
+    pub(crate) fn load_from_dirs(work_dir: &Path, global_dir: &Path) -> CommandRegistry {
+        let mut commands = BTreeMap::new();
+        for command in read_command_dir(global_dir) {
+            commands.insert(
+                command.name.clone(),
+                RegisteredCommand {
+                    command,
+                    origin: CommandOrigin::Global,
+                    shadows_global: false,
+                },
+            );
         }
-        for cmd in read_project_command_dir(work_dir) {
-            commands.insert(cmd.name.clone(), cmd);
+        for command in read_project_command_dir(work_dir) {
+            let shadows_global = commands
+                .get(&command.name)
+                .is_some_and(|entry| entry.origin == CommandOrigin::Global);
+            commands.insert(
+                command.name.clone(),
+                RegisteredCommand {
+                    command,
+                    origin: CommandOrigin::Project,
+                    shadows_global,
+                },
+            );
         }
-        for cmd in builtin_commands() {
-            commands.insert(cmd.name.clone(), cmd);
+        for command in builtin_commands() {
+            commands.insert(
+                command.name.clone(),
+                RegisteredCommand {
+                    command,
+                    origin: CommandOrigin::Builtin,
+                    shadows_global: false,
+                },
+            );
         }
         CommandRegistry { commands }
     }
@@ -206,13 +240,22 @@ impl CommandRegistry {
         CommandRegistry {
             commands: builtin_commands()
                 .into_iter()
-                .map(|c| (c.name.clone(), c))
+                .map(|command| {
+                    (
+                        command.name.clone(),
+                        RegisteredCommand {
+                            command,
+                            origin: CommandOrigin::Builtin,
+                            shadows_global: false,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
 
     pub fn get(&self, name: &str) -> Option<Command> {
-        self.commands.get(name).cloned()
+        self.commands.get(name).map(|entry| entry.command.clone())
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -221,6 +264,14 @@ impl CommandRegistry {
 
     /// All commands, for UI listing.
     pub fn all(&self) -> Vec<Command> {
+        self.commands
+            .values()
+            .map(|entry| entry.command.clone())
+            .collect()
+    }
+
+    /// All effective commands with their precedence source, for UI listing.
+    pub fn all_with_origins(&self) -> Vec<RegisteredCommand> {
         self.commands.values().cloned().collect()
     }
 
@@ -837,6 +888,21 @@ mod tests {
             .template
             .contains("Analyze this codebase"));
         assert_eq!(registry.get("ship").unwrap().template, "project ship");
+
+        let commands = registry.all_with_origins();
+        let init = commands
+            .iter()
+            .find(|entry| entry.command.name == "init")
+            .unwrap();
+        assert_eq!(init.origin, CommandOrigin::Builtin);
+        assert!(!init.shadows_global);
+
+        let ship = commands
+            .iter()
+            .find(|entry| entry.command.name == "ship")
+            .unwrap();
+        assert_eq!(ship.origin, CommandOrigin::Project);
+        assert!(ship.shadows_global);
     }
 
     #[test]

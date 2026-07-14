@@ -12,7 +12,7 @@ use crate::control::ControlPlane;
 use crate::harness::native::agents::AgentRegistry;
 use crate::harness::native::commands::{
     delete_project_command, list_project_commands, read_project_command, write_project_command,
-    CommandFileError, CommandRegistry,
+    CommandFileError, CommandOrigin, CommandRegistry,
 };
 use crate::serve::ApiState;
 use serde::Deserialize;
@@ -213,22 +213,32 @@ async fn native_commands(
     project_id: &str,
 ) -> Result<Vec<CommandInfo>, ApiError> {
     let workdir = project_workdir(cp, project_id).await?;
-    let reg = CommandRegistry::load(Path::new(&workdir));
-    Ok(reg
-        .all()
+    Ok(command_infos(&CommandRegistry::load(Path::new(&workdir))))
+}
+
+fn command_infos(registry: &CommandRegistry) -> Vec<CommandInfo> {
+    registry
+        .all_with_origins()
         .into_iter()
-        .map(|c| CommandInfo {
-            name: c.name,
-            description: c.description,
-            agent: c.agent,
-            model: c.model,
-            subtask: c.subtask,
+        .map(|entry| CommandInfo {
+            name: entry.command.name,
+            description: entry.command.description,
+            agent: entry.command.agent,
+            model: entry.command.model,
+            subtask: entry.command.subtask,
+            origin: match entry.origin {
+                CommandOrigin::Builtin => CommandOriginInfo::Builtin,
+                CommandOrigin::Global => CommandOriginInfo::Global,
+                CommandOrigin::Project => CommandOriginInfo::Project,
+            },
+            shadows_global: entry.shadows_global,
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
 
@@ -239,6 +249,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, json!([]));
+    }
+
+    #[tokio::test]
+    async fn native_command_listing_reports_effective_origins_and_global_shadowing() {
+        let workdir = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workdir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            workdir.path().join(".ryuzi/commands/ship.md"),
+            "project ship",
+        )
+        .unwrap();
+        std::fs::write(global.path().join("ship.md"), "global ship").unwrap();
+        std::fs::write(global.path().join("deploy.md"), "global deploy").unwrap();
+
+        let registry = CommandRegistry::load_from_dirs(workdir.path(), global.path());
+        let commands = command_infos(&registry);
+        let command = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command.name == name)
+                .unwrap()
+        };
+
+        assert_eq!(command("init").origin, CommandOriginInfo::Builtin);
+        assert_eq!(command("deploy").origin, CommandOriginInfo::Global);
+        assert_eq!(command("ship").origin, CommandOriginInfo::Project);
+        assert!(command("ship").shadows_global);
     }
 
     #[tokio::test]

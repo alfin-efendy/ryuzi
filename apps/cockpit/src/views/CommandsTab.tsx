@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Edit3, Plus, Search, Trash2 } from "lucide-react";
 import { Button, Combobox, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, SettingsCard, Switch, Textarea } from "@ryuzi/ui";
-import type { Project, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto } from "@/bindings";
+import type { CommandInfo, Project, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto } from "@/bindings";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useAgents } from "@/store-agents";
@@ -161,12 +161,41 @@ function CommandEditor({
   );
 }
 
+function OriginBadge({ origin }: { origin: CommandInfo["origin"] }) {
+  const label = origin === "builtin" ? "Built-in" : origin === "global" ? "Global" : "Project";
+  return <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{label}</span>;
+}
+
+function ReadOnlyCommandRow({ command }: { command: CommandInfo }) {
+  return (
+    <SettingsCard className="flex min-h-[88px] items-stretch">
+      <div className="min-w-0 flex-1 px-[18px] py-3">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[13px] font-semibold">/{command.name}</span>
+          <OriginBadge origin={command.origin} />
+          {command.subtask ? (
+            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Subtask</span>
+          ) : null}
+        </div>
+        {command.description ? <p className="mt-1 truncate text-xs text-muted-foreground">{command.description}</p> : null}
+        {(command.agent || command.model) && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {[command.agent && `Agent: ${command.agent}`, command.model && `Model: ${command.model}`].filter(Boolean).join(" · ")}
+          </p>
+        )}
+      </div>
+    </SettingsCard>
+  );
+}
+
 function CommandRow({
   command,
+  shadowsGlobal,
   onEdit,
   onDelete,
 }: {
   command: ProjectCommandInfo;
+  shadowsGlobal: boolean;
   onEdit: () => void;
   onDelete: (trigger: HTMLButtonElement) => void;
 }) {
@@ -175,6 +204,10 @@ function CommandRow({
       <div className="min-w-0 flex-1 px-[18px] py-3">
         <div className="flex items-center gap-2">
           <span className="font-mono text-[13px] font-semibold">/{command.name}</span>
+          <OriginBadge origin="project" />
+          {shadowsGlobal ? (
+            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Overrides global</span>
+          ) : null}
           {command.subtask ? (
             <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Subtask</span>
           ) : null}
@@ -208,6 +241,7 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
   const [editing, setEditing] = useState<ProjectCommandInfo | null | undefined>(undefined);
   const [deleting, setDeleting] = useState<{ command: ProjectCommandInfo; trigger: HTMLButtonElement } | null>(null);
   const commands = useNative((state) => (projectId ? state.projectCommandsByProject[projectId] : undefined));
+  const effectiveCommands = useNative((state) => (projectId ? state.commandsByProject[projectId] : undefined));
   const projectAgents = useNative((state) => (projectId ? state.agentsByProject[projectId] : undefined));
   const agentModels = useAgents((state) => state.models);
 
@@ -220,6 +254,7 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
   useEffect(() => {
     if (projectId) {
       void useNative.getState().loadProjectCommands(LOCAL_RUNNER, projectId);
+      void useNative.getState().loadCommands(LOCAL_RUNNER, projectId);
       void useNative.getState().loadAgents(LOCAL_RUNNER, projectId);
     }
   }, [projectId]);
@@ -233,6 +268,11 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
       ),
     );
   }, [commands, search]);
+  const externalCommands = useMemo(() => (effectiveCommands ?? []).filter((command) => command.origin !== "project"), [effectiveCommands]);
+  const projectCommandsByName = useMemo(
+    () => new Map((effectiveCommands ?? []).filter((command) => command.origin === "project").map((command) => [command.name, command])),
+    [effectiveCommands],
+  );
   const projectOptions = availableProjects.map((project) => ({
     value: project.projectId,
     label: project.name,
@@ -281,7 +321,7 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
         </div>
 
         <SettingsCard className="px-[18px] py-3 text-xs text-muted-foreground">
-          Built-in and global commands are read-only. The local project-command API currently returns project commands only.
+          Project commands are editable. Global and built-in commands are listed below as read-only effective commands.
         </SettingsCard>
 
         {selectedProject ? (
@@ -308,6 +348,7 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
                   <CommandRow
                     key={command.name}
                     command={command}
+                    shadowsGlobal={projectCommandsByName.get(command.name)?.shadowsGlobal ?? false}
                     onEdit={() => setEditing(command)}
                     onDelete={(trigger) => setDeleting({ command, trigger })}
                   />
@@ -316,6 +357,18 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
                 <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">
                   {search ? "No project commands match your search." : "No project commands yet."}
                 </SettingsCard>
+              )}
+            </div>
+            <div className="flex flex-col gap-2">
+              <div className="text-xs font-semibold text-muted-foreground">Global and built-in commands</div>
+              {effectiveCommands === undefined ? (
+                <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">
+                  Loading global and built-in commands…
+                </SettingsCard>
+              ) : externalCommands.length > 0 ? (
+                externalCommands.map((command) => <ReadOnlyCommandRow key={command.name} command={command} />)
+              ) : (
+                <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">No global commands.</SettingsCard>
               )}
             </div>
           </>

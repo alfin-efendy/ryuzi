@@ -48,20 +48,33 @@ type NativeState = {
   shareSession: (runnerId: string, sessionPk: string) => Promise<string | null>;
 };
 
-// Monotonic per-session fetch tokens for loadTodos: `todowrite` events and the
-// settle-time reload can race, and command responses may resolve out of order.
-// Only the newest in-flight fetch for a session may commit its result. Keyed by
-// the composite session key.
+// Monotonic fetch tokens prevent out-of-order todo, effective-command, and
+// project-command responses from replacing newer cache data. Keys identify the
+// runner/project or session.
 const todoFetchToken: Record<string, number> = {};
+const commandFetchToken: Record<string, number> = {};
 const projectCommandFetchToken: Record<string, number> = {};
 
 function projectCommandKey(runnerId: string, projectId: string): string {
   return `${runnerId}:${projectId}`;
 }
 
+function invalidateCommandFetch(runnerId: string, projectId: string): void {
+  const key = projectCommandKey(runnerId, projectId);
+  commandFetchToken[key] = (commandFetchToken[key] ?? 0) + 1;
+}
+
 function invalidateProjectCommandFetch(runnerId: string, projectId: string): void {
   const key = projectCommandKey(runnerId, projectId);
   projectCommandFetchToken[key] = (projectCommandFetchToken[key] ?? 0) + 1;
+}
+
+async function refreshCommands(runnerId: string, projectId: string): Promise<void> {
+  try {
+    await useNative.getState().loadCommands(runnerId, projectId);
+  } catch {
+    // Effective-command cache reloads are best-effort after a persisted mutation.
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -83,8 +96,11 @@ export const useNative = create<NativeState>((set) => ({
   },
 
   loadCommands: async (runnerId, projectId) => {
+    const key = projectCommandKey(runnerId, projectId);
+    const token = (commandFetchToken[key] ?? 0) + 1;
+    commandFetchToken[key] = token;
     const res = await commands.nativeCommands(runnerId, projectId);
-    if (res.status === "ok") {
+    if (res.status === "ok" && commandFetchToken[key] === token) {
       set((s) => ({ commandsByProject: { ...s.commandsByProject, [projectId]: res.data } }));
     }
   },
@@ -115,12 +131,14 @@ export const useNative = create<NativeState>((set) => ({
         return { status: "error", message };
       }
       invalidateProjectCommandFetch(runnerId, projectId);
+      invalidateCommandFetch(runnerId, projectId);
       set((s) => ({
         projectCommandsByProject: {
           ...s.projectCommandsByProject,
           [projectId]: [...(s.projectCommandsByProject[projectId] ?? []), res.data].sort((a, b) => a.name.localeCompare(b.name)),
         },
       }));
+      await refreshCommands(runnerId, projectId);
       return { status: "success" };
     } catch (error) {
       const message = errorMessage(error);
@@ -144,12 +162,14 @@ export const useNative = create<NativeState>((set) => ({
         return { status: "error", message };
       }
       invalidateProjectCommandFetch(runnerId, projectId);
+      invalidateCommandFetch(runnerId, projectId);
       set((s) => ({
         projectCommandsByProject: {
           ...s.projectCommandsByProject,
           [projectId]: (s.projectCommandsByProject[projectId] ?? []).map((current) => (current.name === command.name ? res.data : current)),
         },
       }));
+      await refreshCommands(runnerId, projectId);
       return { status: "success" };
     } catch (error) {
       const message = errorMessage(error);
@@ -173,12 +193,14 @@ export const useNative = create<NativeState>((set) => ({
         return { status: "error", message };
       }
       invalidateProjectCommandFetch(runnerId, projectId);
+      invalidateCommandFetch(runnerId, projectId);
       set((s) => ({
         projectCommandsByProject: {
           ...s.projectCommandsByProject,
           [projectId]: (s.projectCommandsByProject[projectId] ?? []).filter((current) => current.name !== command.name),
         },
       }));
+      await refreshCommands(runnerId, projectId);
       return { status: "success" };
     } catch (error) {
       const message = errorMessage(error);

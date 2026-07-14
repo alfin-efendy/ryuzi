@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { Project, ProjectCommandInfo, SelectableModelInfo } from "@/bindings";
+import type { CommandInfo, Project, ProjectCommandInfo, SelectableModelInfo } from "@/bindings";
 
 const command: ProjectCommandInfo = {
   name: "audit",
@@ -36,7 +36,21 @@ const modelOption: SelectableModelInfo = {
 };
 
 const createdCommand = { ...command, name: "ship", template: "Ship $ARGUMENTS" };
+const effectiveCommands: CommandInfo[] = [
+  { name: "audit", description: "Project audit", agent: null, model: null, subtask: false, origin: "project", shadowsGlobal: true },
+  { name: "deploy", description: "Deploy everywhere", agent: null, model: null, subtask: false, origin: "global", shadowsGlobal: false },
+  {
+    name: "init",
+    description: "Initialize the project",
+    agent: null,
+    model: null,
+    subtask: false,
+    origin: "builtin",
+    shadowsGlobal: false,
+  },
+];
 const listProjectCommands = mock(async () => ({ status: "ok" as const, data: [command] }));
+const nativeCommands = mock(async () => ({ status: "ok" as const, data: effectiveCommands }));
 const createProjectCommand = mock(async () => ({ status: "ok" as const, data: createdCommand }));
 const updateProjectCommand = mock(async () => ({ status: "ok" as const, data: command }));
 const deleteProjectCommand = mock(async () => ({ status: "ok" as const, data: null }));
@@ -46,7 +60,7 @@ const nativeAgents = mock(async () => ({
 }));
 
 mock.module("@/bindings", () => ({
-  commands: { listProjectCommands, createProjectCommand, updateProjectCommand, deleteProjectCommand, nativeAgents },
+  commands: { listProjectCommands, createProjectCommand, updateProjectCommand, deleteProjectCommand, nativeAgents, nativeCommands },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 
@@ -57,13 +71,19 @@ const nativeDeleteProjectCommand = useNative.getState().deleteProjectCommand;
 
 afterEach(() => {
   cleanup();
-  useNative.setState({ projectCommandsByProject: {}, agentsByProject: {}, deleteProjectCommand: nativeDeleteProjectCommand });
+  useNative.setState({
+    projectCommandsByProject: {},
+    commandsByProject: {},
+    agentsByProject: {},
+    deleteProjectCommand: nativeDeleteProjectCommand,
+  });
   useAgents.setState({ models: [] });
   listProjectCommands.mockClear();
   createProjectCommand.mockClear();
   updateProjectCommand.mockClear();
   deleteProjectCommand.mockClear();
   nativeAgents.mockClear();
+  nativeCommands.mockClear();
 });
 
 test("disables command creation until a project is selected", () => {
@@ -80,6 +100,20 @@ test("validates backend command names and previews positional placeholders", () 
   expect(projectCommandPreview("review", "Review $ARGUMENTS; compare $1 with $2")).toBe(
     "/review <arguments>\nReview <arguments>; compare <argument 1> with <argument 2>",
   );
+});
+
+test("renders global and built-in commands as read-only with visible origins", async () => {
+  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+
+  expect(await screen.findByText("/deploy")).toBeTruthy();
+  expect(screen.getByText("Global")).toBeTruthy();
+  expect(screen.getByText("/init")).toBeTruthy();
+  expect(screen.getByText("Built-in")).toBeTruthy();
+  const projectRow = screen.getByText("/audit").closest(".min-h-\\[88px\\]");
+  expect(projectRow?.textContent).toContain("Project");
+  expect(screen.queryByRole("button", { name: "Edit /deploy" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete /deploy" })).toBeNull();
+  expect(screen.getByText("Overrides global")).toBeTruthy();
 });
 
 test("opens deletion confirmation from a trigger and confirms or cancels the requested command", async () => {
