@@ -48,28 +48,64 @@ struct AdaptedPrimary {
     allowed_skills: Option<Vec<String>>,
 }
 
+fn tool_filter_for_profile(
+    profile: &crate::agents::types::AgentProfile,
+    available: &[String],
+) -> agents::ToolFilter {
+    if profile.tools.native.is_empty()
+        && profile.tools.plugins.is_empty()
+        && profile.tools.apps.is_empty()
+    {
+        return agents::ToolFilter::All;
+    }
+
+    let mut configured = profile
+        .tools
+        .native
+        .iter()
+        .filter(|name| {
+            available
+                .iter()
+                .any(|available_name| available_name == *name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for plugin in &profile.tools.plugins {
+        if available.iter().any(|name| name == plugin) {
+            configured.push(plugin.clone());
+            continue;
+        }
+        let (provider, tool) = plugin.split_once('.').unwrap_or((plugin, ""));
+        configured.extend(
+            available
+                .iter()
+                .filter(|name| {
+                    *name == &format!("mcp__{provider}__{tool}")
+                        || *name == &format!("ext__{provider}__{tool}")
+                })
+                .cloned(),
+        );
+    }
+    for app in &profile.tools.apps {
+        configured.extend(
+            available
+                .iter()
+                .filter(|name| name.starts_with(&format!("mcp__{app}__")))
+                .cloned(),
+        );
+    }
+    configured.sort();
+    configured.dedup();
+    if configured.is_empty() {
+        agents::ToolFilter::Only(Vec::new())
+    } else {
+        agents::ToolFilter::Only(configured)
+    }
+}
+
 fn adapt_primary_profile(
     profile: &crate::agents::types::AgentProfile,
 ) -> anyhow::Result<AdaptedPrimary> {
-    if !profile.tools.plugins.is_empty() {
-        anyhow::bail!(
-            "primary agent `{}` configures plugin tools, which the native runtime cannot enforce",
-            profile.id
-        );
-    }
-    if !profile.tools.apps.is_empty() {
-        anyhow::bail!(
-            "primary agent `{}` configures app tools, which the native runtime cannot enforce",
-            profile.id
-        );
-    }
-    if !profile.permissions.rules.is_empty() {
-        anyhow::bail!(
-            "primary agent `{}` configures permission rules, which the native runtime cannot enforce",
-            profile.id
-        );
-    }
-
     let tools = if profile.tools.native.is_empty() {
         agents::ToolFilter::All
     } else {
@@ -82,6 +118,7 @@ fn adapt_primary_profile(
             mode: agents::AgentMode::Primary,
             prompt: None,
             tools,
+            permission_rules: profile.permissions.rules.clone(),
             can_delegate: false,
             builtin: false,
         },
@@ -109,6 +146,16 @@ pub(crate) fn primary_turn_config(
         agent_tools: adapted.agent,
         allowed_skills: adapted.allowed_skills,
     })
+}
+
+pub(crate) fn primary_turn_config_with_tools(
+    agent: Arc<crate::agents::types::AgentSnapshot>,
+    run_id: String,
+    available_tools: &[String],
+) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
+    let mut config = primary_turn_config(agent.clone(), run_id)?;
+    config.agent_tools.tools = tool_filter_for_profile(&agent.profile, available_tools);
+    Ok(config)
 }
 
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
@@ -354,6 +401,7 @@ impl Harness for NativeHarness {
                 isolated_target: ctx.isolated_target,
                 main_agent_id: ctx.main_agent_id,
                 learning_queue: ctx.learning_queue,
+                agent_knowledge: ctx.agent_knowledge,
                 kind: ctx.kind,
                 work_dir: ctx.work_dir,
                 attachments_dir: ctx.attachments_dir,
@@ -680,14 +728,53 @@ mod tests {
     }
 
     #[test]
-    fn durable_primary_adapter_rejects_profile_capabilities_native_cannot_enforce() {
+    fn profile_tool_filter_resolves_native_plugin_and_app_tools_without_fallback() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
+        profile.tools.native = vec!["read".into()];
+        profile.tools.plugins = vec!["github.search".into(), "lint.check".into()];
+        profile.tools.apps = vec!["slack".into()];
+        let available = vec![
+            "read".into(),
+            "write".into(),
+            "mcp__github__search".into(),
+            "ext__lint__check".into(),
+            "mcp__slack__send".into(),
+        ];
+
+        assert_eq!(
+            tool_filter_for_profile(&profile, &available),
+            agents::ToolFilter::Only(vec![
+                "ext__lint__check".into(),
+                "mcp__github__search".into(),
+                "mcp__slack__send".into(),
+                "read".into(),
+            ])
+        );
+
+        profile.tools.native = vec!["missing-native".into()];
+        profile.tools.plugins = vec!["missing.tool".into()];
+        profile.tools.apps = vec!["missing-app".into()];
+        assert_eq!(
+            tool_filter_for_profile(&profile, &available),
+            agents::ToolFilter::Only(Vec::new()),
+            "a nonempty configuration must never broaden to every registered tool"
+        );
+    }
+
+    #[test]
+    fn durable_primary_adapter_accepts_plugin_app_and_permission_capabilities() {
         let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
         profile.tools.plugins = vec!["github.search".into()];
+        profile.tools.apps = vec!["github".into()];
+        profile.permissions.rules = vec![crate::agents::types::PermissionRule {
+            id: "deny-bash".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Deny,
+            command_prefix: None,
+        }];
 
-        assert!(adapt_primary_profile(&profile)
-            .unwrap_err()
-            .to_string()
-            .contains("plugin tools"));
+        let adapted = adapt_primary_profile(&profile).unwrap();
+        assert_eq!(adapted.agent.permission_rules, profile.permissions.rules);
     }
     #[test]
     fn native_plugin_manifest_has_expected_identity() {

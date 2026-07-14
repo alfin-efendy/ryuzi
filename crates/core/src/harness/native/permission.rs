@@ -61,6 +61,11 @@ impl SessionPermOverrides {
 /// Everything one permission check needs. Borrowed from `RunnerDeps` at the
 /// dispatch site so the check itself stays a pure function of its inputs.
 pub struct PermGate<'a> {
+    /// Order (top wins): Plan hard-deny → profile rules → session overrides → project
+    /// `tool_policies` (allowAlways AND rejectAlways) → mode auto-allow → prompt.
+    /// Plan sits above every other rule so no profile/session choice can punch
+    /// through Plan's read-only guarantee.
+    pub permission_rules: &'a [crate::agents::types::PermissionRule],
     pub perm_mode: PermMode,
     pub project_id: Option<&'a str>,
     pub store: &'a Store,
@@ -90,6 +95,29 @@ fn key_to_policy_tool(key: &str) -> &str {
     }
 }
 
+fn profile_rule_decision(
+    rules: &[crate::agents::types::PermissionRule],
+    tool: &str,
+    input: &serde_json::Value,
+) -> Option<PermDecision> {
+    use crate::agents::types::PermissionDecision;
+
+    rules.iter().find_map(|rule| {
+        (rule.tool == tool
+            && rule.command_prefix.as_ref().is_none_or(|prefix| {
+                input
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|command| command.starts_with(prefix))
+            }))
+        .then_some(match rule.decision {
+            PermissionDecision::Allow => PermDecision::Allow,
+            PermissionDecision::Deny => PermDecision::Deny,
+            PermissionDecision::Ask => return None,
+        })
+    })
+}
+
 /// Decide whether a native tool call may proceed.
 ///
 /// Order (top wins): Plan hard-deny → session overrides → project
@@ -104,6 +132,9 @@ pub async fn evaluate(
     let tool = key_to_policy_tool(&spec.key);
     if gate.perm_mode == PermMode::Plan && !is_safe_tool(tool) {
         return PermDecision::Deny;
+    }
+    if let Some(decision) = profile_rule_decision(gate.permission_rules, &spec.key, input) {
+        return decision;
     }
     match gate.overrides.lock().unwrap().decision_for(tool) {
         Some(true) => return PermDecision::Allow,
@@ -226,6 +257,7 @@ mod tests {
 
         fn gate(&self, perm_mode: PermMode, project_id: Option<&'static str>) -> PermGate<'_> {
             PermGate {
+                permission_rules: &[],
                 perm_mode,
                 project_id,
                 store: &self.store,
@@ -240,6 +272,46 @@ mod tests {
                 cancel: &self.cancel,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn profile_rules_allow_matching_tool_and_command_prefix() {
+        let f = Fixture::new().await;
+        let rules = [crate::agents::types::PermissionRule {
+            id: "cargo-test".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Allow,
+            command_prefix: Some("cargo test".into()),
+        }];
+        let gate = PermGate {
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "cargo test -p ryuzi-core"}),
+            &gate,
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn profile_rule_ask_falls_through_to_the_normal_gate() {
+        let f = Fixture::new().await;
+        let rules = [crate::agents::types::PermissionRule {
+            id: "ask-bash".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Ask,
+            command_prefix: None,
+        }];
+        let gate = PermGate {
+            permission_rules: &rules,
+            ..f.gate(PermMode::BypassPermissions, None)
+        };
+        let d = evaluate(&spec("bash"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
     }
 
     #[tokio::test]

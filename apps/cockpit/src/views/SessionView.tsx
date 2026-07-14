@@ -418,7 +418,7 @@ export function SessionView() {
                 running={running}
               >
                 {pendingForSession.map((a, i) => (
-                  <div key={a.requestId} className="px-4 pb-2">
+                  <div key={`${a.runnerId}:${a.runId}:${a.requestId}`} className="px-4 pb-2">
                     <ApprovalCard approval={a} hotkey={i === pendingForSession.length - 1} />
                   </div>
                 ))}

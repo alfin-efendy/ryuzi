@@ -107,6 +107,8 @@ pub struct RunnerDeps {
     pub main_agent_id: String,
     /// Durable learning queue shared with the daemon worker.
     pub learning_queue: Arc<crate::agents::learning_queue::LearningQueue>,
+    /// Per-agent knowledge bundles used to construct isolated target memory.
+    pub agent_knowledge: Arc<crate::agents::knowledge::AgentKnowledgeStore>,
     /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
     /// `SessionCtx::kind`. Consulted by `visible_tool_defs` to schema-gate
     /// `orch_block` (Task E6, spec §8) to `Worker` sessions only.
@@ -1326,6 +1328,7 @@ pub(crate) fn review_agent(system: String) -> Agent {
                 .map(|s| s.to_string())
                 .collect(),
         ),
+        permission_rules: Vec::new(),
         can_delegate: false,
         builtin: true,
     }
@@ -1457,6 +1460,7 @@ impl RunnerMainAgentSpawner {
         request: crate::delegation::MainDelegationRequest,
     ) -> MainDelegationResult {
         let background = request.background;
+        let context = request.context.clone();
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
@@ -1476,7 +1480,7 @@ impl RunnerMainAgentSpawner {
             };
             let goal = child_run.run.task.clone();
             tokio::spawn(async move {
-                let result = worker.execute_child(child_run).await;
+                let result = worker.execute_child(child_run, context).await;
                 worker.deliver_background_result(&goal, &result).await;
             });
             return MainDelegationResult::completed(
@@ -1485,10 +1489,14 @@ impl RunnerMainAgentSpawner {
                 "background delegation dispatched".to_string(),
             );
         }
-        self.execute_child(child_run).await
+        self.execute_child(child_run, context).await
     }
 
-    async fn execute_child(&self, child: RunHandle) -> MainDelegationResult {
+    async fn execute_child(
+        &self,
+        child: RunHandle,
+        context: Option<String>,
+    ) -> MainDelegationResult {
         let run_id = child.run.run_id.clone();
         let agent_id = child.run.executing_agent_id.clone().unwrap_or_default();
         let result = async {
@@ -1497,17 +1505,38 @@ impl RunnerMainAgentSpawner {
                 .agent_snapshot
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("delegated agent snapshot is unavailable"))?;
-            let primary_turn = super::primary_turn_config(snapshot.clone(), run_id.clone())?;
             let mut child_deps = self.deps.clone();
             child_deps.run_id = run_id.clone();
+            let primary_turn = super::primary_turn_config_with_tools(
+                snapshot.clone(),
+                run_id.clone(),
+                &child_deps.tools.names(),
+            )?;
             child_deps.primary_agent = primary_turn.agent;
             child_deps.main_agent_id = snapshot.profile.id.clone();
             child_deps.isolated_target = true;
             child_deps.attachments_dir = None;
-            child_deps.memory = None;
+            child_deps.memory = Some(Arc::new(super::memory::MemoryStore::for_agent(
+                child_deps.agent_knowledge.clone(),
+                &snapshot.profile.id,
+                child_deps.project_id.as_deref(),
+            )?));
             child_deps.app_control = None;
+            child_deps.perm_overrides = Arc::new(std::sync::Mutex::new(Default::default()));
             child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
             child_deps.model = primary_turn.model;
+            child_deps.meta = crate::llm_router::model_meta::resolve(
+                &child_deps.store,
+                child_deps.model.as_deref().unwrap_or(""),
+            )
+            .await;
+            let mut effort_policy = crate::llm_router::model_effort::build_utility_effort_policy(
+                &child_deps.store,
+                child_deps.model.as_deref().unwrap_or(""),
+            )
+            .await?;
+            effort_policy.project_override = primary_turn.effort;
+            child_deps.turn_effort_policy = Arc::new(effort_policy);
             child_deps.allowed_skills = primary_turn.allowed_skills;
             child_deps.agent = primary_turn.agent_tools;
             // The child's own catalog excludes ITS profile (not the
@@ -1524,8 +1553,11 @@ impl RunnerMainAgentSpawner {
                 ContextConfig::with_meta(child_deps.meta.clone()),
             );
             let task = child.run.task.clone();
-            cm.append_user(json!([{ "type": "text", "text": task }]))
-                .await?;
+            let mut prompt = vec![json!({ "type": "text", "text": task })];
+            if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+                prompt.push(json!({ "type": "text", "text": context }));
+            }
+            cm.append_user(Value::Array(prompt)).await?;
             let turns = snapshot.profile.loop_settings.max_turns.max(1) as usize;
             let text = drive(
                 &child_deps,
@@ -2049,6 +2081,7 @@ async fn run_tool_call(
     let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
     let gate = super::permission::PermGate {
+        permission_rules: &agent.permission_rules,
         perm_mode,
         project_id: deps.project_id.as_deref(),
         store: &deps.store,
@@ -2759,7 +2792,21 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
+    use async_trait::async_trait;
     use serial_test::serial;
+
+    struct StaticMcpCaller;
+
+    #[async_trait]
+    impl crate::harness::native::mcp_client::McpCaller for StaticMcpCaller {
+        async fn call(
+            &self,
+            _tool: &str,
+            _arguments: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"content": []}))
+        }
+    }
 
     #[tokio::test]
     async fn primary_agent_model_drives_turn_configuration() {
@@ -2868,6 +2915,26 @@ mod tests {
         llm: Arc<dyn LlmStream>,
         store: Arc<Store>,
     ) -> RunnerDeps {
+        deps_with_store_and_registry(dir, llm, store).await.0
+    }
+
+    async fn deps_with_executable_profile_registry(
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmStream>,
+        store: Arc<Store>,
+    ) -> (RunnerDeps, Arc<crate::agents::registry::AgentRegistry>) {
+        add_anthropic_conn_with_efforts(&store, &["parent-model", "target-model"]).await;
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        deps_with_store_and_registry(dir, llm, store).await
+    }
+
+    async fn deps_with_store_and_registry(
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmStream>,
+        store: Arc<Store>,
+    ) -> (RunnerDeps, Arc<crate::agents::registry::AgentRegistry>) {
         let (events, _rx) = broadcast::channel(256);
         let agents = Arc::new(AgentRegistry::builtin());
         let agent = agents.default_agent();
@@ -2886,56 +2953,62 @@ mod tests {
             .resolved_snapshot("ryuzi")
             .await
             .unwrap();
+        let registry = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
         let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
-            persistence.registry,
+            registry.clone(),
             events.clone(),
         );
-        RunnerDeps {
-            session_pk: "s1".into(),
-            primary_agent,
-            run_id: "r1".into(),
-            delegation,
-            isolated_target: false,
-            main_agent_id: "ryuzi".into(),
-            learning_queue,
-            kind: SessionKind::Chat,
-            work_dir: dir.to_path_buf(),
-            attachments_dir: None,
-            extra_skill_dirs: vec![],
-            extension_events: None,
-            // bypassPermissions so the scripted bash tool runs without a prompt.
-            model: Some("test/model".into()),
-            turn_effort_policy: Arc::new(TurnEffortPolicy {
-                requested_model: "test/model".into(),
-                project_override: None,
-                route_compatibility: Default::default(),
-                configured: Default::default(),
-                surfaces: Default::default(),
-            }),
-            meta: crate::llm_router::model_meta::FALLBACK,
-            perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
-            project_id: None,
-            perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
-            store,
-            events,
-            approvals: Arc::new(ApprovalHub::new()),
-            llm,
-            tools: Arc::new(ToolRegistry::builtin()),
-            agent,
-            agents,
-            commands: Arc::new(CommandRegistry::builtin()),
-            allowed_skills: None,
-            memory: None,
-            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            steer: SteerBuffer::new(),
-            background: super::super::background::BackgroundRegistry::new(),
-            app_control: None,
-            nudge: Arc::new(NudgeState::default()),
-            review_tool_defs: None,
-            write_origin: crate::domain::WriteOrigin::User,
-            delegation_catalog: Vec::new(),
-        }
+        (
+            RunnerDeps {
+                session_pk: "s1".into(),
+                primary_agent,
+                run_id: "r1".into(),
+                delegation,
+                isolated_target: false,
+                main_agent_id: "ryuzi".into(),
+                learning_queue,
+                agent_knowledge,
+                kind: SessionKind::Chat,
+                work_dir: dir.to_path_buf(),
+                attachments_dir: None,
+                extra_skill_dirs: vec![],
+                extension_events: None,
+                // bypassPermissions so the scripted bash tool runs without a prompt.
+                model: Some("test/model".into()),
+                turn_effort_policy: Arc::new(TurnEffortPolicy {
+                    requested_model: "test/model".into(),
+                    project_override: None,
+                    route_compatibility: Default::default(),
+                    configured: Default::default(),
+                    surfaces: Default::default(),
+                }),
+                meta: crate::llm_router::model_meta::FALLBACK,
+                perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
+                project_id: None,
+                perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
+                store,
+                events,
+                approvals: Arc::new(ApprovalHub::new()),
+                llm,
+                tools: Arc::new(ToolRegistry::builtin()),
+                agent,
+                agents,
+                commands: Arc::new(CommandRegistry::builtin()),
+                allowed_skills: None,
+                memory: None,
+                snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                steer: SteerBuffer::new(),
+                background: super::super::background::BackgroundRegistry::new(),
+                app_control: None,
+                nudge: Arc::new(NudgeState::default()),
+                review_tool_defs: None,
+                write_origin: crate::domain::WriteOrigin::User,
+                delegation_catalog: Vec::new(),
+            },
+            registry,
+        )
     }
 
     /// Feature C1a: a real tool call (the bash tool, actually executed —
@@ -3726,6 +3799,53 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    async fn add_anthropic_conn_with_efforts(store: &Store, models: &[&str]) {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        use crate::llm_router::model_effort::{DiscoveredModelMeta, ReasoningEffortOption};
+
+        let effort = |value: &str| ReasoningEffortOption {
+            value: value.into(),
+            label: value.into(),
+            description: None,
+        };
+        connections::add_connection(
+            store,
+            ConnectionRow {
+                id: "claude".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "claude".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(models.iter().map(|model| (*model).into()).collect()),
+                    model_meta_overrides: Some(
+                        models
+                            .iter()
+                            .map(|model| {
+                                (
+                                    (*model).into(),
+                                    DiscoveredModelMeta {
+                                        effort_options: Some(vec![effort("low"), effort("high")]),
+                                        default_effort_advertised: true,
+                                        default_effort: Some("low".into()),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// An enabled anthropic API-key connection serving exactly `models`, so
@@ -6062,6 +6182,246 @@ mod tests {
             .payload
             .contains(&format!("[ASYNC DELEGATION COMPLETE — {id}]")));
         assert!(row.payload.contains("all done"));
+    }
+
+    #[tokio::test]
+    async fn delegated_main_child_uses_the_target_profile_without_parent_leaks() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            PermissionDecision, PermissionRule,
+        };
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "plan-mode-call", "bash"),
+                input_json_delta(0, r#"{"command":"target-only check"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "profile-rule-call", "read"),
+                input_json_delta(0, r#"{"path":"ignored-by-profile-rule"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("target done"),
+        ]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm.clone(), store).await;
+        let parent = registry
+            .create(AgentMutationInput {
+                name: "Parent".into(),
+                description: "Parent-only profile".into(),
+                avatar: AgentAvatar {
+                    color: "orange".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/parent-model".into(),
+                    effort: Some("low".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: vec![PermissionRule {
+                        id: "parent-rule".into(),
+                        tool: "write".into(),
+                        decision: PermissionDecision::Allow,
+                        command_prefix: None,
+                    }],
+                },
+                skills: vec!["parent-skill".into()],
+                tools: AgentTools {
+                    native: vec!["write".into()],
+                    plugins: vec![],
+                    apps: vec![],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 9,
+                    max_tool_rounds: 9,
+                },
+            })
+            .await
+            .unwrap();
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Target".into(),
+                description: "Target-only profile".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: Some("high".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::Plan,
+                    rules: vec![PermissionRule {
+                        id: "target-rule".into(),
+                        tool: "read".into(),
+                        decision: PermissionDecision::Deny,
+                        command_prefix: None,
+                    }],
+                },
+                skills: vec!["target-skill".into()],
+                tools: AgentTools {
+                    native: vec!["read".into(), "bash".into()],
+                    plugins: vec!["github.search".into(), "lint.check".into()],
+                    apps: vec!["slack".into()],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 3,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        deps.primary_agent = Arc::new(parent);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "github",
+                "search",
+                "GitHub search",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "slack",
+                "send",
+                "Slack send",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+        ]));
+        deps.attachments_dir = Some(dir.path().join("parent-attachments"));
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                deps.agent_knowledge.clone(),
+                "parent",
+                None,
+            )
+            .unwrap(),
+        ));
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/target-model",
+                r#"{"context_window":222222,"max_output_tokens":3333}"#,
+            )
+            .await
+            .unwrap();
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "parent")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id.clone();
+        let parent_attachments = deps.attachments_dir.clone();
+        let parent_memory = deps.memory.as_ref().unwrap().knowledge_root().to_path_buf();
+        let target_memory = crate::harness::native::memory::MemoryStore::for_agent(
+            deps.agent_knowledge.clone(),
+            &target.profile.id,
+            None,
+        )
+        .unwrap();
+        target_memory
+            .add(
+                crate::harness::native::memory::MemoryScope::Global,
+                "target memory only",
+            )
+            .await
+            .unwrap();
+
+        let result = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root.run.run_id,
+                target_agent_id: target.profile.id.clone(),
+                task: "inspect the target profile".into(),
+                context: Some("only inspect authentication files".into()),
+                background: false,
+            })
+            .await;
+
+        assert_eq!(result.status, SubtaskStatus::Completed);
+        let child = deps
+            .store
+            .get_agent_run(&result.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.executing_agent_id.as_deref(),
+            Some(target.profile.id.as_str())
+        );
+        assert_eq!(
+            child.resolved_model.as_deref(),
+            Some("anthropic/target-model")
+        );
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "target loop receives every scripted turn");
+        let body = &bodies[0];
+        assert_eq!(body["model"], "anthropic/target-model");
+        assert_eq!(
+            body["max_tokens"], 3_333,
+            "the target model metadata controls its output context"
+        );
+        assert_eq!(
+            llm.policies.lock().unwrap()[0].project_override.as_deref(),
+            Some("high")
+        );
+        let tool_rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let plan_mode_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("plan-mode-call"))
+            .expect("plan-mode bash call is recorded");
+        assert_eq!(plan_mode_call.status.as_deref(), Some("failed"));
+        assert!(
+            plan_mode_call.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("Plan mode is read-only")),
+            "target plan mode, not the parent's bypass mode, denies bash"
+        );
+        let profile_rule_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("profile-rule-call"))
+            .expect("target profile-rule call is recorded");
+        assert_eq!(profile_rule_call.status.as_deref(), Some("failed"));
+        assert_eq!(
+            profile_rule_call.payload["output"], "Denied by user",
+            "the target profile's deny rule applies even to a plan-safe read"
+        );
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "inspect the target profile");
+        assert_eq!(content[1]["text"], "only inspect authentication files");
+        let system = body["system"].as_str().unwrap();
+        assert!(system.contains("target memory only"));
+        assert!(!system.contains("parent-skill"));
+        let advertised = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(advertised.contains(&"read"));
+        assert!(advertised.contains(&"bash"));
+        assert!(advertised.contains(&"mcp__github__search"));
+        assert!(advertised.contains(&"mcp__slack__send"));
+        assert!(!advertised.contains(&"write"));
+        assert!(!advertised.contains(&"ext__lint__check"));
+        assert!(!advertised.contains(&"app_projects"));
+        assert_eq!(
+            parent_attachments,
+            Some(dir.path().join("parent-attachments"))
+        );
+        assert_eq!(
+            deps.memory.as_ref().unwrap().knowledge_root(),
+            parent_memory
+        );
+        assert_ne!(target_memory.knowledge_root(), parent_memory.as_path());
     }
 
     #[tokio::test]

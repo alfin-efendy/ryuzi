@@ -2098,6 +2098,7 @@ impl ControlPlane {
             isolated_target: false,
             main_agent_id: persistence.registry.default_agent_id().await,
             learning_queue: persistence.learning.clone(),
+            agent_knowledge: persistence.knowledge.clone(),
             kind: SessionKind::Review,
             work_dir,
             attachments_dir: None,

@@ -303,7 +303,14 @@ mod tests {
         assert!(!out.is_error, "{}", out.for_model);
         assert!(out.for_model.contains("audit complete"));
         assert!(out.for_model.contains("tests complete"));
-        assert_eq!(spawner.requests.lock().unwrap().len(), 2);
+        let requests = spawner.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].target_agent_id, "reviewer");
+        assert_eq!(requests[0].task, "audit");
+        assert_eq!(requests[0].context.as_deref(), Some("optional"));
+        assert_eq!(requests[1].target_agent_id, "tester");
+        assert_eq!(requests[1].task, "test");
+        assert_eq!(requests[1].context, None);
     }
 
     #[tokio::test]

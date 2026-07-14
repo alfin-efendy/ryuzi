@@ -71,6 +71,8 @@ pub struct Agent {
     /// Custom system prompt; `None` uses the runtime's assembled prompt.
     pub prompt: Option<String>,
     pub tools: ToolFilter,
+    /// Profile-level rules evaluated before session and project overrides.
+    pub permission_rules: Vec<crate::agents::types::PermissionRule>,
     /// Whether this agent, when spawned as a sub-agent, may itself delegate
     /// via the `task` tool (subject to the `max_spawn_depth` setting).
     /// Frontmatter key: `delegate: true`.
@@ -100,6 +102,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Primary,
             prompt: None,
             tools: ToolFilter::All,
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -115,6 +118,7 @@ fn builtin_agents() -> Vec<Agent> {
                     .into(),
             ),
             tools: ToolFilter::Only(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect()),
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -124,6 +128,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Subagent,
             prompt: None,
             tools: ToolFilter::All,
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -142,6 +147,7 @@ fn builtin_agents() -> Vec<Agent> {
                     .map(|s| s.to_string())
                     .collect(),
             ),
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -152,6 +158,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Subagent,
             prompt: Some(ORCHESTRATOR_PROMPT.into()),
             tools: ToolFilter::All,
+            permission_rules: Vec::new(),
             can_delegate: true,
             builtin: true,
         },
@@ -275,6 +282,7 @@ fn parse_agent_markdown(name: &str, text: &str) -> Agent {
         mode,
         prompt: (!prompt.is_empty()).then(|| prompt.to_string()),
         tools,
+        permission_rules: Vec::new(),
         can_delegate,
         builtin: false,
     }
