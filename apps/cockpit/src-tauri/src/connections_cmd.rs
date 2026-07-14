@@ -19,7 +19,7 @@ use ryuzi_core::llm_router::oauth;
 use ryuzi_core::llm_router::quota::{CodexResetCreditResult, ProviderQuotaInfo};
 use ryuzi_core::llm_router::registry::{self, ApiFormat, ProviderCategory};
 use ryuzi_core::llm_router::routes::{
-    ModelRouteInfo, ModelRouteStrategy, ProviderAccountRouteInfo,
+    ModelRouteInfo, ModelRouteStrategy, ModelRouteTargetCapability, ProviderAccountRouteInfo,
 };
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -301,6 +301,21 @@ pub async fn list_model_routes(
 ) -> R<Vec<ModelRouteInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client.rpc("list_model_routes", serde_json::json!({})).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_model_route_target_capabilities(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ModelRouteTargetCapability>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "list_model_route_target_capabilities",
+            serde_json::json!({}),
+        )
+        .await
 }
 
 #[tauri::command]

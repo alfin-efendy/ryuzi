@@ -4,6 +4,7 @@ use crate::llm_router::client::{
     ensure_fresh_for_attempt, route_models_for_body, send_upstream, RouteTarget, UpstreamCtx,
 };
 use crate::llm_router::codex::normalize_codex_responses_body;
+use crate::llm_router::model_effort;
 use crate::llm_router::registry::{self, ApiFormat};
 use crate::llm_router::{
     claude_cloak, connections, keys, oauth, routes, sse::SseParser, translate,
@@ -63,6 +64,7 @@ impl AppState {
             store: self.store.clone(),
             http: self.http.clone(),
             oauth_token_url_override: self.oauth_token_url_override.clone(),
+            kiro_base_override: self.kiro_base_override.clone(),
             mimo_bootstrap_url_override: None,
         }
     }
@@ -260,6 +262,54 @@ async fn ensure_fresh_or_reconnect_error(
     None
 }
 
+fn response_effort(body: &Value) -> Option<String> {
+    [
+        body.pointer("/reasoning/effort"),
+        body.get("reasoning_effort"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|effort| !effort.is_empty())
+    .map(str::to_string)
+}
+
+fn anthropic_effort(body: &Value) -> Option<String> {
+    body.pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .filter(|effort| !effort.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn resolved_effort(
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) -> Option<String> {
+    crate::llm_router::client::target_effort(target, policy).value
+}
+
+fn apply_responses_effort(
+    body: &mut Value,
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) -> Option<String> {
+    let effort = resolved_effort(target, policy);
+    if target.route_target_key.is_some() {
+        if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+            reasoning.remove("effort");
+        }
+        if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+        }
+    }
+    effort
+}
+
+fn apply_kiro_effort_policy(body: &mut Value) {
+    crate::llm_router::client::strip_kiro_effort(body);
+}
+
 /// Client speaks Anthropic. `client_fmt` differs from `handle_chat` only in
 /// error shape + translation direction.
 async fn handle_messages(
@@ -294,11 +344,24 @@ async fn handle_messages(
         );
     }
 
+    let policy = match model_effort::build_request_effort_policy(
+        &state.store,
+        &requested,
+        anthropic_effort(&body),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(e) => return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::Anthropic, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::Anthropic, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -318,6 +381,11 @@ async fn handle_messages(
 
         let outcome: Result<Response, AttemptError> = match target.desc.format {
             ApiFormat::Anthropic => {
+                crate::llm_router::client::apply_anthropic_effort(
+                    &mut attempt_body,
+                    &target,
+                    &policy,
+                );
                 let started = crate::paths::now_ms();
                 match proxy_passthrough(&state, &mut target, &attempt_body).await {
                     Ok(resp) => {
@@ -343,6 +411,12 @@ async fn handle_messages(
                     Ok(b) => b,
                     Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e.to_string()),
                 };
+                crate::llm_router::client::apply_openai_effort(
+                    &mut upstream_body,
+                    &target,
+                    &policy,
+                    body.get("thinking").is_some(),
+                );
                 crate::llm_router::client::apply_max_completion_tokens(
                     target.desc,
                     &mut upstream_body,
@@ -440,11 +514,24 @@ async fn handle_chat(
         );
     }
 
+    let policy = match model_effort::build_request_effort_policy(
+        &state.store,
+        &requested,
+        response_effort(&body),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::OpenAi, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::OpenAi, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -461,6 +548,7 @@ async fn handle_chat(
         let stream = body["stream"].as_bool().unwrap_or(false);
         let mut attempt_body = body.clone();
         attempt_body["model"] = json!(target.upstream_model);
+        crate::llm_router::client::apply_openai_effort(&mut attempt_body, &target, &policy, false);
 
         let outcome: Result<Response, AttemptError> = match target.desc.format {
             ApiFormat::OpenAi => {
@@ -484,10 +572,16 @@ async fn handle_chat(
                 }
             }
             ApiFormat::Anthropic => {
-                let upstream_body = match translate::openai_to_anthropic_request(&attempt_body) {
+                let mut upstream_body = match translate::openai_to_anthropic_request(&attempt_body)
+                {
                     Ok(b) => b,
                     Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
                 };
+                crate::llm_router::client::apply_anthropic_effort(
+                    &mut upstream_body,
+                    &target,
+                    &policy,
+                );
                 if stream {
                     let ctx = RecordCtx {
                         conn_id: target.conn.id.clone(),
@@ -575,12 +669,25 @@ async fn handle_responses(
     }
 
     let stream = chat["stream"].as_bool().unwrap_or(false);
+    let policy = match model_effort::build_request_effort_policy(
+        &state.store,
+        &requested,
+        response_effort(&body),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
 
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::Responses, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::Responses, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -597,10 +704,11 @@ async fn handle_responses(
         // same-format.
         if target.conn.provider == "openai-oauth" {
             let mut passthrough_body = body.clone();
+            let effort = apply_responses_effort(&mut passthrough_body, &target, &policy);
             normalize_codex_responses_body(
                 &mut passthrough_body,
                 &target.upstream_model,
-                target.request_compatibility_effort.as_deref(),
+                effort.as_deref(),
                 None,
             );
             let started = crate::paths::now_ms();
@@ -646,6 +754,7 @@ async fn handle_responses(
 
         let mut attempt_chat = chat.clone();
         attempt_chat["model"] = json!(target.upstream_model);
+        crate::llm_router::client::apply_openai_effort(&mut attempt_chat, &target, &policy, false);
         let started = crate::paths::now_ms();
 
         // Normalize the upstream response to OpenAI chat shape, then encode Responses.
@@ -656,7 +765,10 @@ async fn handle_responses(
                 b
             }
             ApiFormat::Anthropic => match translate::openai_to_anthropic_request(&attempt_chat) {
-                Ok(b) => b,
+                Ok(mut body) => {
+                    crate::llm_router::client::apply_anthropic_effort(&mut body, &target, &policy);
+                    body
+                }
                 Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
             },
         };
@@ -2069,7 +2181,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let kiro_body = json!({"conversationState": {}});
         let req = kiro_upstream_request(&state, &target, &kiro_body)
@@ -2152,7 +2263,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2186,7 +2296,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2215,7 +2324,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2249,6 +2357,21 @@ mod tests {
             kiro_endpoints("idc", "eu-west-1")[0],
             "https://codewhisperer.eu-west-1.amazonaws.com/generateAssistantResponse"
         );
+    }
+
+    #[test]
+    fn kiro_request_body_ignores_client_effort_fields() {
+        let data = ConnectionData::default();
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "low"},
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "high"}
+        });
+
+        let out = kiro_request_body(&body, ClientFormat::OpenAi, "m", &data, "c1");
+
+        assert_eq!(out["inferenceConfig"], json!({"maxTokens": 32000}));
     }
 
     #[test]
@@ -2320,5 +2443,548 @@ mod tests {
         assert_eq!(tc["function"]["name"], "get_weather");
         assert_eq!(tc["function"]["arguments"], "{\"city\":\"Paris\"}");
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    async fn effort_capture_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
+        use axum::{extract::State, routing::post, Json, Router};
+
+        async fn capture(
+            State(captured): State<Arc<Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            captured.lock().unwrap().push(body);
+            Json(json!({"id": "captured"}))
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/messages", post(capture))
+            .route("/v1/chat/completions", post(capture))
+            .route("/responses", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, captured)
+    }
+
+    fn effort_meta(default: &str) -> crate::llm_router::model_effort::DiscoveredModelMeta {
+        crate::llm_router::model_effort::DiscoveredModelMeta {
+            display_name: None,
+            effort_options: Some(
+                ["low", "medium", "high"]
+                    .into_iter()
+                    .map(
+                        |value| crate::llm_router::model_effort::ReasoningEffortOption {
+                            value: value.into(),
+                            label: value.into(),
+                            description: None,
+                        },
+                    )
+                    .collect(),
+            ),
+            default_effort_advertised: true,
+            default_effort: Some(default.into()),
+        }
+    }
+
+    async fn post_router(port: u16, key: &str, path: &str, body: Value) {
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}{path}"))
+            .header("x-api-key", key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{response:?}");
+        let _ = response.bytes().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "anthropic-route",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["claude-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "claude-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "anthropic-effort-route".into(),
+                name: "smart-anthropic".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/messages",
+            json!({
+                "model": "smart-anthropic",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"}
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            captured.lock().unwrap()[0]["output_config"]["effort"],
+            "high"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_named_route_uses_configured_then_provider_default_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-route",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "openai-effort-route".into(),
+                name: "smart-openai".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-route".into(),
+                    effort: None,
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let preference = crate::llm_router::model_effort::ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-route".into(),
+        };
+        crate::llm_router::model_effort::set_preference(&state.store, &preference, Some("medium"))
+            .await
+            .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+        let request = || {
+            json!({
+                "model": "smart-openai",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low"
+            })
+        };
+
+        post_router(port, &key.key, "/v1/chat/completions", request()).await;
+        crate::llm_router::model_effort::set_preference(&state.store, &preference, None)
+            .await
+            .unwrap();
+        post_router(port, &key.key, "/v1/chat/completions", request()).await;
+
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured[0]["reasoning_effort"], "medium");
+            assert_eq!(captured[1]["reasoning_effort"], "high");
+        }
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn responses_codex_named_route_replaces_caller_effort_with_target_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "codex-route",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("test-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 100 * 24 * 60 * 60 * 1_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    needs_relogin: Some(false),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}")),
+                    models_override: Some(vec!["gpt-codex-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-codex-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "codex-effort-route".into(),
+                name: "smart-codex".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-codex-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/responses",
+            json!({
+                "model": "smart-codex",
+                "input": "hi",
+                "reasoning": {"effort": "low", "summary": "detailed"}
+            }),
+        )
+        .await;
+
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured[0]["reasoning"]["effort"], "high");
+            assert_eq!(captured[0]["reasoning"]["summary"], "detailed");
+        }
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_direct_model_keeps_caller_effort_first() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-direct",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-direct".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-direct".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/chat/completions",
+            json!({
+                "model": "openai/gpt-direct",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low"
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "low");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn messages_translation_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-messages-route",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-messages-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-messages-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "openai-messages-effort-route".into(),
+                name: "smart-openai-messages".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-messages-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/messages",
+            json!({
+                "model": "smart-openai-messages",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"}
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "high");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_translation_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "anthropic-chat-route",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["claude-chat-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "claude-chat-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "anthropic-chat-effort-route".into(),
+                name: "smart-anthropic-chat".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-chat-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/chat/completions",
+            json!({
+                "model": "smart-anthropic-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            captured.lock().unwrap()[0]["output_config"]["effort"],
+            "high"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn responses_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-responses-route",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-responses-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-responses-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "openai-responses-effort-route".into(),
+                name: "smart-openai-responses".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-responses-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/responses",
+            json!({
+                "model": "smart-openai-responses",
+                "input": "hi",
+                "reasoning": {"effort": "low"}
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "high");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn direct_responses_uses_flat_caller_effort_when_nested_effort_is_empty() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-direct-responses",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-direct-responses".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-direct-responses".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/responses",
+            json!({
+                "model": "openai/gpt-direct-responses",
+                "input": "hi",
+                "reasoning": {"effort": ""},
+                "reasoning_effort": "low"
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "low");
+        server.stop().await;
     }
 }

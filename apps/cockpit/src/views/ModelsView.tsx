@@ -6,7 +6,14 @@ import { useConnections } from "@/store-connections";
 import { useModelRoutes } from "@/store-model-routes";
 import { useUsage } from "@/store-usage";
 import { useNav } from "@/store-nav";
-import type { CatalogEntry, ConnectionInfo, ModelRouteInfo, ModelRouteStrategy } from "@/bindings";
+import type {
+  CatalogEntry,
+  ConnectionInfo,
+  ModelRouteInfo,
+  ModelRouteStrategy,
+  ModelRouteTarget,
+  ModelRouteTargetCapability,
+} from "@/bindings";
 import {
   Button,
   Combobox,
@@ -384,15 +391,32 @@ function targetKey(target: { provider: string; model: string }): string {
   return `${target.provider}::${target.model}`;
 }
 
+function capabilityForTarget(
+  targetCapabilities: ModelRouteTargetCapability[],
+  target: { provider: string; model: string },
+): ModelRouteTargetCapability | undefined {
+  return targetCapabilities.find((capability) => capability.provider === target.provider && capability.model === target.model);
+}
+
+function nextTargetEffort(
+  effort: string | null | undefined,
+  targetCapabilities: ModelRouteTargetCapability[],
+  target: { provider: string; model: string },
+): string | null {
+  return capabilityForTarget(targetCapabilities, target)?.supported.some((option) => option.value === effort) ? (effort ?? null) : null;
+}
+
 function RouteForm({
   value,
   targetOptions,
+  targetCapabilities,
   saving,
   onCancel,
   onSave,
 }: {
   value: ModelRouteInfo;
   targetOptions: TargetOption[];
+  targetCapabilities: ModelRouteTargetCapability[];
   saving: boolean;
   onCancel: () => void;
   onSave: (route: ModelRouteInfo) => void;
@@ -413,7 +437,13 @@ function RouteForm({
     setDraft((current) => ({
       ...current,
       targets: current.targets.map((target, i) =>
-        i === index ? { provider: option.provider, model: option.model, effort: null } : target,
+        i === index
+          ? {
+              provider: option.provider,
+              model: option.model,
+              effort: nextTargetEffort(target.effort, targetCapabilities, option),
+            }
+          : target,
       ),
     }));
   };
@@ -486,6 +516,34 @@ function RouteForm({
                   setTarget(index, `${v.slice(0, slash)}::${v.slice(slash + 1)}`);
                 }}
               />
+              {(() => {
+                const capability = capabilityForTarget(targetCapabilities, target);
+                if (!capability || capability.supported.length === 0) return null;
+                return (
+                  <Combobox
+                    aria-label={`Target ${index + 1} effort`}
+                    options={[
+                      { value: "", label: "Model default" },
+                      ...capability.supported.map((option) => ({ value: option.value, label: option.label })),
+                    ]}
+                    value={target.effort ?? ""}
+                    onValueChange={(effort) =>
+                      setDraft((current) => ({
+                        ...current,
+                        targets: current.targets.map((currentTarget, i) =>
+                          i === index ? { ...currentTarget, effort: effort || null } : currentTarget,
+                        ),
+                      }))
+                    }
+                    className="w-40 shrink-0"
+                    trigger={
+                      <Button variant="outline" className="w-full justify-between gap-2 font-normal">
+                        {capability.supported.find((option) => option.value === target.effort)?.label ?? target.effort ?? "Model default"}
+                      </Button>
+                    }
+                  />
+                );
+              })()}
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -536,13 +594,15 @@ function RouteForm({
   );
 }
 
-function RouteTargetPill({ target, catalog }: { target: { provider: string; model: string }; catalog: CatalogEntry[] }) {
+function RouteTargetPill({ target, catalog }: { target: ModelRouteTarget; catalog: CatalogEntry[] }) {
   const head = catalog.find((entry) => entry.id === target.provider);
+  const effortLabel = target.effort ? `${target.effort.charAt(0).toUpperCase()}${target.effort.slice(1)} override` : null;
   return (
     <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md bg-muted px-2 py-1 font-mono text-[11.5px] text-muted-foreground">
       <span className="truncate">
         {head?.name ?? target.provider} / {target.model}
       </span>
+      {effortLabel && <span className="shrink-0">{effortLabel}</span>}
       <ModelCapabilityIcons model={target.model} compact />
     </span>
   );
@@ -601,7 +661,7 @@ function RouteCard({
 }
 
 function RouteTab() {
-  const { routes, loaded, hydrate, save, remove } = useModelRoutes();
+  const { routes, targetCapabilities, targetCapabilitiesLoaded, loaded, hydrate, save, remove } = useModelRoutes();
   const catalog = useConnections((s) => s.catalog);
   const connections = useConnections((s) => s.connections);
   const [editing, setEditing] = useState<ModelRouteInfo | null>(null);
@@ -610,8 +670,8 @@ function RouteTab() {
   const targets = useMemo(() => routeTargetOptions(catalog, connections), [catalog, connections]);
 
   useEffect(() => {
-    if (!loaded) void hydrate();
-  }, [loaded, hydrate]);
+    if (!loaded || !targetCapabilitiesLoaded) void hydrate();
+  }, [loaded, targetCapabilitiesLoaded, hydrate]);
 
   const beginNew = () => setEditing(newRoute(targets));
   const saveRoute = async (route: ModelRouteInfo) => {
@@ -631,6 +691,7 @@ function RouteTab() {
         <RouteForm
           value={editing}
           targetOptions={targets}
+          targetCapabilities={targetCapabilities}
           saving={saving}
           onCancel={() => setEditing(null)}
           onSave={(route) => void saveRoute(route)}

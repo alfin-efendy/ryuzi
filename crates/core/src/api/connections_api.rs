@@ -46,6 +46,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "connection_provider_quota",
     "reset_codex_credit",
     "list_model_routes",
+    "list_model_route_target_capabilities",
     "save_model_route",
     "delete_model_route",
     "provider_account_route",
@@ -239,6 +240,9 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             ok(reset_codex_credit(cp, a.id).await?)
         }
         "list_model_routes" => ok(routes::list_model_routes(cp.store()).await?),
+        "list_model_route_target_capabilities" => {
+            ok(routes::list_model_route_target_capabilities(cp.store()).await?)
+        }
         "save_model_route" => {
             let a: SaveModelRouteP = params(p)?;
             routes::save_model_route(cp.store(), a.route).await?;
@@ -1260,6 +1264,54 @@ mod tests {
 
     fn status(code: u16) -> reqwest::StatusCode {
         reqwest::StatusCode::from_u16(code).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_model_route_target_capabilities_dispatches_resolver_backed_anthropic_capability()
+    {
+        let s = state().await;
+        connections::add_connection(
+            s.cp.store(),
+            ConnectionRow {
+                id: "anthropic-live".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    models_override: Some(vec!["claude-opus-4-7".into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities: Vec<routes::ModelRouteTargetCapability> = serde_json::from_value(
+            dispatch(&s, "list_model_route_target_capabilities", json!({}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let capability = capabilities
+            .iter()
+            .find(|capability| {
+                capability.provider == "anthropic" && capability.model == "claude-opus-4-7"
+            })
+            .unwrap();
+
+        assert_eq!(
+            capability
+                .supported
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "max", "xhigh"]
+        );
+        assert_eq!(capability.provider_default.as_deref(), Some("high"));
     }
 
     #[test]

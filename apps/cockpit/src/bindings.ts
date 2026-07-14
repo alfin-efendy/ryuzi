@@ -1036,6 +1036,14 @@ async listModelRoutes(runnerId: string | null) : Promise<Result<ModelRouteInfo[]
     else return { status: "error", error: e  as any };
 }
 },
+async listModelRouteTargetCapabilities(runnerId: string | null) : Promise<Result<ModelRouteTargetCapability[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_route_target_capabilities", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async saveModelRoute(runnerId: string | null, route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_model_route", { runnerId, route }) };
@@ -1849,7 +1857,7 @@ severity: string;
  * see `crate::plugins::doctor::plugin_doctor`'s extension section).
  */
 kind: string; message: string; suggestedAction: string }
-export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
+export type EffectiveEffortSource = "project" | "session" | "routeTarget" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 /**
@@ -1997,10 +2005,10 @@ export type ModelRouteTarget = {
  */
 provider: string; model: string; 
 /**
- * Compatibility-only storage for legacy Codex virtual model suffixes.
- * New route writes cannot edit this value directly.
+ * Explicit effort policy; `None` uses the model default.
  */
 effort?: string | null }
+export type ModelRouteTargetCapability = { provider: string; model: string; supported: ReasoningEffortOption[]; providerDefault: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.

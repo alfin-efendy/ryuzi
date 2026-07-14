@@ -146,6 +146,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::connection_provider_quota,
             connections_cmd::reset_codex_credit,
             connections_cmd::list_model_routes,
+            connections_cmd::list_model_route_target_capabilities,
             connections_cmd::save_model_route,
             connections_cmd::delete_model_route,
             connections_cmd::provider_account_route,
