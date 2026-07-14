@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AgentSummaryInfo, CmdError, OpenTarget, Project, Result, Session } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -43,6 +43,11 @@ const projectRuntimeInfo = mock(() =>
 // `commands` through this same live binding, so an absent `fetchAttachment`
 // here would break ITS attachment-preview test instead of ours.
 const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data: { dataBase64: "", contentType: null } }));
+const continueSession = mock(() => Promise.resolve({ status: "ok" as const, data: null }));
+const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Project[] }));
+const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
+const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as string[] }));
 
 mock.module("@/bindings", () => ({
   commands: {
@@ -53,6 +58,11 @@ mock.module("@/bindings", () => ({
     sessionTodos,
     projectRuntimeInfo,
     fetchAttachment,
+    continueSession,
+    listProjects,
+    listSessions,
+    listGateways,
+    searchFiles,
     // SessionView's orch task-strip effect (Phase 5) calls this on a chat
     // session; stub an empty result so no strip mounts and it doesn't throw.
     orchListRoots: async () => ({ status: "ok" as const, data: [] }),
@@ -166,11 +176,18 @@ function seed(runnerId: string, sessionOverrides: Partial<Session> = {}, agents:
 beforeEach(() => {
   drawerMounts.length = 0;
   listOpenTargets.mockClear();
+  continueSession.mockClear();
+  listProjects.mockClear();
+  listSessions.mockClear();
+  listGateways.mockClear();
+  searchFiles.mockClear();
 });
 
 afterEach(() => {
   cleanup();
-  useNav.setState({ bottomOpen: false });
+  useNav.setState({ drafts: {}, bottomOpen: false, rightOpen: false });
+  useStore.setState({ sessions: [], projects: [], focusedSession: null, transcripts: {}, pendingApprovals: [] });
+  useAgents.setState({ registry: null, models: [] });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
 });
 
@@ -185,6 +202,97 @@ test("immutable primary snapshot labels the session despite profile edits", asyn
   expect(await screen.findByText("Original reviewer")).toBeTruthy();
   expect(screen.queryByText("Renamed profile")).toBeNull();
   expect((screen.getByPlaceholderText("Ask for follow-up changes") as HTMLTextAreaElement).disabled).toBe(false);
+});
+
+test("session composer sends raw leading whitespace and its structured mention span", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
+    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
+  );
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "  @a review", selectionStart: 4 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("  @Ada  review");
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() =>
+    expect(continueSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "s1",
+      expect.objectContaining({
+        text: "  @Ada  review",
+        mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 2, endUtf16: 6 }],
+      }),
+    ),
+  );
+});
+
+test("session mention metadata stays with its draft when switching sessions", async () => {
+  const s2 = session(LOCAL_RUNNER, {
+    sessionPk: "s2",
+    primaryAgentId: "primary",
+    primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" },
+  });
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
+    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
+  );
+  useStore.setState({ sessions: [...useStore.getState().sessions, s2] });
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@a keep", selectionStart: 2 } });
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("@Ada  keep");
+
+  act(() => useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "s2" } }));
+  fireEvent.change(composer, { target: { value: "plain s2" } });
+  act(() => useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "s1" } }));
+  expect(composer.value).toBe("@Ada  keep");
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() =>
+    expect(continueSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "s1",
+      expect.objectContaining({ mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }] }),
+    ),
+  );
+});
+
+test("session textarea Escape closes the agent mention popup", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
+    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
+  );
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+});
+
+test("session plain agent @ mentions open the agent menu instead of searching context", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
+    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
+  );
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+
+  expect(screen.getByRole("menu").textContent).toContain("Agents");
+  expect(searchFiles).not.toHaveBeenCalled();
 });
 
 test("session composer selects an agent mention from its keyboard menu", async () => {

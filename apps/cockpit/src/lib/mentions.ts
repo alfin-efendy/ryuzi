@@ -8,6 +8,7 @@ export type MentionDraft = {
 export type MentionAgent = {
   id: string;
   name: string;
+  description: string;
   executable: boolean;
 };
 
@@ -34,16 +35,14 @@ export function matchMentionAgents<T extends MentionAgent>(
   agents: T[],
   query: string,
   primaryAgentId: string | null,
-  mentions: AgentMention[],
+  _mentions: AgentMention[],
 ): T[] {
   const normalizedQuery = query.toLocaleLowerCase();
-  const mentionedIds = new Set(mentions.map((mention) => mention.agentId));
   return agents.filter(
     (agent) =>
       agent.executable &&
       agent.id !== primaryAgentId &&
-      !mentionedIds.has(agent.id) &&
-      agent.name.toLocaleLowerCase().includes(normalizedQuery),
+      (agent.name.toLocaleLowerCase().includes(normalizedQuery) || agent.description.toLocaleLowerCase().includes(normalizedQuery)),
   );
 }
 
@@ -73,7 +72,6 @@ export function updateMentionDraft(previous: MentionDraft, text: string): Mentio
 }
 
 export function insertAgentMention(draft: MentionDraft, caret: number, agent: MentionAgent): MentionDraft {
-  if (draft.mentions.some((mention) => mention.agentId === agent.id)) return draft;
   const active = activeAgentMentionQuery(draft.text, caret);
   if (!active) return draft;
 

@@ -37,27 +37,43 @@ export function HomeView() {
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
-  const [contextRefs, setContextRefs] = useState<string[]>([]);
-  const [mentions, setMentions] = useState<MentionDraft["mentions"]>([]);
-  const [mentionCaret, setMentionCaret] = useState(0);
-  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
-  const [contextHits, setContextHits] = useState<string[]>([]);
-  const [listening, setListening] = useState(false);
-  const stopVoice = useRef<(() => void) | null>(null);
-
   // Chat is the default: no project is auto-selected. A project is attached
   // only when the user explicitly picks one (sidebar "+" or the composer's
   // project Combobox) — see selectedProjectId in the store.
   const project = projects.find((p) => p.projectId === selectedProjectId);
   const projectId = project?.projectId;
   const draftKey = `home:${projectId ?? ""}`;
-  const draft = nav.drafts[draftKey] ?? "";
-  const setDraft = useCallback(
-    (next: string | ((cur: string) => string)) => {
-      const { drafts, setDraft: write } = useNav.getState();
-      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
+  const [contextRefs, setContextRefs] = useState<string[]>([]);
+  const [mentionsByDraft, setMentionsByDraft] = useState<Record<string, MentionDraft["mentions"]>>({});
+  const mentionsByDraftRef = useRef<Record<string, MentionDraft["mentions"]>>({});
+  mentionsByDraftRef.current = mentionsByDraft;
+  const mentions = mentionsByDraft[draftKey] ?? [];
+  const setMentions = useCallback(
+    (next: MentionDraft["mentions"] | ((current: MentionDraft["mentions"]) => MentionDraft["mentions"])) => {
+      const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
+      const nextMentions = typeof next === "function" ? next(currentMentions) : next;
+      mentionsByDraftRef.current = { ...mentionsByDraftRef.current, [draftKey]: nextMentions };
+      setMentionsByDraft((current) => ({ ...current, [draftKey]: nextMentions }));
     },
     [draftKey],
+  );
+  const [mentionCaret, setMentionCaret] = useState(0);
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
+  const [contextHits, setContextHits] = useState<string[]>([]);
+  const [listening, setListening] = useState(false);
+  const stopVoice = useRef<(() => void) | null>(null);
+
+  const draft = nav.drafts[draftKey] ?? "";
+  const updateDraft = useCallback(
+    (next: string | ((current: string) => string) | MentionDraft) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      const current = drafts[draftKey] ?? "";
+      const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
+      const updated = typeof next === "object" ? next : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
+      write(draftKey, updated.text);
+      setMentions(updated.mentions);
+    },
+    [draftKey, setMentions],
   );
   const isGit = project?.isGit ?? false;
   const registry = useAgents((s) => s.registry);
@@ -106,6 +122,13 @@ export function HomeView() {
     };
   }, [projectId, isGit, setComposerBranch]);
 
+  useEffect(() => {
+    setMentionCaret(0);
+    setMentionActiveIndex(0);
+    setContextRefs([]);
+    setContextHits([]);
+  }, [draftKey]);
+
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
     if (!trimmed.startsWith("/") || trimmed.includes(" ")) return null;
@@ -120,9 +143,9 @@ export function HomeView() {
     () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", primaryAgentId, mentions),
     [registry?.agents, mentionQuery?.query, primaryAgentId, mentions],
   );
-  const mentionMenuOpen = mentionQuery !== null && contextHits.length === 0 && slashMatches.length === 0 && mentionMatches.length > 0;
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
+  const mentionMenuOpen = mentionQuery !== null && contextQuery === null && slashQuery === null && mentionMatches.length > 0;
 
   useEffect(() => {
     if (!projectId || contextQueryText === null) {
@@ -142,16 +165,20 @@ export function HomeView() {
   }, [projectId, contextQueryText]);
 
   const pickContext = (path: string) => {
-    setDraft((cur) => replaceActiveContextToken(cur, path));
+    updateDraft((cur) => replaceActiveContextToken(cur, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
     setContextHits([]);
   };
 
   const pickMention = (agent: AgentSummaryInfo) => {
     const next = insertAgentMention({ text: draft, mentions }, mentionCaret, agent);
-    setDraft(next.text);
-    setMentions(next.mentions);
+    updateDraft(next);
     setMentionCaret(next.text.length);
+    setMentionActiveIndex(0);
+  };
+
+  const dismissMentionMenu = () => {
+    setMentionCaret(0);
     setMentionActiveIndex(0);
   };
 
@@ -163,7 +190,7 @@ export function HomeView() {
       return;
     }
     const started = startVoiceDictation({
-      onText: (text) => setDraft((cur) => (cur.trim() ? `${cur.trimEnd()} ${text}` : text)),
+      onText: (text) => updateDraft((cur) => (cur ? `${cur} ${text}` : text)),
       onEnd: () => {
         stopVoice.current = null;
         setListening(false);
@@ -179,8 +206,8 @@ export function HomeView() {
   };
 
   const send = async () => {
-    const text = draft.trim();
-    if (!hasExecutablePrimary || (!text && composerFiles.attachments.length === 0)) return;
+    const text = draft;
+    if (!hasExecutablePrimary || (!text.trim() && composerFiles.attachments.length === 0)) return;
     useNav.getState().consumePendingPrimaryAgentId();
     const typed = draft;
     const typedMentions = mentions;
@@ -219,14 +246,17 @@ export function HomeView() {
           <Textarea
             value={draft}
             onChange={(e) => {
-              const next = updateMentionDraft({ text: draft, mentions }, e.target.value);
-              setDraft(next.text);
-              setMentions(next.mentions);
+              updateDraft(e.target.value);
               setMentionCaret(e.target.selectionStart);
               setMentionActiveIndex(0);
             }}
             onSelect={(e) => setMentionCaret(e.currentTarget.selectionStart)}
             onKeyDown={(e) => {
+              if (e.key === "Escape" && mentionMenuOpen) {
+                e.preventDefault();
+                dismissMentionMenu();
+                return;
+              }
               if (mentionMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
                 const delta = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
                 e.preventDefault();
@@ -253,14 +283,14 @@ export function HomeView() {
               activeIndex={mentionActiveIndex}
               onActiveIndexChange={setMentionActiveIndex}
               onPick={pickMention}
-              onClose={() => setMentionCaret(0)}
+              onClose={dismissMentionMenu}
             />
           )}
           {slashMatches.length > 0 && (
             <MenuPanel onClose={() => undefined} className="bottom-full left-3 z-50 mb-1.5 w-[320px]">
               <MenuSectionLabel>Commands</MenuSectionLabel>
               {slashMatches.map((cmd) => (
-                <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
+                <MenuItem key={cmd.name} onClick={() => updateDraft(`/${cmd.name} `)} className="font-medium">
                   <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
                   <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
                 </MenuItem>
@@ -400,7 +430,7 @@ export function HomeView() {
 
         <div className="mt-4 flex flex-wrap justify-center gap-2">
           {HOME_SUGGESTIONS.map((s) => (
-            <Button key={s} variant="outline" onClick={() => setDraft(s)} className="rounded-full px-3 text-muted-foreground">
+            <Button key={s} variant="outline" onClick={() => updateDraft(s)} className="rounded-full px-3 text-muted-foreground">
               {s}
             </Button>
           ))}

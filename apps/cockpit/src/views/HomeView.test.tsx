@@ -205,6 +205,7 @@ beforeEach(() => {
   useNav.setState({ composerBranch: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
+  searchFiles.mockClear();
   startSession.mockClear();
   startChatSession.mockClear();
   listProjects.mockClear();
@@ -256,6 +257,119 @@ test("composer text is read from the persisted draft map (key home:{projectId})"
   act(() => {
     useNav.getState().clearDraft("home:p1");
   });
+});
+
+test("sends raw leading whitespace and its structured mention span", async () => {
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        {
+          ...useAgents.getState().registry!.agents[0],
+          id: "ada",
+          name: "Ada",
+          description: "Accessibility reviewer",
+          isDefault: false,
+        },
+      ],
+    },
+  });
+  render(<HomeView />);
+  await waitFor(() => expect(useNav.getState().composerBranch).toBe("main"));
+
+  const composer = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "  @a review", selectionStart: 4 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("  @Ada  review");
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() =>
+    expect(startSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "p1",
+      "ryuzi",
+      expect.objectContaining({
+        text: "  @Ada  review",
+        mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 2, endUtf16: 6 }],
+      }),
+    ),
+  );
+});
+
+test("keeps structured mentions with their home draft when projects switch", async () => {
+  useStore.setState({ projects: [project(), project({ projectId: "p2", name: "other" })] });
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        { ...useAgents.getState().registry!.agents[0], id: "ada", name: "Ada", description: "Accessibility reviewer", isDefault: false },
+      ],
+    },
+  });
+  render(<HomeView />);
+
+  const composer = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@a keep", selectionStart: 2 } });
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("@Ada  keep");
+
+  act(() => useStore.setState({ selectedProjectId: "p2" }));
+  fireEvent.change(composer, { target: { value: "plain p2" } });
+  act(() => useStore.setState({ selectedProjectId: "p1" }));
+  expect(composer.value).toBe("@Ada  keep");
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() =>
+    expect(startSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "p1",
+      "ryuzi",
+      expect.objectContaining({ mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }] }),
+    ),
+  );
+});
+
+test("textarea Escape closes the agent mention popup", () => {
+  useStore.setState({ selectedProjectId: null });
+  localStorage.removeItem("cockpit.lastPrimaryAgentId");
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        { ...useAgents.getState().registry!.agents[0], id: "ada", name: "Ada", description: "Accessibility reviewer", isDefault: false },
+      ],
+    },
+  });
+  render(<HomeView />);
+
+  const composer = screen.getByPlaceholderText("Do anything");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+});
+
+test("plain agent @ mentions open the agent menu instead of searching context", () => {
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        { ...useAgents.getState().registry!.agents[0], id: "ada", name: "Ada", description: "Accessibility reviewer", isDefault: false },
+      ],
+    },
+  });
+  render(<HomeView />);
+
+  const composer = screen.getByPlaceholderText("Do anything");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+
+  expect(screen.getByRole("menu").textContent).toContain("Agents");
+  expect(searchFiles).not.toHaveBeenCalled();
 });
 
 test("selects the default primary and forwards a complete first project TurnInput", async () => {

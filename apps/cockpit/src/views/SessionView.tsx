@@ -46,15 +46,6 @@ export function SessionView() {
   // the visible text instead of leaking one session's draft into another.
   const draftKey = focusedSession ? refKey(focusedSession) : "";
   const draft = nav.drafts[draftKey] ?? "";
-  // Same call shape as the old useState setter so pickContext/voice callbacks
-  // keep working; reads go through getState() to avoid stale closures.
-  const setDraft = useCallback(
-    (next: string | ((cur: string) => string)) => {
-      const { drafts, setDraft: write } = useNav.getState();
-      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
-    },
-    [draftKey],
-  );
   const session = sessions.find((s) => isSession(s, focusedSession));
   const runnerId = session?.runnerId ?? LOCAL_RUNNER;
   // A local ConPTY/bash and locally-installed apps can't operate on a remote
@@ -63,8 +54,31 @@ export function SessionView() {
   const isRemote = runnerId !== LOCAL_RUNNER;
   const composerFiles = useComposerAttachments(runnerId);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
-  const [mentions, setMentions] = useState<MentionDraft["mentions"]>([]);
+  const [mentionsByDraft, setMentionsByDraft] = useState<Record<string, MentionDraft["mentions"]>>({});
+  const mentionsByDraftRef = useRef<Record<string, MentionDraft["mentions"]>>({});
+  mentionsByDraftRef.current = mentionsByDraft;
+  const mentions = mentionsByDraft[draftKey] ?? [];
+  const setMentions = useCallback(
+    (next: MentionDraft["mentions"] | ((current: MentionDraft["mentions"]) => MentionDraft["mentions"])) => {
+      const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
+      const nextMentions = typeof next === "function" ? next(currentMentions) : next;
+      mentionsByDraftRef.current = { ...mentionsByDraftRef.current, [draftKey]: nextMentions };
+      setMentionsByDraft((current) => ({ ...current, [draftKey]: nextMentions }));
+    },
+    [draftKey],
+  );
   const [mentionCaret, setMentionCaret] = useState(0);
+  const updateDraft = useCallback(
+    (next: string | ((current: string) => string) | MentionDraft) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      const current = drafts[draftKey] ?? "";
+      const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
+      const updated = typeof next === "object" ? next : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
+      write(draftKey, updated.text);
+      setMentions(updated.mentions);
+    },
+    [draftKey, setMentions],
+  );
   const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
@@ -132,9 +146,16 @@ export function SessionView() {
       // synchronously in submit() — without a session change — so that
       // path never reaches this cleanup with a stale pending value.
       if (historyRef.current.index >= 0) {
-        useNav.getState().setDraft(draftKey, historyRef.current.pending);
+        updateDraft(historyRef.current.pending);
       }
     };
+  }, [draftKey, updateDraft]);
+
+  useEffect(() => {
+    setMentionCaret(0);
+    setMentionActiveIndex(0);
+    setContextRefs([]);
+    setContextHits([]);
   }, [draftKey]);
 
   const slashQuery = useMemo(() => {
@@ -151,9 +172,9 @@ export function SessionView() {
     () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", session?.primaryAgentId ?? null, mentions),
     [registry?.agents, mentionQuery?.query, session?.primaryAgentId, mentions],
   );
-  const mentionMenuOpen = mentionQuery !== null && contextHits.length === 0 && slashMatches.length === 0 && mentionMatches.length > 0;
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
+  const mentionMenuOpen = mentionQuery !== null && contextQuery === null && slashQuery === null && mentionMatches.length > 0;
 
   useEffect(() => {
     if (!projectId || contextQueryText === null) {
@@ -191,8 +212,8 @@ export function SessionView() {
 
   const submit = () => {
     if (composeReadOnly) return;
-    const t = draft.trim();
-    if (!t && composerFiles.attachments.length === 0) return;
+    const t = draft;
+    if (!t.trim() && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
     const typed = draft;
     const typedMentions = mentions;
@@ -238,16 +259,20 @@ export function SessionView() {
   };
 
   const pickContext = (path: string) => {
-    setDraft((cur) => replaceActiveContextToken(cur, path));
+    updateDraft((cur) => replaceActiveContextToken(cur, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
     setContextHits([]);
   };
 
   const pickMention = (agent: AgentSummaryInfo) => {
     const next = insertAgentMention({ text: draft, mentions }, mentionCaret, agent);
-    setDraft(next.text);
-    setMentions(next.mentions);
+    updateDraft(next);
     setMentionCaret(next.text.length);
+    setMentionActiveIndex(0);
+  };
+
+  const dismissMentionMenu = () => {
+    setMentionCaret(0);
     setMentionActiveIndex(0);
   };
 
@@ -259,7 +284,7 @@ export function SessionView() {
       return;
     }
     const started = startVoiceDictation({
-      onText: (text) => setDraft((cur) => (cur.trim() ? `${cur.trimEnd()} ${text}` : text)),
+      onText: (text) => updateDraft((cur) => (cur ? `${cur} ${text}` : text)),
       onEnd: () => {
         stopVoice.current = null;
         setListening(false);
@@ -379,14 +404,17 @@ export function SessionView() {
                 onChange={(e) => {
                   // Typing exits history mode: the edited text becomes the live draft.
                   historyRef.current = HISTORY_IDLE;
-                  const next = updateMentionDraft({ text: draft, mentions }, e.target.value);
-                  setDraft(next.text);
-                  setMentions(next.mentions);
+                  updateDraft(e.target.value);
                   setMentionCaret(e.target.selectionStart);
                   setMentionActiveIndex(0);
                 }}
                 onSelect={(e) => setMentionCaret(e.currentTarget.selectionStart)}
                 onKeyDown={(e) => {
+                  if (e.key === "Escape" && mentionMenuOpen) {
+                    e.preventDefault();
+                    dismissMentionMenu();
+                    return;
+                  }
                   if (mentionMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
                     const delta = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
                     e.preventDefault();
@@ -411,7 +439,7 @@ export function SessionView() {
                     if (!step) return;
                     e.preventDefault();
                     historyRef.current = step.state;
-                    setDraft(step.text);
+                    updateDraft(step.text);
                   }
                 }}
                 onPaste={composerFiles.onPaste}
@@ -425,14 +453,14 @@ export function SessionView() {
                   activeIndex={mentionActiveIndex}
                   onActiveIndexChange={setMentionActiveIndex}
                   onPick={pickMention}
-                  onClose={() => setMentionCaret(0)}
+                  onClose={dismissMentionMenu}
                 />
               )}
               {slashMatches.length > 0 && (
                 <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
                   <MenuSectionLabel>Commands</MenuSectionLabel>
                   {slashMatches.map((cmd) => (
-                    <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
+                    <MenuItem key={cmd.name} onClick={() => updateDraft(`/${cmd.name} `)} className="font-medium">
                       <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
                       <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
                     </MenuItem>

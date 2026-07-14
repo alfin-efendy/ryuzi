@@ -8,9 +8,9 @@ import {
   type MentionDraft,
 } from "./mentions";
 
-const ada = { id: "ada", name: "Ada", executable: true };
-const lin = { id: "lin", name: "Lin", executable: true };
-const blocked = { id: "blocked", name: "Blocked", executable: false };
+const ada = { id: "ada", name: "Ada", description: "Accessibility review", executable: true };
+const lin = { id: "lin", name: "Lin", description: "Systems planner", executable: true };
+const blocked = { id: "blocked", name: "Blocked", description: "Unavailable", executable: false };
 
 function draft(text: string, mentions: AgentMention[] = []): MentionDraft {
   return { text, mentions };
@@ -26,10 +26,23 @@ describe("insertAgentMention", () => {
     });
   });
 
-  test("does not add the same agent twice", () => {
-    const existing = draft("@Ada and @a", [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }]);
+  test("returns the draft unchanged without an active mention query", () => {
+    const existing = draft("@Ada and done", [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }]);
 
     expect(insertAgentMention(existing, existing.text.length, ada)).toEqual(existing);
+  });
+
+  test("records duplicate visible tokens for backend execution deduplication", () => {
+    const existing = draft("@Ada and @a", [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }]);
+    const result = insertAgentMention(existing, existing.text.length, ada);
+
+    expect(result).toEqual({
+      text: "@Ada and @Ada ",
+      mentions: [
+        { agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 },
+        { agentId: "ada", labelSnapshot: "Ada", startUtf16: 9, endUtf16: 13 },
+      ],
+    });
   });
 });
 
@@ -40,6 +53,12 @@ describe("updateMentionDraft", () => {
     expect(updateMentionDraft(draft("😀 ask @Ada", [mention]), "😀 please ask @Ada")).toEqual(
       draft("😀 please ask @Ada", [{ ...mention, startUtf16: 14, endUtf16: 18 }]),
     );
+  });
+
+  test("preserves a leading whitespace mention span for the untrimmed submit text", () => {
+    const mentions = [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 2, endUtf16: 6 }];
+
+    expect(updateMentionDraft(draft("  @Ada review", mentions), "  @Ada review")).toEqual(draft("  @Ada review", mentions));
   });
 
   test("keeps a mention when text is pasted after it", () => {
@@ -63,10 +82,11 @@ describe("agent mention query and candidates", () => {
     expect(activeAgentMentionQuery("email me@ada", 12)).toBeNull();
   });
 
-  test("matches names case-insensitively while excluding the primary, non-executable, and mentioned agents", () => {
+  test("retains duplicate visible tokens and matches names or descriptions case-insensitively", () => {
     const mentioned: AgentMention[] = [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }];
 
     expect(matchMentionAgents([ada, lin, blocked], "LI", "ada", mentioned)).toEqual([lin]);
-    expect(matchMentionAgents([ada, lin, blocked], "", "lin", mentioned)).toEqual([]);
+    expect(matchMentionAgents([ada, lin, blocked], "review", "lin", mentioned)).toEqual([ada]);
+    expect(matchMentionAgents([ada, lin, blocked], "", "lin", mentioned)).toEqual([ada]);
   });
 });
