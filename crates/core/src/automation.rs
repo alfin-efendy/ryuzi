@@ -1198,7 +1198,7 @@ pub async fn finish_run(
     let run_id = run_id.to_string();
     let status = status.to_string();
     let session_pk = session_pk.map(ToString::to_string);
-    let error = error.map(|value| sanitize_error(value));
+    let error = error.map(sanitize_error);
     let now = now_ms();
     store
         .with_conn(move |c| {

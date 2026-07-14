@@ -198,7 +198,7 @@ impl ControlPlane {
         // explicitly after construction; no test path ever does. See that
         // method's doc comment.
 
-        let control = Arc::new(ControlPlane {
+        Arc::new(ControlPlane {
             store,
             automation: Dispatcher::new(),
             registries,
@@ -217,8 +217,7 @@ impl ControlPlane {
             )),
             extension_host: Arc::new(ExtensionHost::new()),
             agent_persistence: std::sync::OnceLock::new(),
-        });
-        control
+        })
     }
 
     /// One-time, best-effort startup maintenance for the install ledger and
