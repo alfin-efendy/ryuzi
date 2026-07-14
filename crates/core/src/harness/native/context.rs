@@ -46,34 +46,68 @@ fn steer_channel_note() -> String {
     )
 }
 
-/// Assemble the system prompt for a session rooted at `work_dir`.
-/// `extra_skill_dirs` (plugin-bundled skill directories — see
-/// `crate::plugins::PluginHost::enabled_skill_dirs`) are folded into the
-/// discovered skill set alongside the worktree/global ones. `memory` is the
-/// persistent-memory snapshot to inject (primary agents on the assembled
-/// prompt only — agents with custom prompts and sub-agents run memoryless).
-pub fn assemble_system(
+/// One assembled system-prompt block, tagged with a coarse label used only
+/// for the diagnostic breakdown (see `breakdown_of`). Bodies are joined with
+/// `\n\n` to form the final `system` string.
+pub(crate) struct Section {
+    #[allow(dead_code)] // Consumed by the diagnostic breakdown in a later task.
+    pub label: &'static str,
+    pub body: String,
+}
+
+/// Build the ordered list of system-prompt sections for a session rooted at
+/// `work_dir`. Instruction files with byte-identical trimmed bodies are
+/// injected only once (keep-first): a `CLAUDE.md` that is a symlink to — or a
+/// copy of — `AGENTS.md` no longer doubles the prompt. `extra_skill_dirs` are
+/// the plugin-bundled skill directories folded into skill discovery; `memory`
+/// is the persistent-memory snapshot (primary agents only).
+pub(crate) fn build_sections(
     work_dir: &Path,
     extra_skill_dirs: &[std::path::PathBuf],
     memory: Option<&str>,
-) -> String {
-    let mut sections: Vec<String> = vec![
-        BASE_PROMPT.to_string(),
-        steer_channel_note(),
-        super::tools::session_search::SESSION_SEARCH_GUIDANCE.to_string(),
+) -> Vec<Section> {
+    let mut sections: Vec<Section> = vec![
+        Section {
+            label: "base_prompt",
+            body: BASE_PROMPT.to_string(),
+        },
+        Section {
+            label: "steer_note",
+            body: steer_channel_note(),
+        },
+        Section {
+            label: "session_search",
+            body: super::tools::session_search::SESSION_SEARCH_GUIDANCE.to_string(),
+        },
     ];
 
-    // Environment facts.
-    sections.push(format!(
-        "Environment:\n- Working directory: {}\n- Platform: {}",
-        work_dir.display(),
-        std::env::consts::OS
-    ));
+    sections.push(Section {
+        label: "environment",
+        body: format!(
+            "Environment:\n- Working directory: {}\n- Platform: {}",
+            work_dir.display(),
+            std::env::consts::OS
+        ),
+    });
+
+    // Deduplicate instruction files by trimmed body content (not path), so a
+    // symlinked or copied CLAUDE.md/AGENTS.md pair contributes once.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Global instruction files.
     if let Some(home) = dirs::home_dir() {
-        push_if_present(&mut sections, &home.join(".config/ryuzi/AGENTS.md"));
-        push_if_present(&mut sections, &home.join(".claude/CLAUDE.md"));
+        push_if_present(
+            &mut sections,
+            &mut seen,
+            "global_instructions",
+            &home.join(".config/ryuzi/AGENTS.md"),
+        );
+        push_if_present(
+            &mut sections,
+            &mut seen,
+            "global_instructions",
+            &home.join(".claude/CLAUDE.md"),
+        );
     }
 
     // Project instruction files, walked from the worktree up to the fs root,
@@ -85,19 +119,32 @@ pub fn assemble_system(
         cur = d.parent();
     }
     for dir in dirs_up.into_iter().rev() {
-        push_if_present(&mut sections, &dir.join("AGENTS.md"));
-        push_if_present(&mut sections, &dir.join("CLAUDE.md"));
+        push_if_present(
+            &mut sections,
+            &mut seen,
+            "project_instructions",
+            &dir.join("AGENTS.md"),
+        );
+        push_if_present(
+            &mut sections,
+            &mut seen,
+            "project_instructions",
+            &dir.join("CLAUDE.md"),
+        );
     }
 
-    // Persistent memory snapshot (before skills so remembered conventions
-    // precede tooling hints), followed immediately by the "don't hoard"
-    // guidance so the model reads the contract right where it reads the
-    // scopes it applies to.
+    // Persistent memory snapshot, then the "don't hoard" guidance.
     if let Some(mem) = memory {
         let mem = mem.trim();
         if !mem.is_empty() {
-            sections.push(mem.to_string());
-            sections.push(super::memory::MEMORY_GUIDANCE.to_string());
+            sections.push(Section {
+                label: "memory",
+                body: mem.to_string(),
+            });
+            sections.push(Section {
+                label: "memory",
+                body: super::memory::MEMORY_GUIDANCE.to_string(),
+            });
         }
     }
 
@@ -105,17 +152,53 @@ pub fn assemble_system(
     if let Some(guidance) =
         super::skills::SkillRegistry::load_with(work_dir, extra_skill_dirs).guidance()
     {
-        sections.push(guidance);
+        sections.push(Section {
+            label: "skills",
+            body: guidance,
+        });
     }
 
-    sections.join("\n\n")
+    sections
 }
 
-fn push_if_present(sections: &mut Vec<String>, path: &Path) {
+/// Join section bodies into the final `system` string (blank line between).
+/// `pub(crate)`, not `pub`: `Section` itself is crate-internal, and every
+/// current/expected caller (`assemble_system` and later same-crate refactors)
+/// lives inside `ryuzi-core`.
+pub(crate) fn join_sections(sections: &[Section]) -> String {
+    sections
+        .iter()
+        .map(|s| s.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Assemble the system prompt for a session rooted at `work_dir`. Signature is
+/// preserved for existing callers (including the review-fork path); it now
+/// delegates to `build_sections` + `join_sections`.
+pub fn assemble_system(
+    work_dir: &Path,
+    extra_skill_dirs: &[std::path::PathBuf],
+    memory: Option<&str>,
+) -> String {
+    join_sections(&build_sections(work_dir, extra_skill_dirs, memory))
+}
+
+fn push_if_present(
+    sections: &mut Vec<Section>,
+    seen: &mut std::collections::HashSet<String>,
+    label: &'static str,
+    path: &Path,
+) {
     if let Ok(text) = std::fs::read_to_string(path) {
         let text = text.trim();
-        if !text.is_empty() {
-            sections.push(format!("# Instructions from {}\n\n{text}", path.display()));
+        // `seen.insert` is false when this exact body was already pushed —
+        // keep-first, so a genuinely unique nearest file is never dropped.
+        if !text.is_empty() && seen.insert(text.to_string()) {
+            sections.push(Section {
+                label,
+                body: format!("# Instructions from {}\n\n{text}", path.display()),
+            });
         }
     }
 }
@@ -211,5 +294,62 @@ mod tests {
         assert!(!sys.contains(super::super::memory::MEMORY_GUIDANCE));
         let sys = assemble_system(dir.path(), &[], Some("   "));
         assert!(!sys.contains(super::super::memory::MEMORY_GUIDANCE));
+    }
+
+    #[test]
+    fn identical_instruction_bodies_are_injected_once() {
+        let dir = std::env::temp_dir().join(format!("ryuzi-ctx-dedup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("AGENTS.md"), "# Rules\n\nBe precise.").unwrap();
+        // CLAUDE.md with byte-identical content (the symlink/copy case).
+        std::fs::write(dir.join("CLAUDE.md"), "# Rules\n\nBe precise.").unwrap();
+
+        let sections = build_sections(&dir, &[], None);
+        let bodies: Vec<&str> = sections.iter().map(|s| s.body.as_str()).collect();
+        let hits = bodies.iter().filter(|b| b.contains("Be precise.")).count();
+        assert_eq!(
+            hits, 1,
+            "identical instruction content must appear exactly once"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distinct_instruction_bodies_are_both_kept() {
+        let dir = std::env::temp_dir().join(format!("ryuzi-ctx-distinct-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("AGENTS.md"), "# A\n\nAlpha rule.").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "# C\n\nBravo rule.").unwrap();
+
+        let sections = build_sections(&dir, &[], None);
+        let joined = join_sections(&sections);
+        assert!(
+            joined.contains("Alpha rule."),
+            "distinct AGENTS.md body must be present"
+        );
+        assert!(
+            joined.contains("Bravo rule."),
+            "distinct CLAUDE.md body must be present"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whitespace_only_differences_still_dedup() {
+        let dir = std::env::temp_dir().join(format!("ryuzi-ctx-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("AGENTS.md"), "Same body").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "\n  Same body  \n").unwrap(); // trims equal
+
+        let sections = build_sections(&dir, &[], None);
+        let hits = sections
+            .iter()
+            .filter(|s| s.body.contains("Same body"))
+            .count();
+        assert_eq!(hits, 1, "bodies equal after trim must dedup");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
