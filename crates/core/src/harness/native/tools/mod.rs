@@ -885,6 +885,7 @@ mod tests {
             "revert",
             "lsp",
             "task",
+            "delegate_agent",
             "session_search",
             "exitplanmode",
             "askuserquestion",
@@ -895,7 +896,7 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 25);
+        assert_eq!(defs.len(), 24);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
