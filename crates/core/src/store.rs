@@ -1931,7 +1931,8 @@ impl Store {
                     kind: row.get(0)?, hook_id: row.get(1)?, run_id: row.get(2)?, depth: row.get(3)?,
                 }),
             ).optional()
-        }).await.map_err(Into::into)
+        })
+        .await
     }
 
     pub async fn get_session(&self, pk: &str) -> anyhow::Result<Option<Session>> {
