@@ -531,6 +531,13 @@ pub struct Principal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
+    /// Durable run that owns this request. Resolution must supply this value
+    /// along with `request_id`, because tool-call IDs are not global.
+    pub run_id: String,
+    /// Stable id of the agent that requested approval.
+    pub requesting_agent_id: String,
+    /// Display-name snapshot of the requesting agent.
+    pub requesting_agent_name: String,
     pub request_id: String,
     pub tool: String,
     pub summary: String,
@@ -793,6 +800,11 @@ pub enum CoreEvent {
     },
     ApprovalRequested {
         session_pk: String,
+        /// Durable run that owns this approval. It is required for resolution.
+        run_id: String,
+        /// Agent profile identity and display name that originated the prompt.
+        requesting_agent_id: String,
+        requesting_agent_name: String,
         request_id: String,
         tool: String,
         summary: String,

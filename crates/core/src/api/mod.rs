@@ -471,10 +471,10 @@ mod tests {
     #[tokio::test]
     async fn approvals_endpoint_resolves_a_registered_approval() {
         let s = state().await;
-        let rx = s.cp.approvals_for_test_register("req-9");
+        let rx = s.cp.approvals_for_test_register("run-9", "req-9");
         let port = serve(s, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{port}/approvals/req-9"))
+            .post(format!("http://127.0.0.1:{port}/approvals/run-9/req-9"))
             .bearer_auth("t")
             .json(
                 &json!({ "response": { "decision": "allowOnce", "scope": null, "payload": null } }),

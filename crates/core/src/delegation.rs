@@ -182,6 +182,32 @@ impl DelegationRuntime {
         Ok(self.register(run, None).await)
     }
 
+    pub async fn registry_snapshot(&self) -> crate::agents::types::AgentRegistrySnapshot {
+        self.registry.snapshot().await
+    }
+
+    /// The `delegate_agent` catalog: every currently executable profile
+    /// except `exclude_agent_id` (the delegating agent itself — a profile
+    /// can never delegate to its own id). Shared by every site that renders
+    /// the catalog into a system prompt, so the executable filter and the
+    /// self-exclusion rule live in exactly one place.
+    pub async fn delegate_catalog(&self, exclude_agent_id: &str) -> Vec<(String, String, String)> {
+        self.registry
+            .snapshot()
+            .await
+            .agents
+            .into_iter()
+            .filter(|agent| agent.executable && agent.profile.id != exclude_agent_id)
+            .map(|agent| {
+                (
+                    agent.profile.id,
+                    agent.profile.name,
+                    agent.profile.description,
+                )
+            })
+            .collect()
+    }
+
     pub async fn execution_snapshot(&self, run_id: &str) -> Option<Arc<AgentSnapshot>> {
         self.live
             .lock()

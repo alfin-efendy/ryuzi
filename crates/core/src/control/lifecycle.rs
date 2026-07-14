@@ -2142,6 +2142,11 @@ impl ControlPlane {
             // dispatch (`agent.tools`, above) still enforces the whitelist.
             review_tool_defs: Some(payload.tool_defs.clone()),
             write_origin: WriteOrigin::BackgroundReview,
+            // The review fork's `Agent` sets `can_delegate: false` and its
+            // tool whitelist excludes `delegate_agent` entirely — it is an
+            // unattended background critique loop, never a delegation
+            // source — so there is no catalog to render.
+            delegation_catalog: Vec::new(),
         };
 
         let cfg = ContextConfig::with_meta(deps.meta.clone());

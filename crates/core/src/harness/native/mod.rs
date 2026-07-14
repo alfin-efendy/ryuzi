@@ -336,6 +336,13 @@ impl Harness for NativeHarness {
         } else {
             seed_nudge_state(&ctx.store, &ctx.session_pk).await
         };
+        // Rendered into the system prompt below so `delegate_agent` always
+        // advertises the CURRENT executable catalog, excluding this
+        // session's own profile (a profile can't delegate to itself).
+        let delegation_catalog = ctx
+            .delegation
+            .delegate_catalog(&ctx.primary_agent.profile.id)
+            .await;
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             steer: steer.clone(),
@@ -402,6 +409,7 @@ impl Harness for NativeHarness {
                         crate::domain::WriteOrigin::BackgroundReview
                     }
                 },
+                delegation_catalog,
             }),
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),

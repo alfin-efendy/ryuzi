@@ -445,6 +445,9 @@ fn spawn_approval_fanout(
             match rx.recv().await {
                 Ok(CoreEvent::ApprovalRequested {
                     session_pk,
+                    run_id,
+                    requesting_agent_id,
+                    requesting_agent_name,
                     request_id,
                     tool,
                     summary,
@@ -466,7 +469,8 @@ fn spawn_approval_fanout(
                         let cp = Arc::clone(&cp);
                         let store = Arc::clone(&store);
                         inflight.spawn(async move {
-                            schedule_non_tool_approval_cancel(&cp, &store, &request_id).await;
+                            schedule_non_tool_approval_cancel(&cp, &store, &run_id, &request_id)
+                                .await;
                         });
                         continue;
                     }
@@ -479,6 +483,9 @@ fn spawn_approval_fanout(
                             &store,
                             &gateways,
                             &session_pk,
+                            &run_id,
+                            &requesting_agent_id,
+                            &requesting_agent_name,
                             &request_id,
                             &tool,
                             &summary,
@@ -507,6 +514,7 @@ fn spawn_approval_fanout(
 pub(crate) async fn schedule_non_tool_approval_cancel(
     cp: &Arc<ControlPlane>,
     store: &Arc<Store>,
+    run_id: &str,
     request_id: &str,
 ) {
     let settings = SettingsStore::new(Arc::clone(store));
@@ -519,6 +527,7 @@ pub(crate) async fn schedule_non_tool_approval_cancel(
         .unwrap_or(300_000);
     tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
     cp.resolve_approval(
+        run_id,
         request_id,
         ApprovalResponse {
             decision: ApprovalDecision::Cancel,
@@ -548,6 +557,9 @@ pub(crate) async fn handle_approval(
     store: &Arc<Store>,
     gateways: &[Arc<dyn Gateway>],
     session_pk: &str,
+    run_id: &str,
+    requesting_agent_id: &str,
+    requesting_agent_name: &str,
     request_id: &str,
     tool: &str,
     summary: &str,
@@ -594,11 +606,14 @@ pub(crate) async fn handle_approval(
         .collect();
 
     if known_surfaces.is_empty() {
-        cp.resolve_approval_bool(request_id, false);
+        cp.resolve_approval_bool(run_id, request_id, false);
         return;
     }
 
     let req = ApprovalRequest {
+        run_id: run_id.to_string(),
+        requesting_agent_id: requesting_agent_id.to_string(),
+        requesting_agent_name: requesting_agent_name.to_string(),
         request_id: request_id.to_string(),
         tool: tool.to_string(),
         summary: summary.to_string(),
@@ -639,6 +654,7 @@ pub(crate) async fn handle_approval(
     };
 
     cp.resolve_approval_bool(
+        run_id,
         request_id,
         matches!(
             decision,
@@ -1102,6 +1118,9 @@ mod tests {
             &store,
             &gateways,
             "s1",
+            "run-1",
+            "agent-1",
+            "Agent 1",
             "req-1",
             "Bash",
             "ls -la",
@@ -1153,7 +1172,11 @@ mod tests {
         let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(2_000));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep", None).await;
+        handle_approval(
+            &cp, &store, &gateways, "s1", "run-2", "agent-2", "Agent 2", "req-2", "Bash", "sleep",
+            None,
+        )
+        .await;
 
         let parsed = parse_telemetry_lines(&lines);
         assert!(
@@ -1176,7 +1199,11 @@ mod tests {
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls", None).await;
+        handle_approval(
+            &cp, &store, &gateways, "s1", "run-3", "agent-3", "Agent 3", "req-3", "Bash", "ls",
+            None,
+        )
+        .await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1214,6 +1241,9 @@ mod tests {
             &store,
             &gateways,
             "s1",
+            "run-race-1",
+            "agent-race",
+            "Agent Race",
             "req-race-1",
             "Bash",
             "ls",
@@ -1249,6 +1279,9 @@ mod tests {
             &store,
             &gateways,
             "s1",
+            "run-race-2",
+            "agent-race",
+            "Agent Race",
             "req-race-2",
             "Bash",
             "ls",
@@ -1407,6 +1440,9 @@ mod tests {
     #[async_trait]
     impl HarnessSession for PermFakeSession {
         async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            let run_id = "perm-primary-run".to_string();
+            let requesting_agent_id = "ryuzi".to_string();
+            let requesting_agent_name = "Ryuzi".to_string();
             let _ = self
                 .store
                 .insert_message(NewMessage::block(
@@ -1420,6 +1456,9 @@ mod tests {
             let request_id = "perm-req-1".to_string();
             let _ = self.events.send(CoreEvent::ApprovalRequested {
                 session_pk: self.session_pk.clone(),
+                run_id: run_id.clone(),
+                requesting_agent_id,
+                requesting_agent_name,
                 request_id: request_id.clone(),
                 tool: "Bash".into(),
                 summary: "ls -la".into(),
@@ -1427,7 +1466,9 @@ mod tests {
                 input: serde_json::json!({}),
                 principal: None,
             });
-            let rx = self.approvals.register(request_id);
+            let rx = self
+                .approvals
+                .register(crate::approval::ApprovalKey::new(run_id, request_id));
             let allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
             if allow {
                 let _ = self
@@ -1508,6 +1549,9 @@ mod tests {
             match recv {
                 Ok(Ok(CoreEvent::ApprovalRequested {
                     session_pk,
+                    run_id,
+                    requesting_agent_id,
+                    requesting_agent_name,
                     request_id,
                     tool,
                     summary,
@@ -1524,6 +1568,9 @@ mod tests {
                         &store,
                         &gateways,
                         &session_pk,
+                        &run_id,
+                        &requesting_agent_id,
+                        &requesting_agent_name,
                         &request_id,
                         &tool,
                         &summary,
@@ -1569,12 +1616,19 @@ mod tests {
     #[async_trait]
     impl HarnessSession for PlanFakeSession {
         async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+            let run_id = "plan-primary-run".to_string();
+            let requesting_agent_id = "ryuzi".to_string();
+            let requesting_agent_name = "Ryuzi".to_string();
             let request_id = "plan-req-1".to_string();
-            let rx = self
-                .approvals
-                .register_for_session(&self.session_pk, request_id.clone());
+            let rx = self.approvals.register_for_session(
+                &self.session_pk,
+                crate::approval::ApprovalKey::new(run_id.clone(), request_id.clone()),
+            );
             let _ = self.events.send(CoreEvent::ApprovalRequested {
                 session_pk: self.session_pk.clone(),
+                run_id,
+                requesting_agent_id,
+                requesting_agent_name,
                 request_id: request_id.clone(),
                 tool: "exitplanmode".into(),
                 summary: "review the proposed plan".into(),

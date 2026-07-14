@@ -121,7 +121,10 @@ impl Tool for Clarify {
             Err(_elapsed) => {
                 // Deregister the pending approval so a late click can't hit a
                 // stale entry and nothing leaks — never hang the turn.
-                interaction.approvals.resolve_bool(&ctx.tool_call_id, false);
+                interaction.approvals.resolve_bool(
+                    &crate::approval::ApprovalKey::new(&ctx.run_id, &ctx.tool_call_id),
+                    false,
+                );
                 return Ok(ToolOutput::ok(
                     "No answer within the time limit; proceeding without it.",
                 ));
@@ -191,9 +194,12 @@ mod tests {
             .await
             .unwrap();
         let waiter = tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 hub.resolve(
-                    &request_id,
+                    &crate::approval::ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::AllowOnce,
                         scope: None,

@@ -13,12 +13,13 @@ use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
 use super::tools::{
-    BackgroundDispatch, OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus,
-    ToolCtx, ToolRegistry,
+    BackgroundDispatch, MainAgentSpawner, MainDelegationResult, OutputCaps, SubagentSpawner,
+    SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
 };
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
-use crate::domain::{CoreEvent, NewMessage, PermMode, SessionKind};
+use crate::delegation::{RunHandle, SubagentRunRequest};
+use crate::domain::{BackgroundKind, CoreEvent, NewMessage, PermMode, SessionKind};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -185,6 +186,9 @@ pub struct RunnerDeps {
     /// `User` for ordinary interactive sessions; the background review fork
     /// (Task 9) sets `BackgroundReview` so Task 6's skill-write guard applies.
     pub write_origin: crate::domain::WriteOrigin,
+    /// Profiles the runner can delegate to, rendered into the system prompt so
+    /// `delegate_agent` has a current, executable target catalog.
+    pub delegation_catalog: Vec<(String, String, String)>,
 }
 
 impl RunnerDeps {
@@ -317,6 +321,7 @@ pub async fn run_turn(
             deps: deps.clone(),
             cancel: cancel.clone(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         }) as Arc<dyn SubagentSpawner>
     });
     // Seed the parent turn-cap from the `agent.max_provider_turns` setting,
@@ -678,6 +683,18 @@ fn visible_tool_defs(tools: &ToolRegistry, agent: &Agent, kind: SessionKind) -> 
         .collect()
 }
 
+fn with_delegation_catalog(system: String, catalog: &[(String, String, String)]) -> String {
+    if catalog.is_empty() {
+        return system;
+    }
+    let entries = catalog
+        .iter()
+        .map(|(id, name, description)| format!("- `{id}` ({name}): {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{system}\n\nAvailable complete agent profiles for `delegate_agent`:\n{entries}")
+}
+
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
 /// `display` gates persistence of display rows: sub-agents stream only their
 /// tool rows (tagged with their label) so their text/thinking stay internal.
@@ -706,6 +723,7 @@ async fn drive(
             )
         }
     };
+    let system = with_delegation_catalog(system, &deps.delegation_catalog);
     // Tools restricted to what this agent may use — UNLESS a review fork
     // (Task 9) supplies the parent's exact captured `tool_defs` for cache
     // parity. Advertising the full parent tool set here is safe even though
@@ -1420,6 +1438,200 @@ struct RunnerSpawner {
     deps: RunnerDeps,
     cancel: CancellationToken,
     depth: u8,
+    /// The durable run that owns children spawned through this particular
+    /// `task` capability. Root turns use the primary run; each child spawner
+    /// replaces this with its own child run before it can recurse.
+    parent_run_id: String,
+}
+
+/// Runs complete durable main profiles in isolated child harnesses. The child
+/// receives its own immutable profile through `RunHandle.agent_snapshot`; it
+/// never receives parent attachments or persistent parent memory.
+struct RunnerMainAgentSpawner {
+    deps: RunnerDeps,
+}
+
+impl RunnerMainAgentSpawner {
+    async fn run_child(
+        &self,
+        request: crate::delegation::MainDelegationRequest,
+    ) -> MainDelegationResult {
+        let background = request.background;
+        let child_run = match self.deps.delegation.queue_main(request).await {
+            Ok(child) => child,
+            Err(error) => {
+                return MainDelegationResult {
+                    run_id: String::new(),
+                    agent_id: String::new(),
+                    status: SubtaskStatus::Error,
+                    report: error.to_string(),
+                };
+            }
+        };
+        let run_id = child_run.run.run_id.clone();
+        let agent_id = child_run.run.executing_agent_id.clone().unwrap_or_default();
+        if background {
+            let worker = Self {
+                deps: self.deps.clone(),
+            };
+            let goal = child_run.run.task.clone();
+            tokio::spawn(async move {
+                let result = worker.execute_child(child_run).await;
+                worker.deliver_background_result(&goal, &result).await;
+            });
+            return MainDelegationResult::completed(
+                run_id,
+                agent_id,
+                "background delegation dispatched".to_string(),
+            );
+        }
+        self.execute_child(child_run).await
+    }
+
+    async fn execute_child(&self, child: RunHandle) -> MainDelegationResult {
+        let run_id = child.run.run_id.clone();
+        let agent_id = child.run.executing_agent_id.clone().unwrap_or_default();
+        let result = async {
+            self.deps.delegation.mark_running(&run_id).await?;
+            let snapshot = child
+                .agent_snapshot
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("delegated agent snapshot is unavailable"))?;
+            let primary_turn = super::primary_turn_config(snapshot.clone(), run_id.clone())?;
+            let mut child_deps = self.deps.clone();
+            child_deps.run_id = run_id.clone();
+            child_deps.primary_agent = primary_turn.agent;
+            child_deps.main_agent_id = snapshot.profile.id.clone();
+            child_deps.isolated_target = true;
+            child_deps.attachments_dir = None;
+            child_deps.memory = None;
+            child_deps.app_control = None;
+            child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
+            child_deps.model = primary_turn.model;
+            child_deps.allowed_skills = primary_turn.allowed_skills;
+            child_deps.agent = primary_turn.agent_tools;
+            // The child's own catalog excludes ITS profile (not the
+            // parent's) — a delegated agent must never be offered a
+            // `delegate_agent` route back to the profile it's currently
+            // executing as.
+            child_deps.delegation_catalog = self
+                .deps
+                .delegation
+                .delegate_catalog(&snapshot.profile.id)
+                .await;
+            let mut cm = ContextManager::ephemeral(
+                &child_deps.session_pk,
+                ContextConfig::with_meta(child_deps.meta.clone()),
+            );
+            let task = child.run.task.clone();
+            cm.append_user(json!([{ "type": "text", "text": task }]))
+                .await?;
+            let turns = snapshot.profile.loop_settings.max_turns.max(1) as usize;
+            let text = drive(
+                &child_deps,
+                &child_deps.agent.clone(),
+                &mut cm,
+                &child.cancel,
+                Some(Arc::new(RunnerSpawner {
+                    deps: child_deps.clone(),
+                    cancel: child.cancel.clone(),
+                    depth: 0,
+                    parent_run_id: run_id.clone(),
+                })),
+                DisplayMode::ToolsOnly {
+                    label: snapshot.profile.name.clone(),
+                },
+                &IterationBudget::new(turns),
+            )
+            .await?;
+            self.deps.delegation.complete(&run_id, &text).await?;
+            Ok::<_, anyhow::Error>(text)
+        }
+        .await;
+        match result {
+            Ok(report) if child.cancel.is_cancelled() => {
+                let _ = self
+                    .deps
+                    .delegation
+                    .interrupt(&run_id, "delegated agent interrupted")
+                    .await;
+                MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Interrupted,
+                    report,
+                }
+            }
+            Ok(report) => MainDelegationResult::completed(run_id, agent_id, report),
+            Err(error) if child.cancel.is_cancelled() => {
+                let _ = self
+                    .deps
+                    .delegation
+                    .interrupt(&run_id, "delegated agent interrupted")
+                    .await;
+                MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Interrupted,
+                    report: error.to_string(),
+                }
+            }
+            Err(error) => {
+                let _ = self.deps.delegation.fail(&run_id, &error.to_string()).await;
+                MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Error,
+                    report: error.to_string(),
+                }
+            }
+        }
+    }
+
+    async fn deliver_background_result(&self, goal: &str, result: &MainDelegationResult) {
+        let block = delegation::format_delegation_block(&delegation::DelegationResult {
+            id: result.run_id.clone(),
+            goal: goal.to_string(),
+            agent_type: result.agent_id.clone(),
+            model: self.deps.model.clone().unwrap_or_default(),
+            status: result.status.as_str().to_string(),
+            summary: result.report.clone(),
+            error: (result.status == SubtaskStatus::Error).then(|| result.report.clone()),
+        });
+        let _ = self
+            .deps
+            .store
+            .enqueue_background_event(
+                &self.deps.session_pk,
+                BackgroundKind::Delegation.as_str(),
+                &block,
+            )
+            .await;
+    }
+}
+
+#[async_trait]
+impl MainAgentSpawner for RunnerMainAgentSpawner {
+    async fn available(&self) -> Vec<(String, String, String)> {
+        self.deps
+            .delegation
+            .delegate_catalog(&self.deps.primary_agent.profile.id)
+            .await
+    }
+
+    async fn run_one(
+        &self,
+        request: crate::delegation::MainDelegationRequest,
+    ) -> MainDelegationResult {
+        self.run_child(request).await
+    }
+
+    async fn run_many(
+        &self,
+        requests: Vec<crate::delegation::MainDelegationRequest>,
+    ) -> Vec<MainDelegationResult> {
+        futures::future::join_all(requests.into_iter().map(|request| self.run_child(request))).await
+    }
 }
 
 impl RunnerSpawner {
@@ -1453,6 +1665,90 @@ impl RunnerSpawner {
         index: usize,
         spec: SubtaskSpec,
         cancel: CancellationToken,
+    ) -> SubtaskResult {
+        let result = |status, report| SubtaskResult {
+            index,
+            agent_type: spec.agent_type.clone(),
+            status,
+            report,
+        };
+        let child_run = match self
+            .deps
+            .delegation
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: self.parent_run_id.clone(),
+                subagent_type: spec.agent_type.clone(),
+                task: spec.prompt.clone(),
+                context: None,
+                background: false,
+            })
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => return result(SubtaskStatus::Error, error.to_string()),
+        };
+        self.run_queued_child(index, spec, cancel, child_run).await
+    }
+
+    /// Execute a child after its durable run has been admitted. The same path
+    /// powers synchronous single/batch calls and detached background work.
+    async fn run_queued_child(
+        &self,
+        index: usize,
+        spec: SubtaskSpec,
+        cancel: CancellationToken,
+        child_run: RunHandle,
+    ) -> SubtaskResult {
+        let run_id = child_run.run.run_id.clone();
+        let result = |status, report| SubtaskResult {
+            index,
+            agent_type: spec.agent_type.clone(),
+            status,
+            report,
+        };
+        if let Err(error) = self.deps.delegation.mark_running(&run_id).await {
+            return result(SubtaskStatus::Error, error.to_string());
+        }
+        let execution = async { self.run_subagent_loop(index, &spec, cancel, &run_id).await }.await;
+        match execution {
+            SubtaskResult {
+                status: SubtaskStatus::Completed,
+                report,
+                ..
+            } => match self.deps.delegation.complete(&run_id, &report).await {
+                Ok(()) => result(SubtaskStatus::Completed, report),
+                Err(error) => result(SubtaskStatus::Error, error.to_string()),
+            },
+            SubtaskResult {
+                status: SubtaskStatus::Interrupted,
+                report,
+                ..
+            } => {
+                let _ = self
+                    .deps
+                    .delegation
+                    .interrupt(&run_id, "subagent interrupted")
+                    .await;
+                result(SubtaskStatus::Interrupted, report)
+            }
+            SubtaskResult {
+                status: SubtaskStatus::Error,
+                report,
+                ..
+            } => {
+                let _ = self.deps.delegation.fail(&run_id, &report).await;
+                result(SubtaskStatus::Error, report)
+            }
+        }
+    }
+
+    /// Run one bounded, memoryless `task` child after durable admission.
+    async fn run_subagent_loop(
+        &self,
+        index: usize,
+        spec: &SubtaskSpec,
+        cancel: CancellationToken,
+        run_id: &str,
     ) -> SubtaskResult {
         let result = |status, report| SubtaskResult {
             index,
@@ -1519,12 +1815,14 @@ impl RunnerSpawner {
         // unconditionally at the facade layer, not merely because the SUBAGENT
         // name-blocklist (Task 8) hides the tools — defense in depth.
         let mut child_deps = deps_for_subagent(&self.deps);
+        child_deps.run_id = run_id.to_string();
         child_deps.agent = child.clone();
         let child_spawn: Option<Arc<dyn SubagentSpawner>> = if delegates {
             Some(Arc::new(RunnerSpawner {
                 deps: child_deps.clone(),
                 cancel: cancel.clone(),
                 depth: child_depth,
+                parent_run_id: run_id.to_string(),
             }))
         } else {
             None
@@ -1624,12 +1922,32 @@ impl SubagentSpawner for RunnerSpawner {
                 ),
             };
         };
-        let id = crate::paths::new_id();
+        let child_run = match self
+            .deps
+            .delegation
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: self.parent_run_id.clone(),
+                subagent_type: spec.agent_type.clone(),
+                task: spec.prompt.clone(),
+                context: None,
+                background: true,
+            })
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return BackgroundDispatch::Rejected {
+                    note: format!("background delegation could not be queued: {error}"),
+                };
+            }
+        };
+        let id = child_run.run.run_id.clone();
         let deps = self.deps.clone();
         let this_spawner = RunnerSpawner {
             deps: deps.clone(),
             cancel: reservation.token(),
             depth: 0,
+            parent_run_id: child_run.run.run_id.clone(),
         };
         let (deleg_id, goal) = (id.clone(), spec.prompt.clone());
         let parent_pk = deps.session_pk.clone();
@@ -1643,12 +1961,18 @@ impl SubagentSpawner for RunnerSpawner {
             // frees the slot and deregisters the cancel token.
             let _reservation = reservation;
             let cancel = _reservation.token();
-            let child = this_spawner.run_child(0, spec, cancel.clone()).await;
+            let child = this_spawner
+                .run_queued_child(0, spec, cancel.clone(), child_run)
+                .await;
             // A cancelled worker (its parent ended, or was interrupted via
             // `interrupt_for_session`) must not write a stale completion to
             // the rail — the session that would receive it may already be
             // gone, or a fresh one may have taken its session_pk.
             if cancel.is_cancelled() {
+                let _ = deps
+                    .delegation
+                    .interrupt(&deleg_id, "background subagent interrupted")
+                    .await;
                 return;
             }
             let cap_chars = summary_budget::budget_cap_chars(headroom, 1);
@@ -1730,6 +2054,9 @@ async fn run_tool_call(
         store: &deps.store,
         overrides: &deps.perm_overrides,
         session_pk: &deps.session_pk,
+        run_id: &deps.run_id,
+        requesting_agent_id: &deps.primary_agent.profile.id,
+        requesting_agent_name: &agent.name,
         tool_call_id: &t.id,
         approvals: &deps.approvals,
         events: &deps.events,
@@ -1767,6 +2094,7 @@ async fn run_tool_call(
     let started = std::time::Instant::now();
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
+        run_id: deps.run_id.clone(),
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
@@ -1774,12 +2102,16 @@ async fn run_tool_call(
         cancel: cancel.clone(),
         caps: OutputCaps::default(),
         spawn: spawn.clone(),
+        main_agent_spawn: Some(Arc::new(RunnerMainAgentSpawner { deps: deps.clone() })),
         memory: deps.memory.clone(),
         snapshots: deps.snapshots.clone(),
         tool_call_id: t.id.clone(),
         interaction: Some(Arc::new(super::tools::Interaction {
             approvals: deps.approvals.clone(),
             events: deps.events.clone(),
+            run_id: deps.run_id.clone(),
+            requesting_agent_id: deps.primary_agent.profile.id.clone(),
+            requesting_agent_name: agent.name.clone(),
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
         })),
@@ -2602,6 +2934,7 @@ mod tests {
             nudge: Arc::new(NudgeState::default()),
             review_tool_defs: None,
             write_origin: crate::domain::WriteOrigin::User,
+            delegation_catalog: Vec::new(),
         }
     }
 
@@ -4684,6 +5017,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         let results = spawner
             .run_many(vec![
@@ -4720,6 +5054,7 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(turns));
         let deps = deps_at(dir.path(), llm).await;
         let spawner = RunnerSpawner {
+            parent_run_id: deps.run_id.clone(),
             deps,
             cancel: CancellationToken::new(),
             depth: 0,
@@ -4750,6 +5085,7 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(vec![child]));
         let deps = deps_at(dir.path(), llm).await;
         let spawner = RunnerSpawner {
+            parent_run_id: deps.run_id.clone(),
             deps,
             cancel: CancellationToken::new(),
             depth: 0,
@@ -4782,6 +5118,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let spawner = RunnerSpawner {
+            parent_run_id: deps.run_id.clone(),
             deps,
             cancel,
             depth: 0,
@@ -5610,6 +5947,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         // Fill the one slot with a manual reservation.
         let _held = deps.background.try_reserve(1, &deps.session_pk).unwrap();
@@ -5642,6 +5980,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 1,
+            parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
             .run_background(SubtaskSpec {
@@ -5685,6 +6024,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
             .run_background(SubtaskSpec {
@@ -5705,6 +6045,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_children_are_durable_runs_with_tool_counts_and_terminal_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_turn = vec![
+            tool_use_start(0, "child-call", "bash"),
+            input_json_delta(0, "{\"command\":\"echo child\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_turn, final_turn("child done")]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "root")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id.clone();
+
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+        let results = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "inspect the workspace".into(),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, SubtaskStatus::Completed);
+        assert_eq!(results[0].report, "child done");
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&root.run.run_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, crate::domain::AgentRunStatus::Completed);
+        assert_eq!(children[0].tool_count, 1);
+        assert_eq!(
+            deps.store
+                .list_run_messages(&deps.session_pk, &children[0].run_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the child tool call must be attached to its durable run"
+        );
+    }
+
+    #[tokio::test]
     async fn run_background_cancelled_worker_writes_nothing_to_the_rail() {
         let dir = tempfile::tempdir().unwrap();
         // No scripted turns: the cancelled worker must never reach the model.
@@ -5715,6 +6109,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
             .run_background(SubtaskSpec {

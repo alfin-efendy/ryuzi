@@ -8,6 +8,7 @@
 //! All file-touching tools resolve paths through [`jail`], which confines them
 //! to the session worktree, and cap their output via [`truncate`].
 
+use crate::approval::ApprovalKey;
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -21,6 +22,7 @@ pub mod app_orchestrate;
 pub mod app_projects;
 pub mod bash;
 pub mod clarify;
+pub mod delegate;
 pub mod edit;
 pub mod extension;
 pub mod glob;
@@ -100,6 +102,46 @@ pub struct SubtaskResult {
 pub enum BackgroundDispatch {
     Dispatched { id: String },
     Rejected { note: String },
+}
+
+pub struct MainDelegationResult {
+    pub run_id: String,
+    pub agent_id: String,
+    pub status: SubtaskStatus,
+    pub report: String,
+}
+
+impl MainDelegationResult {
+    pub fn completed(
+        run_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        report: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            agent_id: agent_id.into(),
+            status: SubtaskStatus::Completed,
+            report: report.into(),
+        }
+    }
+}
+
+/// Spawns complete main-agent profiles for `delegate_agent`. It is intentionally
+/// distinct from [`SubagentSpawner`]: main delegates retain their immutable
+/// durable profile, while `task` children are bounded ephemeral subagents.
+#[async_trait]
+pub trait MainAgentSpawner: Send + Sync {
+    /// `(id, name, description)` for executable profiles the current agent may
+    /// delegate to. The runner excludes the caller and invalid profiles.
+    async fn available(&self) -> Vec<(String, String, String)>;
+    async fn run_one(
+        &self,
+        request: crate::delegation::MainDelegationRequest,
+    ) -> MainDelegationResult;
+    async fn run_many(
+        &self,
+        requests: Vec<crate::delegation::MainDelegationRequest>,
+    ) -> Vec<MainDelegationResult>;
 }
 
 /// Spawns sub-agents for the `task` tool. Implemented by the runner; `None`
@@ -227,6 +269,9 @@ pub const APP_TOOLS: &[&str] = &["app_jobs", "app_orchestrate", "app_projects", 
 pub struct Interaction {
     pub approvals: Arc<crate::approval::ApprovalHub>,
     pub events: tokio::sync::broadcast::Sender<crate::domain::CoreEvent>,
+    pub run_id: String,
+    pub requesting_agent_id: String,
+    pub requesting_agent_name: String,
     /// The session's live permission mode (shared with `RunnerDeps`).
     pub perm_mode: Arc<std::sync::Mutex<crate::domain::PermMode>>,
     pub project_id: Option<String>,
@@ -246,13 +291,15 @@ impl Interaction {
         input: serde_json::Value,
         cancel: &CancellationToken,
     ) -> Option<crate::domain::ApprovalResponse> {
-        let rx = self
-            .approvals
-            .register_for_session(session_pk, request_id.to_string());
+        let key = ApprovalKey::new(&self.run_id, request_id);
+        let rx = self.approvals.register_for_session(session_pk, key.clone());
         let _ = self
             .events
             .send(crate::domain::CoreEvent::ApprovalRequested {
                 session_pk: session_pk.to_string(),
+                run_id: self.run_id.clone(),
+                requesting_agent_id: self.requesting_agent_id.clone(),
+                requesting_agent_name: self.requesting_agent_name.clone(),
                 request_id: request_id.to_string(),
                 tool: tool.to_string(),
                 summary: summary.to_string(),
@@ -266,7 +313,7 @@ impl Interaction {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                self.approvals.resolve_bool(request_id, false);
+                self.approvals.resolve_bool(&key, false);
                 None
             }
             res = rx => res.ok(),
@@ -277,6 +324,9 @@ impl Interaction {
 /// Everything a tool needs to run one call.
 pub struct ToolCtx {
     pub session_pk: String,
+    /// The durable agent run owning this call; approvals and child runs are
+    /// always scoped to this identity.
+    pub run_id: String,
     /// The session worktree — the sandbox jail root.
     pub work_dir: PathBuf,
     /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
@@ -292,6 +342,8 @@ pub struct ToolCtx {
     pub caps: OutputCaps,
     /// Sub-agent spawner for the `task` tool; `None` disables spawning.
     pub spawn: Option<Arc<dyn SubagentSpawner>>,
+    /// Complete profile spawner for `delegate_agent`; distinct from `task`.
+    pub main_agent_spawn: Option<Arc<dyn MainAgentSpawner>>,
     /// Persistent memory for the `memory` tool; `None` for sub-agents.
     pub memory: Option<Arc<crate::harness::native::memory::MemoryStore>>,
     /// Stack of worktree snapshot SHAs for the `revert` tool (most recent last).
@@ -438,6 +490,7 @@ impl ToolRegistry {
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
+            Arc::new(delegate::DelegateAgent),
             Arc::new(session_search::SessionSearch),
             Arc::new(plan::ExitPlanMode),
             Arc::new(question::AskUserQuestion),
@@ -623,6 +676,7 @@ pub(crate) mod testutil {
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         ToolCtx {
             session_pk: "test-session".into(),
+            run_id: "test-run".into(),
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
@@ -630,6 +684,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
             spawn: None,
+            main_agent_spawn: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tool_call_id: "test-call".into(),
@@ -658,6 +713,9 @@ pub(crate) mod testutil {
         ctx.interaction = Some(Arc::new(Interaction {
             approvals: hub.clone(),
             events: tx,
+            run_id: ctx.run_id.clone(),
+            requesting_agent_id: "test-agent".into(),
+            requesting_agent_name: "Test Agent".into(),
             perm_mode: perm.clone(),
             project_id: None,
         }));

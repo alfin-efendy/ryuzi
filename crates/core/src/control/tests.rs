@@ -1775,8 +1775,8 @@ async fn resolve_approval_counts_allow_and_deny() {
     let (lines, telemetry) = capturing_console_telemetry();
     let (cp, _store, _prompts, _db_guard) = fake_control_plane_with_telemetry(telemetry).await;
 
-    cp.resolve_approval_bool("req-allow", true);
-    cp.resolve_approval_bool("req-deny", false);
+    cp.resolve_approval_bool("run-allow", "req-allow", true);
+    cp.resolve_approval_bool("run-deny", "req-deny", false);
 
     let parsed = parse_telemetry_lines(&lines);
     assert!(
@@ -1796,9 +1796,13 @@ async fn resolve_approval_counts_allow_and_deny() {
 #[tokio::test]
 async fn resolve_approval_delegates_the_structured_response() {
     let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
-    let rx = cp.approvals.register("req-structured".into());
+    let rx = cp.approvals.register(crate::approval::ApprovalKey::new(
+        "run-structured",
+        "req-structured",
+    ));
 
     let resolved = cp.resolve_approval(
+        "run-structured",
         "req-structured",
         ApprovalResponse {
             decision: ApprovalDecision::AllowAlways,
@@ -2203,15 +2207,18 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
     wait_for_running_handle(&cp, &session.session_pk).await;
 
     // Two approvals parked for this session, one for an unrelated session.
-    let rx_a = cp
-        .approvals
-        .register_for_session(&session.session_pk, "tool-a".into());
-    let rx_b = cp
-        .approvals
-        .register_for_session(&session.session_pk, "tool-b".into());
-    let rx_other = cp
-        .approvals
-        .register_for_session("some-other-session", "tool-c".into());
+    let rx_a = cp.approvals.register_for_session(
+        &session.session_pk,
+        crate::approval::ApprovalKey::new("run-a", "tool-a"),
+    );
+    let rx_b = cp.approvals.register_for_session(
+        &session.session_pk,
+        crate::approval::ApprovalKey::new("run-b", "tool-b"),
+    );
+    let rx_other = cp.approvals.register_for_session(
+        "some-other-session",
+        crate::approval::ApprovalKey::new("run-other", "tool-c"),
+    );
 
     cp.stop_session(&session.session_pk).await.unwrap();
 
@@ -2224,7 +2231,7 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
         "stop must deny this session's parked approval"
     );
     // The unrelated session's approval is untouched and still resolvable.
-    assert!(cp.resolve_approval_bool("tool-c", true));
+    assert!(cp.resolve_approval_bool("run-other", "tool-c", true));
     assert!(rx_other.await.unwrap().allowed());
 }
 

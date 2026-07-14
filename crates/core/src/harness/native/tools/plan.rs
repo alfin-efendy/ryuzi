@@ -138,6 +138,7 @@ mod tests {
         let waiter = tokio::spawn(async move {
             match rx.recv().await.unwrap() {
                 CoreEvent::ApprovalRequested {
+                    run_id,
                     request_id,
                     approval_kind,
                     input,
@@ -146,7 +147,7 @@ mod tests {
                     assert_eq!(approval_kind, ApprovalKind::Plan);
                     assert_eq!(input["plan"], "do X");
                     hub.resolve(
-                        &request_id,
+                        &crate::approval::ApprovalKey::new(run_id, request_id),
                         ApprovalResponse {
                             decision: ApprovalDecision::AllowOnce,
                             scope: None,
@@ -221,9 +222,11 @@ mod tests {
 
         let waiter = tokio::spawn(async move {
             match rx.recv().await.unwrap() {
-                CoreEvent::ApprovalRequested { request_id, .. } => {
+                CoreEvent::ApprovalRequested {
+                    run_id, request_id, ..
+                } => {
                     hub.resolve(
-                        &request_id,
+                        &crate::approval::ApprovalKey::new(run_id, request_id),
                         ApprovalResponse {
                             decision: ApprovalDecision::AllowOnce,
                             scope: None,
@@ -260,9 +263,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, perm) = ctx_with_interaction(dir.path(), PermMode::Plan).await;
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 hub.resolve(
-                    &request_id,
+                    &crate::approval::ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::RejectOnce,
                         scope: None,
@@ -285,9 +291,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, perm) = ctx_with_interaction(dir.path(), PermMode::Plan).await;
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 hub.resolve(
-                    &request_id,
+                    &crate::approval::ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::Cancel,
                         scope: None,

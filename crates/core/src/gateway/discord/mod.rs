@@ -795,6 +795,9 @@ mod tests {
                     conversation_id: "t1".to_string(),
                 },
                 &ApprovalRequest {
+                    run_id: "run-1".to_string(),
+                    requesting_agent_id: "agent-1".to_string(),
+                    requesting_agent_name: "Agent 1".to_string(),
                     request_id: "r1".to_string(),
                     tool: "Bash".to_string(),
                     summary: "Bash: rm".to_string(),
