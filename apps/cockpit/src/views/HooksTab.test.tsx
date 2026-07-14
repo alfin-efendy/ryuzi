@@ -61,6 +61,11 @@ const inboundDetail: AutomationHookDetail = {
   },
   runs: [],
 };
+const disabled = { ...inbound, id: "disabled-1", name: "Disabled review", enabled: false };
+const disabledDetail: AutomationHookDetail = {
+  ...inboundDetail,
+  hook: disabled,
+};
 const outboundDetail: AutomationHookDetail = {
   hook: outbound,
   action: {
@@ -102,6 +107,10 @@ const automationHookDetail = mock(async (_runner: string, id: string) => ({
   data: id === inbound.id ? inboundDetail : outboundDetail,
 }));
 const testAutomationHook = mock(async () => ({ status: "ok" as const, data: outboundDetail }));
+const nativeAgents = mock(async () => ({ status: "error" as const, error: { message: "not needed by this test" } }));
+const createAutomationHook = mock<(runner: string, input: AutomationHookInput) => Promise<{ status: "ok"; data: AutomationHookInfo }>>(
+  async () => ({ status: "ok" as const, data: inbound }),
+);
 const updateAutomationHook = mock<
   (runner: string, id: string, input: AutomationHookInput) => Promise<{ status: "ok"; data: AutomationHookInfo }>
 >(async () => ({ status: "ok" as const, data: outbound }));
@@ -114,6 +123,8 @@ mock.module("@/bindings", () => ({
     listAutomationHooks,
     automationHookDetail,
     testAutomationHook,
+    nativeAgents,
+    createAutomationHook,
     updateAutomationHook,
     listMessages,
   },
@@ -123,20 +134,25 @@ mock.module("@/bindings", () => ({
 const { HooksTab } = await import("./HooksTab");
 const { useAutomations } = await import("@/store-automations");
 const { useEndpoint } = await import("@/store-endpoint");
+const { useNative } = await import("@/store-native");
 
 afterEach(() => {
   cleanup();
   useAutomations.setState({ hooks: [], detailsById: {}, loaded: false });
   useEndpoint.setState({ status: null, keys: [], loaded: false });
+  useNative.setState({ agentsByProject: {} });
   useStore.setState({ focusedSession: null });
   useNav.setState({ history: { back: [], current: { kind: "automations", tab: "hooks" }, forward: [] } });
   endpointStatus.mockClear();
   listAutomationHooks.mockClear();
+  listAutomationHooks.mockImplementation(async () => ({ status: "ok" as const, data: [inbound, outbound] }));
   automationHookDetail.mockImplementation(async (_runner: string, id: string) => ({
     status: "ok" as const,
     data: id === inbound.id ? inboundDetail : outboundDetail,
   }));
   testAutomationHook.mockClear();
+  nativeAgents.mockClear();
+  createAutomationHook.mockClear();
   updateAutomationHook.mockClear();
 });
 
@@ -187,6 +203,53 @@ test("opens a hook run's local session", async () => {
 
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "session-1" });
   expect(useNav.getState().history.current).toEqual({ kind: "session" });
+});
+
+test("submits enabled true for a newly created hook", async () => {
+  render(<HooksTab projects={[project]} />);
+  await screen.findByText("Inbound review");
+  fireEvent.click(screen.getByRole("button", { name: "New hook" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "New review" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Prompt" }), { target: { value: "Review $EVENT" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
+
+  await waitFor(() => expect(createAutomationHook).toHaveBeenCalledTimes(1));
+  expect((createAutomationHook.mock.calls[0]?.[1] as AutomationHookInput).enabled).toBe(true);
+});
+
+test("submits the selected native agent name for the hook project", async () => {
+  useNative.setState({
+    agentsByProject: { "project-1": [{ name: "native-reviewer", description: "Reviews changes", mode: "subagent", builtin: true }] },
+  });
+  render(<HooksTab projects={[project]} />);
+  await screen.findByText("Inbound review");
+  fireEvent.click(screen.getByRole("button", { name: "Edit Inbound review" }));
+
+  const agent = await screen.findByRole("combobox", { name: "Agent" });
+  fireEvent.click(agent);
+  fireEvent.click(await screen.findByRole("option", { name: /native-reviewer/ }));
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Agent" }).textContent).toContain("native-reviewer"));
+  fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
+
+  await waitFor(() => expect(nativeAgents).toHaveBeenCalledWith("local", "project-1"));
+  expect(updateAutomationHook).toHaveBeenCalledWith(
+    "local",
+    "inbound-1",
+    expect.objectContaining({ action: expect.objectContaining({ config: expect.objectContaining({ agentId: "native-reviewer" }) }) }),
+  );
+});
+
+test("preserves enabled false when editing a disabled hook", async () => {
+  listAutomationHooks.mockImplementation(async () => ({ status: "ok" as const, data: [disabled] }));
+  automationHookDetail.mockImplementation(async () => ({ status: "ok" as const, data: disabledDetail }));
+  render(<HooksTab projects={[project]} />);
+  await screen.findByText("Disabled review");
+  fireEvent.click(screen.getByRole("button", { name: "Edit Disabled review" }));
+  await screen.findByRole("textbox", { name: "Prompt" });
+  fireEvent.click(screen.getByRole("button", { name: "Save hook" }));
+
+  await waitFor(() => expect(updateAutomationHook).toHaveBeenCalledTimes(1));
+  expect((updateAutomationHook.mock.calls[0]?.[2] as AutomationHookInput).enabled).toBe(false);
 });
 
 test("outbound editor exposes only POST and sends POST when updating", async () => {

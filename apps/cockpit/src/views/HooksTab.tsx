@@ -9,6 +9,7 @@ import { useEndpoint } from "@/store-endpoint";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useNav } from "@/store-nav";
+import { useNative } from "@/store-native";
 
 const TRIGGERS: { value: TriggerKind; label: string }[] = [
   { value: "session.start", label: "Session starts" },
@@ -43,6 +44,7 @@ type HookDraft = {
   method: string;
   headers: HeaderDraft[];
   payloadTemplate: string;
+  enabled: boolean;
 };
 
 function blankDraft(projectId = ""): HookDraft {
@@ -60,18 +62,27 @@ function blankDraft(projectId = ""): HookDraft {
     method: "POST",
     headers: [],
     payloadTemplate: "",
+    enabled: true,
   };
 }
 
 function draftFor(detail: AutomationHookDetail): HookDraft {
   const base = blankDraft();
   if (detail.action.kind === "agent.run") {
-    return { ...base, name: detail.hook.name, triggerKind: detail.hook.triggerKind, actionKind: "agent.run", ...detail.action.config };
+    return {
+      ...base,
+      name: detail.hook.name,
+      triggerKind: detail.hook.triggerKind,
+      actionKind: "agent.run",
+      enabled: detail.hook.enabled,
+      ...detail.action.config,
+    };
   }
   return {
     ...base,
     name: detail.hook.name,
     triggerKind: detail.hook.triggerKind,
+    enabled: detail.hook.enabled,
     actionKind: "webhook.outbound",
     url: detail.action.config.url,
     method: detail.action.config.method,
@@ -106,7 +117,7 @@ function toInput(draft: HookDraft): AutomationHookInput {
             payloadTemplate: draft.payloadTemplate.trim() || null,
           },
         };
-  return { name: draft.name.trim(), triggerKind: draft.triggerKind, action, enabled: true };
+  return { name: draft.name.trim(), triggerKind: draft.triggerKind, action, enabled: draft.enabled };
 }
 
 function triggerLabel(trigger: TriggerKind): string {
@@ -254,12 +265,12 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
   const endpointStatus = useEndpoint((state) => state.status);
   const endpointLoaded = useEndpoint((state) => state.loaded);
   const hydrateEndpoint = useEndpoint((state) => state.hydrate);
-  const agents = useAgents((state) => state.registry?.agents ?? []);
   const models = useAgents((state) => state.models);
   const [draft, setDraft] = useState<HookDraft>(() =>
     detail ? draftFor(detail) : blankDraft(selectedProjectId ?? projects[0]?.projectId ?? ""),
   );
   const [saving, setSaving] = useState(false);
+  const projectAgents = useNative((state) => (draft.projectId ? state.agentsByProject[draft.projectId] : undefined));
   const [deleting, setDeleting] = useState(false);
   const [deleteTrigger, setDeleteTrigger] = useState<HTMLButtonElement | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -275,6 +286,9 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
   useEffect(() => {
     if (detail && !dirtyRef.current) setDraft(draftFor(detail));
   }, [detail]);
+  useEffect(() => {
+    if (draft.projectId) void useNative.getState().loadAgents(LOCAL_RUNNER, draft.projectId);
+  }, [draft.projectId]);
   useEffect(() => {
     if (draft.triggerKind === "webhook.inbound" && !endpointLoaded) void hydrateEndpoint();
   }, [draft.triggerKind, endpointLoaded, hydrateEndpoint]);
@@ -299,7 +313,7 @@ function HookEditor({ hook, projects, onClose }: { hook: AutomationHookInfo | nu
   };
   const projectOptions = projects.map((project) => ({ value: project.projectId, label: project.name, description: project.workdir }));
   const modelOptions = models.map((model) => ({ value: model.requestValue, label: model.displayName }));
-  const agentOptions = agents.map((agent) => ({ value: agent.id, label: agent.name, description: agent.description }));
+  const agentOptions = (projectAgents ?? []).map((agent) => ({ value: agent.name, label: agent.name, description: agent.description }));
   const selectedProject = projects.find((project) => project.projectId === draft.projectId);
 
   return (

@@ -48,9 +48,10 @@ type NativeState = {
   shareSession: (runnerId: string, sessionPk: string) => Promise<string | null>;
 };
 
-// Monotonic fetch tokens prevent out-of-order todo, effective-command, and
-// project-command responses from replacing newer cache data. Keys identify the
-// runner/project or session.
+// Monotonic fetch tokens prevent out-of-order agent, todo, effective-command,
+// and project-command responses from replacing newer cache data. Keys identify
+// the runner/project or session.
+const agentFetchToken: Record<string, number> = {};
 const todoFetchToken: Record<string, number> = {};
 const commandFetchToken: Record<string, number> = {};
 const projectCommandFetchToken: Record<string, number> = {};
@@ -89,8 +90,11 @@ export const useNative = create<NativeState>((set) => ({
   planCollapsed: {},
 
   loadAgents: async (runnerId, projectId) => {
+    const key = projectCommandKey(runnerId, projectId);
+    const token = (agentFetchToken[key] ?? 0) + 1;
+    agentFetchToken[key] = token;
     const res = await commands.nativeAgents(runnerId, projectId);
-    if (res.status === "ok") {
+    if (res.status === "ok" && agentFetchToken[key] === token) {
       set((s) => ({ agentsByProject: { ...s.agentsByProject, [projectId]: res.data } }));
     }
   },

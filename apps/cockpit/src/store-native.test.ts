@@ -48,6 +48,23 @@ test("loadAgents caches the project's agents", async () => {
   spy.mockRestore();
 });
 
+test("loadAgents drops out-of-order responses (a stale fetch can't clobber newer data)", async () => {
+  reset();
+  type AgentsResult = Awaited<ReturnType<typeof commands.nativeAgents>>;
+  const resolvers: Array<(v: AgentsResult) => void> = [];
+  const spy = spyOn(commands, "nativeAgents").mockImplementation(() => new Promise<AgentsResult>((resolve) => resolvers.push(resolve)));
+  const first = useNative.getState().loadAgents(LOCAL_RUNNER, "p1"); // older fetch…
+  const second = useNative.getState().loadAgents(LOCAL_RUNNER, "p1"); // …superseded by this one
+  // The newer fetch resolves first with the fresh list.
+  resolvers[1]({ status: "ok", data: [{ name: "newer", description: "Newer", mode: "subagent", builtin: true }] });
+  await second;
+  // The older fetch resolves late with the stale list — it must be ignored.
+  resolvers[0]({ status: "ok", data: [{ name: "older", description: "Older", mode: "subagent", builtin: true }] });
+  await first;
+  expect(useNative.getState().agentsByProject.p1.map((a) => a.name)).toEqual(["newer"]);
+  spy.mockRestore();
+});
+
 test("project command CRUD calls the generated APIs and updates only that project's cache", async () => {
   reset();
   const listed = spyOn(commands, "listProjectCommands").mockResolvedValue({ status: "ok", data: [projectCommand] });
