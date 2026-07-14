@@ -35,7 +35,6 @@ const row = (partial: Partial<Row>): Row => ({
   toolExitCode: null,
   toolSummary: null,
   toolSubagent: null,
-  speaker: null,
   ...partial,
 });
 
@@ -211,14 +210,10 @@ test("route switch copy groups as notices for model, account, failover, and comb
   expect(groups).toEqual(notices.map((text, index) => ({ type: "notice", key: `s${index + 1}`, text })));
 });
 
-test("speaker rows group into labeled speaker bubbles", () => {
-  const rows = [
-    messageToRow(1, "assistant", "status", { text: "started: a" }, null, null, null, 0, "", "build"),
-    messageToRow(2, "assistant", "text", { text: "done a" }, null, null, null, 0, "", "build"),
-  ];
-  const groups = groupRows(rows);
-  expect(groups.every((g) => g.type === "speaker")).toBe(true);
-  expect(groups.map((g: any) => g.speaker)).toEqual(["build", "build"]);
+test("legacy speaker attribution does not alter the assistant transcript role", () => {
+  const legacyRow = { ...row({ seq: 1, text: "worker update" }), speaker: "build" };
+  const groups = groupRows([legacyRow]);
+  expect(groups).toEqual([{ type: "agent", key: "s1", markdown: "worker update" }]);
 });
 
 test("closeDanglingFence closes an odd number of line-start fences and leaves balanced ones alone", () => {

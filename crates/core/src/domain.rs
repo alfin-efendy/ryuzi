@@ -648,7 +648,8 @@ pub struct Message {
     pub status: Option<String>,
     pub tool_kind: Option<String>,
     pub created_at: i64,
-    /// Group-chat attribution: the agent name for a labeled worker bubble.
+    /// Legacy group-chat attribution retained so existing databases and event
+    /// payloads remain readable. New message constructors leave it unset.
     pub speaker: Option<String>,
 }
 
@@ -662,7 +663,8 @@ pub struct NewMessage {
     pub tool_call_id: Option<String>,
     pub status: Option<String>,
     pub tool_kind: Option<String>,
-    /// Speaker label for a group-chat bubble (`None` for normal rows).
+    /// Legacy group-chat attribution retained for database and event
+    /// compatibility. New message producers always leave it unset.
     pub speaker: Option<String>,
 }
 
@@ -683,27 +685,6 @@ impl NewMessage {
             status: None,
             tool_kind: None,
             speaker: None,
-        }
-    }
-
-    /// A labeled display bubble (role `assistant`) attributed to `speaker`.
-    /// Used to post worker start, status, and report bubbles into the home
-    /// chat. A display row only — never a `provider_turns` entry.
-    pub fn speaker_block(
-        session_pk: &str,
-        speaker: &str,
-        block_type: &str,
-        payload: serde_json::Value,
-    ) -> Self {
-        NewMessage {
-            session_pk: session_pk.to_string(),
-            role: "assistant".to_string(),
-            block_type: block_type.to_string(),
-            payload,
-            tool_call_id: None,
-            status: None,
-            tool_kind: None,
-            speaker: Some(speaker.to_string()),
         }
     }
 }
@@ -777,7 +758,8 @@ pub enum CoreEvent {
         tool_call_id: Option<String>,
         status: Option<String>,
         tool_kind: Option<String>,
-        /// Speaker label for a group-chat bubble (`None` for normal rows).
+        /// Legacy group-chat attribution retained in message events for
+        /// database and wire compatibility.
         speaker: Option<String>,
     },
     Result {

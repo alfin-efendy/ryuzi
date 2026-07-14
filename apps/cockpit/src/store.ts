@@ -212,18 +212,7 @@ export const useStore = create<State>((set, get) => ({
           }
           const prev = st.lastSeq[key] ?? 0;
           if (e.seq <= prev) return {}; // stale/duplicate (covers reload/replay races)
-          const row = messageToRow(
-            e.seq,
-            e.role,
-            e.block_type,
-            e.payload,
-            e.tool_call_id,
-            e.status,
-            e.tool_kind,
-            Date.now(),
-            e.session_pk,
-            e.speaker,
-          );
+          const row = messageToRow(e.seq, e.role, e.block_type, e.payload, e.tool_call_id, e.status, e.tool_kind, Date.now(), e.session_pk);
           return {
             transcripts: append(st.transcripts, key, row),
             lastSeq: { ...st.lastSeq, [key]: e.seq },
@@ -331,7 +320,7 @@ export const useStore = create<State>((set, get) => ({
           return res.status === "ok" ? res.data : [];
         })();
     const hydrated = rows.map((m) =>
-      messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt, pk, m.speaker),
+      messageToRow(m.seq, m.role, m.blockType, m.payload, m.toolCallId, m.status, m.toolKind, m.createdAt, pk),
     );
     const maxSeq = rows.reduce((mx, m) => Math.max(mx, m.seq), 0);
     set((st) => {

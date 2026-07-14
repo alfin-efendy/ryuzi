@@ -41,7 +41,6 @@ export function AgentRunDetail({
       message.toolKind,
       message.createdAt,
       sessionPk,
-      message.speaker,
     ),
   );
   const active = activeStatuses.has(run.status);
