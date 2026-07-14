@@ -1447,6 +1447,29 @@ struct RunnerSpawner {
     parent_run_id: String,
 }
 
+/// Add the fixed delegation capabilities that only a delegated complete-profile
+/// child receives. Its configured profile filter remains authoritative for every
+/// other tool; the registry check keeps the advertised capabilities dispatchable.
+fn effective_delegated_main_child_filter(
+    filter: super::agents::ToolFilter,
+    names: &[String],
+) -> super::agents::ToolFilter {
+    match filter {
+        super::agents::ToolFilter::All => super::agents::ToolFilter::All,
+        super::agents::ToolFilter::Only(mut allowed) => {
+            for delegation_tool in ["task", "delegate_agent"] {
+                if names.iter().any(|name| name == delegation_tool)
+                    && !allowed.iter().any(|name| name == delegation_tool)
+                {
+                    allowed.push(delegation_tool.to_string());
+                }
+            }
+            allowed.sort();
+            super::agents::ToolFilter::Only(allowed)
+        }
+    }
+}
+
 /// Runs complete durable main profiles in isolated child harnesses. The child
 /// receives its own immutable profile through `RunHandle.agent_snapshot`; it
 /// never receives parent attachments or persistent parent memory.
@@ -1539,6 +1562,10 @@ impl RunnerMainAgentSpawner {
             child_deps.turn_effort_policy = Arc::new(effort_policy);
             child_deps.allowed_skills = primary_turn.allowed_skills;
             child_deps.agent = primary_turn.agent_tools;
+            child_deps.agent.tools = effective_delegated_main_child_filter(
+                child_deps.agent.tools,
+                &child_deps.tools.names(),
+            );
             // The child's own catalog excludes ITS profile (not the
             // parent's) — a delegated agent must never be offered a
             // `delegate_agent` route back to the profile it's currently
@@ -5028,6 +5055,26 @@ mod tests {
         assert!(!eff.allows("memory"));
     }
 
+    #[test]
+    fn delegated_main_child_filter_adds_only_delegation_tools() {
+        use super::super::agents::ToolFilter;
+
+        let names = ["read", "bash", "task", "delegate_agent", "write"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let filter = effective_delegated_main_child_filter(
+            ToolFilter::Only(vec!["read".to_string()]),
+            &names,
+        );
+
+        assert!(filter.allows("read"));
+        assert!(filter.allows("task"));
+        assert!(filter.allows("delegate_agent"));
+        assert!(!filter.allows("bash"));
+        assert!(!filter.allows("write"));
+    }
+
     /// Task E6 schema gate: `orch_block` is hidden from every session kind
     /// but `Worker`, even for an agent (`build`) whose own `ToolFilter` is
     /// `All`. The tool's own `Store::task_by_session` lookup (exercised in
@@ -6206,6 +6253,18 @@ mod tests {
                 message_delta("tool_use"),
                 message_stop(),
             ],
+            vec![
+                tool_use_start(0, "task-call", "task"),
+                input_json_delta(0, r#"{"prompt":"inspect","subagent_type":"explore"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "delegate-agent-call", "delegate_agent"),
+                input_json_delta(0, r#"{"agent_id":"missing","task":"inspect"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
             final_turn("target done"),
         ]));
         let db = tempfile::NamedTempFile::new().unwrap();
@@ -6272,7 +6331,7 @@ mod tests {
                     apps: vec!["slack".into()],
                 },
                 loop_settings: AgentLoop {
-                    max_turns: 3,
+                    max_turns: 5,
                     max_tool_rounds: 1,
                 },
             })
@@ -6362,7 +6421,7 @@ mod tests {
             Some("anthropic/target-model")
         );
         let bodies = llm.bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 3, "target loop receives every scripted turn");
+        assert_eq!(bodies.len(), 5, "target loop receives every scripted turn");
         let body = &bodies[0];
         assert_eq!(body["model"], "anthropic/target-model");
         assert_eq!(
@@ -6394,6 +6453,30 @@ mod tests {
             profile_rule_call.payload["output"], "Denied by user",
             "the target profile's deny rule applies even to a plan-safe read"
         );
+        let task_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("task-call"))
+            .expect("task tool call is recorded");
+        assert_eq!(task_call.status.as_deref(), Some("failed"));
+        assert!(
+            task_call.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("Plan mode is read-only")),
+            "an advertised delegated child task tool must reach the normal permission/dispatch path: {}",
+            task_call.payload
+        );
+        let delegate_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("delegate-agent-call"))
+            .expect("delegation tool call is recorded");
+        assert_eq!(delegate_call.status.as_deref(), Some("failed"));
+        assert!(
+            delegate_call.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("Plan mode is read-only")),
+            "an advertised delegated child tool must reach the normal permission/dispatch path: {}",
+            delegate_call.payload
+        );
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["text"], "inspect the target profile");
         assert_eq!(content[1]["text"], "only inspect authentication files");
@@ -6408,6 +6491,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(advertised.contains(&"read"));
         assert!(advertised.contains(&"bash"));
+        assert!(advertised.contains(&"task"));
+        assert!(advertised.contains(&"delegate_agent"));
         assert!(advertised.contains(&"mcp__github__search"));
         assert!(advertised.contains(&"mcp__slack__send"));
         assert!(!advertised.contains(&"write"));
