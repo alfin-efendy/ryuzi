@@ -73,10 +73,16 @@ pub struct Daemon {
     pub learning_queue: Arc<LearningQueue>,
     telemetry: Arc<dyn Telemetry>,
     stopped: AtomicBool,
-    /// Serializes the boot-only prompt-claim recovery and records completion
-    /// only after the recovery succeeds. Holding the mutex across the recovery
-    /// await prevents concurrent `start()` calls from resetting live claims.
-    prompt_claim_recovery_complete: AsyncMutex<bool>,
+    /// Serializes the complete startup lifecycle, including gateway startup,
+    /// recovery, and boot admission. A terminal boot failure is observed by a
+    /// waiting caller before it can acquire any gateway resources.
+    lifecycle: AsyncMutex<()>,
+    /// Set only after the boot admission latch is open. Under `lifecycle`, a
+    /// repeated successful start is a no-op rather than a second gateway boot.
+    started: AtomicBool,
+    /// Completion state for boot recovery. Access occurs under `lifecycle`, so
+    /// an atomic flag is sufficient and avoids a nested recovery mutex.
+    prompt_claim_recovery_complete: AtomicBool,
     /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
     /// can abort it. Otherwise it (and the `Arc<ControlPlane>` clone its
     /// closure holds) would keep running — and keep the control plane
@@ -147,8 +153,12 @@ impl Daemon {
     /// than propagated: a broken endpoint server must not prevent boot
     /// recovery, reconciliation, or idle queue delivery.
     pub async fn start(&self) -> anyhow::Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if self.stopped.load(Ordering::SeqCst) {
             anyhow::bail!("daemon failed to boot");
+        }
+        if self.started.load(Ordering::SeqCst) {
+            return Ok(());
         }
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
@@ -192,6 +202,7 @@ impl Daemon {
             return Err(error);
         }
         self.router_in.open_boot_admission();
+        self.started.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -215,12 +226,11 @@ impl Daemon {
 
     /// Recover prior-process claims, reconcile prior-process Running sessions,
     /// and drain pending idle queue heads exactly once for this daemon. The
-    /// mutex serializes all three phases: reconcile's Running-session snapshot
-    /// completes before delivery can make an idle session Running. Completion
-    /// is set only after recovery and delivery finish.
+    /// startup lifecycle lock serializes all three phases: reconcile's Running-session
+    /// snapshot completes before delivery can make an idle session Running.
+    /// Completion is set only after recovery and delivery finish.
     async fn recover_reconcile_and_deliver_idle_queues_on_boot(&self) -> anyhow::Result<()> {
-        let mut complete = self.prompt_claim_recovery_complete.lock().await;
-        if *complete {
+        if self.prompt_claim_recovery_complete.load(Ordering::SeqCst) {
             return Ok(());
         }
         self.store.recover_abandoned_session_prompt_claims().await?;
@@ -228,7 +238,8 @@ impl Daemon {
         // non-fatal while awaiting its scan so delivery cannot race it.
         let _ = self.cp.reconcile().await;
         self.deliver_pending_idle_session_prompts_on_boot().await?;
-        *complete = true;
+        self.prompt_claim_recovery_complete
+            .store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -469,7 +480,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         learning_queue: persistence.learning,
         telemetry,
         stopped: AtomicBool::new(false),
-        prompt_claim_recovery_complete: AsyncMutex::new(false),
+        lifecycle: AsyncMutex::new(()),
+        started: AtomicBool::new(false),
+        prompt_claim_recovery_complete: AtomicBool::new(false),
         router_handle,
         fanout_handle,
         scheduler_handle,
@@ -701,7 +714,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
@@ -839,6 +854,10 @@ mod tests {
         /// When non-zero, `start()` pauses before recording the gateway as
         /// started so a test can expose events emitted before gateway startup.
         start_delay: Duration,
+        /// Test coordination for racing concurrent `Daemon::start()` calls.
+        /// `start()` signals `entered` after recording its call, then waits for
+        /// `release` before returning.
+        start_block: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         fail_start: bool,
     }
 
@@ -854,6 +873,7 @@ mod tests {
                 stops: Arc::new(AtomicUsize::new(0)),
                 last_req: Arc::new(Mutex::new(None)),
                 start_delay: Duration::ZERO,
+                start_block: None,
                 fail_start: false,
             }
         }
@@ -871,6 +891,17 @@ mod tests {
                 ..FakeGateway::new(gid, GwBehavior::Allow)
             }
         }
+
+        fn new_blocking_start(
+            gid: &str,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            FakeGateway {
+                start_block: Some((entered, release)),
+                ..FakeGateway::new(gid, GwBehavior::Allow)
+            }
+        }
     }
 
     #[async_trait]
@@ -883,7 +914,13 @@ mod tests {
                 anyhow::bail!("start failed for gateway {}", self.gid);
             }
             tokio::time::sleep(self.start_delay).await;
-            self.starts.fetch_add(1, Ordering::SeqCst);
+            let start_number = self.starts.fetch_add(1, Ordering::SeqCst);
+            if start_number == 0 {
+                if let Some((entered, release)) = &self.start_block {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
             Ok(())
         }
         async fn stop(&self) -> anyhow::Result<()> {
@@ -1447,7 +1484,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle,
             fanout_handle,
             scheduler_handle,
@@ -1978,7 +2017,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
@@ -2152,7 +2193,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
@@ -2268,7 +2311,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
@@ -2327,6 +2372,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_start_serializes_concurrent_boot_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let cp =
+            ControlPlane::new_with_telemetry(store, Registries::new(), Arc::new(NoopTelemetry))
+                .await;
+        let store = cp.store().clone();
+        let (start_entered, release_start) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let gateway = FakeGateway::new_blocking_start(
+            "discord",
+            Arc::clone(&start_entered),
+            Arc::clone(&release_start),
+        );
+        let starts = Arc::clone(&gateway.starts);
+        let stops = Arc::clone(&gateway.stops);
+        let gateway: Arc<dyn Gateway> = Arc::new(gateway);
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let router_in = Arc::new(Router::new_boot_gated(
+            Arc::clone(&cp),
+            vec![Arc::clone(&gateway)],
+        ));
+        let daemon = Arc::new(Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![gateway],
+            router_in: Arc::clone(&router_in),
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            orch_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+        });
+
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let first_daemon = Arc::clone(&daemon);
+        let first = tokio::spawn(async move { first_daemon.start().await });
+        start_entered.notified().await;
+        release_start.notify_waiters();
+        recovery_entered.notified().await;
+
+        let second_daemon = Arc::clone(&daemon);
+        let mut second = tokio::spawn(async move { second_daemon.start().await });
+        tokio::task::yield_now().await;
+        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "the second start must wait rather than start the gateway again"
+        );
+
+        store
+            .with_conn(|conn| conn.execute_batch("DROP TABLE session_prompt_queue"))
+            .await
+            .unwrap();
+        release_recovery.notify_one();
+        let first_error = first.await.unwrap().unwrap_err();
+        let second_error = second.await.unwrap().unwrap_err();
+        assert!(first_error.to_string().contains("session_prompt_queue"));
+        assert_eq!(second_error.to_string(), "daemon failed to boot");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+        let inbound_error = router_in
+            .on_reply("discord", "inbound-conversation", "actor", "prompt", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(inbound_error.to_string(), "daemon failed to boot");
+    }
+
+    #[tokio::test]
     async fn daemon_start_does_not_retry_after_prompt_claim_recovery_failure() {
         let (_db_guard, db_path) = temp_db_path();
         let store = Arc::new(Store::open(&db_path).await.unwrap());
@@ -2346,7 +2477,7 @@ mod tests {
         let daemon = prompt_recovery_test_daemon(store.clone()).await;
         store.fail_next_session_prompt_claim_recovery_for_test();
         assert!(daemon.start().await.is_err());
-        assert!(!*daemon.prompt_claim_recovery_complete.lock().await);
+        assert!(!daemon.prompt_claim_recovery_complete.load(Ordering::SeqCst));
 
         let retry_err = daemon.start().await.unwrap_err();
         assert_eq!(retry_err.to_string(), "daemon failed to boot");
@@ -2419,7 +2550,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle,
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
@@ -2529,7 +2662,9 @@ mod tests {
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
-            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle,
             fanout_handle,
             scheduler_handle,
