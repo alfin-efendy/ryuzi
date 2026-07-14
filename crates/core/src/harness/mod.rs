@@ -33,6 +33,10 @@ pub struct SessionCtx {
     /// Which agent persona/config is driving this session, if any. Mirrors
     /// `Session.agent`; unused for `Project` sessions today.
     pub agent: Option<String>,
+    /// True for explicit-mention children. They have their own harness and
+    /// provider context while their display rows are attributed to `run_id` in
+    /// the root session's Task1 message map.
+    pub isolated_target: bool,
     pub work_dir: PathBuf,
     /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
     /// — a second read root the native runtime's `read` tool tries when the
@@ -256,6 +260,7 @@ mod tests {
             project_id: None,
             kind: SessionKind::Chat,
             agent: None,
+            isolated_target: false,
             work_dir: PathBuf::from("/tmp"),
             attachments_dir: None,
             perm_mode: PermMode::Default,

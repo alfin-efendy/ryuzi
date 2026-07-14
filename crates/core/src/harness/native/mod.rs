@@ -331,7 +331,11 @@ impl Harness for NativeHarness {
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
         let steer = steer::SteerBuffer::new();
-        let nudge = seed_nudge_state(&ctx.store, &ctx.session_pk).await;
+        let nudge = if ctx.isolated_target {
+            Arc::new(runner::NudgeState::default())
+        } else {
+            seed_nudge_state(&ctx.store, &ctx.session_pk).await
+        };
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             steer: steer.clone(),
@@ -340,6 +344,7 @@ impl Harness for NativeHarness {
                 primary_agent: ctx.primary_agent,
                 run_id: ctx.run_id,
                 delegation: ctx.delegation,
+                isolated_target: ctx.isolated_target,
                 main_agent_id: ctx.main_agent_id,
                 learning_queue: ctx.learning_queue,
                 kind: ctx.kind,
@@ -613,6 +618,7 @@ mod tests {
             project_id: None,
             kind: crate::domain::SessionKind::Chat,
             agent: None,
+            isolated_target: false,
             work_dir,
             attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,

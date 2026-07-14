@@ -8,6 +8,10 @@ use crate::domain::{
     SessionGitOptions, SessionKind, SessionStatus, WriteOrigin,
 };
 use crate::harness::{HarnessSession, PrimaryTurnConfig, SessionCtx, TurnPrompt};
+use crate::mentions::{
+    coordinator_context, resolve_mentions, CoordinatorOutcome, ResolvedMentions,
+    COORDINATOR_SYNTHESIS_INSTRUCTION,
+};
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::sessions::ownership::{resolve_session_agent_access, SessionAgentAccess};
 use crate::settings::SettingsStore;
@@ -91,6 +95,39 @@ impl ControlPlane {
         .await
     }
 
+    pub async fn start_agent_session_with_turn(
+        self: &Arc<Self>,
+        project_id: Option<&str>,
+        primary_agent_id: &str,
+        prompt: TurnPrompt,
+        mentions: &[crate::api::types::AgentMention],
+        started_by: &str,
+        attachments: &[AttachmentRef],
+        git: Option<SessionGitOptions>,
+    ) -> anyhow::Result<Session> {
+        let resolved_mentions = if mentions.is_empty() {
+            None
+        } else {
+            Some(
+                resolve_mentions(&prompt.display, mentions, primary_agent_id, &self.registry)
+                    .await
+                    .map_err(anyhow::Error::from)?,
+            )
+        };
+        self.start_owned_agent_session_with_prompt(
+            project_id,
+            primary_agent_id,
+            prompt,
+            started_by,
+            attachments,
+            git,
+            None,
+            None,
+            resolved_mentions,
+        )
+        .await
+    }
+
     pub async fn start_agent_session_with_prompt(
         self: &Arc<Self>,
         project_id: Option<&str>,
@@ -109,6 +146,7 @@ impl ControlPlane {
             git,
             None,
             None,
+            None,
         )
         .await
     }
@@ -123,12 +161,17 @@ impl ControlPlane {
         git: Option<SessionGitOptions>,
         worker: Option<WorkerBinding>,
         model_override: Option<String>,
+        resolved_mentions: Option<ResolvedMentions>,
     ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
         let primary_agent = self.registry.resolved_snapshot(primary_agent_id).await?;
         validate_executable_primary(&primary_agent)?;
+        let resolved_mentions = match resolved_mentions {
+            Some(resolved) => Some(resolved),
+            None => None,
+        };
         let identity = crate::domain::AgentIdentitySnapshot {
             id: primary_agent.profile.id.clone(),
             name: primary_agent.profile.name.clone(),
@@ -249,6 +292,7 @@ impl ControlPlane {
                         agent: primary_agent,
                         run_id: stored_run.run_id,
                     },
+                    resolved_mentions,
                 )
                 .await;
             });
@@ -268,11 +312,61 @@ impl ControlPlane {
                         agent: primary_agent,
                         run_id: stored_run.run_id,
                     },
+                    resolved_mentions,
                 )
                 .await;
             });
         }
         Ok(session)
+    }
+
+    pub async fn continue_agent_session_with_turn(
+        self: &Arc<Self>,
+        session_pk: &str,
+        prompt: TurnPrompt,
+        mentions: &[crate::api::types::AgentMention],
+        attachments: &[AttachmentRef],
+    ) -> anyhow::Result<String> {
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("daemon is draining for an update; try again shortly");
+        }
+        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
+            .await?
+        {
+            SessionAgentAccess::Executable { agent_id } => agent_id,
+            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
+            SessionAgentAccess::DeletedReadOnly { .. } => {
+                anyhow::bail!("the session's primary agent was deleted")
+            }
+        };
+        let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
+        validate_executable_primary(&primary_agent)?;
+        let resolved_mentions = if mentions.is_empty() {
+            None
+        } else {
+            Some(
+                resolve_mentions(&prompt.display, mentions, &agent_id, &self.registry)
+                    .await
+                    .map_err(anyhow::Error::from)?,
+            )
+        };
+        let run = self
+            .delegation
+            .begin_primary(session_pk, primary_agent.clone(), &prompt.display)
+            .await?;
+        let run_id = run.run.run_id.clone();
+        self.continue_session_with_primary_turn(
+            session_pk,
+            prompt,
+            attachments,
+            PrimaryTurn {
+                agent: primary_agent,
+                run_id: run_id.clone(),
+            },
+            resolved_mentions,
+        )
+        .await?;
+        Ok(run_id)
     }
 
     pub async fn continue_agent_session_with_prompt(
@@ -308,6 +402,7 @@ impl ControlPlane {
                 agent: primary_agent,
                 run_id: run_id.clone(),
             },
+            None,
         )
         .await?;
         Ok(run_id)
@@ -335,6 +430,7 @@ impl ControlPlane {
             git,
             worker,
             model_override,
+            None,
         )
         .await
     }
@@ -370,9 +466,17 @@ impl ControlPlane {
         attachments: Vec<AttachmentRef>,
         cancel: tokio_util::sync::CancellationToken,
         primary_turn: PrimaryTurn,
+        resolved_mentions: Option<ResolvedMentions>,
     ) {
-        self.chat_startup_phases(&session_pk, prompt, attachments, &cancel, primary_turn)
-            .await;
+        self.chat_startup_phases(
+            &session_pk,
+            prompt,
+            attachments,
+            &cancel,
+            primary_turn,
+            resolved_mentions,
+        )
+        .await;
         self.starting.lock().unwrap().remove(&session_pk);
     }
 
@@ -386,6 +490,7 @@ impl ControlPlane {
         attachments: Vec<AttachmentRef>,
         cancel: &tokio_util::sync::CancellationToken,
         primary_turn: PrimaryTurn,
+        resolved_mentions: Option<ResolvedMentions>,
     ) {
         let run_id = primary_turn.run_id.clone();
         let work_dir = crate::paths::chat_scratch_dir(session_pk);
@@ -408,7 +513,7 @@ impl ControlPlane {
 
         self.emit_status(session_pk, "Connecting tools…").await;
         let handle = match self
-            .start_harness_session(None, session_pk, &work_dir, None, primary_turn)
+            .start_harness_session(None, session_pk, &work_dir, None, primary_turn.clone())
             .await
         {
             Ok(handle) => handle,
@@ -434,16 +539,18 @@ impl ControlPlane {
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, &attachments)
             .await;
-        self.spawn_prompt(
+        self.dispatch_turn(
             handle,
             session_pk.to_string(),
             run_id,
+            primary_turn,
             TurnPrompt {
                 agent: prepared.agent,
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
             },
+            resolved_mentions,
         );
     }
 
@@ -480,6 +587,7 @@ impl ControlPlane {
         prompt: TurnPrompt,
         attachments: &[AttachmentRef],
         primary_turn: PrimaryTurn,
+        resolved_mentions: Option<ResolvedMentions>,
     ) -> anyhow::Result<()> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -549,7 +657,7 @@ impl ControlPlane {
                         session_pk,
                         &work_dir,
                         session.agent_session_id.clone(),
-                        primary_turn,
+                        primary_turn.clone(),
                     )
                     .await
                     // `start_harness_session` already persists any resolved
@@ -576,17 +684,33 @@ impl ControlPlane {
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
-        self.spawn_prompt(
-            handle,
-            session_pk.to_string(),
-            run_id,
-            TurnPrompt {
-                agent: prepared.agent,
-                display: prompt.display,
-                blocks: prepared.image_blocks,
-                attachments: prepared.attachments_meta,
-            },
-        );
+        if let Some(resolved_mentions) = resolved_mentions {
+            self.dispatch_turn(
+                handle,
+                session_pk.to_string(),
+                run_id,
+                primary_turn,
+                TurnPrompt {
+                    agent: prepared.agent,
+                    display: prompt.display,
+                    blocks: prepared.image_blocks,
+                    attachments: prepared.attachments_meta,
+                },
+                Some(resolved_mentions),
+            );
+        } else {
+            self.spawn_prompt(
+                handle,
+                session_pk.to_string(),
+                run_id,
+                TurnPrompt {
+                    agent: prepared.agent,
+                    display: prompt.display,
+                    blocks: prepared.image_blocks,
+                    attachments: prepared.attachments_meta,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -735,6 +859,7 @@ impl ControlPlane {
         attachments: Vec<AttachmentRef>,
         cancel: tokio_util::sync::CancellationToken,
         primary_turn: PrimaryTurn,
+        resolved_mentions: Option<ResolvedMentions>,
     ) {
         self.startup_phases(
             &project,
@@ -744,6 +869,7 @@ impl ControlPlane {
             attachments,
             &cancel,
             primary_turn,
+            resolved_mentions,
         )
         .await;
         self.starting.lock().unwrap().remove(&session_pk);
@@ -772,6 +898,7 @@ impl ControlPlane {
         attachments: Vec<AttachmentRef>,
         cancel: &tokio_util::sync::CancellationToken,
         primary_turn: PrimaryTurn,
+        resolved_mentions: Option<ResolvedMentions>,
     ) {
         let run_id = primary_turn.run_id.clone();
         // Non-git projects skip all git prep — no worktree, no branch — and run
@@ -887,7 +1014,13 @@ impl ControlPlane {
 
         self.emit_status(session_pk, "Connecting tools…").await;
         let handle = match self
-            .start_harness_session(Some(project), session_pk, &work_dir, None, primary_turn)
+            .start_harness_session(
+                Some(project),
+                session_pk,
+                &work_dir,
+                None,
+                primary_turn.clone(),
+            )
             .await
         {
             Ok(handle) => handle,
@@ -915,16 +1048,18 @@ impl ControlPlane {
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, &attachments)
             .await;
-        self.spawn_prompt(
+        self.dispatch_turn(
             handle,
             session_pk.to_string(),
             run_id,
+            primary_turn,
             TurnPrompt {
                 agent: prepared.agent,
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
             },
+            resolved_mentions,
         );
     }
 
@@ -1092,6 +1227,31 @@ impl ControlPlane {
         resume: Option<String>,
         primary_turn: PrimaryTurn,
     ) -> anyhow::Result<Arc<dyn HarnessSession>> {
+        self.start_harness_session_with_options(
+            project,
+            session_pk,
+            work_dir,
+            resume,
+            primary_turn,
+            None,
+            false,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_harness_session_with_options(
+        self: &Arc<Self>,
+        project: Option<&Project>,
+        session_pk: &str,
+        work_dir: &Path,
+        resume: Option<String>,
+        primary_turn: PrimaryTurn,
+        kind_override: Option<SessionKind>,
+        isolated_target: bool,
+        register_live: bool,
+    ) -> anyhow::Result<Arc<dyn HarnessSession>> {
         let settings = SettingsStore::new(self.store.clone());
         // Native sessions execute the immutable primary-agent snapshot captured
         // for this turn. Project, chat-runtime, and global preferences are
@@ -1149,7 +1309,11 @@ impl ControlPlane {
         let session_row = self.store.get_session(session_pk).await.ok().flatten();
         let primary_agent = primary_turn.agent;
         let run_id = primary_turn.run_id;
-        let runtime = self.store.get_session_runtime_settings(session_pk).await?;
+        let runtime = if isolated_target {
+            None
+        } else {
+            self.store.get_session_runtime_settings(session_pk).await?
+        };
         let (model, effort) = (
             runtime
                 .as_ref()
@@ -1160,14 +1324,16 @@ impl ControlPlane {
                 .or_else(|| agent_model_parts(&primary_agent.profile.model).1),
         );
         let perm_mode = primary_agent.profile.permissions.mode;
-        let kind = session_row
-            .as_ref()
-            .map(|s| s.kind)
-            .unwrap_or(if project.is_some() {
-                SessionKind::Project
-            } else {
-                SessionKind::Chat
-            });
+        let kind = kind_override.unwrap_or_else(|| {
+            session_row
+                .as_ref()
+                .map(|s| s.kind)
+                .unwrap_or(if project.is_some() {
+                    SessionKind::Project
+                } else {
+                    SessionKind::Chat
+                })
+        });
         let agent = session_row.and_then(|s| s.agent);
         // The curated app-control facade (spec §9.1) is only for a top-level
         // interactive session: a worker or review-fork session never gets
@@ -1189,6 +1355,7 @@ impl ControlPlane {
             project_id: project.map(|p| p.project_id.clone()),
             kind,
             agent,
+            isolated_target,
             work_dir: work_dir.to_path_buf(),
             attachments_dir: Some(self.attachment_dest_dir(session_pk).await),
             perm_mode,
@@ -1216,10 +1383,14 @@ impl ControlPlane {
             let _ = self.store.update_agent_session_id(session_pk, &sid).await;
         }
 
-        self.running
-            .lock()
-            .unwrap()
-            .insert(session_pk.to_string(), handle.clone());
+        if register_live {
+            // Only root sessions are reusable ControlPlane live handles. An
+            // explicit-mention child is an isolated, one-shot harness.
+            self.running
+                .lock()
+                .unwrap()
+                .insert(session_pk.to_string(), handle.clone());
+        }
         Ok(handle)
     }
 
@@ -1330,6 +1501,167 @@ impl ControlPlane {
                 reason: reason.map(str::to_string),
             })
             .await;
+    }
+
+    fn dispatch_turn(
+        self: &Arc<Self>,
+        handle: Arc<dyn HarnessSession>,
+        session_pk: String,
+        run_id: String,
+        _primary_turn: PrimaryTurn,
+        prompt: TurnPrompt,
+        resolved_mentions: Option<ResolvedMentions>,
+    ) {
+        let Some(resolved_mentions) = resolved_mentions else {
+            self.spawn_prompt(handle, session_pk, run_id, prompt);
+            return;
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let queued =
+                futures::future::join_all(resolved_mentions.targets.iter().map(|target| {
+                    let me = Arc::clone(&me);
+                    let root_run_id = run_id.clone();
+                    let target_agent_id = target.profile.id.clone();
+                    let task = resolved_mentions.task.clone();
+                    async move {
+                        me.delegation
+                            .queue_main(crate::delegation::MainDelegationRequest {
+                                parent_run_id: root_run_id,
+                                target_agent_id,
+                                task,
+                                context: None,
+                                background: false,
+                            })
+                            .await
+                    }
+                }))
+                .await;
+            let outcomes = futures::future::join_all(queued.into_iter().map(|queued| {
+                let me = Arc::clone(&me);
+                let task = resolved_mentions.task.clone();
+                async move {
+                    match queued {
+                        Ok(child) => me.run_explicit_mention_child(child, task).await,
+                        Err(error) => CoordinatorOutcome {
+                            agent_id: String::new(),
+                            agent_name: "unavailable agent".into(),
+                            task,
+                            result: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+            }))
+            .await;
+            let synthesis = format!(
+                "{COORDINATOR_SYNTHESIS_INSTRUCTION}\n\n{}",
+                coordinator_context(&outcomes)
+            );
+            me.spawn_prompt(
+                handle,
+                session_pk,
+                run_id,
+                TurnPrompt::text(synthesis.clone(), synthesis),
+            );
+        });
+    }
+
+    async fn run_explicit_mention_child(
+        self: &Arc<Self>,
+        child: crate::delegation::RunHandle,
+        task: String,
+    ) -> CoordinatorOutcome {
+        let run_id = child.run.run_id.clone();
+        let agent_id = child.run.executing_agent_id.clone().unwrap_or_default();
+        let agent_name = child.run.executing_agent_name_snapshot.clone();
+        let result = async {
+            self.delegation.mark_running(&run_id).await?;
+            let target = child
+                .agent_snapshot
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("child agent snapshot is unavailable"))?;
+            let session = self
+                .store
+                .get_session(&child.run.session_pk)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("parent session is unavailable"))?;
+            let project = match session.project_id.as_deref() {
+                Some(project_id) => Some(
+                    self.store
+                        .get_project(project_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("parent project is unavailable"))?,
+                ),
+                None => None,
+            };
+            let work_dir = session
+                .worktree_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.exists())
+                .unwrap_or_else(|| match &project {
+                    Some(project) => std::path::PathBuf::from(&project.workdir),
+                    None => crate::paths::chat_scratch_dir(&child.run.session_pk),
+                });
+            let handle = self
+                .start_harness_session_with_options(
+                    project.as_ref(),
+                    &child.run.session_pk,
+                    &work_dir,
+                    None,
+                    PrimaryTurn {
+                        agent: target,
+                        run_id: run_id.clone(),
+                    },
+                    Some(SessionKind::Worker),
+                    true,
+                    false,
+                )
+                .await?;
+            let prompt = TurnPrompt::text(task.clone(), task.clone());
+            let turn = handle.send_prompt(prompt).await;
+            let _ = handle.end().await;
+            turn?;
+            self.delegation.complete(&run_id, "").await?;
+            let terminal = self.delegation.await_terminal(&run_id).await?;
+            let messages = self
+                .store
+                .list_run_messages(&terminal.session_pk, &run_id)
+                .await?;
+            let output = messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .filter_map(|message| message.payload["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok::<_, anyhow::Error>(if output.is_empty() {
+                terminal.result.unwrap_or_default()
+            } else {
+                output
+            })
+        }
+        .await;
+        match result {
+            Ok(result) => CoordinatorOutcome {
+                agent_id,
+                agent_name,
+                task,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self.delegation.fail(&run_id, &message).await;
+                CoordinatorOutcome {
+                    agent_id,
+                    agent_name,
+                    task,
+                    result: None,
+                    error: Some(message),
+                }
+            }
+        }
     }
 
     /// Drive a prompt on `handle` in the background. `send_prompt` blocks until
@@ -1676,6 +2008,7 @@ impl ControlPlane {
             primary_agent,
             run_id: review_pk.clone(),
             delegation: self.delegation.clone(),
+            isolated_target: false,
             main_agent_id: persistence.registry.default_agent_id().await,
             learning_queue: persistence.learning.clone(),
             kind: SessionKind::Review,

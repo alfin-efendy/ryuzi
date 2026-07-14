@@ -81,8 +81,17 @@ impl From<crate::agents::registry::AgentRegistryError> for ApiError {
     }
 }
 
+impl From<crate::mentions::MentionError> for ApiError {
+    fn from(e: crate::mentions::MentionError) -> Self {
+        ApiError::bad_request(e.to_string())
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(mention) = e.downcast_ref::<crate::mentions::MentionError>() {
+            return ApiError::from(mention.clone());
+        }
         ApiError {
             status: 500,
             message: e.to_string(),

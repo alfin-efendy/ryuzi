@@ -99,6 +99,9 @@ pub struct RunnerDeps {
     pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
     pub run_id: String,
     pub delegation: Arc<crate::delegation::DelegationRuntime>,
+    /// A child harness must not replay the root transcript or append provider
+    /// turns to it; its result is conveyed only through its run-scoped rows.
+    pub isolated_target: bool,
     /// Main agent whose isolated knowledge bundle owns this session's memory.
     pub main_agent_id: String,
     /// Durable learning queue shared with the daemon worker.
@@ -256,56 +259,65 @@ pub async fn run_turn(
 
     // 2. Load history + context state and append the user turn.
     let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
-    let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
+    let mut cm = if deps.isolated_target {
+        ContextManager::ephemeral(&deps.session_pk, cfg)
+    } else {
+        ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?
+    };
     // Seed the indicator immediately on resume, before any model call —
     // prefer the persisted last-known status (server truth) over the
     // reload estimate (spec §6.1/§10).
-    match deps.store.get_session_context(&deps.session_pk).await {
-        Ok(Some(saved)) => {
-            // Seed BEFORE reading status: an overflowed prior turn persisted
-            // the full-window total via `mark_full`, but this fresh
-            // `ContextManager` only knows the (possibly much smaller) reload
-            // estimate, which would otherwise let `needs_compaction` miss the
-            // overflow and loop forever (spec §12).
-            if let Some(saved_active) = saved["active_tokens"].as_u64() {
-                cm.seed_active_tokens(saved_active);
+    if !deps.isolated_target {
+        match deps.store.get_session_context(&deps.session_pk).await {
+            Ok(Some(saved)) => {
+                // Seed BEFORE reading status: an overflowed prior turn persisted
+                // the full-window total via `mark_full`, but this fresh
+                // `ContextManager` only knows the (possibly much smaller) reload
+                // estimate, which would otherwise let `needs_compaction` miss the
+                // overflow and loop forever (spec §12).
+                if let Some(saved_active) = saved["active_tokens"].as_u64() {
+                    cm.seed_active_tokens(saved_active);
+                }
+                let st = cm.status();
+                let _ = deps.events.send(CoreEvent::ContextUsage {
+                    session_pk: deps.session_pk.clone(),
+                    active_tokens: saved["active_tokens"].as_u64().unwrap_or(st.active_tokens),
+                    context_window: st.context_window,
+                    usable_window: saved["usable_window"].as_u64().unwrap_or(st.usable_window),
+                    percent_left: saved["percent_left"]
+                        .as_u64()
+                        .unwrap_or(st.percent_left as u64) as u8,
+                    cache_read_tokens: 0,
+                    output_tokens: 0,
+                });
+                // Re-emit the accumulated session cost from what's already
+                // persisted — no accumulation here, just pricing the saved tally
+                // at current rates (spec: resume must not double-count).
+                let tally = super::cost::Tally::from_payload(&saved);
+                if !tally.is_empty() {
+                    emit_session_cost(deps, &tally).await;
+                }
             }
-            let st = cm.status();
-            let _ = deps.events.send(CoreEvent::ContextUsage {
-                session_pk: deps.session_pk.clone(),
-                active_tokens: saved["active_tokens"].as_u64().unwrap_or(st.active_tokens),
-                context_window: st.context_window,
-                usable_window: saved["usable_window"].as_u64().unwrap_or(st.usable_window),
-                percent_left: saved["percent_left"]
-                    .as_u64()
-                    .unwrap_or(st.percent_left as u64) as u8,
-                cache_read_tokens: 0,
-                output_tokens: 0,
-            });
-            // Re-emit the accumulated session cost from what's already
-            // persisted — no accumulation here, just pricing the saved tally
-            // at current rates (spec: resume must not double-count).
-            let tally = super::cost::Tally::from_payload(&saved);
-            if !tally.is_empty() {
-                emit_session_cost(deps, &tally).await;
-            }
+            // No persisted tally yet (fresh session) or a read error — either
+            // way this is a display re-emit, never an accumulation: `cm` hasn't
+            // committed any response yet, so `cm.last_*` would be all-zero at
+            // best and stale at worst. `emit_context_usage` would otherwise
+            // persist a spurious zero-token model entry (and a `total_usd=0`
+            // `SessionCost`) on every brand-new session.
+            _ => emit_context_display(deps, &cm, true).await,
         }
-        // No persisted tally yet (fresh session) or a read error — either
-        // way this is a display re-emit, never an accumulation: `cm` hasn't
-        // committed any response yet, so `cm.last_*` would be all-zero at
-        // best and stale at worst. `emit_context_usage` would otherwise
-        // persist a spurious zero-token model entry (and a `total_usd=0`
-        // `SessionCost`) on every brand-new session.
-        _ => emit_context_display(deps, &cm, true).await,
     }
     cm.append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
 
-    // 3. Drive the loop with a spawner available for the `task` tool.
-    let spawn: Arc<dyn SubagentSpawner> = Arc::new(RunnerSpawner {
-        deps: deps.clone(),
-        cancel: cancel.clone(),
-        depth: 0,
+    // 3. Drive the loop. Explicit mention children deliberately do not receive
+    // the Task5 subagent spawner: they are terminal delegated main-agent turns.
+    let spawn = (!deps.isolated_target).then(|| {
+        Arc::new(RunnerSpawner {
+            deps: deps.clone(),
+            cancel: cancel.clone(),
+            depth: 0,
+        }) as Arc<dyn SubagentSpawner>
     });
     // Seed the parent turn-cap from the `agent.max_provider_turns` setting,
     // defaulting to Phase 2's raised ceiling (PARENT_MAX_ITERS). This is what
@@ -322,14 +334,16 @@ pub async fn run_turn(
         &agent,
         &mut cm,
         &cancel,
-        Some(spawn),
+        spawn,
         DisplayMode::Full,
         &budget,
     )
     .await?;
 
     // 4. Best-effort: give a fresh session a generated title.
-    maybe_generate_title(deps, &prompt.display).await;
+    if !deps.isolated_target {
+        maybe_generate_title(deps, &prompt.display).await;
+    }
     Ok(())
 }
 
@@ -1949,7 +1963,7 @@ async fn emit_row(
         tool_kind: tool_kind.clone(),
         speaker: None,
     };
-    match deps.store.insert_message(msg).await {
+    match deps.store.insert_run_message(&deps.run_id, msg).await {
         Ok(seq) => {
             let _ = deps.events.send(CoreEvent::Message {
                 session_pk: deps.session_pk.clone(),
@@ -2550,6 +2564,7 @@ mod tests {
             primary_agent,
             run_id: "r1".into(),
             delegation,
+            isolated_target: false,
             main_agent_id: "ryuzi".into(),
             learning_queue,
             kind: SessionKind::Chat,

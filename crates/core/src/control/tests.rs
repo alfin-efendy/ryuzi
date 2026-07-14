@@ -73,6 +73,8 @@ struct FakeSession {
     store: Arc<Store>,
     events: broadcast::Sender<CoreEvent>,
     session_pk: String,
+    run_id: String,
+    isolated_target: bool,
     block_until_cancel: bool,
     cancelled: Arc<AtomicBool>,
     send_count: Arc<AtomicUsize>,
@@ -99,27 +101,31 @@ impl HarnessSession for FakeSession {
         // Persist the user turn (as the ACP session does in send_prompt),
         // using the RAW display text — not the agent-decorated one — so
         // durable history mirrors what the real ACP session persists.
-        let _ = self
-            .store
-            .insert_message(NewMessage::block(
-                &self.session_pk,
-                "user",
-                "text",
-                serde_json::json!({ "text": prompt.display }),
-            ))
-            .await;
+        let user = NewMessage::block(
+            &self.session_pk,
+            "user",
+            "text",
+            serde_json::json!({ "text": prompt.display }),
+        );
+        let _ = if self.isolated_target {
+            self.store.insert_run_message(&self.run_id, user).await
+        } else {
+            self.store.insert_message(user).await
+        };
 
         // Stream an assistant text row + broadcast it (as the sink does).
-        if let Ok(seq) = self
-            .store
-            .insert_message(NewMessage::block(
-                &self.session_pk,
-                "assistant",
-                "text",
-                serde_json::json!({ "text": "working" }),
-            ))
-            .await
-        {
+        let assistant = NewMessage::block(
+            &self.session_pk,
+            "assistant",
+            "text",
+            serde_json::json!({ "text": "working" }),
+        );
+        let inserted = if self.isolated_target {
+            self.store.insert_run_message(&self.run_id, assistant).await
+        } else {
+            self.store.insert_message(assistant).await
+        };
+        if let Ok(seq) = inserted {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: self.session_pk.clone(),
                 seq,
@@ -216,6 +222,8 @@ impl Harness for FakeHarness {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
             session_pk: ctx.session_pk.clone(),
+            run_id: ctx.run_id.clone(),
+            isolated_target: ctx.isolated_target,
             block_until_cancel: self.block_until_cancel,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
@@ -259,6 +267,8 @@ impl Harness for GatedHarness {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
             session_pk: ctx.session_pk.clone(),
+            run_id: ctx.run_id.clone(),
+            isolated_target: ctx.isolated_target,
             block_until_cancel: false,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
@@ -307,6 +317,8 @@ impl Harness for LatchGatedHarness {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
             session_pk: ctx.session_pk.clone(),
+            run_id: ctx.run_id.clone(),
+            isolated_target: ctx.isolated_target,
             block_until_cancel: false,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
@@ -658,6 +670,101 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
     assert!(
         counters.perm_modes.lock().unwrap().is_empty(),
         "the historic session permission must not overwrite the refreshed profile permission"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_counters().await;
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let target = cp
+        .registry()
+        .create(crate::agents::types::AgentMutationInput {
+            name: "Ada".into(),
+            description: template.description,
+            avatar: template.avatar,
+            model: template.model,
+            permissions: template.permissions,
+            skills: template.skills,
+            tools: template.tools,
+            loop_settings: template.loop_settings,
+        })
+        .await
+        .unwrap();
+    let text = "@Ada @Ada investigate";
+    let mentions = vec![
+        crate::api::types::AgentMention {
+            agent_id: target.profile.id.clone(),
+            label_snapshot: "Ada".into(),
+            start_utf16: 0,
+            end_utf16: 4,
+        },
+        crate::api::types::AgentMention {
+            agent_id: target.profile.id.clone(),
+            label_snapshot: "Ada".into(),
+            start_utf16: 5,
+            end_utf16: 9,
+        },
+    ];
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &mentions,
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(&counters.prompts, 2).await;
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 2, "duplicate target mentions queue one child");
+    let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
+    let child = runs.iter().find(|run| run.parent_run_id.is_some()).unwrap();
+    assert!(
+        cp.running.lock().unwrap().contains_key(&session.session_pk),
+        "the root harness remains registered"
+    );
+    assert_eq!(
+        cp.running.lock().unwrap().len(),
+        1,
+        "an isolated child harness must not register in ControlPlane.running"
+    );
+    let child_rows = store
+        .list_run_messages(&session.session_pk, &child.run_id)
+        .await
+        .unwrap();
+    assert_eq!(child_rows.len(), 2, "child output is run-scoped");
+    assert_eq!(child_rows[1].payload["text"], "working");
+    let synthesis = counters.prompts.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        &synthesis[..crate::mentions::COORDINATOR_SYNTHESIS_INSTRUCTION.len()],
+        crate::mentions::COORDINATOR_SYNTHESIS_INSTRUCTION
+    );
+    assert!(synthesis.contains("Agent: Ada"));
+    assert!(synthesis.contains("Result: working"));
+    assert!(
+        store
+            .list_run_messages(&session.session_pk, &root.run_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the isolated child must not write provider rows to the root run"
     );
 }
 
@@ -2485,6 +2592,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         Vec::new(),
         &cancel,
         PrimaryTurn::new(primary_agent, root.run.run_id.clone()),
+        None,
     )
     .await;
 

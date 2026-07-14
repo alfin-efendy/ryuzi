@@ -21,6 +21,7 @@ pub mod harness;
 pub mod learning;
 pub mod llm_router;
 pub mod mcp;
+pub mod mentions;
 pub mod oauth_loopback;
 pub mod orch;
 pub mod pairing;

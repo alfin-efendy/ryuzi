@@ -185,12 +185,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: StartChatP = params(p)?;
             let attachments = attachment_refs_from_paths(&a.turn.attachments).await?;
             let agent_prompt = chat_agent_prompt(&a.turn.text, a.turn.context.as_ref());
+            let mentions = a.turn.mentions;
             ok(state
                 .cp
-                .start_agent_session_with_prompt(
+                .start_agent_session_with_turn(
                     None,
                     &a.primary_agent_id,
                     TurnPrompt::text(agent_prompt, a.turn.text),
+                    &mentions,
                     "cockpit",
                     &attachments,
                     None,
@@ -297,11 +299,13 @@ async fn start_session(
     let git: Option<SessionGitOptions> = turn.git.clone().map(Into::into);
     let attachments = attachment_refs_from_paths(&turn.attachments).await?;
     let agent_prompt = chat_agent_prompt(&turn.text, turn.context.as_ref());
+    let mentions = turn.mentions;
     Ok(cp
-        .start_agent_session_with_prompt(
+        .start_agent_session_with_turn(
             Some(project_id),
             primary_agent_id,
             TurnPrompt::text(agent_prompt, turn.text),
+            &mentions,
             "cockpit",
             &attachments,
             git,
@@ -316,11 +320,13 @@ async fn continue_session(
 ) -> Result<(), ApiError> {
     let attachments = attachment_refs_from_paths(&turn.attachments).await?;
     let agent_prompt = chat_agent_prompt(&turn.text, turn.context.as_ref());
+    let mentions = turn.mentions;
     state
         .cp
-        .continue_agent_session_with_prompt(
+        .continue_agent_session_with_turn(
             session_pk,
             TurnPrompt::text(agent_prompt, turn.text),
+            &mentions,
             &attachments,
         )
         .await?;
@@ -367,6 +373,36 @@ mod tests {
     use crate::api::{dispatch, tests_support::state};
     use serde_json::json;
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn start_chat_session_rejects_invalid_mentions_before_creating_a_session() {
+        let s = crate::api::tests_support::state_with_fake_native().await;
+        let primary_agent_id = s.cp.registry().default_agent_id().await;
+
+        let err = dispatch(
+            &s,
+            "start_chat_session",
+            json!({
+                "primaryAgentId": primary_agent_id,
+                "turn": {
+                    "text": "@Missing review this",
+                    "attachments": [],
+                    "mentions": [{
+                        "agentId": "missing",
+                        "labelSnapshot": "Missing",
+                        "startUtf16": 0,
+                        "endUtf16": 8
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, 400);
+        assert!(s.cp.store().list_sessions(None).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     #[serial]
