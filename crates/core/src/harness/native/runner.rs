@@ -635,10 +635,17 @@ async fn drive(
                 Some(memory) => memory.snapshot().await?,
                 None => None,
             };
+            let t0 = std::time::Instant::now();
             let sections =
                 context::build_sections(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref());
             system_breakdown = Some(context::breakdown_of(&sections));
-            context::join_sections(&sections)
+            let text = context::join_sections(&sections);
+            tracing::debug!(
+                target: "ryuzi::context",
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "native: system prompt assembled"
+            );
+            text
         }
     };
     // Tools restricted to what this agent may use — UNLESS a review fork
@@ -781,6 +788,8 @@ async fn drive(
                     observation: observation.clone(),
                 },
             };
+            let ttft_start = std::time::Instant::now();
+            let mut ttft_logged = false;
             let RoutedStream {
                 selection,
                 events: mut rx,
@@ -830,6 +839,14 @@ async fn drive(
                 let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
                     continue;
                 };
+                if !ttft_logged {
+                    ttft_logged = true;
+                    tracing::debug!(
+                        target: "ryuzi::context",
+                        ttft_ms = ttft_start.elapsed().as_millis() as u64,
+                        "native: first stream event received"
+                    );
+                }
                 match decoded {
                     MessageStreamEvent::TextDelta { text, .. } => {
                         turn.text.push_str(&text);
