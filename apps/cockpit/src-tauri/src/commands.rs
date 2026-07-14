@@ -521,6 +521,7 @@ pub async fn delete_tool_policy(
 pub fn resolve_approval(
     engine: Engine<'_>,
     runner_id: Option<String>,
+    run_id: String,
     request_id: String,
     response: ApprovalResponse,
 ) -> bool {
@@ -537,7 +538,7 @@ pub fn resolve_approval(
         return false;
     };
     tokio::task::block_in_place(|| {
-        tauri::async_runtime::block_on(client.resolve_approval(&request_id, response))
+        tauri::async_runtime::block_on(client.resolve_approval(&run_id, &request_id, response))
     })
 }
 

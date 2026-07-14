@@ -30,6 +30,8 @@ import { LOCAL_RUNNER, sessKey, refKey, isSession, sameRef, refOf, type SessionR
 export type PendingApproval = {
   runnerId: string;
   sessionPk: string;
+  /** Durable agent run that owns this request; required to resolve it. */
+  runId: string;
   requestId: string;
   tool: string;
   summary: string;
@@ -93,7 +95,7 @@ type State = {
   /** `runnerId` is the runner that produced the event (from the CoreEventMsg
    *  wrapper). */
   applyCoreEvent: (e: CoreEvent, runnerId: string) => void;
-  clearApproval: (requestId: string) => void;
+  clearApproval: (runId: string, requestId: string) => void;
   setFocused: (ref: SessionRef | null) => void;
   selectProject: (id: string | null) => void;
   refresh: () => Promise<void>;
@@ -122,7 +124,7 @@ type State = {
   stop: (runnerId: string, sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (runnerId: string, sessionPk: string) => Promise<boolean>;
-  resolveApproval: (runnerId: string, requestId: string, response: ApprovalResponse) => Promise<void>;
+  resolveApproval: (runnerId: string, runId: string, requestId: string, response: ApprovalResponse) => Promise<void>;
   hydrateTranscript: (runnerId: string, pk: string, fetcher?: (pk: string) => Promise<Message[]>, force?: boolean) => Promise<void>;
   /** Re-hydrates a session's transcript even when it's already `loaded` —
    *  used after a terminal/blocked `orchTaskChanged` so a report or block
@@ -279,6 +281,7 @@ export const useStore = create<State>((set, get) => ({
               {
                 runnerId,
                 sessionPk: e.session_pk,
+                runId: e.run_id,
                 requestId: e.request_id,
                 tool: e.tool,
                 summary: e.summary,
@@ -351,7 +354,10 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
 
-  clearApproval: (requestId) => set((st) => ({ pendingApprovals: st.pendingApprovals.filter((a) => a.requestId !== requestId) })),
+  clearApproval: (runId, requestId) =>
+    set((st) => ({
+      pendingApprovals: st.pendingApprovals.filter((a) => a.runId !== runId || a.requestId !== requestId),
+    })),
 
   setFocused: (ref) => {
     const prev = get().focusedSession;
@@ -782,10 +788,10 @@ export const useStore = create<State>((set, get) => ({
     await get().refresh();
     return res.status === "ok";
   },
-  resolveApproval: async (runnerId, requestId, response) => {
+  resolveApproval: async (runnerId, runId, requestId, response) => {
     try {
-      await commands.resolveApproval(runnerId, requestId, response);
-      get().clearApproval(requestId);
+      await commands.resolveApproval(runnerId, runId, requestId, response);
+      get().clearApproval(runId, requestId);
     } catch (e) {
       console.error("resolveApproval failed", e);
       toast.error("Approval failed: " + String(e));

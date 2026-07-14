@@ -11,6 +11,7 @@ function approval(partial: Partial<PendingApproval>): PendingApproval {
   return {
     runnerId: LOCAL_RUNNER,
     sessionPk: "s1",
+    runId: "run-1",
     requestId: "r1",
     tool: "bash",
     summary: "Bash: rm -rf ./x",
@@ -24,8 +25,8 @@ function approval(partial: Partial<PendingApproval>): PendingApproval {
 function seedResolve() {
   const calls: unknown[] = [];
   useStore.setState({
-    resolveApproval: async (_runnerId, id, resp) => {
-      calls.push([id, resp]);
+    resolveApproval: async (_runnerId, runId, id, resp) => {
+      calls.push([runId, id, resp]);
     },
   });
   return calls;
@@ -36,14 +37,14 @@ test("bash card shows the full command and resolves allowOnce", async () => {
   render(<ApprovalCard approval={approval({})} />);
   expect(screen.getByText("rm -rf ./x")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Allow" }));
-  expect(calls[0]).toEqual(["r1", { decision: "allowOnce", scope: null, payload: null }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "allowOnce", scope: null, payload: null }]);
 });
 
 test("bash card resolves rejectOnce on Deny", async () => {
   const calls = seedResolve();
   render(<ApprovalCard approval={approval({})} />);
   fireEvent.click(screen.getByRole("button", { name: "Deny" }));
-  expect(calls[0]).toEqual(["r1", { decision: "rejectOnce", scope: null, payload: null }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "rejectOnce", scope: null, payload: null }]);
 });
 
 test("allow scope menu sends allowAlways+session and allowAlways+project", async () => {
@@ -51,11 +52,11 @@ test("allow scope menu sends allowAlways+session and allowAlways+project", async
   render(<ApprovalCard approval={approval({})} />);
   fireEvent.click(screen.getByRole("button", { name: "Allow options" }));
   fireEvent.click(screen.getByRole("button", { name: "Allow for this session" }));
-  expect(calls[0]).toEqual(["r1", { decision: "allowAlways", scope: "session", payload: null }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "allowAlways", scope: "session", payload: null }]);
 
   fireEvent.click(screen.getByRole("button", { name: "Allow options" }));
   fireEvent.click(screen.getByRole("button", { name: "Always allow in this project" }));
-  expect(calls[1]).toEqual(["r1", { decision: "allowAlways", scope: "project", payload: null }]);
+  expect(calls[1]).toEqual(["run-1", "r1", { decision: "allowAlways", scope: "project", payload: null }]);
 });
 
 test("deny scope menu sends rejectAlways+project", async () => {
@@ -63,7 +64,7 @@ test("deny scope menu sends rejectAlways+project", async () => {
   render(<ApprovalCard approval={approval({})} />);
   fireEvent.click(screen.getByRole("button", { name: "Deny options" }));
   fireEvent.click(screen.getByRole("button", { name: "Always deny in this project" }));
-  expect(calls[0]).toEqual(["r1", { decision: "rejectAlways", scope: "project", payload: null }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "rejectAlways", scope: "project", payload: null }]);
 });
 
 test("plan card renders the plan and reject reveals a feedback field", () => {
@@ -79,14 +80,14 @@ test("plan rejection sends the typed feedback", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Reject with feedback" }));
   fireEvent.change(screen.getByLabelText("Feedback"), { target: { value: "needs tests" } });
   fireEvent.click(screen.getByRole("button", { name: "Send rejection" }));
-  expect(calls[0]).toEqual(["r1", { decision: "rejectOnce", scope: null, payload: { feedback: "needs tests" } }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "rejectOnce", scope: null, payload: { feedback: "needs tests" } }]);
 });
 
 test("plan approval sends the chosen edit mode", async () => {
   const calls = seedResolve();
   render(<ApprovalCard approval={approval({ kind: "plan", tool: "exitplanmode", input: { plan: "# My plan\ndo X" } })} />);
   fireEvent.click(screen.getByRole("button", { name: "Approve — auto-approve edits" }));
-  expect(calls[0]).toEqual(["r1", { decision: "allowOnce", scope: null, payload: { mode: "acceptEdits" } }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "allowOnce", scope: null, payload: { mode: "acceptEdits" } }]);
 });
 
 test("question card submits selected labels", async () => {
@@ -111,7 +112,7 @@ test("question card submits selected labels", async () => {
   );
   fireEvent.click(screen.getByRole("button", { name: /SQLite/ }));
   fireEvent.click(screen.getByRole("button", { name: "Submit" }));
-  const [, resp] = calls[0] as [string, { payload: { answers: Record<string, string[]> } }];
+  const [, , resp] = calls[0] as [string, string, { payload: { answers: Record<string, string[]> } }];
   expect(resp.payload.answers["Which DB?"]).toEqual(["SQLite"]);
 });
 
@@ -227,7 +228,7 @@ test("question card preserves selections and Other text across Back/Next and sub
   expect(screen.getByRole("button", { name: /Redis/ }).getAttribute("aria-pressed")).toBe("true");
 
   fireEvent.click(screen.getByRole("button", { name: "Submit" }));
-  const [, resp] = calls[0] as [string, { payload: { answers: Record<string, string[]> } }];
+  const [, , resp] = calls[0] as [string, string, { payload: { answers: Record<string, string[]> } }];
   expect(resp.payload.answers["Which DB?"]).toEqual(["SQLite", "MongoDB"]);
   expect(resp.payload.answers["Which cache?"]).toEqual(["Redis"]);
 });
@@ -253,7 +254,7 @@ test("question card allows submitting with no answer selected (answers optional)
     />,
   );
   fireEvent.click(screen.getByRole("button", { name: "Submit" }));
-  const [, resp] = calls[0] as [string, { payload: { answers: Record<string, string[]> } }];
+  const [, , resp] = calls[0] as [string, string, { payload: { answers: Record<string, string[]> } }];
   expect(resp.payload.answers["Which DB?"]).toEqual([]);
 });
 
@@ -271,7 +272,7 @@ test("question card with no questions shows a fallback message with Dismiss and 
   expect(screen.getByText("No questions were provided.")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Submit" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-  expect(calls[0]).toEqual(["r1", { decision: "rejectOnce", scope: null, payload: null }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "rejectOnce", scope: null, payload: null }]);
 });
 
 test("question card hotkey advances through questions and submits on the last with Ctrl/Cmd+Enter", async () => {
@@ -283,7 +284,7 @@ test("question card hotkey advances through questions and submits on the last wi
 
   fireEvent.keyDown(window, { key: "Enter", metaKey: true });
   expect(calls.length).toBe(1);
-  const [, resp] = calls[0] as [string, { payload: { answers: Record<string, string[]> } }];
+  const [, , resp] = calls[0] as [string, string, { payload: { answers: Record<string, string[]> } }];
   expect(resp.payload.answers).toEqual({ "Which DB?": [], "Which cache?": [] });
 });
 
@@ -358,7 +359,7 @@ test("question card appends the per-question Other answer", async () => {
   fireEvent.click(screen.getByRole("button", { name: /SQLite/ }));
   fireEvent.change(screen.getByLabelText("Other answer for Database"), { target: { value: "MongoDB" } });
   fireEvent.click(screen.getByRole("button", { name: "Submit" }));
-  const [, resp] = calls[0] as [string, { payload: { answers: Record<string, string[]> } }];
+  const [, , resp] = calls[0] as [string, string, { payload: { answers: Record<string, string[]> } }];
   expect(resp.payload.answers["Which DB?"]).toEqual(["SQLite", "MongoDB"]);
 });
 
@@ -394,7 +395,7 @@ test("hotkey fires the primary action on Cmd/Ctrl+Enter", async () => {
   const calls = seedResolve();
   render(<ApprovalCard approval={approval({})} hotkey />);
   fireEvent.keyDown(window, { key: "Enter", metaKey: true });
-  expect(calls[0]).toEqual(["r1", { decision: "allowOnce", scope: null, payload: null }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "allowOnce", scope: null, payload: null }]);
 });
 
 test("without hotkey, Cmd/Ctrl+Enter does nothing", async () => {
@@ -428,5 +429,5 @@ test("plan card hotkey submits the rejection instead of approving while feedback
   fireEvent.click(screen.getByRole("button", { name: "Reject with feedback" }));
   fireEvent.change(screen.getByLabelText("Feedback"), { target: { value: "needs more tests" } });
   fireEvent.keyDown(window, { key: "Enter", metaKey: true });
-  expect(calls[0]).toEqual(["r1", { decision: "rejectOnce", scope: null, payload: { feedback: "needs more tests" } }]);
+  expect(calls[0]).toEqual(["run-1", "r1", { decision: "rejectOnce", scope: null, payload: { feedback: "needs more tests" } }]);
 });

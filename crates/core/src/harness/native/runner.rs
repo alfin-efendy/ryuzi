@@ -5185,7 +5185,14 @@ mod tests {
         ]));
         // max_spawn_depth unset: the default (2) must let the builtin
         // orchestrator delegate out of the box.
-        let deps = deps_at(dir.path(), llm.clone()).await;
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "go wide")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id;
 
         run_turn(
             &deps,
@@ -5259,7 +5266,14 @@ mod tests {
             orch_give_up,
             parent_end,
         ]));
-        let deps = deps_at(dir.path(), llm.clone()).await;
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "go")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id;
         // Explicit flat delegation: the orchestrator child may not re-spawn.
         deps.store
             .set_setting(crate::domain::WriteOrigin::User, "max_spawn_depth", "1")
@@ -6012,6 +6026,12 @@ mod tests {
         deps.model = Some("anthropic/model-a".into());
         // The parent session row must exist + be idle for the rail JOIN later.
         seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "audit auth")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id;
         // Generous headroom so the short child report is not spilled.
         deps.store
             .upsert_session_context(
@@ -6103,8 +6123,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No scripted turns: the cancelled worker must never reach the model.
         let llm = Arc::new(ScriptedLlm::new(vec![]));
-        let deps = deps_at(dir.path(), llm).await;
+        let mut deps = deps_at(dir.path(), llm).await;
         seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "audit auth")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id;
         let spawner = RunnerSpawner {
             deps: deps.clone(),
             cancel: CancellationToken::new(),

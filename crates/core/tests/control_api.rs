@@ -339,9 +339,9 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
     // registered (already resolved, unknown, or timed out) — it just reports
     // `resolved: false`.
     let resp = client
-        .post(format!("{base}/approvals/nonexistent-id"))
+        .post(format!("{base}/approvals/nonexistent-run/nonexistent-id"))
         .bearer_auth(&token)
-        .json(&json!({"allow": true}))
+        .json(&json!({ "response": { "decision": "allowOnce", "scope": null, "payload": null } }))
         .send()
         .await
         .unwrap();

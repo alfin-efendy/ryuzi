@@ -141,7 +141,7 @@ export function ApprovalCard({
     setRejecting(false);
   }, [approval.requestId]);
 
-  const resolve = (response: ApprovalResponse) => void resolveApproval(approval.runnerId, approval.requestId, response);
+  const resolve = (response: ApprovalResponse) => void resolveApproval(approval.runnerId, approval.runId, approval.requestId, response);
 
   const activeStep = questions.length === 0 ? 0 : Math.min(step, questions.length - 1);
   const activeQuestion = questions[activeStep];

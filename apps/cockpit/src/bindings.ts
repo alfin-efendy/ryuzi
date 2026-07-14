@@ -109,8 +109,8 @@ async deleteToolPolicy(runnerId: string | null, projectId: string, tool: string)
     else return { status: "error", error: e  as any };
 }
 },
-async resolveApproval(runnerId: string | null, requestId: string, response: ApprovalResponse) : Promise<boolean> {
-    return await TAURI_INVOKE("resolve_approval", { runnerId, requestId, response });
+async resolveApproval(runnerId: string | null, runId: string, requestId: string, response: ApprovalResponse) : Promise<boolean> {
+    return await TAURI_INVOKE("resolve_approval", { runnerId, runId, requestId, response });
 },
 /**
  * Write pasted bytes into the attachments staging area and return the
@@ -1768,7 +1768,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } | 
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; run_id: string; requesting_agent_id: string; requesting_agent_name: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.

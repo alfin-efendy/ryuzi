@@ -117,6 +117,7 @@ mod tests {
     use super::*;
     use crate::domain::{Message, NewMessage, PermMode, Session, SessionKind, SessionStatus};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
     use crate::plugins::Registries;
     use crate::store::Store;
     use async_trait::async_trait;
@@ -244,6 +245,29 @@ mod tests {
     ) -> (Arc<ControlPlane>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(db.path()).await.unwrap());
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let mut regs = Registries::new();
         regs.harness = harness;
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
@@ -260,11 +284,21 @@ mod tests {
     /// rehydrated after a daemon restart.
     async fn idle_chat(cp: &Arc<ControlPlane>, pk: &str) {
         let now = crate::paths::now_ms();
+        let primary_agent = cp.registry().default_agent_id().await;
+        let primary_agent_snapshot = cp
+            .registry()
+            .resolved_snapshot(&primary_agent)
+            .await
+            .unwrap();
         cp.store()
             .insert_session(Session {
                 session_pk: pk.into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
+                primary_agent_id: Some(primary_agent),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent_snapshot.profile.id.clone(),
+                    name: primary_agent_snapshot.profile.name.clone(),
+                    avatar_color: primary_agent_snapshot.profile.avatar.color.clone(),
+                }),
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,

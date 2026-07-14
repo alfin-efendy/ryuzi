@@ -678,24 +678,67 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
   expect(st.lastSeq[k1]).toBe(3);
 });
 
-test("approval.requested adds a pending approval; resolving removes it", () => {
+test("approval.requested retains its run scope and only clears the matching request", () => {
   reset();
   const s = useStore.getState();
-  s.applyCoreEvent(
-    {
-      kind: "approvalRequested",
-      session_pk: "s1",
-      request_id: "r1",
-      tool: "Bash",
-      summary: "Bash: rm",
-      approval_kind: "tool",
-      input: {},
-    },
-    LOCAL_RUNNER,
-  );
-  expect(useStore.getState().pendingApprovals).toHaveLength(1);
-  useStore.getState().clearApproval("r1");
-  expect(useStore.getState().pendingApprovals).toHaveLength(0);
+  for (const run_id of ["run-1", "run-2"]) {
+    s.applyCoreEvent(
+      {
+        kind: "approvalRequested",
+        session_pk: "s1",
+        run_id,
+        requesting_agent_id: "agent-1",
+        requesting_agent_name: "Agent One",
+        request_id: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        approval_kind: "tool",
+        input: {},
+      },
+      LOCAL_RUNNER,
+    );
+  }
+  expect(useStore.getState().pendingApprovals.map((approval) => approval.runId)).toEqual(["run-1", "run-2"]);
+  useStore.getState().clearApproval("run-1", "r1");
+  expect(useStore.getState().pendingApprovals.map((approval) => approval.runId)).toEqual(["run-2"]);
+});
+
+test("resolveApproval calls the run-scoped command and clears that request only", async () => {
+  reset();
+  useStore.setState({
+    pendingApprovals: [
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "run-1",
+        requestId: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        kind: "tool",
+        input: {},
+        principal: null,
+      },
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "run-2",
+        requestId: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        kind: "tool",
+        input: {},
+        principal: null,
+      },
+    ],
+  });
+  const response = { decision: "allowOnce" as const, scope: null, payload: null };
+  const resolve = spyOn(commands, "resolveApproval").mockResolvedValue(true);
+
+  await useStore.getState().resolveApproval(LOCAL_RUNNER, "run-1", "r1", response);
+
+  expect(resolve).toHaveBeenCalledWith(LOCAL_RUNNER, "run-1", "r1", response);
+  expect(useStore.getState().pendingApprovals.map((approval) => approval.runId)).toEqual(["run-2"]);
+  resolve.mockRestore();
 });
 
 test("pending approvals from different sessions both count", () => {
@@ -705,6 +748,9 @@ test("pending approvals from different sessions both count", () => {
     {
       kind: "approvalRequested",
       session_pk: "s1",
+      run_id: "run-1",
+      requesting_agent_id: "agent-1",
+      requesting_agent_name: "Agent One",
       request_id: "r1",
       tool: "Bash",
       summary: "x",
@@ -717,6 +763,9 @@ test("pending approvals from different sessions both count", () => {
     {
       kind: "approvalRequested",
       session_pk: "s2",
+      run_id: "run-2",
+      requesting_agent_id: "agent-2",
+      requesting_agent_name: "Agent Two",
       request_id: "r2",
       tool: "Write",
       summary: "y",

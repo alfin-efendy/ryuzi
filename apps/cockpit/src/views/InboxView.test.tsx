@@ -14,6 +14,7 @@ test("renders one card per pending approval across sessions, newest first", () =
       {
         runnerId: LOCAL_RUNNER,
         sessionPk: "s1",
+        runId: "run-1",
         requestId: "r1",
         tool: "bash",
         summary: "Bash: ls",
@@ -24,6 +25,7 @@ test("renders one card per pending approval across sessions, newest first", () =
       {
         runnerId: LOCAL_RUNNER,
         sessionPk: "s2",
+        runId: "run-2",
         requestId: "r2",
         tool: "edit",
         summary: "Edit: a.ts",
