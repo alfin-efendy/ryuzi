@@ -111,16 +111,15 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// On boot, synchronously recover abandoned prompt claims, reconcile every
-    /// session a dead process left `Running`, and then start one pending FIFO
-    /// head for each idle session before starting gateways. Reconcile must
-    /// finish its scan before the idle drain changes a session to `Running`, or
-    /// it would resume the new queue delivery with a second harness and nudge.
+    /// Start every gateway and perform endpoint autostart before the serial,
+    /// boot-only recovery latch. The latch recovers abandoned prompt claims,
+    /// awaits best-effort reconciliation of prior-process `Running` sessions,
+    /// then starts one pending FIFO head for every idle session. Reconcile's
+    /// snapshot completes before delivery can make an idle session `Running`,
+    /// preventing a second harness and `RESUME_NUDGE` for the new delivery.
     ///
-    /// This boot sequence is deliberately one-time: running it later could
-    /// disrupt an active continuation. Awaiting reconcile intentionally makes
-    /// the successful boot ordering strict; each resumed turn remains an
-    /// independently spawned ControlPlane background task.
+    /// Gateway startup comes first because reconciliation emits resumed status
+    /// events that must be routable to an already-connected gateway.
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
@@ -135,16 +134,13 @@ impl Daemon {
     /// sequence, while each resume it starts is an independent `spawn_prompt`
     /// background turn owned by `ControlPlane`.
     ///
-    /// After the boot sequence, endpoint autostart runs: if the persisted
+    /// After gateway startup, endpoint autostart runs: if the persisted
     /// `endpoint_autostart` setting is `"1"`, `router_server` is started on the
     /// persisted `endpoint_port` (default 21128) — the same autostart Cockpit's
     /// setup hook used to perform. A failure here is logged and swallowed rather
-    /// server must not prevent the rest of the daemon (gateways, sessions)
-    /// from coming up.
+    /// than propagated: a broken endpoint server must not prevent boot
+    /// recovery, reconciliation, or idle queue delivery.
     pub async fn start(&self) -> anyhow::Result<()> {
-        self.recover_reconcile_and_deliver_idle_queues_on_boot()
-            .await?;
-
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
                 if !self.stopped.swap(true, Ordering::SeqCst) {
@@ -184,6 +180,8 @@ impl Daemon {
                 eprintln!("[ryuzi] endpoint autostart failed: {e}");
             }
         }
+        self.recover_reconcile_and_deliver_idle_queues_on_boot()
+            .await?;
         Ok(())
     }
 
@@ -802,10 +800,14 @@ mod tests {
         gid: String,
         behavior: GwBehavior,
         calls: Arc<AtomicUsize>,
+        starts: Arc<AtomicUsize>,
+        status_posts: Arc<AtomicUsize>,
+        status_posts_before_start: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
         last_req: Arc<Mutex<Option<ApprovalRequest>>>,
-        /// When true, `start()` always fails — used to exercise
-        /// `Daemon::start`'s partial-failure rollback.
+        /// When non-zero, `start()` pauses before recording the gateway as
+        /// started so a test can expose events emitted before gateway startup.
+        start_delay: Duration,
         fail_start: bool,
     }
 
@@ -815,9 +817,20 @@ mod tests {
                 gid: gid.to_string(),
                 behavior,
                 calls: Arc::new(AtomicUsize::new(0)),
+                starts: Arc::new(AtomicUsize::new(0)),
+                status_posts: Arc::new(AtomicUsize::new(0)),
+                status_posts_before_start: Arc::new(AtomicUsize::new(0)),
                 stops: Arc::new(AtomicUsize::new(0)),
                 last_req: Arc::new(Mutex::new(None)),
+                start_delay: Duration::ZERO,
                 fail_start: false,
+            }
+        }
+
+        fn new_delayed_start(gid: &str, behavior: GwBehavior, start_delay: Duration) -> Self {
+            FakeGateway {
+                start_delay,
+                ..FakeGateway::new(gid, behavior)
             }
         }
 
@@ -838,6 +851,8 @@ mod tests {
             if self.fail_start {
                 anyhow::bail!("start failed for gateway {}", self.gid);
             }
+            tokio::time::sleep(self.start_delay).await;
+            self.starts.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn stop(&self) -> anyhow::Result<()> {
@@ -851,6 +866,11 @@ mod tests {
             Ok("conv".into())
         }
         async fn post_status(&self, surface: &Surface, _text: &str) -> anyhow::Result<MessageRef> {
+            self.status_posts.fetch_add(1, Ordering::SeqCst);
+            if self.starts.load(Ordering::SeqCst) == 0 {
+                self.status_posts_before_start
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             Ok(MessageRef {
                 surface: surface.clone(),
                 message_id: "m".into(),
@@ -2110,12 +2130,29 @@ mod tests {
             .await
             .unwrap();
 
+        store
+            .add_surface("discord", "resumed-session", "s1")
+            .await
+            .unwrap();
+
+        let gw = FakeGateway::new_delayed_start(
+            "discord",
+            GwBehavior::Allow,
+            Duration::from_millis(100),
+        );
+        let gateway_starts = gw.starts.clone();
+        let status_posts = gw.status_posts.clone();
+        let status_posts_before_start = gw.status_posts_before_start.clone();
+        let gw: Arc<dyn Gateway> = Arc::new(gw);
+        let router_handle =
+            tokio::spawn(Router::new(Arc::clone(&cp), vec![Arc::clone(&gw)]).run(cp.subscribe()));
+
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             cp,
             store: store.clone(),
-            gateways: vec![],
+            gateways: vec![gw],
             router_server: Arc::new(RouterServer::new(store.clone())),
             agents: persistence.registry,
             agent_knowledge: persistence.knowledge,
@@ -2123,7 +2160,7 @@ mod tests {
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             prompt_claim_recovery_complete: AsyncMutex::new(false),
-            router_handle: tokio::spawn(async {}),
+            router_handle,
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
             orch_handle: tokio::spawn(async {}),
@@ -2141,9 +2178,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
-            prompts.lock().unwrap().first().cloned(),
-            Some(crate::control::RESUME_NUDGE.to_string()),
-            "Daemon::start must reconcile the recovered Running session with the nudge"
+            gateway_starts.load(Ordering::SeqCst),
+            1,
+            "the gateway must start before boot reconciliation"
+        );
+        assert_eq!(
+            status_posts.load(Ordering::SeqCst),
+            1,
+            "reconciliation must emit the resumed status to its bound surface"
+        );
+        assert_eq!(
+            status_posts_before_start.load(Ordering::SeqCst),
+            0,
+            "the resumed status must not be routed before Gateway::start"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().as_slice(),
+            [crate::control::RESUME_NUDGE],
+            "Daemon::start must issue exactly one resume nudge for the recovered Running session"
         );
     }
 
