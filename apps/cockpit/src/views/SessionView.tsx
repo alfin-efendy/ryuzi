@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
-import { commands, type SessionRuntimeInfo } from "@/bindings";
-import { useStore, type ChatOptions } from "@/store";
+import { commands, type ChatRequestOptions, type SessionRuntimeInfo } from "@/bindings";
+import { useStore } from "@/store";
 import { LOCAL_RUNNER, isSession, refKey } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
@@ -54,7 +54,7 @@ export function SessionView() {
     orchTasks,
     loadOrchTasks,
   } = useStore();
-  const enqueueMessage = useStore((s) => s.enqueueMessage);
+  const enqueueQueueMessage = useNative((s) => s.enqueueQueueMessage);
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
@@ -80,6 +80,8 @@ export function SessionView() {
   const [contextRefs, setContextRefs] = useState<string[]>([]);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
+  const submitInFlight = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
 
   const rows = (focusedSession && transcripts[refKey(focusedSession)]) || [];
@@ -289,28 +291,33 @@ export function SessionView() {
   const permUi = corePermToUi(session.permMode);
   const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
 
-  const submit = () => {
+  const submit = async () => {
     const t = draft.trim();
-    if (!t && composerFiles.attachments.length === 0) return;
-    const key = session.sessionPk;
-    const typed = draft;
-    const options: ChatOptions = {
-      context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-      attachments: composerFiles.attachments,
-    };
-    // Clear optimistically; a rejected *send* puts the text back. Enqueue never
-    // fails, so no restore path there.
-    useNav.getState().clearDraft(key);
-    historyRef.current = HISTORY_IDLE;
-    composerFiles.clear();
-    setContextRefs([]);
-    if (running) {
-      enqueueMessage(runnerId, key, { id: crypto.randomUUID(), text: t, options });
-      return;
+    if ((!t && composerFiles.attachments.length === 0) || submitInFlight.current) return;
+    submitInFlight.current = true;
+    setSubmitting(true);
+    try {
+      const options: ChatRequestOptions = {
+        model: null,
+        effort: null,
+        context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
+        attachments: composerFiles.attachments,
+        git: null,
+        permMode: null,
+      };
+      const sent = running
+        ? await enqueueQueueMessage(runnerId, session.sessionPk, t, options)
+        : await send(runnerId, session.sessionPk, t, options);
+      if (!sent) return;
+
+      useNav.getState().clearDraft(draftKey);
+      historyRef.current = HISTORY_IDLE;
+      composerFiles.clear();
+      setContextRefs([]);
+    } finally {
+      submitInFlight.current = false;
+      setSubmitting(false);
     }
-    void send(runnerId, key, t, options).then((ok) => {
-      if (!ok) useNav.getState().restoreDraft(key, typed);
-    });
   };
 
   const pickContext = (path: string) => {
@@ -404,10 +411,12 @@ export function SessionView() {
             <OpenInMenu runnerId={runnerId} sessionPk={session.sessionPk} />
           </div>
 
-          {/* Transcript, with the floating plan panel overlaying it */}
+          {/* Transcript, with the TODO List overlaying it */}
           <div className="relative flex min-h-0 flex-1 flex-col">
             {/* Pinned orchestration task strip — only for a home chat with a live run */}
             {orchRootId && <TaskStrip rootId={orchRootId} />}
+            {/* TODO List (todowrite) — floating overlay within the transcript area */}
+            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
               <Transcript
                 runnerId={runnerId}
@@ -424,8 +433,6 @@ export function SessionView() {
                 ))}
               </Transcript>
             </TranscriptFileContext.Provider>
-            {/* Agent plan (todowrite) — floating rounded panel */}
-            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
           </div>
 
           {/* Session composer */}
@@ -444,7 +451,7 @@ export function SessionView() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    submit();
+                    void submit();
                     return;
                   }
                   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
@@ -542,7 +549,7 @@ export function SessionView() {
                     <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
                   </Button>
                 ) : (
-                  <Button size="icon" title="Send" onClick={submit} className="rounded-full">
+                  <Button size="icon" title="Send" onClick={() => void submit()} disabled={submitting} className="rounded-full">
                     <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
                   </Button>
                 )}

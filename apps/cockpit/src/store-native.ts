@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { commands, type AgentInfo, type CommandInfo, type TodoItem } from "./bindings";
+import { commands, type AgentInfo, type ChatRequestOptions, type CommandInfo, type QueuedMessageInfo, type TodoItem } from "./bindings";
 import { sessKey } from "./lib/session-key";
 
 // Native-runtime metadata: the agents and slash commands available to a
@@ -13,11 +13,15 @@ type NativeState = {
   agentsByProject: Record<string, AgentInfo[]>;
   commandsByProject: Record<string, CommandInfo[]>;
   todosBySession: Record<string, TodoItem[]>;
-  // Whether the floating plan panel is collapsed to a pill, per session.
+  queuedBySession: Record<string, QueuedMessageInfo[]>;
+  // Whether the floating TODO List panel is collapsed to a pill, per session.
   planCollapsed: Record<string, boolean>;
   loadAgents: (runnerId: string, projectId: string) => Promise<void>;
   loadCommands: (runnerId: string, projectId: string) => Promise<void>;
   loadTodos: (runnerId: string, sessionPk: string) => Promise<void>;
+  loadQueue: (runnerId: string, sessionPk: string) => Promise<void>;
+  enqueueQueueMessage: (runnerId: string, sessionPk: string, prompt: string, options: ChatRequestOptions | null) => Promise<boolean>;
+  removeQueueMessage: (runnerId: string, sessionPk: string, id: string) => Promise<boolean>;
   setPlanCollapsed: (runnerId: string, sessionPk: string, collapsed: boolean) => void;
   exportSession: (runnerId: string, sessionPk: string) => Promise<string | null>;
   importSession: (runnerId: string, projectId: string, data: string) => Promise<boolean>;
@@ -29,11 +33,13 @@ type NativeState = {
 // Only the newest in-flight fetch for a session may commit its result. Keyed by
 // the composite session key.
 const todoFetchToken: Record<string, number> = {};
+const queueFetchToken: Record<string, number> = {};
 
 export const useNative = create<NativeState>((set) => ({
   agentsByProject: {},
   commandsByProject: {},
   todosBySession: {},
+  queuedBySession: {},
   planCollapsed: {},
 
   loadAgents: async (runnerId, projectId) => {
@@ -57,6 +63,52 @@ export const useNative = create<NativeState>((set) => ({
     const res = await commands.sessionTodos(runnerId, sessionPk);
     if (res.status === "ok" && todoFetchToken[key] === token) {
       set((s) => ({ todosBySession: { ...s.todosBySession, [key]: res.data } }));
+    }
+  },
+
+  loadQueue: async (runnerId, sessionPk) => {
+    const key = sessKey(runnerId, sessionPk);
+    const token = (queueFetchToken[key] ?? 0) + 1;
+    queueFetchToken[key] = token;
+    try {
+      const res = await commands.sessionQueue(runnerId, sessionPk);
+      if (res.status === "ok" && queueFetchToken[key] === token) {
+        set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: res.data } }));
+      }
+    } catch {
+      // Generated IPC commands may reject; retain the last known durable queue.
+    }
+  },
+
+  enqueueQueueMessage: async (runnerId, sessionPk, prompt, options) => {
+    try {
+      const res = await commands.enqueueSessionMessage(runnerId, sessionPk, prompt, options);
+      if (res.status !== "ok") return false;
+      const key = sessKey(runnerId, sessionPk);
+      queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
+      set((s) => {
+        const queued = s.queuedBySession[key] ?? [];
+        const next = queued.some((message) => message.id === res.data.id) ? queued : [...queued, res.data];
+        return { queuedBySession: { ...s.queuedBySession, [key]: next } };
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  removeQueueMessage: async (runnerId, sessionPk, id) => {
+    try {
+      const res = await commands.removeSessionMessage(runnerId, sessionPk, id);
+      if (res.status !== "ok") return false;
+      const key = sessKey(runnerId, sessionPk);
+      queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
+      set((s) => ({
+        queuedBySession: { ...s.queuedBySession, [key]: (s.queuedBySession[key] ?? []).filter((message) => message.id !== id) },
+      }));
+      return true;
+    } catch {
+      return false;
     }
   },
 

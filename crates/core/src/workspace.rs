@@ -46,7 +46,7 @@ pub fn prepare_session_workspace(
             let branch = git
                 .branch_name
                 .clone()
-                .unwrap_or_else(|| format!("harness/{short}"));
+                .unwrap_or_else(|| format!("ryuzi/{short}"));
             worktree::create(
                 repo_dir,
                 &short,
@@ -85,7 +85,7 @@ pub fn prepare_session_workspace(
             let branch = git
                 .branch_name
                 .clone()
-                .unwrap_or_else(|| format!("harness/{short}"));
+                .unwrap_or_else(|| format!("ryuzi/{short}"));
             let base = resolve_base_commit(&repo, git.base_branch.as_deref())?;
             repo.branch(&branch, &base, false)
                 .map_err(|e| anyhow::anyhow!("couldn't create branch '{branch}': {e}"))?;
@@ -261,13 +261,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ws.branch, "harness/abcdef01");
+        assert_eq!(ws.branch, "ryuzi/abcdef01");
         assert!(ws.branch_owned, "auto-named branch is engine-owned");
         assert_eq!(ws.work_dir, wt_path);
         assert_eq!(ws.worktree_path.as_deref(), Some(wt_path.as_path()));
         let repo = Repository::open(repo_dir.path()).unwrap();
         let tip = repo
-            .find_branch("harness/abcdef01", BranchType::Local)
+            .find_branch("ryuzi/abcdef01", BranchType::Local)
             .unwrap()
             .get()
             .peel_to_commit()
@@ -365,12 +365,12 @@ mod tests {
 
         assert_eq!(ws.work_dir, repo_dir.path());
         assert_eq!(ws.worktree_path, None);
-        assert_eq!(ws.branch, "harness/abcdef01");
+        assert_eq!(ws.branch, "ryuzi/abcdef01");
         assert!(ws.branch_owned);
         let repo = Repository::open(repo_dir.path()).unwrap();
         assert_eq!(
             repo.head().unwrap().shorthand().unwrap(),
-            "harness/abcdef01",
+            "ryuzi/abcdef01",
             "the project checkout must now be on the new branch"
         );
         assert!(!wt_path.exists(), "no worktree may be created in this cell");

@@ -5,7 +5,7 @@ import { useNative } from "@/store-native";
 import { sessKey } from "@/lib/session-key";
 import type { TodoItem } from "@/bindings";
 
-/** Step summary for the floating plan panel: `step` is the 1-based index of
+/** Step summary for the floating TODO List panel: `step` is the 1-based index of
  *  the first `in_progress` item (the footer's "Step X"); with no active item
  *  it rests at the completed count. `label` headlines the pill. */
 export function todoStepSummary(todos: TodoItem[]): {
@@ -22,13 +22,12 @@ export function todoStepSummary(todos: TodoItem[]): {
     step: activeIdx >= 0 ? activeIdx + 1 : done,
     total: todos.length,
     done,
-    label: active?.content ?? lastDone?.content ?? "Plan",
+    label: active?.content ?? lastDone?.content ?? "TODO List",
   };
 }
 
-// Floating rounded plan panel (todowrite), overlaying the transcript above
-// the composer — see docs/design/2026-07-10-cockpit-chat-batch3-design.md §1
-// and the approved mockup. Expanded: header + step list + "Step X / N"
+// Floating rounded TODO List panel (todowrite), overlaying the transcript
+// directly below the session header. Expanded: header + step list + "Step X / N"
 // footer. Collapsed: a pill with the live step summary. State per session.
 export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; sessionPk: string; running: boolean }) {
   const key = sessKey(runnerId, sessionPk);
@@ -47,7 +46,7 @@ export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; 
   const { step, done, label } = todoStepSummary(todos ?? []);
   const allDone = total > 0 && done === total;
 
-  // Auto-collapse to the pill the moment the plan completes.
+  // Auto-collapse to the pill the moment the TODO List completes.
   useEffect(() => {
     if (allDone) setCollapsed(runnerId, sessionPk, true);
   }, [allDone, runnerId, sessionPk, setCollapsed]);
@@ -64,11 +63,11 @@ export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; 
   if (!running && allDone) return null;
 
   return (
-    <div className="pointer-events-none absolute bottom-3 left-1/2 z-20 flex w-[min(480px,calc(100%-32px))] -translate-x-1/2 flex-col items-center">
+    <div className="pointer-events-none absolute top-3 left-1/2 z-20 flex w-[min(480px,calc(100%-32px))] -translate-x-1/2 flex-col items-center">
       {collapsed ? (
         <button
           type="button"
-          aria-label="Expand plan"
+          aria-label="Expand TODO List"
           onClick={() => setCollapsed(runnerId, sessionPk, false)}
           className="acrylic-card pointer-events-auto flex max-w-full items-center gap-2 rounded-full border border-border px-3.5 py-1.5 text-[12.5px] shadow-lg"
         >
@@ -85,12 +84,12 @@ export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; 
         <div className="acrylic-card pointer-events-auto w-full overflow-hidden rounded-2xl border border-border shadow-lg">
           <button
             type="button"
-            aria-label="Collapse plan"
+            aria-label="Collapse TODO List"
             onClick={() => setCollapsed(runnerId, sessionPk, true)}
             className="flex w-full items-center gap-2 px-3.5 pb-1 pt-2.5 text-[11px] font-semibold uppercase tracking-[0.05em] text-muted-foreground"
           >
             <ListTodo aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-            Plan
+            TODO List
             <ChevronDown aria-hidden size={11} strokeWidth={2} className="ml-auto size-[11px] shrink-0" />
           </button>
           <ul className="flex max-h-[45vh] flex-col gap-px overflow-y-auto px-2 pb-1.5">

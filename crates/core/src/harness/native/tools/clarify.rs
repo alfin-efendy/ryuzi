@@ -1,19 +1,16 @@
 //! `clarify` — ask the user ONE structured question (≤4 choices) mid-task and
 //! block on the answer (spec §9.1). Reuses the approval/interaction channel
 //! (`ApprovalKind::Question`) exactly like `askuserquestion`, but is part of
-//! the app toolset, single-question, and TIME-BOUNDED: it wraps the request in
-//! a `clarify.timeout_secs` timeout so a turn can never deadlock waiting for a
-//! human. Permission key `clarify` auto-allows (its execution IS the prompt).
+//! the app toolset and waits for an explicit response or cancellation.
+//! Permission key `clarify` auto-allows (its execution IS the prompt).
 
 use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::domain::{ApprovalDecision, ApprovalKind};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::time::Duration;
 
 const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 4;
-const DEFAULT_TIMEOUT_SECS: usize = 300;
 
 pub struct Clarify;
 
@@ -50,8 +47,8 @@ impl Tool for Clarify {
     }
     fn description(&self) -> &str {
         "Ask the user ONE multiple-choice question (2-4 options) when you are \
-         blocked on a decision only they can make. Blocks until they answer or a \
-         timeout elapses; do not use it for decisions you can make yourself."
+         blocked on a decision only they can make. Blocks until they answer or are \
+         cancelled; do not use it for decisions you can make yourself."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -100,33 +97,17 @@ impl Tool for Clarify {
             "multiSelect": false
         } ]});
 
-        let secs = crate::settings::usize_setting(
-            &ctx.store,
-            "clarify.timeout_secs",
-            DEFAULT_TIMEOUT_SECS,
-        )
-        .await as u64;
-
-        let fut = interaction.request(
-            &ctx.session_pk,
-            &ctx.tool_call_id,
-            "clarify",
-            "answer the agent's question",
-            ApprovalKind::Question,
-            card,
-            &ctx.cancel,
-        );
-        let resp = match tokio::time::timeout(Duration::from_secs(secs), fut).await {
-            Ok(r) => r,
-            Err(_elapsed) => {
-                // Deregister the pending approval so a late click can't hit a
-                // stale entry and nothing leaks — never hang the turn.
-                interaction.approvals.resolve_bool(&ctx.tool_call_id, false);
-                return Ok(ToolOutput::ok(
-                    "No answer within the time limit; proceeding without it.",
-                ));
-            }
-        };
+        let resp = interaction
+            .request(
+                &ctx.session_pk,
+                &ctx.tool_call_id,
+                "clarify",
+                "answer the agent's question",
+                ApprovalKind::Question,
+                card,
+                &ctx.cancel,
+            )
+            .await;
 
         let Some(resp) = resp else {
             return Ok(ToolOutput::error("Interrupted by user"));
@@ -179,17 +160,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waits_for_explicit_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
+        let mut clarify = tokio::spawn(async move { Clarify.execute(&ctx, q()).await.unwrap() });
+
+        let request_id = match rx.recv().await.unwrap() {
+            CoreEvent::ApprovalRequested { request_id, .. } => request_id,
+            other => panic!("unexpected event {other:?}"),
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut clarify)
+                .await
+                .is_err(),
+            "clarify must remain pending until the user responds"
+        );
+
+        hub.resolve(
+            &request_id,
+            ApprovalResponse {
+                decision: ApprovalDecision::AllowOnce,
+                scope: None,
+                payload: Some(json!({"answers": {"Deploy now?": ["No"]}})),
+            },
+        );
+        let out = clarify.await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.for_model.contains("No"));
+    }
+
+    #[tokio::test]
     async fn answer_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
-        ctx.store
-            .set_setting(
-                crate::domain::WriteOrigin::User,
-                "clarify.timeout_secs",
-                "30",
-            )
-            .await
-            .unwrap();
         let waiter = tokio::spawn(async move {
             if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
                 hub.resolve(
@@ -206,32 +209,6 @@ mod tests {
         waiter.await.unwrap();
         assert!(!out.is_error);
         assert!(out.for_model.contains("No"));
-    }
-
-    #[tokio::test]
-    async fn timeout_returns_no_answer_without_hanging() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ctx, hub, _rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
-        // 0-second timeout: nobody answers -> the tool must return promptly.
-        ctx.store
-            .set_setting(
-                crate::domain::WriteOrigin::User,
-                "clarify.timeout_secs",
-                "0",
-            )
-            .await
-            .unwrap();
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            Clarify.execute(&ctx, q()),
-        )
-        .await
-        .expect("clarify must not hang")
-        .unwrap();
-        assert!(!out.is_error);
-        assert!(out.for_model.to_lowercase().contains("no answer"));
-        // The pending approval was deregistered.
-        assert!(!hub.has_pending());
     }
 
     #[tokio::test]

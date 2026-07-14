@@ -277,7 +277,7 @@ pub struct Session {
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
     pub resume_attempts: i64,
-    /// True when the engine auto-generated the branch name (`harness/{short}`).
+    /// True when the engine auto-generated the branch name (`ryuzi/{short}`).
     /// `end_session` deletes the branch ONLY when this is set; user-named and
     /// pre-existing branches survive teardown.
     pub branch_owned: bool,
@@ -300,7 +300,7 @@ pub struct Session {
 pub struct SessionGitOptions {
     pub use_worktree: bool,
     pub create_branch: bool,
-    /// User-typed branch name; `None` => auto `harness/{short}`.
+    /// User-typed branch name; `None` => auto `ryuzi/{short}`.
     pub branch_name: Option<String>,
     /// Branch to cut from (`create_branch`) or run on (`!create_branch`);
     /// `None` => repo HEAD / current branch (legacy behavior).
@@ -375,6 +375,26 @@ pub struct AttachmentRef {
     pub url: String,
     pub content_type: Option<String>,
     pub size: u64,
+}
+
+/// A persisted prompt waiting for a session to become available. Attachment
+/// references remain durable inputs; turn blocks and display metadata are
+/// reconstructed only when the prompt is delivered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedSessionPrompt {
+    pub id: String,
+    pub session_pk: String,
+    pub agent: String,
+    pub display: String,
+    pub attachments: Vec<AttachmentRef>,
+    pub created_at: i64,
+}
+
+impl QueuedSessionPrompt {
+    pub fn into_turn_prompt(self) -> crate::harness::TurnPrompt {
+        crate::harness::TurnPrompt::text(self.agent, self.display)
+    }
 }
 
 /// Identifies the plugin an approvable action originates from — attribution
@@ -654,6 +674,9 @@ pub enum CoreEvent {
         tool_kind: Option<String>,
         /// Speaker label for a group-chat bubble (`None` for normal rows).
         speaker: Option<String>,
+    },
+    SessionQueueChanged {
+        session_pk: String,
     },
     Result {
         session_pk: String,
