@@ -2601,6 +2601,75 @@ impl Store {
         .await
     }
 
+    /// Remove every pending or claimed prompt for one session and return their
+    /// payloads for queue-owned attachment cleanup.
+    pub async fn take_all_session_prompts(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Vec<QueuedSessionPrompt>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let payloads = {
+                let mut stmt = tx.prepare(
+                    "DELETE FROM session_prompt_queue WHERE session_pk=?1 RETURNING payload",
+                )?;
+                let rows = stmt.query_map(params![session_pk], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let prompts = payloads
+                .into_iter()
+                .map(|payload| {
+                    serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            tx.commit()?;
+            Ok(prompts)
+        })
+        .await
+    }
+
+    /// Remove a pending session prompt and return its payload for cleanup.
+    pub async fn take_session_prompt(
+        &self,
+        session_pk: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<QueuedSessionPrompt>> {
+        let session_pk = session_pk.to_string();
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let payload = tx
+                .query_row(
+                    "DELETE FROM session_prompt_queue \
+                     WHERE session_pk=?1 AND id=?2 AND status='pending' RETURNING payload",
+                    params![session_pk, id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let prompt = payload
+                .map(|payload| {
+                    serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
+            tx.commit()?;
+            Ok(prompt)
+        })
+        .await
+    }
+
     /// Remove a pending session prompt owned by `session_pk`.
     pub async fn remove_session_prompt(&self, session_pk: &str, id: &str) -> anyhow::Result<bool> {
         let session_pk = session_pk.to_string();
@@ -2674,6 +2743,65 @@ impl Store {
         .await
     }
 
+    /// Atomically claim the next pending prompt and reserve an idle session for it.
+    ///
+    /// The status compare-and-set and queue claim share one immediate
+    /// transaction, so concurrent clients can never both start a turn for the
+    /// same session or advance its FIFO queue out of order.
+    pub async fn claim_next_session_prompt_if_idle(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<QueuedSessionPrompt>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let row = tx
+                .query_row(
+                    "SELECT id, payload FROM session_prompt_queue \
+                     WHERE session_pk=?1 AND status='pending' ORDER BY position LIMIT 1",
+                    params![session_pk],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let result = match row {
+                Some((id, payload)) => {
+                    let prompt = serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    let reserved = tx.execute(
+                        "UPDATE sessions SET status=?2 WHERE session_pk=?1 AND status=?3",
+                        params![
+                            session_pk,
+                            SessionStatus::Running.as_str(),
+                            SessionStatus::Idle.as_str(),
+                        ],
+                    )?;
+                    if reserved == 0 {
+                        None
+                    } else {
+                        let claimed = tx.execute(
+                            "UPDATE session_prompt_queue SET status='claimed' \
+                             WHERE id=?1 AND status='pending'",
+                            params![id],
+                        )?;
+                        if claimed != 1 {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
+                        Some(prompt)
+                    }
+                }
+                None => None,
+            };
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+
     /// Atomically claim the next pending prompt for one session.
     pub async fn claim_next_session_prompt(
         &self,
@@ -2722,6 +2850,36 @@ impl Store {
                 params![id],
             )
             .map(|changed| changed > 0)
+        })
+        .await
+    }
+
+    /// Delete a successfully delivered claimed prompt and return it for cleanup.
+    pub async fn take_completed_claimed_session_prompt(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<QueuedSessionPrompt>> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            let payload = c
+                .query_row(
+                    "DELETE FROM session_prompt_queue \
+                     WHERE id=?1 AND status='claimed' RETURNING payload",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            payload
+                .map(|payload| {
+                    serde_json::from_str(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()
         })
         .await
     }
@@ -8057,6 +8215,134 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_queue_claims_fifo_head_and_reserves_an_idle_session_together() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(1),
+                last_active: Some(1),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: PermMode::Default,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        for id in ["first", "second"] {
+            store
+                .enqueue_session_prompt(QueuedSessionPrompt {
+                    id: id.into(),
+                    session_pk: "s1".into(),
+                    agent: id.into(),
+                    display: id.into(),
+                    attachments: vec![],
+                    created_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .claim_next_session_prompt_if_idle("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "first"
+        );
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().status,
+            SessionStatus::Running
+        );
+        assert!(store
+            .claim_next_session_prompt_if_idle("s1")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_queue_idle_claim_deserialization_error_rolls_back_reservation() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(1),
+                last_active: Some(1),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: PermMode::Default,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO session_prompt_queue(id, session_pk, position, payload, created_at) \
+                     VALUES ('bad', 's1', 1, 'not json', 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(store.claim_next_session_prompt_if_idle("s1").await.is_err());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().status,
+            SessionStatus::Idle
+        );
+        assert_eq!(
+            store
+                .with_conn(|connection| {
+                    connection.query_row(
+                        "SELECT status FROM session_prompt_queue WHERE id='bad'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                })
+                .await
+                .unwrap(),
+            "pending"
+        );
     }
 
     #[tokio::test]

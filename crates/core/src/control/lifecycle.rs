@@ -4,8 +4,8 @@
 use super::{ControlPlane, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
 use crate::domain::{
-    AttachmentRef, CoreEvent, NewMessage, PermMode, Project, Session, SessionGitOptions,
-    SessionKind, SessionStatus, WriteOrigin,
+    AttachmentRef, CoreEvent, NewMessage, PermMode, Project, QueuedSessionPrompt, Session,
+    SessionGitOptions, SessionKind, SessionStatus, WriteOrigin,
 };
 use crate::harness::{HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::{new_id, now_ms, worktree_path_for};
@@ -331,6 +331,40 @@ impl ControlPlane {
             .await
     }
 
+    /// Remove a pending queue row and clean up only attachments owned by that row.
+    pub async fn remove_session_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+        id: &str,
+    ) -> anyhow::Result<bool> {
+        let removed = self.store.take_session_prompt(session_pk, id).await?;
+        if let Some(prompt) = removed {
+            self.cleanup_queue_attachments(&prompt).await;
+            let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                session_pk: session_pk.to_string(),
+            });
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Persist a queued prompt, notify queue observers, and opportunistically
+    /// start its FIFO head if this session is idle. A failed delivery kick
+    /// leaves the accepted row durable for a later idle transition.
+    pub async fn enqueue_session_prompt(
+        self: &Arc<Self>,
+        prompt: QueuedSessionPrompt,
+    ) -> anyhow::Result<()> {
+        let session_pk = prompt.session_pk.clone();
+        self.store.enqueue_session_prompt(prompt).await?;
+        let _ = self.events.send(CoreEvent::SessionQueueChanged {
+            session_pk: session_pk.clone(),
+        });
+        let _ = self.deliver_next_queued_session_prompt(&session_pk).await;
+        Ok(())
+    }
+
     /// Claim and deliver one durable queued prompt after a session becomes idle.
     /// A claimed row stays claimed until the continuation has been accepted;
     /// a failed start restores the row at its original FIFO position.
@@ -338,7 +372,11 @@ impl ControlPlane {
         self: &Arc<Self>,
         session_pk: &str,
     ) -> anyhow::Result<()> {
-        let Some(queued) = self.store.claim_next_session_prompt(session_pk).await? else {
+        let Some(queued) = self
+            .store
+            .claim_next_session_prompt_if_idle(session_pk)
+            .await?
+        else {
             return Ok(());
         };
         let id = queued.id.clone();
@@ -346,11 +384,17 @@ impl ControlPlane {
         let prompt = queued.into_turn_prompt();
 
         match self
-            .continue_session_with_prompt(session_pk, prompt, &attachments)
+            .continue_reserved_session_with_prompt(session_pk, prompt, &attachments)
             .await
         {
             Ok(()) => {
-                self.store.complete_claimed_session_prompt(&id).await?;
+                if let Some(delivered) = self
+                    .store
+                    .take_completed_claimed_session_prompt(&id)
+                    .await?
+                {
+                    self.cleanup_queue_attachments(&delivered).await;
+                }
                 let _ = self.events.send(CoreEvent::SessionQueueChanged {
                     session_pk: session_pk.to_string(),
                 });
@@ -376,6 +420,29 @@ impl ControlPlane {
         prompt: TurnPrompt,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
+        self.continue_session_with_prompt_inner(session_pk, prompt, attachments, true)
+            .await
+    }
+
+    /// Continue a prompt whose queue claim has already atomically reserved the
+    /// session as Running.
+    async fn continue_reserved_session_with_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+        prompt: TurnPrompt,
+        attachments: &[AttachmentRef],
+    ) -> anyhow::Result<()> {
+        self.continue_session_with_prompt_inner(session_pk, prompt, attachments, false)
+            .await
+    }
+
+    async fn continue_session_with_prompt_inner(
+        self: &Arc<Self>,
+        session_pk: &str,
+        prompt: TurnPrompt,
+        attachments: &[AttachmentRef],
+        reserve_status: bool,
+    ) -> anyhow::Result<()> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
@@ -385,9 +452,11 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
 
-        self.store
-            .update_status(session_pk, SessionStatus::Running, None)
-            .await?;
+        if reserve_status {
+            self.store
+                .update_status(session_pk, SessionStatus::Running, None)
+                .await?;
+        }
 
         // A session still in background startup has no live handle yet, and its
         // FIRST prompt hasn't been driven. Cold-resuming now would spawn a
@@ -1356,6 +1425,15 @@ impl ControlPlane {
             // still-working agent inside the worktree we're about to delete.
             let _ = handle.cancel().await;
             let _ = handle.end().await;
+        }
+        let removed_prompts = self.store.take_all_session_prompts(session_pk).await?;
+        for prompt in &removed_prompts {
+            self.cleanup_queue_attachments(prompt).await;
+        }
+        if !removed_prompts.is_empty() {
+            let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                session_pk: session_pk.to_string(),
+            });
         }
         // Cancel any in-flight background delegations this session dispatched
         // and purge its pending rail rows — orphaned background work must not

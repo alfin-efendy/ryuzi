@@ -215,15 +215,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "remove_session_message" => {
             let a: RemoveSessionMessageP = params(p)?;
             ensure_session_exists(cp, &a.session_pk).await?;
-            let removed = cp
-                .store()
-                .remove_session_prompt(&a.session_pk, &a.id)
-                .await?;
-            if removed {
-                cp.emit(crate::domain::CoreEvent::SessionQueueChanged {
-                    session_pk: a.session_pk,
-                });
-            }
+            let removed = cp.remove_session_prompt(&a.session_pk, &a.id).await?;
             ok(removed)
         }
         "steer" => {
@@ -433,10 +425,7 @@ async fn enqueue_session_message(
         attachments,
         created_at: crate::paths::now_ms(),
     };
-    cp.store().enqueue_session_prompt(queued).await?;
-    cp.emit(crate::domain::CoreEvent::SessionQueueChanged {
-        session_pk: session_pk.to_string(),
-    });
+    cp.enqueue_session_prompt(queued).await?;
     Ok(QueuedMessageInfo {
         id,
         text: prompt.to_string(),
@@ -636,7 +625,7 @@ mod tests {
                 worktree_path: None,
                 branch: None,
                 title: None,
-                status: crate::domain::SessionStatus::Idle,
+                status: crate::domain::SessionStatus::Running,
                 started_by: None,
                 created_at: Some(1),
                 last_active: Some(1),
@@ -722,6 +711,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_session_message_kicks_an_idle_session_without_duplicate_rows() {
+        let s = state().await;
+        s.cp.store()
+            .insert_session(crate::domain::Session {
+                session_pk: "idle-kick".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: crate::domain::SessionStatus::Idle,
+                started_by: None,
+                created_at: Some(1),
+                last_active: Some(1),
+                resume_attempts: 0,
+                branch_owned: false,
+                perm_mode: crate::domain::PermMode::Default,
+                kind: crate::domain::SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        let _first = dispatch(
+            &s,
+            "enqueue_session_message",
+            json!({"session_pk": "idle-kick", "prompt": "first", "options": {"attachments": []}}),
+        )
+        .await
+        .unwrap();
+        let second = dispatch(
+            &s,
+            "enqueue_session_message",
+            json!({"session_pk": "idle-kick", "prompt": "second", "options": {"attachments": []}}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dispatch(&s, "session_queue", json!({"session_pk": "idle-kick"}))
+                .await
+                .unwrap(),
+            json!([second])
+        );
+        assert_eq!(
+            s.cp.store()
+                .get_session("idle-kick")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::domain::SessionStatus::Running
+        );
+    }
+
+    #[tokio::test]
     async fn enqueue_session_message_preserves_same_named_staged_attachments() {
         use crate::settings::SettingsStore;
 
@@ -734,7 +781,7 @@ mod tests {
                 worktree_path: None,
                 branch: None,
                 title: None,
-                status: crate::domain::SessionStatus::Idle,
+                status: crate::domain::SessionStatus::Running,
                 started_by: None,
                 created_at: Some(1),
                 last_active: Some(1),
@@ -828,7 +875,7 @@ mod tests {
                 worktree_path: None,
                 branch: None,
                 title: None,
-                status: crate::domain::SessionStatus::Idle,
+                status: crate::domain::SessionStatus::Running,
                 started_by: None,
                 created_at: Some(1),
                 last_active: Some(1),
