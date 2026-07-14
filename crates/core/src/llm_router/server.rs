@@ -2256,19 +2256,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_webhook_rate_limit_returns_retry_after() {
-        let (state, _cp, key, path) = webhook_state().await;
-        for _ in 0..1000 {
+    async fn inbound_webhook_per_hook_rate_limit_returns_retry_after() {
+        let (state, cp, key, path) = webhook_state().await;
+        let router_server = RouterServer::new(state.store.clone());
+        router_server.attach_control_plane(&cp);
+        let port = router_server.start(0).await.unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/automations/hooks/{path}");
+
+        for _ in 0..60 {
             assert_eq!(
-                invoke_webhook(state.clone(), webhook_request(&path, &key))
+                client
+                    .post(&url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .json(&json!({"event": "opened"}))
+                    .send()
                     .await
+                    .unwrap()
                     .status(),
                 StatusCode::ACCEPTED
             );
         }
-        let response = invoke_webhook(state, webhook_request(&path, &key)).await;
+
+        let response = client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .json(&json!({"event": "opened"}))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+
+        let other_hook = automation::create_hook(
+            &state.store,
+            automation::HookInput::agent_run(
+                "Other inbound",
+                TriggerKind::WebhookInbound,
+                "project-1",
+                "",
+                "local",
+                "Process the other webhook",
+            ),
+        )
+        .await
+        .unwrap();
+        let other_url = format!(
+            "http://127.0.0.1:{port}/v1/automations/hooks/{}",
+            other_hook.inbound_path.unwrap()
+        );
+        assert_eq!(
+            client
+                .post(other_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .json(&json!({"event": "opened"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        router_server.stop().await;
     }
 
     #[tokio::test]

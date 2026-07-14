@@ -393,8 +393,11 @@ impl Dispatcher {
         if accepted.len() >= 1000 {
             return RateVerdict::EngineLimited;
         }
-        let lifecycle = matches!(trigger, TriggerKind::ToolBefore | TriggerKind::ToolAfter);
-        if lifecycle
+        let hook_limited = matches!(
+            trigger,
+            TriggerKind::ToolBefore | TriggerKind::ToolAfter | TriggerKind::WebhookInbound
+        );
+        if hook_limited
             && accepted
                 .iter()
                 .filter(|(_, id, kind)| id == hook_id && *kind == trigger)
@@ -2113,6 +2116,25 @@ mod tests {
         assert_eq!(
             dispatcher.rate_verdict("hook-1", TriggerKind::ToolBefore, 0),
             RateVerdict::HookLimited
+        );
+    }
+
+    #[test]
+    fn rate_verdict_limits_each_inbound_webhook_hook_independently() {
+        let dispatcher = Dispatcher::new();
+        for _ in 0..60 {
+            assert_eq!(
+                dispatcher.rate_verdict("hook-1", TriggerKind::WebhookInbound, 0),
+                RateVerdict::Accepted
+            );
+        }
+        assert_eq!(
+            dispatcher.rate_verdict("hook-1", TriggerKind::WebhookInbound, 0),
+            RateVerdict::HookLimited
+        );
+        assert_eq!(
+            dispatcher.rate_verdict("hook-2", TriggerKind::WebhookInbound, 0),
+            RateVerdict::Accepted
         );
     }
 
