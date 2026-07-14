@@ -187,6 +187,22 @@ test("immutable primary snapshot labels the session despite profile edits", asyn
   expect((screen.getByPlaceholderText("Ask for follow-up changes") as HTMLTextAreaElement).disabled).toBe(false);
 });
 
+test("session composer selects an agent mention from its keyboard menu", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
+    [primary("primary"), { ...primary("ada"), name: "Ada" }],
+  );
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "ask @a", selectionStart: 6 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("ask @Ada ");
+});
+
 test("legacy sessions stay read-only without a repair destination", async () => {
   seed(LOCAL_RUNNER, { primaryAgentId: null, primaryAgentSnapshot: null });
   render(<SessionView />);

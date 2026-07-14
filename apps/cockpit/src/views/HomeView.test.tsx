@@ -268,6 +268,7 @@ test("selects the default primary and forwards a complete first project TurnInpu
 
   await waitFor(() => expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "ryuzi", {
     text: "ship it",
+    mentions: [],
     context: { branch: "main", voiceTranscript: null, references: [] },
     attachments: [],
     git: { useWorktree: true, createBranch: true, branchName: null, baseBranch: null },
@@ -351,6 +352,7 @@ test("starts a chat without a project using the selected primary", async () => {
 
   await waitFor(() => expect(startChatSession).toHaveBeenCalledWith(LOCAL_RUNNER, "ryuzi", {
     text: "chat",
+    mentions: [],
     context: { branch: null, voiceTranscript: null, references: [] },
     attachments: [],
     git: null,

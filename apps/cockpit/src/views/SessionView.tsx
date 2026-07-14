@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
-import { commands, type TurnInput } from "@/bindings";
+import { commands, type AgentSummaryInfo, type TurnInput } from "@/bindings";
 import { useStore, type ChatOptions } from "@/store";
 import { LOCAL_RUNNER, isSession, refKey } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
@@ -12,6 +12,8 @@ import { useAgents } from "@/store-agents";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { sessionIsReadOnly, sessionPrimaryLabel } from "@/lib/session-primary";
+import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
+import { AgentMentionMenu } from "@/components/composer/AgentMentionMenu";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
@@ -61,6 +63,9 @@ export function SessionView() {
   const isRemote = runnerId !== LOCAL_RUNNER;
   const composerFiles = useComposerAttachments(runnerId);
   const [contextRefs, setContextRefs] = useState<string[]>([]);
+  const [mentions, setMentions] = useState<MentionDraft["mentions"]>([]);
+  const [mentionCaret, setMentionCaret] = useState(0);
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
@@ -141,6 +146,12 @@ export function SessionView() {
     if (slashQuery === null) return [];
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
   }, [nativeCommands, slashQuery]);
+  const mentionQuery = useMemo(() => activeAgentMentionQuery(draft, mentionCaret), [draft, mentionCaret]);
+  const mentionMatches = useMemo(
+    () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", session?.primaryAgentId ?? null, mentions),
+    [registry?.agents, mentionQuery?.query, session?.primaryAgentId, mentions],
+  );
+  const mentionMenuOpen = mentionQuery !== null && contextHits.length === 0 && slashMatches.length === 0 && mentionMatches.length > 0;
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
 
@@ -184,12 +195,15 @@ export function SessionView() {
     if (!t && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
     const typed = draft;
+    const typedMentions = mentions;
     const options: ChatOptions = {
+      mentions,
       context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
     };
     const turn: TurnInput = {
       text: t,
+      mentions,
       context: {
         branch: options.context?.branch ?? null,
         voiceTranscript: options.context?.voiceTranscript ?? null,
@@ -198,18 +212,28 @@ export function SessionView() {
       attachments: options.attachments ?? [],
       git: null,
     };
-    // Clear optimistically; a rejected *send* puts the text back. Enqueue never
-    // fails, so no restore path there.
-    useNav.getState().clearDraft(key);
-    historyRef.current = HISTORY_IDLE;
-    composerFiles.clear();
-    setContextRefs([]);
+    // Clear only after a successful send; queued turns retain their complete
+    // structured payload, including agent mentions.
     if (running) {
       enqueueMessage(runnerId, key, { id: crypto.randomUUID(), text: t, options });
+      useNav.getState().clearDraft(key);
+      historyRef.current = HISTORY_IDLE;
+      composerFiles.clear();
+      setContextRefs([]);
+      setMentions([]);
       return;
     }
     void send(runnerId, key, turn).then((ok) => {
-      if (!ok) useNav.getState().restoreDraft(key, typed);
+      if (ok) {
+        useNav.getState().clearDraft(key);
+        historyRef.current = HISTORY_IDLE;
+        composerFiles.clear();
+        setContextRefs([]);
+        setMentions([]);
+      } else {
+        useNav.getState().restoreDraft(key, typed);
+        setMentions(typedMentions);
+      }
     });
   };
 
@@ -217,6 +241,14 @@ export function SessionView() {
     setDraft((cur) => replaceActiveContextToken(cur, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
     setContextHits([]);
+  };
+
+  const pickMention = (agent: AgentSummaryInfo) => {
+    const next = insertAgentMention({ text: draft, mentions }, mentionCaret, agent);
+    setDraft(next.text);
+    setMentions(next.mentions);
+    setMentionCaret(next.text.length);
+    setMentionActiveIndex(0);
   };
 
   const toggleVoice = () => {
@@ -347,9 +379,24 @@ export function SessionView() {
                 onChange={(e) => {
                   // Typing exits history mode: the edited text becomes the live draft.
                   historyRef.current = HISTORY_IDLE;
-                  setDraft(e.target.value);
+                  const next = updateMentionDraft({ text: draft, mentions }, e.target.value);
+                  setDraft(next.text);
+                  setMentions(next.mentions);
+                  setMentionCaret(e.target.selectionStart);
+                  setMentionActiveIndex(0);
                 }}
+                onSelect={(e) => setMentionCaret(e.currentTarget.selectionStart)}
                 onKeyDown={(e) => {
+                  if (mentionMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
+                    const delta = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
+                    e.preventDefault();
+                    if (delta) setMentionActiveIndex((index) => (index + delta + mentionMatches.length) % mentionMatches.length);
+                    else {
+                      const agent = mentionMatches[mentionActiveIndex];
+                      if (agent) pickMention(agent);
+                    }
+                    return;
+                  }
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     submit();
@@ -357,7 +404,7 @@ export function SessionView() {
                   }
                   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
                     const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
-                    const popupOpen = slashMatches.length > 0 || contextHits.length > 0;
+                    const popupOpen = slashMatches.length > 0 || contextHits.length > 0 || mentionMenuOpen;
                     const el = e.currentTarget;
                     if (!shouldNavigateHistory(dir, draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, popupOpen)) return;
                     const step = stepHistory(dir, history, historyRef.current, draft);
@@ -372,6 +419,15 @@ export function SessionView() {
                 placeholder={composeReadOnly ? composeReadOnlyReason : running ? "Enter to queue" : "Ask for follow-up changes"}
                 className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
               />
+              {mentionMenuOpen && (
+                <AgentMentionMenu
+                  agents={mentionMatches}
+                  activeIndex={mentionActiveIndex}
+                  onActiveIndexChange={setMentionActiveIndex}
+                  onPick={pickMention}
+                  onClose={() => setMentionCaret(0)}
+                />
+              )}
               {slashMatches.length > 0 && (
                 <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
                   <MenuSectionLabel>Commands</MenuSectionLabel>

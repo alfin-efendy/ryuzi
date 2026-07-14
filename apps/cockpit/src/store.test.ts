@@ -1455,7 +1455,7 @@ test("two runners with the same session_pk keep separate transcripts and separat
   expect(useStore.getState().focusedSession).toEqual({ runnerId: remote, pk: "s1" });
 });
 
-const qmsg = (id: string, text = id): QueuedMessage => ({ id, text, options: null });
+const qmsg = (id: string, text = id, options: QueuedMessage["options"] = null): QueuedMessage => ({ id, text, options });
 
 test("enqueueMessage appends per session; removeQueued removes by id", () => {
   useStore.setState({ queued: {} });
@@ -1466,18 +1466,30 @@ test("enqueueMessage appends per session; removeQueued removes by id", () => {
   expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
 });
 
-test("sendNextQueued sends the head TurnInput and removes it on success", async () => {
+test("sendNextQueued sends structured mentions and removes the head on success", async () => {
   const calls: Array<[string, string, TurnInput]> = [];
+  const mentions = [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }];
   useStore.setState({
-    queued: { [k1]: [qmsg("a", "hello"), qmsg("b", "world")] },
+    queued: { [k1]: [qmsg("a", "@Ada review", { mentions }), qmsg("b", "world")] },
     send: async (runnerId, pk, turn) => {
       calls.push([runnerId, pk, turn]);
       return true;
     },
   });
   await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
-  expect(calls).toEqual([[LOCAL_RUNNER, "s1", { text: "hello", context: null, attachments: [], git: null }]]);
+  expect(calls).toEqual([[LOCAL_RUNNER, "s1", { text: "@Ada review", mentions, context: null, attachments: [], git: null }]]);
   expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
+});
+
+test("sendNextQueued restores the structured head when send fails", async () => {
+  const mentions = [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }];
+  const queued = qmsg("a", "@Ada review", { mentions });
+  useStore.setState({
+    queued: { [k1]: [queued] },
+    send: async () => false,
+  });
+  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
+  expect(useStore.getState().queued[k1]).toEqual([queued]);
 });
 
 test("sendNextQueued unshifts the head back when send fails", async () => {

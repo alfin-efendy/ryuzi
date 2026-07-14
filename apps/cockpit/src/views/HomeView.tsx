@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
-import { commands, type BranchList } from "@/bindings";
+import { commands, type AgentSummaryInfo, type BranchList } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
 import { useNav, choosePrimaryAgent, LAST_PRIMARY_AGENT_KEY } from "@/store-nav";
@@ -10,6 +10,8 @@ import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
 import { HOME_SUGGESTIONS } from "@/constants";
 import { useAgents } from "@/store-agents";
+import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
+import { AgentMentionMenu } from "@/components/composer/AgentMentionMenu";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
@@ -36,6 +38,9 @@ export function HomeView() {
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
   const [contextRefs, setContextRefs] = useState<string[]>([]);
+  const [mentions, setMentions] = useState<MentionDraft["mentions"]>([]);
+  const [mentionCaret, setMentionCaret] = useState(0);
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
@@ -56,6 +61,13 @@ export function HomeView() {
   );
   const isGit = project?.isGit ?? false;
   const registry = useAgents((s) => s.registry);
+  const primaryAgentId = choosePrimaryAgent(
+    registry?.agents ?? [],
+    nav.pendingPrimaryAgentId,
+    localStorage.getItem(LAST_PRIMARY_AGENT_KEY),
+    registry?.defaultAgentId ?? null,
+  );
+  const hasExecutablePrimary = primaryAgentId !== null;
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
   const connectionsLoaded = useConnections((s) => s.loaded);
@@ -103,6 +115,12 @@ export function HomeView() {
     if (slashQuery === null) return [];
     return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
   }, [nativeCommands, slashQuery]);
+  const mentionQuery = useMemo(() => activeAgentMentionQuery(draft, mentionCaret), [draft, mentionCaret]);
+  const mentionMatches = useMemo(
+    () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", primaryAgentId, mentions),
+    [registry?.agents, mentionQuery?.query, primaryAgentId, mentions],
+  );
+  const mentionMenuOpen = mentionQuery !== null && contextHits.length === 0 && slashMatches.length === 0 && mentionMatches.length > 0;
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
 
@@ -129,6 +147,14 @@ export function HomeView() {
     setContextHits([]);
   };
 
+  const pickMention = (agent: AgentSummaryInfo) => {
+    const next = insertAgentMention({ text: draft, mentions }, mentionCaret, agent);
+    setDraft(next.text);
+    setMentions(next.mentions);
+    setMentionCaret(next.text.length);
+    setMentionActiveIndex(0);
+  };
+
   const toggleVoice = () => {
     if (listening) {
       stopVoice.current?.();
@@ -152,35 +178,33 @@ export function HomeView() {
     setListening(true);
   };
 
-  const primaryAgentId = choosePrimaryAgent(
-    registry?.agents ?? [],
-    nav.pendingPrimaryAgentId,
-    localStorage.getItem(LAST_PRIMARY_AGENT_KEY),
-    registry?.defaultAgentId ?? null,
-  );
-  const hasExecutablePrimary = primaryAgentId !== null;
-
   const send = async () => {
     const text = draft.trim();
     if (!hasExecutablePrimary || (!text && composerFiles.attachments.length === 0)) return;
     useNav.getState().consumePendingPrimaryAgentId();
     const typed = draft;
+    const typedMentions = mentions;
     const turn = {
       text,
+      mentions,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
     };
-    useNav.getState().clearDraft(draftKey);
-    composerFiles.clear();
-    setContextRefs([]);
     const ok = project
       ? await start(LOCAL_RUNNER, project.projectId, primaryAgentId, turn)
       : await startChat(LOCAL_RUNNER, primaryAgentId, turn);
     if (ok) {
+      useNav.getState().clearDraft(draftKey);
+      composerFiles.clear();
+      setContextRefs([]);
+      setMentions([]);
       localStorage.setItem(LAST_PRIMARY_AGENT_KEY, primaryAgentId);
       nav.navigate({ kind: "session" });
-    } else useNav.getState().restoreDraft(draftKey, typed);
+    } else {
+      useNav.getState().restoreDraft(draftKey, typed);
+      setMentions(typedMentions);
+    }
   };
 
   return (
@@ -194,8 +218,25 @@ export function HomeView() {
         >
           <Textarea
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              const next = updateMentionDraft({ text: draft, mentions }, e.target.value);
+              setDraft(next.text);
+              setMentions(next.mentions);
+              setMentionCaret(e.target.selectionStart);
+              setMentionActiveIndex(0);
+            }}
+            onSelect={(e) => setMentionCaret(e.currentTarget.selectionStart)}
             onKeyDown={(e) => {
+              if (mentionMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
+                const delta = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
+                e.preventDefault();
+                if (delta) setMentionActiveIndex((index) => (index + delta + mentionMatches.length) % mentionMatches.length);
+                else {
+                  const agent = mentionMatches[mentionActiveIndex];
+                  if (agent) pickMention(agent);
+                }
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 void send();
@@ -206,6 +247,15 @@ export function HomeView() {
             placeholder="Do anything"
             className="max-h-[40vh] resize-none overflow-y-auto border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
           />
+          {mentionMenuOpen && (
+            <AgentMentionMenu
+              agents={mentionMatches}
+              activeIndex={mentionActiveIndex}
+              onActiveIndexChange={setMentionActiveIndex}
+              onPick={pickMention}
+              onClose={() => setMentionCaret(0)}
+            />
+          )}
           {slashMatches.length > 0 && (
             <MenuPanel onClose={() => undefined} className="bottom-full left-3 z-50 mb-1.5 w-[320px]">
               <MenuSectionLabel>Commands</MenuSectionLabel>

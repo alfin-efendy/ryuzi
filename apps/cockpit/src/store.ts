@@ -45,6 +45,7 @@ export type ChatOptions = {
     voiceTranscript?: string | null;
     references?: string[];
   } | null;
+  mentions?: TurnInput["mentions"];
   attachments?: string[];
   git?: GitOptions | null;
 };
@@ -132,6 +133,7 @@ function append(map: Record<string, Row[]>, key: string, row: Row): Record<strin
 function toTurnInput(text: string, options?: ChatOptions | null): TurnInput {
   return {
     text,
+    mentions: options?.mentions,
     context: options?.context
       ? {
           branch: options.context.branch ?? null,
