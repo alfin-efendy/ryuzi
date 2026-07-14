@@ -17,6 +17,7 @@ import {
   type ProjectRuntimeInfo,
 } from "./bindings";
 import { basename } from "./lib/paths";
+import { useDelegation } from "./store-delegation";
 import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
@@ -307,6 +308,9 @@ export const useStore = create<State>((set, get) => ({
         case "contextCompacted":
           // The transcript notice arrives as a persisted message row; no
           // extra state to keep here.
+          return {};
+        case "agentRunChanged":
+          useDelegation.getState().applyCoreEvent(e, runnerId);
           return {};
         case "orchTaskChanged": {
           // A root reports its OWN status change with root_id: null (it has
