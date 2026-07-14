@@ -3,7 +3,7 @@
 //! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
-use super::commands::CommandRegistry;
+use super::commands::{CommandRegistry, ResolvedCommand};
 use super::context_manager::{
     compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
     ContextManager,
@@ -218,6 +218,35 @@ async fn max_provider_turns(deps: &RunnerDeps, options: &TurnOptions) -> usize {
     }
 }
 
+async fn command_root(deps: &RunnerDeps) -> PathBuf {
+    let Some(project_id) = deps.project_id.as_deref() else {
+        return deps.work_dir.clone();
+    };
+    match deps.store.get_project(project_id).await {
+        Ok(Some(project)) => PathBuf::from(project.workdir),
+        Ok(None) => deps.work_dir.clone(),
+        Err(error) => {
+            tracing::warn!(project_id, %error, "native: falling back to active worktree for command root");
+            deps.work_dir.clone()
+        }
+    }
+}
+
+/// Resolve a slash command from its current project root. Agent overrides use
+/// the matching root's registry; absent command agent metadata leaves the
+/// session's active-worktree agent unchanged.
+async fn resolve_slash_command(
+    deps: &RunnerDeps,
+    input: &str,
+) -> Option<(ResolvedCommand, Option<Agent>)> {
+    let root = command_root(deps).await;
+    let commands = CommandRegistry::load(&root);
+    let agents = AgentRegistry::load(&root);
+    let resolved = commands.resolve(input)?;
+    let agent = resolved.agent.as_deref().and_then(|name| agents.get(name));
+    Some((resolved, agent))
+}
+
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
 /// (end_turn / cancellation); the control plane then emits `CoreEvent::Result`.
 ///
@@ -232,8 +261,13 @@ pub async fn run_turn(
     let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
     let force_subtask = prompt.force_subtask;
 
-    // Slash-command resolution on the raw user text. Command metadata stays
-    // outside the expanded prompt and is applied only to this turn.
+    // Slash-command resolution on the raw user text. Reload only for a
+    // command-shaped prompt so project command CRUD becomes visible to a live
+    // session without adding filesystem work to ordinary turns. When the
+    // owning project is reachable, its canonical workdir is the command root;
+    // chat/bare or deleted-project sessions fall back to the active worktree.
+    // Command metadata stays outside the expanded prompt and is applied only
+    // to this turn.
     let (agent_text, agent, command_model, mut options) = if manual_compact {
         (
             prompt.agent.clone(),
@@ -242,13 +276,16 @@ pub async fn run_turn(
             TurnOptions::default(),
         )
     } else {
-        match deps.commands.resolve(&prompt.display) {
-            Some(resolved) => {
-                let agent = resolved
-                    .agent
-                    .as_deref()
-                    .and_then(|name| deps.agents.get(name))
-                    .unwrap_or_else(|| deps.agent.clone());
+        let resolved = if trimmed.starts_with('/') {
+            resolve_slash_command(deps, &prompt.display).await
+        } else {
+            deps.commands
+                .resolve(&prompt.display)
+                .map(|resolved| (resolved, None))
+        };
+        match resolved {
+            Some((resolved, command_agent)) => {
+                let agent = command_agent.unwrap_or_else(|| deps.agent.clone());
                 let options = turn_options(&resolved);
                 (
                     merge_agent_prompt_suffix(resolved.prompt, &prompt),
@@ -3621,6 +3658,65 @@ mod tests {
         assert_eq!(
             max_provider_turns(&deps, &options).await,
             SUBAGENT_MAX_ITERS
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_project_command_root_falls_back_to_active_worktree() {
+        use testutil::RecordingLlm;
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_workdir = dir.path().join("canonical-project");
+        std::fs::create_dir_all(&canonical_workdir).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".ryuzi/commands/fallback.md"),
+            "Active-worktree fallback $ARGUMENTS",
+        )
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("deleted-project".into());
+        deps.store
+            .insert_project(crate::domain::Project {
+                project_id: "deleted-project".into(),
+                name: "deleted-project".into(),
+                workdir: canonical_workdir.display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::BypassPermissions,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        deps.store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM projects WHERE project_id='deleted-project'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("/fallback command", "/fallback command"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert!(
+            body.to_string()
+                .contains("Active-worktree fallback command"),
+            "a missing project row must resolve slash commands from the active worktree"
         );
     }
 
