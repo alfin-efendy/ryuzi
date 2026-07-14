@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::harness::{HarnessSession, PrimaryTurnConfig, SessionCtx, TurnPrompt};
 use crate::mentions::{
-    coordinator_context, resolve_mentions, CoordinatorOutcome, ResolvedMentions,
+    coordinator_context_from_run, resolve_mentions, CoordinatorOutcome, ResolvedMentions,
     COORDINATOR_SYNTHESIS_INSTRUCTION,
 };
 use crate::paths::{new_id, now_ms, worktree_path_for};
@@ -55,12 +55,15 @@ fn validate_executable_primary(
             .map(|issue| issue.message.as_str())
             .collect::<Vec<_>>()
             .join("; ");
+        let details_suffix = if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {details}")
+        };
         anyhow::bail!(
             "primary agent `{}` is not executable{}",
             agent.profile.id,
-            (!details.is_empty())
-                .then(|| format!(": {details}"))
-                .unwrap_or_default(),
+            details_suffix,
         );
     }
     crate::harness::native::primary_turn_config(agent.clone(), String::new())?;
@@ -95,6 +98,7 @@ impl ControlPlane {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_agent_session_with_turn(
         self: &Arc<Self>,
         project_id: Option<&str>,
@@ -151,6 +155,7 @@ impl ControlPlane {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_owned_agent_session_with_prompt(
         self: &Arc<Self>,
         project_id: Option<&str>,
@@ -168,10 +173,6 @@ impl ControlPlane {
         }
         let primary_agent = self.registry.resolved_snapshot(primary_agent_id).await?;
         validate_executable_primary(&primary_agent)?;
-        let resolved_mentions = match resolved_mentions {
-            Some(resolved) => Some(resolved),
-            None => None,
-        };
         let identity = crate::domain::AgentIdentitySnapshot {
             id: primary_agent.profile.id.clone(),
             name: primary_agent.profile.name.clone(),
@@ -850,6 +851,7 @@ impl ControlPlane {
     /// Background half of `start_session_with_prompt`. Its cancellation token
     /// is registered synchronously before this task is spawned, so a stop/end
     /// immediately after start returns can cancel startup before its first poll.
+    #[allow(clippy::too_many_arguments)]
     async fn run_session_startup(
         self: Arc<Self>,
         project: Project,
@@ -889,6 +891,7 @@ impl ControlPlane {
     // scheduling opportunity between registering the cancellation token and
     // evaluating the checkpoint). Calling the phase directly with the token
     // already cancelled is the only reliable way to pin it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn startup_phases(
         self: &Arc<Self>,
         project: &Project,
@@ -1518,6 +1521,9 @@ impl ControlPlane {
         };
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            if me.delegation.mark_running(&run_id).await.is_err() {
+                return;
+            }
             let queued =
                 futures::future::join_all(resolved_mentions.targets.iter().map(|target| {
                     let me = Arc::clone(&me);
@@ -1547,6 +1553,7 @@ impl ControlPlane {
                             agent_id: String::new(),
                             agent_name: "unavailable agent".into(),
                             task,
+                            status: "failed".into(),
                             result: None,
                             error: Some(error.to_string()),
                         },
@@ -1554,10 +1561,44 @@ impl ControlPlane {
                 }
             }))
             .await;
-            let synthesis = format!(
-                "{COORDINATOR_SYNTHESIS_INSTRUCTION}\n\n{}",
-                coordinator_context(&outcomes)
-            );
+            for outcome in &outcomes {
+                if let Err(error) = me
+                    .store
+                    .insert_run_message(
+                        &run_id,
+                        crate::domain::NewMessage::block(
+                            &session_pk,
+                            "system",
+                            "coordinator_outcome",
+                            serde_json::json!({
+                                "agent_id": outcome.agent_id,
+                                "name": outcome.agent_name,
+                                "task": outcome.task,
+                                "status": outcome.status,
+                                "result": outcome.result,
+                                "error": outcome.error,
+                            }),
+                        ),
+                    )
+                    .await
+                {
+                    let _ = me.delegation.fail(&run_id, &error.to_string()).await;
+                    return;
+                }
+            }
+            if coordinator_cancelled(&me.store, &session_pk, &run_id).await {
+                return;
+            }
+            let context = match coordinator_context_from_run(&me.store, &session_pk, &run_id).await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = me.delegation.fail(&run_id, &message).await;
+                    return;
+                }
+            };
+            let synthesis = format!("{COORDINATOR_SYNTHESIS_INSTRUCTION}\n\n{context}");
             me.spawn_prompt(
                 handle,
                 session_pk,
@@ -1566,7 +1607,6 @@ impl ControlPlane {
             );
         });
     }
-
     async fn run_explicit_mention_child(
         self: &Arc<Self>,
         child: crate::delegation::RunHandle,
@@ -1577,6 +1617,9 @@ impl ControlPlane {
         let agent_name = child.run.executing_agent_name_snapshot.clone();
         let result = async {
             self.delegation.mark_running(&run_id).await?;
+            if child.cancel.is_cancelled() {
+                anyhow::bail!("child run cancelled");
+            }
             let target = child
                 .agent_snapshot
                 .clone()
@@ -1620,9 +1663,18 @@ impl ControlPlane {
                 )
                 .await?;
             let prompt = TurnPrompt::text(task.clone(), task.clone());
-            let turn = handle.send_prompt(prompt).await;
+            let turn = tokio::select! {
+                result = handle.send_prompt(prompt) => result,
+                () = child.cancel.cancelled() => {
+                    let _ = handle.cancel().await;
+                    Err(anyhow::anyhow!("child run cancelled"))
+                }
+            };
             let _ = handle.end().await;
             turn?;
+            if child.cancel.is_cancelled() {
+                anyhow::bail!("child run cancelled");
+            }
             self.delegation.complete(&run_id, "").await?;
             let terminal = self.delegation.await_terminal(&run_id).await?;
             let messages = self
@@ -1647,18 +1699,32 @@ impl ControlPlane {
                 agent_id,
                 agent_name,
                 task,
+                status: "completed".into(),
                 result: Some(result),
                 error: None,
             },
             Err(error) => {
-                let message = error.to_string();
-                let _ = self.delegation.fail(&run_id, &message).await;
+                let fallback_error = error.to_string();
+                let terminal = match self.store.get_agent_run(&run_id).await {
+                    Ok(Some(run)) if run.status.is_terminal() => Some(run),
+                    _ => {
+                        let _ = self.delegation.fail(&run_id, &fallback_error).await;
+                        self.store.get_agent_run(&run_id).await.ok().flatten()
+                    }
+                };
+                let (status, error) = terminal
+                    .map(|run| {
+                        let error = run.error.or_else(|| Some(fallback_error.clone()));
+                        (run.status.as_db().to_string(), error)
+                    })
+                    .unwrap_or_else(|| ("failed".into(), Some(fallback_error)));
                 CoordinatorOutcome {
                     agent_id,
                     agent_name,
                     task,
+                    status,
                     result: None,
-                    error: Some(message),
+                    error,
                 }
             }
         }
@@ -1806,6 +1872,23 @@ impl ControlPlane {
         // never come. The native gate also observes the turn token; this
         // covers the hub side and clears stale prompts.
         self.approvals.resolve_session(session_pk, false);
+        let roots = self
+            .store
+            .list_session_agent_runs(session_pk)
+            .await?
+            .into_iter()
+            .filter(|run| run.parent_run_id.is_none() && run.status.is_active())
+            .collect::<Vec<_>>();
+        for root in roots {
+            let _ = self
+                .delegation
+                .cancel_descendants_of_root(session_pk, &root.run_id)
+                .await;
+            let _ = self
+                .delegation
+                .interrupt(&root.run_id, "session stopped")
+                .await;
+        }
         self.store
             .update_status(session_pk, SessionStatus::Interrupted, Some(now_ms()))
             .await?;
@@ -2117,6 +2200,33 @@ impl ControlPlane {
         }
         Ok(())
     }
+}
+
+async fn coordinator_cancelled(
+    store: &crate::store::Store,
+    session_pk: &str,
+    run_id: &str,
+) -> bool {
+    let root_cancelled = store
+        .get_agent_run(run_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|run| {
+            run.status.is_terminal() && run.status != crate::domain::AgentRunStatus::Completed
+        });
+    let session_cancelled = store
+        .get_session(session_pk)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|session| {
+            matches!(
+                session.status,
+                SessionStatus::Interrupted | SessionStatus::Ended
+            )
+        });
+    root_cancelled || session_cancelled
 }
 
 /// The stage of `attach_plugin_mcp_servers` at which a connector failed —

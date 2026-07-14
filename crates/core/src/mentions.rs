@@ -52,6 +52,7 @@ pub struct CoordinatorOutcome {
     pub agent_id: String,
     pub agent_name: String,
     pub task: String,
+    pub status: String,
     pub result: Option<String>,
     pub error: Option<String>,
 }
@@ -59,17 +60,54 @@ pub struct CoordinatorOutcome {
 pub fn coordinator_context(outcomes: &[CoordinatorOutcome]) -> String {
     outcomes
         .iter()
-        .map(|outcome| {
-            format!(
-                "Agent: {}\nTask: {}\nResult: {}\nError: {}",
-                outcome.agent_name,
-                outcome.task,
-                outcome.result.as_deref().unwrap_or(""),
-                outcome.error.as_deref().unwrap_or(""),
-            )
-        })
+        .map(coordinator_outcome_context)
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn coordinator_outcome_context(outcome: &CoordinatorOutcome) -> String {
+    format!(
+        "Agent: {}\nTask: {}\nStatus: {}\nResult: {}\nError: {}",
+        outcome.agent_name,
+        outcome.task,
+        outcome.status,
+        outcome.result.as_deref().unwrap_or(""),
+        outcome.error.as_deref().unwrap_or(""),
+    )
+}
+
+pub async fn coordinator_context_from_run(
+    store: &crate::store::Store,
+    session_pk: &str,
+    root_run_id: &str,
+) -> anyhow::Result<String> {
+    let outcomes = store
+        .list_run_messages(session_pk, root_run_id)
+        .await?
+        .into_iter()
+        .filter(|message| message.role == "system" && message.block_type == "coordinator_outcome")
+        .map(|message| CoordinatorOutcome {
+            agent_id: message.payload["agent_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            agent_name: message.payload["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            task: message.payload["task"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            status: message.payload["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            result: message.payload["result"].as_str().map(str::to_string),
+            error: message.payload["error"].as_str().map(str::to_string),
+        })
+        .collect::<Vec<_>>();
+    Ok(coordinator_context(&outcomes))
 }
 
 pub async fn coordinate_explicit_mentions<
@@ -113,29 +151,17 @@ pub async fn resolve_mentions(
     primary_agent_id: &str,
     registry: &crate::agents::registry::AgentRegistry,
 ) -> Result<ResolvedMentions, MentionError> {
-    let mut boundaries = Vec::with_capacity(text.len() + 1);
-    boundaries.push(0usize);
-    let mut utf16 = 0u32;
+    let mut boundaries = vec![Some(0usize)];
     for (byte, character) in text.char_indices() {
         if byte != 0 {
-            boundaries.push(byte);
+            boundaries.push(Some(byte));
         }
-        utf16 += character.len_utf16() as u32;
+        for _ in 1..character.len_utf16() {
+            boundaries.push(None);
+        }
     }
-    boundaries.push(text.len());
-    let boundary_at = |offset| {
-        if offset > utf16 {
-            return None;
-        }
-        let mut seen = 0u32;
-        for (byte, character) in text.char_indices() {
-            if seen == offset {
-                return Some(byte);
-            }
-            seen += character.len_utf16() as u32;
-        }
-        (seen == offset).then_some(text.len())
-    };
+    boundaries.push(Some(text.len()));
+    let boundary_at = |offset| boundaries.get(offset as usize).copied().flatten();
 
     let mut spans = Vec::with_capacity(mentions.len());
     for mention in mentions {
@@ -337,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn mentions_reject_spoofed_stale_labels_and_invalid_utf16_ranges() {
-        let (persistence, primary, ada, bob) = registry().await;
+        let (persistence, primary, ada, _bob) = registry().await;
         let text = "😀 @Ada @Bob";
         let ada_span = utf16_span(text, "@Ada", 0);
         let bob_span = utf16_span(text, "@Bob", 0);
@@ -440,6 +466,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_context_reads_structured_terminal_entries_in_run_order() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(database.path()).await.unwrap());
+        let primary = "primary".to_string();
+        let root = crate::domain::NewAgentRun {
+            run_id: "root".into(),
+            session_pk: "session".into(),
+            parent_run_id: None,
+            retry_of: None,
+            primary_agent_id: primary,
+            executing_agent_id: Some("primary".into()),
+            executing_agent_name_snapshot: "Primary".into(),
+            agent_kind: crate::domain::AgentRunKind::Primary,
+            task: "coordinate".into(),
+            status: crate::domain::AgentRunStatus::Queued,
+            resolved_model: None,
+            resolved_effort: None,
+        };
+        store
+            .with_conn(move |connection| {
+                connection.execute(
+                    "INSERT INTO sessions(session_pk,status,perm_mode,kind,branch_owned,resume_attempts) VALUES ('session','idle','default','chat',0,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.insert_primary_agent_run(root).await.unwrap();
+        for (name, task, status, result, error) in [
+            ("Ada", "inspect", "completed", Some("approved"), None),
+            ("Bob", "test", "cancelled", None, Some("cancelled")),
+        ] {
+            store
+                .insert_run_message(
+                    "root",
+                    crate::domain::NewMessage::block(
+                        "session",
+                        "system",
+                        "coordinator_outcome",
+                        serde_json::json!({
+                            "name": name,
+                            "task": task,
+                            "status": status,
+                            "result": result,
+                            "error": error,
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let context = coordinator_context_from_run(&store, "session", "root")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            context,
+            "Agent: Ada\nTask: inspect\nStatus: completed\nResult: approved\nError: \n\nAgent: Bob\nTask: test\nStatus: cancelled\nResult: \nError: cancelled"
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_mentions_queue_all_targets_concurrently_and_synthesize_once_with_partial_failures(
     ) {
         let (persistence, primary, ada, bob) = registry().await;
@@ -488,6 +578,7 @@ mod tests {
                                 agent_id: run_id.clone(),
                                 agent_name: if run_id == ada { "Ada" } else { "Bob" }.into(),
                                 task: "review the change".into(),
+                                status: if run_id == ada { "completed" } else { "failed" }.into(),
                                 result: (run_id == ada).then_some("approved".into()),
                                 error: (run_id == bob).then_some("timed out".into()),
                             })
@@ -515,7 +606,7 @@ mod tests {
         assert_eq!(
             synthesis[0],
             format!(
-                "{COORDINATOR_SYNTHESIS_INSTRUCTION}\n\nAgent: Ada\nTask: review the change\nResult: approved\nError: \n\nAgent: Bob\nTask: review the change\nResult: \nError: timed out"
+                "{COORDINATOR_SYNTHESIS_INSTRUCTION}\n\nAgent: Ada\nTask: review the change\nStatus: completed\nResult: approved\nError: \n\nAgent: Bob\nTask: review the change\nStatus: failed\nResult: \nError: timed out"
             )
         );
     }

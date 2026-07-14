@@ -76,9 +76,11 @@ struct FakeSession {
     run_id: String,
     isolated_target: bool,
     block_until_cancel: bool,
+    failure: Option<String>,
     cancelled: Arc<AtomicBool>,
     send_count: Arc<AtomicUsize>,
     ended: Arc<AtomicBool>,
+    cancels: Arc<AtomicUsize>,
     /// Every prompt text driven on this (or a sibling) fake session, in
     /// order — lets resume tests assert the exact nudge text sent.
     prompts: Arc<Mutex<Vec<String>>>,
@@ -139,6 +141,10 @@ impl HarnessSession for FakeSession {
             });
         }
 
+        if let Some(failure) = &self.failure {
+            anyhow::bail!(failure.clone());
+        }
+
         if self.block_until_cancel {
             // Block until cancel() is observed, so the session stays Running.
             loop {
@@ -152,6 +158,7 @@ impl HarnessSession for FakeSession {
     }
 
     async fn cancel(&self) -> anyhow::Result<()> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
         self.cancelled.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -189,6 +196,8 @@ struct Counters {
     sends: Arc<AtomicUsize>,
     /// Set once `end()` is called on a produced session.
     ended: Arc<AtomicBool>,
+    /// Number of cancellation calls received across produced sessions.
+    cancels: Arc<AtomicUsize>,
     /// Prompts observed by `send_prompt` across every produced session, in order.
     prompts: Arc<Mutex<Vec<String>>>,
     /// `steer()` calls observed across every produced session, in order.
@@ -209,6 +218,7 @@ struct Counters {
 
 struct FakeHarness {
     block_until_cancel: bool,
+    fail_isolated_target: Option<String>,
     counters: Counters,
 }
 
@@ -225,9 +235,16 @@ impl Harness for FakeHarness {
             run_id: ctx.run_id.clone(),
             isolated_target: ctx.isolated_target,
             block_until_cancel: self.block_until_cancel,
+            failure: (ctx.isolated_target
+                && self
+                    .fail_isolated_target
+                    .as_deref()
+                    .is_some_and(|name| name == ctx.primary_agent.profile.name))
+            .then(|| format!("{} child failed", ctx.primary_agent.profile.name)),
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
+            cancels: self.counters.cancels.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
             primary_turns: self.counters.primary_turns.clone(),
@@ -238,6 +255,7 @@ impl Harness for FakeHarness {
 
 struct FakeHarnessFactory {
     block_until_cancel: bool,
+    fail_isolated_target: Option<String>,
     counters: Counters,
 }
 
@@ -245,6 +263,7 @@ impl HarnessFactory for FakeHarnessFactory {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
         Ok(Arc::new(FakeHarness {
             block_until_cancel: self.block_until_cancel,
+            fail_isolated_target: self.fail_isolated_target.clone(),
             counters: self.counters.clone(),
         }))
     }
@@ -270,9 +289,11 @@ impl Harness for GatedHarness {
             run_id: ctx.run_id.clone(),
             isolated_target: ctx.isolated_target,
             block_until_cancel: false,
+            failure: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
+            cancels: self.counters.cancels.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
             primary_turns: self.counters.primary_turns.clone(),
@@ -320,9 +341,11 @@ impl Harness for LatchGatedHarness {
             run_id: ctx.run_id.clone(),
             isolated_target: ctx.isolated_target,
             block_until_cancel: false,
+            failure: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
+            cancels: self.counters.cancels.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
             primary_turns: self.counters.primary_turns.clone(),
@@ -356,6 +379,7 @@ fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
     let mut regs = Registries::new();
     regs.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel,
+        fail_isolated_target: None,
         counters,
     });
     regs
@@ -399,6 +423,7 @@ async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tem
     let mut regs = Registries::new();
     regs.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel: false,
+        fail_isolated_target: None,
         counters: counters.clone(),
     });
     let cp = test_control_plane(store, regs).await;
@@ -638,26 +663,27 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
     );
     assert!(continued_run.started_at.is_some());
     assert!(continued_run.finished_at.is_some());
-    let primary_turns = counters.primary_turns.lock().unwrap();
-    assert_eq!(
-        primary_turns.len(),
-        1,
-        "live session must refresh its turn config"
-    );
-    assert_eq!(primary_turns[0].agent.profile.name, "Renamed primary");
-    assert_eq!(primary_turns[0].agent.profile.model, profile.model);
-    assert_eq!(
-        primary_turns[0].agent.profile.permissions.mode,
-        crate::domain::PermMode::AcceptEdits
-    );
-    assert_eq!(
-        primary_turns[0].allowed_skills,
-        Some(vec!["release".into()])
-    );
-    assert!(primary_turns[0].agent_tools.tools.allows("read"));
-    assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
-    assert_eq!(primary_turns[0].run_id, run_id);
-    drop(primary_turns);
+    {
+        let primary_turns = counters.primary_turns.lock().unwrap();
+        assert_eq!(
+            primary_turns.len(),
+            1,
+            "live session must refresh its turn config"
+        );
+        assert_eq!(primary_turns[0].agent.profile.name, "Renamed primary");
+        assert_eq!(primary_turns[0].agent.profile.model, profile.model);
+        assert_eq!(
+            primary_turns[0].agent.profile.permissions.mode,
+            crate::domain::PermMode::AcceptEdits
+        );
+        assert_eq!(
+            primary_turns[0].allowed_skills,
+            Some(vec!["release".into()])
+        );
+        assert!(primary_turns[0].agent_tools.tools.allows("read"));
+        assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
+        assert_eq!(primary_turns[0].run_id, run_id);
+    }
     assert_eq!(
         store
             .get_session(&session.session_pk)
@@ -715,6 +741,7 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
             end_utf16: 9,
         },
     ];
+    let mut run_events = cp.subscribe();
     let session = cp
         .start_agent_session_with_turn(
             None,
@@ -736,6 +763,20 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
     assert_eq!(runs.len(), 2, "duplicate target mentions queue one child");
     let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
     let child = runs.iter().find(|run| run.parent_run_id.is_some()).unwrap();
+    let statuses = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_primary_run_statuses(&mut run_events, &session.session_pk, &root.run_id),
+    )
+    .await
+    .expect("coordinator root must reach a terminal state");
+    assert_eq!(
+        statuses
+            .iter()
+            .find(|status| status.as_str() == "running")
+            .map(String::as_str),
+        Some("running"),
+        "the coordinator root becomes running before child work completes"
+    );
     assert!(
         cp.running.lock().unwrap().contains_key(&session.session_pk),
         "the root harness remains registered"
@@ -758,14 +799,226 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
     );
     assert!(synthesis.contains("Agent: Ada"));
     assert!(synthesis.contains("Result: working"));
-    assert!(
-        store
-            .list_run_messages(&session.session_pk, &root.run_id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "the isolated child must not write provider rows to the root run"
+    let coordinator_entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(coordinator_entries.len(), 1, "one child outcome is durable");
+    assert_eq!(coordinator_entries[0].role, "system");
+    assert_eq!(coordinator_entries[0].block_type, "coordinator_outcome");
+    assert_eq!(coordinator_entries[0].payload["name"], "Ada");
+    assert_eq!(coordinator_entries[0].payload["task"], "  investigate");
+    assert_eq!(coordinator_entries[0].payload["status"], "completed");
+    assert_eq!(coordinator_entries[0].payload["result"], "working");
+    assert!(coordinator_entries[0].payload["error"].is_null());
+    assert_eq!(
+        coordinator_entries.len(),
+        1,
+        "only coordinator outcome entries belong to the root run"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_partial_failure_context()
+{
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let mut registries = Registries::new();
+    registries.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel: false,
+        fail_isolated_target: Some("Ada".into()),
+        counters: counters.clone(),
+    });
+    let cp = test_control_plane(store, registries).await;
+    let store = cp.store().clone();
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: &str| crate::agents::types::AgentMutationInput {
+        name: name.into(),
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let ada = cp.registry().create(create("Ada")).await.unwrap();
+    let bob = cp.registry().create(create("Bob")).await.unwrap();
+    let text = "@Ada @Bob inspect the change";
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &[
+                crate::api::types::AgentMention {
+                    agent_id: ada.profile.id.clone(),
+                    label_snapshot: "Ada".into(),
+                    start_utf16: 0,
+                    end_utf16: 4,
+                },
+                crate::api::types::AgentMention {
+                    agent_id: bob.profile.id.clone(),
+                    label_snapshot: "Bob".into(),
+                    start_utf16: 5,
+                    end_utf16: 9,
+                },
+            ],
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(&counters.prompts, 3).await;
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
+    let ada_run = runs
+        .iter()
+        .find(|run| run.executing_agent_id.as_deref() == Some(ada.profile.id.as_str()))
+        .unwrap();
+    let bob_run = runs
+        .iter()
+        .find(|run| run.executing_agent_id.as_deref() == Some(bob.profile.id.as_str()))
+        .unwrap();
+    let ada_run = wait_for_primary_run_terminal(&store, &session.session_pk, &ada_run.run_id).await;
+    let bob_run = wait_for_primary_run_terminal(&store, &session.session_pk, &bob_run.run_id).await;
+    assert_eq!(ada_run.status, crate::domain::AgentRunStatus::Failed);
+    assert_eq!(bob_run.status, crate::domain::AgentRunStatus::Completed);
+
+    let synthesis = counters.prompts.lock().unwrap().last().cloned().unwrap();
+    assert!(synthesis.contains("Agent: Ada"));
+    assert!(synthesis.contains("Status: failed"));
+    assert!(synthesis.contains("Error: Ada child failed"));
+    assert!(synthesis.contains("Agent: Bob"));
+    assert!(synthesis.contains("Status: completed"));
+    let coordinator_entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(coordinator_entries.len(), 2);
+    assert!(coordinator_entries.iter().any(|message| {
+        message.payload["name"] == "Ada"
+            && message.payload["status"] == "failed"
+            && message.payload["error"] == "Ada child failed"
+    }));
+    assert!(coordinator_entries.iter().any(|message| {
+        message.payload["name"] == "Bob"
+            && message.payload["status"] == "completed"
+            && message.payload["error"].is_null()
+    }));
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
+async fn stopping_explicit_mention_parent_cancels_children_without_synthesis() {
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(true, counters.clone())).await;
+    let store = cp.store().clone();
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: &str| crate::agents::types::AgentMutationInput {
+        name: name.into(),
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let ada = cp.registry().create(create("Ada")).await.unwrap();
+    let bob = cp.registry().create(create("Bob")).await.unwrap();
+    let text = "@Ada @Bob inspect the change";
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &[
+                crate::api::types::AgentMention {
+                    agent_id: ada.profile.id.clone(),
+                    label_snapshot: "Ada".into(),
+                    start_utf16: 0,
+                    end_utf16: 4,
+                },
+                crate::api::types::AgentMention {
+                    agent_id: bob.profile.id.clone(),
+                    label_snapshot: "Bob".into(),
+                    start_utf16: 5,
+                    end_utf16: 9,
+                },
+            ],
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(&counters.prompts, 2).await;
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
+    let children = runs
+        .iter()
+        .filter(|run| run.parent_run_id.as_deref() == Some(root.run_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 2);
+
+    cp.stop_session(&session.session_pk).await.unwrap();
+    let root = wait_for_primary_run_terminal(&store, &session.session_pk, &root.run_id).await;
+    assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
+    for child in children {
+        let child = wait_for_primary_run_terminal(&store, &session.session_pk, &child.run_id).await;
+        assert_eq!(child.status, crate::domain::AgentRunStatus::Cancelled);
+    }
+    assert_eq!(
+        counters.prompts.lock().unwrap().len(),
+        2,
+        "a stopped coordinator must not synthesize after child cancellation"
+    );
+    let coordinator_entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator_entries.len(),
+        2,
+        "each cancelled child outcome is durable"
+    );
+    assert!(coordinator_entries.iter().all(|message| {
+        message.block_type == "coordinator_outcome"
+            && message.payload["status"] == "cancelled"
+            && message.payload["error"] == "parent run cancelled"
+    }));
+    drop(db_guard);
 }
 
 #[tokio::test]
@@ -1943,6 +2196,7 @@ impl HarnessFactory for FailingResumeFactory {
         }
         Ok(Arc::new(FakeHarness {
             block_until_cancel: false,
+            fail_isolated_target: None,
             counters: self.counters.clone(),
         }))
     }

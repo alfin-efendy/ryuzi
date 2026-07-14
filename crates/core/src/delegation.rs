@@ -324,6 +324,52 @@ impl DelegationRuntime {
         Ok(self.register(run, snapshot).await.run)
     }
 
+    pub async fn cancel_descendants_of_root(
+        &self,
+        session_pk: &str,
+        root_run_id: &str,
+    ) -> anyhow::Result<()> {
+        let _admission = self.admission.lock().await;
+        let root = self
+            .store
+            .get_agent_run(root_run_id)
+            .await?
+            .ok_or_else(|| anyhow!("unknown agent run"))?;
+        if root.session_pk != session_pk || root.parent_run_id.is_some() {
+            bail!("only a root run in this session can cancel its descendants");
+        }
+        for run in self.store.list_descendant_agent_runs(root_run_id).await? {
+            if self
+                .store
+                .transition_agent_run(
+                    &run.run_id,
+                    &[AgentRunStatus::Queued, AgentRunStatus::Running],
+                    AgentRunStatus::Cancelled,
+                    None,
+                    Some("parent run cancelled"),
+                )
+                .await?
+            {
+                let run = self
+                    .store
+                    .get_agent_run(&run.run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("unknown agent run"))?;
+                self.emit(
+                    &run.session_pk,
+                    &run.run_id,
+                    run.parent_run_id.clone(),
+                    run.status,
+                );
+                if let Some(live) = self.live.lock().await.remove(&run.run_id) {
+                    live.cancel.cancel();
+                }
+                self.record_terminal(run).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn tree(&self, run_id: &str) -> anyhow::Result<(AgentRun, Vec<AgentRun>, AgentRun)> {
         let parent = self
             .store
