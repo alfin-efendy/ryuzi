@@ -1545,9 +1545,11 @@ impl ControlPlane {
                 .await;
             let outcomes = futures::future::join_all(queued.into_iter().map(|queued| {
                 let me = Arc::clone(&me);
+                let session_pk = session_pk.clone();
+                let root_run_id = run_id.clone();
                 let task = resolved_mentions.task.clone();
                 async move {
-                    match queued {
+                    let outcome = match queued {
                         Ok(child) => me.run_explicit_mention_child(child, task).await,
                         Err(error) => CoordinatorOutcome {
                             agent_id: String::new(),
@@ -1557,34 +1559,31 @@ impl ControlPlane {
                             result: None,
                             error: Some(error.to_string()),
                         },
-                    }
+                    };
+                    me.store
+                        .insert_run_message(
+                            &root_run_id,
+                            crate::domain::NewMessage::block(
+                                &session_pk,
+                                "system",
+                                "coordinator_outcome",
+                                serde_json::json!({
+                                    "agent_id": outcome.agent_id,
+                                    "name": outcome.agent_name,
+                                    "task": outcome.task,
+                                    "status": outcome.status,
+                                    "result": outcome.result,
+                                    "error": outcome.error,
+                                }),
+                            ),
+                        )
+                        .await
                 }
             }))
             .await;
-            for outcome in &outcomes {
-                if let Err(error) = me
-                    .store
-                    .insert_run_message(
-                        &run_id,
-                        crate::domain::NewMessage::block(
-                            &session_pk,
-                            "system",
-                            "coordinator_outcome",
-                            serde_json::json!({
-                                "agent_id": outcome.agent_id,
-                                "name": outcome.agent_name,
-                                "task": outcome.task,
-                                "status": outcome.status,
-                                "result": outcome.result,
-                                "error": outcome.error,
-                            }),
-                        ),
-                    )
-                    .await
-                {
-                    let _ = me.delegation.fail(&run_id, &error.to_string()).await;
-                    return;
-                }
+            if let Some(error) = outcomes.into_iter().find_map(Result::err) {
+                let _ = me.delegation.fail(&run_id, &error.to_string()).await;
+                return;
             }
             if coordinator_cancelled(&me.store, &session_pk, &run_id).await {
                 return;

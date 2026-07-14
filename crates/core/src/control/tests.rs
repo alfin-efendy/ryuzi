@@ -76,6 +76,7 @@ struct FakeSession {
     run_id: String,
     isolated_target: bool,
     block_until_cancel: bool,
+    completion_gate: Option<Arc<AtomicBool>>,
     failure: Option<String>,
     cancelled: Arc<AtomicBool>,
     send_count: Arc<AtomicUsize>,
@@ -143,6 +144,21 @@ impl HarnessSession for FakeSession {
 
         if let Some(failure) = &self.failure {
             anyhow::bail!(failure.clone());
+        }
+
+        if self
+            .completion_gate
+            .as_ref()
+            .is_some_and(|open| !open.load(Ordering::SeqCst))
+        {
+            while !self
+                .completion_gate
+                .as_ref()
+                .is_some_and(|open| open.load(Ordering::SeqCst))
+                && !self.cancelled.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         }
 
         if self.block_until_cancel {
@@ -218,6 +234,7 @@ struct Counters {
 
 struct FakeHarness {
     block_until_cancel: bool,
+    completion_gate: Option<(String, Arc<AtomicBool>)>,
     fail_isolated_target: Option<String>,
     counters: Counters,
 }
@@ -235,6 +252,10 @@ impl Harness for FakeHarness {
             run_id: ctx.run_id.clone(),
             isolated_target: ctx.isolated_target,
             block_until_cancel: self.block_until_cancel,
+            completion_gate: self.completion_gate.as_ref().and_then(|(name, open)| {
+                (ctx.isolated_target && ctx.primary_agent.profile.name == *name)
+                    .then(|| Arc::clone(open))
+            }),
             failure: (ctx.isolated_target
                 && self
                     .fail_isolated_target
@@ -255,6 +276,7 @@ impl Harness for FakeHarness {
 
 struct FakeHarnessFactory {
     block_until_cancel: bool,
+    completion_gate: Option<(String, Arc<AtomicBool>)>,
     fail_isolated_target: Option<String>,
     counters: Counters,
 }
@@ -263,6 +285,7 @@ impl HarnessFactory for FakeHarnessFactory {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
         Ok(Arc::new(FakeHarness {
             block_until_cancel: self.block_until_cancel,
+            completion_gate: self.completion_gate.clone(),
             fail_isolated_target: self.fail_isolated_target.clone(),
             counters: self.counters.clone(),
         }))
@@ -289,6 +312,7 @@ impl Harness for GatedHarness {
             run_id: ctx.run_id.clone(),
             isolated_target: ctx.isolated_target,
             block_until_cancel: false,
+            completion_gate: None,
             failure: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
@@ -341,6 +365,7 @@ impl Harness for LatchGatedHarness {
             run_id: ctx.run_id.clone(),
             isolated_target: ctx.isolated_target,
             block_until_cancel: false,
+            completion_gate: None,
             failure: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
@@ -379,6 +404,7 @@ fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
     let mut regs = Registries::new();
     regs.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel,
+        completion_gate: None,
         fail_isolated_target: None,
         counters,
     });
@@ -423,6 +449,7 @@ async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tem
     let mut regs = Registries::new();
     regs.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel: false,
+        completion_gate: None,
         fail_isolated_target: None,
         counters: counters.clone(),
     });
@@ -820,16 +847,17 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
 
 #[tokio::test]
 #[serial]
-async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_partial_failure_context()
-{
+async fn explicit_mentions_persist_completed_outcomes_while_a_sibling_is_pending() {
     let _guard = StateDirGuard::new();
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let counters = Counters::default();
+    let bob_completion_open = Arc::new(AtomicBool::new(false));
     let mut registries = Registries::new();
     registries.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel: false,
-        fail_isolated_target: Some("Ada".into()),
+        completion_gate: Some(("Bob".into(), Arc::clone(&bob_completion_open))),
+        fail_isolated_target: None,
         counters: counters.clone(),
     });
     let cp = test_control_plane(store, registries).await;
@@ -881,6 +909,118 @@ async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_parti
         .await
         .unwrap();
 
+    wait_for_prompts(&counters.prompts, 2).await;
+    let root = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.is_none())
+        .unwrap();
+    let entries = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let entries = store
+                .list_run_messages(&session.session_pk, &root.run_id)
+                .await
+                .unwrap();
+            if entries.len() == 1 {
+                return entries;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Ada's terminal outcome must be durable before Bob completes");
+    assert_eq!(entries[0].payload["name"], "Ada");
+    assert_eq!(entries[0].payload["status"], "completed");
+    assert_eq!(
+        crate::mentions::coordinator_context_from_run(&store, &session.session_pk, &root.run_id)
+            .await
+            .unwrap(),
+        "Agent: Ada\nTask:   inspect the change\nStatus: completed\nResult: working\nError: "
+    );
+    let bob_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.executing_agent_id.as_deref() == Some(bob.profile.id.as_str()))
+        .unwrap();
+    assert_eq!(bob_run.status, crate::domain::AgentRunStatus::Running);
+    assert_eq!(
+        counters.prompts.lock().unwrap().len(),
+        2,
+        "synthesis must wait for every child to reach a terminal state"
+    );
+
+    bob_completion_open.store(true, Ordering::SeqCst);
+    wait_for_prompts(&counters.prompts, 3).await;
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_partial_failure_context()
+{
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let mut registries = Registries::new();
+    registries.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel: false,
+        completion_gate: None,
+        fail_isolated_target: Some("Ada".into()),
+        counters: counters.clone(),
+    });
+    let cp = test_control_plane(store, registries).await;
+    let store = cp.store().clone();
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: &str| crate::agents::types::AgentMutationInput {
+        name: name.into(),
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let ada = cp.registry().create(create("Ada")).await.unwrap();
+    let bob = cp.registry().create(create("Bob")).await.unwrap();
+    let text = "@Ada @Bob inspect the change";
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &[
+                crate::api::types::AgentMention {
+                    agent_id: ada.profile.id.clone(),
+                    label_snapshot: "Ada".into(),
+                    start_utf16: 0,
+                    end_utf16: 4,
+                },
+                crate::api::types::AgentMention {
+                    agent_id: bob.profile.id.clone(),
+                    label_snapshot: "Bob".into(),
+                    start_utf16: 5,
+                    end_utf16: 9,
+                },
+            ],
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
     wait_for_prompts(&counters.prompts, 3).await;
     let runs = store
         .list_session_agent_runs(&session.session_pk)
@@ -2196,6 +2336,7 @@ impl HarnessFactory for FailingResumeFactory {
         }
         Ok(Arc::new(FakeHarness {
             block_until_cancel: false,
+            completion_gate: None,
             fail_isolated_target: None,
             counters: self.counters.clone(),
         }))
