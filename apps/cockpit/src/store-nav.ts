@@ -146,11 +146,6 @@ type NavState = {
   composerBranch: string | null;
   /** Run the session in an isolated git worktree (matrix column 1). */
   composerUseWorktree: boolean;
-  /** Model the next composed session should run on; null = fall back to the
-   *  project's pinned model, then the agent's default model (see HomeView). */
-  composerModel: string | null;
-  /** Chat-only effort override paired with composerModel; project composers use project runtime state. */
-  composerEffort: string | null;
   /** Unsent composer text keyed by composer identity: a sessionPk (SessionView)
    *  or `home:{projectId}` (HomeView). Persisted so drafts survive restarts. */
   drafts: Record<string, string>;
@@ -173,8 +168,6 @@ type NavState = {
   setSearchQuery: (q: string) => void;
   setComposerBranch: (b: string | null) => void;
   setComposerUseWorktree: (v: boolean) => void;
-  setComposerModel: (model: string | null) => void;
-  setComposerEffort: (effort: string | null) => void;
   setDraft: (key: string, text: string) => void;
   clearDraft: (key: string) => void;
   /** Refill a draft after a failed send — no-op if the user already typed anew. */
@@ -202,8 +195,6 @@ export const useNav = create<NavState>((set, get) => ({
   searchQuery: "",
   composerBranch: null,
   composerUseWorktree: true,
-  composerModel: null,
-  composerEffort: null,
   drafts: readDrafts(readStored(KEY_DRAFTS)),
   projectSettingsFor: null,
   pendingPrimaryAgentId: null,
@@ -251,8 +242,6 @@ export const useNav = create<NavState>((set, get) => ({
   setSearchQuery: (q) => set({ searchQuery: q }),
   setComposerBranch: (b) => set({ composerBranch: b }),
   setComposerUseWorktree: (v) => set({ composerUseWorktree: v }),
-  setComposerModel: (model) => set({ composerModel: model }),
-  setComposerEffort: (effort) => set({ composerEffort: effort }),
   setDraft: (key, text) =>
     set((s) => {
       const drafts = upsertDraft(s.drafts, key, text);

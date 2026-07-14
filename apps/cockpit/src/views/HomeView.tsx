@@ -152,19 +152,18 @@ export function HomeView() {
     setListening(true);
   };
 
+  const primaryAgentId = choosePrimaryAgent(
+    registry?.agents ?? [],
+    nav.pendingPrimaryAgentId,
+    localStorage.getItem(LAST_PRIMARY_AGENT_KEY),
+    registry?.defaultAgentId ?? null,
+  );
+  const hasExecutablePrimary = primaryAgentId !== null;
+
   const send = async () => {
     const text = draft.trim();
-    if (!text && composerFiles.attachments.length === 0) return;
-    const primaryAgentId = choosePrimaryAgent(
-      registry?.agents ?? [],
-      useNav.getState().consumePendingPrimaryAgentId(),
-      localStorage.getItem(LAST_PRIMARY_AGENT_KEY),
-      registry?.defaultAgentId ?? null,
-    );
-    if (!primaryAgentId) {
-      toast.error("No executable agent is available.");
-      return;
-    }
+    if (!hasExecutablePrimary || (!text && composerFiles.attachments.length === 0)) return;
+    useNav.getState().consumePendingPrimaryAgentId();
     const typed = draft;
     const turn = {
       text,
@@ -203,6 +202,7 @@ export function HomeView() {
               }
             }}
             onPaste={composerFiles.onPaste}
+            disabled={!hasExecutablePrimary}
             placeholder="Do anything"
             className="max-h-[40vh] resize-none overflow-y-auto border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
           />
@@ -234,6 +234,7 @@ export function HomeView() {
               size="icon-sm"
               title="Attach"
               onClick={() => void composerFiles.attachFiles()}
+              disabled={!hasExecutablePrimary}
               className="rounded-full text-muted-foreground"
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
@@ -244,14 +245,23 @@ export function HomeView() {
               size="icon-sm"
               title="Voice"
               onClick={toggleVoice}
+              disabled={!hasExecutablePrimary}
               className={`rounded-full ${listening ? "bg-accent text-accent-foreground" : "text-muted-foreground"}`}
             >
               <Mic aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             </Button>
-            <Button size="icon" title="Start session" onClick={() => void send()} className="rounded-full">
+            <Button size="icon" title="Start session" onClick={() => void send()} disabled={!hasExecutablePrimary} className="rounded-full">
               <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
             </Button>
           </div>
+          {!hasExecutablePrimary ? (
+            <div className="flex items-center justify-between gap-3 border-t border-border px-3 py-2 text-sm text-muted-foreground">
+              <span>No executable agent is available.</span>
+              <Button variant="outline" size="sm" onClick={() => nav.navigate({ kind: "agents" })}>
+                Repair agents
+              </Button>
+            </div>
+          ) : null}
           {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-3 pb-2">
               {contextRefs.map((path) => (

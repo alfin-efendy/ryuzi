@@ -44,7 +44,6 @@ function reset() {
     loaded: {},
     contextUsage: {},
     projectRuntimeById: {},
-    sessionRuntimeById: {},
     sessionCost: {},
     queued: {},
   });
@@ -1154,39 +1153,6 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   startChat.mockRestore();
   listProjects.mockRestore();
   listSessions.mockRestore();
-});
-
-test("projectless session runtime loads and updates independently", async () => {
-  reset();
-  const initial = {
-    sessionPk: "c1",
-    model: "fixture/model-alpha",
-    storedEffort: "medium",
-    effectiveEffort: "medium",
-    effectiveEffortLabel: "Medium",
-    effectiveSource: "session" as const,
-    storedEffortStatus: "valid" as const,
-    modelInfo: null,
-  };
-  const runtimeCommands = commands as typeof commands & {
-    sessionRuntimeInfo: typeof commands.projectRuntimeInfo;
-    updateSessionRuntime: typeof commands.updateProjectRuntime;
-  };
-  const sessionInfo = mock(async () => ({ status: "ok" as const, data: initial }));
-  const update = mock(async () => ({
-    status: "ok" as const,
-    data: { ...initial, model: "fixture/model-beta", storedEffort: "ultra" },
-  }));
-  Object.assign(runtimeCommands, { sessionRuntimeInfo: sessionInfo, updateSessionRuntime: update });
-
-  await useStore.getState().loadSessionRuntime(LOCAL_RUNNER, "c1");
-  expect(useStore.getState().sessionRuntimeById.c1).toEqual(initial);
-  await useStore.getState().setSessionRuntime(LOCAL_RUNNER, "c1", "fixture/model-beta", "ultra");
-  expect(update).toHaveBeenCalledWith(LOCAL_RUNNER, "c1", "fixture/model-beta", "ultra");
-  expect(useStore.getState().sessionRuntimeById.c1).toMatchObject({ model: "fixture/model-beta", storedEffort: "ultra" });
-
-  delete (runtimeCommands as Partial<typeof runtimeCommands>).sessionRuntimeInfo;
-  delete (runtimeCommands as Partial<typeof runtimeCommands>).updateSessionRuntime;
 });
 
 test("startChat returns false and does not focus on backend error", async () => {

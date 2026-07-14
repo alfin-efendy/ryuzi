@@ -8,15 +8,13 @@ import {
   type Message,
   type TurnInput,
   type GitOptions,
-  type PermMode,
   type ApprovalKind,
   type ApprovalResponse,
   type ModelPreferenceKey,
-  type ProjectRuntimeInfo,
-  type SessionRuntimeInfo,
   type ModelCost,
   type OrchTask,
   type Principal,
+  type ProjectRuntimeInfo,
 } from "./bindings";
 import { basename } from "./lib/paths";
 import { useNative } from "./store-native";
@@ -76,7 +74,6 @@ type State = {
     }
   >;
   projectRuntimeById: Record<string, ProjectRuntimeInfo>;
-  sessionRuntimeById: Record<string, SessionRuntimeInfo>;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   /** Per-session in-memory type-ahead queue (messages typed while running). */
@@ -104,10 +101,6 @@ type State = {
   setProjectRuntime: (projectId: string, model: string | null, effort: string | null) => Promise<boolean>;
   setModelEffortPreference: (key: ModelPreferenceKey, effort: string | null) => Promise<boolean>;
   refreshModelConfiguration: () => Promise<void>;
-  loadSessionRuntime: (runnerId: string, sessionPk: string) => Promise<void>;
-  setSessionRuntime: (runnerId: string, sessionPk: string, model: string | null, effort: string | null) => Promise<boolean>;
-  /** Change the permission mode this session (only this session) runs under. */
-  setSessionPermMode: (runnerId: string, sessionPk: string, permMode: PermMode) => Promise<void>;
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. `runnerId` is the
    *  runner the session is created on (defaults to the local engine). */
@@ -127,12 +120,6 @@ type State = {
   refetchTranscript: (runnerId: string, pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   /** Fetches the full task graph under `rootId` (a fresh strip on mount). */
   loadOrchTasks: (rootId: string) => Promise<void>;
-  /** Submit a fresh goal for orchestrated execution (the composer's
-   *  "Orchestrate" toggle / `/orchestrate` entry) — bound to the currently
-   *  attached project and the currently focused home chat, so worker
-   *  bubbles, block-for-human cards, and the aggregate report have somewhere
-   *  to post into. Resolves false (a no-op) without both. */
-  startOrchestration: (prompt: string, decompose?: boolean) => Promise<boolean>;
   /** Answer a worker's blocking question (BlockCard's inline composer). */
   orchAnswerBlock: (taskId: string, answer: string) => Promise<void>;
   init: () => Promise<void>;
@@ -172,8 +159,6 @@ type RuntimeQueue<T> = {
 };
 
 const projectRuntimeQueues = new Map<string, RuntimeQueue<ProjectRuntimeInfo>>();
-const sessionRuntimeLoadGeneration = new Map<string, number>();
-const sessionRuntimeQueues = new Map<string, RuntimeQueue<SessionRuntimeInfo>>();
 
 function nextGeneration(generations: Map<string, number>, projectId: string): number {
   const generation = (generations.get(projectId) ?? 0) + 1;
@@ -193,7 +178,6 @@ export const useStore = create<State>((set, get) => ({
   loaded: {},
   contextUsage: {},
   projectRuntimeById: {},
-  sessionRuntimeById: {},
   sessionCost: {},
   orchTasks: {},
 
@@ -399,14 +383,6 @@ export const useStore = create<State>((set, get) => ({
     if (res.status === "ok") set((st) => ({ orchTasks: { ...st.orchTasks, [rootId]: res.data } }));
   },
 
-  startOrchestration: async (prompt, decompose = true) => {
-    const projectId = get().selectedProjectId;
-    const home = get().focusedSession;
-    if (!projectId || !home) return false;
-    const res = await commands.orchSubmit(projectId, prompt, decompose, home.pk);
-    if (res.status === "error") toast.error("Couldn't start orchestration: " + res.error.message);
-    return res.status === "ok";
-  },
   orchAnswerBlock: async (taskId, answer) => {
     const res = await commands.orchAnswerBlock(taskId, answer);
     if (res.status === "error") toast.error("Couldn't send the answer: " + res.error.message);
@@ -598,91 +574,6 @@ export const useStore = create<State>((set, get) => ({
     await get().refreshModelConfiguration();
     return true;
   },
-  loadSessionRuntime: async (runnerId, sessionPk) => {
-    const loadGeneration = nextGeneration(sessionRuntimeLoadGeneration, sessionPk);
-    const queue = sessionRuntimeQueues.get(sessionPk);
-    const intent = queue?.latestIntent ?? 0;
-    const res = await commands.sessionRuntimeInfo(runnerId, sessionPk);
-    if (
-      res.status === "ok" &&
-      sessionRuntimeLoadGeneration.get(sessionPk) === loadGeneration &&
-      (sessionRuntimeQueues.get(sessionPk)?.latestIntent ?? 0) === intent
-    ) {
-      set((st) => ({ sessionRuntimeById: { ...st.sessionRuntimeById, [sessionPk]: res.data } }));
-    }
-  },
-  setSessionRuntime: async (runnerId, sessionPk, model, effort) => {
-    const previousRuntime = get().sessionRuntimeById[sessionPk];
-    let queue = sessionRuntimeQueues.get(sessionPk);
-    if (!queue) {
-      queue = {
-        tail: Promise.resolve(),
-        pending: 0,
-        latestIntent: 0,
-        confirmedModel: previousRuntime?.model ?? null,
-        confirmedEffort: previousRuntime?.storedEffort ?? null,
-        confirmedRuntime: previousRuntime,
-      };
-      sessionRuntimeQueues.set(sessionPk, queue);
-    }
-    const intent = ++queue.latestIntent;
-    queue.pending += 1;
-    const optimistic: SessionRuntimeInfo = previousRuntime
-      ? { ...previousRuntime, model, storedEffort: effort }
-      : {
-          sessionPk,
-          model,
-          storedEffort: effort,
-          effectiveEffort: effort,
-          effectiveEffortLabel: effort,
-          effectiveSource: effort ? "project" : "none",
-          storedEffortStatus: "valid",
-          modelInfo: null,
-        };
-    set((st) => ({ sessionRuntimeById: { ...st.sessionRuntimeById, [sessionPk]: optimistic } }));
-    let succeeded = false;
-    const execute = async () => {
-      try {
-        const res = await commands.updateSessionRuntime(runnerId, sessionPk, model, effort);
-        succeeded = res.status === "ok";
-        if (res.status === "ok") {
-          queue.confirmedRuntime = res.data;
-          queue.confirmedModel = res.data.model;
-          queue.confirmedEffort = res.data.storedEffort;
-        } else {
-          toast.error("Couldn't set chat model and effort: " + res.error.message);
-        }
-      } catch (error) {
-        toast.error("Couldn't set chat model and effort: " + String(error));
-      }
-      queue.pending -= 1;
-      if (intent === queue.latestIntent) {
-        const confirmed = queue.confirmedRuntime;
-        set((st) => {
-          const next = { ...st.sessionRuntimeById };
-          if (confirmed) next[sessionPk] = { ...confirmed, sessionPk };
-          else delete next[sessionPk];
-          return { sessionRuntimeById: next };
-        });
-      }
-      if (queue.pending === 0) sessionRuntimeQueues.delete(sessionPk);
-    };
-    const task = queue.pending === 1 ? execute() : queue.tail.then(execute);
-    queue.tail = task.catch(() => undefined);
-    await task;
-    return succeeded;
-  },
-  setSessionPermMode: async (runnerId, sessionPk, permMode) => {
-    const session = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }));
-    if (!session || session.permMode === permMode) return;
-    set({ sessions: get().sessions.map((s) => (isSession(s, { runnerId, pk: sessionPk }) ? { ...s, permMode } : s)) });
-    const res = await commands.updateSessionPermMode(runnerId, sessionPk, permMode);
-    if (res.status === "error") {
-      toast.error("Couldn't set permission mode: " + res.error.message);
-      await get().refresh();
-    }
-  },
-
   start: async (runnerId, projectId, primaryAgentId, turn) => {
     const res = await commands.startSession(runnerId, projectId, primaryAgentId, turn);
     if (res.status === "error") {

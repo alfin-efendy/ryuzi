@@ -223,19 +223,10 @@ const initialProjectRuntime = {
   modelInfo: null,
 };
 
-const initialSessionRuntime = {
-  sessionPk: "c-1",
-  model: null,
-  storedEffort: null,
-  effectiveEffort: null,
-  effectiveEffortLabel: null,
-  effectiveSource: "none",
-  storedEffortStatus: "valid",
-  modelInfo: null,
-};
-
 export const SESSION = {
   sessionPk: "s-1",
+  primaryAgentId: "ryuzi",
+  primaryAgentSnapshot: { id: "ryuzi", name: "Ryuzi", avatarColor: "#7C3AED" },
   projectId: "p-demo",
   agentSessionId: null,
   worktreePath: null,
@@ -376,8 +367,6 @@ const FIXTURES: Record<string, unknown> = {
   connection_usage: null,
   set_model_effort_preference: null,
   start_chat_session: CHAT_SESSION,
-  session_runtime_info: initialSessionRuntime,
-  update_session_runtime: initialSessionRuntime,
 };
 
 /**
@@ -439,32 +428,6 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         effectiveSource: string;
         storedEffortStatus: string;
         modelInfo: (typeof SELECTABLE_MODELS)[number] | null;
-      };
-      let sessionRuntime = fixtures.session_runtime_info as {
-        sessionPk: string;
-        model: string | null;
-        storedEffort: string | null;
-        effectiveEffort: string | null;
-        effectiveEffortLabel: string | null;
-        effectiveSource: string;
-        storedEffortStatus: string;
-        modelInfo: (typeof SELECTABLE_MODELS)[number] | null;
-      };
-
-      const resolveRuntime = (owner: { projectId: string } | { sessionPk: string }, model: string | null, effort: string | null) => {
-        const modelInfo = (fixtures.list_selectable_models as typeof SELECTABLE_MODELS).find((entry) => entry.requestValue === model);
-        const fallback = modelInfo?.supported.find((option) => option.value === modelInfo.resolvedDefault) ?? null;
-        const selected = modelInfo?.supported.find((option) => option.value === effort) ?? fallback;
-        return {
-          ...owner,
-          model,
-          storedEffort: effort,
-          effectiveEffort: selected?.value ?? null,
-          effectiveEffortLabel: selected?.label ?? null,
-          effectiveSource: effort ? "project" : modelInfo ? "provider" : "none",
-          storedEffortStatus: "valid",
-          modelInfo: modelInfo ?? null,
-        };
       };
       let cbId = 1;
       const eventHandlers = new Map<string, number[]>();
@@ -627,8 +590,6 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           }
           if (cmd === "start_chat_session") {
             const session = fixtures.start_chat_session as typeof CHAT_SESSION;
-            const options = (args as { options?: { model?: string | null; effort?: string | null } }).options;
-            sessionRuntime = resolveRuntime({ sessionPk: session.sessionPk }, options?.model ?? null, options?.effort ?? null);
             sessions = [session];
             persist();
             observeRoute(session.sessionPk);
@@ -663,12 +624,6 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
               modelInfo: modelInfo ?? null,
             };
             return Promise.resolve(projectRuntime);
-          }
-          if (cmd === "session_runtime_info") return Promise.resolve(sessionRuntime);
-          if (cmd === "update_session_runtime") {
-            const update = args as { sessionPk: string; model: string | null; effort: string | null };
-            sessionRuntime = resolveRuntime({ sessionPk: update.sessionPk }, update.model, update.effort);
-            return Promise.resolve(sessionRuntime);
           }
           if (cmd === "connection_provider_quota") {
             const { id } = args as { id: string };

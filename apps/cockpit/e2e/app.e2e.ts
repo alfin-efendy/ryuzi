@@ -74,32 +74,7 @@ test("composer Enter with no project starts a chat session and navigates to it",
   await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
   await expect(page.getByRole("heading", { name: /What should we build/ })).toHaveCount(0);
   const start = (await mockCalls(page)).find((c) => c.cmd === "start_chat_session");
-  expect(start?.args).toMatchObject({ prompt: "build me a test" });
-});
-
-test("projectless chat persists model and effort from Home and can change them in Session", async ({ page }) => {
-  await page.goto("/");
-  const homeTrigger = page.getByRole("button", { name: "Model and effort" });
-  await homeTrigger.click();
-  await page.getByText("Model Alpha", { exact: true }).click();
-  await page.getByText("High", { exact: true }).click();
-
-  const composer = page.getByPlaceholder("Do anything");
-  await composer.fill("chat with explicit effort");
-  await composer.press("Enter");
-  await expect
-    .poll(async () => (await mockCalls(page)).find((call) => call.cmd === "start_chat_session")?.args)
-    .toMatchObject({ options: { model: "fixture/model-alpha", effort: "high" } });
-
-  const sessionTrigger = page.getByRole("button", { name: "Model and effort" });
-  await expect(sessionTrigger).toContainText("Model Alpha");
-  await expect(sessionTrigger).toContainText("High");
-  await sessionTrigger.click();
-  await page.getByText("Model Beta", { exact: true }).click();
-  await page.getByText("Ultra", { exact: true }).click();
-  await expect
-    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_session_runtime").at(-1)?.args)
-    .toMatchObject({ sessionPk: "c-1", model: "fixture/model-beta", effort: "ultra" });
+  expect(start?.args).toMatchObject({ turn: { text: "build me a test" } });
 });
 
 test("composer Enter with a project selected starts a project session", async ({ page }) => {
@@ -113,72 +88,7 @@ test("composer Enter with a project selected starts a project session", async ({
   await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_session")).toBe(true);
   await expect(page.getByRole("heading", { name: /What should we build/ })).toHaveCount(0);
   const start = (await mockCalls(page)).find((c) => c.cmd === "start_session");
-  expect(start?.args).toMatchObject({
-    projectId: "p-demo",
-    prompt: "build me a test",
-  });
-});
-
-test("structured model effort choices follow the selected execution surface", async ({ page }) => {
-  await page.goto("/");
-  await selectDemoProject(page);
-
-  const trigger = page.getByRole("button", { name: "Model and effort" });
-  await trigger.click();
-  await page.getByText("Model Alpha", { exact: true }).click();
-
-  await trigger.click();
-  await expect(page.getByText("Light", { exact: true })).toBeVisible();
-  await expect(page.getByText("Medium", { exact: true })).toBeVisible();
-  await expect(page.getByText("High", { exact: true })).toBeVisible();
-  await expect(page.getByText("Extra high", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Ultra", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Advanced", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Speed", { exact: true })).toHaveCount(0);
-  await page.getByText("Medium", { exact: true }).click();
-
-  await trigger.click();
-  await page.getByText("Model Beta", { exact: true }).click();
-  await trigger.click();
-  await expect(page.getByText("Light", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Medium", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("High", { exact: true })).toBeVisible();
-  await expect(page.getByText("Extra high", { exact: true })).toBeVisible();
-  await expect(page.getByText("Ultra", { exact: true })).toBeVisible();
-
-  await page.getByText("Named safe route", { exact: true }).click();
-  await trigger.click();
-  await expect(page.getByText("High", { exact: true })).toBeVisible();
-  await expect(page.getByText("Read-only effort", { exact: true })).toBeVisible();
-  await expect(page.getByText("Light", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Medium", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Extra high", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("Ultra", { exact: true })).toHaveCount(0);
-});
-
-test("project effort override can return to the model default", async ({ page }) => {
-  await page.goto("/");
-  await selectDemoProject(page);
-  const trigger = page.getByRole("button", { name: "Model and effort" });
-  await trigger.click();
-  await page.getByText("Model Alpha", { exact: true }).click();
-  await trigger.click();
-  await page.getByText("High", { exact: true }).click();
-  await trigger.click();
-  await page.getByText(/Model default/).click();
-
-  await expect
-    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_project_runtime").at(-1)?.args)
-    .toMatchObject({ projectId: "p-demo", model: "fixture/model-alpha", effort: null });
-
-  const readsBeforeRemount = (await mockCalls(page)).filter((call) => call.cmd === "project_runtime_info").length;
-  await page.getByText("Models", { exact: true }).first().click();
-  await page.getByText("New session", { exact: true }).first().click();
-  await expect
-    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "project_runtime_info").length)
-    .toBeGreaterThan(readsBeforeRemount);
-  await expect(trigger).toContainText("Model Alpha");
-  await expect(trigger).toContainText("Model default");
+  expect(start?.args).toMatchObject({ projectId: "p-demo", turn: { text: "build me a test" } });
 });
 
 test("provider screen writes the global default for a concrete model", async ({ page }) => {
@@ -193,33 +103,8 @@ test("provider screen writes the global default for a concrete model", async ({ 
     .toMatchObject({ key: { family: "fixture", model: "model-alpha" }, effort: "high" });
 });
 
-test("running session effort changes are marked for the next turn", async ({ page }) => {
-  await page.goto("/");
-  await selectDemoProject(page);
-  const homeTrigger = page.getByRole("button", { name: "Model and effort" });
-  await homeTrigger.click();
-  await page.getByText("Model Beta", { exact: true }).click();
-  await page.getByPlaceholder("Do anything").fill("start fixture session");
-  await page.getByTitle("Start session").click();
-
-  const sessionTrigger = page.getByRole("button", { name: "Model and effort" });
-  await sessionTrigger.click();
-  await expect(page.getByText("Changes apply to the next turns.", { exact: true })).toBeVisible();
-  await page.getByText("Ultra", { exact: true }).click();
-  await expect
-    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "update_project_runtime").at(-1)?.args)
-    .toMatchObject({ projectId: "p-demo", model: "fixture/model-beta", effort: "ultra" });
-});
-
 test("route switch notices render live once and survive reload", async ({ page }) => {
   await page.goto("/");
-  await selectDemoProject(page);
-
-  const homeTrigger = page.getByRole("button", { name: "Model and effort" });
-  await homeTrigger.click();
-  await page.getByText("Model Alpha", { exact: true }).click();
-  await homeTrigger.click();
-  await page.getByText("High", { exact: true }).click();
   await page.getByPlaceholder("Do anything").fill("establish route baseline");
   await page.getByTitle("Start session").click();
 
@@ -228,32 +113,25 @@ test("route switch notices render live once and survive reload", async ({ page }
   await page.getByTitle("Stop").click();
   await expect(page.getByTitle("Send")).toBeVisible();
 
-  const sessionTrigger = page.getByRole("button", { name: "Model and effort" });
-  await sessionTrigger.click();
-  await page.getByText("Model Beta", { exact: true }).click();
-  await sessionTrigger.click();
-  await page.getByText("Ultra", { exact: true }).click();
-
   const sendTurn = async (text: string) => {
     await page.getByPlaceholder("Ask for follow-up changes").fill(text);
     await page.getByTitle("Send").click();
     await expect(page.getByTitle("Send")).toBeVisible();
   };
 
-  await sendTurn("use the new model");
-  await expect(page.getByText("Switched to Model Beta · Ultra", { exact: true })).toHaveCount(1);
+  await sendTurn("use the same route");
+  await expect(switchNotices).toHaveCount(0);
 
   await sendTurn("rotate the account");
   await expect(page.getByText("Account switched to Backup account · round robin", { exact: true })).toHaveCount(1);
 
   await sendTurn("keep this route");
-  await expect(switchNotices).toHaveCount(2);
+  await expect(switchNotices).toHaveCount(1);
 
   await page.reload();
   await page.getByText("Untitled session", { exact: true }).click();
-  await expect(page.getByText("Switched to Model Beta · Ultra", { exact: true })).toHaveCount(1);
   await expect(page.getByText("Account switched to Backup account · round robin", { exact: true })).toHaveCount(1);
-  await expect(switchNotices).toHaveCount(2);
+  await expect(switchNotices).toHaveCount(1);
 });
 
 test("resolved provider and family changes are durable identity changes", async ({ page }) => {

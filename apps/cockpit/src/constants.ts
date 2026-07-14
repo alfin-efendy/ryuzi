@@ -11,46 +11,6 @@ export const PROJECTS_ROOT_KEY = "projects_root";
 // default app-data location.
 export const WORKTREE_DIR_KEY = "worktree_dir";
 
-export type UiPermMode = "plan" | "ask" | "edit" | "full";
-
-export const PERM_MODES: { id: UiPermMode; label: string; desc: string }[] = [
-  { id: "plan", label: "Plan", desc: "Proposes a plan first; every action needs approval." },
-  { id: "ask", label: "Ask", desc: "Asks before edits and shell commands." },
-  { id: "edit", label: "Edit", desc: "Edits files freely, asks before shell commands." },
-  { id: "full", label: "Full", desc: "Full access — no approval prompts." },
-];
-
-// The project row stores the engine's `PermMode`; the composer speaks the UI
-// four-mode vocabulary. These keep the two in sync (maps onto the engine's
-// PermMode at session start).
-export type CorePermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
-
-export function corePermToUi(mode: CorePermMode | string): UiPermMode {
-  switch (mode) {
-    case "plan":
-      return "plan";
-    case "acceptEdits":
-      return "edit";
-    case "bypassPermissions":
-      return "full";
-    default:
-      return "ask";
-  }
-}
-
-export function uiPermToCore(mode: UiPermMode): CorePermMode {
-  switch (mode) {
-    case "plan":
-      return "plan";
-    case "edit":
-      return "acceptEdits";
-    case "full":
-      return "bypassPermissions";
-    default:
-      return "default";
-  }
-}
-
 export type GatewayFsMode = "full" | "projects" | "read";
 
 export const GW_FS_MODES: { id: GatewayFsMode; label: string; desc: string }[] = [

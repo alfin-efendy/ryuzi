@@ -321,7 +321,7 @@ test("uses a persisted executable primary when no pending choice exists", async 
   await waitFor(() => expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "stored", expect.anything()));
 });
 
-test("does not start or clear the draft when no executable primary exists", async () => {
+test("disables the composer and navigates to agent repair when no executable primary exists", () => {
   useAgents.setState({
     registry: {
       agents: [{ ...useAgents.getState().registry!.agents[0], executable: false }],
@@ -330,13 +330,17 @@ test("does not start or clear the draft when no executable primary exists", asyn
       subagentModel: { kind: "route", route: "fast" },
     },
   });
+  useNav.setState({ drafts: { "home:p1": "keep this" } });
   render(<HomeView />);
-  const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
-  fireEvent.change(box, { target: { value: "keep this" } });
-  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
 
-  expect(startSession).not.toHaveBeenCalled();
+  const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  expect(box.disabled).toBe(true);
   expect(box.value).toBe("keep this");
+  expect(screen.getByRole("button", { name: "Start session" }).hasAttribute("disabled")).toBe(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "Repair agents" }));
+  expect(useNav.getState().view()).toEqual({ kind: "agents" });
+  expect(startSession).not.toHaveBeenCalled();
 });
 
 test("starts a chat without a project using the selected primary", async () => {

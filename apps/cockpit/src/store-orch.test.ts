@@ -119,27 +119,6 @@ test("answering a block calls orchAnswerBlock with the task id", async () => {
   spy.mockRestore();
 });
 
-test("startOrchestration submits when both a project and a focused home session are present", async () => {
-  useStore.setState({ selectedProjectId: "p1", focusedSession: { runnerId: LOCAL_RUNNER, pk: "home-1" } });
-  const submit = spyOn(commands, "orchSubmit").mockResolvedValue({ status: "ok", data: "root-1" });
-  await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(true);
-  expect(submit).toHaveBeenCalledWith("p1", "fix the bug", true, "home-1");
-  submit.mockRestore();
-});
-
-test("startOrchestration is a no-op without both an attached project and a focused home session", async () => {
-  const submit = spyOn(commands, "orchSubmit");
-
-  useStore.setState({ selectedProjectId: null, focusedSession: { runnerId: LOCAL_RUNNER, pk: "home-1" } });
-  await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(false);
-
-  useStore.setState({ selectedProjectId: "p1", focusedSession: null });
-  await expect(useStore.getState().startOrchestration("fix the bug")).resolves.toBe(false);
-
-  expect(submit).not.toHaveBeenCalled();
-  submit.mockRestore();
-});
-
 test("send steers a live orchestration and does not also send a normal chat turn", async () => {
   useStore.setState({ sessions: [] });
   const steer = spyOn(commands, "orchSteer").mockResolvedValue({ status: "ok", data: "noted" });
