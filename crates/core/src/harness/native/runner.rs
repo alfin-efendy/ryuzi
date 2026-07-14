@@ -272,6 +272,7 @@ pub async fn run_turn(
                     .as_u64()
                     .unwrap_or(st.percent_left as u64) as u8,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 output_tokens: 0,
             });
             // Re-emit the accumulated session cost from what's already
@@ -1984,6 +1985,7 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         usable_window: st.usable_window,
         percent_left: st.percent_left,
         cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
         output_tokens: cm.last_output(),
     });
 
@@ -2053,6 +2055,7 @@ async fn emit_context_display(deps: &RunnerDeps, cm: &ContextManager, emit: bool
         usable_window: st.usable_window,
         percent_left: st.percent_left,
         cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
         output_tokens: cm.last_output(),
     });
 
@@ -3954,6 +3957,41 @@ mod tests {
         assert_eq!(
             after_display["models"]["test/model"], saved_after_commit,
             "display-only re-emit must not change the persisted tally"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_context_usage_reports_cache_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+        let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        cm.observe_message_start(&json!({
+            "usage": { "input_tokens": 30_000, "cache_creation_input_tokens": 12_000 }
+        }));
+        cm.commit_response();
+
+        let mut rx = deps.events.subscribe();
+        emit_context_usage(&deps, &cm, true).await;
+
+        let mut creation = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::ContextUsage {
+                cache_creation_tokens,
+                ..
+            } = ev
+            {
+                creation = Some(cache_creation_tokens);
+                break;
+            }
+        }
+        assert_eq!(
+            creation,
+            Some(12_000),
+            "cache_creation must be surfaced on the event"
         );
     }
 

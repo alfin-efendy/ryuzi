@@ -19,6 +19,7 @@ test("contextUsage keeps window + cache + output fields", () => {
       usable_window: 190000,
       percent_left: 95,
       cache_read_tokens: 300,
+      cache_creation_tokens: 4000,
       output_tokens: 512,
     } as CoreEvent,
     LOCAL_RUNNER,
@@ -29,6 +30,7 @@ test("contextUsage keeps window + cache + output fields", () => {
     percentLeft: 95,
     contextWindow: 200000,
     cacheReadTokens: 300,
+    cacheCreationTokens: 4000,
     outputTokens: 512,
   });
 });
