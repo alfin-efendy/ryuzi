@@ -529,45 +529,48 @@ fn parse_telemetry_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Val
 #[tokio::test]
 async fn gateway_status_adapter_dispatches_only_matching_hook() {
     let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "project-1").await;
     let matching = crate::automation::create_hook(
         &store,
-        crate::automation::HookInput::outbound(
+        crate::automation::HookInput::agent_run(
             "gateway status",
             crate::automation::TriggerKind::GatewayStatusChanged,
-            "https://example.com/status",
-            None,
+            "project-1",
+            "",
+            "local",
+            "record the gateway status",
         ),
     )
     .await
     .unwrap();
     let other = crate::automation::create_hook(
         &store,
-        crate::automation::HookInput::outbound(
+        crate::automation::HookInput::agent_run(
             "session end",
             crate::automation::TriggerKind::SessionEnd,
-            "https://example.com/end",
-            None,
+            "project-1",
+            "",
+            "local",
+            "ignore",
         ),
     )
     .await
     .unwrap();
 
-    // The gateway table has no operational status column and its only writer
-    // (`gateways::upsert_row`) persists configuration. This adapter is thus the
-    // producer boundary until a core runtime status writer exists.
-    cp.observe_gateway_status_transition("discord", "connecting", "ready")
+    cp.observe_gateway_status_transition("discord", "offline", "connected")
         .await;
 
     let matching_runs = crate::automation::list_runs(&store, &matching.id)
         .await
         .unwrap();
     assert_eq!(matching_runs.len(), 1);
-    assert_eq!(matching_runs[0].status, "queued");
+    assert_eq!(matching_runs[0].status, "running");
     assert_eq!(matching_runs[0].envelope["source"]["kind"], "gateway");
     assert_eq!(
         matching_runs[0].envelope["data"]["previousStatus"],
-        "connecting"
+        "offline"
     );
+    assert_eq!(matching_runs[0].envelope["data"]["status"], "connected");
     assert!(crate::automation::list_runs(&store, &other.id)
         .await
         .unwrap()

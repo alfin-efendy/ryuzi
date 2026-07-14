@@ -684,10 +684,10 @@ impl ControlPlane {
         }
     }
 
-    /// No core gateway runtime currently persists operational status; gateway
-    /// config writes and router status messages are view/config state, not a status
-    /// transition producer. Keep this adapter as the narrow integration boundary
-    /// for the future runtime writer rather than falsely dispatching from polling.
+    /// Emits the normalized gateway lifecycle event for the daemon's concrete
+    /// connected/offline transitions. It intentionally remains a narrow adapter:
+    /// the lifecycle owner detects and deduplicates transitions, while this method
+    /// owns the stable automation envelope shape.
     pub async fn observe_gateway_status_transition(
         self: &Arc<Self>,
         gateway_id: &str,
