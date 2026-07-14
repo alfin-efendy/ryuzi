@@ -123,7 +123,9 @@ impl Daemon {
     /// preventing a second harness and `RESUME_NUDGE` for the new delivery.
     ///
     /// Gateway startup comes first because reconciliation emits resumed status
-    /// events that must be routable to an already-connected gateway.
+    /// events that must be routable to an already-connected gateway. A boot
+    /// failure is terminal for this `Daemon`; callers must construct a new one
+    /// before retrying, so stopped tasks and gateway ownership are never reused.
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
@@ -145,19 +147,14 @@ impl Daemon {
     /// than propagated: a broken endpoint server must not prevent boot
     /// recovery, reconciliation, or idle queue delivery.
     pub async fn start(&self) -> anyhow::Result<()> {
+        if self.stopped.load(Ordering::SeqCst) {
+            anyhow::bail!("daemon failed to boot");
+        }
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
-                if !self.stopped.swap(true, Ordering::SeqCst) {
-                    for started in &self.gateways[..idx] {
-                        let _ = started.stop().await;
-                    }
-                    self.router_handle.abort();
-                    self.fanout_handle.abort();
-                    self.scheduler_handle.abort();
-                    self.orch_handle.abort();
-                    self.rail_handle.abort();
-                    self.learning_handle.abort();
-                    self.curator_handle.abort();
+                self.fail_boot_and_rollback().await;
+                for started in &self.gateways[..idx] {
+                    let _ = started.stop().await;
                 }
                 return Err(e);
             }
@@ -184,10 +181,36 @@ impl Daemon {
                 eprintln!("[ryuzi] endpoint autostart failed: {e}");
             }
         }
-        self.recover_reconcile_and_deliver_idle_queues_on_boot()
-            .await?;
+        if let Err(error) = self
+            .recover_reconcile_and_deliver_idle_queues_on_boot()
+            .await
+        {
+            self.fail_boot_and_rollback().await;
+            for gateway in &self.gateways {
+                let _ = gateway.stop().await;
+            }
+            return Err(error);
+        }
         self.router_in.open_boot_admission();
         Ok(())
+    }
+
+    /// Mark boot admission failed and abort the background tasks exactly once.
+    /// Callers stop any gateways already started by this daemon separately,
+    /// because start failure knows precisely which of them acquired resources.
+    async fn fail_boot_and_rollback(&self) {
+        self.router_in.fail_boot_admission();
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.router_handle.abort();
+        self.fanout_handle.abort();
+        self.scheduler_handle.abort();
+        self.orch_handle.abort();
+        self.rail_handle.abort();
+        self.learning_handle.abort();
+        self.curator_handle.abort();
+        self.router_server.stop().await;
     }
 
     /// Recover prior-process claims, reconcile prior-process Running sessions,
@@ -2186,7 +2209,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_start_retries_prompt_claim_recovery_after_failure() {
+    async fn daemon_start_rejects_waiting_inbound_work_and_rolls_back_after_boot_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut regs = Registries::new();
+        regs.harness = Arc::new(ResumeFakeHarnessFactory {
+            prompts: prompts.clone(),
+        });
+        let cp = ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry)).await;
+        let store = cp.store().clone();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: "inbound-session".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_surface("discord", "inbound-conversation", "inbound-session")
+            .await
+            .unwrap();
+
+        let gateway = FakeGateway::new("discord", GwBehavior::Allow);
+        let starts = gateway.starts.clone();
+        let stops = gateway.stops.clone();
+        let gateway: Arc<dyn Gateway> = Arc::new(gateway);
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let router_in = Arc::new(Router::new_boot_gated(
+            Arc::clone(&cp),
+            vec![Arc::clone(&gateway)],
+        ));
+        let daemon = Arc::new(Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![gateway],
+            router_in: Arc::clone(&router_in),
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            orch_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+        });
+
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let boot_daemon = Arc::clone(&daemon);
+        let boot = tokio::spawn(async move { boot_daemon.start().await });
+        recovery_entered.notified().await;
+
+        let reply_router = Arc::clone(&router_in);
+        let mut reply = tokio::spawn(async move {
+            reply_router
+                .on_reply(
+                    "discord",
+                    "inbound-conversation",
+                    "actor",
+                    "inbound prompt",
+                    &[],
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(futures::poll!(&mut reply), Poll::Pending),
+            "the inbound reply must remain pending while boot recovery is paused"
+        );
+
+        store
+            .with_conn(|conn| conn.execute_batch("DROP TABLE session_prompt_queue"))
+            .await
+            .unwrap();
+        release_recovery.notify_one();
+
+        assert!(boot.await.unwrap().is_err(), "boot recovery must fail");
+        let reply_error = reply
+            .await
+            .expect("inbound task must not panic")
+            .expect_err("failed boot must reject the inbound reply");
+        assert_eq!(reply_error.to_string(), "daemon failed to boot");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            1,
+            "the started gateway must be stopped during boot-failure rollback"
+        );
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "the failed boot must not admit the inbound prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_does_not_retry_after_prompt_claim_recovery_failure() {
         let (_db_guard, db_path) = temp_db_path();
         let store = Arc::new(Store::open(&db_path).await.unwrap());
         store
@@ -2207,16 +2348,8 @@ mod tests {
         assert!(daemon.start().await.is_err());
         assert!(!*daemon.prompt_claim_recovery_complete.lock().await);
 
-        daemon.start().await.unwrap();
-        assert!(
-            store
-                .list_session_prompt_queue("s1")
-                .await
-                .unwrap()
-                .iter()
-                .any(|prompt| prompt.id == "queued"),
-            "a retry after recovery failure must restore the abandoned claim"
-        );
+        let retry_err = daemon.start().await.unwrap_err();
+        assert_eq!(retry_err.to_string(), "daemon failed to boot");
     }
 
     #[tokio::test]
