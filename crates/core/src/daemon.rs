@@ -57,6 +57,10 @@ pub struct Daemon {
     pub cp: Arc<ControlPlane>,
     pub store: Arc<Store>,
     pub gateways: Vec<Arc<dyn Gateway>>,
+    /// The boot-gated inbound Router passed to production gateways. It stays
+    /// closed through boot recovery so gateway events cannot mutate sessions
+    /// while reconciliation takes its startup snapshot.
+    router_in: Arc<Router>,
     /// The local Anthropic/OpenAI-compatible endpoint server. The daemon
     /// always constructs it (cheap — it does not bind a port until
     /// `start()`'s autostart branch, or an explicit RPC, calls
@@ -182,6 +186,7 @@ impl Daemon {
         }
         self.recover_reconcile_and_deliver_idle_queues_on_boot()
             .await?;
+        self.router_in.open_boot_admission();
         Ok(())
     }
 
@@ -412,7 +417,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let router_out = Router::new(Arc::clone(&cp), gateways.clone());
     let router_handle = tokio::spawn(router_out.run(cp.subscribe()));
 
-    let router_in = Arc::new(Router::new(Arc::clone(&cp), gateways.clone()));
+    let router_in = Arc::new(Router::new_boot_gated(Arc::clone(&cp), gateways.clone()));
     for gw in &gateways {
         gw.set_router(Arc::clone(&router_in));
     }
@@ -434,6 +439,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         cp,
         store,
         gateways,
+        router_in,
         router_server,
         agents: persistence.registry,
         agent_knowledge: persistence.knowledge,
@@ -660,10 +666,12 @@ mod tests {
         .await;
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let router_in = Arc::new(Router::new(Arc::clone(&cp), vec![]));
         Daemon {
             cp,
             store: store.clone(),
             gateways: vec![],
+            router_in,
             router_server: Arc::new(RouterServer::new(store)),
             agents: persistence.registry,
             agent_knowledge: persistence.knowledge,
@@ -1406,6 +1414,7 @@ mod tests {
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
             store: store.clone(),
             gateways,
@@ -1936,6 +1945,7 @@ mod tests {
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
             store: store.clone(),
             gateways: vec![],
@@ -2026,19 +2036,26 @@ mod tests {
             "queued"
         );
 
-        let daemon = prompt_recovery_test_daemon(store.clone()).await;
+        let daemon = Arc::new(prompt_recovery_test_daemon(store.clone()).await);
         let (recovery_entered, release_recovery) =
             store.pause_next_session_prompt_claim_recovery_for_test();
-        let first = daemon.start();
-        tokio::pin!(first);
-        assert!(matches!(futures::poll!(first.as_mut()), Poll::Pending));
-        recovery_entered.notified().await;
+        let recovery_wait = recovery_entered.notified();
+        tokio::pin!(recovery_wait);
+        assert!(matches!(
+            futures::poll!(recovery_wait.as_mut()),
+            Poll::Pending
+        ));
+        let first_daemon = Arc::clone(&daemon);
+        let first = tokio::spawn(async move { first_daemon.start().await });
+        recovery_wait.await;
 
-        let mut second = Box::pin(daemon.start());
-        assert!(matches!(futures::poll!(second.as_mut()), Poll::Pending));
+        let second_daemon = Arc::clone(&daemon);
+        let mut second = tokio::spawn(async move { second_daemon.start().await });
+        tokio::task::yield_now().await;
+        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
         release_recovery.notify_one();
 
-        first.await.unwrap();
+        first.await.unwrap().unwrap();
         assert_eq!(
             store
                 .claim_next_session_prompt("s1")
@@ -2048,7 +2065,7 @@ mod tests {
                 .id,
             "queued"
         );
-        second.await.unwrap();
+        second.await.unwrap().unwrap();
         assert!(
             store
                 .list_session_prompt_queue("s1")
@@ -2056,6 +2073,115 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the second concurrent boot recovery must not reset the live claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_holds_inbound_reply_until_boot_recovery_finishes() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut regs = Registries::new();
+        regs.harness = Arc::new(ResumeFakeHarnessFactory {
+            prompts: prompts.clone(),
+        });
+        let cp = ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry)).await;
+        let store = cp.store().clone();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: "inbound-session".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_surface("discord", "inbound-conversation", "inbound-session")
+            .await
+            .unwrap();
+
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let router_in = Arc::new(Router::new_boot_gated(Arc::clone(&cp), vec![]));
+        let daemon = Arc::new(Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![],
+            router_in: Arc::clone(&router_in),
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            orch_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+        });
+
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let boot_daemon = Arc::clone(&daemon);
+        let boot = tokio::spawn(async move { boot_daemon.start().await });
+        recovery_entered.notified().await;
+
+        let reply_router = Arc::clone(&router_in);
+        let mut reply = tokio::spawn(async move {
+            reply_router
+                .on_reply(
+                    "discord",
+                    "inbound-conversation",
+                    "actor",
+                    "inbound prompt",
+                    &[],
+                )
+                .await
+        });
+        // Yield so the spawned task reaches the admission wait before its
+        // JoinHandle is polled.
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(futures::poll!(&mut reply), Poll::Pending),
+            "the inbound reply must remain pending while boot recovery is paused"
+        );
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "the inbound reply must not start a harness before boot recovery completes"
+        );
+
+        release_recovery.notify_one();
+        boot.await.unwrap().unwrap();
+        reply.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if prompts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            prompts.lock().unwrap().as_slice(),
+            ["inbound prompt"],
+            "the admitted reply must start exactly one harness prompt"
         );
     }
 
@@ -2150,6 +2276,7 @@ mod tests {
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![Arc::clone(&gw)])),
             cp,
             store: store.clone(),
             gateways: vec![gw],
@@ -2259,6 +2386,7 @@ mod tests {
         let persistence = test_agent_persistence(store.clone()).await;
         cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
             store: store.clone(),
             gateways,

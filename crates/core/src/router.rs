@@ -23,7 +23,7 @@ use crate::harness::TurnPrompt;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// Split `s` into <=1900-char slices for gateways with per-message size
 /// limits. Empty input yields a single `"(done)"` placeholder so callers
@@ -77,6 +77,7 @@ pub struct Router {
     store: Arc<Store>,
     gateways: HashMap<String, Arc<dyn Gateway>>,
     state: HashMap<String, SessionRenderState>,
+    boot_admission: watch::Sender<bool>,
 }
 
 impl Router {
@@ -85,6 +86,21 @@ impl Router {
     /// calls (`on_connect`/`on_start`) are immediately visible to outbound
     /// rendering (`run`), even across two `Router` instances (see module doc).
     pub fn new(cp: Arc<ControlPlane>, gateways: Vec<Arc<dyn Gateway>>) -> Self {
+        Self::with_boot_admission(cp, gateways, true)
+    }
+
+    /// Build an inbound router that holds mutating gateway work until daemon
+    /// boot recovery, reconciliation, and idle-queue delivery have completed.
+    pub fn new_boot_gated(cp: Arc<ControlPlane>, gateways: Vec<Arc<dyn Gateway>>) -> Self {
+        Self::with_boot_admission(cp, gateways, false)
+    }
+
+    fn with_boot_admission(
+        cp: Arc<ControlPlane>,
+        gateways: Vec<Arc<dyn Gateway>>,
+        boot_admitted: bool,
+    ) -> Self {
+        let (boot_admission, _) = watch::channel(boot_admitted);
         let store = cp.store().clone();
         let gateways = gateways
             .into_iter()
@@ -95,6 +111,28 @@ impl Router {
             store,
             gateways,
             state: HashMap::new(),
+            boot_admission,
+        }
+    }
+
+    /// Open the one-way boot admission latch. Repeated calls are harmless.
+    pub fn open_boot_admission(&self) {
+        self.boot_admission.send_if_modified(|admitted| {
+            if *admitted {
+                false
+            } else {
+                *admitted = true;
+                true
+            }
+        });
+    }
+
+    async fn await_boot_admission(&self) {
+        let mut admission = self.boot_admission.subscribe();
+        while !*admission.borrow() {
+            if admission.changed().await.is_err() {
+                return;
+            }
         }
     }
 
@@ -106,6 +144,7 @@ impl Router {
         actor: &str,
         opts: ConnectOpts,
     ) -> anyhow::Result<ConnectOutcome> {
+        self.await_boot_admission().await;
         let gw = self
             .gateways
             .get(gateway_id)
@@ -186,6 +225,7 @@ impl Router {
         prompt: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
+        self.await_boot_admission().await;
         let Some(project) = self
             .store
             .resolve_project_by_workspace(gateway_id, workspace_id)
@@ -226,6 +266,7 @@ impl Router {
         prompt: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
+        self.await_boot_admission().await;
         let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -252,6 +293,7 @@ impl Router {
         user_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.await_boot_admission().await;
         if let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -278,6 +320,7 @@ impl Router {
 
     /// End the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_end(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
+        self.await_boot_admission().await;
         if let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -290,6 +333,7 @@ impl Router {
 
     /// Stop the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_stop(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
+        self.await_boot_admission().await;
         if let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
