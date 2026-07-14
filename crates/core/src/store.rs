@@ -2584,6 +2584,24 @@ impl Store {
         .await
     }
 
+    /// List session keys with a pending queue head, ordered by that head's FIFO
+    /// position and then session key for a deterministic boot drain.
+    pub(crate) async fn pending_session_prompt_session_pks(&self) -> anyhow::Result<Vec<String>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT session_pk FROM session_prompt_queue \
+                 WHERE status='pending' \
+                 GROUP BY session_pk \
+                 ORDER BY MIN(position), session_pk",
+            )?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        })
+        .await
+    }
+
     /// Add a session prompt at the end of its FIFO queue.
     pub async fn enqueue_session_prompt(&self, prompt: QueuedSessionPrompt) -> anyhow::Result<()> {
         let payload = serde_json::to_string(&prompt)?;
@@ -8215,6 +8233,39 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_queue_lists_pending_session_keys_in_deterministic_head_order() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for (id, session_pk, created_at) in [
+            ("claimed", "claimed-session", 0),
+            ("b-first", "b", 2),
+            ("a-first", "a", 1),
+            ("a-second", "a", 3),
+        ] {
+            store
+                .enqueue_session_prompt(QueuedSessionPrompt {
+                    id: id.into(),
+                    session_pk: session_pk.into(),
+                    agent: id.into(),
+                    display: id.into(),
+                    attachments: vec![],
+                    created_at,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .claim_next_session_prompt("claimed-session")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.pending_session_prompt_session_pks().await.unwrap(),
+            ["a", "b"]
+        );
     }
 
     #[tokio::test]

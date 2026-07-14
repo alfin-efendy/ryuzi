@@ -113,10 +113,10 @@ pub struct Daemon {
 impl Daemon {
     /// Start every gateway, then fire-and-forget `cp.reconcile()` (resumes
     /// any session a dead process left `Running`). Before either, synchronously
-    /// recover prompt claims abandoned by a previous process. This recovery is
-    /// deliberately boot-only: running it later could disrupt an active
-    /// continuation. Reconcile runs in the background so a slow/hanging resume
-    /// can't block daemon startup.
+    /// recover abandoned prompt claims and start one pending FIFO head for every
+    /// idle session. This recovery is deliberately boot-only: running it later
+    /// could disrupt an active continuation. Reconcile runs in the background so
+    /// a slow/hanging resume can't block daemon startup.
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
@@ -144,7 +144,8 @@ impl Daemon {
     /// server must not prevent the rest of the daemon (gateways, sessions)
     /// from coming up.
     pub async fn start(&self) -> anyhow::Result<()> {
-        self.recover_abandoned_prompt_claims_on_boot().await?;
+        self.recover_abandoned_prompt_claims_and_deliver_idle_queues_on_boot()
+            .await?;
 
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
@@ -192,18 +193,34 @@ impl Daemon {
         Ok(())
     }
 
-    /// Recover prompt claims left by a prior process once for this daemon.
-    ///
-    /// The mutex remains held while Store recovery awaits, so exactly one
-    /// concurrent `start()` performs the reset. Completion is set only after a
-    /// successful reset; an error leaves it false and a later start retries.
-    async fn recover_abandoned_prompt_claims_on_boot(&self) -> anyhow::Result<()> {
+    /// Recover prior-process prompt claims and drain pending idle queue heads
+    /// exactly once for this daemon. The mutex remains held for both phases so
+    /// concurrent `start()` calls cannot reset a live claim or re-run the boot
+    /// queue scan. Completion is set only after both phases succeed.
+    async fn recover_abandoned_prompt_claims_and_deliver_idle_queues_on_boot(
+        &self,
+    ) -> anyhow::Result<()> {
         let mut complete = self.prompt_claim_recovery_complete.lock().await;
         if *complete {
             return Ok(());
         }
         self.store.recover_abandoned_session_prompt_claims().await?;
+        self.deliver_pending_idle_session_prompts_on_boot().await?;
         *complete = true;
+        Ok(())
+    }
+
+    /// Start one pending FIFO head for each idle session after boot claim
+    /// recovery. The control plane's atomic Idle-to-Running claim prevents a
+    /// concurrent start from duplicating a delivery and skips non-idle sessions
+    /// for asynchronous reconcile to resume.
+    async fn deliver_pending_idle_session_prompts_on_boot(&self) -> anyhow::Result<()> {
+        for session_pk in self.store.pending_session_prompt_session_pks().await? {
+            let _ = self
+                .cp
+                .deliver_next_queued_session_prompt(&session_pk)
+                .await;
+        }
         Ok(())
     }
 
@@ -1783,6 +1800,170 @@ mod tests {
                 prompts: self.prompts.clone(),
             }))
         }
+    }
+
+    struct BootQueueFakeSession {
+        prompts: Arc<Mutex<Vec<String>>>,
+        sent: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl HarnessSession for BootQueueFakeSession {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            self.prompts.lock().unwrap().push(prompt.agent);
+            self.sent.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            Some("boot-queue-agent".into())
+        }
+    }
+    struct BootQueueFakeHarness {
+        prompts: Arc<Mutex<Vec<String>>>,
+        sent: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Harness for BootQueueFakeHarness {
+        async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            Ok(Box::new(BootQueueFakeSession {
+                prompts: self.prompts.clone(),
+                sent: self.sent.clone(),
+                release: self.release.clone(),
+            }))
+        }
+    }
+    struct BootQueueFakeHarnessFactory {
+        prompts: Arc<Mutex<Vec<String>>>,
+        sent: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl HarnessFactory for BootQueueFakeHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(BootQueueFakeHarness {
+                prompts: self.prompts.clone(),
+                sent: self.sent.clone(),
+                release: self.release.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_start_delivers_one_pending_idle_queue_head_after_crash_window() {
+        let _state_dir = StateDirGuard::new();
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Store::open(&db_path).await.unwrap();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut regs = Registries::new();
+        regs.harness = Arc::new(BootQueueFakeHarnessFactory {
+            prompts: prompts.clone(),
+            sent: sent.clone(),
+            release: release.clone(),
+        });
+        let cp =
+            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        let store = cp.store().clone();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: "idle-queued".into(),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        // Simulate a process crash after the durable enqueue commit, before its
+        // best-effort delivery kick can run.
+        for (id, created_at) in [("first", 1), ("second", 2)] {
+            store
+                .enqueue_session_prompt(QueuedSessionPrompt {
+                    id: id.into(),
+                    session_pk: "idle-queued".into(),
+                    agent: id.into(),
+                    display: id.into(),
+                    attachments: vec![],
+                    created_at,
+                })
+                .await
+                .unwrap();
+        }
+
+        let persistence = test_agent_persistence(store.clone()).await;
+        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let daemon = Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![],
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents: persistence.registry,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AsyncMutex::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            orch_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+        };
+
+        daemon.start().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sent.notified())
+            .await
+            .expect("boot must start the pending idle queue head");
+        assert_eq!(prompts.lock().unwrap().as_slice(), ["first"]);
+        assert_eq!(
+            store
+                .list_session_prompt_queue("idle-queued")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["second"],
+            "boot must claim only the FIFO head"
+        );
+
+        daemon.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|prompt| prompt.as_str() == "first")
+                .count(),
+            1,
+            "a repeated start must not duplicate the live boot delivery"
+        );
+        release.notify_waiters();
     }
 
     #[tokio::test]
