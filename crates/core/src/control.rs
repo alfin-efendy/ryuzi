@@ -20,7 +20,6 @@ mod provisioning;
 #[cfg(test)]
 mod tests;
 
-pub use lifecycle::WorkerBinding;
 pub use provisioning::{ProvisionProjectRequest, ProvisionSettings};
 
 /// Nudge prompt used when re-driving a turn interrupted by a restart.

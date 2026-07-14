@@ -2872,9 +2872,8 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
     let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
     // Unstaged modification to a tracked file = dirty → in-place prep refuses.
     std::fs::write(repo_dir.path().join("a.txt"), "changed").unwrap();
-    // Subscribe BEFORE starting: the orchestrator's and scheduler's session
-    // watchers finish only on a bus-terminal Result/Error for the session,
-    // so a startup failure MUST broadcast CoreEvent::Error — without it they
+    // Subscribe BEFORE starting: session watchers finish only on a
+    // bus-terminal Result/Error for the session, so a startup failure MUST
     // hang to their 2h deadline instead of reporting the real git error.
     let mut rx = cp.subscribe();
 

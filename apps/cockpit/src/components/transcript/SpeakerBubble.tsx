@@ -1,7 +1,7 @@
 import { agentColor } from "@/lib/agent-color";
 import { Markdown } from "./Markdown";
 
-/** A labeled bubble for a worker/orchestrator message in a group-chat run:
+/** A labeled bubble for a worker message in a group-chat run:
  *  a colored dot + the speaker's name above a bordered markdown body,
  *  distinct from the home agent's own AgentTurn bubbles. */
 export function SpeakerBubble({ speaker, markdown }: { speaker: string; markdown: string }) {

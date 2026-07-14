@@ -1,8 +1,7 @@
-// Stable per-agent color for group-chat UI: speaker bubbles (Transcript) and
-// the task strip (C2) both key off an agent's display name, so this hashes
-// the name into a deterministic hue instead of tracking an id->color map
-// that would need to grow every time a new worker/orchestrator agent shows
-// up in a session.
+// Stable per-agent color for group-chat UI: speaker bubbles key off an
+// agent's display name, so this hashes the name into a deterministic hue
+// instead of tracking an id->color map that would need to grow every time a
+// new worker agent shows up in a session.
 
 /** Small string hash (djb2 variant) — deterministic, no external deps. */
 function hashString(s: string): number {

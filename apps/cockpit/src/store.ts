@@ -12,7 +12,6 @@ import {
   type ApprovalResponse,
   type ModelPreferenceKey,
   type ModelCost,
-  type OrchTask,
   type Principal,
   type ProjectRuntimeInfo,
 } from "./bindings";
@@ -80,10 +79,6 @@ type State = {
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   /** Per-session in-memory type-ahead queue (messages typed while running). */
   queued: Record<string, QueuedMessage[]>;
-  /** Live orchestration task graph, keyed by root task id — the task strip's
-   *  data source. Upserted piecemeal by `orchTaskChanged` events and seeded
-   *  in bulk by `loadOrchTasks`. */
-  orchTasks: Record<string, OrchTask[]>;
   enqueueMessage: (runnerId: string, sessionPk: string, msg: QueuedMessage) => void;
   removeQueued: (runnerId: string, sessionPk: string, id: string) => void;
   /** Send the head of a session's queue; on send-failure re-queue it at the front. */
@@ -116,14 +111,8 @@ type State = {
   end: (runnerId: string, sessionPk: string) => Promise<boolean>;
   resolveApproval: (runnerId: string, runId: string, requestId: string, response: ApprovalResponse) => Promise<void>;
   hydrateTranscript: (runnerId: string, pk: string, fetcher?: (pk: string) => Promise<Message[]>, force?: boolean) => Promise<void>;
-  /** Re-hydrates a session's transcript even when it's already `loaded` —
-   *  used after a terminal/blocked `orchTaskChanged` so a report or block
-   *  card posted into the home chat lands without a full reload. */
   refetchTranscript: (runnerId: string, pk: string, fetcher?: (pk: string) => Promise<Message[]>) => Promise<void>;
   /** Fetches the full task graph under `rootId` (a fresh strip on mount). */
-  loadOrchTasks: (rootId: string) => Promise<void>;
-  /** Answer a worker's blocking question (BlockCard's inline composer). */
-  orchAnswerBlock: (taskId: string, answer: string) => Promise<void>;
   init: () => Promise<void>;
 };
 
@@ -182,7 +171,6 @@ export const useStore = create<State>((set, get) => ({
   contextUsage: {},
   projectRuntimeById: {},
   sessionCost: {},
-  orchTasks: {},
 
   applyCoreEvent: (e, runnerId) =>
     set((st) => {
@@ -312,25 +300,6 @@ export const useStore = create<State>((set, get) => ({
         case "agentRunChanged":
           useDelegation.getState().applyCoreEvent(e, runnerId);
           return {};
-        case "orchTaskChanged": {
-          // A root reports its OWN status change with root_id: null (it has
-          // no parent) — key the graph by the task's own id in that case.
-          const rootId = e.root_id ?? e.task_id;
-          const prev = st.orchTasks[rootId] ?? [];
-          const idx = prev.findIndex((t) => t.id === e.task_id);
-          const next =
-            idx >= 0
-              ? prev.map((t) => (t.id === e.task_id ? { ...t, status: e.status } : t))
-              : [...prev, { id: e.task_id, rootId: e.root_id, status: e.status } as OrchTask];
-          // A terminal/blocked change may have posted a bubble or report card
-          // into the focused home chat — refetch it so the row lands without
-          // waiting for an unrelated refresh.
-          if (e.status === "blocked" || e.status === "done" || e.status === "failed") {
-            const focused = get().focusedSession;
-            if (focused) void get().refetchTranscript(focused.runnerId, focused.pk);
-          }
-          return { orchTasks: { ...st.orchTasks, [rootId]: next } };
-        }
         default:
           return {};
       }
@@ -381,18 +350,8 @@ export const useStore = create<State>((set, get) => ({
 
   // Same fetch as hydrateTranscript, but forced — bypasses the `loaded`
   // short-circuit so a session already on screen picks up a row that landed
-  // out of band (e.g. an orchestration report posted by a background worker).
+  // out-of-band transcript refresh for newly persisted messages.
   refetchTranscript: (runnerId, pk, fetcher) => get().hydrateTranscript(runnerId, pk, fetcher, true),
-
-  loadOrchTasks: async (rootId) => {
-    const res = await commands.orchTasks(rootId);
-    if (res.status === "ok") set((st) => ({ orchTasks: { ...st.orchTasks, [rootId]: res.data } }));
-  },
-
-  orchAnswerBlock: async (taskId, answer) => {
-    const res = await commands.orchAnswerBlock(taskId, answer);
-    if (res.status === "error") toast.error("Couldn't send the answer: " + res.error.message);
-  },
 
   // Selecting a project clears the focused session so the center shows the "start a new session" composer.
   selectProject: (id) => set({ selectedProjectId: id, focusedSession: null }),
@@ -608,31 +567,13 @@ export const useStore = create<State>((set, get) => ({
     return true;
   },
   send: async (runnerId, sessionPk, turn) => {
-    const { text } = turn;
-    // instead of running as a normal chat turn — e.g. "cancel" cancels the
-    // tree, anything else is noted as guidance for the judge. `orch_steer`
-    // returns exactly one of three wire strings: "noted"/"cancelled" when the
-    // orchestration actually consumed the message, or "noOrchestration" when
-    // there's no live root bound to this session (the store keeps no
-    // client-side cache of that binding — the backend check is authoritative).
-    // Only the two positive outcomes short-circuit the normal turn; ANYTHING
-    // else — "noOrchestration", a thrown IPC error, or an unexpected/null
-    // payload from a backend that doesn't implement steering — MUST fall
-    // through to the normal send path so a steer-check never swallows the
-    // user's message.
-    try {
-      const steer = await commands.orchSteer(sessionPk, text);
-      if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
-    } catch {
-      // fall through to the normal send path
-    }
     // A session already RUNNING a turn gets steered — the message is
     // injected into that turn's next tool-result batch instead of racing a
     // whole new turn onto the session. Any other status (idle, interrupted,
     // ended) starts a normal continue. Matched within the correct runner.
     const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
     const res = isRunning
-      ? await commands.steerSession(runnerId, sessionPk, text)
+      ? await commands.steerSession(runnerId, sessionPk, turn.text)
       : await commands.continueSession(runnerId, sessionPk, turn);
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);

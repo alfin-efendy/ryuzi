@@ -18,7 +18,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub mod app_jobs;
-pub mod app_orchestrate;
 pub mod app_projects;
 pub mod bash;
 pub mod clarify;
@@ -31,7 +30,6 @@ pub mod ls;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
-pub mod orch_block;
 pub mod plan;
 pub mod question;
 pub mod read;
@@ -205,20 +203,6 @@ pub struct AppJobCreate {
     pub model_override: Option<String>,
 }
 
-/// One orchestration task as seen through `app_orchestrate`.
-#[derive(Debug, Clone)]
-pub struct AppOrchSummary {
-    pub id: String,
-    pub title: String,
-    pub status: String,
-    pub agent: String,
-    /// The judge's final verdict text, present once a root reaches `done`
-    /// (`None` while in progress). Lets an agent-initiated (home-less)
-    /// orchestration retrieve its outcome via the `app_orchestrate` status
-    /// action — the rail verdict delivery is skipped when there's no home chat.
-    pub result: Option<String>,
-}
-
 /// A project as seen through `app_projects`.
 #[derive(Debug, Clone)]
 pub struct AppProjectSummary {
@@ -247,12 +231,6 @@ pub trait AppControl: Send + Sync {
     async fn set_job_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool>;
     async fn run_job_now(&self, id: &str) -> anyhow::Result<String>;
 
-    // --- orchestration (orch.read / orch.write) ---
-    async fn submit_orchestration(&self, project_id: &str, goal: &str) -> anyhow::Result<String>;
-    async fn list_orchestrations(&self, root: Option<&str>) -> anyhow::Result<Vec<AppOrchSummary>>;
-    async fn cancel_orchestration(&self, id: &str) -> anyhow::Result<u32>;
-    async fn retry_orchestration(&self, id: &str) -> anyhow::Result<bool>;
-
     // --- projects (projects.read / projects.write) ---
     async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>>;
     async fn create_chat_session(&self, title: Option<String>) -> anyhow::Result<String>;
@@ -261,7 +239,7 @@ pub trait AppControl: Send + Sync {
 
 /// The app-control tool names — added to the sub-agent blocklist and never
 /// advertised to delegated children (spec §9.1).
-pub const APP_TOOLS: &[&str] = &["app_jobs", "app_orchestrate", "app_projects", "clarify"];
+pub const APP_TOOLS: &[&str] = &["app_jobs", "app_projects", "clarify"];
 
 /// Channel bundle for tools whose EXECUTION is a user interaction
 /// (`exitplanmode`, `askuserquestion`): they emit their own
@@ -496,14 +474,11 @@ impl ToolRegistry {
             Arc::new(question::AskUserQuestion),
             // Gated to `kind='worker'` sessions — see
             // `runner::visible_tool_defs` (schema) and its own
-            // `Store::task_by_session` guard (runtime).
-            Arc::new(orch_block::OrchBlock),
             // App-control tools over the curated `AppControl` facade (spec
             // §9.1); `None` on `ctx.app` (sub-agents/workers/tests) errors
             // "not available". Blocked from delegated children — see
             // `runner::SUBAGENT_BLOCKLIST`.
             Arc::new(app_jobs::AppJobs),
-            Arc::new(app_orchestrate::AppOrchestrate),
             Arc::new(app_projects::AppProjects),
             Arc::new(clarify::Clarify),
         ];
@@ -726,7 +701,6 @@ pub(crate) mod testutil {
     #[derive(Default)]
     pub struct FakeAppControl {
         pub created: std::sync::Mutex<Vec<AppJobCreate>>,
-        pub submitted: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -751,32 +725,6 @@ pub(crate) mod testutil {
         }
         async fn run_job_now(&self, _id: &str) -> anyhow::Result<String> {
             Ok("run-1".into())
-        }
-        async fn submit_orchestration(
-            &self,
-            _project_id: &str,
-            goal: &str,
-        ) -> anyhow::Result<String> {
-            self.submitted.lock().unwrap().push(goal.to_string());
-            Ok("orch-root".into())
-        }
-        async fn list_orchestrations(
-            &self,
-            _root: Option<&str>,
-        ) -> anyhow::Result<Vec<AppOrchSummary>> {
-            Ok(vec![AppOrchSummary {
-                id: "orch-root".into(),
-                title: "build it".into(),
-                status: "running".into(),
-                agent: "orchestrator".into(),
-                result: None,
-            }])
-        }
-        async fn cancel_orchestration(&self, _id: &str) -> anyhow::Result<u32> {
-            Ok(3)
-        }
-        async fn retry_orchestration(&self, _id: &str) -> anyhow::Result<bool> {
-            Ok(true)
         }
         async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>> {
             Ok(vec![AppProjectSummary {
@@ -940,9 +888,7 @@ mod tests {
             "session_search",
             "exitplanmode",
             "askuserquestion",
-            "orch_block",
             "app_jobs",
-            "app_orchestrate",
             "app_projects",
             "clarify",
         ] {

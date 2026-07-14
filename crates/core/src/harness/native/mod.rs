@@ -439,8 +439,8 @@ impl Harness for NativeHarness {
                 // Every autonomous agent session (Project/Chat/Worker) runs as
                 // `Agent` so the negative-space storage guard + the skill_manage
                 // guard engage; the human acts as `User` through Cockpit/TUI. A
-                // Worker is an UNATTENDED orchestration agent — it must be at
-                // least as guarded as an attended chat, never less (avoiding the
+                // Worker is an unattended agent — it must be at least as
+                // guarded as an attended chat, never less (avoiding the
                 // "unattended-with-more-power" inversion). Review never routes
                 // through here: its fork builds `RunnerDeps` directly with
                 // `BackgroundReview`, so the `Review` arm below is defensively

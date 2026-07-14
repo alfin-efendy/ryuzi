@@ -1,4 +1,4 @@
-//! `UpdateManager` — orchestrates the self-update lifecycle: on a timer (or
+//! `UpdateManager` — manages the self-update lifecycle: on a timer (or
 //! on demand via `tick`), checks GitHub Releases for a newer version, then
 //! either self-applies (install.sh installs, in `auto` mode, when an
 //! `ApplyHook` is wired up) or broadcasts a `Notice` to live sessions via a
@@ -66,7 +66,7 @@ pub struct UpdateManagerDeps {
     pub apply_update: Option<Arc<dyn ApplyHook>>,
 }
 
-/// Orchestrates periodic update checks. `start`/`stop` drive a real
+/// Manages periodic update checks. `start`/`stop` drive a real
 /// `tokio::spawn`ed interval task, tracked by `timer`; `tick` can also be
 /// called directly for an on-demand check.
 pub struct UpdateManager {

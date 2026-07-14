@@ -37,7 +37,12 @@ const projectRuntimeInfo = mock(() => Promise.resolve({ status: "ok" as const, d
 // so the permission-picker test can drive the real store's start() and
 // inspect what startSession actually received.
 const startSession = mock(
-  (_runnerId: string, _projectId: string, _primaryAgentId: string, _turn: { text: string; context: ChatContextArg | null }): Promise<Result<Session, CmdError>> =>
+  (
+    _runnerId: string,
+    _projectId: string,
+    _primaryAgentId: string,
+    _turn: { text: string; context: ChatContextArg | null },
+  ): Promise<Result<Session, CmdError>> =>
     Promise.resolve({
       status: "ok",
       data: {
@@ -64,7 +69,11 @@ const startSession = mock(
     }),
 );
 const startChatSession = mock(
-  (_runnerId: string, _primaryAgentId: string, _turn: { text: string; context: ChatContextArg | null }): Promise<Result<Session, CmdError>> =>
+  (
+    _runnerId: string,
+    _primaryAgentId: string,
+    _turn: { text: string; context: ChatContextArg | null },
+  ): Promise<Result<Session, CmdError>> =>
     Promise.resolve({
       status: "ok",
       data: {
@@ -98,7 +107,17 @@ const listSessions = mock((): Promise<Result<Session[], CmdError>> => Promise.re
 const listGateways = mock((): Promise<Result<never[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo, startChatSession, startSession, listProjects, listSessions, listGateways },
+  commands: {
+    listBranches,
+    nativeCommands,
+    searchFiles,
+    projectRuntimeInfo,
+    startChatSession,
+    startSession,
+    listProjects,
+    listSessions,
+    listGateways,
+  },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount.
@@ -380,13 +399,15 @@ test("selects the default primary and forwards a complete first project TurnInpu
   fireEvent.change(box, { target: { value: "ship it" } });
   fireEvent.keyDown(box, { key: "Enter" });
 
-  await waitFor(() => expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "ryuzi", {
-    text: "ship it",
-    mentions: [],
-    context: { branch: "main", voiceTranscript: null, references: [] },
-    attachments: [],
-    git: { useWorktree: true, createBranch: true, branchName: null, baseBranch: null },
-  }));
+  await waitFor(() =>
+    expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "ryuzi", {
+      text: "ship it",
+      mentions: [],
+      context: { branch: "main", voiceTranscript: null, references: [] },
+      attachments: [],
+      git: { useWorktree: true, createBranch: true, branchName: null, baseBranch: null },
+    }),
+  );
   expect(localStorage.getItem("cockpit.lastPrimaryAgentId")).toBe("ryuzi");
 });
 
@@ -464,16 +485,18 @@ test("starts a chat without a project using the selected primary", async () => {
   fireEvent.change(screen.getByPlaceholderText("Do anything"), { target: { value: "chat" } });
   fireEvent.click(screen.getByRole("button", { name: "Start session" }));
 
-  await waitFor(() => expect(startChatSession).toHaveBeenCalledWith(LOCAL_RUNNER, "ryuzi", {
-    text: "chat",
-    mentions: [],
-    context: { branch: null, voiceTranscript: null, references: [] },
-    attachments: [],
-    git: null,
-  }));
+  await waitFor(() =>
+    expect(startChatSession).toHaveBeenCalledWith(LOCAL_RUNNER, "ryuzi", {
+      text: "chat",
+      mentions: [],
+      context: { branch: null, voiceTranscript: null, references: [] },
+      attachments: [],
+      git: null,
+    }),
+  );
 });
 
-test("preserves project, branch, context, voice, and attachment controls while model and orchestration controls stay removed", () => {
+test("preserves project, branch, context, voice, and attachment controls while model controls stay removed", () => {
   render(<HomeView />);
   expect(screen.getByRole("combobox", { name: "Project" })).toBeTruthy();
   expect(screen.getByRole("combobox", { name: "Branch" })).toBeTruthy();
@@ -481,5 +504,4 @@ test("preserves project, branch, context, voice, and attachment controls while m
   expect(screen.getByRole("button", { name: "Voice" })).toBeTruthy();
   expect(screen.queryByRole("combobox", { name: "Permission mode" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Model and effort" })).toBeNull();
-  expect(screen.queryByText("Orchestrate")).toBeNull();
 });

@@ -70,15 +70,6 @@ fn validate_executable_primary(
     Ok(())
 }
 
-/// Binds a spawned session to an orchestration as a labeled worker (spec §8):
-/// it runs `agent`, its bubbles are attributed to that name, and its
-/// `parent_session_pk` points at the home chat it reports into.
-#[derive(Debug, Clone)]
-pub struct WorkerBinding {
-    pub agent: String,
-    pub home_session_pk: Option<String>,
-}
-
 impl ControlPlane {
     pub async fn start_session(
         self: &Arc<Self>,
@@ -164,7 +155,7 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
-        worker: Option<WorkerBinding>,
+        _worker: Option<()>,
         model_override: Option<String>,
         resolved_mentions: Option<ResolvedMentions>,
     ) -> anyhow::Result<Session> {
@@ -198,7 +189,7 @@ impl ControlPlane {
                     .is_git
                     .then(|| git.branch_name.clone().or_else(|| git.base_branch.clone()))
                     .flatten();
-                let kind = if worker.is_some() {
+                let kind = if _worker.is_some() {
                     SessionKind::Worker
                 } else {
                     SessionKind::Project
@@ -227,9 +218,9 @@ impl ControlPlane {
             resume_attempts: 0,
             branch_owned,
             kind,
-            speaker: worker.as_ref().map(|binding| binding.agent.clone()),
-            agent: worker.as_ref().map(|binding| binding.agent.clone()),
-            parent_session_pk: worker.and_then(|binding| binding.home_session_pk),
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
         };
         let model_override = model_override.filter(|model| !model.trim().is_empty());
         let (resolved_model, resolved_effort) = model_override
@@ -419,7 +410,7 @@ impl ControlPlane {
         git: Option<SessionGitOptions>,
         _perm_mode: Option<PermMode>,
         model_override: Option<String>,
-        worker: Option<WorkerBinding>,
+        _worker: Option<()>,
     ) -> anyhow::Result<Session> {
         let primary_agent_id = self.registry.default_agent_id().await;
         self.start_owned_agent_session_with_prompt(
@@ -429,7 +420,7 @@ impl ControlPlane {
             started_by,
             attachments,
             git,
-            worker,
+            _worker,
             model_override,
             None,
         )
@@ -785,69 +776,6 @@ impl ControlPlane {
         }
     }
 
-    /// Post a labeled display bubble into a session's transcript (spec §8:
-    /// worker/orchestrator start/status/report bubbles). A DISPLAY row only —
-    /// written to the `messages` ledger via `insert_message`, NOT
-    /// `provider_turns`, so it never enters the model's history or perturbs
-    /// role alternation. Emits the live `CoreEvent::Message` so attached
-    /// surfaces render it immediately.
-    pub async fn post_speaker_bubble(
-        &self,
-        session_pk: &str,
-        speaker: &str,
-        block_type: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
-        let payload = serde_json::json!({ "text": text });
-        let seq = self
-            .store
-            .insert_message(NewMessage::speaker_block(
-                session_pk,
-                speaker,
-                block_type,
-                payload.clone(),
-            ))
-            .await?;
-        let _ = self.events.send(CoreEvent::Message {
-            session_pk: session_pk.to_string(),
-            seq,
-            role: "assistant".to_string(),
-            block_type: block_type.to_string(),
-            payload,
-            tool_call_id: None,
-            status: None,
-            tool_kind: None,
-            speaker: Some(speaker.to_string()),
-        });
-        Ok(())
-    }
-
-    /// Deliver a human's answer to a blocked worker (spec §8, Task E6). The
-    /// answer flows back over the rail (`kind='unblock'`) as a clean new user
-    /// turn once the worker session is idle — never a mid-turn splice; the
-    /// idle-only drainer resumes the worker. Returns whether the task was
-    /// actually blocked (a stale/unknown/already-resumed task id is a no-op,
-    /// not an error).
-    pub async fn answer_orch_block(&self, task_id: &str, answer: &str) -> anyhow::Result<bool> {
-        let Some(task) = crate::orch::get_task(&self.store, task_id).await? else {
-            return Ok(false);
-        };
-        if task.status != "blocked" {
-            return Ok(false);
-        }
-        let Some(worker) = task.session_pk.as_deref() else {
-            return Ok(false);
-        };
-        let block = format!(
-            "[HUMAN ANSWER — orchestration block for task {task_id}] The user answered your \
-             blocking question. Continue the subtask using this answer.\n\n{answer}"
-        );
-        self.store
-            .enqueue_background_event(worker, "unblock", &block)
-            .await?;
-        Ok(true)
-    }
-
     /// Background half of `start_session_with_prompt`. Its cancellation token
     /// is registered synchronously before this task is spawned, so a stop/end
     /// immediately after start returns can cancel startup before its first poll.
@@ -1069,7 +997,7 @@ impl ControlPlane {
     /// Startup failed: surface it in the transcript, release the session
     /// back to Idle so the user can retry, and broadcast the bus-terminal
     /// `CoreEvent::Error` (mirroring `spawn_prompt`'s error arm). The
-    /// broadcast is load-bearing: the orchestrator's `watch_session` and the
+    /// broadcast makes the persisted message immediately available to live surfaces.
     /// scheduler's run watcher finish only on `Result`/`Error` for the
     /// session, so without it they would hang to their 2h deadline instead
     /// of reporting the real git/harness error. `demote_if_running` (not a
@@ -1792,12 +1720,10 @@ impl ControlPlane {
                     // Broadcast `Result` BEFORE the idle demote (the Err arm
                     // below deliberately demotes first, for UI-refresh
                     // reasons; this arm must not). The ordering is load-bearing
-                    // for orch's block-for-human resume (Task E6): the
-                    // background-rail drainer flips a `blocked` worker task to
-                    // `running` (`orch::on_unblock_delivered`) only AFTER it
-                    // claims the unblock event, and a claim requires the worker
-                    // session to be idle (`claim_deliverable_background_event`
-                    // joins on `sessions.status`). Emitting `Result` before the
+                    // `running` only after it claims the unblock event, and
+                    // a claim requires the worker session to be idle because
+                    // `claim_deliverable_background_event` joins on
+                    // `sessions.status`. Emitting `Result` before the
                     // demote guarantees a parked `watch_session` has the block
                     // turn's `Result` queued before the session is ever
                     // claimable — so it reads the task as still `blocked` and

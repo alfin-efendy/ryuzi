@@ -1,7 +1,7 @@
 //! The daemon-hosted background-rail drainer (spec §6.1). Delivers completed
-//! out-of-band work (async delegation, learning forks, scheduled jobs, orch
-//! events — anything `Store::enqueue_background_event` recorded) into its
-//! target session as a NEW user turn, but only while that session is idle.
+//! out-of-band work (async delegation, learning forks, scheduled jobs —
+//! anything `Store::enqueue_background_event` recorded) into its target
+//! session as a NEW user turn, but only while that session is idle.
 //!
 //! This idle-only delivery is the rail's one load-bearing invariant: it must
 //! NEVER splice into a running turn. Hermes' role-alternation and
@@ -23,8 +23,7 @@ use crate::harness::TurnPrompt;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Poll cadence for the drainer loop (mirrors `scheduler`/`orch`'s 5s cadence
-/// — see their `run_loop`s).
+/// Poll cadence for the drainer loop (mirrors the scheduler's 5s cadence).
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Deliver at most this many rows per tick, so one busy tick can't starve the
@@ -53,16 +52,6 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                 break;
             }
         };
-        // An `unblock` answer must resume the blocked worker's orch task
-        // causally with delivery — flip it `blocked → running` here, not by a
-        // tick-time session-status poll (which false-resumes the block-turn
-        // tail and strands a fast resume). Safe for non-orch kinds: this is
-        // gated on `kind == "unblock"`, which only ever targets a worker
-        // session. Runs BEFORE the turn re-enters so the flip is settled by the
-        // time the resumed turn's terminal event reaches `watch_session`.
-        if event.kind == "unblock" {
-            crate::orch::on_unblock_delivered(cp, &event.target_session_pk).await;
-        }
         // `continue_session_with_prompt` is the ONLY delivery path: a clean
         // new user turn onto a session `claim_deliverable_background_event`
         // already proved is idle. Never a mid-turn splice.
@@ -97,7 +86,7 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
 /// The drainer's background loop: sleep, then drain a batch, forever.
 ///
 /// Returned as a future (not self-spawned) so hosts can run it on their own
-/// runtime, mirroring `scheduler::run_loop` / `orch::run_loop`.
+/// runtime, mirroring `scheduler::run_loop`.
 pub async fn run_loop(cp: Arc<ControlPlane>) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -106,8 +95,7 @@ pub async fn run_loop(cp: Arc<ControlPlane>) {
 }
 
 /// Spawn the drainer on the host's runtime (mirrors `scheduler::spawn_runner`
-/// / `orch::spawn_runner` — the daemon is the single always-on engine host
-/// for all of these background loops).
+/// — the daemon is the single always-on engine host for all background loops).
 pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_loop(cp))
 }

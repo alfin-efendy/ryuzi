@@ -50,9 +50,9 @@ impl LlmStreamFactory for RouterLlmStreamFactory {
 }
 
 /// Resolve the model for a secondary (auxiliary) call — session-title
-/// generation, context compaction, orchestrator goal-decompose — from the
-/// raw-KV setting `auxiliary.<task>.model`. Falls back to `fallback` (the
-/// session/default model) when the setting is unset, unreadable, or blank.
+/// generation and context compaction — from the raw-KV setting
+/// `auxiliary.<task>.model`. Falls back to `fallback` (the session/default
+/// model) when the setting is unset, unreadable, or blank.
 pub async fn aux_model(store: &Store, task: &str, fallback: &str) -> String {
     let key = format!("auxiliary.{task}.model");
     match store.get_setting(&key).await {

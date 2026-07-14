@@ -107,7 +107,7 @@ impl SessionKind {
 }
 
 /// A durable background-rail row (spec §6.1). Producers (async delegation,
-/// learning forks, scheduled jobs, orch events) enqueue one; the daemon
+/// learning forks, and scheduled jobs) enqueue one; the daemon
 /// drainer delivers it into `target_session_pk` as a new user turn while
 /// that session is idle. `kind` is one of [`BackgroundKind`]'s db strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,8 +128,6 @@ pub enum BackgroundKind {
     Delegation,
     Learning,
     Job,
-    Orch,
-    Unblock,
 }
 
 impl BackgroundKind {
@@ -138,27 +136,15 @@ impl BackgroundKind {
             BackgroundKind::Delegation => "delegation",
             BackgroundKind::Learning => "learning",
             BackgroundKind::Job => "job",
-            BackgroundKind::Orch => "orch",
-            BackgroundKind::Unblock => "unblock",
         }
     }
     pub fn from_db(s: &str) -> Self {
         match s {
             "learning" => BackgroundKind::Learning,
             "job" => BackgroundKind::Job,
-            "orch" => BackgroundKind::Orch,
-            "unblock" => BackgroundKind::Unblock,
             _ => BackgroundKind::Delegation,
         }
     }
-}
-
-/// Outcome of `Store::record_child_failure`: whether the child re-queued for
-/// another attempt, or the circuit breaker tripped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChildFailure {
-    pub requeued: bool,
-    pub gave_up: bool,
 }
 
 /// Which actor initiated a write — a general-purpose provenance marker
@@ -662,8 +648,7 @@ pub struct Message {
     pub status: Option<String>,
     pub tool_kind: Option<String>,
     pub created_at: i64,
-    /// Group-chat attribution: the agent name for a labeled worker/orchestrator
-    /// bubble. `None` for ordinary user/assistant rows.
+    /// Group-chat attribution: the agent name for a labeled worker bubble.
     pub speaker: Option<String>,
 }
 
@@ -702,8 +687,8 @@ impl NewMessage {
     }
 
     /// A labeled display bubble (role `assistant`) attributed to `speaker`.
-    /// Used by the orchestrator to post worker start/status/report bubbles into
-    /// the home chat. A display row only — never a `provider_turns` entry.
+    /// Used to post worker start, status, and report bubbles into the home
+    /// chat. A display row only — never a `provider_turns` entry.
     pub fn speaker_block(
         session_pk: &str,
         speaker: &str,
@@ -844,13 +829,6 @@ pub enum CoreEvent {
     JobRunChanged {
         job_id: String,
         run_id: String,
-        status: String,
-    },
-    /// An orchestrated task changed status (todo|ready|running|done|failed|
-    /// cancelled; roots also decomposing|waiting|judging).
-    OrchTaskChanged {
-        task_id: String,
-        root_id: Option<String>,
         status: String,
     },
     /// Per-response context usage for a native session (drives the

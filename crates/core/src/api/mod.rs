@@ -14,7 +14,6 @@ pub mod fsview_api;
 pub mod gateways_api;
 pub mod learning_api;
 pub mod native_api;
-pub mod orch_api;
 pub mod plugins_api;
 pub mod remote_catalog_api;
 pub mod scheduler_api;
@@ -134,7 +133,6 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
         m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
-        m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
         m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await
@@ -265,26 +263,8 @@ pub(crate) mod tests_support {
     }
 
     /// Like `state()`, but with one connected project (`"p1"`) already in the
-    /// store — for command families (orch, scheduler, ...) whose calls need a
-    /// real `project_id` to validate against.
-    pub(crate) async fn state_with_project() -> ApiState {
-        let s = state().await;
-        s.cp.store()
-            .insert_project(crate::domain::Project {
-                project_id: "p1".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
-                source: None,
-                model: None,
-                effort: None,
-                perm_mode: crate::domain::PermMode::Default,
-                created_at: None,
-                is_git: false,
-            })
-            .await
-            .unwrap();
-        s
-    }
+    /// store — for command families whose calls need a real `project_id` to
+    /// validate against.
 
     /// A no-op `HarnessSession` — the RPC tests that use
     /// `state_with_fake_native` only assert on the session row a start call
@@ -438,6 +418,40 @@ mod tests {
 
         let io: ApiError = AgentRegistryError::Io(anyhow::anyhow!("disk full")).into();
         assert_eq!(io.status, 500);
+    }
+
+    #[tokio::test]
+    async fn rpc_surface_has_no_legacy_orchestration_methods() {
+        let port = serve(state().await, opts(0)).await.unwrap();
+        let client = reqwest::Client::new();
+        for method in [
+            "orch_submit",
+            "orch_list_roots",
+            "orch_tasks",
+            "orch_cancel",
+            "orch_retry",
+            "orch_answer_block",
+            "orch_steer",
+        ] {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/rpc/{method}"))
+                .bearer_auth("t")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{method}"
+            );
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(
+                body["error"],
+                format!("unknown method: {method}"),
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]

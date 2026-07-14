@@ -354,7 +354,6 @@ impl Router {
             | CoreEvent::ApprovalRequested { .. }
             | CoreEvent::AgentRunChanged { .. }
             | CoreEvent::JobRunChanged { .. }
-            | CoreEvent::OrchTaskChanged { .. }
             // Context telemetry has no Discord rendering (yet) — the
             // compaction notice arrives as a persisted Message row instead.
             | CoreEvent::ContextUsage { .. }

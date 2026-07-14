@@ -2484,8 +2484,7 @@ impl Store {
     /// worker/review sessions (internal delegation noise) and any hit whose
     /// lineage root is in `exclude_lineage` (the caller's own conversation),
     /// dedup remaining hits by lineage root (one hit per past conversation),
-    /// and rank interactive-origin sessions above scheduler/orch-started
-    /// ones.
+    /// and rank interactive-origin sessions above scheduled ones.
     ///
     /// `query` is always passed as a bound parameter — never interpolated
     /// into the SQL — so it cannot inject outer-SQL syntax. It IS still
@@ -2511,7 +2510,7 @@ impl Store {
                  JOIN messages m ON m.session_pk = f.session_pk AND m.seq = f.seq \
                  WHERE messages_fts MATCH ?1 \
                    AND s.kind NOT IN ('worker','review') \
-                 ORDER BY (s.started_by IN ('scheduler','orch')) ASC, \
+                 ORDER BY (s.started_by = 'scheduler') ASC, \
                           m.created_at DESC \
                  LIMIT ?2",
             )?;
@@ -3946,51 +3945,6 @@ impl Store {
         .await
     }
 
-    /// Record a worker child's failure and decide retry vs. give-up. Increments
-    /// `consecutive_failures`; if it stays `<= max_retries` the child re-queues
-    /// (`todo`, cleared outcome) for another attempt; otherwise the breaker
-    /// trips (`gave_up=1`, `failed`). Only affects a `running` child.
-    pub async fn record_child_failure(
-        &self,
-        id: &str,
-        max_retries: i64,
-    ) -> anyhow::Result<crate::domain::ChildFailure> {
-        let id = id.to_string();
-        let now = crate::paths::now_ms();
-        self.with_conn(move |c| {
-            let tx = c.transaction()?;
-            let n: i64 = tx
-                .query_row(
-                    "SELECT consecutive_failures FROM orch_tasks WHERE id=?1 AND status='running'",
-                    params![id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?
-                + 1;
-            let gave_up = n > max_retries;
-            if gave_up {
-                tx.execute(
-                    "UPDATE orch_tasks SET status='failed', gave_up=1, \
-                     consecutive_failures=?2, finished_at=?3 WHERE id=?1",
-                    params![id, n, now],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE orch_tasks SET status='todo', consecutive_failures=?2, \
-                     session_pk=NULL, error=NULL, result=NULL, finished_at=NULL WHERE id=?1",
-                    params![id, n],
-                )?;
-            }
-            tx.commit()?;
-            Ok(crate::domain::ChildFailure {
-                requeued: !gave_up,
-                gave_up,
-            })
-        })
-        .await
-    }
-
     /// Replace the entire cached remote catalog with `rows` in one
     /// transaction. Called after a signed feed fetch verifies successfully;
     /// an empty slice clears the cache.
@@ -4015,29 +3969,6 @@ impl Store {
                 )?;
             }
             tx.commit()
-        })
-        .await
-    }
-
-    /// The orch task whose worker (or judge) session is `session_pk`, if any.
-    /// The `orch_block` tool's runtime guard (Task E6, spec §8): a session
-    /// with no matching row here is not an orchestrated worker turn, so the
-    /// tool refuses regardless of what the schema-level gate advertised.
-    pub async fn task_by_session(
-        &self,
-        session_pk: &str,
-    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
-        let session_pk = session_pk.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!(
-                    "SELECT {} FROM orch_tasks WHERE session_pk=?1",
-                    crate::orch::ORCH_COLS
-                ),
-                params![session_pk],
-                crate::orch::task_from,
-            )
-            .optional()
         })
         .await
     }
@@ -4093,44 +4024,6 @@ impl Store {
                 },
             )
             .optional()
-        })
-        .await
-    }
-
-    /// A non-terminal root bound to `home_session_pk` (the live orchestration a
-    /// typed steer targets), if any.
-    pub async fn live_root_for_home(
-        &self,
-        home_session_pk: &str,
-    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
-        let home = home_session_pk.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!(
-                    "SELECT {} FROM orch_tasks WHERE root_id IS NULL AND home_session_pk=?1 \
-                     AND status IN ('decomposing','waiting','judging') ORDER BY created_at DESC LIMIT 1",
-                    crate::orch::ORCH_COLS
-                ),
-                params![home],
-                crate::orch::task_from,
-            )
-            .optional()
-        })
-        .await
-    }
-
-    /// Append a mid-run user directive to a root's steer note (newline-joined).
-    pub async fn append_steer_note(&self, root_id: &str, text: &str) -> anyhow::Result<()> {
-        let (root_id, text) = (root_id.to_string(), text.to_string());
-        self.with_conn(move |c| {
-            c.execute(
-                "UPDATE orch_tasks SET steer_note = \
-                   CASE WHEN steer_note IS NULL OR steer_note='' THEN ?2 \
-                        ELSE steer_note || char(10) || ?2 END \
-                 WHERE id=?1 AND root_id IS NULL",
-                params![root_id, text],
-            )
-            .map(|_| ())
         })
         .await
     }
@@ -5270,58 +5163,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A store with one `waiting` root and one `running` child (`ot-child`) —
-    /// just enough orch-task graph for the circuit-breaker test below. Raw
-    /// SQL rather than `orch::insert_root`/`insert_children`: those mint
-    /// random ids, and this test needs a stable id to fail repeatedly.
-    async fn orch_test_store() -> Store {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        std::mem::forget(tmp);
-        store
-            .with_conn(|c| {
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
-                     VALUES ('ot-root', NULL, 'p1', 'goal', 'do it', '', 'waiting', 1)",
-                    [],
-                )?;
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
-                     VALUES ('ot-child', 'ot-root', 'p1', 'child', 'do child', '', 'running', 2)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        store
-    }
-
-    #[tokio::test]
-    async fn record_child_failure_requeues_then_trips_the_breaker() {
-        let store = orch_test_store().await;
-        let child = "ot-child";
-        // First two failures re-queue for retry.
-        let a = store.record_child_failure(child, 2).await.unwrap();
-        assert!(a.requeued && !a.gave_up);
-        // Re-mark running to model the retry attempt, then fail again.
-        crate::orch::set_status(&store, child, "todo", "running")
-            .await
-            .unwrap();
-        let b = store.record_child_failure(child, 2).await.unwrap();
-        assert!(b.requeued && !b.gave_up);
-        crate::orch::set_status(&store, child, "todo", "running")
-            .await
-            .unwrap();
-        // Third failure trips the breaker.
-        let c = store.record_child_failure(child, 2).await.unwrap();
-        assert!(!c.requeued && c.gave_up);
-        let t = crate::orch::get_task(&store, child).await.unwrap().unwrap();
-        assert_eq!(t.status, "failed");
-        assert!(t.gave_up);
-        assert_eq!(t.consecutive_failures, 3);
-    }
-
     #[tokio::test]
     async fn migration_adds_sessions_branch_owned_defaulting_to_owned() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -5841,42 +5682,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project_id, "p2");
         assert_eq!(rows[0].decision, "rejectAlways");
-    }
-
-    #[tokio::test]
-    async fn record_audit_writes_rows_read_back_newest_first() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store
-            .record_audit(
-                WriteOrigin::Agent,
-                Some("sess-1"),
-                "app_jobs",
-                "create",
-                "allow",
-            )
-            .await
-            .unwrap();
-        store
-            .record_audit(
-                WriteOrigin::Agent,
-                Some("sess-1"),
-                "app_orchestrate",
-                "submit",
-                "allow",
-            )
-            .await
-            .unwrap();
-        let rows = store.list_audit(10).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        // Newest first.
-        assert_eq!(rows[0].tool, "app_orchestrate");
-        assert_eq!(rows[0].action, "submit");
-        assert_eq!(rows[0].origin, "agent");
-        assert_eq!(rows[0].session_pk.as_deref(), Some("sess-1"));
-        assert_eq!(rows[1].tool, "app_jobs");
-        // Limit is honored.
-        assert_eq!(store.list_audit(1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -6485,33 +6290,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(user_version, 35, "forward migration must land at v35");
-    }
-
-    #[tokio::test]
-    async fn migration_29_adds_speaker_and_orch_group_chat_columns() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        // A speaker-labeled display row round-trips.
-        store
-            .insert_message(crate::domain::NewMessage::speaker_block(
-                "s1",
-                "build",
-                "text",
-                serde_json::json!({ "text": "worker report" }),
-            ))
-            .await
-            .unwrap();
-        let rows = store.list_messages("s1").await.unwrap();
-        assert_eq!(rows[0].speaker.as_deref(), Some("build"));
-        // A root task records its home chat + starts un-broken.
-        let root = crate::orch::insert_root(&store, "p1", "goal", "waiting", Some("home-1"))
-            .await
-            .unwrap();
-        let t = crate::orch::get_task(&store, &root).await.unwrap().unwrap();
-        assert_eq!(t.home_session_pk.as_deref(), Some("home-1"));
-        assert_eq!(t.consecutive_failures, 0);
-        assert!(!t.gave_up);
-        assert_eq!(t.steer_note, None);
     }
 
     #[tokio::test]

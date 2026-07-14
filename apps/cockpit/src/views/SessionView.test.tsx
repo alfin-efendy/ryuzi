@@ -63,9 +63,6 @@ mock.module("@/bindings", () => ({
     listSessions,
     listGateways,
     searchFiles,
-    // SessionView's orch task-strip effect (Phase 5) calls this on a chat
-    // session; stub an empty result so no strip mounts and it doesn't throw.
-    orchListRoots: async () => ({ status: "ok" as const, data: [] }),
   },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
@@ -168,7 +165,9 @@ function seed(runnerId: string, sessionOverrides: Partial<Session> = {}, agents:
     transcripts: {},
     pendingApprovals: [],
   });
-  useAgents.setState({ registry: { agents, defaultAgentId: agents[0]?.id ?? "none", recovery: [], subagentModel: { kind: "route", route: "fast" } } });
+  useAgents.setState({
+    registry: { agents, defaultAgentId: agents[0]?.id ?? "none", recovery: [], subagentModel: { kind: "route", route: "fast" } },
+  });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ loaded: true });
 }
@@ -228,11 +227,10 @@ test("immutable primary snapshot labels the session despite profile edits", asyn
 });
 
 test("session composer sends raw leading whitespace and its structured mention span", async () => {
-  seed(
-    LOCAL_RUNNER,
-    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
-    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
-  );
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
   render(<SessionView />);
 
   const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
@@ -260,11 +258,10 @@ test("session mention metadata stays with its draft when switching sessions", as
     primaryAgentId: "primary",
     primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" },
   });
-  seed(
-    LOCAL_RUNNER,
-    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
-    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
-  );
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
   useStore.setState({ sessions: [...useStore.getState().sessions, s2] });
   render(<SessionView />);
 
@@ -289,11 +286,10 @@ test("session mention metadata stays with its draft when switching sessions", as
 });
 
 test("session textarea Escape closes the agent mention popup", async () => {
-  seed(
-    LOCAL_RUNNER,
-    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
-    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
-  );
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
   render(<SessionView />);
 
   const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
@@ -304,11 +300,10 @@ test("session textarea Escape closes the agent mention popup", async () => {
 });
 
 test("session plain agent @ mentions open the agent menu instead of searching context", async () => {
-  seed(
-    LOCAL_RUNNER,
-    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
-    [primary("primary"), { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" }],
-  );
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
   render(<SessionView />);
 
   const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
@@ -319,11 +314,10 @@ test("session plain agent @ mentions open the agent menu instead of searching co
 });
 
 test("session composer selects an agent mention from its keyboard menu", async () => {
-  seed(
-    LOCAL_RUNNER,
-    { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } },
-    [primary("primary"), { ...primary("ada"), name: "Ada" }],
-  );
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada" },
+  ]);
   render(<SessionView />);
 
   const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
@@ -353,11 +347,9 @@ test("a deleted primary makes a captured session read-only without repair", asyn
 });
 
 test("a nonexecutable primary offers repair navigation", async () => {
-  seed(
-    LOCAL_RUNNER,
-    { primaryAgentId: "reviewer", primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "violet" } },
-    [primary("reviewer", false)],
-  );
+  seed(LOCAL_RUNNER, { primaryAgentId: "reviewer", primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "violet" } }, [
+    primary("reviewer", false),
+  ]);
   render(<SessionView />);
 
   fireEvent.click(await screen.findByRole("button", { name: "Repair agent" }));

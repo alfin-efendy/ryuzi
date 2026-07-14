@@ -111,7 +111,6 @@ pub struct RunnerDeps {
     pub agent_knowledge: Arc<crate::agents::knowledge::AgentKnowledgeStore>,
     /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
     /// `SessionCtx::kind`. Consulted by `visible_tool_defs` to schema-gate
-    /// `orch_block` (Task E6, spec §8) to `Worker` sessions only.
     pub kind: SessionKind,
     pub work_dir: PathBuf,
     /// Session attachments folder (second read root for the `read` tool).
@@ -661,25 +660,16 @@ const BUDGET_EXHAUSTED_PROMPT: &str = "You've reached the maximum number of \
     summarizing what you've found and accomplished so far, without calling \
     any more tools.";
 
-/// The tool definitions a turn advertises to the model: the registry's
-/// tools filtered by the agent's allow-list, with `orch_block` additionally
-/// hidden from every session kind but `Worker` (Task E6, spec §8) — the
-/// SCHEMA-level half of the gate. This is advisory, not the safety boundary:
-/// dispatch (`run_tool_call`'s `agent.tools.allows` check) still enforces the
-/// agent's real whitelist regardless of what's advertised, and `orch_block`'s
-/// own `Store::task_by_session` lookup is the authoritative RUNTIME guard — a
-/// non-worker session has no orch task row for its `session_pk` even if it
-/// somehow called the tool anyway.
-fn visible_tool_defs(tools: &ToolRegistry, agent: &Agent, kind: SessionKind) -> Vec<Value> {
+/// The tool definitions a turn advertises to the model, filtered by the
+/// agent's allow-list.
+fn visible_tool_defs(tools: &ToolRegistry, agent: &Agent, _kind: SessionKind) -> Vec<Value> {
     tools
         .definitions()
         .into_iter()
         .filter(|d| {
             d.get("name")
                 .and_then(|n| n.as_str())
-                .map(|n| {
-                    agent.tools.allows(n) && (n != "orch_block" || kind == SessionKind::Worker)
-                })
+                .map(|n| agent.tools.allows(n))
                 .unwrap_or(false)
         })
         .collect()
@@ -1360,7 +1350,7 @@ pub(crate) async fn drive_review(
 }
 
 /// Tools delegated children may never use regardless of filters. `task` is
-/// re-armed for delegator agents (the orchestrator role); `memory` never is —
+/// re-armed for agents permitted to delegate; `memory` never is —
 /// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
 /// tools are blocked because the list is keyed by the parent's session_pk: a
 /// child's `todowrite` would silently clobber the user-visible plan.
@@ -1378,7 +1368,6 @@ const SUBAGENT_BLOCKLIST: &[&str] = &[
     "todoread",
     "skill_manage",
     "app_jobs",
-    "app_orchestrate",
     "app_projects",
     "clarify",
 ];
@@ -1417,8 +1406,7 @@ fn effective_child_filter(
     )
 }
 
-/// The `max_spawn_depth` setting (default 2: a delegating sub-agent like the
-/// builtin `orchestrator` can itself delegate one level; its children cannot).
+/// The `max_spawn_depth` setting controls how many delegation hops a child may make.
 async fn max_spawn_depth(store: &Store) -> u8 {
     crate::settings::usize_setting(store, "max_spawn_depth", 2).await as u8
 }
@@ -1837,7 +1825,7 @@ impl RunnerSpawner {
             &self.deps.tools.names(),
             SUBAGENT_BLOCKLIST,
         );
-        // Orchestrator role: a delegating child gets the `task` tool re-armed
+        // Delegating children get the `task` tool re-armed.
         // and a spawner one hop deeper, while the spawn-depth budget allows.
         let child_depth = self.depth.saturating_add(1);
         let max_depth = max_spawn_depth(&self.deps.store).await;
@@ -5075,31 +5063,6 @@ mod tests {
         assert!(!filter.allows("write"));
     }
 
-    /// Task E6 schema gate: `orch_block` is hidden from every session kind
-    /// but `Worker`, even for an agent (`build`) whose own `ToolFilter` is
-    /// `All`. The tool's own `Store::task_by_session` lookup (exercised in
-    /// `tools::orch_block`'s tests) is the runtime backstop this pairs with.
-    #[test]
-    fn visible_tool_defs_hides_orch_block_outside_worker_sessions() {
-        let tools = ToolRegistry::builtin();
-        let agent = AgentRegistry::builtin().default_agent();
-        assert_eq!(agent.tools, super::super::agents::ToolFilter::All);
-        let names = |defs: &[Value]| -> Vec<String> {
-            defs.iter()
-                .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                .collect()
-        };
-        for kind in [SessionKind::Chat, SessionKind::Project, SessionKind::Review] {
-            let defs = visible_tool_defs(&tools, &agent, kind);
-            assert!(
-                !names(&defs).contains(&"orch_block".to_string()),
-                "{kind:?} must not see orch_block"
-            );
-        }
-        let worker_defs = visible_tool_defs(&tools, &agent, SessionKind::Worker);
-        assert!(names(&worker_defs).contains(&"orch_block".to_string()));
-    }
-
     #[test]
     fn subagent_blocklist_blocks_todo_tools() {
         use super::super::agents::ToolFilter;
@@ -5306,173 +5269,6 @@ mod tests {
         assert!(results
             .iter()
             .all(|r| r.status == SubtaskStatus::Interrupted));
-    }
-
-    #[tokio::test]
-    async fn orchestrator_child_delegates_at_default_depth() {
-        use testutil::RecordingLlm;
-        let dir = tempfile::tempdir().unwrap();
-        // parent → task(orchestrator) → orchestrator → task(explore) →
-        // explore reports → orchestrator synthesizes → parent closes.
-        let parent = vec![
-            tool_use_start(0, "c1", "task"),
-            input_json_delta(
-                0,
-                "{\"subagent_type\":\"orchestrator\",\"prompt\":\"coordinate this\"}",
-            ),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        let orch_1 = vec![
-            tool_use_start(0, "c2", "task"),
-            input_json_delta(
-                0,
-                "{\"subagent_type\":\"explore\",\"prompt\":\"look around\"}",
-            ),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        let explore = vec![
-            text_delta("explored ok"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let orch_2 = vec![
-            text_delta("coordinated: explored ok"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let parent_end = vec![
-            text_delta("done"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let llm = Arc::new(RecordingLlm::new(vec![
-            parent, orch_1, explore, orch_2, parent_end,
-        ]));
-        // max_spawn_depth unset: the default (2) must let the builtin
-        // orchestrator delegate out of the box.
-        let mut deps = deps_at(dir.path(), llm.clone()).await;
-        seed_idle_session(&deps.store, &deps.session_pk).await;
-        let root = deps
-            .delegation
-            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "go wide")
-            .await
-            .unwrap();
-        deps.run_id = root.run.run_id;
-
-        run_turn(
-            &deps,
-            TurnPrompt::text("go wide", "go wide"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        {
-            let bodies = llm.bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 5, "orchestrator's delegation really ran");
-            // The orchestrator child carries the capability block + task tool.
-            let orch_sys = bodies[1]["system"].as_str().unwrap();
-            assert!(orch_sys.contains("spawn depth 1 of 2"), "{orch_sys}");
-            let orch_tools: Vec<&str> = bodies[1]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|t| t["name"].as_str())
-                .collect();
-            assert!(orch_tools.contains(&"task"));
-            assert!(!orch_tools.contains(&"memory"), "memory stays blocked");
-            // Guard dropped before the awaits below (clippy: await_holding_lock).
-        }
-        // The grandchild explore ran and fed the orchestrator's synthesis.
-        let task_row_out = deps
-            .store
-            .list_messages("s1")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|m| m.block_type == "tool_call" && m.payload["name"] == "task")
-            .expect("task row")
-            .payload["output"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(task_row_out.contains("coordinated: explored ok"));
-    }
-
-    #[tokio::test]
-    async fn orchestrator_child_cannot_delegate_when_depth_is_flat() {
-        use testutil::RecordingLlm;
-        let dir = tempfile::tempdir().unwrap();
-        let parent = vec![
-            tool_use_start(0, "c1", "task"),
-            input_json_delta(
-                0,
-                "{\"subagent_type\":\"orchestrator\",\"prompt\":\"coordinate\"}",
-            ),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        // The orchestrator tries to delegate anyway; the tool must refuse.
-        let orch_try = vec![
-            tool_use_start(0, "c2", "task"),
-            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"x\"}"),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        let orch_give_up = vec![
-            text_delta("did it alone"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let parent_end = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
-        let llm = Arc::new(RecordingLlm::new(vec![
-            parent,
-            orch_try,
-            orch_give_up,
-            parent_end,
-        ]));
-        let mut deps = deps_at(dir.path(), llm.clone()).await;
-        seed_idle_session(&deps.store, &deps.session_pk).await;
-        let root = deps
-            .delegation
-            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "go")
-            .await
-            .unwrap();
-        deps.run_id = root.run.run_id;
-        // Explicit flat delegation: the orchestrator child may not re-spawn.
-        deps.store
-            .set_setting(crate::domain::WriteOrigin::User, "max_spawn_depth", "1")
-            .await
-            .unwrap();
-
-        run_turn(
-            &deps,
-            TurnPrompt::text("go", "go"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        let bodies = llm.bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 4, "no grandchild stream was opened");
-        // `task` was filtered out of the child's toolset entirely, so the
-        // allow-list gate refuses the attempt.
-        let orch_tools: Vec<&str> = bodies[1]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert!(!orch_tools.contains(&"task"));
-        let msgs = serde_json::to_string(&bodies[2]["messages"]).unwrap();
-        assert!(msgs.contains("not permitted"), "{msgs}");
-        // And its system prompt has no capability block.
-        assert!(!bodies[1]["system"]
-            .as_str()
-            .unwrap()
-            .contains("spawn depth"));
     }
 
     #[tokio::test]

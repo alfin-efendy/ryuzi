@@ -542,6 +542,7 @@ mod tests {
     use crate::control::ControlPlane;
     use crate::domain::{SessionKind, SessionStatus};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
     use crate::plugins::Registries;
     use crate::settings::SettingsStore;
     use crate::store::Store;
@@ -980,6 +981,29 @@ mod tests {
     ) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(db_guard.path()).await.unwrap());
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let mut regs = Registries::new();
         regs.harness = Arc::new(OneShotHarnessFactory);
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())

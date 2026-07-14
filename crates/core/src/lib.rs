@@ -23,7 +23,6 @@ pub mod llm_router;
 pub mod mcp;
 pub mod mentions;
 pub mod oauth_loopback;
-pub mod orch;
 pub mod pairing;
 pub mod paths;
 pub mod plugins;
@@ -52,7 +51,6 @@ pub use domain::{
 };
 pub use gateway::{Gateway, GatewayFactory, GatewayRegistry, MessageRef};
 pub use harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
-pub use orch::OrchTask;
 pub use plugins::{CorePlugin, PluginHost, PluginSource, Registries};
 pub use registry::Registry;
 pub use router::{chunk, ConnectOpts, ConnectOutcome, Router};

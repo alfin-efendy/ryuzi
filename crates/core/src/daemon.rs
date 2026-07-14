@@ -91,11 +91,8 @@ pub struct Daemon {
     /// the same anchor and double-fire or skip jobs. Tracked so `stop()`
     /// can abort it, same as `router_handle`/`fanout_handle`.
     scheduler_handle: JoinHandle<()>,
-    /// The orch dispatcher's background loop (`orch::spawn_runner`), tracked
-    /// for the same reason as `scheduler_handle`.
-    orch_handle: JoinHandle<()>,
     /// The background-rail drainer's loop (`background_rail::spawn_runner`),
-    /// tracked for the same reason as `scheduler_handle`/`orch_handle` — the
+    /// tracked for the same reason as `scheduler_handle` — the
     /// daemon is the single always-on engine host for it too.
     rail_handle: JoinHandle<()>,
     /// The durable per-agent learning queue worker (`learning::spawn_runner`),
@@ -117,7 +114,7 @@ impl Daemon {
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
-    /// same as `stop()`), the router/fan-out/scheduler/orch/rail/learning/
+    /// same as `stop()`), the router/fan-out/scheduler/rail/learning/
     /// curator handles are aborted, and the daemon is marked stopped (reusing the same
     /// idempotency flag `stop()` checks) before the error is returned.
     /// Marking it stopped here means a caller's own best-effort `stop()` on
@@ -150,7 +147,6 @@ impl Daemon {
                     self.router_handle.abort();
                     self.fanout_handle.abort();
                     self.scheduler_handle.abort();
-                    self.orch_handle.abort();
                     self.rail_handle.abort();
                     self.learning_handle.abort();
                     self.curator_handle.abort();
@@ -191,7 +187,7 @@ impl Daemon {
     /// failing gateway can't block the rest of the shutdown),
     /// abort the router and approval fan-out broadcast-consumer loops (which
     /// also aborts any in-flight per-approval races the fan-out spawned —
-    /// see `spawn_approval_fanout`), abort the scheduler, orch, rail,
+    /// see `spawn_approval_fanout`), abort the scheduler, rail,
     /// learning, and curator loops, stop the endpoint server, then flush
     /// telemetry. A second call is a no-op.
     pub async fn stop(&self) {
@@ -204,7 +200,6 @@ impl Daemon {
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
-        self.orch_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.curator_handle.abort();
@@ -223,7 +218,6 @@ impl Drop for Daemon {
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
-        self.orch_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.curator_handle.abort();
@@ -283,8 +277,7 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// → a second, inbound-only `Router` handed to every gateway via
 /// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
 /// instances) → the approval fan-out spawned on another `cp.subscribe()`
-/// → the cron scheduler (`scheduler::spawn_runner`), orch dispatcher
-/// (`orch::spawn_runner`), background-rail drainer
+/// → the cron scheduler (`scheduler::spawn_runner`), background-rail drainer
 /// (`background_rail::spawn_runner`), learning worker
 /// (`learning::spawn_runner`), and curator (`curator::spawn_runner`, Task
 /// 10 — store-only, spawned off `store` directly rather than `cp` since it
@@ -394,11 +387,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let fanout_handle =
         spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), gateways.clone());
 
-    // The daemon is the single always-on engine host: cron scheduler and
-    // orch dispatcher live HERE (moved out of Cockpit). The scheduler's
+    // The daemon is the single always-on engine host for cron scheduling. The scheduler's
     // job_last_fired anchor is single-host-only — never spawn a second one.
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
-    let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
@@ -417,7 +408,6 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         router_handle,
         fanout_handle,
         scheduler_handle,
-        orch_handle,
         rail_handle,
         learning_handle,
         curator_handle,
@@ -686,6 +676,29 @@ mod tests {
     async fn test_agent_persistence(
         store: Arc<Store>,
     ) -> crate::agents::bootstrap::AgentPersistence {
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let config = tempfile::tempdir().unwrap();
         let persistence = crate::agents::bootstrap::initialize_agent_persistence(
             config.path().to_path_buf(),
@@ -1319,7 +1332,7 @@ mod tests {
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw_a), Arc::new(gw_b)];
 
         // Long-running "loops" standing in for the real router/fan-out/
-        // scheduler/orch/rail/learning tasks, so this test can assert that a
+        // scheduler/rail/learning tasks, so this test can assert that a
         // failed `start()` aborts them too.
         let router_handle = tokio::spawn(async {
             loop {
@@ -1332,11 +1345,6 @@ mod tests {
             }
         });
         let scheduler_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        });
-        let orch_handle = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -1370,7 +1378,6 @@ mod tests {
             router_handle,
             fanout_handle,
             scheduler_handle,
-            orch_handle,
             rail_handle,
             learning_handle,
             curator_handle,
@@ -1400,10 +1407,6 @@ mod tests {
         assert!(
             daemon.scheduler_handle.is_finished(),
             "start()'s rollback must abort the scheduler loop"
-        );
-        assert!(
-            daemon.orch_handle.is_finished(),
-            "start()'s rollback must abort the orch loop"
         );
         assert!(
             daemon.rail_handle.is_finished(),
@@ -1868,7 +1871,6 @@ mod tests {
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -1909,7 +1911,7 @@ mod tests {
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
         // Long-running "loops" standing in for the real router/fan-out/
-        // scheduler/orch/rail/learning tasks, so this test can assert
+        // scheduler/rail/learning tasks, so this test can assert
         // `stop()` actually aborts them.
         let router_handle = tokio::spawn(async {
             loop {
@@ -1922,11 +1924,6 @@ mod tests {
             }
         });
         let scheduler_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        });
-        let orch_handle = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -1960,7 +1957,6 @@ mod tests {
             router_handle,
             fanout_handle,
             scheduler_handle,
-            orch_handle,
             rail_handle,
             learning_handle,
             curator_handle,
@@ -1974,8 +1970,8 @@ mod tests {
             1,
             "a second stop() must not re-invoke gateway.stop()"
         );
-        // Give the abort a moment to actually land, then assert all seven
-        // tracked loops are gone — stop() must not leave them running.
+        // Give the abort a moment to actually land, then assert all tracked
+        // loops are gone — stop() must not leave them running.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             daemon.router_handle.is_finished(),
@@ -1988,10 +1984,6 @@ mod tests {
         assert!(
             daemon.scheduler_handle.is_finished(),
             "stop() must abort the scheduler loop"
-        );
-        assert!(
-            daemon.orch_handle.is_finished(),
-            "stop() must abort the orch loop"
         );
         assert!(
             daemon.rail_handle.is_finished(),
@@ -2274,7 +2266,7 @@ mod tests {
         );
     }
 
-    // ---------- (j) daemon hosts scheduler + orch + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
+    // ---------- (j) daemon hosts scheduler + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
 
     #[tokio::test]
     async fn daemon_uses_injected_config_root_not_database_parent() {
@@ -2328,7 +2320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_hosts_and_stop_aborts_scheduler_orch_rail_learning_and_curator_loops() {
+    async fn daemon_hosts_and_stop_aborts_scheduler_rail_learning_and_curator_loops() {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
@@ -2344,7 +2336,6 @@ mod tests {
             !daemon.scheduler_handle.is_finished(),
             "scheduler loop must be live"
         );
-        assert!(!daemon.orch_handle.is_finished(), "orch loop must be live");
         assert!(!daemon.rail_handle.is_finished(), "rail loop must be live");
         assert!(
             !daemon.learning_handle.is_finished(),
@@ -2360,10 +2351,6 @@ mod tests {
         assert!(
             daemon.scheduler_handle.is_finished(),
             "stop() must abort the scheduler loop"
-        );
-        assert!(
-            daemon.orch_handle.is_finished(),
-            "stop() must abort the orch loop"
         );
         assert!(
             daemon.rail_handle.is_finished(),

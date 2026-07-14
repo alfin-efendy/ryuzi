@@ -15,8 +15,7 @@ const k2 = sessKey(LOCAL_RUNNER, "s2");
 // The sendNextQueued suite below overwrites the store's real `send` action with
 // stubs via `setState({ send })`. `useStore` is a process-global singleton shared
 // with every other test file in the same `bun test` run, so leaving a stub in
-// place leaks into later files (e.g. store-orch.test.ts's send-routing tests,
-// which then invoke the stub instead of the real orch-steer path). Snapshot the
+// place leaks into later files (e.g. later send-routing tests). Snapshot the
 // genuine implementation at module load and reinstate it once this file is done.
 const realSendImpl = useStore.getState().send;
 afterAll(() => {
@@ -1261,6 +1260,23 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
   useNative.setState({ loadTodos: original });
 });
 
+test("send preserves /orchestrate text as an ordinary turn input", async () => {
+  reset();
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = mockGateways();
+  const turn: TurnInput = { text: "/orchestrate audit", context: null, attachments: [], git: null };
+
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", turn)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", turn);
+
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+  listGateways.mockRestore();
+});
+
 test("send resolves true on success and false on backend error (drives composer draft restore)", async () => {
   reset();
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
@@ -1271,7 +1287,9 @@ test("send resolves true on success and false on backend error (drives composer 
   await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(true);
 
   cont.mockResolvedValue({ status: "error", error: { message: "quota exhausted" } });
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(false);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(
+    false,
+  );
 
   cont.mockRestore();
   listProjects.mockRestore();
@@ -1288,7 +1306,9 @@ test("send steers a RUNNING session instead of starting a new turn via continue"
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hold on", context: null, attachments: [], git: null })).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hold on", context: null, attachments: [], git: null })).resolves.toBe(
+    true,
+  );
   expect(steer).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hold on");
   expect(cont).not.toHaveBeenCalled();
 
