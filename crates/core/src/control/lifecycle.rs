@@ -1528,10 +1528,13 @@ impl ControlPlane {
                 futures::future::join_all(resolved_mentions.targets.iter().map(|target| {
                     let me = Arc::clone(&me);
                     let root_run_id = run_id.clone();
-                    let target_agent_id = target.profile.id.clone();
+                    let agent_id = target.profile.id.clone();
+                    let agent_name = target.profile.name.clone();
+                    let target_agent_id = agent_id.clone();
                     let task = resolved_mentions.task.clone();
                     async move {
-                        me.delegation
+                        let queued = me
+                            .delegation
                             .queue_main(crate::delegation::MainDelegationRequest {
                                 parent_run_id: root_run_id,
                                 target_agent_id,
@@ -1539,7 +1542,8 @@ impl ControlPlane {
                                 context: None,
                                 background: false,
                             })
-                            .await
+                            .await;
+                        (agent_id, agent_name, queued)
                     }
                 }))
                 .await;
@@ -1549,11 +1553,12 @@ impl ControlPlane {
                 let root_run_id = run_id.clone();
                 let task = resolved_mentions.task.clone();
                 async move {
+                    let (agent_id, agent_name, queued) = queued;
                     let outcome = match queued {
                         Ok(child) => me.run_explicit_mention_child(child, task).await,
                         Err(error) => CoordinatorOutcome {
-                            agent_id: String::new(),
-                            agent_name: "unavailable agent".into(),
+                            agent_id,
+                            agent_name,
                             task,
                             status: "failed".into(),
                             result: None,

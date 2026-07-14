@@ -847,6 +847,110 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
 
 #[tokio::test]
 #[serial]
+async fn explicit_mentions_keep_queue_rejection_identity_in_durable_synthesis_context() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_counters().await;
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: String| crate::agents::types::AgentMutationInput {
+        name,
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let mut targets = Vec::new();
+    for number in 1..=crate::delegation::MAX_ACTIVE_CHILD_RUNS + 1 {
+        targets.push(
+            cp.registry()
+                .create(create(format!("Target{number}")))
+                .await
+                .unwrap(),
+        );
+    }
+    let rejected = targets.last().unwrap().clone();
+    let mut text = String::new();
+    let mut mentions = Vec::new();
+    for target in &targets {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let start_utf16 = text.len() as u32;
+        text.push('@');
+        text.push_str(&target.profile.name);
+        mentions.push(crate::api::types::AgentMention {
+            agent_id: target.profile.id.clone(),
+            label_snapshot: target.profile.name.clone(),
+            start_utf16,
+            end_utf16: text.len() as u32,
+        });
+    }
+    text.push_str(" inspect the change");
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(&text, &text),
+            &mentions,
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(
+        &counters.prompts,
+        crate::delegation::MAX_ACTIVE_CHILD_RUNS + 1,
+    )
+    .await;
+    let root = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.is_none())
+        .unwrap();
+    let entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), targets.len());
+    for target in &targets {
+        assert!(entries.iter().any(|entry| {
+            entry.payload["agent_id"] == target.profile.id
+                && entry.payload["name"] == target.profile.name
+        }));
+    }
+    let rejected_entry = entries
+        .iter()
+        .find(|entry| entry.payload["agent_id"] == rejected.profile.id)
+        .expect("rejected mention must retain its resolved identity");
+    assert_eq!(rejected_entry.payload["name"], rejected.profile.name);
+    assert_eq!(rejected_entry.payload["status"], "failed");
+    assert!(rejected_entry.payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("active child run limit exceeded"));
+
+    let synthesis = counters.prompts.lock().unwrap().last().cloned().unwrap();
+    for target in &targets {
+        assert!(synthesis.contains(&format!("Agent: {}", target.profile.name)));
+    }
+    assert!(synthesis.contains("active child run limit exceeded"));
+}
+
+#[tokio::test]
+#[serial]
 async fn explicit_mentions_persist_completed_outcomes_while_a_sibling_is_pending() {
     let _guard = StateDirGuard::new();
     let (db_guard, db_path) = temp_db_path();
