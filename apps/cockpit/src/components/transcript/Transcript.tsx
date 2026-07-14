@@ -203,9 +203,10 @@ export function Transcript({
     () =>
       pendingApprovals.filter(
         (approval) =>
+          approvalRunId !== undefined &&
           approval.runnerId === runnerId &&
           approval.sessionPk === sessionPk &&
-          (approvalRunId === undefined || approval.runId === approvalRunId),
+          approval.runId === approvalRunId,
       ),
     [approvalRunId, pendingApprovals, runnerId, sessionPk],
   );

@@ -191,6 +191,29 @@ afterEach(() => {
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
 });
 
+test("normal sessions render their passed approval card only once", async () => {
+  seed(LOCAL_RUNNER);
+  useStore.setState({
+    pendingApprovals: [
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "main-run",
+        requestId: "main-approval",
+        tool: "bash",
+        summary: "run the main command",
+        kind: "tool",
+        input: { command: "printf normal-session-approval" },
+        principal: null,
+      },
+    ],
+  });
+
+  render(<SessionView />);
+
+  expect(await screen.findAllByText("printf normal-session-approval")).toHaveLength(1);
+});
+
 test("immutable primary snapshot labels the session despite profile edits", async () => {
   seed(
     LOCAL_RUNNER,
