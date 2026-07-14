@@ -626,6 +626,7 @@ async fn drive(
     display: DisplayMode,
     budget: &IterationBudget,
 ) -> anyhow::Result<String> {
+    let mut system_breakdown: Option<Vec<(&'static str, u64)>> = None;
     let system = match &agent.prompt {
         Some(p) => p.clone(),
         None => {
@@ -633,7 +634,10 @@ async fn drive(
                 Some(memory) => memory.snapshot().await?,
                 None => None,
             };
-            context::assemble_system(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref())
+            let sections =
+                context::build_sections(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref());
+            system_breakdown = Some(context::breakdown_of(&sections));
+            context::join_sections(&sections)
         }
     };
     // Tools restricted to what this agent may use — UNLESS a review fork
@@ -650,6 +654,20 @@ async fn drive(
     let mut final_text = String::new();
 
     cm.set_baseline(&system, &tool_defs);
+    if let Some(mut bd) = system_breakdown.take() {
+        let tools_tokens: u64 = tool_defs
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0) as u64)
+            .sum::<u64>()
+            / 4;
+        bd.push(("tools", tools_tokens));
+        tracing::debug!(
+            target: "ryuzi::context",
+            breakdown = ?bd,
+            baseline_tokens = cm.status().active_tokens,
+            "native: context baseline breakdown"
+        );
+    }
     let settings_cap =
         crate::settings::usize_setting(&deps.store, "context.max_output_tokens", 1).await;
     // usize_setting floors at 1; treat 1 (the "unset" default) as no cap.

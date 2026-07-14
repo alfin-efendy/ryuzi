@@ -50,7 +50,6 @@ fn steer_channel_note() -> String {
 /// for the diagnostic breakdown (see `breakdown_of`). Bodies are joined with
 /// `\n\n` to form the final `system` string.
 pub(crate) struct Section {
-    #[allow(dead_code)] // Consumed by the diagnostic breakdown in a later task.
     pub label: &'static str,
     pub body: String,
 }
@@ -171,6 +170,21 @@ pub(crate) fn join_sections(sections: &[Section]) -> String {
         .map(|s| s.body.as_str())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Per-block token estimate (`bytes / 4`) of an assembled section list, with
+/// same-label sections summed and first-seen order preserved. Diagnostic only.
+pub(crate) fn breakdown_of(sections: &[Section]) -> Vec<(&'static str, u64)> {
+    let mut out: Vec<(&'static str, u64)> = Vec::new();
+    for s in sections {
+        let tokens = (s.body.len() / 4) as u64;
+        if let Some(entry) = out.iter_mut().find(|(l, _)| *l == s.label) {
+            entry.1 += tokens;
+        } else {
+            out.push((s.label, tokens));
+        }
+    }
+    out
 }
 
 /// Assemble the system prompt for a session rooted at `work_dir`. Signature is
@@ -349,6 +363,40 @@ mod tests {
             .filter(|s| s.body.contains("Same body"))
             .count();
         assert_eq!(hits, 1, "bodies equal after trim must dedup");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn breakdown_sums_match_joined_length() {
+        // No instruction files, no memory: only the fixed blocks + skills(if any).
+        let dir = std::env::temp_dir().join(format!("ryuzi-ctx-bd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let sections = build_sections(&dir, &[], None);
+        let bd = breakdown_of(&sections);
+
+        // Every label present in sections appears once in the breakdown.
+        for s in &sections {
+            assert!(
+                bd.iter().any(|(l, _)| *l == s.label),
+                "label {} missing",
+                s.label
+            );
+        }
+        // Per-label token sums equal the /4 estimate of that label's bodies.
+        for (label, tokens) in &bd {
+            let bytes: usize = sections
+                .iter()
+                .filter(|s| s.label == *label)
+                .map(|s| s.body.len())
+                .sum();
+            assert_eq!(
+                *tokens,
+                (bytes / 4) as u64,
+                "token sum mismatch for {label}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
