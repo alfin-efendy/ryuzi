@@ -767,6 +767,9 @@ fn validate_action(trigger_kind: TriggerKind, action: &HookActionInput) -> anyho
                 }
                 reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
                     .context("outbound header name must be a valid HTTP header name")?;
+                if header.value.is_empty() {
+                    bail!("outbound header values must not be empty");
+                }
                 if header.value.len() > 4 * 1024 {
                     bail!("outbound header values must be at most 4096 bytes");
                 }
@@ -1085,13 +1088,30 @@ pub async fn create_hook(store: &Store, input: HookInput) -> anyhow::Result<Hook
 }
 
 pub async fn update_hook(store: &Store, id: &str, input: HookInput) -> anyhow::Result<HookRow> {
-    let name = validate_input(&input)?;
+    let name = normalize_name(&input.name)?;
     let id = id.to_string();
     let now = now_ms();
     store
         .with_conn(move |c| {
-            let config_json = encode_action_for_storage(&input.action)
-                .map_err(sql_json_error)?;
+            let existing_action = c.query_row(
+                "SELECT config_json FROM automation_hooks WHERE id=?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut action = input.action;
+            if let (HookActionInput::WebhookOutbound(existing), HookActionInput::WebhookOutbound(updated)) =
+                (decode_action_from_storage(&existing_action).map_err(sql_json_error)?, &mut action)
+            {
+                for header in &mut updated.headers {
+                    if header.value.is_empty() {
+                        if let Some(previous) = existing.headers.iter().find(|previous| previous.name.eq_ignore_ascii_case(&header.name)) {
+                            header.value.clone_from(&previous.value);
+                        }
+                    }
+                }
+            }
+            validate_action(input.trigger_kind, &action).map_err(sql_json_error)?;
+            let config_json = encode_action_for_storage(&action).map_err(sql_json_error)?;
             let changed = c.execute(
                 "UPDATE automation_hooks SET name=?2, trigger_kind=?3, action_kind=?4, enabled=?5, \
                  inbound_path=CASE WHEN ?3='webhook.inbound' THEN COALESCE(inbound_path, ?6) ELSE NULL END, \
@@ -1100,7 +1120,7 @@ pub async fn update_hook(store: &Store, id: &str, input: HookInput) -> anyhow::R
                     id,
                     name,
                     input.trigger_kind.as_str(),
-                    input.action.kind().as_str(),
+                    action.kind().as_str(),
                     input.enabled as i64,
                     inbound_path(input.trigger_kind),
                     config_json,
@@ -1764,6 +1784,79 @@ mod tests {
         assert!(is_public_outbound_ip(
             "2606:4700:4700::1111".parse().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn update_preserves_blank_outbound_header_values_and_create_rejects_them() {
+        crate::llm_router::secrets::use_test_key_file();
+        let (store, _db) = mem_store().await;
+        let mut input = HookInput::outbound(
+            "Configured header",
+            TriggerKind::SessionEnd,
+            "https://example.com/original",
+            None,
+        );
+        let HookActionInput::WebhookOutbound(action) = &mut input.action else {
+            unreachable!();
+        };
+        action.headers.push(WebhookHeader {
+            name: "Authorization".into(),
+            value: "Bearer secret-value".into(),
+        });
+        let hook = create_hook(&store, input).await.unwrap();
+
+        let mut update = HookInput::outbound(
+            "Renamed hook",
+            TriggerKind::SessionEnd,
+            "https://example.com/updated",
+            None,
+        );
+        let HookActionInput::WebhookOutbound(action) = &mut update.action else {
+            unreachable!();
+        };
+        action.headers.push(WebhookHeader {
+            name: "Authorization".into(),
+            value: String::new(),
+        });
+        update_hook(&store, &hook.id, update).await.unwrap();
+
+        let hook_id = hook.id.clone();
+        let stored: String = store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT config_json FROM automation_hooks WHERE id=?1",
+                    params![hook_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(stored.contains("enc:v1:"));
+        assert!(!stored.contains("Bearer secret-value"));
+
+        let run = create_run(&store, &hook.id, json!({ "event": "session.end" }))
+            .await
+            .unwrap();
+        let HookActionInput::WebhookOutbound(action) = run.snapshot.action else {
+            unreachable!();
+        };
+        assert_eq!(action.url, "https://example.com/updated");
+        assert_eq!(action.headers[0].value, "Bearer secret-value");
+
+        let mut blank = HookInput::outbound(
+            "Blank header",
+            TriggerKind::SessionEnd,
+            "https://example.com/blank",
+            None,
+        );
+        let HookActionInput::WebhookOutbound(action) = &mut blank.action else {
+            unreachable!();
+        };
+        action.headers.push(WebhookHeader {
+            name: "Authorization".into(),
+            value: String::new(),
+        });
+        assert!(create_hook(&store, blank).await.is_err());
     }
 
     #[tokio::test]

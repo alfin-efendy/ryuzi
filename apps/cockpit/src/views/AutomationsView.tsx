@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Segmented, SettingsCard } from "@ryuzi/ui";
+import { Segmented } from "@ryuzi/ui";
 import { CommandsTab } from "./CommandsTab";
+import { HooksTab } from "./HooksTab";
 import { SchedulerView } from "./SchedulerView";
 
 type AutomationTab = "scheduler" | "hooks" | "commands";
@@ -10,16 +11,6 @@ const TABS: { id: AutomationTab; label: string }[] = [
   { id: "hooks", label: "Hooks" },
   { id: "commands", label: "Commands" },
 ];
-
-function UnavailableTab({ name }: { name: string }) {
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
-      <div className="mx-auto max-w-[860px]">
-        <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">{name} are not available yet.</SettingsCard>
-      </div>
-    </div>
-  );
-}
 
 export function AutomationsView({ initialTab = "scheduler" }: { initialTab?: AutomationTab }) {
   const [tab, setTab] = useState<AutomationTab>(initialTab);
@@ -31,7 +22,7 @@ export function AutomationsView({ initialTab = "scheduler" }: { initialTab?: Aut
           <Segmented options={TABS} value={tab} onChange={setTab} />
         </div>
       </div>
-      {tab === "scheduler" ? <SchedulerView /> : tab === "commands" ? <CommandsTab /> : <UnavailableTab name="Hooks" />}
+      {tab === "scheduler" ? <SchedulerView /> : tab === "commands" ? <CommandsTab /> : <HooksTab />}
     </div>
   );
 }

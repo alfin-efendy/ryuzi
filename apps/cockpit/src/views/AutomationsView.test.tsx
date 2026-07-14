@@ -72,10 +72,10 @@ test("renders all automation tabs and preserves the Scheduler job list by defaul
   expect(screen.getByRole("heading", { name: "Scheduler" })).toBeTruthy();
 });
 
-test("initializes the requested placeholder tab and changes tabs locally", () => {
+test("initializes the requested Hooks tab and changes tabs locally", async () => {
   render(<AutomationsView initialTab="hooks" />);
 
-  expect(screen.getByText("Hooks are not available yet.")).toBeTruthy();
+  expect(await screen.findByRole("heading", { name: "Hooks" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Commands" }));
   expect(screen.getByText("Select a project to manage project commands")).toBeTruthy();
 });
@@ -87,5 +87,5 @@ test("uses the requested initial tab after a keyed route change", async () => {
 
   rerender(renderForTab("hooks"));
 
-  expect(screen.getByText("Hooks are not available yet.")).toBeTruthy();
+  expect(await screen.findByRole("heading", { name: "Hooks" })).toBeTruthy();
 });
