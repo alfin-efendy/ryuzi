@@ -21,6 +21,19 @@ const MAX_RUNS: u32 = 20;
 const MAX_DETAIL_ATTEMPTS: u32 = 3;
 const MAX_TOOL_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
+/// Maximum JSON request body accepted by an inbound webhook endpoint.
+pub const MAX_INBOUND_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
+/// Maximum serialized, non-sensitive request headers retained with an inbound
+/// webhook. Header filtering enforces this budget before persistence.
+pub(crate) const MAX_INBOUND_WEBHOOK_HEADERS_BYTES: usize = 64 * 1024;
+/// Maximum serialized inbound envelope: a 1 MiB raw JSON body stored as a JSON
+/// string (at most twice its wire size after escaping), the serialized retained
+/// header budget, and bounded route/envelope framing.
+pub(crate) const MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES: usize =
+    MAX_INBOUND_WEBHOOK_BODY_BYTES * 2 + MAX_INBOUND_WEBHOOK_HEADERS_BYTES + 8 * 1024;
+/// Caps each untrusted metadata input at 256 bytes. Even if every byte needs
+/// JSON escaping, the three fields fit within the inbound framing allowance.
+const MAX_INBOUND_WEBHOOK_METADATA_INPUT_BYTES: usize = 256;
 
 const MAX_OUTBOUND_TEMPLATE_BYTES: usize = 64 * 1024;
 const OUTBOUND_RETRY_DELAYS: [std::time::Duration; 3] = [
@@ -132,12 +145,27 @@ impl AutomationEnvelope {
     /// Cap an envelope before it reaches persistence, a prompt, or an eventual
     /// outbound delivery. Object keys are considered lexically, making the
     /// retained prefix deterministic across runs.
-    pub fn capped(mut self) -> Self {
+    pub fn capped(self) -> Self {
+        self.cap_to(MAX_ENVELOPE_BYTES)
+    }
+
+    /// Cap an inbound webhook envelope without discarding its validated raw JSON
+    /// body. The route bounds the wire body and serialized filtered headers before
+    /// constructing this envelope, so generic `Value` shrinking is neither needed
+    /// nor safe: it would change JSON number lexemes retained in the raw body.
+    pub fn capped_inbound_webhook(mut self) -> Self {
+        self.occurred_at = truncate_metadata_string(self.occurred_at);
+        self.source.kind = truncate_metadata_string(self.source.kind);
+        self.source.id = truncate_metadata_string(self.source.id);
+        self
+    }
+
+    fn cap_to(mut self, max_bytes: usize) -> Self {
         cap_tool_values(&mut self.data);
-        self.occurred_at = cap_metadata_string(self.occurred_at);
-        self.source.kind = cap_metadata_string(self.source.kind);
-        self.source.id = cap_metadata_string(self.source.id);
-        while serde_json::to_vec(&self).map_or(true, |bytes| bytes.len() > MAX_ENVELOPE_BYTES) {
+        self.occurred_at = cap_metadata_string(self.occurred_at, max_bytes);
+        self.source.kind = cap_metadata_string(self.source.kind, max_bytes);
+        self.source.id = cap_metadata_string(self.source.id, max_bytes);
+        while serde_json::to_vec(&self).map_or(true, |bytes| bytes.len() > max_bytes) {
             let before = serde_json::to_vec(&self.data).map_or(usize::MAX, |bytes| bytes.len());
             self.data = shrink_json(self.data);
             if serde_json::to_vec(&self.data).is_ok_and(|bytes| bytes.len() < before) {
@@ -154,6 +182,13 @@ impl AutomationEnvelope {
         }
         self
     }
+}
+
+fn truncate_metadata_string(value: String) -> String {
+    truncate_string(&value, MAX_INBOUND_WEBHOOK_METADATA_INPUT_BYTES)
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn shrink_metadata_string(value: &mut String) -> bool {
@@ -175,8 +210,8 @@ fn shrink_metadata_string(value: &mut String) -> bool {
     true
 }
 
-fn cap_metadata_string(value: String) -> String {
-    let max_bytes = MAX_ENVELOPE_BYTES
+fn cap_metadata_string(value: String, max_envelope_bytes: usize) -> String {
+    let max_bytes = max_envelope_bytes
         .saturating_sub(serde_json::to_vec(&TriggerKind::WebhookInbound).map_or(0, |v| v.len()))
         .saturating_div(4);
     truncate_string(&value, max_bytes)

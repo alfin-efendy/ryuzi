@@ -2,7 +2,7 @@ use crate::approval::ApprovalHub;
 use crate::attachments::{AttachmentFetcher, UreqFetcher};
 use crate::automation::{
     AutomationEnvelope, AutomationSource, Dispatcher, HookActionInput, HookOrigin, HookRow,
-    RateVerdict, TriggerKind,
+    RateVerdict, TriggerKind, MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES,
 };
 use crate::domain::{
     ApprovalResponse, CoreEvent, Message, PermMode, Project, Session, ToolPolicyRow,
@@ -442,9 +442,16 @@ impl ControlPlane {
         {
             return Err(InboundWebhookError::RateLimited);
         }
-        let envelope = envelope.capped();
+        let envelope = envelope.capped_inbound_webhook();
         let envelope_json = serde_json::to_value(&envelope)
             .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;
+        if serde_json::to_vec(&envelope_json).map_or(true, |bytes| {
+            bytes.len() > MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
+        }) {
+            return Err(InboundWebhookError::Invalid(
+                "inbound webhook envelope exceeds its storage limit".to_string(),
+            ));
+        }
         let run = crate::automation::create_run(&self.store, &hook.id, envelope_json)
             .await
             .map_err(|error| InboundWebhookError::Unavailable(error.to_string()))?;

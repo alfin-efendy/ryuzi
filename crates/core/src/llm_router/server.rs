@@ -1,6 +1,9 @@
 //! The local endpoint server: Anthropic + OpenAI compatible surface on
 //! 127.0.0.1, gated by endpoint keys, routed to provider connections.
-use crate::automation::{self, AutomationEnvelope, AutomationSource, TriggerKind};
+use crate::automation::{
+    self, AutomationEnvelope, AutomationSource, TriggerKind, MAX_INBOUND_WEBHOOK_BODY_BYTES,
+    MAX_INBOUND_WEBHOOK_HEADERS_BYTES,
+};
 use crate::control::ControlPlane;
 use crate::llm_router::client::{
     ensure_fresh_for_attempt, route_models_for_body, send_upstream, RouteTarget, UpstreamCtx,
@@ -18,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -146,7 +150,7 @@ impl RouterServer {
             .route(
                 "/v1/automations/hooks/{path}",
                 post(handle_inbound_webhook).layer(axum::extract::DefaultBodyLimit::max(
-                    MAX_INBOUND_WEBHOOK_BYTES,
+                    MAX_INBOUND_WEBHOOK_BODY_BYTES,
                 )),
             )
             // Agent conversations with inline images exceed axum's 2 MB default.
@@ -233,8 +237,6 @@ async fn check_auth(
     }
 }
 
-const MAX_INBOUND_WEBHOOK_BYTES: usize = 1024 * 1024;
-
 fn inbound_webhook_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": { "message": message } }))).into_response()
 }
@@ -248,26 +250,34 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
 }
 
 fn filtered_webhook_headers(headers: &HeaderMap) -> serde_json::Map<String, Value> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name = name.as_str().to_ascii_lowercase();
-            let sensitive = matches!(
-                name.as_str(),
-                "authorization" | "x-api-key" | "cookie" | "set-cookie"
-            ) || name.ends_with("-token")
-                || name.ends_with("-secret")
-                || name.ends_with("-key");
-            (!sensitive)
-                .then(|| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name, Value::String(value.to_string())))
-                })
-                .flatten()
-        })
-        .collect()
+    let mut filtered = serde_json::Map::new();
+    let mut seen = HashSet::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let sensitive = matches!(
+            name.as_str(),
+            "authorization" | "x-api-key" | "cookie" | "set-cookie"
+        ) || name.ends_with("-token")
+            || name.ends_with("-secret")
+            || name.ends_with("-key");
+        if sensitive {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        let candidate = Value::String(value.to_string());
+        filtered.insert(name.clone(), candidate);
+        if serde_json::to_vec(&filtered).map_or(true, |bytes| {
+            bytes.len() > MAX_INBOUND_WEBHOOK_HEADERS_BYTES
+        }) {
+            filtered.remove(&name);
+        }
+    }
+    filtered
 }
 
 async fn handle_inbound_webhook(
@@ -306,14 +316,14 @@ async fn handle_inbound_webhook(
             "content type must be application/json",
         );
     }
-    if body.len() > MAX_INBOUND_WEBHOOK_BYTES {
+    if body.len() > MAX_INBOUND_WEBHOOK_BODY_BYTES {
         return inbound_webhook_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "request body exceeds 1 MiB",
         );
     }
-    let payload = match serde_json::from_slice::<Value>(&body) {
-        Ok(payload) => payload,
+    let body_text = match String::from_utf8(body.to_vec()) {
+        Ok(body) => body,
         Err(_) => {
             return inbound_webhook_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -321,6 +331,12 @@ async fn handle_inbound_webhook(
             )
         }
     };
+    if serde_json::from_str::<Value>(&body_text).is_err() {
+        return inbound_webhook_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "request body must be valid JSON",
+        );
+    }
     let hook = match automation::find_inbound_hook(&state.store, &path).await {
         Ok(Some(hook)) => hook,
         Ok(None) => {
@@ -352,7 +368,7 @@ async fn handle_inbound_webhook(
                 "method": method.as_str(),
                 "path": format!("/v1/automations/hooks/{path}"),
                 "headers": filtered_webhook_headers(&headers),
-                "body": payload,
+                "body": body_text.clone(),
             }
         }),
     );
@@ -2004,15 +2020,22 @@ mod tests {
         }
     }
 
-    struct WebhookHarnessFactory;
+    struct WebhookHarnessFactory {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
 
-    struct WebhookHarness;
+    struct WebhookHarness {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
 
-    struct WebhookSession;
+    struct WebhookSession {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
 
     #[async_trait::async_trait]
     impl HarnessSession for WebhookSession {
-        async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            self.prompts.lock().unwrap().push(prompt.agent);
             Ok(())
         }
 
@@ -2032,22 +2055,35 @@ mod tests {
     #[async_trait::async_trait]
     impl Harness for WebhookHarness {
         async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
-            Ok(Box::new(WebhookSession))
+            Ok(Box::new(WebhookSession {
+                prompts: self.prompts.clone(),
+            }))
         }
     }
 
     impl HarnessFactory for WebhookHarnessFactory {
         fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
-            Ok(Arc::new(WebhookHarness))
+            Ok(Arc::new(WebhookHarness {
+                prompts: self.prompts.clone(),
+            }))
         }
     }
 
-    async fn webhook_state() -> (AppState, Arc<ControlPlane>, String, String) {
+    async fn webhook_state() -> (
+        AppState,
+        Arc<ControlPlane>,
+        String,
+        String,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         crate::llm_router::secrets::use_test_key_file();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
         let mut registries = Registries::new();
-        registries.harness = Arc::new(WebhookHarnessFactory);
+        registries.harness = Arc::new(WebhookHarnessFactory {
+            prompts: prompts.clone(),
+        });
         let cp = ControlPlane::new_with_telemetry(
             store.clone(),
             registries,
@@ -2092,7 +2128,7 @@ mod tests {
             oauth_token_url_override: None,
             kiro_base_override: None,
         };
-        (state, cp, key.key, hook.inbound_path.unwrap())
+        (state, cp, key.key, hook.inbound_path.unwrap(), prompts)
     }
 
     fn webhook_request(path: &str, key: &str) -> axum::http::Request<Body> {
@@ -2121,9 +2157,20 @@ mod tests {
         .await
     }
 
+    #[test]
+    fn filtered_webhook_headers_retains_the_first_duplicate_value() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-retained", header::HeaderValue::from_static("first"));
+        headers.append("x-retained", header::HeaderValue::from_static("second"));
+
+        let filtered = filtered_webhook_headers(&headers);
+
+        assert_eq!(filtered["x-retained"], "first");
+    }
+
     #[tokio::test]
     async fn inbound_webhook_route_is_served_by_router_server() {
-        let (state, cp, key, path) = webhook_state().await;
+        let (state, cp, key, path, _prompts) = webhook_state().await;
         let router_server = RouterServer::new(state.store.clone());
         router_server.attach_control_plane(&cp);
         let port = router_server.start(0).await.unwrap();
@@ -2144,8 +2191,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_webhook_route_preserves_an_exact_1mib_exponent_body_in_run_and_prompt() {
+        let (state, cp, key, path, prompts) = webhook_state().await;
+        let body = format!(
+            "[{}]",
+            std::iter::repeat_n("1e15", (MAX_INBOUND_WEBHOOK_BODY_BYTES - 1) / 5)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(body.len(), MAX_INBOUND_WEBHOOK_BODY_BYTES);
+        assert!(serde_json::from_str::<Value>(&body).is_ok());
+        assert!(
+            serde_json::to_string(&serde_json::from_str::<Value>(&body).unwrap())
+                .unwrap()
+                .len()
+                > body.len()
+        );
+
+        let mut request = webhook_request(&path, &key);
+        *request.body_mut() = Body::from(body.clone());
+        request
+            .headers_mut()
+            .insert("x-retained", "r".repeat(128).parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-over-budget", "x".repeat(64 * 1024).parse().unwrap());
+        assert_eq!(
+            invoke_webhook(state, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let hook = automation::find_inbound_hook(cp.store(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            run.envelope["data"]["request"]["body"].as_str(),
+            Some(body.as_str()),
+            "the persisted run must retain the accepted wire JSON text"
+        );
+        assert_eq!(
+            run.envelope["data"]["request"]["headers"]["x-retained"],
+            "r".repeat(128)
+        );
+        assert!(run.envelope["data"]["request"]["headers"]
+            .get("x-over-budget")
+            .is_none());
+        for _ in 0..100 {
+            if prompts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+        assert!(prompts.lock().unwrap()[0].contains(&body));
+        assert!(
+            serde_json::to_vec(&run.envelope).unwrap().len()
+                <= automation::MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_preserves_exact_1mib_whitespace_body_in_run_and_prompt() {
+        let (state, cp, key, path, prompts) = webhook_state().await;
+        let whitespace = "\n\t".repeat((MAX_INBOUND_WEBHOOK_BODY_BYTES - 4) / 4);
+        let body = format!("{whitespace}null{whitespace}");
+        assert_eq!(body.len(), MAX_INBOUND_WEBHOOK_BODY_BYTES);
+        assert!(serde_json::from_str::<Value>(&body).is_ok());
+
+        let mut request = webhook_request(&path, &key);
+        *request.body_mut() = Body::from(body.clone());
+        assert_eq!(
+            invoke_webhook(state, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let hook = automation::find_inbound_hook(cp.store(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            run.envelope["data"]["request"]["body"].as_str(),
+            Some(body.as_str()),
+            "the persisted run must retain the accepted wire JSON text"
+        );
+        assert_eq!(
+            run.envelope["data"]["request"]["headers"]["x-visible"],
+            "retained"
+        );
+        assert!(
+            serde_json::to_vec(&run.envelope).unwrap().len()
+                <= automation::MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
+        );
+
+        for _ in 0..100 {
+            if prompts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let prompt = prompts.lock().unwrap().remove(0);
+        let event_json = prompt
+            .split_once("[UNTRUSTED AUTOMATION EVENT — JSON]\n")
+            .unwrap()
+            .1
+            .strip_suffix("\n[END UNTRUSTED AUTOMATION EVENT]")
+            .unwrap();
+        let prompted_envelope = serde_json::from_str::<Value>(event_json).unwrap();
+        assert_eq!(
+            prompted_envelope["data"]["request"]["body"].as_str(),
+            Some(body.as_str()),
+            "the agent prompt JSON must retain the exact wire body"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_preserves_negative_zero_and_exponent_lexemes() {
+        let (state, cp, key, path, prompts) = webhook_state().await;
+        let body = "[-0,1e15]";
+        let mut request = webhook_request(&path, &key);
+        *request.body_mut() = Body::from(body);
+        assert_eq!(
+            invoke_webhook(state, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let hook = automation::find_inbound_hook(cp.store(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.envelope["data"]["request"]["body"], body);
+        for _ in 0..100 {
+            if prompts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(prompts.lock().unwrap().len(), 1);
+        assert!(prompts.lock().unwrap()[0].contains(body));
+    }
+
+    #[tokio::test]
     async fn inbound_webhook_route_rejects_oversized_body_with_422() {
-        let (state, cp, key, path) = webhook_state().await;
+        let (state, cp, key, path, _prompts) = webhook_state().await;
         let router_server = RouterServer::new(state.store.clone());
         router_server.attach_control_plane(&cp);
         let port = router_server.start(0).await.unwrap();
@@ -2155,7 +2355,7 @@ mod tests {
             ))
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("Bearer {key}"))
-            .body(vec![b'x'; MAX_INBOUND_WEBHOOK_BYTES + 1])
+            .body(vec![b'x'; MAX_INBOUND_WEBHOOK_BODY_BYTES + 1])
             .send()
             .await
             .unwrap();
@@ -2166,7 +2366,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_webhook_accepts_bearer_and_x_api_key_and_redacts_sensitive_headers() {
-        let (state, cp, key, path) = webhook_state().await;
+        let (state, cp, key, path, _prompts) = webhook_state().await;
         let response = invoke_webhook(state.clone(), webhook_request(&path, &key)).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let mut x_api_key_request = webhook_request(&path, &key);
@@ -2217,7 +2417,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_webhook_returns_required_statuses() {
-        let (state, _cp, key, path) = webhook_state().await;
+        let (state, _cp, key, path, _prompts) = webhook_state().await;
         let missing = invoke_webhook(state.clone(), webhook_request(&path, "wrong")).await;
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
         let unknown = invoke_webhook(state.clone(), webhook_request("wh_missing", &key)).await;
@@ -2257,7 +2457,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_webhook_per_hook_rate_limit_returns_retry_after() {
-        let (state, cp, key, path) = webhook_state().await;
+        let (state, cp, key, path, _prompts) = webhook_state().await;
         let router_server = RouterServer::new(state.store.clone());
         router_server.attach_control_plane(&cp);
         let port = router_server.start(0).await.unwrap();

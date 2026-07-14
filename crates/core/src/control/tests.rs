@@ -575,6 +575,65 @@ async fn gateway_status_adapter_dispatches_only_matching_hook() {
 }
 
 #[tokio::test]
+async fn inbound_webhook_preserves_accepted_size_payload_in_run_and_agent_prompt() {
+    let (cp, store, prompts, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "project-1").await;
+    let hook = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "inbound payload",
+            crate::automation::TriggerKind::WebhookInbound,
+            "project-1",
+            "",
+            "local",
+            "Process the webhook",
+        ),
+    )
+    .await
+    .unwrap();
+    let payload_overhead = serde_json::to_vec(&serde_json::json!({ "payload": "" }))
+        .unwrap()
+        .len();
+    let body = "x".repeat(crate::automation::MAX_INBOUND_WEBHOOK_BODY_BYTES - payload_overhead);
+    assert_eq!(
+        serde_json::to_vec(&serde_json::json!({ "payload": &body }))
+            .unwrap()
+            .len(),
+        crate::automation::MAX_INBOUND_WEBHOOK_BODY_BYTES,
+        "the simulated JSON body must be valid at the endpoint's accepted size"
+    );
+
+    cp.dispatch_inbound_webhook(
+        hook.clone(),
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::WebhookInbound,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("webhook", "wh_test"),
+            serde_json::json!({ "request": { "body": { "payload": body.clone() } } }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let run = crate::automation::list_runs(&store, &hook.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        run.envelope["data"]["request"]["body"]["payload"]
+            .as_str()
+            .is_some_and(|payload| payload == body),
+        "the persisted run must retain the complete accepted payload"
+    );
+    wait_for_prompts(&prompts, 1).await;
+    assert!(
+        prompts.lock().unwrap()[0].contains(&body),
+        "the agent prompt must retain the complete accepted payload"
+    );
+}
+
+#[tokio::test]
 async fn ending_a_hook_session_preserves_failed_run_and_never_emits_late_success() {
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
