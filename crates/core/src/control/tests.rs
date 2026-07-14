@@ -10,6 +10,7 @@ use crate::plugins::Registries;
 use crate::settings::SettingsStore;
 use async_trait::async_trait;
 use serial_test::serial;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Redirect dirs::data_dir() into a tempdir for the duration of a test so
@@ -1513,6 +1514,70 @@ async fn stop_immediately_after_start_is_registered() {
         !cp.running.lock().unwrap().contains_key(&session.session_pk),
         "end_session must remove the handle from the running map"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn project_stop_immediately_after_start_never_sends_the_prompt() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
+    let store = cp.store().clone();
+    let dir = tempfile::tempdir().unwrap(); // Plain folder, but still a project session.
+    let project = cp.connect_project(dir.path(), "demo").await.unwrap();
+    assert!(!project.is_git);
+
+    let mut start = Box::pin(cp.start_session(&project.project_id, "go", "test", &[]));
+    let mut pending_stop = None;
+    let session = std::future::poll_fn(|cx| -> std::task::Poll<anyhow::Result<Session>> {
+        match start.as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(session)) => {
+                // Poll the first synchronous portion of stop in the same executor
+                // turn that observes start's Ready result. The spawned startup
+                // task cannot run in between, so this is the exact return-to-stop
+                // race the registration must close.
+                let cp = Arc::clone(&cp);
+                let session_pk = session.session_pk.clone();
+                let mut stop = Box::pin(async move { cp.stop_session(&session_pk).await });
+                if let std::task::Poll::Ready(result) = stop.as_mut().poll(cx) {
+                    result.unwrap();
+                } else {
+                    pending_stop = Some(stop);
+                }
+                std::task::Poll::Ready(Ok(session))
+            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(stop) = pending_stop {
+        stop.await.unwrap();
+    }
+    let root = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("project startup creates its root run before returning");
+
+    let root = wait_for_primary_run_terminal(&store, &session.session_pk, &root.run_id).await;
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        0,
+        "an immediately stopped project startup must never drive the first prompt"
+    );
+    assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Interrupted);
 }
 
 #[tokio::test]

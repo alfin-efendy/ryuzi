@@ -232,6 +232,11 @@ impl ControlPlane {
         let me = Arc::clone(self);
         let attachments = attachments.to_vec();
         if let Some((project, git)) = project {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            self.starting
+                .lock()
+                .unwrap()
+                .insert(session_pk.clone(), cancel.clone());
             tokio::spawn(async move {
                 me.run_session_startup(
                     project,
@@ -239,6 +244,7 @@ impl ControlPlane {
                     git,
                     prompt,
                     attachments,
+                    cancel,
                     PrimaryTurn {
                         agent: primary_agent,
                         run_id: stored_run.run_id,
@@ -717,9 +723,9 @@ impl ControlPlane {
         Ok(true)
     }
 
-    /// Background half of `start_session_with_prompt`. Registers a
-    /// cancellation token in `starting` for the duration of the phases so a
-    /// stop/end that lands mid-startup can abort them cleanly.
+    /// Background half of `start_session_with_prompt`. Its cancellation token
+    /// is registered synchronously before this task is spawned, so a stop/end
+    /// immediately after start returns can cancel startup before its first poll.
     async fn run_session_startup(
         self: Arc<Self>,
         project: Project,
@@ -727,13 +733,9 @@ impl ControlPlane {
         git: SessionGitOptions,
         prompt: TurnPrompt,
         attachments: Vec<AttachmentRef>,
+        cancel: tokio_util::sync::CancellationToken,
         primary_turn: PrimaryTurn,
     ) {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        self.starting
-            .lock()
-            .unwrap()
-            .insert(session_pk.clone(), cancel.clone());
         self.startup_phases(
             &project,
             &session_pk,
