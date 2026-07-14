@@ -7,6 +7,7 @@ pub mod agent_api;
 pub mod apps_api;
 pub mod audit;
 pub mod connections_api;
+pub mod delegation_api;
 pub mod endpoint_api;
 pub mod extension_status_api;
 pub mod fsview_api;
@@ -125,6 +126,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
         m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,
         m if agent_api::HANDLES.contains(&m) => agent_api::dispatch(state, m, p).await,
+        m if delegation_api::HANDLES.contains(&m) => delegation_api::dispatch(state, m, p).await,
         m if session_io_api::HANDLES.contains(&m) => session_io_api::dispatch(state, m, p).await,
         m if fsview_api::HANDLES.contains(&m) => fsview_api::dispatch(state, m, p).await,
         m if skills_api::HANDLES.contains(&m) => skills_api::dispatch(state, m, p).await,

@@ -5,6 +5,7 @@ mod audit_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
+mod delegation_cmd;
 mod endpoint_cmd;
 pub mod engine;
 pub mod engine_daemon;
@@ -67,6 +68,10 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::orch_retry,
             commands::orch_answer_block,
             commands::orch_steer,
+            delegation_cmd::get_child_runs,
+            delegation_cmd::get_child_transcript,
+            delegation_cmd::cancel_child_run,
+            delegation_cmd::retry_child_run,
             agent_cmd::list_selectable_models,
             agent_cmd::list_agents,
             agent_cmd::get_agent,
