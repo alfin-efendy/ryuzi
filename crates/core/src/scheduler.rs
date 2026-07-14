@@ -812,6 +812,32 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
 mod tests {
     use super::*;
 
+    async fn prepare_test_agent_persistence(store: &std::sync::Arc<Store>) {
+        crate::llm_router::connections::add_connection(
+            store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(store)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn natural_phrases_map_to_cron() {
         assert_eq!(
@@ -908,6 +934,7 @@ mod tests {
     async fn tick_records_scheduler_liveness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let cp = {
             let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
                 .await
@@ -1020,6 +1047,7 @@ mod tests {
     async fn scheduler_model_override_is_session_scoped_without_mutating_primary_profile() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let cp = {
             let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
                 .await
@@ -1220,6 +1248,7 @@ mod tests {
         let _guard = SchedulerStateDirGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let mut regs = crate::plugins::Registries::new();
         regs.harness = std::sync::Arc::new(FakeJobHarnessFactory);
         let cp = {

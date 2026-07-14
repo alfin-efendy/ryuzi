@@ -435,16 +435,18 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// routing and a substitute is resolved, a status row announces the
 /// substitution — no silent swap.
 async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
+    let scheduler_override = scheduler_model_override(deps).await;
     let project_pin = project_pinned_model(deps).await;
     let session_pin = if project_pin.is_none() {
         chat_session_pinned_model(&deps.store, &deps.session_pk).await
     } else {
         None
     };
-    let pinned = match project_pin.clone() {
-        Some(pinned) => pinned,
-        None => session_pin.clone().or_else(|| deps.model.clone()),
-    };
+    let pinned = scheduler_override
+        .clone()
+        .or_else(|| deps.model.clone())
+        .or_else(|| project_pin.clone().flatten())
+        .or(session_pin.clone());
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
         if !pinned.trim().is_empty() && pinned != resolved {
@@ -469,7 +471,8 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
     }
     let model = turn.model.as_deref().unwrap_or("");
     let primary_model = agent_model_name(&turn.primary_agent.profile.model);
-    if project_pin.is_some()
+    if scheduler_override.is_some()
+        || project_pin.is_some()
         || session_pin.is_some()
         || turn.model != deps.model
         || primary_model.as_deref() == Some(model)
@@ -500,6 +503,24 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
 /// inner Option is the pin itself, which may legitimately be unset. `None`
 /// when there is no session/project row to read, or the session has no
 /// bound project (chat-first sessions).
+async fn scheduler_model_override(deps: &RunnerDeps) -> Option<String> {
+    let session = deps
+        .store
+        .get_session(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()?;
+    if session.started_by.as_deref() != Some("scheduler") {
+        return None;
+    }
+    deps.store
+        .get_session_runtime_settings(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|runtime| runtime.model)
+}
+
 async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
     let session = deps
         .store
@@ -3386,15 +3407,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_turn_picks_up_a_mid_chat_model_change() {
+    async fn durable_primary_model_wins_over_a_project_pin() {
         use testutil::RecordingLlm;
+
         let dir = tempfile::tempdir().unwrap();
-        let turn1 = vec![text_delta("one"), message_delta("end_turn"), message_stop()];
-        let turn2 = vec![text_delta("two"), message_delta("end_turn"), message_stop()];
-        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
         let mut deps = deps_at(dir.path(), llm.clone()).await;
-        // Simulate what start_session froze into RunnerDeps at session start.
-        deps.model = Some("anthropic/model-a".into());
+        deps.model = Some("anthropic/model-b".into());
         add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
         seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
 
@@ -3406,45 +3426,44 @@ mod tests {
         .await
         .unwrap();
 
-        // The user repins the model mid-chat (exactly what the composer's
-        // model picker writes via update_project).
+        assert_eq!(llm.bodies.lock().unwrap()[0]["model"], "anthropic/model-b");
+    }
+
+    #[tokio::test]
+    async fn scheduler_model_override_wins_over_project_and_primary_models() {
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.model = Some("anthropic/model-b".into());
+        add_anthropic_conn(&deps.store, &["model-a", "model-b", "model-c"]).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
         deps.store
-            .update_project(
-                "p",
-                Some("anthropic/model-b".into()),
-                PermMode::BypassPermissions,
-            )
+            .with_conn(|connection| {
+                connection.execute(
+                    "UPDATE sessions SET started_by = 'scheduler' WHERE session_pk = 's1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        deps.store
+            .update_session_runtime_settings("s1", Some("anthropic/model-c".into()), None)
             .await
             .unwrap();
 
         run_turn(
             &deps,
-            TurnPrompt::text("two", "two"),
+            TurnPrompt::text("one", "one"),
             CancellationToken::new(),
         )
         .await
         .unwrap();
 
-        {
-            let bodies = llm.bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 2);
-            assert_eq!(bodies[0]["model"], "anthropic/model-a");
-            assert_eq!(
-                bodies[1]["model"], "anthropic/model-b",
-                "the next turn must re-read the project's pinned model"
-            );
-        }
-
-        // Negative invariant: both pins (model-a, then model-b) are routable
-        // via the connection seeded above, so neither turn should have
-        // announced a substitution.
-        let msgs = deps.store.list_messages("s1").await.unwrap();
-        assert!(
-            !msgs.iter().any(|m| m.payload["summary"]
-                .as_str()
-                .is_some_and(|s| s.contains("is not routable"))),
-            "a routable pin must never emit a not-routable status row"
-        );
+        assert_eq!(llm.bodies.lock().unwrap()[0]["model"], "anthropic/model-c");
     }
 
     #[tokio::test]
@@ -3541,6 +3560,10 @@ mod tests {
             .clear_model_effort_preference(&key_a)
             .await
             .unwrap();
+        // The durable primary model wins over the project pin; update it before
+        // the next turn so this test continues to exercise model-specific
+        // effort and metadata refresh without relying on project precedence.
+        deps.model = Some("anthropic/model-b".into());
         let key_b = ModelPreferenceKey {
             family: "anthropic".into(),
             model: "model-b".into(),
@@ -3604,7 +3627,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
         let llm = Arc::new(RecordingLlm::new(vec![turn]));
-        let deps = deps_at(dir.path(), llm.clone()).await;
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.model = None;
         add_anthropic_conn(&deps.store, &["model-a"]).await;
         // A route the default-model fallback resolves to (mirrors
         // native/mod.rs::native_model_resolution_falls_back_from_an_unresolvable_model).

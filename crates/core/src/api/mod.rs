@@ -145,12 +145,39 @@ pub(crate) mod tests_support {
     use async_trait::async_trait;
     use std::sync::Arc;
 
+    async fn prepare_test_agent_persistence(store: &Arc<crate::store::Store>) {
+        crate::llm_router::connections::add_connection(
+            store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(store)
+            .await
+            .unwrap();
+    }
+
     /// A fresh in-memory-backed `ApiState` with a real bearer token ("t").
     /// Leaks the backing tempfile's guard for test simplicity — acceptable
     /// since each test process exits shortly after.
     pub(crate) async fn state() -> ApiState {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
             .await
             .unwrap();
@@ -300,6 +327,7 @@ pub(crate) mod tests_support {
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let mut registries = crate::plugins::Registries::new();
         registries.harness = Arc::new(FakeHarnessFactory);
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))

@@ -1,3 +1,4 @@
+use super::lifecycle::PrimaryTurn;
 use super::*;
 use crate::domain::{
     ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionKind,
@@ -21,11 +22,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// global git config.
 struct StateDirGuard {
     _dir: tempfile::TempDir,
+    previous_xdg_data_home: Option<std::ffi::OsString>,
+    previous_home: Option<std::ffi::OsString>,
 }
 
 impl StateDirGuard {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
+        let previous_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let previous_home = std::env::var_os("HOME");
         std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
         std::env::set_var("HOME", dir.path());
         std::fs::write(
@@ -33,7 +38,24 @@ impl StateDirGuard {
             "[user]\n\tname = Test\n\temail = test@example.com\n",
         )
         .expect("write .gitconfig");
-        StateDirGuard { _dir: dir }
+        StateDirGuard {
+            _dir: dir,
+            previous_xdg_data_home,
+            previous_home,
+        }
+    }
+}
+
+impl Drop for StateDirGuard {
+    fn drop(&mut self) {
+        match &self.previous_xdg_data_home {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match &self.previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
 
@@ -60,8 +82,10 @@ struct FakeSession {
     /// Every `steer()` call observed on this (or a sibling) fake session, in
     /// order — lets steer tests assert the live handle actually received it.
     steered: Arc<Mutex<Vec<String>>>,
-    /// Every primary-turn configuration received by this live session.
+    /// Every primary-turn configuration received by a live session.
     primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
+    /// Historic session permission updates observed by a live session.
+    perm_modes: Arc<Mutex<Vec<crate::domain::PermMode>>>,
 }
 
 #[async_trait]
@@ -139,6 +163,10 @@ impl HarnessSession for FakeSession {
         self.steered.lock().unwrap().push(text);
     }
 
+    fn set_perm_mode(&self, mode: crate::domain::PermMode) {
+        self.perm_modes.lock().unwrap().push(mode);
+    }
+
     async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {
         self.primary_turns.lock().unwrap().push(primary);
     }
@@ -160,6 +188,8 @@ struct Counters {
     steered: Arc<Mutex<Vec<String>>>,
     /// Every primary-turn configuration received by a live session.
     primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
+    /// Historic session permission updates observed by a live session.
+    perm_modes: Arc<Mutex<Vec<crate::domain::PermMode>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -192,6 +222,7 @@ impl Harness for FakeHarness {
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
             primary_turns: self.counters.primary_turns.clone(),
+            perm_modes: self.counters.perm_modes.clone(),
         }))
     }
 }
@@ -234,6 +265,7 @@ impl Harness for GatedHarness {
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
             primary_turns: self.counters.primary_turns.clone(),
+            perm_modes: self.counters.perm_modes.clone(),
         }))
     }
 }
@@ -281,6 +313,7 @@ impl Harness for LatchGatedHarness {
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
             primary_turns: self.counters.primary_turns.clone(),
+            perm_modes: self.counters.perm_modes.clone(),
         }))
     }
 }
@@ -371,10 +404,9 @@ fn temp_db_path() -> (tempfile::NamedTempFile, std::path::PathBuf) {
     (f, path)
 }
 
-async fn test_control_plane(store: Store, registries: Registries) -> Arc<ControlPlane> {
-    let store = Arc::new(store);
+async fn prepare_test_agent_persistence(store: &Arc<Store>) {
     crate::llm_router::connections::add_connection(
-        &store,
+        store,
         crate::llm_router::connections::ConnectionRow {
             id: "test-anthropic".into(),
             provider: "anthropic".into(),
@@ -393,9 +425,14 @@ async fn test_control_plane(store: Store, registries: Registries) -> Arc<Control
     )
     .await
     .unwrap();
-    crate::agents::bootstrap::ensure_default_routes(&store)
+    crate::agents::bootstrap::ensure_default_routes(store)
         .await
         .unwrap();
+}
+
+async fn test_control_plane(store: Store, registries: Registries) -> Arc<ControlPlane> {
+    let store = Arc::new(store);
+    prepare_test_agent_persistence(&store).await;
     let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
         .await
         .unwrap();
@@ -407,6 +444,7 @@ async fn test_control_plane_with_telemetry(
     registries: Registries,
     telemetry: Arc<dyn crate::telemetry::Telemetry>,
 ) -> Arc<ControlPlane> {
+    prepare_test_agent_persistence(&store).await;
     let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
         .await
         .unwrap();
@@ -419,6 +457,7 @@ async fn test_control_plane_full(
     telemetry: Arc<dyn crate::telemetry::Telemetry>,
     attachment_fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
 ) -> Arc<ControlPlane> {
+    prepare_test_agent_persistence(&store).await;
     let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
         .await
         .unwrap();
@@ -615,6 +654,229 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
             .primary_agent_snapshot,
         Some(creation_identity),
     );
+    assert!(
+        counters.perm_modes.lock().unwrap().is_empty(),
+        "the historic session permission must not overwrite the refreshed profile permission"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let profile = cp
+        .registry()
+        .resolved_snapshot(&agent_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: profile.name,
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: crate::agents::types::AgentTools {
+                    native: profile.tools.native,
+                    plugins: vec!["unimplemented.plugin_tool".into()],
+                    apps: Vec::new(),
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = cp
+        .start_agent_session_with_prompt(
+            None,
+            &agent_id,
+            TurnPrompt::text("reject", "reject"),
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .expect_err("native-incompatible primary must be rejected before persistence");
+    assert!(error.to_string().contains("plugin tools"));
+    assert!(store.list_sessions(None).await.unwrap().is_empty());
+    let run_count: i64 = store
+        .with_conn(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+        })
+        .await
+        .unwrap();
+    assert_eq!(run_count, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persisting() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _counters, _db_guard) = fake_control_plane_with_counters().await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let session = cp
+        .start_agent_session_with_prompt(
+            None,
+            &agent_id,
+            TurnPrompt::text("first", "first"),
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    wait_for_primary_run_terminal(&store, &session.session_pk, &initial_run.run_id).await;
+    let profile = cp
+        .registry()
+        .resolved_snapshot(&agent_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: profile.name,
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: crate::agents::types::AgentTools {
+                    native: profile.tools.native,
+                    plugins: vec!["unimplemented.plugin_tool".into()],
+                    apps: Vec::new(),
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+    let messages_before_rejection = store
+        .list_messages(&session.session_pk)
+        .await
+        .unwrap()
+        .len();
+    let error = cp
+        .continue_agent_session_with_prompt(
+            &session.session_pk,
+            TurnPrompt::text("must not persist", "must not persist"),
+            &[],
+        )
+        .await
+        .expect_err("native-incompatible primary must be rejected before a continuation mutates");
+    assert!(error.to_string().contains("plugin tools"));
+    assert_eq!(
+        store
+            .list_session_agent_runs(&session.session_pk)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "rejection must happen before queuing a root run"
+    );
+    assert_eq!(
+        store
+            .list_messages(&session.session_pk)
+            .await
+            .unwrap()
+            .len(),
+        messages_before_rejection,
+        "rejection must happen before persisting the user prompt"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mutation() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let primary = cp.registry().resolved_snapshot(&agent_id).await.unwrap();
+    let now = now_ms();
+    store
+        .insert_session(Session {
+            session_pk: "resume-invalid-primary".into(),
+            primary_agent_id: Some(agent_id.clone()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: primary.profile.id.clone(),
+                name: primary.profile.name.clone(),
+                avatar_color: primary.profile.avatar.color.clone(),
+            }),
+            project_id: None,
+            agent_session_id: Some("existing-harness-session".into()),
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: SessionStatus::Interrupted,
+            perm_mode: primary.profile.permissions.mode,
+            started_by: Some("test".into()),
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        })
+        .await
+        .unwrap();
+    let profile = primary.profile.clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: profile.name,
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: crate::agents::types::AgentTools {
+                    native: profile.tools.native,
+                    plugins: vec!["unimplemented.plugin_tool".into()],
+                    apps: Vec::new(),
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = cp
+        .resume_session("resume-invalid-primary", "test")
+        .await
+        .expect_err("native-incompatible primary must be rejected before resume mutations");
+    assert!(error.to_string().contains("plugin tools"));
+    let stored = store
+        .get_session("resume-invalid-primary")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Interrupted);
+    assert_eq!(stored.resume_attempts, 0);
+    assert!(store
+        .list_session_agent_runs("resume-invalid-primary")
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1990,6 +2252,18 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
             .unwrap();
     }
     assert_eq!(stored.status, SessionStatus::Idle);
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("startup creates its root run");
+    assert_eq!(initial_run.status, crate::domain::AgentRunStatus::Failed);
+    assert!(initial_run
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("uncommitted changes")));
 }
 
 #[tokio::test]
@@ -2049,6 +2323,17 @@ async fn stop_during_startup_cancels_cleanly() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Interrupted);
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("startup creates its root run");
+    assert_eq!(
+        initial_run.status,
+        crate::domain::AgentRunStatus::Interrupted
+    );
 }
 
 // Task 7.2 review fix: `startup_phases`' only pre-harness cancel checkpoint
@@ -2088,10 +2373,19 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     // `startup_phases` directly instead of going through the normal
     // `start_session` spawn (see the comment above for why).
     let session_pk = crate::paths::new_id();
+    let primary_agent = cp
+        .registry()
+        .resolved_snapshot(&cp.registry().default_agent_id().await)
+        .await
+        .unwrap();
     let session = Session {
         session_pk: session_pk.clone(),
-        primary_agent_id: None,
-        primary_agent_snapshot: None,
+        primary_agent_id: Some(primary_agent.profile.id.clone()),
+        primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+            id: primary_agent.profile.id.clone(),
+            name: primary_agent.profile.name.clone(),
+            avatar_color: primary_agent.profile.avatar.color.clone(),
+        }),
         project_id: Some(project.project_id.clone()),
         agent_session_id: None,
         worktree_path: None,
@@ -2110,6 +2404,11 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         parent_session_pk: None,
     };
     store.insert_session(session).await.unwrap();
+    let root = cp
+        .delegation()
+        .begin_primary(&session_pk, primary_agent.clone(), "go")
+        .await
+        .unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
@@ -2120,7 +2419,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         TurnPrompt::text("go", "go"),
         Vec::new(),
         &cancel,
-        None,
+        PrimaryTurn::new(primary_agent, root.run.run_id.clone()),
     )
     .await;
 
@@ -2135,6 +2434,8 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         msgs.is_empty(),
         "no status row should be emitted once startup was already cancelled; got: {msgs:?}"
     );
+    let root = wait_for_primary_run_terminal(&store, &session_pk, &root.run.run_id).await;
+    assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
 }
 
 #[tokio::test]

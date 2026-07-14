@@ -31,9 +31,36 @@ pub(super) struct PrimaryTurn {
 }
 
 impl PrimaryTurn {
+    #[cfg(test)]
+    pub(super) fn new(agent: Arc<crate::agents::types::AgentSnapshot>, run_id: String) -> Self {
+        Self { agent, run_id }
+    }
+
     fn config(&self) -> anyhow::Result<PrimaryTurnConfig> {
         crate::harness::native::primary_turn_config(self.agent.clone(), self.run_id.clone())
     }
+}
+
+fn validate_executable_primary(
+    agent: &Arc<crate::agents::types::AgentSnapshot>,
+) -> anyhow::Result<()> {
+    if !agent.executable {
+        let details = agent
+            .validation
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "primary agent `{}` is not executable{}",
+            agent.profile.id,
+            (!details.is_empty())
+                .then(|| format!(": {details}"))
+                .unwrap_or_default(),
+        );
+    }
+    crate::harness::native::primary_turn_config(agent.clone(), String::new())?;
+    Ok(())
 }
 
 /// Binds a spawned session to an orchestration as a labeled worker (spec §8):
@@ -101,6 +128,7 @@ impl ControlPlane {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
         let primary_agent = self.registry.resolved_snapshot(primary_agent_id).await?;
+        validate_executable_primary(&primary_agent)?;
         let identity = crate::domain::AgentIdentitySnapshot {
             id: primary_agent.profile.id.clone(),
             name: primary_agent.profile.name.clone(),
@@ -260,6 +288,7 @@ impl ControlPlane {
             }
         };
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
+        validate_executable_primary(&primary_agent)?;
         let run = self
             .delegation
             .begin_primary(session_pk, primary_agent.clone(), &prompt.display)
@@ -269,10 +298,10 @@ impl ControlPlane {
             session_pk,
             prompt,
             attachments,
-            Some(PrimaryTurn {
+            PrimaryTurn {
                 agent: primary_agent,
                 run_id: run_id.clone(),
-            }),
+            },
         )
         .await?;
         Ok(run_id)
@@ -336,14 +365,8 @@ impl ControlPlane {
         cancel: tokio_util::sync::CancellationToken,
         primary_turn: PrimaryTurn,
     ) {
-        self.chat_startup_phases(
-            &session_pk,
-            prompt,
-            attachments,
-            &cancel,
-            Some(primary_turn),
-        )
-        .await;
+        self.chat_startup_phases(&session_pk, prompt, attachments, &cancel, primary_turn)
+            .await;
         self.starting.lock().unwrap().remove(&session_pk);
     }
 
@@ -356,42 +379,50 @@ impl ControlPlane {
         prompt: TurnPrompt,
         attachments: Vec<AttachmentRef>,
         cancel: &tokio_util::sync::CancellationToken,
-        primary_turn: Option<PrimaryTurn>,
+        primary_turn: PrimaryTurn,
     ) {
+        let run_id = primary_turn.run_id.clone();
         let work_dir = crate::paths::chat_scratch_dir(session_pk);
         if let Err(e) = tokio::fs::create_dir_all(&work_dir).await {
             self.fail_startup(
                 session_pk,
+                &run_id,
                 &format!("Couldn't prepare the chat workspace: {e}"),
             )
             .await;
             return;
         }
         if cancel.is_cancelled() {
+            let _ = self
+                .delegation
+                .interrupt(&run_id, "startup stopped before dispatch")
+                .await;
             return;
         }
 
         self.emit_status(session_pk, "Connecting tools…").await;
-        let Some(primary_turn) = primary_turn else {
-            self.fail_startup(session_pk, "Couldn't start the agent: missing primary turn")
-                .await;
-            return;
-        };
-        let run_id = primary_turn.run_id.clone();
         let handle = match self
-            .start_harness_session(None, session_pk, &work_dir, None, Some(primary_turn))
+            .start_harness_session(None, session_pk, &work_dir, None, primary_turn)
             .await
         {
             Ok(handle) => handle,
             Err(e) => {
-                self.fail_startup(session_pk, &format!("Couldn't start the agent: {e}"))
-                    .await;
+                self.fail_startup(
+                    session_pk,
+                    &run_id,
+                    &format!("Couldn't start the agent: {e}"),
+                )
+                .await;
                 return;
             }
         };
 
         if cancel.is_cancelled() {
             let _ = handle.cancel().await;
+            let _ = self
+                .delegation
+                .interrupt(&run_id, "startup stopped before dispatch")
+                .await;
             return;
         }
         let prepared = self
@@ -442,7 +473,7 @@ impl ControlPlane {
         session_pk: &str,
         prompt: TurnPrompt,
         attachments: &[AttachmentRef],
-        primary_turn: Option<PrimaryTurn>,
+        primary_turn: PrimaryTurn,
     ) -> anyhow::Result<()> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
@@ -453,8 +484,8 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
 
-        let primary_config = primary_turn.as_ref().map(PrimaryTurn::config).transpose()?;
-        let run_id = primary_turn.as_ref().map(|turn| turn.run_id.clone());
+        let primary_config = primary_turn.config()?;
+        let run_id = primary_turn.run_id.clone();
 
         self.store
             .update_status(session_pk, SessionStatus::Running, None)
@@ -523,6 +554,9 @@ impl ControlPlane {
                 match resume {
                     Ok(handle) => handle,
                     Err(e) => {
+                        // A failed cold-resume never reaches `spawn_prompt`, so
+                        // terminalize the root run created for this turn here.
+                        let _ = self.delegation.fail(&run_id, &e.to_string()).await;
                         // Roll back the optimistic Running write above —
                         // otherwise a failed resume wedges the session in a
                         // false "running" state with no live handle.
@@ -532,19 +566,10 @@ impl ControlPlane {
                 }
             }
         };
-        if let Some(primary_config) = primary_config {
-            handle.refresh_primary_turn(primary_config).await;
-        }
-        // Refresh the live session's permission mode from ITS OWN row so a
-        // change made in the composer between turns takes effect NOW — and so
-        // one session's change never leaks into siblings (per-session mode).
-        // Works for chat sessions too: they carry their own perm_mode with no
-        // project to consult.
-        handle.set_perm_mode(session.perm_mode);
+        handle.refresh_primary_turn(primary_config).await;
         let prepared = self
             .prepare_attachments(session_pk, &prompt.agent, attachments)
             .await;
-        let run_id = run_id.ok_or_else(|| anyhow::anyhow!("missing primary turn for prompt"))?;
         self.spawn_prompt(
             handle,
             session_pk.to_string(),
@@ -716,7 +741,7 @@ impl ControlPlane {
             prompt,
             attachments,
             &cancel,
-            Some(primary_turn),
+            primary_turn,
         )
         .await;
         self.starting.lock().unwrap().remove(&session_pk);
@@ -744,8 +769,9 @@ impl ControlPlane {
         prompt: TurnPrompt,
         attachments: Vec<AttachmentRef>,
         cancel: &tokio_util::sync::CancellationToken,
-        primary_turn: Option<PrimaryTurn>,
+        primary_turn: PrimaryTurn,
     ) {
+        let run_id = primary_turn.run_id.clone();
         // Non-git projects skip all git prep — no worktree, no branch — and run
         // the harness directly in the project workdir. Git projects run the
         // full branch-controls prep and backfill the workspace columns.
@@ -789,14 +815,19 @@ impl ControlPlane {
                 Ok(Err(e)) => {
                     self.fail_startup(
                         session_pk,
+                        &run_id,
                         &format!("Couldn't prepare the git workspace: {e}"),
                     )
                     .await;
                     return;
                 }
                 Err(e) => {
-                    self.fail_startup(session_pk, &format!("Workspace preparation failed: {e}"))
-                        .await;
+                    self.fail_startup(
+                        session_pk,
+                        &run_id,
+                        &format!("Workspace preparation failed: {e}"),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -816,6 +847,10 @@ impl ControlPlane {
             // before teardown) reads the real worktree path and cleans it up; a
             // plain stop leaves the workspace in place for a later retry or end.
             if cancel.is_cancelled() {
+                let _ = self
+                    .delegation
+                    .interrupt(&run_id, "startup stopped before dispatch")
+                    .await;
                 return;
             }
             self.emit_status(
@@ -841,30 +876,26 @@ impl ControlPlane {
         // still spawn the harness (unlike a git session with identical
         // timing, caught above).
         if cancel.is_cancelled() {
+            let _ = self
+                .delegation
+                .interrupt(&run_id, "startup stopped before dispatch")
+                .await;
             return;
         }
 
         self.emit_status(session_pk, "Connecting tools…").await;
-        let Some(primary_turn) = primary_turn else {
-            self.fail_startup(session_pk, "Couldn't start the agent: missing primary turn")
-                .await;
-            return;
-        };
-        let run_id = primary_turn.run_id.clone();
         let handle = match self
-            .start_harness_session(
-                Some(project),
-                session_pk,
-                &work_dir,
-                None,
-                Some(primary_turn),
-            )
+            .start_harness_session(Some(project), session_pk, &work_dir, None, primary_turn)
             .await
         {
             Ok(handle) => handle,
             Err(e) => {
-                self.fail_startup(session_pk, &format!("Couldn't start the agent: {e}"))
-                    .await;
+                self.fail_startup(
+                    session_pk,
+                    &run_id,
+                    &format!("Couldn't start the agent: {e}"),
+                )
+                .await;
                 return;
             }
         };
@@ -873,6 +904,10 @@ impl ControlPlane {
         // `running` (the normal post-stop state) — just don't drive the turn.
         if cancel.is_cancelled() {
             let _ = handle.cancel().await;
+            let _ = self
+                .delegation
+                .interrupt(&run_id, "startup stopped before dispatch")
+                .await;
             return;
         }
         let prepared = self
@@ -901,7 +936,8 @@ impl ControlPlane {
     /// blind status write) so a stop that already marked it Interrupted
     /// wins; it runs before the broadcast so a lagged watcher that falls
     /// back to consulting the session row never reads a stale Running.
-    async fn fail_startup(&self, session_pk: &str, message: &str) {
+    async fn fail_startup(&self, session_pk: &str, run_id: &str, message: &str) {
+        let _ = self.delegation.fail(run_id, message).await;
         self.emit_error(session_pk, message).await;
         let _ = self.store.demote_if_running(session_pk, now_ms()).await;
         let _ = self.events.send(CoreEvent::Error {
@@ -934,6 +970,17 @@ impl ControlPlane {
             },
             None => None,
         };
+        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
+            .await?
+        {
+            SessionAgentAccess::Executable { agent_id } => agent_id,
+            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
+            SessionAgentAccess::DeletedReadOnly { .. } => {
+                anyhow::bail!("the session's primary agent was deleted")
+            }
+        };
+        let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
+        validate_executable_primary(&primary_agent)?;
         if session.agent_session_id.is_none() {
             self.store
                 .update_status(session_pk, SessionStatus::Idle, None)
@@ -974,16 +1021,6 @@ impl ControlPlane {
             // dir still exists before the harness starts in it.
             let _ = tokio::fs::create_dir_all(&work_dir).await;
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
-        let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         let run = self
             .delegation
             .begin_primary(session_pk, primary_agent.clone(), RESUME_NUDGE)
@@ -999,7 +1036,7 @@ impl ControlPlane {
                 session_pk,
                 &work_dir,
                 session.agent_session_id.clone(),
-                Some(primary_turn),
+                primary_turn,
             )
             .await
         {
@@ -1013,6 +1050,7 @@ impl ControlPlane {
                 Ok(())
             }
             Err(e) => {
+                let _ = self.delegation.fail(&run_id, &e.to_string()).await;
                 let _ = self
                     .store
                     .update_status(session_pk, SessionStatus::Idle, None)
@@ -1050,7 +1088,7 @@ impl ControlPlane {
         session_pk: &str,
         work_dir: &Path,
         resume: Option<String>,
-        primary_turn: Option<PrimaryTurn>,
+        primary_turn: PrimaryTurn,
     ) -> anyhow::Result<Arc<dyn HarnessSession>> {
         let settings = SettingsStore::new(self.store.clone());
         // Native sessions execute the immutable primary-agent snapshot captured
@@ -1107,32 +1145,6 @@ impl ControlPlane {
         // (a not-yet-persisted resume path) that default stands in — and it is
         // already project-less-safe, so no `project` deref is needed here.
         let session_row = self.store.get_session(session_pk).await.ok().flatten();
-        let primary_turn = match primary_turn {
-            Some(primary_turn) => primary_turn,
-            None => {
-                let agent_id =
-                    match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-                        .await?
-                    {
-                        SessionAgentAccess::Executable { agent_id } => agent_id,
-                        SessionAgentAccess::LegacyReadOnly => {
-                            anyhow::bail!("legacy sessions are read-only")
-                        }
-                        SessionAgentAccess::DeletedReadOnly { .. } => {
-                            anyhow::bail!("the session's primary agent was deleted")
-                        }
-                    };
-                let agent = self.registry.resolved_snapshot(&agent_id).await?;
-                let run = self
-                    .delegation
-                    .begin_primary(session_pk, agent.clone(), "resume")
-                    .await?;
-                PrimaryTurn {
-                    agent,
-                    run_id: run.run.run_id,
-                }
-            }
-        };
         let primary_agent = primary_turn.agent;
         let run_id = primary_turn.run_id;
         let runtime = self.store.get_session_runtime_settings(session_pk).await?;
