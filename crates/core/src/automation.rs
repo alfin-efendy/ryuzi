@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use specta::Type;
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
@@ -690,15 +690,16 @@ fn validate_outbound_url(value: &str) -> anyhow::Result<url::Url> {
             bail!("outbound HTTPS URLs only permit port 443");
         }
     }
-    // HTTP is restricted to loopback, but accepts explicit ports for local development and tests.
-    let host = url.host_str().context("outbound URL must include a host")?;
-    let ip_host = host.trim_matches(['[', ']']);
-    match ip_host.parse::<IpAddr>() {
-        Ok(ip) if url.scheme() == "http" && is_loopback_ip(ip) => {}
-        Ok(_) => bail!("outbound URL IP literals are not permitted"),
-        Err(_) if url.scheme() == "http" && host.eq_ignore_ascii_case("localhost") => {}
-        Err(_) if url.scheme() == "https" => {}
-        Err(_) => bail!("HTTP outbound URLs are only permitted for localhost"),
+    // HTTP is restricted to literal loopback hosts, but accepts explicit ports
+    // for local development and tests.
+    match (url.scheme(), url.host()) {
+        ("http", Some(url::Host::Domain(host))) if host.eq_ignore_ascii_case("localhost") => {}
+        ("http", Some(url::Host::Ipv4(Ipv4Addr::LOCALHOST)))
+        | ("http", Some(url::Host::Ipv6(Ipv6Addr::LOCALHOST))) => {}
+        ("http", _) => bail!("HTTP outbound URLs are only permitted for localhost"),
+        ("https", Some(url::Host::Domain(_))) => {}
+        ("https", _) => bail!("outbound URL IP literals are not permitted"),
+        _ => unreachable!("scheme was validated above"),
     }
     Ok(url)
 }
@@ -719,6 +720,8 @@ fn is_public_outbound_ip(ip: IpAddr) -> bool {
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+                || ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0
+                || ip.octets()[0] == 198 && (18..=19).contains(&ip.octets()[1])
                 || ip.octets()[0] >= 224
                 || ip == Ipv4Addr::new(0, 0, 0, 0))
         }
@@ -1815,9 +1818,10 @@ mod tests {
         for url in [
             "ftp://example.com/hook",
             "https://user@example.com/hook",
-            "https://example.com:444/hook",
+            "https://example.com:8443/hook",
             "http://example.com/hook",
             "https://127.0.0.1/hook",
+            "http://127.0.0.2/hook",
             "http://[::2]/hook",
         ] {
             assert!(
@@ -1827,10 +1831,13 @@ mod tests {
         }
         for url in [
             "https://example.com/hook",
+            "https://example.com:443/hook",
             "http://localhost/hook",
-            "http://localhost:43123/hook", // Explicit loopback ports remain intentional.
+            "http://localhost:9999/hook", // Explicit loopback ports remain intentional.
             "http://127.0.0.1/hook",
+            "http://127.0.0.1:9999/hook",
             "http://[::1]/hook",
+            "http://[::1]:9999/hook",
         ] {
             assert!(validate_outbound_url(url).is_ok(), "{url} must be accepted");
         }
@@ -1846,6 +1853,8 @@ mod tests {
             "169.254.0.1",
             "0.0.0.0",
             "100.64.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
             "224.0.0.1",
             "::1",
             "::",
