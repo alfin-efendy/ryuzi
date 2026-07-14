@@ -265,7 +265,7 @@ pub(crate) mod tests_support {
     /// Like `state()`, but with one connected project (`"p1"`) already in the
     /// store — for command families whose calls need a real `project_id` to
     /// validate against.
-
+    ///
     /// A no-op `HarnessSession` — the RPC tests that use
     /// `state_with_fake_native` only assert on the session row a start call
     /// returns synchronously, before the background startup ever drives a

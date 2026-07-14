@@ -322,4 +322,52 @@ mod tests {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
         export_bindings(&out);
     }
+
+    #[test]
+    fn exported_child_run_commands_match_the_plan6_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("bindings.ts");
+        export_bindings(&out);
+        let bindings = std::fs::read_to_string(out).unwrap();
+
+        for command in [
+            "async getChildRuns(",
+            "async getChildTranscript(",
+            "async cancelChildRun(",
+            "async retryChildRun(",
+        ] {
+            assert!(
+                bindings.contains(command),
+                "missing exported command {command}"
+            );
+        }
+        let child_run_commands: Vec<_> = bindings
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix("async ")?.split_once('(')?.0;
+                (name.contains("Child") || name.contains("AgentRun")).then_some(name)
+            })
+            .collect();
+        assert_eq!(
+            child_run_commands,
+            [
+                "getChildRuns",
+                "getChildTranscript",
+                "cancelChildRun",
+                "retryChildRun",
+            ]
+        );
+
+        for draft_name in [
+            "listAgentRuns",
+            "getAgentRunTranscript",
+            "stopAgentRun",
+            "retryAgentRun",
+        ] {
+            assert!(
+                !bindings.contains(draft_name),
+                "obsolete draft command {draft_name} was exported"
+            );
+        }
+    }
 }

@@ -52,6 +52,26 @@ mod tests {
     use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
     use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 
+    fn plan6_contract(
+        session: Session,
+        snapshot: AgentIdentitySnapshot,
+        access: SessionAgentAccess,
+    ) {
+        let _: Option<String> = session.primary_agent_id;
+        let _: Option<AgentIdentitySnapshot> = session.primary_agent_snapshot;
+        let _ = snapshot;
+        match access {
+            SessionAgentAccess::Executable { agent_id } => drop(agent_id),
+            SessionAgentAccess::LegacyReadOnly => {}
+            SessionAgentAccess::DeletedReadOnly { snapshot } => drop(snapshot),
+        }
+    }
+
+    #[test]
+    fn plan6_ownership_contract_type_checks() {
+        let _: fn(Session, AgentIdentitySnapshot, SessionAgentAccess) = plan6_contract;
+    }
+
     fn session(
         session_pk: &str,
         primary_agent_id: Option<&str>,

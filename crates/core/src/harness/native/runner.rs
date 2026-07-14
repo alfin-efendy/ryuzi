@@ -6216,7 +6216,7 @@ mod tests {
             child.resolved_model.as_deref(),
             Some("anthropic/target-model")
         );
-        let bodies = llm.bodies.lock().unwrap();
+        let bodies = llm.bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 5, "target loop receives every scripted turn");
         let body = &bodies[0];
         assert_eq!(body["model"], "anthropic/target-model");
