@@ -52,12 +52,16 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "create_automation_hook" => {
             let a: InputP = params(p)?;
-            let hook = automation::create_hook(state.cp.store(), a.input.into()).await?;
+            let hook = automation::create_hook(state.cp.store(), a.input.into())
+                .await
+                .map_err(hook_mutation_error)?;
             ok(AutomationHookInfo::from(hook))
         }
         "update_automation_hook" => {
             let a: IdInputP = params(p)?;
-            let hook = automation::update_hook(state.cp.store(), &a.id, a.input.into()).await?;
+            let hook = automation::update_hook(state.cp.store(), &a.id, a.input.into())
+                .await
+                .map_err(hook_mutation_error)?;
             ok(AutomationHookInfo::from(hook))
         }
         "toggle_automation_hook" => {
@@ -91,6 +95,16 @@ async fn detail(state: &ApiState, id: &str) -> Result<AutomationHookDetail, ApiE
         .await?
         .map(Into::into)
         .ok_or_else(|| ApiError::not_found(format!("automation hook not found: {id}")))
+}
+
+/// Client-input validation failures (unknown project/agent/model, malformed
+/// fields) map to `400`; genuine store/I/O failures fall through to the
+/// crate-wide `anyhow::Error -> ApiError` `500` mapping.
+fn hook_mutation_error(error: automation::HookMutationError) -> ApiError {
+    match error {
+        automation::HookMutationError::Validation(message) => ApiError::bad_request(message),
+        automation::HookMutationError::Store(error) => error.into(),
+    }
 }
 
 async fn test_hook(state: &ApiState, id: &str) -> Result<AutomationHookDetail, ApiError> {
@@ -130,7 +144,7 @@ async fn test_hook(state: &ApiState, id: &str) -> Result<AutomationHookDetail, A
 
 #[cfg(test)]
 mod tests {
-    use crate::api::{dispatch, tests_support::state};
+    use crate::api::{dispatch, tests_support::state, tests_support::state_with_project};
     use axum::{extract::Json, http::StatusCode, routing::post, Router};
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
@@ -171,7 +185,7 @@ mod tests {
             "action": {
                 "kind": "agent.run",
                 "config": {
-                    "projectId": "project-1",
+                    "projectId": "p1",
                     "branch": "",
                     "gatewayId": "local",
                     "prompt": "Review the completed session",
@@ -186,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_crud_routes_through_core_rpc() {
-        let state = state().await;
+        let state = state_with_project().await;
         let created = dispatch(
             &state,
             "create_automation_hook",
@@ -282,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_automation_hook_rejects_non_outbound_actions() {
-        let state = state().await;
+        let state = state_with_project().await;
         let created = dispatch(
             &state,
             "create_automation_hook",

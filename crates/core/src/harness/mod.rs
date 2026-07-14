@@ -127,6 +127,14 @@ pub struct TurnPrompt {
     /// Display metadata persisted on the user transcript row —
     /// `[{name, path, contentType, size}]` per saved attachment.
     pub attachments: Vec<serde_json::Value>,
+    /// Force this turn's subtask runtime metadata (see the native runner's
+    /// `TurnOptions`), overriding whatever a resolved slash command would
+    /// otherwise set. `None` preserves ordinary slash-command resolution —
+    /// every existing caller is unaffected. Used by automation Hook agent
+    /// runs, whose `subtask` field must reach the same runtime budget a
+    /// command's `subtask: true` frontmatter does, without being encoded
+    /// into the prompt text itself.
+    pub force_subtask: Option<bool>,
 }
 
 impl TurnPrompt {

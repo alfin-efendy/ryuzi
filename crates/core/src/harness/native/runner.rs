@@ -230,10 +230,11 @@ pub async fn run_turn(
 ) -> anyhow::Result<()> {
     let trimmed = prompt.display.trim();
     let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
+    let force_subtask = prompt.force_subtask;
 
     // Slash-command resolution on the raw user text. Command metadata stays
     // outside the expanded prompt and is applied only to this turn.
-    let (agent_text, agent, command_model, options) = if manual_compact {
+    let (agent_text, agent, command_model, mut options) = if manual_compact {
         (
             prompt.agent.clone(),
             deps.agent.clone(),
@@ -264,6 +265,13 @@ pub async fn run_turn(
             ),
         }
     };
+    // A caller-supplied override (currently: automation Hook agent runs)
+    // wins over slash-command resolution — the hook's `subtask` field must
+    // reach the same runtime budget a command's `subtask: true` frontmatter
+    // does, regardless of whether the prompt happened to start with `/`.
+    if let Some(force_subtask) = force_subtask {
+        options.subtask = force_subtask;
+    }
 
     // 1. Persist + broadcast the user's message (raw display text).
     emit_row(
@@ -3573,6 +3581,46 @@ mod tests {
             max_provider_turns(&deps, &TurnOptions::default()).await,
             7,
             "plain turns keep the configured normal budget"
+        );
+    }
+
+    /// `TurnPrompt.force_subtask` is the caller seam automation Hook agent
+    /// runs use to reach the exact same subagent budget a `subtask: true`
+    /// slash command reaches — proven directly against `run_turn`'s options
+    /// resolution rather than only the pure `turn_options` helper above.
+    #[tokio::test]
+    async fn turn_prompt_force_subtask_overrides_plain_text_turn_options() {
+        use testutil::ScriptedLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "7",
+            )
+            .await
+            .unwrap();
+
+        // Plain (non-command) text with no override keeps the configured
+        // normal budget.
+        let plain = TurnPrompt::text("hello", "hello");
+        assert_eq!(plain.force_subtask, None);
+        assert_eq!(max_provider_turns(&deps, &TurnOptions::default()).await, 7);
+
+        // A hook-run TurnPrompt forcing subtask=true reaches the same
+        // subagent budget as a `subtask: true` command, even though its
+        // text is plain (not a `/command`).
+        let mut hook_prompt = TurnPrompt::text("Review $EVENT", "Review $EVENT");
+        hook_prompt.force_subtask = Some(true);
+        let mut options = TurnOptions::default();
+        if let Some(force_subtask) = hook_prompt.force_subtask {
+            options.subtask = force_subtask;
+        }
+        assert_eq!(
+            max_provider_turns(&deps, &options).await,
+            SUBAGENT_MAX_ITERS
         );
     }
 

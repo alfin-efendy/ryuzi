@@ -464,10 +464,12 @@ impl ControlPlane {
             agent: agent.clone(),
             home_session_pk: None,
         });
+        let mut turn_prompt = crate::harness::TurnPrompt::text(prompt.clone(), prompt);
+        turn_prompt.force_subtask = Some(action.subtask);
         let session = self
             .start_session_with_prompt_and_origin(
                 &action.project_id,
-                crate::harness::TurnPrompt::text(prompt.clone(), prompt),
+                turn_prompt,
                 "automation",
                 &[],
                 git,
@@ -624,10 +626,12 @@ impl ControlPlane {
                             });
                     let hook_origin =
                         HookOrigin::new(&run.hook_id, &run.id, depth.saturating_add(1));
+                    let mut turn_prompt = crate::harness::TurnPrompt::text(prompt.clone(), prompt);
+                    turn_prompt.force_subtask = Some(action.subtask);
                     match self
                         .start_session_with_prompt_and_origin(
                             &action.project_id,
-                            crate::harness::TurnPrompt::text(prompt.clone(), prompt),
+                            turn_prompt,
                             "automation",
                             &[],
                             git,

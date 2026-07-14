@@ -341,6 +341,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
         );
     }
@@ -468,6 +469,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
         );
         Ok(())
@@ -778,6 +780,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
         );
     }

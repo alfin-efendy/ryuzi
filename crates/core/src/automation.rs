@@ -1,5 +1,7 @@
 //! Persisted automation Hook configuration and dispatch history.
 
+use crate::harness::native::agents::AgentRegistry;
+use crate::llm_router::client::selectable_native_models;
 use crate::llm_router::secrets;
 use crate::paths::{new_id, now_ms};
 use crate::store::Store;
@@ -799,6 +801,71 @@ fn validate_input(input: &HookInput) -> anyhow::Result<String> {
     Ok(name)
 }
 
+#[derive(Debug)]
+pub enum HookMutationError {
+    Validation(String),
+    Store(anyhow::Error),
+}
+
+impl std::fmt::Display for HookMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(message) => message.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for HookMutationError {}
+
+impl From<anyhow::Error> for HookMutationError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl HookMutationError {
+    fn validation(error: anyhow::Error) -> Self {
+        Self::Validation(error.to_string())
+    }
+}
+
+async fn validate_targets(
+    store: &Store,
+    action: &HookActionInput,
+) -> Result<(), HookMutationError> {
+    let HookActionInput::AgentRun(config) = action else {
+        return Ok(());
+    };
+    let project = store
+        .get_project(&config.project_id)
+        .await?
+        .ok_or_else(|| {
+            HookMutationError::Validation(format!("unknown project: {}", config.project_id))
+        })?;
+    if let Some(agent_id) = config.agent_id.as_deref() {
+        let agents = AgentRegistry::load(std::path::Path::new(&project.workdir));
+        if !agents.all().iter().any(|agent| agent.name == agent_id) {
+            return Err(HookMutationError::Validation(format!(
+                "unknown agent for project {}: {agent_id}",
+                config.project_id
+            )));
+        }
+    }
+    if let Some(model) = config.model_override.as_deref() {
+        let models = selectable_native_models(store).await?;
+        if !models
+            .iter()
+            .any(|candidate| candidate.request_value == model)
+        {
+            return Err(HookMutationError::Validation(format!(
+                "unknown model: {model}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn inbound_path(trigger_kind: TriggerKind) -> Option<String> {
     (trigger_kind == TriggerKind::WebhookInbound).then(|| format!("wh_{}", Uuid::new_v4().simple()))
 }
@@ -1047,8 +1114,9 @@ fn attempt_from(row: &Row<'_>) -> rusqlite::Result<HookAttemptRow> {
     })
 }
 
-pub async fn create_hook(store: &Store, input: HookInput) -> anyhow::Result<HookRow> {
-    let name = validate_input(&input)?;
+pub async fn create_hook(store: &Store, input: HookInput) -> Result<HookRow, HookMutationError> {
+    let name = validate_input(&input).map_err(HookMutationError::validation)?;
+    validate_targets(store, &input.action).await?;
     let now = now_ms();
     let hook = HookRow {
         id: new_id(),
@@ -1087,11 +1155,16 @@ pub async fn create_hook(store: &Store, input: HookInput) -> anyhow::Result<Hook
     Ok(hook)
 }
 
-pub async fn update_hook(store: &Store, id: &str, input: HookInput) -> anyhow::Result<HookRow> {
-    let name = normalize_name(&input.name)?;
+pub async fn update_hook(
+    store: &Store,
+    id: &str,
+    input: HookInput,
+) -> Result<HookRow, HookMutationError> {
+    let name = normalize_name(&input.name).map_err(HookMutationError::validation)?;
+    validate_targets(store, &input.action).await?;
     let id = id.to_string();
     let now = now_ms();
-    store
+    Ok(store
         .with_conn(move |c| {
             let existing_action = c.query_row(
                 "SELECT config_json FROM automation_hooks WHERE id=?1",
@@ -1110,6 +1183,10 @@ pub async fn update_hook(store: &Store, id: &str, input: HookInput) -> anyhow::R
                     }
                 }
             }
+            // Header values may have just been backfilled from the stored
+            // secret above, so the full action shape (including headers) is
+            // validated here — after merge, not before it — exactly as
+            // before `validate_targets` was introduced.
             validate_action(input.trigger_kind, &action).map_err(sql_json_error)?;
             let config_json = encode_action_for_storage(&action).map_err(sql_json_error)?;
             let changed = c.execute(
@@ -1136,7 +1213,7 @@ pub async fn update_hook(store: &Store, id: &str, input: HookInput) -> anyhow::R
                 hook_from,
             )
         })
-        .await
+        .await?)
 }
 
 pub async fn list_hooks(store: &Store) -> anyhow::Result<Vec<HookRow>> {
@@ -2045,10 +2122,181 @@ mod tests {
         assert!(!HookOrigin::new("hook-1", "run-1", 3).allows_dispatch());
     }
 
+    async fn seed_project(store: &Store, project_id: &str) {
+        let workdir = tempfile::tempdir().unwrap();
+        let workdir = workdir.keep();
+        store
+            .insert_project(crate::domain::Project {
+                project_id: project_id.to_string(),
+                name: project_id.to_string(),
+                workdir: workdir.display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn seed_selectable_model(store: &Store, model: &str) {
+        crate::llm_router::connections::add_connection(
+            store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-connection".into(),
+                provider: "openai".into(),
+                auth_type: "api_key".into(),
+                label: "Test connection".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec![model.trim_start_matches("openai/").into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     async fn mem_store() -> (Store, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db.path()).await.unwrap();
+        seed_project(&store, "project-1").await;
         (store, db)
+    }
+
+    #[tokio::test]
+    async fn create_hook_rejects_unknown_project_target() {
+        let (store, _db) = mem_store().await;
+
+        let error = create_hook(
+            &store,
+            HookInput::agent_run(
+                "Unknown project",
+                TriggerKind::SessionEnd,
+                "missing-project",
+                "",
+                "local",
+                "run",
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown project"));
+    }
+
+    #[tokio::test]
+    async fn create_hook_rejects_unknown_agent_target() {
+        let (store, _db) = mem_store().await;
+        let mut input = HookInput::agent_run(
+            "Unknown agent",
+            TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        );
+        let HookActionInput::AgentRun(action) = &mut input.action else {
+            unreachable!();
+        };
+        action.agent_id = Some("missing-agent".into());
+
+        let error = create_hook(&store, input).await.unwrap_err();
+
+        assert!(error.to_string().contains("unknown agent"));
+    }
+
+    #[tokio::test]
+    async fn create_hook_rejects_unknown_model_target() {
+        let (store, _db) = mem_store().await;
+        let mut input = HookInput::agent_run(
+            "Unknown model",
+            TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        );
+        let HookActionInput::AgentRun(action) = &mut input.action else {
+            unreachable!();
+        };
+        action.model_override = Some("missing/model".into());
+
+        let error = create_hook(&store, input).await.unwrap_err();
+
+        assert!(error.to_string().contains("unknown model"));
+    }
+
+    #[tokio::test]
+    async fn create_hook_accepts_known_agent_and_model_targets() {
+        let (store, _db) = mem_store().await;
+        seed_selectable_model(&store, "gpt-test").await;
+        let mut input = HookInput::agent_run(
+            "Known targets",
+            TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        );
+        let HookActionInput::AgentRun(action) = &mut input.action else {
+            unreachable!();
+        };
+        action.agent_id = Some("build".into());
+        action.model_override = Some("openai/gpt-test".into());
+
+        let hook = create_hook(&store, input).await.unwrap();
+
+        assert_eq!(
+            hook.action.agent_run().unwrap().agent_id.as_deref(),
+            Some("build")
+        );
+        assert_eq!(
+            hook.action.agent_run().unwrap().model_override.as_deref(),
+            Some("openai/gpt-test")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_hook_rejects_unknown_project_target() {
+        let (store, _db) = mem_store().await;
+        let hook = create_hook(
+            &store,
+            HookInput::agent_run(
+                "Known project",
+                TriggerKind::SessionEnd,
+                "project-1",
+                "",
+                "local",
+                "run",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let error = update_hook(
+            &store,
+            &hook.id,
+            HookInput::agent_run(
+                "Unknown project",
+                TriggerKind::SessionEnd,
+                "missing-project",
+                "",
+                "local",
+                "run",
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown project"));
     }
 
     #[tokio::test]
