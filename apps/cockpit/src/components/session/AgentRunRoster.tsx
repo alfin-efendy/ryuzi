@@ -6,7 +6,7 @@ import { Button } from "@ryuzi/ui";
 const activeStatuses = new Set(["queued", "running"]);
 
 function kindLabel(run: AgentRun): string {
-  return run.agentKind === "primary" ? "Main agent" : "Subagent";
+  return run.agentKind === "subagent" ? "Subagent" : "Main agent";
 }
 
 function duration(run: AgentRun): string {

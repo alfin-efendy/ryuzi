@@ -58,6 +58,19 @@ test("splits exactly queued/running into Active and terminal runs into Done", ()
   expect(screen.getByText("tool failed")).toBeTruthy();
 });
 
+test("labels a main delegate as Main agent", () => {
+  useDelegation.setState({
+    bySession: {
+      [delegationSessionKey("local", "s1")]: [run({ agentKind: "main-delegate", executingAgentNameSnapshot: "Delegate" })],
+    },
+  });
+
+  render(<AgentRunRoster runnerId="local" sessionPk="s1" />);
+
+  expect(screen.getByText("Main agent")).toBeTruthy();
+  expect(screen.queryByText("Subagent")).toBeNull();
+});
+
 test("selecting a roster card navigates to its full detail", () => {
   useDelegation.setState({ bySession: { [delegationSessionKey("local", "s1")]: [run()] } });
 

@@ -69,7 +69,7 @@ export function AgentRunDetail({
           <h3 className="text-[13px] font-medium">{run.task}</h3>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
             <span className="capitalize">{run.status}</span>
-            <span>{run.agentKind === "primary" ? "Main agent" : "Subagent"}</span>
+            <span>{run.agentKind === "subagent" ? "Subagent" : "Main agent"}</span>
             <span>{run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}</span>
             <span>{duration(run)}</span>
             {run.resolvedModel && <span>{run.resolvedModel}{run.resolvedEffort ? ` · ${run.resolvedEffort}` : ""}</span>}
@@ -91,7 +91,7 @@ export function AgentRunDetail({
           </Button>
         </div>
         <div className="min-h-[240px]">
-          <Transcript runnerId={runnerId} sessionPk={sessionPk} rows={rows} agentName={run.executingAgentNameSnapshot} agentColor="#6b7280" running={active} />
+          <Transcript runnerId={runnerId} sessionPk={sessionPk} rows={rows} agentName={run.executingAgentNameSnapshot} agentColor="#6b7280" running={active} approvalRunId={run.runId} />
         </div>
       </div>
     </div>
