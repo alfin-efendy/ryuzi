@@ -80,6 +80,8 @@ test("importSession reports success", async () => {
     status: "ok",
     data: {
       sessionPk: "new",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,

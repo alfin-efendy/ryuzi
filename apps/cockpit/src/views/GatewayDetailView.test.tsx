@@ -29,6 +29,8 @@ const daemonEvents: GatewayEventInfo[] = [{ at: 1_720_000_000_000, level: "info"
 
 const runningSession: Session = {
   sessionPk: "s-run",
+  primaryAgentId: null,
+  primaryAgentSnapshot: null,
   projectId: "p-1",
   agentSessionId: null,
   worktreePath: null,

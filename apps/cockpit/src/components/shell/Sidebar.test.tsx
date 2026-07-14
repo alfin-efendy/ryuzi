@@ -32,6 +32,8 @@ const project: Project = {
 const session: UiSession = {
   runnerId: LOCAL_RUNNER,
   sessionPk: "s1",
+  primaryAgentId: null,
+  primaryAgentSnapshot: null,
   projectId: "p1",
   agentSessionId: null,
   worktreePath: "C:\\code\\ryuzi-worktree",
@@ -133,6 +135,8 @@ function sessionFixture(pk: string, lastActive: number): UiSession {
   return {
     ...session,
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p1",
     title: pk,
     lastActive,

@@ -92,6 +92,8 @@ beforeEach(() => {
       {
         runnerId: LOCAL_RUNNER,
         sessionPk: "s1",
+        primaryAgentId: null,
+        primaryAgentSnapshot: null,
         projectId: null,
         agentSessionId: null,
         worktreePath: null,

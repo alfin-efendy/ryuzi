@@ -146,7 +146,9 @@ test("send steers a live orchestration and does not also send a normal chat turn
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
   const steerSession = spyOn(commands, "steerSession").mockResolvedValue({ status: "ok", data: true });
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "home-1", "cancel the build task", null)).resolves.toBe(true);
+  await expect(
+    useStore.getState().send(LOCAL_RUNNER, "home-1", { text: "cancel the build task", context: null, attachments: [], git: null }),
+  ).resolves.toBe(true);
   expect(steer).toHaveBeenCalledWith("home-1", "cancel the build task");
   expect(cont).not.toHaveBeenCalled();
   expect(steerSession).not.toHaveBeenCalled();
@@ -164,9 +166,9 @@ test("send falls through to the normal path when orchSteer reports no live orche
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = spyOn(commands, "listGateways").mockResolvedValue({ status: "ok", data: [] });
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(true);
   expect(steer).toHaveBeenCalledWith("s1", "hi");
-  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hi", null);
+  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null });
 
   steer.mockRestore();
   cont.mockRestore();
@@ -183,8 +185,8 @@ test("send falls through to the normal path when orchSteer itself errors", async
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = spyOn(commands, "listGateways").mockResolvedValue({ status: "ok", data: [] });
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
-  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hi", null);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(true);
+  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null });
 
   steer.mockRestore();
   cont.mockRestore();
