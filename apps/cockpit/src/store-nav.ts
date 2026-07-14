@@ -1,3 +1,4 @@
+import type { AgentSummaryInfo } from "./bindings";
 import { create } from "zustand";
 
 // View router for the Relay v3 shell. Session focus itself stays in the main
@@ -41,7 +42,19 @@ export function goForwardHistory(h: NavHistory): NavHistory {
   return { back: [...h.back, h.current], current: next, forward: h.forward.slice(1) };
 }
 
-const KEY_SIDEBAR = "cockpit.nav.sidebarOpen";
+export const LAST_PRIMARY_AGENT_KEY = "cockpit.lastPrimaryAgentId";
+
+export function choosePrimaryAgent(
+  agents: AgentSummaryInfo[],
+  requestedId: string | null,
+  lastId: string | null,
+  defaultId: string | null,
+): string | null {
+  const valid = (id: string | null) => id !== null && agents.some((agent) => agent.id === id && agent.executable);
+  return [requestedId, lastId, defaultId].find(valid) ?? agents.find((agent) => agent.executable)?.id ?? null;
+}
+
+
 
 function readBool(key: string, fallback: boolean): boolean {
   if (typeof localStorage === "undefined") return fallback;
@@ -49,6 +62,7 @@ function readBool(key: string, fallback: boolean): boolean {
   return v === null ? fallback : v === "1";
 }
 
+const KEY_SIDEBAR = "cockpit.nav.sidebarOpen";
 const KEY_RIGHT_OPEN = "cockpit.nav.rightOpen";
 const KEY_RIGHT_TAB = "cockpit.nav.rightTab";
 const KEY_RIGHT_WIDTH = "cockpit.nav.rightWidth";

@@ -5,6 +5,8 @@ import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import type { QueuedMessage } from "./lib/queue";
+import type { AgentSummaryInfo, TurnInput } from "./bindings";
+import { LAST_PRIMARY_AGENT_KEY, choosePrimaryAgent } from "./store-nav";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const k1 = sessKey(LOCAL_RUNNER, "s1");
@@ -780,6 +782,8 @@ test("pending approvals from different sessions both count", () => {
 const runningSession = (pk: string) => ({
   runnerId: LOCAL_RUNNER,
   sessionPk: pk,
+  primaryAgentId: null,
+  primaryAgentSnapshot: null,
   projectId: "p1",
   agentSessionId: null,
   worktreePath: null,
@@ -931,12 +935,36 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
+test("choosePrimaryAgent integrates pending, persisted, default, then executable fallback", () => {
+  const agent = (id: string, executable = true): AgentSummaryInfo => ({
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  });
+  localStorage.setItem(LAST_PRIMARY_AGENT_KEY, "stored");
+  const agents = [agent("broken", false), agent("fallback"), agent("default"), agent("stored"), agent("requested")];
+  expect(choosePrimaryAgent(agents, "requested", localStorage.getItem(LAST_PRIMARY_AGENT_KEY), "default")).toBe("requested");
+  expect(choosePrimaryAgent(agents, null, localStorage.getItem(LAST_PRIMARY_AGENT_KEY), "default")).toBe("stored");
+  localStorage.removeItem(LAST_PRIMARY_AGENT_KEY);
+});
+
 test("start forwards chat options so composer model, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
     data: {
       sessionPk: "s1",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
@@ -962,19 +990,18 @@ test("start forwards chat options so composer model, context, and attachments re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  await useStore.getState().start(LOCAL_RUNNER, "p1", "/review", {
-    model: "fable",
-    context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
-    attachments: ["C:\\tmp\\notes.txt"],
-  });
-
-  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "/review", {
-    model: "fable",
-    effort: null,
+  await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", {
+    text: "/review",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
-    permMode: null,
+  });
+
+  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "primary", {
+    text: "/review",
+    context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
+    attachments: ["C:\\tmp\\notes.txt"],
+    git: null,
   });
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
 
@@ -989,6 +1016,8 @@ test("start forwards composer git options to IPC", async () => {
     status: "ok",
     data: {
       sessionPk: "s2",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
@@ -1012,17 +1041,18 @@ test("start forwards composer git options to IPC", async () => {
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  await useStore.getState().start(LOCAL_RUNNER, "p1", "go", {
-    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
-  });
-
-  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "go", {
-    model: null,
-    effort: null,
+  await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", {
+    text: "go",
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
-    permMode: null,
+  });
+
+  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "primary", {
+    text: "go",
+    context: null,
+    attachments: [],
+    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
   });
 
   start.mockRestore();
@@ -1036,6 +1066,8 @@ test("start resolves and focuses the session without waiting for refresh", async
     status: "ok",
     data: {
       sessionPk: "s3",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
@@ -1058,7 +1090,7 @@ test("start resolves and focuses the session without waiting for refresh", async
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "go", null);
+  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", { text: "go", context: null, attachments: [], git: null });
 
   expect(ok).toBe(true);
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s3" });
@@ -1076,7 +1108,7 @@ test("start returns false and does not focus on backend error", async () => {
     status: "error",
     error: { message: "boom" },
   });
-  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "go", null);
+  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", { text: "go", context: null, attachments: [], git: null });
   expect(ok).toBe(false);
   expect(useStore.getState().focusedSession).toBeNull();
   start.mockRestore();
@@ -1088,6 +1120,8 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
     status: "ok",
     data: {
       sessionPk: "c1",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: null,
       agentSessionId: null,
       worktreePath: null,
@@ -1110,16 +1144,9 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", { model: "fable", effort: "high" });
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "primary", { text: "hey", context: null, attachments: [], git: null });
 
-  expect(startChat).toHaveBeenCalledWith(LOCAL_RUNNER, "hey", {
-    model: "fable",
-    effort: "high",
-    permMode: null,
-    context: null,
-    attachments: [],
-    git: null,
-  });
+  expect(startChat).toHaveBeenCalledWith(LOCAL_RUNNER, "primary", { text: "hey", context: null, attachments: [], git: null });
   expect(ok).toBe(true);
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "c1" });
   expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("c1");
@@ -1168,7 +1195,7 @@ test("startChat returns false and does not focus on backend error", async () => 
     status: "error",
     error: { message: "boom" },
   });
-  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", null);
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "primary", { text: "hey", context: null, attachments: [], git: null });
   expect(ok).toBe(false);
   expect(useStore.getState().focusedSession).toBeNull();
   startChat.mockRestore();
@@ -1275,10 +1302,10 @@ test("send resolves true on success and false on backend error (drives composer 
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(true);
 
   cont.mockResolvedValue({ status: "error", error: { message: "quota exhausted" } });
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(false);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(false);
 
   cont.mockRestore();
   listProjects.mockRestore();
@@ -1295,7 +1322,7 @@ test("send steers a RUNNING session instead of starting a new turn via continue"
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hold on", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hold on", context: null, attachments: [], git: null })).resolves.toBe(true);
   expect(steer).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hold on");
   expect(cont).not.toHaveBeenCalled();
 
@@ -1315,7 +1342,7 @@ test("send falls back to continue for a session that is not running", async () =
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "go", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "go", context: null, attachments: [], git: null })).resolves.toBe(true);
   expect(cont).toHaveBeenCalled();
   expect(steer).not.toHaveBeenCalled();
 
@@ -1334,6 +1361,8 @@ test("setFocused marks the previously-focused session read up to its lastActive"
       {
         runnerId: LOCAL_RUNNER,
         sessionPk: "s1",
+        primaryAgentId: null,
+        primaryAgentSnapshot: null,
         projectId: "p",
         agentSessionId: null,
         worktreePath: null,
@@ -1471,17 +1500,17 @@ test("enqueueMessage appends per session; removeQueued removes by id", () => {
   expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
 });
 
-test("sendNextQueued sends the head and removes it on success", async () => {
-  const calls: Array<[string, string, string]> = [];
+test("sendNextQueued sends the head TurnInput and removes it on success", async () => {
+  const calls: Array<[string, string, TurnInput]> = [];
   useStore.setState({
     queued: { [k1]: [qmsg("a", "hello"), qmsg("b", "world")] },
-    send: async (runnerId, pk, text) => {
-      calls.push([runnerId, pk, text]);
+    send: async (runnerId, pk, turn) => {
+      calls.push([runnerId, pk, turn]);
       return true;
     },
   });
   await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
-  expect(calls).toEqual([[LOCAL_RUNNER, "s1", "hello"]]);
+  expect(calls).toEqual([[LOCAL_RUNNER, "s1", { text: "hello", context: null, attachments: [], git: null }]]);
   expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
 });
 

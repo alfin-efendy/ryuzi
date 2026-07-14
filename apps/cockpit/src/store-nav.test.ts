@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHistory, type View } from "./store-nav";
+import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHistory, type View, choosePrimaryAgent } from "./store-nav";
+import type { AgentSummaryInfo } from "./bindings";
 
 const home: View = { kind: "home" };
 const models: View = { kind: "models" };
@@ -167,6 +168,29 @@ test("openAgentChat records the primary agent and opens New session", () => {
   expect(useNav.getState().history.back).toEqual([{ kind: "agents" }]);
 });
 
+test("choosePrimaryAgent prefers requested, then stored, default, then first executable", () => {
+  const agent = (id: string, executable = true): AgentSummaryInfo => ({
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  });
+  const agents = [agent("invalid", false), agent("first"), agent("default"), agent("stored"), agent("requested")];
+
+  expect(choosePrimaryAgent(agents, "requested", "stored", "default")).toBe("requested");
+  expect(choosePrimaryAgent(agents, "missing", "stored", "default")).toBe("stored");
+  expect(choosePrimaryAgent(agents, "missing", "missing", "default")).toBe("default");
+  expect(choosePrimaryAgent(agents, "missing", "missing", "missing")).toBe("first");
+  expect(choosePrimaryAgent([agent("invalid", false)], null, null, null)).toBeNull();
+});
 test("consumePendingPrimaryAgentId is a one-shot handoff", () => {
   useNav.setState({ pendingPrimaryAgentId: "reviewer" });
   expect(useNav.getState().consumePendingPrimaryAgentId()).toBe("reviewer");

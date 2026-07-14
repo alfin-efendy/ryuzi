@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, render, screen } from "@testing-library/react";
-import type { CmdError, OpenTarget, Project, Result, Session } from "@/bindings";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AgentSummaryInfo, CmdError, OpenTarget, Project, Result, Session } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 // --- @/bindings: only the commands actually reachable from the mount paths
@@ -89,6 +89,7 @@ mock.module("@/components/session/BottomTerminalDrawer", () => ({
 const { SessionView } = await import("./SessionView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
+const { useAgents } = await import("@/store-agents");
 const { useConnections } = await import("@/store-connections");
 
 function project(overrides: Partial<Project> = {}): Project {
@@ -110,6 +111,8 @@ function session(runnerId: string, overrides: Partial<Session> = {}): Session & 
   return {
     runnerId,
     sessionPk: "s1",
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p1",
     agentSessionId: null,
     worktreePath: null,
@@ -130,14 +133,32 @@ function session(runnerId: string, overrides: Partial<Session> = {}): Session & 
   };
 }
 
-function seed(runnerId: string) {
+function primary(id: string, executable = true): AgentSummaryInfo {
+  return {
+    id,
+    name: "Renamed profile",
+    description: "",
+    avatarColor: "blue",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  };
+}
+
+function seed(runnerId: string, sessionOverrides: Partial<Session> = {}, agents: AgentSummaryInfo[] = []) {
   useStore.setState({
-    sessions: [session(runnerId)],
+    sessions: [session(runnerId, sessionOverrides)],
     projects: [project()],
     focusedSession: { runnerId, pk: "s1" },
     transcripts: {},
     pendingApprovals: [],
   });
+  useAgents.setState({ registry: { agents, defaultAgentId: agents[0]?.id ?? "none", recovery: [], subagentModel: { kind: "route", route: "fast" } } });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ loaded: true });
 }
@@ -151,6 +172,49 @@ afterEach(() => {
   cleanup();
   useNav.setState({ bottomOpen: false });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
+});
+
+test("immutable primary snapshot labels the session despite profile edits", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "reviewer", primaryAgentSnapshot: { id: "reviewer", name: "Original reviewer", avatarColor: "violet" } },
+    [primary("reviewer")],
+  );
+  render(<SessionView />);
+
+  expect(await screen.findByText("Original reviewer")).toBeTruthy();
+  expect(screen.queryByText("Renamed profile")).toBeNull();
+  expect((screen.getByPlaceholderText("Ask for follow-up changes") as HTMLTextAreaElement).disabled).toBe(false);
+});
+
+test("legacy sessions stay read-only without a repair destination", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: null, primaryAgentSnapshot: null });
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Legacy sessions are read-only.")) as HTMLTextAreaElement;
+  expect(composer.disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "Repair agent" })).toBeNull();
+});
+
+test("a deleted primary makes a captured session read-only without repair", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "deleted", primaryAgentSnapshot: { id: "deleted", name: "Deleted", avatarColor: "rose" } });
+  render(<SessionView />);
+
+  expect(await screen.findByText("The session’s primary agent was deleted, so this session is read-only.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Repair agent" })).toBeNull();
+});
+
+test("a nonexecutable primary offers repair navigation", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "reviewer", primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "violet" } },
+    [primary("reviewer", false)],
+  );
+  render(<SessionView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Repair agent" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" });
 });
 
 test("local session with the bottom panel open: terminal drawer mounts and both controls are enabled", async () => {

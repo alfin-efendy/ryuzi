@@ -7,6 +7,8 @@ import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
 import { AgentSkillsToolsTab } from "@/components/agents/AgentSkillsToolsTab";
+import { LOCAL_RUNNER } from "@/lib/session-key";
+import { useStore } from "@/store";
 import { useAgents } from "@/store-agents";
 import { useNav } from "@/store-nav";
 
@@ -40,6 +42,8 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   const detail = useAgents((state) => (state.detail?.summary.id === agentId ? state.detail : null));
   const loading = useAgents((state) => state.loading);
   const [tab, setTab] = useState<Tab>("overview");
+  const recentSessions = useAgents((state) => state.recentSessionsByAgent[agentId] ?? []);
+  const setFocused = useStore((state) => state.setFocused);
   const nav = useNav();
   const leaveDeletedDetail = () => {
     if (nav.history.back.length > 0) nav.goBack();
@@ -47,6 +51,9 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
   };
   useEffect(() => {
     if (!detail) void useAgents.getState().loadDetail(agentId);
+  }, [agentId, detail]);
+  useEffect(() => {
+    if (detail) void useAgents.getState().loadRecentSessions(agentId);
   }, [agentId, detail]);
 
   if (!detail)
@@ -115,7 +122,27 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             </SettingsCard>
             <SettingsCard className="col-span-3 px-[18px] py-4">
               <SettingsCardTitle>Recent sessions</SettingsCardTitle>
-              <p className="mb-0 mt-3 text-xs text-muted-foreground">No owned sessions yet.</p>
+              {recentSessions.length === 0 ? (
+                <p className="mb-0 mt-3 text-xs text-muted-foreground">No owned sessions yet.</p>
+              ) : (
+                <div className="mt-3 divide-y divide-border">
+                  {recentSessions.map((session) => (
+                    <Button
+                      key={session.sessionPk}
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setFocused({ runnerId: LOCAL_RUNNER, pk: session.sessionPk });
+                        nav.navigate({ kind: "session" });
+                      }}
+                      className="h-auto w-full justify-between gap-3 rounded-none px-0 py-2 text-left"
+                    >
+                      <span className="min-w-0 truncate font-medium">{session.title || "Untitled session"}</span>
+                      <span className="shrink-0 text-muted-foreground">{session.status}</span>
+                    </Button>
+                  ))}
+                </div>
+              )}
             </SettingsCard>
           </div>
         ) : null}

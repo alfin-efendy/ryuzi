@@ -1,19 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
+import { ArrowUp, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
 import { commands, type BranchList } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
-import { useNav } from "@/store-nav";
+import { useNav, choosePrimaryAgent, LAST_PRIMARY_AGENT_KEY } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { HOME_SUGGESTIONS, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
+import { HOME_SUGGESTIONS } from "@/constants";
 import { useAgents } from "@/store-agents";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
-import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -32,10 +31,6 @@ export function HomeView() {
     selectProject,
     start,
     startChat,
-    startOrchestration,
-    projectRuntimeById,
-    loadProjectRuntime,
-    setProjectRuntime,
   } = useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
@@ -44,12 +39,6 @@ export function HomeView() {
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
-  // Permission mode for the session about to be created. null = project default.
-  const [composerPerm, setComposerPerm] = useState<UiPermMode | null>(null);
-  // Orchestrate mode: submit the goal to the orchestrator (decomposed into
-  // tracked subtasks run by workers) instead of starting a normal turn.
-  // Requires an attached project — see the toggle's disabled state below.
-  const [orchestrate, setOrchestrate] = useState(false);
 
   // Chat is the default: no project is auto-selected. A project is attached
   // only when the user explicitly picks one (sidebar "+" or the composer's
@@ -66,31 +55,7 @@ export function HomeView() {
     [draftKey],
   );
   const isGit = project?.isGit ?? false;
-  // Ryuzi-only: every session runs the native agent; the user picks a model.
-  const agentModels = useAgents((s) => s.models);
-  const setComposerModel = useNav((s) => s.setComposerModel);
-  const setComposerEffort = useNav((s) => s.setComposerEffort);
-  const previousProjectId = useRef(projectId);
-  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
-  const chatModelInfo = agentModels.find((entry) => entry.requestValue === nav.composerModel) ?? null;
-  const chatEffectiveEffort = nav.composerEffort ?? chatModelInfo?.resolvedDefault ?? null;
-  const chatRuntime = useMemo(
-    () => ({
-      projectId: "",
-      model: nav.composerModel,
-      storedEffort: nav.composerEffort,
-      effectiveEffort: chatEffectiveEffort,
-      effectiveEffortLabel: chatModelInfo?.supported.find((option) => option.value === chatEffectiveEffort)?.label ?? chatEffectiveEffort,
-      effectiveSource: nav.composerEffort
-        ? ("project" as const)
-        : chatModelInfo?.defaultSource === "provider"
-          ? ("provider" as const)
-          : ("none" as const),
-      storedEffortStatus: "valid" as const,
-      modelInfo: chatModelInfo,
-    }),
-    [chatEffectiveEffort, chatModelInfo, nav.composerEffort, nav.composerModel],
-  );
+  const registry = useAgents((s) => s.registry);
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
   const connectionsLoaded = useConnections((s) => s.loaded);
@@ -101,32 +66,6 @@ export function HomeView() {
     if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
   }, [projectId, loadCommands]);
 
-  useEffect(() => {
-    if (projectId) void loadProjectRuntime(projectId);
-  }, [projectId, loadProjectRuntime]);
-
-  useEffect(() => {
-    if (!connectionsLoaded) void hydrateConnections();
-  }, [connectionsLoaded, hydrateConnections]);
-
-  // A model picked for one project must not leak into the next one.
-  useEffect(() => {
-    if (previousProjectId.current === projectId) return;
-    previousProjectId.current = projectId;
-    setComposerModel(null);
-    setComposerEffort(null);
-  }, [projectId, setComposerEffort, setComposerModel]);
-
-  // A permission mode picked for one project's new-chat composer must not leak into the next one.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
-  useEffect(() => {
-    setComposerPerm(null);
-  }, [projectId]);
-  // Orchestration needs a project — detaching one turns the toggle back off
-  // instead of leaving it silently unusable.
-  useEffect(() => {
-    if (!projectId) setOrchestrate(false);
-  }, [projectId]);
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
   const setComposerBranch = nav.setComposerBranch;
@@ -214,65 +153,35 @@ export function HomeView() {
   };
 
   const send = async () => {
-    const t = draft.trim();
-    if (!t && composerFiles.attachments.length === 0) return;
-    // The toggle or a typed "/orchestrate " prefix both route to the
-    // orchestrator instead of a normal turn.
-    const orchestrateRequested = orchestrate || t.startsWith("/orchestrate ");
-    const typed = draft;
-    if (orchestrateRequested) {
-      if (!project) {
-        toast.error("Attach a project to orchestrate.");
-        return;
-      }
-      const goal = t.replace(/^\/orchestrate\s+/, "");
-      useNav.getState().clearDraft(draftKey);
-      composerFiles.clear();
-      setContextRefs([]);
-      // Orchestration posts worker bubbles, block-for-human cards, and the
-      // aggregate report into a home chat — create one (chat-first; the
-      // project attached above scopes the goal itself, not the session) so
-      // there's somewhere for those to land and for follow-up messages to
-      // steer the run (store.send's orch-steer route).
-      const chatOk = await startChat(LOCAL_RUNNER, goal, {
-        model: nav.composerModel ?? null,
-        effort: nav.composerEffort ?? null,
-        context: { branch: null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-        attachments: composerFiles.attachments,
-        git: null,
-        permMode: composerPerm ? uiPermToCore(composerPerm) : null,
-      });
-      if (!chatOk) {
-        useNav.getState().restoreDraft(draftKey, typed);
-        return;
-      }
-      if (!(await startOrchestration(goal, true))) {
-        toast.error("Chat started, but orchestration couldn't be submitted.");
-      }
-      nav.navigate({ kind: "session" });
+    const text = draft.trim();
+    if (!text && composerFiles.attachments.length === 0) return;
+    const primaryAgentId = choosePrimaryAgent(
+      registry?.agents ?? [],
+      useNav.getState().consumePendingPrimaryAgentId(),
+      localStorage.getItem(LAST_PRIMARY_AGENT_KEY),
+      registry?.defaultAgentId ?? null,
+    );
+    if (!primaryAgentId) {
+      toast.error("No executable agent is available.");
       return;
     }
-    const opts = {
-      model: project ? null : (nav.composerModel ?? null),
-      effort: project ? null : (nav.composerEffort ?? null),
+    const typed = draft;
+    const turn = {
+      text,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
-      permMode: composerPerm ? uiPermToCore(composerPerm) : null,
     };
     useNav.getState().clearDraft(draftKey);
     composerFiles.clear();
     setContextRefs([]);
-    // No project attached → a chat-first session (the Home default);
-    // a picked project starts a normal project session, unchanged. Home has no
-    // runner picker yet — new sessions always start on the local engine.
-    // TODO(P3-6 deferred): add a small LOCAL/remote-runner dropdown here once
-    // `useStore().projects` is runner-scoped (today it's a single flat list
-    // sourced from the local engine only, so picking a remote runner would
-    // need its own project listing first — bigger than a composer tweak).
-    const ok = project ? await start(LOCAL_RUNNER, project.projectId, t, opts) : await startChat(LOCAL_RUNNER, t, opts);
-    if (ok) nav.navigate({ kind: "session" });
-    else useNav.getState().restoreDraft(draftKey, typed);
+    const ok = project
+      ? await start(LOCAL_RUNNER, project.projectId, primaryAgentId, turn)
+      : await startChat(LOCAL_RUNNER, primaryAgentId, turn);
+    if (ok) {
+      localStorage.setItem(LAST_PRIMARY_AGENT_KEY, primaryAgentId);
+      nav.navigate({ kind: "session" });
+    } else useNav.getState().restoreDraft(draftKey, typed);
   };
 
   return (
@@ -329,51 +238,7 @@ export function HomeView() {
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
             </Button>
-            <Combobox
-              aria-label="Permission mode"
-              options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
-              value={composerPerm ?? corePermToUi(project?.permMode ?? "default")}
-              onValueChange={(mode) => setComposerPerm(mode as UiPermMode)}
-              trigger={
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  title="Permission mode for the new session"
-                  className="font-medium"
-                  style={{
-                    color: (composerPerm ?? corePermToUi(project?.permMode ?? "default")) === "full" ? "#E8703A" : undefined,
-                  }}
-                >
-                  <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-                  {PERM_MODES.find((m) => m.id === (composerPerm ?? corePermToUi(project?.permMode ?? "default")))?.label ?? "Ask"}
-                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                </Button>
-              }
-            />
             <div className="flex-1" />
-            <ComposerModelEffortMenu
-              models={agentModels}
-              runtime={projectId ? projectRuntime : chatRuntime}
-              onChange={(model, effort) => {
-                if (projectId) void setProjectRuntime(projectId, model, effort);
-                else {
-                  setComposerModel(model);
-                  setComposerEffort(effort);
-                }
-              }}
-              disabled={agentModels.length === 0}
-            />
-            <div
-              className={`flex items-center gap-1.5 px-1 ${project ? "" : "cursor-not-allowed opacity-50"}`}
-              title={project ? "Decompose this goal into tracked subtasks run by workers" : "Attach a project to orchestrate"}
-            >
-              <span className="text-[11px] font-medium text-muted-foreground">Orchestrate</span>
-              <Switch
-                on={orchestrate}
-                onToggle={() => project && setOrchestrate((v) => !v)}
-                label="Orchestrate this goal into tracked subtasks"
-              />
-            </div>
             <Button
               variant="ghost"
               size="icon-sm"

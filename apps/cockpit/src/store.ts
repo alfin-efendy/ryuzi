@@ -6,7 +6,7 @@ import {
   type Project,
   type CoreEvent,
   type Message,
-  type ChatRequestOptions,
+  type TurnInput,
   type GitOptions,
   type PermMode,
   type ApprovalKind,
@@ -42,8 +42,6 @@ export type PendingApproval = {
   principal: Principal | null;
 };
 export type ChatOptions = {
-  model?: string | null;
-  effort?: string | null;
   context?: {
     branch?: string | null;
     voiceTranscript?: string | null;
@@ -51,7 +49,6 @@ export type ChatOptions = {
   } | null;
   attachments?: string[];
   git?: GitOptions | null;
-  permMode?: PermMode | null;
 };
 
 type State = {
@@ -114,13 +111,11 @@ type State = {
   /** Resolves true as soon as the backend accepts — navigate immediately;
    *  the session list refresh completes in the background. `runnerId` is the
    *  runner the session is created on (defaults to the local engine). */
-  start: (runnerId: string, projectId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
-  /** Same shape as `start`, but for a chat-first session with no project
-   *  (`start_chat_session`) — Home's default when no project is attached. */
-  startChat: (runnerId: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
-  /** Resolves true when the backend accepted the prompt — false lets the
-   *  composer restore its optimistically-cleared draft. */
-  send: (runnerId: string, sessionPk: string, prompt: string, options?: ChatOptions | null) => Promise<boolean>;
+  start: (runnerId: string, projectId: string, primaryAgentId: string, turn: TurnInput) => Promise<boolean>;
+  /** Same shape as `start`, but for a chat-first session with no project. */
+  startChat: (runnerId: string, primaryAgentId: string, turn: TurnInput) => Promise<boolean>;
+  /** Resolves true when the backend accepts an ownership-preserving turn. */
+  send: (runnerId: string, sessionPk: string, turn: TurnInput) => Promise<boolean>;
   stop: (runnerId: string, sessionPk: string) => Promise<void>;
   /** Resolves true only when the backend teardown actually succeeded. */
   end: (runnerId: string, sessionPk: string) => Promise<boolean>;
@@ -147,21 +142,18 @@ function append(map: Record<string, Row[]>, key: string, row: Row): Record<strin
   return { ...map, [key]: [...(map[key] ?? []), row] };
 }
 
-function toChatRequestOptions(options?: ChatOptions | null): ChatRequestOptions | null {
-  if (!options) return null;
+function toTurnInput(text: string, options?: ChatOptions | null): TurnInput {
   return {
-    model: options.model ?? null,
-    effort: options.effort ?? null,
-    context: options.context
+    text,
+    context: options?.context
       ? {
           branch: options.context.branch ?? null,
           voiceTranscript: options.context.voiceTranscript ?? null,
           references: options.context.references ?? [],
         }
       : null,
-    attachments: options.attachments ?? [],
-    git: options.git ?? null,
-    permMode: options.permMode ?? null,
+    attachments: options?.attachments ?? [],
+    git: options?.git ?? null,
   };
 }
 
@@ -691,8 +683,8 @@ export const useStore = create<State>((set, get) => ({
     }
   },
 
-  start: async (runnerId, projectId, prompt, options) => {
-    const res = await commands.startSession(runnerId, projectId, prompt, toChatRequestOptions(options));
+  start: async (runnerId, projectId, primaryAgentId, turn) => {
+    const res = await commands.startSession(runnerId, projectId, primaryAgentId, turn);
     if (res.status === "error") {
       toast.error("Couldn't start session: " + res.error.message);
       return false;
@@ -705,8 +697,8 @@ export const useStore = create<State>((set, get) => ({
     void get().refresh();
     return true;
   },
-  startChat: async (runnerId, prompt, options) => {
-    const res = await commands.startChatSession(runnerId, prompt, toChatRequestOptions(options));
+  startChat: async (runnerId, primaryAgentId, turn) => {
+    const res = await commands.startChatSession(runnerId, primaryAgentId, turn);
     if (res.status === "error") {
       toast.error("Couldn't start chat: " + res.error.message);
       return false;
@@ -718,8 +710,8 @@ export const useStore = create<State>((set, get) => ({
     void get().refresh();
     return true;
   },
-  send: async (runnerId, sessionPk, prompt, options) => {
-    // A typed message while THIS chat drives a live orchestration steers it
+  send: async (runnerId, sessionPk, turn) => {
+    const { text } = turn;
     // instead of running as a normal chat turn — e.g. "cancel" cancels the
     // tree, anything else is noted as guidance for the judge. `orch_steer`
     // returns exactly one of three wire strings: "noted"/"cancelled" when the
@@ -732,7 +724,7 @@ export const useStore = create<State>((set, get) => ({
     // through to the normal send path so a steer-check never swallows the
     // user's message.
     try {
-      const steer = await commands.orchSteer(sessionPk, prompt);
+      const steer = await commands.orchSteer(sessionPk, text);
       if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
     } catch {
       // fall through to the normal send path
@@ -743,8 +735,8 @@ export const useStore = create<State>((set, get) => ({
     // ended) starts a normal continue. Matched within the correct runner.
     const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
     const res = isRunning
-      ? await commands.steerSession(runnerId, sessionPk, prompt)
-      : await commands.continueSession(runnerId, sessionPk, prompt, toChatRequestOptions(options));
+      ? await commands.steerSession(runnerId, sessionPk, text)
+      : await commands.continueSession(runnerId, sessionPk, turn);
     if (res.status === "error") {
       toast.error("Couldn't send message: " + res.error.message);
     }
@@ -767,7 +759,7 @@ export const useStore = create<State>((set, get) => ({
     if (!head) return;
     // Remove the head BEFORE awaiting so a second `result` can't re-send it.
     set((st) => ({ queued: { ...st.queued, [key]: rest } }));
-    const ok = await get().send(runnerId, sessionPk, head.text, head.options);
+    const ok = await get().send(runnerId, sessionPk, toTurnInput(head.text, head.options));
     if (!ok) {
       // Command-level rejection: put it back at the front so it stays visible.
       set((st) => ({ queued: { ...st.queued, [key]: [head, ...(st.queued[key] ?? [])] } }));

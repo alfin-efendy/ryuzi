@@ -1,34 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronDown, CircleAlert, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
+import { ArrowUp, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
-import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
-import { commands, type SessionRuntimeInfo } from "@/bindings";
+import { Button, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
+import { commands, type TurnInput } from "@/bindings";
 import { useStore, type ChatOptions } from "@/store";
 import { LOCAL_RUNNER, isSession, refKey } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
-import { useConnections } from "@/store-connections";
 import { useAgents } from "@/store-agents";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
-import { headerAgentLine } from "@/lib/session-header";
-import { sessionRuntimeScope } from "@/lib/session-runtime";
-import { defaultAgentModel } from "@/lib/default-agent-model";
+import { sessionIsReadOnly, sessionPrimaryLabel } from "@/lib/session-primary";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
-import { NATIVE_AGENT, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
-import { composerMode } from "@/components/composerMode";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
-import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { Transcript } from "@/components/transcript/Transcript";
 import { TranscriptFileContext } from "@/components/transcript/TranscriptFileContext";
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
-import { TaskStrip } from "@/components/session/TaskStrip";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
-import { SessionCostPanel } from "@/components/session/SessionCostPanel";
 import { QueuedMessages } from "@/components/session/QueuedMessages";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
@@ -44,15 +36,6 @@ export function SessionView() {
     stop,
     pendingApprovals,
     projects,
-    setProjectRuntime,
-    projectRuntimeById,
-    loadProjectRuntime,
-    sessionRuntimeById,
-    loadSessionRuntime,
-    setSessionPermMode,
-    setSessionRuntime,
-    orchTasks,
-    loadOrchTasks,
   } = useStore();
   const enqueueMessage = useStore((s) => s.enqueueMessage);
   const nav = useNav();
@@ -83,87 +66,17 @@ export function SessionView() {
   const stopVoice = useRef<(() => void) | null>(null);
 
   const rows = (focusedSession && transcripts[refKey(focusedSession)]) || [];
-  // Ryuzi-only: every session runs the native agent. Tolerant by
-  // construction — legacy rows still saying "claude-code" (restored DBs)
-  // are simply treated as native.
-  const agentModels = useAgents((s) => s.models);
-  const agentModel = useAgents((s) => defaultAgentModel(s.registry));
+  const registry = useAgents((s) => s.registry);
   const project = projects.find((p) => p.projectId === session?.projectId);
   const projectId = project?.projectId;
-  const runtimeScope = sessionRuntimeScope(session?.kind, projectId ?? null);
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
-  const connectionsLoaded = useConnections((s) => s.loaded);
-  const hydrateConnections = useConnections((s) => s.hydrate);
 
   useEffect(() => {
     // Slash commands are project metadata on the local engine.
     if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
   }, [projectId, loadCommands]);
-
-  useEffect(() => {
-    if (projectId) void loadProjectRuntime(projectId);
-  }, [projectId, loadProjectRuntime]);
-
-  useEffect(() => {
-    if (session?.sessionPk && runtimeScope === "session") void loadSessionRuntime(runnerId, session.sessionPk);
-  }, [runtimeScope, runnerId, session?.sessionPk, loadSessionRuntime]);
-
-  useEffect(() => {
-    if (!connectionsLoaded) void hydrateConnections();
-  }, [connectionsLoaded, hydrateConnections]);
-
-  // Home chats with a live orchestration mount a task strip above the
-  // transcript. `orch_list_roots` returns every root with no per-home filter,
-  // so the home→root mapping is resolved client-side: once per focused
-  // session, and again whenever the store's orch task graph grows a root this
-  // component hasn't seen yet (a fresh orchTaskChanged for a new goal).
-  // Re-resolve the home→root mapping whenever any orch task's status changes,
-  // not only when a brand-new root appears. A root finishing is a same-key
-  // in-place status update that leaves the root COUNT unchanged, so keying the
-  // effect on the count alone left the strip mounted (showing a stale "live"
-  // state) after a run completed. This signal changes on every status delta,
-  // so the effect re-runs and the `!live` branch clears `orchRootForHome`.
-  const orchStatusSignal = Object.values(orchTasks)
-    .flat()
-    .map((t) => `${t.id}:${t.status}`)
-    .join("|");
-  const [orchRootForHome, setOrchRootForHome] = useState<Record<string, string>>({});
-  const homeSessionPk = session?.kind === "chat" ? session.sessionPk : null;
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: orchStatusSignal is a deliberate re-run trigger (any orch status change), not read in the body
-  useEffect(() => {
-    if (!homeSessionPk) return;
-    let alive = true;
-    void commands.orchListRoots().then((res) => {
-      if (!alive || res.status !== "ok") return;
-      const live = res.data
-        .filter((t) => t.homeSessionPk === homeSessionPk && ["decomposing", "waiting", "judging"].includes(t.status))
-        .sort((a, b) => b.createdAt - a.createdAt)[0];
-      setOrchRootForHome((cur) => {
-        if (!live) {
-          if (!(homeSessionPk in cur)) return cur;
-          const next = { ...cur };
-          delete next[homeSessionPk];
-          return next;
-        }
-        return cur[homeSessionPk] === live.id ? cur : { ...cur, [homeSessionPk]: live.id };
-      });
-    });
-    return () => {
-      alive = false;
-    };
-  }, [homeSessionPk, orchStatusSignal]);
-
-  const orchRootId = homeSessionPk ? orchRootForHome[homeSessionPk] : undefined;
-
-  // A fresh strip on mount: seed the full task graph (titles, agents) once
-  // the home→root mapping above resolves — orchTaskChanged only carries a
-  // status delta, not the row's display fields.
-  useEffect(() => {
-    if (orchRootId) void loadOrchTasks(orchRootId);
-  }, [orchRootId, loadOrchTasks]);
 
   // Refresh edit-card diff stats after every turn, independent of the right
   // panel (which only fetches while open/on its own "review" tab).
@@ -248,35 +161,6 @@ export function SessionView() {
     };
   }, [projectId, contextQueryText]);
 
-  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
-  const agentModelInfo = agentModels.find((model) => model.requestValue === agentModel) ?? null;
-  const readOnlyRuntime: SessionRuntimeInfo | null = session
-    ? {
-        sessionPk: session.sessionPk,
-        model: agentModel,
-        storedEffort: null,
-        effectiveEffort: agentModelInfo?.resolvedDefault ?? null,
-        effectiveEffortLabel:
-          agentModelInfo?.supported.find((option) => option.value === agentModelInfo.resolvedDefault)?.label ??
-          agentModelInfo?.resolvedDefault ??
-          null,
-        effectiveSource:
-          agentModelInfo?.defaultSource === "configured"
-            ? "configured"
-            : agentModelInfo?.defaultSource === "provider"
-              ? "provider"
-              : "none",
-        storedEffortStatus: "valid",
-        modelInfo: agentModelInfo,
-      }
-    : null;
-  const runtime =
-    runtimeScope === "project"
-      ? projectRuntime
-      : runtimeScope === "session" && session
-        ? (sessionRuntimeById[session.sessionPk] ?? null)
-        : readOnlyRuntime;
-
   if (!session) {
     return (
       <div className="flex flex-1 items-center justify-center text-[13px] text-muted-foreground">Select a session from the sidebar.</div>
@@ -286,10 +170,16 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const pendingForSession = pendingApprovals.filter((a) => a.runnerId === runnerId && a.sessionPk === session.sessionPk);
-  const permUi = corePermToUi(session.permMode);
-  const permMeta = PERM_MODES.find((m) => m.id === permUi) ?? PERM_MODES[1];
+  const currentPrimary = session.primaryAgentId ? registry?.agents.find((agent) => agent.id === session.primaryAgentId) ?? null : null;
+  const composeReadOnly = sessionIsReadOnly(session.primaryAgentSnapshot) || currentPrimary === null || !currentPrimary.executable;
+  const composeReadOnlyReason = sessionIsReadOnly(session.primaryAgentSnapshot)
+    ? "Legacy sessions are read-only."
+    : currentPrimary === null
+      ? "The session’s primary agent was deleted, so this session is read-only."
+      : "The session’s primary agent is not executable.";
 
   const submit = () => {
+    if (composeReadOnly) return;
     const t = draft.trim();
     if (!t && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
@@ -297,6 +187,16 @@ export function SessionView() {
     const options: ChatOptions = {
       context: { branch: session.branch, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
+    };
+    const turn: TurnInput = {
+      text: t,
+      context: {
+        branch: options.context?.branch ?? null,
+        voiceTranscript: options.context?.voiceTranscript ?? null,
+        references: options.context?.references ?? [],
+      },
+      attachments: options.attachments ?? [],
+      git: null,
     };
     // Clear optimistically; a rejected *send* puts the text back. Enqueue never
     // fails, so no restore path there.
@@ -308,7 +208,7 @@ export function SessionView() {
       enqueueMessage(runnerId, key, { id: crypto.randomUUID(), text: t, options });
       return;
     }
-    void send(runnerId, key, t, options).then((ok) => {
+    void send(runnerId, key, turn).then((ok) => {
       if (!ok) useNav.getState().restoreDraft(key, typed);
     });
   };
@@ -391,7 +291,7 @@ export function SessionView() {
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
               <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-                <span>{headerAgentLine(project, agentModel)}</span>
+                <span>{sessionPrimaryLabel(session.primaryAgentSnapshot)}</span>
                 {session.branch && (
                   <span className="inline-flex items-center gap-1">
                     <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -406,15 +306,13 @@ export function SessionView() {
 
           {/* Transcript, with the floating plan panel overlaying it */}
           <div className="relative flex min-h-0 flex-1 flex-col">
-            {/* Pinned orchestration task strip — only for a home chat with a live run */}
-            {orchRootId && <TaskStrip rootId={orchRootId} />}
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
               <Transcript
                 runnerId={runnerId}
                 sessionPk={session.sessionPk}
                 rows={rows}
-                agentName={NATIVE_AGENT.name}
-                agentColor={NATIVE_AGENT.color}
+                agentName={sessionPrimaryLabel(session.primaryAgentSnapshot)}
+                agentColor={session.primaryAgentSnapshot?.avatarColor ?? "#71717A"}
                 running={running}
               >
                 {pendingForSession.map((a, i) => (
@@ -431,6 +329,16 @@ export function SessionView() {
           {/* Session composer */}
           <div className="shrink-0 px-6 pb-4 pt-3">
             <QueuedMessages runnerId={runnerId} sessionPk={session.sessionPk} />
+            {composeReadOnly && (
+              <div className="mx-auto flex w-full max-w-3xl items-center justify-between gap-3 px-3 pb-2 text-xs text-muted-foreground">
+                <span>{composeReadOnlyReason}</span>
+                {currentPrimary && !currentPrimary.executable ? (
+                  <Button variant="outline" size="sm" onClick={() => nav.navigate({ kind: "agentDetail", agentId: currentPrimary.id })}>
+                    Repair agent
+                  </Button>
+                ) : null}
+              </div>
+            )}
             <div
               className={`acrylic-card relative mx-auto w-full max-w-3xl rounded-2xl border shadow-xs ${composerFiles.dragOver ? "border-primary" : "border-border"}`}
             >
@@ -460,7 +368,8 @@ export function SessionView() {
                   }
                 }}
                 onPaste={composerFiles.onPaste}
-                placeholder={running ? "Enter to queue" : "Ask for follow-up changes"}
+                disabled={composeReadOnly}
+                placeholder={composeReadOnly ? composeReadOnlyReason : running ? "Enter to queue" : "Ask for follow-up changes"}
                 className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
               />
               {slashMatches.length > 0 && (
@@ -491,58 +400,28 @@ export function SessionView() {
                   size="icon-sm"
                   title="Attach"
                   onClick={() => void composerFiles.attachFiles()}
+                  disabled={composeReadOnly}
                   className="rounded-full text-muted-foreground"
                 >
                   <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
                 </Button>
-                <Combobox
-                  aria-label="Permission mode"
-                  options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
-                  value={permUi}
-                  onValueChange={(mode) => {
-                    void setSessionPermMode(runnerId, session.sessionPk, uiPermToCore(mode as UiPermMode));
-                  }}
-                  trigger={
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      title="Permission mode"
-                      className="font-medium"
-                      style={{ color: permUi === "full" ? "#E8703A" : undefined }}
-                    >
-                      <CircleAlert aria-hidden size={12} strokeWidth={2} className="size-3" />
-                      {permMeta.label}
-                      <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                    </Button>
-                  }
-                />
                 <div className="flex-1" />
-                <SessionCostPanel runnerId={runnerId} sessionPk={session.sessionPk} />
-                <ComposerModelEffortMenu
-                  models={agentModels}
-                  runtime={runtime}
-                  onChange={(model, effort) => {
-                    if (runtimeScope === "project" && projectId) void setProjectRuntime(projectId, model, effort);
-                    else if (runtimeScope === "session") void setSessionRuntime(runnerId, session.sessionPk, model, effort);
-                  }}
-                  disabled={agentModels.length === 0 || runtimeScope === null}
-                  running={running}
-                />
                 <Button
                   variant="ghost"
                   size="icon-sm"
                   title="Voice"
                   onClick={toggleVoice}
+                  disabled={composeReadOnly}
                   className={`rounded-full ${listening ? "bg-accent text-accent-foreground" : "text-muted-foreground"}`}
                 >
                   <Mic aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
                 </Button>
-                {composerMode(session.status) === "stop" ? (
+                {running ? (
                   <Button size="icon" title="Stop" onClick={() => void stop(runnerId, session.sessionPk)} className="rounded-full">
                     <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
                   </Button>
                 ) : (
-                  <Button size="icon" title="Send" onClick={submit} className="rounded-full">
+                  <Button size="icon" title="Send" onClick={submit} disabled={composeReadOnly} className="rounded-full">
                     <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
                   </Button>
                 )}
