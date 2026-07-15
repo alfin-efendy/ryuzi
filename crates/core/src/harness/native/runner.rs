@@ -19,7 +19,7 @@ use super::tools::{
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::delegation::{RunHandle, SubagentRunRequest};
-use crate::domain::{BackgroundKind, CoreEvent, NewMessage, PermMode, SessionKind};
+use crate::domain::{CoreEvent, NewMessage, PermMode, SessionKind};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -1472,6 +1472,7 @@ impl RunnerMainAgentSpawner {
     ) -> MainDelegationResult {
         let background = request.background;
         let context = request.context.clone();
+        let originating_run_id = request.parent_run_id.clone();
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
@@ -1492,7 +1493,9 @@ impl RunnerMainAgentSpawner {
             let goal = child_run.run.task.clone();
             tokio::spawn(async move {
                 let result = worker.execute_child(child_run, context).await;
-                worker.deliver_background_result(&goal, &result).await;
+                worker
+                    .deliver_background_result(&originating_run_id, &goal, &result)
+                    .await;
             });
             return MainDelegationResult::completed(
                 run_id,
@@ -1635,7 +1638,12 @@ impl RunnerMainAgentSpawner {
         }
     }
 
-    async fn deliver_background_result(&self, goal: &str, result: &MainDelegationResult) {
+    async fn deliver_background_result(
+        &self,
+        originating_run_id: &str,
+        goal: &str,
+        result: &MainDelegationResult,
+    ) {
         let block = delegation::format_delegation_block(&delegation::DelegationResult {
             id: result.run_id.clone(),
             goal: goal.to_string(),
@@ -1645,15 +1653,45 @@ impl RunnerMainAgentSpawner {
             summary: result.report.clone(),
             error: (result.status == SubtaskStatus::Error).then(|| result.report.clone()),
         });
-        let _ = self
+        let payload = json!({
+            "run_id": result.run_id,
+            "goal": goal,
+            "status": result.status.as_str(),
+            "result": result.report,
+            "error": (result.status == SubtaskStatus::Error).then(|| result.report.clone()),
+            "text": block,
+        });
+        let message = NewMessage::block(
+            &self.deps.session_pk,
+            "system",
+            "delegation_result",
+            payload.clone(),
+        );
+        match self
             .deps
             .store
-            .enqueue_background_event(
-                &self.deps.session_pk,
-                BackgroundKind::Delegation.as_str(),
-                &block,
-            )
-            .await;
+            .insert_run_message(originating_run_id, message)
+            .await
+        {
+            Ok(seq) => {
+                let _ = self.deps.events.send(CoreEvent::Message {
+                    session_pk: self.deps.session_pk.clone(),
+                    seq,
+                    role: "system".to_string(),
+                    block_type: "delegation_result".to_string(),
+                    payload,
+                    tool_call_id: None,
+                    status: None,
+                    tool_kind: None,
+                    speaker: None,
+                });
+            }
+            Err(error) => tracing::warn!(
+                "native: failed to deliver background main delegation {} to originating run {}: {error}",
+                result.run_id,
+                originating_run_id,
+            ),
+        }
     }
 }
 
@@ -3439,8 +3477,6 @@ mod tests {
     /// queue row for the main agent, carrying a cache-parity payload.
     #[tokio::test]
     async fn finalizer_enqueues_a_learning_row_every_nudge_interval() {
-        use crate::domain::PermMode;
-
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("one"), final_turn("two")]));
         let deps = deps_at(dir.path(), llm).await;
@@ -3511,8 +3547,6 @@ mod tests {
     /// a non-`Full` `DisplayMode` too, so the same mechanism will exclude it.)
     #[tokio::test]
     async fn subagent_end_turn_never_nudges_even_past_threshold() {
-        use crate::domain::PermMode;
-
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("subagent reply")]));
         let deps = deps_at(dir.path(), llm).await;
@@ -5412,7 +5446,6 @@ mod tests {
 
     #[tokio::test]
     async fn generates_a_title_for_a_fresh_session() {
-        use crate::domain::{Project, Session, SessionKind, SessionStatus};
         let dir = tempfile::tempdir().unwrap();
         // Turn 0: the actual reply. Turn 1: the title generation.
         let main = vec![
@@ -6053,6 +6086,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_main_delegate_delivers_completion_to_its_origin_run_without_a_new_turn() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("background main result")]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (deps, registry) = deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Background target".into(),
+                description: "background target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let target_agent_id = target.profile.id.clone();
+        let root_run_id = deps.run_id.clone();
+        let mut events = deps.events.subscribe();
+
+        let dispatched = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id.clone(),
+                target_agent_id: target_agent_id.clone(),
+                task: "finish in the background".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+
+        for _ in 0..200 {
+            if deps
+                .store
+                .get_agent_run(&dispatched.run_id)
+                .await
+                .unwrap()
+                .is_some_and(|run| run.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let child = deps
+            .store
+            .get_agent_run(&dispatched.run_id)
+            .await
+            .unwrap()
+            .expect("background main delegate is durable");
+        assert_eq!(child.status, crate::domain::AgentRunStatus::Completed);
+        assert_eq!(child.result.as_deref(), Some("background main result"));
+        assert_eq!(deps.store.pending_background_count().await.unwrap(), 0);
+        assert!(
+            deps.store
+                .list_provider_turns(&deps.session_pk)
+                .await
+                .unwrap()
+                .is_empty(),
+            "completion must not continue the primary session as a new user turn"
+        );
+        assert!(
+            deps.store
+                .list_messages(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.role != "user"),
+            "completion must not persist a synthetic primary user message"
+        );
+        let completion = deps
+            .store
+            .list_run_messages(&deps.session_pk, &root_run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.block_type == "delegation_result")
+            .expect("completion is attached to the originating run");
+        assert_eq!(completion.payload["run_id"], dispatched.run_id);
+        assert_eq!(completion.payload["result"], "background main result");
+        assert!(completion.payload["error"].is_null());
+        assert!(
+            (0..32)
+                .filter_map(|_| events.try_recv().ok())
+                .any(|event| matches!(
+                    event,
+                    CoreEvent::Message { block_type, payload, .. }
+                        if block_type == "delegation_result"
+                            && payload["result"] == "background main result"
+                )),
+            "completion emits the run-scoped message event"
+        );
+
+        let failed = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id.clone(),
+                target_agent_id,
+                task: "fail in the background".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+        for _ in 0..200 {
+            if deps
+                .store
+                .get_agent_run(&failed.run_id)
+                .await
+                .unwrap()
+                .is_some_and(|run| run.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let failed_run = deps
+            .store
+            .get_agent_run(&failed.run_id)
+            .await
+            .unwrap()
+            .expect("failed background main delegate is durable");
+        assert_eq!(failed_run.status, crate::domain::AgentRunStatus::Failed);
+        assert!(failed_run.error.is_some());
+        let failure = deps
+            .store
+            .list_run_messages(&deps.session_pk, &root_run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.payload["run_id"] == failed.run_id)
+            .expect("failure is attached to the originating run");
+        assert_eq!(failure.block_type, "delegation_result");
+        assert_eq!(failure.payload["status"], "error");
+        assert!(failure.payload["error"].as_str().is_some());
+        assert_eq!(
+            deps.store
+                .list_session_agent_runs(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|run| run.agent_kind == crate::domain::AgentRunKind::Primary)
+                .count(),
+            1,
+            "background completion must not create a new primary run"
+        );
+        assert!(
+            deps.store
+                .list_provider_turns(&deps.session_pk)
+                .await
+                .unwrap()
+                .is_empty(),
+            "neither completion nor error may continue the primary session"
+        );
+    }
+
+    #[tokio::test]
     async fn delegated_main_child_uses_the_target_profile_without_parent_leaks() {
         use crate::agents::types::{
             AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
@@ -6555,7 +6764,7 @@ mod tests {
             message_stop(),
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![child_turn, final_turn("child done")]));
-        let mut deps = deps_at(dir.path(), llm).await;
+        let deps = deps_at(dir.path(), llm).await;
         // `deps_at` already owns a root run for run-scoped transcript rows.
         let root = deps.run_id.clone();
         let spawner = RunnerSpawner {
