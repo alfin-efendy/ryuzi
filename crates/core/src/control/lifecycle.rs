@@ -2015,6 +2015,23 @@ impl ControlPlane {
             let _ = handle.cancel().await;
             let _ = handle.end().await;
         }
+        // Cancel every active delegation tree after the primary turn is
+        // interrupted, matching `stop_session`: a detached main or background
+        // child holds its own token and can otherwise finish after the session
+        // is gone and enqueue a stale rail result.
+        let roots = self
+            .store
+            .list_session_agent_runs(session_pk)
+            .await?
+            .into_iter()
+            .filter(|run| run.parent_run_id.is_none() && run.status.is_active())
+            .collect::<Vec<_>>();
+        for root in roots {
+            let _ = self
+                .delegation
+                .cancel_descendants_of_root(session_pk, &root.run_id)
+                .await;
+        }
         // Cancel any in-flight background delegations this session dispatched
         // and purge its pending rail rows — orphaned background work must not
         // survive to leak into a new chat or be delivered to a dead session

@@ -2730,6 +2730,88 @@ async fn end_chat_session_removes_the_scratch_dir() {
 
 #[tokio::test]
 #[serial]
+async fn end_session_cancels_deferred_background_descendants_before_they_can_deliver() {
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(true, counters)).await;
+    let store = cp.store().clone();
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    let pk = session.session_pk.clone();
+    wait_for_running_handle(&cp, &pk).await;
+    let root = store
+        .list_session_agent_runs(&pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.is_none())
+        .expect("chat startup creates a primary root");
+    assert!(
+        root.status.is_active(),
+        "the primary root must still be active"
+    );
+
+    // Model a queued background child before its detached worker is released.
+    // The worker has no rail side effect until `release`; ending the session
+    // must cancel the child's token first, so releasing it afterwards cannot
+    // enqueue a result for the dead session.
+    let child = cp
+        .delegation()
+        .queue_subagent(crate::delegation::SubagentRunRequest {
+            parent_run_id: root.run_id,
+            subagent_type: "general".into(),
+            task: "deferred background work".into(),
+            context: None,
+            background: true,
+        })
+        .await
+        .unwrap();
+    let child_run_id = child.run.run_id.clone();
+    let child_cancel = child.cancel.clone();
+    let background = cp.background().try_reserve(3, &pk).unwrap();
+    let background_cancel = background.token();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let worker_release = release.clone();
+    let worker_store = store.clone();
+    let worker_pk = pk.clone();
+    let worker = tokio::spawn(async move {
+        let _background = background;
+        worker_release.notified().await;
+        if child_cancel.is_cancelled() {
+            return;
+        }
+        worker_store
+            .enqueue_background_event(&worker_pk, "delegation", "late result")
+            .await
+            .unwrap();
+    });
+
+    cp.end_session(&pk).await.unwrap();
+
+    let child = wait_for_primary_run_terminal(&store, &pk, &child_run_id).await;
+    assert_eq!(child.status, crate::domain::AgentRunStatus::Cancelled);
+    assert!(
+        background_cancel.is_cancelled(),
+        "ending must cancel the deferred worker's background reservation"
+    );
+
+    release.notify_one();
+    worker.await.unwrap();
+    assert_eq!(
+        store.pending_background_count().await.unwrap(),
+        0,
+        "a cancelled deferred child must not enqueue a late rail event after session end"
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
 async fn end_session_cancels_and_purges_orphaned_background_work() {
     let _guard = StateDirGuard::new();
     let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
