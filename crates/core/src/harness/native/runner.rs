@@ -169,6 +169,13 @@ pub struct RunnerDeps {
     /// fork's real whitelist regardless of what's advertised. `None` for
     /// every non-review turn (parent and sub-agent).
     pub review_tool_defs: Option<Vec<Value>>,
+    /// Per-session set of deferred tools the model has loaded via `load_tools`
+    /// (Phase 2 lazy tools). `Some` on primary sessions (lazy advertising on);
+    /// `None` for sub-agents and review forks, which keep the eager filtered
+    /// set. `BTreeSet` order keeps the advertised tools array deterministic so
+    /// the prompt cache holds across turns with an unchanged set.
+    pub activated_tools:
+        Option<std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeSet<String>>>>,
     /// Which actor is driving this session's tool calls (Phase 4 §7) —
     /// threaded into every `ToolCtx` this session's `run_tool_call` builds.
     /// `User` for ordinary interactive sessions; the background review fork
@@ -707,6 +714,20 @@ fn visible_tool_defs(
     out
 }
 
+/// The tool definitions to send this provider turn: the review fork's captured
+/// set verbatim (cache parity), else the activation-aware set from a snapshot of
+/// `deps.activated_tools`.
+async fn current_tool_defs(deps: &RunnerDeps, agent: &Agent) -> Vec<Value> {
+    if let Some(captured) = &deps.review_tool_defs {
+        return captured.clone();
+    }
+    let activated = match &deps.activated_tools {
+        Some(m) => Some(m.lock().await.clone()),
+        None => None,
+    };
+    visible_tool_defs(&deps.tools, agent, deps.kind, activated.as_ref())
+}
+
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
 /// `display` gates persistence of display rows: sub-agents stream only their
 /// tool rows (tagged with their label) so their text/thinking stay internal.
@@ -741,16 +762,10 @@ async fn drive(
             text
         }
     };
-    // Tools restricted to what this agent may use — UNLESS a review fork
-    // (Task 9) supplies the parent's exact captured `tool_defs` for cache
-    // parity. Advertising the full parent tool set here is safe even though
-    // the review agent's `ToolFilter` only allows a few of them: dispatch
-    // (`run_tool_call`, below) enforces the real whitelist at call time, so a
-    // non-whitelisted call is refused, not merely hidden from the model.
-    let tool_defs: Vec<Value> = match &deps.review_tool_defs {
-        Some(captured) => captured.clone(),
-        None => visible_tool_defs(&deps.tools, agent, deps.kind, None),
-    };
+    // Baseline snapshot of what this turn starts with (used by set_baseline +
+    // the Phase-1 breakdown). Recomputed each provider turn below so a mid-turn
+    // `load_tools` takes effect on the next iteration.
+    let tool_defs: Vec<Value> = current_tool_defs(deps, agent).await;
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
@@ -859,6 +874,7 @@ async fn drive(
             } else {
                 json!(system)
             };
+            let tool_defs = current_tool_defs(deps, agent).await;
             let body = json!({
                 "model": model,
                 "system": system_value,
@@ -1468,6 +1484,7 @@ fn deps_for_subagent(deps: &RunnerDeps) -> RunnerDeps {
     let mut child = deps.clone();
     child.memory = None;
     child.app_control = None;
+    child.activated_tools = None;
     child
 }
 
@@ -2676,6 +2693,7 @@ mod tests {
             app_control: None,
             nudge: Arc::new(NudgeState::default()),
             review_tool_defs: None,
+            activated_tools: None,
             write_origin: crate::domain::WriteOrigin::User,
         }
     }
@@ -4803,6 +4821,38 @@ mod tests {
         // Deterministic order across calls.
         let again = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&set));
         assert_eq!(lazy, again);
+    }
+
+    #[tokio::test]
+    async fn primary_deps_advertise_hot_core_and_load_tools_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = std::sync::Arc::new(ScriptedLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        // Primary session: lazy tools on.
+        deps.activated_tools = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::BTreeSet::new(),
+        )));
+        let defs = current_tool_defs(&deps, &deps.agent).await;
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&LOAD_TOOLS_NAME.to_string()));
+        assert!(
+            !names.contains(&"webfetch".to_string()),
+            "deferred hidden for primary until loaded"
+        );
+
+        // Eager (sub-agent style): full set, no load_tools.
+        deps.activated_tools = None;
+        let eager = current_tool_defs(&deps, &deps.agent).await;
+        let enames: Vec<String> = eager
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(enames.contains(&"webfetch".to_string()));
+        assert!(!enames.contains(&LOAD_TOOLS_NAME.to_string()));
     }
 
     #[test]

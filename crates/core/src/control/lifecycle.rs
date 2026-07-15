@@ -1646,6 +1646,9 @@ impl ControlPlane {
             // Cache parity: advertise the parent's FULL captured tool set —
             // dispatch (`agent.tools`, above) still enforces the whitelist.
             review_tool_defs: Some(payload.tool_defs.clone()),
+            // Irrelevant: `current_tool_defs` short-circuits on
+            // `review_tool_defs` above before ever consulting this field.
+            activated_tools: None,
             write_origin: WriteOrigin::BackgroundReview,
         };
 

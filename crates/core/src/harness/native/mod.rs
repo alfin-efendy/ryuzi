@@ -311,6 +311,12 @@ impl Harness for NativeHarness {
                 app_control: ctx.app_control,
                 nudge,
                 review_tool_defs: None,
+                // Primary sessions advertise lazily (hot core + load_tools);
+                // sub-agents and the review fork strip this back to `None`
+                // (eager) via `deps_for_subagent` / their own builder.
+                activated_tools: Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                    std::collections::BTreeSet::new(),
+                ))),
                 // Every agent tool call — even one an interactive human turn
                 // triggers — is the AGENT deciding to call a tool, not a
                 // direct human action, so a top-level Project/Chat session is
