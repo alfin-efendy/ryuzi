@@ -19,7 +19,7 @@ use super::tools::{
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::delegation::{RunHandle, SubagentRunRequest};
-use crate::domain::{CoreEvent, NewMessage, PermMode, SessionKind};
+use crate::domain::{BackgroundKind, CoreEvent, NewMessage, PermMode, SessionKind};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -315,16 +315,15 @@ pub async fn run_turn(
     cm.append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
 
-    // 3. Drive the loop. Explicit mention children deliberately do not receive
-    // the Task5 subagent spawner: they are terminal delegated main-agent turns.
-    let spawn = (!deps.isolated_target).then(|| {
-        Arc::new(RunnerSpawner {
-            deps: deps.clone(),
-            cancel: cancel.clone(),
-            depth: 0,
-            parent_run_id: deps.run_id.clone(),
-        }) as Arc<dyn SubagentSpawner>
-    });
+    // 3. Drive the loop. Isolated complete-profile children retain `task`
+    // execution when it is advertised, but their RunnerSpawner still strips
+    // attachments, app control, and persistent memory in deps_for_subagent.
+    let spawn = Some(Arc::new(RunnerSpawner {
+        deps: deps.clone(),
+        cancel: cancel.clone(),
+        depth: 0,
+        parent_run_id: deps.run_id.clone(),
+    }) as Arc<dyn SubagentSpawner>);
     // Seed the parent turn-cap from the `agent.max_provider_turns` setting,
     // defaulting to Phase 2's raised ceiling (PARENT_MAX_ITERS). This is what
     // makes the setting meaningful under the IterationBudget model: drive()'s
@@ -511,9 +510,14 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
         .await
     };
     if let Ok(mut policy) = policy {
-        policy.project_override = policy
-            .project_override
-            .or_else(|| agent_effort(&turn.primary_agent.profile.model));
+        policy.project_override = if turn.agent.mode.is_subagent() {
+            turn.turn_effort_policy.project_override.clone()
+        } else {
+            policy
+                .project_override
+                .or_else(|| turn.turn_effort_policy.project_override.clone())
+                .or_else(|| agent_effort(&turn.primary_agent.profile.model))
+        };
         turn.turn_effort_policy = Arc::new(policy);
     }
     turn
@@ -1411,16 +1415,59 @@ async fn max_spawn_depth(store: &Store) -> u8 {
     crate::settings::usize_setting(store, "max_spawn_depth", 2).await as u8
 }
 
-/// Clone `deps` for a spawned sub-agent, stripping the capabilities that are
-/// top-level-session only: persistent memory (sub-agents run memoryless) and
-/// the app-control facade (spec §9.1).
-fn deps_for_subagent(deps: &RunnerDeps) -> RunnerDeps {
-    let mut child = deps.clone();
-    child.memory = None;
-    child.attachments_dir = None;
-    child.allowed_skills = None;
-    child.app_control = None;
-    child
+/// Build one memoryless task child's dependencies from the current shared
+/// subagent configuration. The parent contributes only session-scoped services
+/// and isolation boundaries; its model, metadata, and effort policy never
+/// select the child model.
+async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
+    let shared_model = deps.delegation.registry_snapshot().await.subagent_model;
+    let model = super::resolve_native_model(&deps.store, agent_model_name(&shared_model)).await;
+    let model_name = model.as_deref().unwrap_or("");
+    let mut effort_policy =
+        crate::llm_router::model_effort::build_utility_effort_policy(&deps.store, model_name)
+            .await?;
+    effort_policy.project_override = agent_effort(&shared_model);
+    let meta = crate::llm_router::model_meta::resolve(&deps.store, model_name).await;
+
+    Ok(RunnerDeps {
+        session_pk: deps.session_pk.clone(),
+        primary_agent: deps.primary_agent.clone(),
+        run_id: deps.run_id.clone(),
+        delegation: deps.delegation.clone(),
+        isolated_target: deps.isolated_target,
+        main_agent_id: deps.main_agent_id.clone(),
+        learning_queue: deps.learning_queue.clone(),
+        agent_knowledge: deps.agent_knowledge.clone(),
+        kind: deps.kind,
+        work_dir: deps.work_dir.clone(),
+        attachments_dir: None,
+        extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        extension_events: deps.extension_events.clone(),
+        model,
+        turn_effort_policy: Arc::new(effort_policy),
+        meta,
+        perm_mode: deps.perm_mode.clone(),
+        project_id: deps.project_id.clone(),
+        perm_overrides: deps.perm_overrides.clone(),
+        store: deps.store.clone(),
+        events: deps.events.clone(),
+        approvals: deps.approvals.clone(),
+        llm: deps.llm.clone(),
+        tools: deps.tools.clone(),
+        agent: deps.agent.clone(),
+        agents: deps.agents.clone(),
+        commands: deps.commands.clone(),
+        allowed_skills: None,
+        memory: None,
+        snapshots: deps.snapshots.clone(),
+        steer: deps.steer.clone(),
+        background: deps.background.clone(),
+        app_control: None,
+        nudge: deps.nudge.clone(),
+        review_tool_defs: None,
+        write_origin: deps.write_origin,
+        delegation_catalog: deps.delegation_catalog.clone(),
+    })
 }
 
 /// A [`SubagentSpawner`] backed by the runner: runs sub-agents in ephemeral
@@ -1446,6 +1493,9 @@ fn effective_delegated_main_child_filter(
     match filter {
         super::agents::ToolFilter::All => super::agents::ToolFilter::All,
         super::agents::ToolFilter::Only(mut allowed) => {
+            // Isolated main profiles advertise `task` when the delegation
+            // contract requires it, and their terminal turn receives the
+            // constrained RunnerSpawner above.
             for delegation_tool in ["task", "delegate_agent"] {
                 if names.iter().any(|name| name == delegation_tool)
                     && !allowed.iter().any(|name| name == delegation_tool)
@@ -1473,7 +1523,6 @@ impl RunnerMainAgentSpawner {
     ) -> MainDelegationResult {
         let background = request.background;
         let context = request.context.clone();
-        let originating_run_id = request.parent_run_id.clone();
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
@@ -1494,9 +1543,7 @@ impl RunnerMainAgentSpawner {
             let goal = child_run.run.task.clone();
             tokio::spawn(async move {
                 let result = worker.execute_child(child_run, context).await;
-                worker
-                    .deliver_background_result(&originating_run_id, &goal, &result)
-                    .await;
+                worker.deliver_background_result(&goal, &result).await;
             });
             return MainDelegationResult::completed(
                 run_id,
@@ -1641,12 +1688,7 @@ impl RunnerMainAgentSpawner {
         }
     }
 
-    async fn deliver_background_result(
-        &self,
-        originating_run_id: &str,
-        goal: &str,
-        result: &MainDelegationResult,
-    ) {
+    async fn deliver_background_result(&self, goal: &str, result: &MainDelegationResult) {
         let block = delegation::format_delegation_block(&delegation::DelegationResult {
             id: result.run_id.clone(),
             goal: goal.to_string(),
@@ -1656,44 +1698,20 @@ impl RunnerMainAgentSpawner {
             summary: result.report.clone(),
             error: (result.status == SubtaskStatus::Error).then(|| result.report.clone()),
         });
-        let payload = json!({
-            "run_id": result.run_id,
-            "goal": goal,
-            "status": result.status.as_str(),
-            "result": result.report,
-            "error": (result.status == SubtaskStatus::Error).then(|| result.report.clone()),
-            "text": block,
-        });
-        let message = NewMessage::block(
-            &self.deps.session_pk,
-            "system",
-            "delegation_result",
-            payload.clone(),
-        );
-        match self
+        if let Err(error) = self
             .deps
             .store
-            .insert_run_message(originating_run_id, message)
+            .enqueue_background_event(
+                &self.deps.session_pk,
+                BackgroundKind::Delegation.as_str(),
+                &block,
+            )
             .await
         {
-            Ok(seq) => {
-                let _ = self.deps.events.send(CoreEvent::Message {
-                    session_pk: self.deps.session_pk.clone(),
-                    seq,
-                    role: "system".to_string(),
-                    block_type: "delegation_result".to_string(),
-                    payload,
-                    tool_call_id: None,
-                    status: None,
-                    tool_kind: None,
-                    speaker: None,
-                });
-            }
-            Err(error) => tracing::warn!(
-                "native: failed to deliver background main delegation {} to originating run {}: {error}",
+            tracing::warn!(
+                "native: failed to enqueue background main delegation {}: {error}",
                 result.run_id,
-                originating_run_id,
-            ),
+            );
         }
     }
 }
@@ -1908,7 +1926,10 @@ impl RunnerSpawner {
         // Reset it here so the `ctx.app == None for sub-agents` invariant holds
         // unconditionally at the facade layer, not merely because the SUBAGENT
         // name-blocklist (Task 8) hides the tools — defense in depth.
-        let mut child_deps = deps_for_subagent(&self.deps);
+        let mut child_deps = match deps_for_subagent(&self.deps).await {
+            Ok(deps) => deps,
+            Err(error) => return result(SubtaskStatus::Error, error.to_string()),
+        };
         child_deps.run_id = run_id.to_string();
         child_deps.agent = child.clone();
         let child_spawn: Option<Arc<dyn SubagentSpawner>> = if delegates {
@@ -5398,7 +5419,7 @@ mod tests {
             )
             .unwrap(),
         ));
-        let child = deps_for_subagent(&parent);
+        let child = deps_for_subagent(&parent).await.unwrap();
         assert!(child.memory.is_none());
         assert!(child.attachments_dir.is_none());
         assert_eq!(child.work_dir, parent.work_dir);
@@ -6162,7 +6183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_main_delegate_delivers_completion_to_its_origin_run_without_a_new_turn() {
+    async fn background_main_delegate_enqueues_and_delivers_on_the_delegation_rail() {
         use crate::agents::types::{
             AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
@@ -6200,14 +6221,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let target_agent_id = target.profile.id.clone();
         let root_run_id = deps.run_id.clone();
-        let mut events = deps.events.subscribe();
 
         let dispatched = RunnerMainAgentSpawner { deps: deps.clone() }
             .run_child(crate::delegation::MainDelegationRequest {
                 parent_run_id: root_run_id.clone(),
-                target_agent_id: target_agent_id.clone(),
+                target_agent_id: target.profile.id,
                 task: "finish in the background".into(),
                 context: None,
                 background: true,
@@ -6235,97 +6254,35 @@ mod tests {
             .expect("background main delegate is durable");
         assert_eq!(child.status, crate::domain::AgentRunStatus::Completed);
         assert_eq!(child.result.as_deref(), Some("background main result"));
-        assert_eq!(deps.store.pending_background_count().await.unwrap(), 0);
         assert!(
             deps.store
-                .list_provider_turns(&deps.session_pk)
-                .await
-                .unwrap()
-                .is_empty(),
-            "completion must not continue the primary session as a new user turn"
-        );
-        assert!(
-            deps.store
-                .list_messages(&deps.session_pk)
+                .list_run_messages(&deps.session_pk, &root_run_id)
                 .await
                 .unwrap()
                 .iter()
-                .all(|message| message.role != "user"),
-            "completion must not persist a synthetic primary user message"
-        );
-        let completion = deps
-            .store
-            .list_run_messages(&deps.session_pk, &root_run_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|message| message.block_type == "delegation_result")
-            .expect("completion is attached to the originating run");
-        assert_eq!(completion.payload["run_id"], dispatched.run_id);
-        assert_eq!(completion.payload["result"], "background main result");
-        assert!(completion.payload["error"].is_null());
-        assert!(
-            (0..32)
-                .filter_map(|_| events.try_recv().ok())
-                .any(|event| matches!(
-                    event,
-                    CoreEvent::Message { block_type, payload, .. }
-                        if block_type == "delegation_result"
-                            && payload["result"] == "background main result"
-                )),
-            "completion emits the run-scoped message event"
+                .all(|message| message.block_type != "delegation_result"),
+            "main background results must not bypass the rail with a run message"
         );
 
-        let failed = RunnerMainAgentSpawner { deps: deps.clone() }
-            .run_child(crate::delegation::MainDelegationRequest {
-                parent_run_id: root_run_id.clone(),
-                target_agent_id,
-                task: "fail in the background".into(),
-                context: None,
-                background: true,
-            })
-            .await;
-        for _ in 0..200 {
-            if deps
-                .store
-                .get_agent_run(&failed.run_id)
-                .await
-                .unwrap()
-                .is_some_and(|run| run.status.is_terminal())
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let failed_run = deps
-            .store
-            .get_agent_run(&failed.run_id)
-            .await
-            .unwrap()
-            .expect("failed background main delegate is durable");
-        assert_eq!(failed_run.status, crate::domain::AgentRunStatus::Failed);
-        assert!(failed_run.error.is_some());
-        let failure = deps
-            .store
-            .list_run_messages(&deps.session_pk, &root_run_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|message| message.payload["run_id"] == failed.run_id)
-            .expect("failure is attached to the originating run");
-        assert_eq!(failure.block_type, "delegation_result");
-        assert_eq!(failure.payload["status"], "error");
-        assert!(failure.payload["error"].as_str().is_some());
+        let claimed = wait_for_rail_row(&deps.store, &deps.session_pk).await;
         assert_eq!(
+            claimed.kind,
+            crate::domain::BackgroundKind::Delegation.as_str()
+        );
+        assert!(claimed.payload.contains(&dispatched.run_id));
+        assert!(claimed.payload.contains("background main result"));
+        assert_eq!(claimed.claimed_by.as_deref(), Some("test-poll"));
+        deps.store
+            .mark_background_delivered(&claimed.id)
+            .await
+            .unwrap();
+        assert!(
             deps.store
-                .list_session_agent_runs(&deps.session_pk)
+                .claim_deliverable_background_event("after-delivery")
                 .await
                 .unwrap()
-                .iter()
-                .filter(|run| run.agent_kind == crate::domain::AgentRunKind::Primary)
-                .count(),
-            1,
-            "background completion must not create a new primary run"
+                .is_none(),
+            "a delivered main delegation rail row is not claimed again"
         );
         assert!(
             deps.store
@@ -6333,7 +6290,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "neither completion nor error may continue the primary session"
+            "enqueueing does not create a new primary turn; the generic rail owns delivery"
         );
     }
 
@@ -6950,6 +6907,94 @@ mod tests {
                 .all(|row| row.tool_call_id.as_deref() != Some("must-not-run")),
             "the cancellation token stops the loop before a subsequent tool side effect"
         );
+    }
+
+    #[tokio::test]
+    async fn isolated_main_target_executes_advertised_task_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_task = vec![
+            tool_use_start(0, "delegate-work", "task"),
+            input_json_delta(0, r#"{"subagent_type":"general","prompt":"inspect"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(testutil::RecordingLlm::new(vec![
+            parent_task,
+            final_turn("subagent complete"),
+            final_turn("parent complete"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.isolated_target = true;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate", "delegate"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(llm.bodies.lock().unwrap().len(), 3);
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, crate::domain::AgentRunStatus::Completed);
+        assert_eq!(children[0].result.as_deref(), Some("subagent complete"));
+    }
+
+    #[tokio::test]
+    async fn subagent_uses_current_shared_model_effort_and_audits_it() {
+        use crate::agents::types::AgentModel;
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("subagent complete")]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm.clone(), store).await;
+        deps.model = Some("anthropic/parent-model".into());
+        registry
+            .set_subagent_model(AgentModel::Concrete {
+                name: "anthropic/target-model".into(),
+                effort: Some("high".into()),
+            })
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+
+        let result = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "inspect".into(),
+            }])
+            .await;
+
+        assert_eq!(result[0].status, SubtaskStatus::Completed);
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/target-model");
+        let policy = llm.policies.lock().unwrap().pop().unwrap();
+        assert_eq!(policy.project_override.as_deref(), Some("high"));
+        let child = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            child.resolved_model.as_deref(),
+            Some("anthropic/target-model")
+        );
+        assert_eq!(child.resolved_effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]
