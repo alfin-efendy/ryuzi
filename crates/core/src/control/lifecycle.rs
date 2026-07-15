@@ -2031,6 +2031,10 @@ impl ControlPlane {
                 .delegation
                 .cancel_descendants_of_root(session_pk, &root.run_id)
                 .await;
+            let _ = self
+                .delegation
+                .interrupt(&root.run_id, "session ended")
+                .await;
         }
         // Cancel any in-flight background delegations this session dispatched
         // and purge its pending rail rows — orphaned background work must not
@@ -2205,6 +2209,7 @@ impl ControlPlane {
             session_pk: review_pk.clone(),
             primary_agent,
             run_id: review_pk.clone(),
+            root_run_id: review_pk.clone(),
             delegation: self.delegation.clone(),
             isolated_target: false,
             main_agent_id: persistence.registry.default_agent_id().await,

@@ -99,6 +99,10 @@ pub struct RunnerDeps {
     /// Immutable primary identity and root run for this dispatched turn.
     pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
     pub run_id: String,
+    /// The persisted primary root that owns all descendant rail outcomes.
+    /// This remains stable while `run_id` changes for delegated main profiles
+    /// and ephemeral sub-agent loops.
+    pub root_run_id: String,
     pub delegation: Arc<crate::delegation::DelegationRuntime>,
     /// A child harness must not replay the root transcript or append provider
     /// turns to it; its result is conveyed only through its run-scoped rows.
@@ -1433,6 +1437,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         session_pk: deps.session_pk.clone(),
         primary_agent: deps.primary_agent.clone(),
         run_id: deps.run_id.clone(),
+        root_run_id: deps.root_run_id.clone(),
         delegation: deps.delegation.clone(),
         isolated_target: deps.isolated_target,
         main_agent_id: deps.main_agent_id.clone(),
@@ -1523,7 +1528,7 @@ impl RunnerMainAgentSpawner {
     ) -> MainDelegationResult {
         let background = request.background;
         let context = request.context.clone();
-        let originating_run_id = request.parent_run_id.clone();
+        let root_run_id = self.deps.root_run_id.clone();
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
@@ -1585,7 +1590,7 @@ impl RunnerMainAgentSpawner {
                     return;
                 }
                 worker
-                    .deliver_background_result(&originating_run_id, &goal, &result)
+                    .deliver_background_result(&root_run_id, &goal, &result)
                     .await;
             });
             return MainDelegationResult::completed(
@@ -2153,7 +2158,7 @@ impl SubagentSpawner for RunnerSpawner {
             parent_run_id: child_run.run.run_id.clone(),
         };
         let (deleg_id, goal) = (id.clone(), spec.prompt.clone());
-        let (parent_pk, originating_run_id) = (deps.session_pk.clone(), self.parent_run_id.clone());
+        let (parent_pk, root_run_id) = (deps.session_pk.clone(), self.deps.root_run_id.clone());
         // Read the parent's persisted headroom on the CALLER's task (a quick
         // DB read) before detaching — the spawned worker only needs the
         // resulting number, not a live store round-trip mid-flight.
@@ -2196,7 +2201,7 @@ impl SubagentSpawner for RunnerSpawner {
             // delegation result instead of opening a synthetic user turn.
             let _ = deps
                 .store
-                .enqueue_background_delegation_event(&parent_pk, &originating_run_id, &block)
+                .enqueue_background_delegation_event(&parent_pk, &root_run_id, &block)
                 .await;
         });
         BackgroundDispatch::Dispatched { id }
@@ -3192,6 +3197,7 @@ mod tests {
             session_pk: "s1".into(),
             primary_agent,
             run_id: "r1".into(),
+            root_run_id: "r1".into(),
             delegation,
             isolated_target: false,
             main_agent_id: "ryuzi".into(),
@@ -3274,7 +3280,8 @@ mod tests {
             .begin_primary(&deps.session_pk, deps.primary_agent.clone(), task)
             .await
             .unwrap();
-        deps.run_id = root.run.run_id;
+        deps.run_id = root.run.run_id.clone();
+        deps.root_run_id = root.run.run_id;
         deps.agent = crate::harness::native::primary_turn_config_with_tools(
             deps.primary_agent.clone(),
             deps.run_id.clone(),
@@ -6188,7 +6195,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn run_background_dispatch_writes_a_run_scoped_rail_row_on_completion() {
+    async fn nested_main_background_task_delivers_to_the_root_run() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = StateDirGuard::new();
         let child_turn = vec![
@@ -6197,7 +6204,38 @@ mod tests {
             message_stop(),
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![child_turn]));
-        let mut deps = deps_at(dir.path(), llm).await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let target = registry
+            .create(crate::agents::types::AgentMutationInput {
+                name: "Delegate".into(),
+                description: "delegate".into(),
+                avatar: crate::agents::types::AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: crate::agents::types::AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: crate::agents::types::AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: crate::agents::types::AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: crate::agents::types::AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
         deps.model = Some("anthropic/model-a".into());
         // The parent session row must exist + be idle for the rail JOIN later.
         seed_idle_session(&deps.store, &deps.session_pk).await;
@@ -6206,7 +6244,20 @@ mod tests {
             .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "audit auth")
             .await
             .unwrap();
-        deps.run_id = root.run.run_id;
+        let root_run_id = root.run.run_id.clone();
+        let parent = deps
+            .delegation
+            .queue_main(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id.clone(),
+                target_agent_id: target.profile.id,
+                task: "delegate audit".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        deps.run_id = parent.run.run_id.clone();
+        deps.root_run_id = root_run_id.clone();
         // Generous headroom so the short child report is not spilled.
         deps.store
             .upsert_session_context(
@@ -6219,7 +6270,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
-            parent_run_id: deps.run_id.clone(),
+            parent_run_id: parent.run.run_id,
         };
         let out = spawner
             .run_background(SubtaskSpec {
@@ -6235,8 +6286,8 @@ mod tests {
         assert_eq!(row.kind, crate::domain::BackgroundKind::Delegation.as_str());
         assert_eq!(
             row.origin_run_id.as_deref(),
-            Some(deps.run_id.as_str()),
-            "background task delivery must remain scoped to its originating primary run"
+            Some(root_run_id.as_str()),
+            "a main delegate's background task must deliver to the root primary run"
         );
         assert!(row
             .payload

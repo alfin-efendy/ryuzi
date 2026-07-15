@@ -1204,7 +1204,8 @@ async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_parti
 
 #[tokio::test]
 #[serial]
-async fn stopping_explicit_mention_parent_cancels_children_without_synthesis() {
+async fn ending_explicit_mention_parent_without_a_live_harness_cancels_children_without_synthesis()
+{
     let _guard = StateDirGuard::new();
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
@@ -1270,7 +1271,8 @@ async fn stopping_explicit_mention_parent_cancels_children_without_synthesis() {
         .collect::<Vec<_>>();
     assert_eq!(children.len(), 2);
 
-    cp.stop_session(&session.session_pk).await.unwrap();
+    cp.running.lock().unwrap().remove(&session.session_pk);
+    cp.end_session(&session.session_pk).await.unwrap();
     let root = wait_for_primary_run_terminal(&store, &session.session_pk, &root.run_id).await;
     assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
     for child in children {

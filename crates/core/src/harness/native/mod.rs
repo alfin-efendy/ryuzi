@@ -406,7 +406,8 @@ impl Harness for NativeHarness {
             deps: Mutex::new(runner::RunnerDeps {
                 session_pk: ctx.session_pk,
                 primary_agent: ctx.primary_agent,
-                run_id: ctx.run_id,
+                run_id: ctx.run_id.clone(),
+                root_run_id: ctx.run_id,
                 delegation: ctx.delegation,
                 isolated_target: ctx.isolated_target,
                 main_agent_id: ctx.main_agent_id,
