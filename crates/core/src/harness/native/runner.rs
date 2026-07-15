@@ -2153,7 +2153,7 @@ impl SubagentSpawner for RunnerSpawner {
             parent_run_id: child_run.run.run_id.clone(),
         };
         let (deleg_id, goal) = (id.clone(), spec.prompt.clone());
-        let parent_pk = deps.session_pk.clone();
+        let (parent_pk, originating_run_id) = (deps.session_pk.clone(), self.parent_run_id.clone());
         // Read the parent's persisted headroom on the CALLER's task (a quick
         // DB read) before detaching — the spawned worker only needs the
         // resulting number, not a live store round-trip mid-flight.
@@ -2191,11 +2191,12 @@ impl SubagentSpawner for RunnerSpawner {
                 summary: budgeted.text,
                 error: (child.status == SubtaskStatus::Error).then(|| child.report.clone()),
             });
-            // Durable re-entry (survives a daemon restart). The drainer
-            // delivers it as a new user turn once the parent is idle.
+            // Durable re-entry (survives a daemon restart), scoped to the
+            // primary run that dispatched this child so the rail records a
+            // delegation result instead of opening a synthetic user turn.
             let _ = deps
                 .store
-                .enqueue_background_event(&parent_pk, "delegation", &block)
+                .enqueue_background_delegation_event(&parent_pk, &originating_run_id, &block)
                 .await;
         });
         BackgroundDispatch::Dispatched { id }
@@ -6187,7 +6188,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn run_background_dispatch_writes_a_rail_row_on_completion() {
+    async fn run_background_dispatch_writes_a_run_scoped_rail_row_on_completion() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = StateDirGuard::new();
         let child_turn = vec![
@@ -6231,7 +6232,12 @@ mod tests {
             _ => panic!("expected dispatch"),
         };
         let row = wait_for_rail_row(&deps.store, &deps.session_pk).await;
-        assert_eq!(row.kind, "delegation");
+        assert_eq!(row.kind, crate::domain::BackgroundKind::Delegation.as_str());
+        assert_eq!(
+            row.origin_run_id.as_deref(),
+            Some(deps.run_id.as_str()),
+            "background task delivery must remain scoped to its originating primary run"
+        );
         assert!(row
             .payload
             .contains(&format!("[ASYNC DELEGATION COMPLETE — {id}]")));
