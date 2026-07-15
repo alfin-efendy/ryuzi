@@ -357,7 +357,10 @@ impl Harness for NativeHarness {
         let mut effort_policy =
             crate::llm_router::model_effort::build_utility_effort_policy(&ctx.store, model_name)
                 .await?;
-        effort_policy.project_override = ctx.effort;
+        effort_policy.project_override = match &primary_turn.agent.profile.model {
+            crate::agents::types::AgentModel::Concrete { effort, .. } => effort.clone(),
+            crate::agents::types::AgentModel::Route { .. } => None,
+        };
         // Persistent memory is unconditional: a chat (project-less) session
         // still gets GLOBAL + USER memory, while a project session gets
         // global + user + project scope. `at_default(None)` sets the global
@@ -651,6 +654,45 @@ mod tests {
     }
 
     async fn ctx_for(store: Arc<Store>, work_dir: std::path::PathBuf) -> SessionCtx {
+        crate::llm_router::connections::add_connection(
+            &store,
+            conn_for_resolution_tests("test-anthropic", "anthropic", "test/model"),
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        if store.get_session("sess").await.unwrap().is_none() {
+            store
+                .insert_session(crate::domain::Session {
+                    session_pk: "sess".into(),
+                    primary_agent_id: Some("ryuzi".into()),
+                    primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                        id: "ryuzi".into(),
+                        name: "Ryuzi".into(),
+                        avatar_color: "blue".into(),
+                    }),
+                    project_id: None,
+                    agent_session_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    title: Some("test".into()),
+                    status: crate::domain::SessionStatus::Idle,
+                    perm_mode: PermMode::BypassPermissions,
+                    started_by: None,
+                    created_at: Some(0),
+                    last_active: Some(0),
+                    resume_attempts: 0,
+                    branch_owned: false,
+                    kind: crate::domain::SessionKind::Chat,
+                    speaker: None,
+                    agent: None,
+                    parent_session_pk: None,
+                })
+                .await
+                .unwrap();
+        }
         let (events, _rx) = broadcast::channel(64);
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
             .await
@@ -665,10 +707,14 @@ mod tests {
             persistence.registry.clone(),
             events.clone(),
         );
+        let run = delegation
+            .begin_primary("sess", primary_agent.clone(), "test")
+            .await
+            .unwrap();
         SessionCtx {
             session_pk: "sess".into(),
             primary_agent,
-            run_id: "run".into(),
+            run_id: run.run.run_id,
             delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,
@@ -1222,9 +1268,18 @@ mod tests {
         let policies = llm.policies.lock().unwrap();
         assert_eq!(policies.len(), 2);
         assert_eq!(policies[0].requested_model, "anthropic/model-a");
-        assert_eq!(policies[0].project_override, None);
+        assert_eq!(
+            policies[0].project_override.as_deref(),
+            Some("low"),
+            "the first turn keeps the project effort active when it started"
+        );
         assert_eq!(policies[1].requested_model, "anthropic/model-a");
-        assert_eq!(policies[1].project_override, None);
+        assert_eq!(
+            policies[1].project_override.as_deref(),
+            Some("high"),
+            "the queued turn may intentionally read the updated project effort while retaining \
+             the immutable primary model snapshot"
+        );
     }
 
     fn conn_for_resolution_tests(

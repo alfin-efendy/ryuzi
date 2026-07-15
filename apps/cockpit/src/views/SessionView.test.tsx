@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AgentSummaryInfo, CmdError, OpenTarget, Project, Result, Session } from "@/bindings";
-import { LOCAL_RUNNER } from "@/lib/session-key";
+import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 // --- @/bindings: only the commands actually reachable from the mount paths
 // exercised below need a real implementation; everything else stays absent
@@ -326,6 +326,38 @@ test("session composer selects an agent mention from its keyboard menu", async (
 
   fireEvent.keyDown(composer, { key: "Enter" });
   expect(composer.value).toBe("ask @Ada ");
+});
+
+test("a deleted primary labels the header and transcript with its preserved identity", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "deleted", primaryAgentSnapshot: { id: "deleted", name: "Deleted", avatarColor: "rose" } });
+  useStore.setState({
+    transcripts: {
+      [sessKey(LOCAL_RUNNER, "s1")]: [
+        {
+          seq: 1,
+          role: "assistant",
+          blockType: "text",
+          text: "Preserved response",
+          toolCallId: null,
+          toolStatus: null,
+          toolKind: null,
+          toolName: null,
+          toolOutput: null,
+          createdAt: 1,
+          attachments: [],
+          toolPath: null,
+          toolInput: null,
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+        },
+      ],
+    },
+  });
+  render(<SessionView />);
+
+  expect(await screen.findAllByText("Deleted (Deleted)")).toHaveLength(2);
 });
 
 test("legacy sessions stay read-only without a repair destination", async () => {

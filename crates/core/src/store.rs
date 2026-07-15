@@ -1936,6 +1936,19 @@ impl Store {
         Ok(())
     }
 
+    /// Clear a session title so the next completed turn generates one.
+    pub async fn clear_session_title(&self, pk: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET title=NULL WHERE session_pk=?1",
+                params![pk],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Set one session's permission mode (per-session override; the project
     /// row is only the default seed for NEW sessions).
     pub async fn update_session_perm_mode(&self, pk: &str, mode: PermMode) -> anyhow::Result<()> {

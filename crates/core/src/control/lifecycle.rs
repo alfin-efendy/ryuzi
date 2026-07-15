@@ -46,6 +46,7 @@ impl PrimaryTurn {
 }
 
 fn validate_executable_primary(
+    registries: &crate::plugins::Registries,
     agent: &Arc<crate::agents::types::AgentSnapshot>,
 ) -> anyhow::Result<()> {
     if !agent.executable {
@@ -65,6 +66,17 @@ fn validate_executable_primary(
             agent.profile.id,
             details_suffix,
         );
+    }
+    for tool in &agent.profile.tools.plugins {
+        let plugin = tool.split_once('.').map_or(tool.as_str(), |(id, _)| id);
+        if registries.plugins.get(plugin).is_none() {
+            anyhow::bail!("primary agent references unavailable plugin tools: {tool}");
+        }
+    }
+    for app in &agent.profile.tools.apps {
+        if registries.plugins.get(app).is_none() {
+            anyhow::bail!("primary agent references unavailable app tools: {app}");
+        }
     }
     crate::harness::native::primary_turn_config(agent.clone(), String::new())?;
     Ok(())
@@ -163,7 +175,7 @@ impl ControlPlane {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
         let primary_agent = self.registry.resolved_snapshot(primary_agent_id).await?;
-        validate_executable_primary(&primary_agent)?;
+        validate_executable_primary(&self.registries, &primary_agent)?;
         let identity = crate::domain::AgentIdentitySnapshot {
             id: primary_agent.profile.id.clone(),
             name: primary_agent.profile.name.clone(),
@@ -332,7 +344,7 @@ impl ControlPlane {
             }
         };
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&primary_agent)?;
+        validate_executable_primary(&self.registries, &primary_agent)?;
         let resolved_mentions = if mentions.is_empty() {
             None
         } else {
@@ -380,7 +392,7 @@ impl ControlPlane {
             }
         };
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&primary_agent)?;
+        validate_executable_primary(&self.registries, &primary_agent)?;
         let run = self
             .delegation
             .begin_primary(session_pk, primary_agent.clone(), &prompt.display)
@@ -1048,7 +1060,7 @@ impl ControlPlane {
             }
         };
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&primary_agent)?;
+        validate_executable_primary(&self.registries, &primary_agent)?;
         if session.agent_session_id.is_none() {
             self.store
                 .update_status(session_pk, SessionStatus::Idle, None)
@@ -1240,20 +1252,7 @@ impl ControlPlane {
         let session_row = self.store.get_session(session_pk).await.ok().flatten();
         let primary_agent = primary_turn.agent;
         let run_id = primary_turn.run_id;
-        let runtime = if isolated_target {
-            None
-        } else {
-            self.store.get_session_runtime_settings(session_pk).await?
-        };
-        let (model, effort) = (
-            runtime
-                .as_ref()
-                .and_then(|settings| settings.model.clone())
-                .or_else(|| agent_model_parts(&primary_agent.profile.model).0),
-            runtime
-                .and_then(|settings| settings.effort)
-                .or_else(|| agent_model_parts(&primary_agent.profile.model).1),
-        );
+        let (model, effort) = agent_model_parts(&primary_agent.profile.model);
         let perm_mode = primary_agent.profile.permissions.mode;
         let kind = kind_override.unwrap_or_else(|| {
             session_row

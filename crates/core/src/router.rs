@@ -939,6 +939,29 @@ mod tests {
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(db_guard.path()).await.unwrap());
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let mut regs = crate::plugins::Registries::new();
         regs.harness = harness;
         let cp = {

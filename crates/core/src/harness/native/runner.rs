@@ -1532,7 +1532,7 @@ impl RunnerMainAgentSpawner {
                 &snapshot.profile.id,
                 child_deps.project_id.as_deref(),
             )?));
-            child_deps.app_control = None;
+            child_deps.app_control = self.deps.app_control.clone();
             child_deps.perm_overrides = Arc::new(std::sync::Mutex::new(Default::default()));
             child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
             child_deps.model = primary_turn.model;
@@ -1711,7 +1711,7 @@ impl RunnerSpawner {
         &self,
         index: usize,
         spec: SubtaskSpec,
-        cancel: CancellationToken,
+        _cancel: CancellationToken,
     ) -> SubtaskResult {
         let result = |status, report| SubtaskResult {
             index,
@@ -1734,7 +1734,8 @@ impl RunnerSpawner {
             Ok(child) => child,
             Err(error) => return result(SubtaskStatus::Error, error.to_string()),
         };
-        self.run_queued_child(index, spec, cancel, child_run).await
+        self.run_queued_child(index, spec, child_run.cancel.clone(), child_run)
+            .await
     }
 
     /// Execute a child after its durable run has been admitted. The same path
@@ -1743,7 +1744,7 @@ impl RunnerSpawner {
         &self,
         index: usize,
         spec: SubtaskSpec,
-        cancel: CancellationToken,
+        _cancel: CancellationToken,
         child_run: RunHandle,
     ) -> SubtaskResult {
         let run_id = child_run.run.run_id.clone();
@@ -1756,7 +1757,12 @@ impl RunnerSpawner {
         if let Err(error) = self.deps.delegation.mark_running(&run_id).await {
             return result(SubtaskStatus::Error, error.to_string());
         }
-        let execution = async { self.run_subagent_loop(index, &spec, cancel, &run_id).await }.await;
+        let child_cancel = child_run.cancel.clone();
+        let execution = async {
+            self.run_subagent_loop(index, &spec, child_cancel, &run_id)
+                .await
+        }
+        .await;
         match execution {
             SubtaskResult {
                 status: SubtaskStatus::Completed,
@@ -1990,9 +1996,10 @@ impl SubagentSpawner for RunnerSpawner {
         };
         let id = child_run.run.run_id.clone();
         let deps = self.deps.clone();
+        let child_cancel = child_run.cancel.clone();
         let this_spawner = RunnerSpawner {
             deps: deps.clone(),
-            cancel: reservation.token(),
+            cancel: child_cancel.clone(),
             depth: 0,
             parent_run_id: child_run.run.run_id.clone(),
         };
@@ -2007,15 +2014,15 @@ impl SubagentSpawner for RunnerSpawner {
             // slot taken; its Drop (on completion, panic, or cancellation)
             // frees the slot and deregisters the cancel token.
             let _reservation = reservation;
-            let cancel = _reservation.token();
+            let reservation_cancel = _reservation.token();
             let child = this_spawner
-                .run_queued_child(0, spec, cancel.clone(), child_run)
+                .run_queued_child(0, spec, child_cancel.clone(), child_run)
                 .await;
             // A cancelled worker (its parent ended, or was interrupted via
             // `interrupt_for_session`) must not write a stale completion to
             // the rail — the session that would receive it may already be
             // gone, or a fresh one may have taken its session_pk.
-            if cancel.is_cancelled() {
+            if reservation_cancel.is_cancelled() || child_cancel.is_cancelled() {
                 let _ = deps
                     .delegation
                     .interrupt(&deleg_id, "background subagent interrupted")
@@ -2073,7 +2080,18 @@ async fn run_tool_call(
         finish_tool_row(deps, &t.id, &msg, true).await;
         return tool_result(&t.id, &msg, true);
     }
-    insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
+    if insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await {
+        if let Err(error) = deps
+            .store
+            .increment_agent_run_tool_count(&deps.run_id)
+            .await
+        {
+            tracing::warn!(
+                "native: increment_agent_run_tool_count({}) failed: {error}",
+                deps.run_id
+            );
+        }
+    }
 
     // Plugin hooks: a `tool.before` hook (script or extension) may deny the
     // call — see `hooks::fire_hook`'s combine contract.
@@ -2224,7 +2242,7 @@ async fn insert_tool_row(
     input: &Value,
     kind: &str,
     subagent: Option<&str>,
-) {
+) -> bool {
     let mut payload = json!({ "name": t.name, "input": input });
     if let Some(label) = subagent {
         payload["subagent"] = json!(label);
@@ -2238,7 +2256,7 @@ async fn insert_tool_row(
         Some("in_progress".to_string()),
         Some(kind.to_string()),
     )
-    .await;
+    .await
 }
 
 /// Patch the tool_call row with its output + terminal status, then re-emit the
@@ -2332,7 +2350,7 @@ async fn emit_row(
     tool_call_id: Option<String>,
     status: Option<String>,
     tool_kind: Option<String>,
-) {
+) -> bool {
     let msg = NewMessage {
         session_pk: deps.session_pk.clone(),
         role: role.to_string(),
@@ -2356,8 +2374,12 @@ async fn emit_row(
                 tool_kind,
                 speaker: None,
             });
+            true
         }
-        Err(e) => tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}"),
+        Err(e) => {
+            tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}");
+            false
+        }
     }
 }
 
@@ -2812,6 +2834,47 @@ mod tests {
 
     struct StaticMcpCaller;
 
+    struct BlockingTool {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn description(&self) -> &str {
+            "Blocks until the test releases it."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("blocking", "block test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::ok("released"))
+        }
+    }
+
     #[async_trait]
     impl crate::harness::native::mcp_client::McpCaller for StaticMcpCaller {
         async fn call(
@@ -2975,55 +3038,100 @@ mod tests {
             registry.clone(),
             events.clone(),
         );
-        (
-            RunnerDeps {
-                session_pk: "s1".into(),
-                primary_agent,
-                run_id: "r1".into(),
-                delegation,
-                isolated_target: false,
-                main_agent_id: "ryuzi".into(),
-                learning_queue,
-                agent_knowledge,
-                kind: SessionKind::Chat,
-                work_dir: dir.to_path_buf(),
-                attachments_dir: None,
-                extra_skill_dirs: vec![],
-                extension_events: None,
-                // bypassPermissions so the scripted bash tool runs without a prompt.
-                model: Some("test/model".into()),
-                turn_effort_policy: Arc::new(TurnEffortPolicy {
-                    requested_model: "test/model".into(),
-                    project_override: None,
-                    route_compatibility: Default::default(),
-                    configured: Default::default(),
-                    surfaces: Default::default(),
+        let mut deps = RunnerDeps {
+            session_pk: "s1".into(),
+            primary_agent,
+            run_id: "r1".into(),
+            delegation,
+            isolated_target: false,
+            main_agent_id: "ryuzi".into(),
+            learning_queue,
+            agent_knowledge,
+            kind: SessionKind::Chat,
+            work_dir: dir.to_path_buf(),
+            attachments_dir: None,
+            extra_skill_dirs: vec![],
+            extension_events: None,
+            // bypassPermissions so the scripted bash tool runs without a prompt.
+            model: Some("test/model".into()),
+            turn_effort_policy: Arc::new(TurnEffortPolicy {
+                requested_model: "test/model".into(),
+                project_override: None,
+                route_compatibility: Default::default(),
+                configured: Default::default(),
+                surfaces: Default::default(),
+            }),
+            meta: crate::llm_router::model_meta::FALLBACK,
+            perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
+            project_id: None,
+            perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
+            store,
+            events,
+            approvals: Arc::new(ApprovalHub::new()),
+            llm,
+            tools: Arc::new(ToolRegistry::builtin()),
+            agent,
+            agents,
+            commands: Arc::new(CommandRegistry::builtin()),
+            allowed_skills: None,
+            memory: None,
+            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            steer: SteerBuffer::new(),
+            background: super::super::background::BackgroundRegistry::new(),
+            app_control: None,
+            nudge: Arc::new(NudgeState::default()),
+            review_tool_defs: None,
+            write_origin: crate::domain::WriteOrigin::User,
+            delegation_catalog: Vec::new(),
+        };
+        seed_owned_session_with_root(&mut deps, "test root").await;
+        (deps, registry)
+    }
+
+    async fn seed_owned_session_with_root(deps: &mut RunnerDeps, task: &str) {
+        use crate::domain::{AgentIdentitySnapshot, Session, SessionStatus};
+
+        deps.store
+            .insert_session(Session {
+                session_pk: deps.session_pk.clone(),
+                primary_agent_id: Some(deps.primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(AgentIdentitySnapshot {
+                    id: deps.primary_agent.profile.id.clone(),
+                    name: deps.primary_agent.profile.name.clone(),
+                    avatar_color: deps.primary_agent.profile.avatar.color.clone(),
                 }),
-                meta: crate::llm_router::model_meta::FALLBACK,
-                perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
                 project_id: None,
-                perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
-                store,
-                events,
-                approvals: Arc::new(ApprovalHub::new()),
-                llm,
-                tools: Arc::new(ToolRegistry::builtin()),
-                agent,
-                agents,
-                commands: Arc::new(CommandRegistry::builtin()),
-                allowed_skills: None,
-                memory: None,
-                snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                steer: SteerBuffer::new(),
-                background: super::super::background::BackgroundRegistry::new(),
-                app_control: None,
-                nudge: Arc::new(NudgeState::default()),
-                review_tool_defs: None,
-                write_origin: crate::domain::WriteOrigin::User,
-                delegation_catalog: Vec::new(),
-            },
-            registry,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("test root".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::BypassPermissions,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), task)
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id;
+        deps.agent = crate::harness::native::primary_turn_config_with_tools(
+            deps.primary_agent.clone(),
+            deps.run_id.clone(),
+            &deps.tools.names(),
         )
+        .unwrap()
+        .agent_tools;
     }
 
     /// Feature C1a: a real tool call (the bash tool, actually executed —
@@ -3306,7 +3414,7 @@ mod tests {
     /// queue row for the main agent, carrying a cache-parity payload.
     #[tokio::test]
     async fn finalizer_enqueues_a_learning_row_every_nudge_interval() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+        use crate::domain::PermMode;
 
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("one"), final_turn("two")]));
@@ -3319,35 +3427,6 @@ mod tests {
             )
             .await
             .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                // Pre-titled: an untitled session would make `run_turn`'s
-                // trailing `maybe_generate_title` call consume a THIRD
-                // scripted LLM turn (this test scripts exactly two, one per
-                // `run_turn` call).
-                title: Some("titled".into()),
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-
         run_turn(
             &deps,
             TurnPrompt::text("one", "one"),
@@ -3407,7 +3486,7 @@ mod tests {
     /// a non-`Full` `DisplayMode` too, so the same mechanism will exclude it.)
     #[tokio::test]
     async fn subagent_end_turn_never_nudges_even_past_threshold() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+        use crate::domain::PermMode;
 
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("subagent reply")]));
@@ -3420,31 +3499,6 @@ mod tests {
             )
             .await
             .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-
         let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
         let mut cm = ContextManager::load(deps.store.clone(), "subagent", cfg)
             .await
@@ -3775,7 +3829,7 @@ mod tests {
     /// per-turn snapshot has rows to read while title generation stays off
     /// (an untitled session row would consume an extra scripted LLM turn).
     async fn seed_pinned_project(store: &Store, model: Option<&str>) {
-        use crate::domain::{Project, Session, SessionKind, SessionStatus};
+        use crate::domain::Project;
         store
             .insert_project(Project {
                 project_id: "p".into(),
@@ -3790,30 +3844,8 @@ mod tests {
             })
             .await
             .unwrap();
-        store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: Some("p".into()),
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: Some("titled".into()),
-                status: SessionStatus::Running,
-                perm_mode: PermMode::BypassPermissions,
-                started_by: None,
-                created_at: Some(0),
-                last_active: Some(0),
-                resume_attempts: 0,
-                branch_owned: true,
-                kind: SessionKind::Project,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
+        store.set_session_project("s1", "p").await.unwrap();
+        store.set_session_title("s1", "titled").await.unwrap();
     }
 
     async fn add_anthropic_conn_with_efforts(store: &Store, models: &[&str]) {
@@ -5371,45 +5403,10 @@ mod tests {
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![main, title]));
         let deps = deps_at(dir.path(), llm).await;
-        // A session row must exist (and be untitled) for title generation.
-        deps.store
-            .insert_project(Project {
-                project_id: "p".into(),
-                name: "p".into(),
-                workdir: dir.path().to_string_lossy().into(),
-                source: None,
-                model: None,
-                effort: None,
-                perm_mode: PermMode::Default,
-                created_at: Some(0),
-                is_git: false,
-            })
-            .await
-            .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: Some("p".into()),
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Running,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: Some(0),
-                last_active: Some(0),
-                resume_attempts: 0,
-                branch_owned: true,
-                kind: SessionKind::Project,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
+        // Override the default fixture title so this test still exercises
+        // title generation without replacing its durable session/root run.
+        deps.store.clear_session_title("s1").await.unwrap();
+        deps.store.set_session_project("s1", "p").await.unwrap();
 
         run_turn(
             &deps,
@@ -5863,10 +5860,13 @@ mod tests {
         }
     }
 
-    /// Insert an IDLE session row for `session_pk` — the rail's
-    /// `claim_deliverable_background_event` only claims rows whose target
-    /// session is idle (spec §6.1's idle-only invariant).
+    /// Ensure `session_pk` has a durable session row for tests that exercise
+    /// background delivery. `deps_with_store_and_registry` already creates the
+    /// matching owned root run used by run-scoped transcript emission.
     async fn seed_idle_session(store: &Store, session_pk: &str) {
+        if store.get_session(session_pk).await.unwrap().is_some() {
+            return;
+        }
         use crate::domain::{Session, SessionKind, SessionStatus};
         store
             .insert_session(Session {
@@ -6038,26 +6038,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(RecordingLlm::new(vec![
             vec![
-                tool_use_start(0, "plan-mode-call", "bash"),
-                input_json_delta(0, r#"{"command":"target-only check"}"#),
+                tool_use_start(0, "target-app-call", "app_projects"),
+                input_json_delta(0, r#"{"action":"list"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "target-mcp-call", "mcp__slack__send"),
+                input_json_delta(0, r#"{}"#),
                 message_delta("tool_use"),
                 message_stop(),
             ],
             vec![
                 tool_use_start(0, "profile-rule-call", "read"),
                 input_json_delta(0, r#"{"path":"ignored-by-profile-rule"}"#),
-                message_delta("tool_use"),
-                message_stop(),
-            ],
-            vec![
-                tool_use_start(0, "task-call", "task"),
-                input_json_delta(0, r#"{"prompt":"inspect","subagent_type":"explore"}"#),
-                message_delta("tool_use"),
-                message_stop(),
-            ],
-            vec![
-                tool_use_start(0, "delegate-agent-call", "delegate_agent"),
-                input_json_delta(0, r#"{"agent_id":"missing","task":"inspect"}"#),
                 message_delta("tool_use"),
                 message_stop(),
             ],
@@ -6112,7 +6106,7 @@ mod tests {
                     effort: Some("high".into()),
                 },
                 permissions: AgentPermissions {
-                    mode: PermMode::Plan,
+                    mode: PermMode::BypassPermissions,
                     rules: vec![PermissionRule {
                         id: "target-rule".into(),
                         tool: "read".into(),
@@ -6122,12 +6116,12 @@ mod tests {
                 },
                 skills: vec!["target-skill".into()],
                 tools: AgentTools {
-                    native: vec!["read".into(), "bash".into()],
+                    native: vec!["read".into(), "bash".into(), "app_projects".into()],
                     plugins: vec!["github.search".into(), "lint.check".into()],
                     apps: vec!["slack".into()],
                 },
                 loop_settings: AgentLoop {
-                    max_turns: 5,
+                    max_turns: 4,
                     max_tool_rounds: 1,
                 },
             })
@@ -6152,6 +6146,9 @@ mod tests {
                 None,
             )),
         ]));
+        deps.app_control = Some(Arc::new(
+            crate::harness::native::tools::testutil::FakeAppControl::default(),
+        ));
         deps.attachments_dir = Some(dir.path().join("parent-attachments"));
         deps.memory = Some(Arc::new(
             crate::harness::native::memory::MemoryStore::for_agent(
@@ -6216,8 +6213,16 @@ mod tests {
             child.resolved_model.as_deref(),
             Some("anthropic/target-model")
         );
+        assert_eq!(
+            child.tool_count, 3,
+            "every target-owned known and allowed tool call is counted, including a permission denial"
+        );
         let bodies = llm.bodies.lock().unwrap().clone();
-        assert_eq!(bodies.len(), 5, "target loop receives every scripted turn");
+        assert_eq!(
+            bodies.len(),
+            4,
+            "the target loop executes its configured turns"
+        );
         let body = &bodies[0];
         assert_eq!(body["model"], "anthropic/target-model");
         assert_eq!(
@@ -6229,17 +6234,22 @@ mod tests {
             Some("high")
         );
         let tool_rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
-        let plan_mode_call = tool_rows
+        let target_app_call = tool_rows
             .iter()
-            .find(|row| row.tool_call_id.as_deref() == Some("plan-mode-call"))
-            .expect("plan-mode bash call is recorded");
-        assert_eq!(plan_mode_call.status.as_deref(), Some("failed"));
+            .find(|row| row.tool_call_id.as_deref() == Some("target-app-call"))
+            .expect("target app facade call is recorded");
+        assert_eq!(target_app_call.status.as_deref(), Some("completed"));
         assert!(
-            plan_mode_call.payload["output"]
+            target_app_call.payload["output"]
                 .as_str()
-                .is_some_and(|output| output.contains("Plan mode is read-only")),
-            "target plan mode, not the parent's bypass mode, denies bash"
+                .is_some_and(|output| output.contains("Ryuzi [p1]")),
+            "the target's app facade is present and executable"
         );
+        let target_mcp_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("target-mcp-call"))
+            .expect("target app MCP call is recorded");
+        assert_eq!(target_mcp_call.status.as_deref(), Some("completed"));
         let profile_rule_call = tool_rows
             .iter()
             .find(|row| row.tool_call_id.as_deref() == Some("profile-rule-call"))
@@ -6249,29 +6259,12 @@ mod tests {
             profile_rule_call.payload["output"], "Denied by user",
             "the target profile's deny rule applies even to a plan-safe read"
         );
-        let task_call = tool_rows
-            .iter()
-            .find(|row| row.tool_call_id.as_deref() == Some("task-call"))
-            .expect("task tool call is recorded");
-        assert_eq!(task_call.status.as_deref(), Some("failed"));
         assert!(
-            task_call.payload["output"]
-                .as_str()
-                .is_some_and(|output| output.contains("Plan mode is read-only")),
-            "an advertised delegated child task tool must reach the normal permission/dispatch path: {}",
-            task_call.payload
-        );
-        let delegate_call = tool_rows
-            .iter()
-            .find(|row| row.tool_call_id.as_deref() == Some("delegate-agent-call"))
-            .expect("delegation tool call is recorded");
-        assert_eq!(delegate_call.status.as_deref(), Some("failed"));
-        assert!(
-            delegate_call.payload["output"]
-                .as_str()
-                .is_some_and(|output| output.contains("Plan mode is read-only")),
-            "an advertised delegated child tool must reach the normal permission/dispatch path: {}",
-            delegate_call.payload
+            tool_rows.iter().all(|row| !matches!(
+                row.tool_call_id.as_deref(),
+                Some("plan-mode-call" | "task-call" | "delegate-agent-call")
+            )),
+            "parent-only bash and delegation calls must not leak into the target loop"
         );
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0]["text"], "inspect the target profile");
@@ -6291,9 +6284,9 @@ mod tests {
         assert!(advertised.contains(&"delegate_agent"));
         assert!(advertised.contains(&"mcp__github__search"));
         assert!(advertised.contains(&"mcp__slack__send"));
+        assert!(advertised.contains(&"app_projects"));
         assert!(!advertised.contains(&"write"));
         assert!(!advertised.contains(&"ext__lint__check"));
-        assert!(!advertised.contains(&"app_projects"));
         assert_eq!(
             parent_attachments,
             Some(dir.path().join("parent-attachments"))
@@ -6303,6 +6296,228 @@ mod tests {
             parent_memory
         );
         assert_ne!(target_memory.knowledge_root(), parent_memory.as_path());
+    }
+
+    #[tokio::test]
+    async fn tool_counts_include_main_subagent_and_retry_but_not_denied_or_unknown_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_allowed = vec![
+            tool_use_start(0, "main-allowed", "bash"),
+            input_json_delta(0, r#"{"command":"echo main"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let main_denied = vec![
+            tool_use_start(0, "main-denied", "write"),
+            input_json_delta(0, r#"{"path":"denied.txt","content":"no"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let main_unknown = vec![
+            tool_use_start(0, "main-unknown", "unknown"),
+            input_json_delta(0, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let child_allowed = vec![
+            tool_use_start(0, "child-allowed", "bash"),
+            input_json_delta(0, r#"{"command":"echo child"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let retry_allowed = vec![
+            tool_use_start(0, "retry-allowed", "bash"),
+            input_json_delta(0, r#"{"command":"echo retry"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            main_allowed,
+            main_denied,
+            main_unknown,
+            final_turn("main done"),
+            child_allowed,
+            final_turn("child done"),
+            retry_allowed,
+            final_turn("retry done"),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        let mut restricted = deps.agent.clone();
+        restricted.tools = crate::harness::native::agents::ToolFilter::Only(vec!["bash".into()]);
+        let budget = IterationBudget::new(4);
+        let mut cm = ContextManager::ephemeral(
+            &deps.session_pk,
+            ContextConfig::with_meta(deps.meta.clone()),
+        );
+        cm.append_user(json!([{ "type": "text", "text": "count tools" }]))
+            .await
+            .unwrap();
+        drive(
+            &deps,
+            &restricted,
+            &mut cm,
+            &CancellationToken::new(),
+            None,
+            DisplayMode::Full,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            1,
+            "the primary run counts only its allowed known call"
+        );
+
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+        let child = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "run the child tool".into(),
+            }])
+            .await;
+        assert_eq!(child[0].status, SubtaskStatus::Completed);
+        let first_child = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(first_child.tool_count, 1);
+
+        let retry = deps
+            .delegation
+            .retry_child(&deps.session_pk, &first_child.run_id)
+            .await
+            .unwrap();
+        let retry_handle = crate::delegation::RunHandle {
+            run: retry.clone(),
+            agent_snapshot: None,
+            cancel: CancellationToken::new(),
+        };
+        let retry_spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+        let retry_result = retry_spawner
+            .run_queued_child(
+                0,
+                SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "retry the child tool".into(),
+                },
+                retry_handle.cancel.clone(),
+                retry_handle,
+            )
+            .await;
+        assert_eq!(retry_result.status, SubtaskStatus::Completed);
+        assert_eq!(
+            deps.store
+                .get_agent_run(&retry.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            1,
+            "the retry owns a new single allowed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_subagent_stops_follow_on_tools_and_preserves_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocking_turn = vec![
+            tool_use_start(0, "blocking-call", "blocking"),
+            input_json_delta(0, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let next_tool_turn = vec![
+            tool_use_start(0, "must-not-run", "bash"),
+            input_json_delta(0, r#"{"command":"echo side-effect"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![blocking_turn, next_tool_turn]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(BlockingTool {
+            started: started.clone(),
+            release: release.clone(),
+            effects: effects.clone(),
+        })]));
+        let root = deps.run_id.clone();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: root,
+        };
+        let worker = tokio::spawn(async move {
+            spawner
+                .run_many(vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "block until cancelled".into(),
+                }])
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("the child entered its blocking tool");
+        let child = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .expect("the child is durably queued before it runs");
+        assert_eq!(child.status, crate::domain::AgentRunStatus::Running);
+        deps.delegation
+            .cancel_child(&deps.session_pk, &child.run_id)
+            .await
+            .unwrap();
+        release.notify_one();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("cancelling a child must settle its worker")
+            .unwrap();
+
+        assert_eq!(results[0].status, SubtaskStatus::Interrupted);
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            deps.store
+                .get_agent_run(&child.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::domain::AgentRunStatus::Cancelled,
+            "the worker must not overwrite the runtime cancellation"
+        );
+        assert!(
+            deps.store
+                .list_messages(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.tool_call_id.as_deref() != Some("must-not-run")),
+            "the cancellation token stops the loop before a subsequent tool side effect"
+        );
     }
 
     #[tokio::test]
@@ -6316,14 +6531,8 @@ mod tests {
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![child_turn, final_turn("child done")]));
         let mut deps = deps_at(dir.path(), llm).await;
-        seed_idle_session(&deps.store, &deps.session_pk).await;
-        let root = deps
-            .delegation
-            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "root")
-            .await
-            .unwrap();
-        deps.run_id = root.run.run_id.clone();
-
+        // `deps_at` already owns a root run for run-scoped transcript rows.
+        let root = deps.run_id.clone();
         let spawner = RunnerSpawner {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
@@ -6340,11 +6549,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, SubtaskStatus::Completed);
         assert_eq!(results[0].report, "child done");
-        let children = deps
-            .store
-            .list_descendant_agent_runs(&root.run.run_id)
-            .await
-            .unwrap();
+        let children = deps.store.list_descendant_agent_runs(&root).await.unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].status, crate::domain::AgentRunStatus::Completed);
         assert_eq!(children[0].tool_count, 1);

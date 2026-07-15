@@ -3976,7 +3976,7 @@ async fn provision_project_git_url_flow_derives_name_and_records_source() {
     std::fs::create_dir_all(&upstream_dir).unwrap();
     init_repo(&upstream_dir);
 
-    let git_url = format!("{}/.git", upstream_dir.display()).replace('\\', "/");
+    let git_url = format!("{}/.git", upstream_dir.display());
     let mut req = provision_req("fake", "ws1", "u1");
     req.git_url = Some(git_url.clone());
     // A trailing "/.git" strips to the parent dir name ("upstream-repo") via basename.

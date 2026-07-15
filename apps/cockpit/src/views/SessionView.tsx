@@ -348,7 +348,7 @@ export function SessionView() {
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold tracking-[-0.01em]">{session.title || "Untitled session"}</div>
               <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
-                <span>{sessionPrimaryLabel(session.primaryAgentSnapshot)}</span>
+                <span>{sessionPrimaryLabel(session.primaryAgentSnapshot, registry?.agents)}</span>
                 {session.branch && (
                   <span className="inline-flex items-center gap-1">
                     <GitBranch aria-hidden size={11} strokeWidth={2} />
@@ -368,7 +368,7 @@ export function SessionView() {
                 runnerId={runnerId}
                 sessionPk={session.sessionPk}
                 rows={rows}
-                agentName={sessionPrimaryLabel(session.primaryAgentSnapshot)}
+                agentName={sessionPrimaryLabel(session.primaryAgentSnapshot, registry?.agents)}
                 agentColor={session.primaryAgentSnapshot?.avatarColor ?? "#71717A"}
                 running={running}
               >

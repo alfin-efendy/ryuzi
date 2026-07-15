@@ -299,6 +299,11 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         Arc::clone(&store),
     )
     .await?;
+    // Default durable profiles target the `smart` and `fast` routes. Create
+    // those routes only after persistence has materialized the profiles and
+    // after connections are available; a fresh daemon with none remains
+    // intentionally unconfigured.
+    crate::agents::bootstrap::ensure_default_routes(&store).await?;
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
     // the atomicity/idempotency/degraded-state contract.
@@ -676,6 +681,19 @@ mod tests {
     async fn test_agent_persistence(
         store: Arc<Store>,
     ) -> crate::agents::bootstrap::AgentPersistence {
+        let config = tempfile::tempdir().unwrap();
+        let persistence = test_agent_persistence_at(store, config.path().to_path_buf()).await;
+        std::mem::forget(config);
+        persistence
+    }
+
+    async fn test_agent_persistence_at(
+        store: Arc<Store>,
+        config_root: PathBuf,
+    ) -> crate::agents::bootstrap::AgentPersistence {
+        crate::agents::bootstrap::initialize_agent_persistence(config_root.clone(), store.clone())
+            .await
+            .unwrap();
         crate::llm_router::connections::add_connection(
             &store,
             crate::llm_router::connections::ConnectionRow {
@@ -699,15 +717,9 @@ mod tests {
         crate::agents::bootstrap::ensure_default_routes(&store)
             .await
             .unwrap();
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            store,
-        )
-        .await
-        .unwrap();
-        std::mem::forget(config);
-        persistence
+        crate::agents::bootstrap::initialize_agent_persistence(config_root, store)
+            .await
+            .unwrap()
     }
 
     fn capturing_console_telemetry() -> (Arc<Mutex<Vec<String>>>, Arc<dyn Telemetry>) {
@@ -772,8 +784,12 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: session_pk.to_string(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
+                primary_agent_id: Some("ryuzi".into()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: "ryuzi".into(),
+                    name: "Ryuzi".into(),
+                    avatar_color: "blue".into(),
+                }),
                 project_id: Some(project_id.to_string()),
                 agent_session_id: None,
                 worktree_path: None,
@@ -2125,6 +2141,12 @@ mod tests {
     async fn build_daemon_real_fanout_lets_a_blocked_turn_complete_end_to_end() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
+        let config_root = tempfile::tempdir().unwrap();
+        test_agent_persistence_at(
+            Arc::new(Store::open(&db_path).await.unwrap()),
+            config_root.path().to_path_buf(),
+        )
+        .await;
         {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
@@ -2139,7 +2161,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            config_root: tempfile::tempdir().unwrap().keep(),
+            config_root: config_root.path().to_path_buf(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -2204,10 +2226,16 @@ mod tests {
     async fn daemon_stop_aborts_fanout_so_a_later_approval_is_never_resolved() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
+        let config_root = tempfile::tempdir().unwrap();
+        test_agent_persistence_at(
+            Arc::new(Store::open(&db_path).await.unwrap()),
+            config_root.path().to_path_buf(),
+        )
+        .await;
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            config_root: tempfile::tempdir().unwrap().keep(),
+            config_root: config_root.path().to_path_buf(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
