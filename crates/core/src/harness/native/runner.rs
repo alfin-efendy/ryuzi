@@ -1759,6 +1759,9 @@ async fn run_tool_call(
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
 ) -> Value {
+    if t.name == LOAD_TOOLS_NAME {
+        return handle_load_tools(deps, agent, t, display).await;
+    }
     let input = t.parsed_input();
     let Some(tool) = deps.tools.get(&t.name) else {
         let msg = format!("unknown tool `{}`", t.name);
@@ -1909,6 +1912,85 @@ async fn run_tool_call(
     )
     .await;
     tool_use_result
+}
+
+/// Handle the synthetic `load_tools` meta-call: activate the requested deferred
+/// tools into `deps.activated_tools` so they are advertised from the next
+/// provider turn. Validated against the tools this agent may actually load
+/// (registry tools that are allowed, not hot, and not gated out). Skips the
+/// permission gate and worktree snapshot — it mutates advertisement state only.
+async fn handle_load_tools(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    t: &ToolAccum,
+    display: &DisplayMode,
+) -> Value {
+    let input = t.parsed_input();
+    insert_tool_row(deps, t, &input, "other", display.subagent()).await;
+
+    let Some(activated) = deps.activated_tools.as_ref() else {
+        let msg = "load_tools is not available in this session";
+        finish_tool_row(deps, &t.id, msg, true).await;
+        return tool_result(&t.id, msg, true);
+    };
+
+    let loadable: std::collections::BTreeSet<String> = deps
+        .tools
+        .names()
+        .into_iter()
+        .filter(|n| {
+            agent.tools.allows(n)
+                && !is_hot(n)
+                && (n != "orch_block" || deps.kind == SessionKind::Worker)
+        })
+        .collect();
+
+    let requested: Vec<String> = input
+        .get("names")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (mut loaded, mut unknown) = (Vec::new(), Vec::new());
+    for name in requested {
+        if loadable.contains(&name) {
+            loaded.push(name);
+        } else {
+            unknown.push(name);
+        }
+    }
+    if !loaded.is_empty() {
+        let mut set = activated.lock().await;
+        for n in &loaded {
+            set.insert(n.clone());
+        }
+    }
+
+    let is_error = loaded.is_empty();
+    let msg = if unknown.is_empty() {
+        format!(
+            "Loaded: {}. These tools are now available to call.",
+            loaded.join(", ")
+        )
+    } else if loaded.is_empty() {
+        format!(
+            "No tools loaded. Unknown or unavailable: {}. Loadable tools: {}.",
+            unknown.join(", "),
+            loadable.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    } else {
+        format!(
+            "Loaded: {}. Ignored (unknown/unavailable): {}.",
+            loaded.join(", "),
+            unknown.join(", ")
+        )
+    };
+    finish_tool_row(deps, &t.id, &msg, is_error).await;
+    tool_result(&t.id, &msg, is_error)
 }
 
 /// Insert the initial `tool_call` row (`{name, input}`, in_progress).
@@ -4853,6 +4935,125 @@ mod tests {
             .collect();
         assert!(enames.contains(&"webfetch".to_string()));
         assert!(!enames.contains(&LOAD_TOOLS_NAME.to_string()));
+    }
+
+    /// A Worker-kind primary session is eager (`activated_tools: None`), not
+    /// lazy — its own `orch_block` "block for human" primitive must never sit
+    /// behind a `load_tools` step. Mirrors `worker_defs` in
+    /// `visible_tool_defs_hides_orch_block_outside_worker_sessions` above, but
+    /// asserts the `None` (eager) path directly: `orch_block` advertised, no
+    /// synthetic `load_tools`.
+    #[test]
+    fn visible_tool_defs_worker_sessions_are_eager() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent();
+        let defs = visible_tool_defs(&tools, &agent, SessionKind::Worker, None);
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            names.contains(&"orch_block".to_string()),
+            "Worker sessions must see their own block-for-human primitive"
+        );
+        assert!(
+            !names.iter().any(|n| n == LOAD_TOOLS_NAME),
+            "Worker sessions are eager: no synthetic load_tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_tools_reveals_a_deferred_tool_on_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: the model calls load_tools(["webfetch"]).
+        let turn1 = vec![
+            message_start_with_usage(1_000, 0),
+            tool_use_start(0, "c1", "load_tools"),
+            input_json_delta(0, r#"{"names":["webfetch"]}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // Turn 2: the model finishes.
+        let turn2 = vec![
+            message_start_with_usage(1_000, 0),
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = std::sync::Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.activated_tools = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::BTreeSet::new(),
+        )));
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "two provider turns");
+        let names_of = |b: &serde_json::Value| -> Vec<String> {
+            b["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(String::from))
+                .collect()
+        };
+        let t1 = names_of(&bodies[0]);
+        let t2 = names_of(&bodies[1]);
+        // Turn 1: hot core + load_tools, webfetch deferred.
+        assert!(t1.contains(&"load_tools".to_string()));
+        assert!(t1.contains(&"read".to_string()));
+        assert!(
+            !t1.contains(&"webfetch".to_string()),
+            "webfetch deferred on turn 1"
+        );
+        // Turn 2: webfetch now advertised (loaded).
+        assert!(
+            t2.contains(&"webfetch".to_string()),
+            "webfetch loaded on turn 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_tools_rejects_unknown_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            message_start_with_usage(1_000, 0),
+            tool_use_start(0, "c1", "load_tools"),
+            input_json_delta(0, r#"{"names":["not_a_tool"]}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            message_start_with_usage(1_000, 0),
+            text_delta("ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = std::sync::Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        let set = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeSet::new()));
+        deps.activated_tools = Some(set.clone());
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Nothing was activated; turn 2 still has no bogus tool.
+        assert!(
+            set.lock().await.is_empty(),
+            "unknown name must not be activated"
+        );
+        let bodies = llm.bodies.lock().unwrap();
+        let t2: Vec<String> = bodies[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        assert!(!t2.contains(&"not_a_tool".to_string()));
     }
 
     #[test]

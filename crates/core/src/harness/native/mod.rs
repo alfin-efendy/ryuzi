@@ -313,10 +313,18 @@ impl Harness for NativeHarness {
                 review_tool_defs: None,
                 // Primary sessions advertise lazily (hot core + load_tools);
                 // sub-agents and the review fork strip this back to `None`
-                // (eager) via `deps_for_subagent` / their own builder.
-                activated_tools: Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                    std::collections::BTreeSet::new(),
-                ))),
+                // (eager) via `deps_for_subagent` / their own builder. Worker
+                // sessions are ALSO eager: a Worker's `orch_block` "block for
+                // human" primitive is its own essential primitive, and hiding
+                // it behind a `load_tools` step is fragile — so a Worker
+                // primary session gets `None` here, same as a sub-agent.
+                activated_tools: if matches!(ctx.kind, crate::domain::SessionKind::Worker) {
+                    None
+                } else {
+                    Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                        std::collections::BTreeSet::new(),
+                    )))
+                },
                 // Every agent tool call — even one an interactive human turn
                 // triggers — is the AGENT deciding to call a tool, not a
                 // direct human action, so a top-level Project/Chat session is
