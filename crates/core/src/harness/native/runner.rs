@@ -363,6 +363,7 @@ pub async fn run_turn(
                     .as_u64()
                     .unwrap_or(st.percent_left as u64) as u8,
                 cache_read_tokens: 0,
+                cache_creation_tokens: 0,
                 output_tokens: 0,
             });
             // Re-emit the accumulated session cost from what's already
@@ -725,6 +726,7 @@ async fn drive(
     display: DisplayMode,
     budget: &IterationBudget,
 ) -> anyhow::Result<String> {
+    let mut system_breakdown: Option<Vec<(&'static str, u64)>> = None;
     let system = match &agent.prompt {
         Some(p) => p.clone(),
         None => {
@@ -732,7 +734,17 @@ async fn drive(
                 Some(memory) => memory.snapshot().await?,
                 None => None,
             };
-            context::assemble_system(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref())
+            let t0 = std::time::Instant::now();
+            let sections =
+                context::build_sections(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref());
+            system_breakdown = Some(context::breakdown_of(&sections));
+            let text = context::join_sections(&sections);
+            tracing::debug!(
+                target: "ryuzi::context",
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "native: system prompt assembled"
+            );
+            text
         }
     };
     // Tools restricted to what this agent may use — UNLESS a review fork
@@ -749,6 +761,20 @@ async fn drive(
     let mut final_text = String::new();
 
     cm.set_baseline(&system, &tool_defs);
+    if let Some(mut bd) = system_breakdown.take() {
+        let tools_tokens: u64 = tool_defs
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0) as u64)
+            .sum::<u64>()
+            / 4;
+        bd.push(("tools", tools_tokens));
+        tracing::debug!(
+            target: "ryuzi::context",
+            breakdown = ?bd,
+            baseline_tokens = cm.status().active_tokens,
+            "native: context baseline breakdown"
+        );
+    }
     let settings_cap =
         crate::settings::usize_setting(&deps.store, "context.max_output_tokens", 1).await;
     // usize_setting floors at 1; treat 1 (the "unset" default) as no cap.
@@ -861,6 +887,8 @@ async fn drive(
                     observation: observation.clone(),
                 },
             };
+            let ttft_start = std::time::Instant::now();
+            let mut ttft_logged = false;
             let RoutedStream {
                 selection,
                 events: mut rx,
@@ -910,6 +938,14 @@ async fn drive(
                 let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
                     continue;
                 };
+                if !ttft_logged {
+                    ttft_logged = true;
+                    tracing::debug!(
+                        target: "ryuzi::context",
+                        ttft_ms = ttft_start.elapsed().as_millis() as u64,
+                        "native: first stream event received"
+                    );
+                }
                 match decoded {
                     MessageStreamEvent::TextDelta { text, .. } => {
                         turn.text.push_str(&text);
@@ -2078,6 +2114,7 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         usable_window: st.usable_window,
         percent_left: st.percent_left,
         cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
         output_tokens: cm.last_output(),
     });
 
@@ -2147,6 +2184,7 @@ async fn emit_context_display(deps: &RunnerDeps, cm: &ContextManager, emit: bool
         usable_window: st.usable_window,
         percent_left: st.percent_left,
         cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
         output_tokens: cm.last_output(),
     });
 
@@ -2633,8 +2671,8 @@ mod tests {
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {
                 requested_model: "test/model".into(),
-                project_override: None,
-                route_compatibility: Default::default(),
+                caller_override: None,
+                route_targets: Default::default(),
                 configured: Default::default(),
                 surfaces: Default::default(),
             }),
@@ -3912,13 +3950,13 @@ mod tests {
         {
             let policies = llm.policies.lock().unwrap();
             assert_eq!(policies[0].requested_model, "anthropic/model-a");
-            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(policies[0].caller_override.as_deref(), Some("high"));
             assert_eq!(
                 policies[0].configured.get(&key_a).map(String::as_str),
                 Some("low")
             );
             assert_eq!(policies[1].requested_model, "anthropic/model-b");
-            assert_eq!(policies[1].project_override, None);
+            assert_eq!(policies[1].caller_override, None);
             assert!(!policies[1].configured.contains_key(&key_a));
             assert_eq!(
                 policies[1].configured.get(&key_b).map(String::as_str),
@@ -4308,6 +4346,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_context_usage_reports_cache_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+        let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        cm.observe_message_start(&json!({
+            "usage": { "input_tokens": 30_000, "cache_creation_input_tokens": 12_000 }
+        }));
+        cm.commit_response();
+
+        let mut rx = deps.events.subscribe();
+        emit_context_usage(&deps, &cm, true).await;
+
+        let mut creation = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::ContextUsage {
+                cache_creation_tokens,
+                ..
+            } = ev
+            {
+                creation = Some(cache_creation_tokens);
+                break;
+            }
+        }
+        assert_eq!(
+            creation,
+            Some(12_000),
+            "cache_creation must be surfaced on the event"
+        );
+    }
+
+    #[tokio::test]
     async fn pre_turn_compaction_triggers_and_continues_the_turn() {
         let dir = tempfile::tempdir().unwrap();
         // ScriptedLlm turn 0 answers the summarize call; turn 1 is the real turn.
@@ -4481,7 +4554,7 @@ mod tests {
             let policies = llm.policies.lock().unwrap();
             assert_eq!(policies.len(), 1, "manual compact makes one utility call");
             assert_eq!(policies[0].requested_model, "anthropic/model-a");
-            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(policies[0].caller_override.as_deref(), Some("high"));
         }
         // A notice row records it in the transcript.
         let msgs = deps.store.list_messages("s1").await.unwrap();

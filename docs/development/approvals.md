@@ -21,10 +21,9 @@ interaction tools:
   answers become the tool result.
 
 Surfaces: Cockpit renders `ApprovalCard`s in the session view and the
-cross-session Inbox; the CLI prompts inline. Gateways (Discord, headless
-daemon) only fan out Tool-kind prompts as binary approve/deny; Plan/Question
-prompts in headless sessions expire after `approval_timeout_ms` and the tool
-reports that no interactive surface answered.
+cross-session Inbox, where approvals wait for an explicit response. Headless
+gateway binary Tool approvals wait for an explicit gateway answer. Non-tool
+Plan/Question prompts have no supported gateway UI.
 
 MCP tools are gated per-tool: the permission key is the tool's own full name
 (`mcp__server__tool`), so "don't ask again" rules never span multiple MCP

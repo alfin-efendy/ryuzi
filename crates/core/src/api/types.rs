@@ -61,6 +61,13 @@ pub struct ChatRequestOptions {
     pub perm_mode: Option<crate::domain::PermMode>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedMessageInfo {
+    pub id: String,
+    pub text: String,
+}
+
 pub(crate) fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
     let Some(context) = context else {
         return prompt.to_string();

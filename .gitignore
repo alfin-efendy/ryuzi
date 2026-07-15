@@ -54,6 +54,7 @@ npm/platform/*/ryuzi.exe
 !/.cargo/config.toml
 
 # Local agent/skill tooling artifacts (session-local, not part of the repo)
+.agent-reviews/
 .agents/
 .claude/
 /.sdd/

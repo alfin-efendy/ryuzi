@@ -156,6 +156,34 @@ test("structured model effort choices follow the selected execution surface", as
   await expect(page.getByText("Ultra", { exact: true })).toHaveCount(0);
 });
 
+test("route target effort journey saves an exact capability override", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Models", { exact: true }).first().click();
+  await page.getByRole("button", { name: "Route" }).click();
+  await page.getByRole("button", { name: "Edit" }).click();
+
+  const effort = page.getByRole("combobox", { name: "Target 1 effort" });
+  await effort.click();
+  await expect.poll(() => page.getByRole("option").allTextContents()).toEqual(["Model default", "Low", "High"]);
+  await page.getByRole("option", { name: "High" }).click();
+  await page.getByRole("button", { name: "Save route" }).click();
+
+  await expect.poll(async () => (await mockCalls(page)).some((call) => call.cmd === "save_model_route")).toBe(true);
+  const saves = await page.evaluate(() =>
+    (window as unknown as { __mockCalls: Array<{ cmd: string; args: { route?: unknown } }> }).__mockCalls.filter(
+      (call) => call.cmd === "save_model_route",
+    ),
+  );
+  expect(saves.at(-1)?.args).toMatchObject({
+    route: { id: "route-smart", name: "smart", targets: [{ provider: "fixture", model: "model-alpha", effort: "high" }] },
+  });
+  await page.reload();
+  await expect(page.getByText("Models", { exact: true }).first()).toBeVisible();
+  await page.getByText("Models", { exact: true }).first().click();
+  await page.getByRole("button", { name: "Route" }).click();
+  await expect(page.getByText("High override", { exact: true })).toBeVisible();
+});
+
 test("project effort override can return to the model default", async ({ page }) => {
   await page.goto("/");
   await selectDemoProject(page);

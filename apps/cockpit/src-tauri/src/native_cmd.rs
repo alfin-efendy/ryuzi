@@ -9,7 +9,7 @@ use tauri::State;
 
 pub use ryuzi_core::api::types::{
     AgentInfo, CommandInfo, ProjectCommandInfo, ProjectCommandInputDto, ProjectCommandMutationDto,
-    TodoItem,
+    QueuedMessageInfo, TodoItem,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -158,6 +158,64 @@ pub async fn delete_project_command(
                 "name": name,
                 "revision": revision,
             }),
+        )
+        .await
+}
+
+/// A session's durable queued messages.
+#[tauri::command]
+#[specta::specta]
+pub async fn session_queue(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<Vec<QueuedMessageInfo>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "session_queue",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+/// Queue a durable message for a session.
+#[tauri::command]
+#[specta::specta]
+pub async fn enqueue_session_message(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    prompt: String,
+    options: Option<ryuzi_core::api::types::ChatRequestOptions>,
+) -> R<QueuedMessageInfo> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "enqueue_session_message",
+            serde_json::json!({
+                "session_pk": session_pk,
+                "prompt": prompt,
+                "options": options,
+            }),
+        )
+        .await
+}
+
+/// Remove a durable queued message from a session.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_session_message(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+    id: String,
+) -> R<bool> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "remove_session_message",
+            serde_json::json!({ "session_pk": session_pk, "id": id }),
         )
         .await
 }

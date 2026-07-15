@@ -11,7 +11,15 @@ afterEach(cleanup);
 beforeEach(() => {
   useStore.setState({
     contextUsage: {
-      [KEY]: { activeTokens: 1000, usableWindow: 190000, percentLeft: 95, contextWindow: 200000, cacheReadTokens: 300, outputTokens: 512 },
+      [KEY]: {
+        activeTokens: 1000,
+        usableWindow: 190000,
+        percentLeft: 95,
+        contextWindow: 200000,
+        cacheReadTokens: 300,
+        cacheCreationTokens: 0,
+        outputTokens: 512,
+      },
     },
     sessionCost: {
       [KEY]: {
@@ -28,6 +36,13 @@ test("shows the ring percent and opens a popover with cost rows", () => {
   fireEvent.click(screen.getByRole("button", { name: /context/i }));
   expect(screen.getByText("claude-sonnet-4")).toBeTruthy();
   expect(screen.getByText("$0.12")).toBeTruthy();
+  expect(screen.getByText("In")).toBeTruthy();
+  expect(screen.getByText("Out")).toBeTruthy();
+  expect(screen.getByText("Cache")).toBeTruthy();
+  expect(screen.getByText("100")).toBeTruthy();
+  expect(screen.getByText("40")).toBeTruthy();
+  expect(screen.getByText("25")).toBeTruthy();
+  expect(screen.queryByText("100 in · 40 out · 25 cache")).toBeNull();
 });
 
 test("sub-cent total renders <$0.01", () => {

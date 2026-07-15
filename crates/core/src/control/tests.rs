@@ -1,7 +1,7 @@
 use super::*;
 use crate::domain::{
-    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionKind,
-    SessionStatus,
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, QueuedSessionPrompt,
+    SessionKind, SessionStatus,
 };
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;
@@ -199,6 +199,68 @@ impl HarnessFactory for FakeHarnessFactory {
             counters: self.counters.clone(),
         }))
     }
+}
+
+/// A controllable live session: every prompt is recorded, then waits for one
+/// permit. Queue-delivery tests release permits one turn at a time.
+struct ControlledSession {
+    prompts: Arc<Mutex<Vec<String>>>,
+    releases: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl HarnessSession for ControlledSession {
+    async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+        self.prompts.lock().unwrap().push(prompt.display);
+        self.releases.acquire().await.unwrap().forget();
+        Ok(())
+    }
+
+    async fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn end(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn agent_session_id(&self) -> Option<String> {
+        None
+    }
+}
+
+struct ErroringSession;
+
+#[async_trait]
+impl HarnessSession for ErroringSession {
+    async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("intentional turn error"))
+    }
+
+    async fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn end(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn agent_session_id(&self) -> Option<String> {
+        None
+    }
+}
+
+async fn wait_for_controlled_prompts(prompts: &Arc<Mutex<Vec<String>>>, expected: usize) {
+    for _ in 0..400 {
+        if prompts.lock().unwrap().len() >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "timed out waiting for {expected} controlled prompt(s); got {:?}",
+        prompts.lock().unwrap()
+    );
 }
 
 /// A harness whose `start_session` parks until `release` is notified —
@@ -1134,6 +1196,604 @@ async fn wait_for_session_ctx_principals(
 }
 
 #[tokio::test]
+async fn delivering_a_queued_prompt_cleans_its_owned_copy_but_not_external_file() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-delivery-cleanup";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let owned_dir = root.join("queue").join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    let owned = owned_dir.join("note.txt");
+    tokio::fs::write(&owned, b"owned").await.unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("external.txt");
+    tokio::fs::write(&external, b"external").await.unwrap();
+    let attachment = |name: &str, path: &std::path::Path| AttachmentRef {
+        name: name.into(),
+        url: crate::attachments::file_url_for_path(path)
+            .unwrap()
+            .to_string(),
+        content_type: None,
+        size: 0,
+    };
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![
+                attachment("owned", &owned),
+                attachment("external", &external),
+            ],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    cp.deliver_next_queued_session_prompt(session_pk)
+        .await
+        .unwrap();
+    assert!(!owned_dir.exists());
+    assert!(external.exists());
+}
+
+#[tokio::test]
+async fn removing_a_queued_prompt_cleans_its_owned_copy_but_not_external_file() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-remove-cleanup";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let owned_dir = root.join("queue").join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    let owned = owned_dir.join("note.txt");
+    tokio::fs::write(&owned, b"owned").await.unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("external.txt");
+    tokio::fs::write(&external, b"external").await.unwrap();
+    let attachment = |name: &str, path: &std::path::Path| AttachmentRef {
+        name: name.into(),
+        url: crate::attachments::file_url_for_path(path)
+            .unwrap()
+            .to_string(),
+        content_type: None,
+        size: 0,
+    };
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![
+                attachment("owned", &owned),
+                attachment("external", &external),
+            ],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    assert!(cp.remove_session_prompt(session_pk, "owned").await.unwrap());
+    assert!(!owned_dir.exists());
+    assert!(external.exists());
+}
+
+#[tokio::test]
+async fn removing_a_queued_prompt_does_not_clean_an_owned_dir_for_a_queue_root_url() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-remove-root-url";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let queue_dir = root.join("queue");
+    let owned_dir = queue_dir.join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    tokio::fs::write(owned_dir.join("note.txt"), b"owned")
+        .await
+        .unwrap();
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![AttachmentRef {
+                name: "queue".into(),
+                url: crate::attachments::file_url_for_path(&queue_dir)
+                    .unwrap()
+                    .to_string(),
+                content_type: None,
+                size: 0,
+            }],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    assert!(cp.remove_session_prompt(session_pk, "owned").await.unwrap());
+    assert!(
+        owned_dir.exists(),
+        "a queue-root URL does not own this prompt directory"
+    );
+}
+
+#[tokio::test]
+async fn end_session_purges_pending_and_claimed_prompts_and_cleans_owned_copies() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-end-cleanup";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("external.txt");
+    tokio::fs::write(&external, b"external").await.unwrap();
+    for id in ["claimed", "pending"] {
+        let owned_dir = root.join("queue").join(id);
+        tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+        let owned = owned_dir.join("note.txt");
+        tokio::fs::write(&owned, id).await.unwrap();
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: id.into(),
+                session_pk: session_pk.into(),
+                agent: id.into(),
+                display: id.into(),
+                attachments: vec![
+                    AttachmentRef {
+                        name: "owned".into(),
+                        url: crate::attachments::file_url_for_path(&owned)
+                            .unwrap()
+                            .to_string(),
+                        content_type: None,
+                        size: 0,
+                    },
+                    AttachmentRef {
+                        name: "external".into(),
+                        url: crate::attachments::file_url_for_path(&external)
+                            .unwrap()
+                            .to_string(),
+                        content_type: None,
+                        size: 0,
+                    },
+                ],
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .claim_next_session_prompt("queued-end-cleanup")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "claimed"
+    );
+
+    cp.end_session(session_pk).await.unwrap();
+
+    assert!(store
+        .list_session_prompt_queue(session_pk)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .take_completed_claimed_session_prompt("claimed")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!root.join("queue").join("claimed").exists());
+    assert!(!root.join("queue").join("pending").exists());
+    assert!(external.exists());
+}
+
+#[tokio::test]
+async fn failed_queued_delivery_restores_the_prompt_and_keeps_its_owned_copy() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-delivery-failure";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let owned_dir = cp.attachments_root().await.join("queue").join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    let owned = owned_dir.join("note.txt");
+    tokio::fs::write(&owned, b"owned").await.unwrap();
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![AttachmentRef {
+                name: "owned".into(),
+                url: crate::attachments::file_url_for_path(&owned)
+                    .unwrap()
+                    .to_string(),
+                content_type: None,
+                size: 0,
+            }],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+    cp.draining.store(true, Ordering::SeqCst);
+
+    assert!(cp
+        .deliver_next_queued_session_prompt(session_pk)
+        .await
+        .is_err());
+    assert!(owned_dir.exists());
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["owned"]
+    );
+    assert_eq!(
+        store.get_session(session_pk).await.unwrap().unwrap().status,
+        SessionStatus::Idle
+    );
+}
+
+#[tokio::test]
+async fn enqueue_for_idle_session_starts_the_fifo_head_once() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-idle";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let releases = Arc::new(tokio::sync::Semaphore::new(0));
+    cp.running.lock().unwrap().insert(
+        session_pk.into(),
+        Arc::new(ControlledSession {
+            prompts: prompts.clone(),
+            releases: releases.clone(),
+        }),
+    );
+    for (id, display) in [("first", "first queued"), ("second", "second queued")] {
+        cp.enqueue_session_prompt(QueuedSessionPrompt {
+            id: id.into(),
+            session_pk: session_pk.into(),
+            agent: display.into(),
+            display: display.into(),
+            attachments: vec![],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+    }
+
+    wait_for_controlled_prompts(&prompts, 1).await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["first queued"]);
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["second"]
+    );
+    releases.add_permits(1);
+    wait_for_controlled_prompts(&prompts, 2).await;
+    assert_eq!(
+        prompts.lock().unwrap().as_slice(),
+        ["first queued", "second queued"]
+    );
+}
+
+#[tokio::test]
+async fn queued_prompt_delivers_one_head_per_successful_turn() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-turns";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let releases = Arc::new(tokio::sync::Semaphore::new(0));
+    cp.running.lock().unwrap().insert(
+        session_pk.into(),
+        Arc::new(ControlledSession {
+            prompts: prompts.clone(),
+            releases: releases.clone(),
+        }),
+    );
+    for (id, display) in [("first", "first queued"), ("second", "second queued")] {
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: id.into(),
+                session_pk: session_pk.into(),
+                agent: format!("agent {display}"),
+                display: display.into(),
+                attachments: vec![],
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut events = cp.subscribe();
+    cp.continue_session_with_prompt(session_pk, TurnPrompt::text("current", "current"), &[])
+        .await
+        .unwrap();
+    wait_for_controlled_prompts(&prompts, 1).await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["current"]);
+
+    releases.add_permits(1);
+    wait_for_controlled_prompts(&prompts, 2).await;
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        CoreEvent::Result { session_pk: event_session } if event_session == session_pk
+    ));
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        CoreEvent::SessionQueueChanged { session_pk: event_session } if event_session == session_pk
+    ));
+    assert_eq!(
+        prompts.lock().unwrap().as_slice(),
+        ["current", "first queued"]
+    );
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["second"]
+    );
+
+    releases.add_permits(1);
+    wait_for_controlled_prompts(&prompts, 3).await;
+    assert_eq!(
+        prompts.lock().unwrap().as_slice(),
+        ["current", "first queued", "second queued"]
+    );
+    releases.add_permits(1);
+    for _ in 0..400 {
+        if store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("queued prompts were not fully delivered");
+}
+
+#[tokio::test]
+async fn errored_turn_does_not_drain_queued_prompt() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-error";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    cp.running
+        .lock()
+        .unwrap()
+        .insert(session_pk.into(), Arc::new(ErroringSession));
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "pending".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    cp.continue_session_with_prompt(session_pk, TurnPrompt::text("current", "current"), &[])
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if store.get_session(session_pk).await.unwrap().unwrap().status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["pending"]
+    );
+}
+
+#[tokio::test]
+async fn stopped_turn_does_not_drain_queued_prompt() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(true, counters.clone())).await;
+    let store = cp.store.clone();
+    let session_pk = "queued-stop";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    cp.running.lock().unwrap().insert(
+        session_pk.into(),
+        Arc::new(FakeSession {
+            store: store.clone(),
+            events: cp.events.clone(),
+            session_pk: session_pk.into(),
+            block_until_cancel: true,
+            cancelled,
+            send_count: counters.sends.clone(),
+            ended: counters.ended.clone(),
+            prompts: counters.prompts.clone(),
+            steered: counters.steered.clone(),
+        }),
+    );
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "pending".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    cp.continue_session_with_prompt(session_pk, TurnPrompt::text("current", "current"), &[])
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if counters.sends.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    cp.stop_session(session_pk).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["pending"]
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
+async fn queued_prompt_delivery_restores_head_and_emits_change_when_continuation_fails() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let mut registries = Registries::new();
+    registries.harness = Arc::new(FailingHarnessFactory {
+        message: "failing harness".into(),
+    });
+    let cp = test_control_plane(store, registries).await;
+    let store = cp.store.clone();
+    let session_pk = "queued-restore";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    for (id, display) in [("first", "first queued"), ("second", "second queued")] {
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: id.into(),
+                session_pk: session_pk.into(),
+                agent: display.into(),
+                display: display.into(),
+                attachments: vec![],
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut events = cp.subscribe();
+    assert!(cp
+        .deliver_next_queued_session_prompt(session_pk)
+        .await
+        .is_err());
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        CoreEvent::SessionQueueChanged { session_pk: event_session } if event_session == session_pk
+    ));
+    let status = store.get_session(session_pk).await.unwrap().unwrap().status;
+    assert_eq!(status, SessionStatus::Idle);
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
 async fn connect_project_on_plain_folder_succeeds_with_is_git_false() {
     let (cp, store, _db_guard) = provisioning_control_plane().await;
 
@@ -1872,7 +2532,7 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .unwrap();
     assert!(stored.worktree_path.is_some(), "worktree path backfilled");
     let branch = stored.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"), "got: {branch}");
+    assert!(branch.starts_with("ryuzi/"), "got: {branch}");
     assert!(stored.branch_owned);
 
     // …and the progress rows landed in order.
@@ -1884,7 +2544,7 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .collect();
     assert_eq!(statuses[0], "Creating worktree…");
     assert!(
-        statuses[1].starts_with("Created and checked out branch harness/"),
+        statuses[1].starts_with("Created and checked out branch ryuzi/"),
         "got: {statuses:?}"
     );
     assert_eq!(statuses[2], "Connecting tools…");
@@ -3793,7 +4453,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
         .unwrap()
         .unwrap();
     let branch = stored.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"));
+    assert!(branch.starts_with("ryuzi/"));
 
     cp.end_session(&session.session_pk).await.unwrap();
 

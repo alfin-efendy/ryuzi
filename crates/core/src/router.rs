@@ -23,7 +23,7 @@ use crate::harness::TurnPrompt;
 use crate::store::Store;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// Split `s` into <=1900-char slices for gateways with per-message size
 /// limits. Empty input yields a single `"(done)"` placeholder so callers
@@ -69,6 +69,14 @@ pub struct ConnectOutcome {
     pub perm_mode_downgraded: bool,
 }
 
+/// State of inbound work admission while a daemon completes boot recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootAdmission {
+    Pending,
+    Ready,
+    Failed,
+}
+
 /// Renders `CoreEvent`s onto every gateway surface bound to their session
 /// (outbound), and dispatches gateway-triggered actions to the control plane
 /// (inbound — Task 4).
@@ -77,6 +85,7 @@ pub struct Router {
     store: Arc<Store>,
     gateways: HashMap<String, Arc<dyn Gateway>>,
     state: HashMap<String, SessionRenderState>,
+    boot_admission: watch::Sender<BootAdmission>,
 }
 
 impl Router {
@@ -85,6 +94,25 @@ impl Router {
     /// calls (`on_connect`/`on_start`) are immediately visible to outbound
     /// rendering (`run`), even across two `Router` instances (see module doc).
     pub fn new(cp: Arc<ControlPlane>, gateways: Vec<Arc<dyn Gateway>>) -> Self {
+        Self::with_boot_admission(cp, gateways, true)
+    }
+
+    /// Build an inbound router that holds mutating gateway work until daemon
+    /// boot recovery, reconciliation, and idle-queue delivery have completed.
+    pub fn new_boot_gated(cp: Arc<ControlPlane>, gateways: Vec<Arc<dyn Gateway>>) -> Self {
+        Self::with_boot_admission(cp, gateways, false)
+    }
+
+    fn with_boot_admission(
+        cp: Arc<ControlPlane>,
+        gateways: Vec<Arc<dyn Gateway>>,
+        boot_admitted: bool,
+    ) -> Self {
+        let (boot_admission, _) = watch::channel(if boot_admitted {
+            BootAdmission::Ready
+        } else {
+            BootAdmission::Pending
+        });
         let store = cp.store().clone();
         let gateways = gateways
             .into_iter()
@@ -95,6 +123,49 @@ impl Router {
             store,
             gateways,
             state: HashMap::new(),
+            boot_admission,
+        }
+    }
+
+    /// Open the one-way boot admission latch. Repeated calls are harmless.
+    pub fn open_boot_admission(&self) {
+        self.boot_admission
+            .send_if_modified(|admission| match admission {
+                BootAdmission::Pending => {
+                    *admission = BootAdmission::Ready;
+                    true
+                }
+                BootAdmission::Ready | BootAdmission::Failed => false,
+            });
+    }
+
+    /// Fail the one-way boot admission latch. Waiting inbound calls are
+    /// rejected and future calls fail immediately. Repeated calls are harmless.
+    pub fn fail_boot_admission(&self) {
+        self.boot_admission
+            .send_if_modified(|admission| match admission {
+                BootAdmission::Pending => {
+                    *admission = BootAdmission::Failed;
+                    true
+                }
+                BootAdmission::Ready | BootAdmission::Failed => false,
+            });
+    }
+
+    async fn await_boot_admission(&self) -> anyhow::Result<()> {
+        let mut admission = self.boot_admission.subscribe();
+        loop {
+            let state = *admission.borrow_and_update();
+            match state {
+                BootAdmission::Ready => return Ok(()),
+                BootAdmission::Failed => anyhow::bail!("daemon failed to boot"),
+                BootAdmission::Pending => {
+                    admission
+                        .changed()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("daemon failed to boot"))?;
+                }
+            }
         }
     }
 
@@ -106,6 +177,7 @@ impl Router {
         actor: &str,
         opts: ConnectOpts,
     ) -> anyhow::Result<ConnectOutcome> {
+        self.await_boot_admission().await?;
         let gw = self
             .gateways
             .get(gateway_id)
@@ -186,6 +258,7 @@ impl Router {
         prompt: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
+        self.await_boot_admission().await?;
         let Some(project) = self
             .store
             .resolve_project_by_workspace(gateway_id, workspace_id)
@@ -226,6 +299,7 @@ impl Router {
         prompt: &str,
         attachments: &[AttachmentRef],
     ) -> anyhow::Result<()> {
+        self.await_boot_admission().await?;
         let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -252,6 +326,7 @@ impl Router {
         user_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        self.await_boot_admission().await?;
         if let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -278,6 +353,7 @@ impl Router {
 
     /// End the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_end(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
+        self.await_boot_admission().await?;
         if let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -290,6 +366,7 @@ impl Router {
 
     /// Stop the session bound to `conversation_id`; no-op if none is bound.
     pub async fn on_stop(&self, gateway_id: &str, conversation_id: &str) -> anyhow::Result<()> {
+        self.await_boot_admission().await?;
         if let Some(session) = self
             .store
             .resolve_by_conversation(gateway_id, conversation_id)
@@ -352,6 +429,7 @@ impl Router {
             }
             CoreEvent::SessionCreated { .. }
             | CoreEvent::AutomationHookRunChanged { .. }
+            | CoreEvent::SessionQueueChanged { .. }
             | CoreEvent::ApprovalRequested { .. }
             | CoreEvent::JobRunChanged { .. }
             | CoreEvent::OrchTaskChanged { .. }
@@ -577,6 +655,20 @@ mod tests {
         cp.attach_test_agent_persistence().await;
         let store_ref = cp.store().clone();
         (cp, store_ref)
+    }
+
+    #[tokio::test]
+    async fn boot_gated_router_rejects_inbound_work_after_boot_failure() {
+        let (cp, _store) = test_control_plane().await;
+        let router = Router::new_boot_gated(cp, vec![]);
+
+        router.fail_boot_admission();
+
+        let err = router
+            .on_reply("fake", "no-such-conversation", "actor", "prompt", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "daemon failed to boot");
     }
 
     fn text_event(session_pk: &str, seq: i64, text: &str) -> CoreEvent {

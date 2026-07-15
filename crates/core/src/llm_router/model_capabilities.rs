@@ -97,7 +97,6 @@ fn valid_default(default: Option<&str>, supported: &[ReasoningEffortOption]) -> 
     default
         .filter(|value| supported.iter().any(|option| option.value == *value))
         .map(str::to_string)
-        .or_else(|| (supported.len() == 1).then(|| supported[0].value.clone()))
 }
 
 pub fn resolve_effort_capabilities(
@@ -160,7 +159,8 @@ pub async fn resolve_for_surface(
     let catalog = model_meta::resolve_catalog_for_surface(surface);
     let discovered = model_meta::discovered_for_surface(store, surface).await;
     let wire_supports = registry::descriptor(&surface.provider_id).is_some_and(|descriptor| {
-        descriptor.family == family
+        descriptor.id != "kiro"
+            && descriptor.family == family
             && (family != "anthropic"
                 || matches!(descriptor.format, registry::ApiFormat::Anthropic))
     });
@@ -389,6 +389,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_discovery_without_advertised_default_does_not_guess_single_option() {
+        let discovered = DiscoveredModelMeta {
+            display_name: None,
+            effort_options: Some(vec![option("high")]),
+            default_effort_advertised: false,
+            default_effort: None,
+        };
+
+        let resolved =
+            resolve_effort_capabilities("openai", "gpt-single", Some(&discovered), &[], None, true);
+
+        assert_eq!(values(&resolved), ["high"]);
+        assert_eq!(resolved.provider_default, None);
+    }
+
+    #[test]
     fn explicit_discovery_is_authoritative_even_when_empty() {
         let empty = DiscoveredModelMeta {
             display_name: Some("Live Claude".into()),
@@ -570,6 +586,30 @@ mod store_tests {
                 .iter()
                 .any(|option| option.value == "xhigh"));
         }
+    }
+
+    #[tokio::test]
+    async fn kiro_surface_does_not_advertise_effort_from_metadata() {
+        let (_tmp, store) = store().await;
+        let model = "claude-sonnet-4.5";
+        let mut metadata = HashMap::new();
+        metadata.insert(model.into(), discovered(Some(&["high"]), Some("high")));
+        connections::add_connection(
+            &store,
+            connection("kiro-live", "kiro", &[model], Some(metadata)),
+        )
+        .await
+        .unwrap();
+
+        let surface = ExecutionSurfaceKey {
+            provider_id: "kiro".into(),
+            connection_id: Some("kiro-live".into()),
+            model: model.into(),
+        };
+        let resolved = resolve_for_surface(&store, "kiro", &surface).await;
+
+        assert!(resolved.supported.is_empty());
+        assert_eq!(resolved.provider_default, None);
     }
 
     #[tokio::test]

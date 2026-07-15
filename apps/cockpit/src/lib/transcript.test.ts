@@ -331,7 +331,7 @@ test("the live last turn stays uncollapsed while running", () => {
 test("live startup activity renders after the initial user bubble", () => {
   const startupRows: Row[] = [
     row({ seq: 1, role: "system", blockType: "status", text: "Creating worktree…", createdAt: 1 }),
-    row({ seq: 2, role: "system", blockType: "status", text: "Created and checked out branch harness/s1", createdAt: 2 }),
+    row({ seq: 2, role: "system", blockType: "status", text: "Created and checked out branch ryuzi/s1", createdAt: 2 }),
     row({ seq: 3, role: "system", blockType: "status", text: "Connecting tools…", createdAt: 3 }),
     row({ seq: 4, role: "user", blockType: "text", text: "Fix the issue", createdAt: 4 }),
   ];
@@ -342,7 +342,7 @@ test("live startup activity renders after the initial user bubble", () => {
   const activity = blocks[1] as Extract<TurnBlock, { type: "activity" }>;
   expect(activity.items).toEqual([
     { type: "status", key: "s1", text: "Creating worktree…" },
-    { type: "status", key: "s2", text: "Created and checked out branch harness/s1" },
+    { type: "status", key: "s2", text: "Created and checked out branch ryuzi/s1" },
     { type: "status", key: "s3", text: "Connecting tools…" },
   ]);
 });

@@ -3,10 +3,12 @@ import { toast } from "sonner";
 import {
   commands,
   type AgentInfo,
+  type ChatRequestOptions,
   type CommandInfo,
   type ProjectCommandInfo,
   type ProjectCommandInputDto,
   type ProjectCommandMutationDto,
+  type QueuedMessageInfo,
   type TodoItem,
 } from "./bindings";
 import { sessKey } from "./lib/session-key";
@@ -28,7 +30,8 @@ type NativeState = {
   commandsByProject: Record<string, CommandInfo[]>;
   projectCommandsByProject: Record<string, ProjectCommandInfo[]>;
   todosBySession: Record<string, TodoItem[]>;
-  // Whether the floating plan panel is collapsed to a pill, per session.
+  queuedBySession: Record<string, QueuedMessageInfo[]>;
+  // Whether the floating TODO List panel is collapsed to a pill, per session.
   planCollapsed: Record<string, boolean>;
   loadAgents: (runnerId: string, projectId: string) => Promise<void>;
   loadCommands: (runnerId: string, projectId: string) => Promise<void>;
@@ -42,6 +45,9 @@ type NativeState = {
   ) => Promise<ProjectCommandMutationResult>;
   deleteProjectCommand: (runnerId: string, projectId: string, command: ProjectCommandInfo) => Promise<ProjectCommandMutationResult>;
   loadTodos: (runnerId: string, sessionPk: string) => Promise<void>;
+  loadQueue: (runnerId: string, sessionPk: string) => Promise<void>;
+  enqueueQueueMessage: (runnerId: string, sessionPk: string, prompt: string, options: ChatRequestOptions | null) => Promise<boolean>;
+  removeQueueMessage: (runnerId: string, sessionPk: string, id: string) => Promise<boolean>;
   setPlanCollapsed: (runnerId: string, sessionPk: string, collapsed: boolean) => void;
   exportSession: (runnerId: string, sessionPk: string) => Promise<string | null>;
   importSession: (runnerId: string, projectId: string, data: string) => Promise<boolean>;
@@ -55,6 +61,7 @@ const agentFetchToken: Record<string, number> = {};
 const todoFetchToken: Record<string, number> = {};
 const commandFetchToken: Record<string, number> = {};
 const projectCommandFetchToken: Record<string, number> = {};
+const queueFetchToken: Record<string, number> = {};
 
 function projectCommandKey(runnerId: string, projectId: string): string {
   return `${runnerId}:${projectId}`;
@@ -87,6 +94,7 @@ export const useNative = create<NativeState>((set) => ({
   commandsByProject: {},
   projectCommandsByProject: {},
   todosBySession: {},
+  queuedBySession: {},
   planCollapsed: {},
 
   loadAgents: async (runnerId, projectId) => {
@@ -220,6 +228,52 @@ export const useNative = create<NativeState>((set) => ({
     const res = await commands.sessionTodos(runnerId, sessionPk);
     if (res.status === "ok" && todoFetchToken[key] === token) {
       set((s) => ({ todosBySession: { ...s.todosBySession, [key]: res.data } }));
+    }
+  },
+
+  loadQueue: async (runnerId, sessionPk) => {
+    const key = sessKey(runnerId, sessionPk);
+    const token = (queueFetchToken[key] ?? 0) + 1;
+    queueFetchToken[key] = token;
+    try {
+      const res = await commands.sessionQueue(runnerId, sessionPk);
+      if (res.status === "ok" && queueFetchToken[key] === token) {
+        set((s) => ({ queuedBySession: { ...s.queuedBySession, [key]: res.data } }));
+      }
+    } catch {
+      // Generated IPC commands may reject; retain the last known durable queue.
+    }
+  },
+
+  enqueueQueueMessage: async (runnerId, sessionPk, prompt, options) => {
+    try {
+      const res = await commands.enqueueSessionMessage(runnerId, sessionPk, prompt, options);
+      if (res.status !== "ok") return false;
+      const key = sessKey(runnerId, sessionPk);
+      queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
+      set((s) => {
+        const queued = s.queuedBySession[key] ?? [];
+        const next = queued.some((message) => message.id === res.data.id) ? queued : [...queued, res.data];
+        return { queuedBySession: { ...s.queuedBySession, [key]: next } };
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  removeQueueMessage: async (runnerId, sessionPk, id) => {
+    try {
+      const res = await commands.removeSessionMessage(runnerId, sessionPk, id);
+      if (res.status !== "ok") return false;
+      const key = sessKey(runnerId, sessionPk);
+      queueFetchToken[key] = (queueFetchToken[key] ?? 0) + 1;
+      set((s) => ({
+        queuedBySession: { ...s.queuedBySession, [key]: (s.queuedBySession[key] ?? []).filter((message) => message.id !== id) },
+      }));
+      return true;
+    } catch {
+      return false;
     }
   },
 

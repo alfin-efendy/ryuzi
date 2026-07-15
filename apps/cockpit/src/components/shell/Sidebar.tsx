@@ -99,7 +99,7 @@ export function Sidebar() {
   };
 
   // Archive = real teardown: end the session (interrupt + stop the agent,
-  // kill its terminals, remove the worktree and its harness/* branch), then
+  // kill its terminals, remove the worktree and its ryuzi/* branch), then
   // hide the row. Work that teardown would destroy — uncommitted changes OR
   // commits that exist only on the session branch — gets a confirmation.
   // The row is archived ONLY when the backend teardown succeeded.

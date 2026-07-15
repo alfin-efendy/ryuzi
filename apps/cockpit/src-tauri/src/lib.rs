@@ -154,6 +154,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::connection_provider_quota,
             connections_cmd::reset_codex_credit,
             connections_cmd::list_model_routes,
+            connections_cmd::list_model_route_target_capabilities,
             connections_cmd::save_model_route,
             connections_cmd::delete_model_route,
             connections_cmd::provider_account_route,
@@ -171,6 +172,9 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::create_project_command,
             native_cmd::update_project_command,
             native_cmd::delete_project_command,
+            native_cmd::session_queue,
+            native_cmd::enqueue_session_message,
+            native_cmd::remove_session_message,
             skills_cmd::list_skills,
             skills_cmd::install_skill,
             skills_cmd::remove_skill,
@@ -236,15 +240,30 @@ pub fn export_bindings(out: &std::path::Path) {
             out,
         )
         .expect("export bindings");
-    // specta may leave a trailing space after multiline union members. Normalize
-    // generated output here so every generation path satisfies `git diff --check`.
-    let contents = std::fs::read_to_string(out).expect("read generated bindings");
-    let normalized = contents
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(out, format!("{normalized}\n")).expect("normalize generated bindings");
+
+    let bindings = std::fs::read_to_string(out).expect("read exported bindings");
+    let normalized = normalize_binding_whitespace(&bindings);
+    if normalized != bindings {
+        std::fs::write(out, normalized).expect("write normalized bindings");
+    }
+}
+
+fn normalize_binding_whitespace(bindings: &str) -> String {
+    let mut normalized = String::with_capacity(bindings.len());
+
+    for line in bindings.split_inclusive('\n') {
+        let (content, line_ending) = match line.strip_suffix('\n') {
+            Some(line) => match line.strip_suffix('\r') {
+                Some(line) => (line, "\r\n"),
+                None => (line, "\n"),
+            },
+            None => (line, ""),
+        };
+        normalized.push_str(content.trim_end_matches([' ', '\t']));
+        normalized.push_str(line_ending);
+    }
+
+    normalized
 }
 
 pub fn run() {
@@ -335,6 +354,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_trailing_horizontal_whitespace_without_changing_line_endings() {
+        let source = "first \t\r\nsecond\t \nthird \t";
+
+        assert_eq!(
+            normalize_binding_whitespace(source),
+            "first\r\nsecond\nthird"
+        );
+    }
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
     /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`

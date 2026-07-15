@@ -24,7 +24,6 @@ import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
 import { messageToRow, mergeToolRow, type Row } from "./lib/transcript";
 import { notifier, notifyIntentForEvent, isWindowFocused } from "@/lib/notify";
-import { enqueue, dequeue, removeById, type QueuedMessage } from "@/lib/queue";
 import { LOCAL_RUNNER, sessKey, refKey, isSession, sameRef, refOf, type SessionRef, type UiSession } from "@/lib/session-key";
 
 export type PendingApproval = {
@@ -73,6 +72,7 @@ type State = {
       percentLeft: number;
       contextWindow: number;
       cacheReadTokens: number;
+      cacheCreationTokens: number;
       outputTokens: number;
     }
   >;
@@ -80,16 +80,10 @@ type State = {
   sessionRuntimeById: Record<string, SessionRuntimeInfo>;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
-  /** Per-session in-memory type-ahead queue (messages typed while running). */
-  queued: Record<string, QueuedMessage[]>;
   /** Live orchestration task graph, keyed by root task id — the task strip's
    *  data source. Upserted piecemeal by `orchTaskChanged` events and seeded
    *  in bulk by `loadOrchTasks`. */
   orchTasks: Record<string, OrchTask[]>;
-  enqueueMessage: (runnerId: string, sessionPk: string, msg: QueuedMessage) => void;
-  removeQueued: (runnerId: string, sessionPk: string, id: string) => void;
-  /** Send the head of a session's queue; on send-failure re-queue it at the front. */
-  sendNextQueued: (runnerId: string, sessionPk: string) => Promise<void>;
   /** `runnerId` is the runner that produced the event (from the CoreEventMsg
    *  wrapper). */
   applyCoreEvent: (e: CoreEvent, runnerId: string) => void;
@@ -192,7 +186,6 @@ export const useStore = create<State>((set, get) => ({
   sessions: [],
   transcripts: {},
   pendingApprovals: [],
-  queued: {},
   focusedSession: null,
   selectedProjectId: null,
   lastSeq: {},
@@ -312,6 +305,7 @@ export const useStore = create<State>((set, get) => ({
                 percentLeft: e.percent_left,
                 contextWindow: e.context_window,
                 cacheReadTokens: e.cache_read_tokens,
+                cacheCreationTokens: e.cache_creation_tokens,
                 outputTokens: e.output_tokens,
               },
             },
@@ -713,58 +707,40 @@ export const useStore = create<State>((set, get) => ({
     return true;
   },
   send: async (runnerId, sessionPk, prompt, options) => {
-    // A typed message while THIS chat drives a live orchestration steers it
-    // instead of running as a normal chat turn — e.g. "cancel" cancels the
-    // tree, anything else is noted as guidance for the judge. `orch_steer`
-    // returns exactly one of three wire strings: "noted"/"cancelled" when the
-    // orchestration actually consumed the message, or "noOrchestration" when
-    // there's no live root bound to this session (the store keeps no
-    // client-side cache of that binding — the backend check is authoritative).
-    // Only the two positive outcomes short-circuit the normal turn; ANYTHING
-    // else — "noOrchestration", a thrown IPC error, or an unexpected/null
-    // payload from a backend that doesn't implement steering — MUST fall
-    // through to the normal send path so a steer-check never swallows the
-    // user's message.
     try {
-      const steer = await commands.orchSteer(sessionPk, prompt);
-      if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
+      // A typed message while THIS chat drives a live orchestration steers it
+      // instead of running as a normal chat turn — e.g. "cancel" cancels the
+      // tree, anything else is noted as guidance for the judge. `orch_steer`
+      // returns exactly one of three wire strings: "noted"/"cancelled" when the
+      // orchestration actually consumed the message, or "noOrchestration" when
+      // there's no live root bound to this session (the store keeps no
+      // client-side cache of that binding — the backend check is authoritative).
+      // Only the two positive outcomes short-circuit the normal turn; ANYTHING
+      // else — "noOrchestration", a thrown IPC error, or an unexpected/null
+      // payload from a backend that doesn't implement steering — MUST fall
+      // through to the normal send path so a steer-check never swallows the
+      // user's message.
+      try {
+        const steer = await commands.orchSteer(sessionPk, prompt);
+        if (steer.status === "ok" && (steer.data === "noted" || steer.data === "cancelled")) return true;
+      } catch {
+        // fall through to the normal send path
+      }
+      // A session already RUNNING a turn gets steered — the message is
+      // injected into that turn's next tool-result batch instead of racing a
+      // whole new turn onto the session. Any other status (idle, interrupted,
+      // ended) starts a normal continue. Matched within the correct runner.
+      const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
+      const res = isRunning
+        ? await commands.steerSession(runnerId, sessionPk, prompt)
+        : await commands.continueSession(runnerId, sessionPk, prompt, toChatRequestOptions(options));
+      if (res.status === "error") {
+        toast.error("Couldn't send message: " + res.error.message);
+      }
+      await get().refresh();
+      return res.status === "ok";
     } catch {
-      // fall through to the normal send path
-    }
-    // A session already RUNNING a turn gets steered — the message is
-    // injected into that turn's next tool-result batch instead of racing a
-    // whole new turn onto the session. Any other status (idle, interrupted,
-    // ended) starts a normal continue. Matched within the correct runner.
-    const isRunning = get().sessions.find((s) => isSession(s, { runnerId, pk: sessionPk }))?.status === "running";
-    const res = isRunning
-      ? await commands.steerSession(runnerId, sessionPk, prompt)
-      : await commands.continueSession(runnerId, sessionPk, prompt, toChatRequestOptions(options));
-    if (res.status === "error") {
-      toast.error("Couldn't send message: " + res.error.message);
-    }
-    await get().refresh();
-    return res.status === "ok";
-  },
-  enqueueMessage: (runnerId, sessionPk, msg) =>
-    set((st) => {
-      const key = sessKey(runnerId, sessionPk);
-      return { queued: { ...st.queued, [key]: enqueue(st.queued[key], msg) } };
-    }),
-  removeQueued: (runnerId, sessionPk, id) =>
-    set((st) => {
-      const key = sessKey(runnerId, sessionPk);
-      return { queued: { ...st.queued, [key]: removeById(st.queued[key], id) } };
-    }),
-  sendNextQueued: async (runnerId, sessionPk) => {
-    const key = sessKey(runnerId, sessionPk);
-    const { head, rest } = dequeue(get().queued[key]);
-    if (!head) return;
-    // Remove the head BEFORE awaiting so a second `result` can't re-send it.
-    set((st) => ({ queued: { ...st.queued, [key]: rest } }));
-    const ok = await get().send(runnerId, sessionPk, head.text, head.options);
-    if (!ok) {
-      // Command-level rejection: put it back at the front so it stays visible.
-      set((st) => ({ queued: { ...st.queued, [key]: [head, ...(st.queued[key] ?? [])] } }));
+      return false;
     }
   },
   stop: async (runnerId, sessionPk) => {
@@ -784,8 +760,12 @@ export const useStore = create<State>((set, get) => ({
   },
   resolveApproval: async (runnerId, requestId, response) => {
     try {
-      await commands.resolveApproval(runnerId, requestId, response);
-      get().clearApproval(requestId);
+      const resolved = await commands.resolveApproval(runnerId, requestId, response);
+      if (resolved) {
+        get().clearApproval(requestId);
+      } else {
+        toast.error("Approval is still pending. Please try again.");
+      }
     } catch (e) {
       console.error("resolveApproval failed", e);
       toast.error("Approval failed: " + String(e));
@@ -808,7 +788,7 @@ export const useStore = create<State>((set, get) => ({
           intent,
           get().sessions.find((s) => isSession(s, { runnerId: intent.runnerId, pk: intent.sessionPk })),
         );
-      drainQueueOnEvent(event, runnerId);
+      if (event.kind === "sessionQueueChanged") void useNative.getState().loadQueue(runnerId, event.session_pk);
       // Sessions can be created outside UI actions (e.g. scheduler runs) —
       // refresh the list so they appear in the sidebar immediately.
       if (event.kind === "sessionCreated") void get().refresh();
@@ -828,16 +808,4 @@ export function markFocusedSessionReadOnEvent(event: CoreEvent, runnerId: string
   if (activePk && focusedSession && sameRef({ runnerId, pk: activePk }, focusedSession)) {
     useUi.getState().markRead(sessKey(runnerId, activePk), Date.now());
   }
-}
-
-/**
- * Drain one queued message when a session's turn finishes *successfully*.
- * Keyed on `result` only: an `error` turn emits no `result`, so the queue
- * stays put (structural pause). Extracted so the decision is testable without
- * a real Tauri event subscription.
- */
-export function drainQueueOnEvent(event: CoreEvent, runnerId: string): void {
-  if (event.kind !== "result") return;
-  const pk = (event as { session_pk?: string }).session_pk;
-  if (pk) void useStore.getState().sendNextQueued(runnerId, pk);
 }

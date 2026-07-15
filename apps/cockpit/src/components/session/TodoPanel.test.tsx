@@ -30,7 +30,7 @@ describe("todoStepSummary", () => {
     expect(todoStepSummary(done)).toEqual({ step: 2, total: 2, done: 2, label: "b" });
   });
   test("empty and untouched lists", () => {
-    expect(todoStepSummary([])).toEqual({ step: 0, total: 0, done: 0, label: "Plan" });
+    expect(todoStepSummary([])).toEqual({ step: 0, total: 0, done: 0, label: "TODO List" });
     expect(todoStepSummary([{ content: "x", status: "pending" }]).step).toBe(0);
   });
 });
@@ -41,12 +41,12 @@ describe("TodoPanel", () => {
     render(<TodoPanel runnerId={LOCAL_RUNNER} sessionPk="s1" running={true} />);
     expect(screen.getByText("Write the modal plan")).toBeTruthy();
     expect(screen.getByText(/Step/)).toBeTruthy();
-    // collapse via the header button
-    fireEvent.click(screen.getByRole("button", { name: /collapse plan/i }));
+    // collapse via the TODO List header button
+    fireEvent.click(screen.getByRole("button", { name: /collapse TODO List/i }));
     expect(screen.queryByText("Write the effort plan")).toBeNull(); // list hidden
     expect(screen.getByText(/Step 2\/3/)).toBeTruthy(); // pill summary
     // expand again via the pill
-    fireEvent.click(screen.getByRole("button", { name: /expand plan/i }));
+    fireEvent.click(screen.getByRole("button", { name: /expand TODO List/i }));
     expect(screen.getByText("Write the effort plan")).toBeTruthy();
   });
 

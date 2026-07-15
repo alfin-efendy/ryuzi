@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { CmdError, CommandInfo, OpenTarget, Project, Result, Session } from "@/bindings";
-import { LOCAL_RUNNER } from "@/lib/session-key";
+import { LOCAL_RUNNER, refKey } from "@/lib/session-key";
+import { useNative } from "@/store-native";
 
 // --- @/bindings: only the commands actually reachable from the mount paths
 // exercised below need a real implementation; everything else stays absent
@@ -16,6 +17,13 @@ const nativeCommands = mock((): Promise<Result<CommandInfo[], CmdError>> => Prom
 // TodoPanel (always mounted by SessionView) fires this on mount — stubbed ok:[]
 // so its effect resolves cleanly; TodoPanel itself renders null for an empty list.
 const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const sessionQueue = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const continueSession = mock(() => Promise.resolve({ status: "ok" as const, data: null }));
+const enqueueSessionMessage = mock<
+  (
+    ...args: Parameters<typeof import("@/bindings").commands["enqueueSessionMessage"]>
+  ) => ReturnType<typeof import("@/bindings").commands["enqueueSessionMessage"]>
+>(() => Promise.resolve({ status: "ok" as const, data: { id: "q1", text: "queued" } }));
 // loadProjectRuntime (always fired on mount for a project-bound session) fires
 // this too — stubbed with a minimal valid ProjectRuntimeInfo so its effect
 // resolves cleanly; the model/effort UI isn't under test here.
@@ -51,6 +59,10 @@ mock.module("@/bindings", () => ({
     sessionWorkdir,
     nativeCommands,
     sessionTodos,
+    sessionQueue,
+    continueSession,
+    enqueueSessionMessage,
+    removeSessionMessage: async () => ({ status: "ok" as const, data: true }),
     projectRuntimeInfo,
     fetchAttachment,
     // SessionView's orch task-strip effect (Phase 5) calls this on a chat
@@ -90,7 +102,23 @@ const { SessionView } = await import("./SessionView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { useNative } = await import("@/store-native");
+const realSend = useStore.getState().send;
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function project(overrides: Partial<Project> = {}): Project {
   return {
@@ -131,9 +159,9 @@ function session(runnerId: string, overrides: Partial<Session> = {}): Session & 
   };
 }
 
-function seed(runnerId: string) {
+function seed(runnerId: string, status: Session["status"] = "idle") {
   useStore.setState({
-    sessions: [session(runnerId)],
+    sessions: [session(runnerId, { status })],
     projects: [project()],
     focusedSession: { runnerId, pk: "s1" },
     transcripts: {},
@@ -147,6 +175,14 @@ function seed(runnerId: string) {
 beforeEach(() => {
   drawerMounts.length = 0;
   listOpenTargets.mockClear();
+  sessionQueue.mockClear();
+  continueSession.mockClear();
+  continueSession.mockResolvedValue({ status: "ok", data: null });
+  enqueueSessionMessage.mockClear();
+  enqueueSessionMessage.mockResolvedValue({ status: "ok", data: { id: "q1", text: "queued" } });
+  useNative.setState({ queuedBySession: {} });
+  useStore.setState({ send: realSend });
+  useNav.setState({ drafts: {} });
 });
 
 afterEach(() => {
@@ -280,4 +316,140 @@ test("remote session with the bottom panel closed: toggling it stays a no-op (di
 
   expect(useNav.getState().bottomOpen).toBe(false);
   expect(screen.queryByTestId("bottom-terminal-drawer")).toBeNull();
+});
+
+test("running queue accepts one rapid Enter submission and clears after durable enqueue", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  const queued = deferred<{ status: "ok"; data: { id: string; text: string } }>();
+  seed(runnerId, "running");
+  useNav.setState({ drafts: { [draftKey]: "queue this" } });
+  enqueueSessionMessage.mockImplementationOnce(() => queued.promise);
+
+  render(<SessionView />);
+  const composer = screen.getByPlaceholderText("Enter to queue");
+  fireEvent.keyDown(composer, { key: "Enter" });
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledTimes(1));
+  expect((screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+
+  queued.resolve({ status: "ok", data: { id: "q1", text: "queue this" } });
+  await waitFor(() => expect(useNav.getState().drafts[draftKey]).toBeUndefined());
+});
+
+test("idle composer accepts one Enter and click submission while send is pending", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  const sent = deferred<boolean>();
+  const send = mock(() => sent.promise);
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "send this" } });
+  useStore.setState({ send });
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
+  const sendButton = screen.getByRole("button", { name: "Send" });
+  fireEvent.click(sendButton);
+
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  expect((sendButton as HTMLButtonElement).disabled).toBe(true);
+
+  sent.resolve(true);
+  await waitFor(() => expect(useNav.getState().drafts[draftKey]).toBeUndefined());
+  await waitFor(() => expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(false));
+});
+
+test("a failed submission retains the draft and allows a retry", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  const send = mock(() => Promise.resolve(false));
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "retry this" } });
+  useStore.setState({ send });
+
+  render(<SessionView />);
+  const composer = screen.getByPlaceholderText("Ask for follow-up changes");
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
+});
+
+test("running queue success clears the runner-qualified draft", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  seed(runnerId, "running");
+  useNav.setState({ drafts: { [draftKey]: "queue this", s1: "other session" } });
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Enter to queue"), { key: "Enter" });
+
+  await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledWith(runnerId, "s1", "queue this", expect.anything()));
+  expect(useNav.getState().drafts[draftKey]).toBeUndefined();
+  expect(useNav.getState().drafts.s1).toBe("other session");
+});
+
+test("running queue failure leaves the runner-qualified draft", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  seed(runnerId, "running");
+  useNav.setState({ drafts: { [draftKey]: "keep this", s1: "other session" } });
+  enqueueSessionMessage.mockResolvedValue({ status: "error", error: { message: "nope" } });
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Enter to queue"), { key: "Enter" });
+
+  await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalled());
+  expect(useNav.getState().drafts[draftKey]).toBe("keep this");
+  expect(useNav.getState().drafts.s1).toBe("other session");
+});
+
+test("idle send success clears the runner-qualified draft", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "send this", s1: "other session" } });
+  const send = mock(async () => true);
+  useStore.setState({ send });
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
+
+  await waitFor(() => expect(send).toHaveBeenCalled());
+  expect(useNav.getState().drafts[draftKey]).toBeUndefined();
+  expect(useNav.getState().drafts.s1).toBe("other session");
+});
+
+test("idle send failure leaves the runner-qualified draft", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "retry this", s1: "other session" } });
+  const send = mock(async () => false);
+  useStore.setState({ send });
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
+
+  await waitFor(() => expect(send).toHaveBeenCalled());
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
+  expect(useNav.getState().drafts.s1).toBe("other session");
+});
+
+test("a rejected idle send keeps the draft without an unhandled rejection", async () => {
+  const runnerId = "remote-1";
+  const draftKey = refKey({ runnerId, pk: "s1" });
+  seed(runnerId);
+  useNav.setState({ drafts: { [draftKey]: "retry this" } });
+  continueSession.mockRejectedValueOnce(new Error("IPC unavailable"));
+
+  render(<SessionView />);
+  fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
+
+  await waitFor(() => expect(continueSession).toHaveBeenCalledWith(runnerId, "s1", "retry this", expect.anything()));
+  expect(useNav.getState().drafts[draftKey]).toBe("retry this");
 });

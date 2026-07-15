@@ -376,18 +376,117 @@ test("edit card shows before/after blocks", () => {
   expect(screen.getByText("const a = 2")).toBeTruthy();
 });
 
-test("generic tool renders summary and a collapsible parameter dump", () => {
+test("question option buttons wrap long labels and descriptions without shifting the selected indicator", () => {
+  render(
+    <ApprovalCard
+      approval={approval({
+        kind: "question",
+        tool: "askuserquestion",
+        input: {
+          questions: [
+            {
+              question: "Choose an option",
+              header: "Long option",
+              options: [
+                {
+                  label: "AnUnbrokenOptionLabelThatMustWrapWithinTheApprovalCardInsteadOfOverflowingHorizontally",
+                  description: "AnUnbrokenDescriptionThatMustAlsoWrapWithinTheApprovalCardInsteadOfOverlappingTheSelectionIndicator",
+                },
+              ],
+            },
+          ],
+        },
+      })}
+    />,
+  );
+
+  const option = screen.getByRole("button", { name: /AnUnbrokenOptionLabel/ });
+  const [indicator, text] = Array.from(option.querySelectorAll(":scope > span"));
+  expect(option.className).toContain("items-start");
+  expect(indicator?.className).toContain("self-start");
+  expect(text?.className).toContain("min-w-0");
+  expect(text?.className).toContain("flex-1");
+  expect(text?.firstElementChild?.className).toContain("whitespace-normal");
+  expect(text?.firstElementChild?.className).toContain("break-words");
+  expect(text?.lastElementChild?.className).toContain("whitespace-normal");
+  expect(text?.lastElementChild?.className).toContain("break-words");
+});
+
+test("generic tool previews input until the full input is requested", () => {
+  const tail = "input-tail-that-is-only-visible-in-the-expanded-json";
   render(
     <ApprovalCard
       approval={approval({
         tool: "webfetch",
         summary: "Fetch: https://example.com",
-        input: { url: "https://example.com" },
+        input: { url: "https://example.com", body: `${"x".repeat(400)}${tail}` },
       })}
     />,
   );
+
   expect(screen.getByText("Fetch: https://example.com")).toBeTruthy();
-  expect(screen.getByText("Parameters")).toBeTruthy();
+  const showFullInput = screen.getByRole("button", { name: "Show full input" });
+  expect(showFullInput.getAttribute("aria-expanded")).toBe("false");
+  const fullInputId = showFullInput.getAttribute("aria-controls");
+  expect(fullInputId).toBeTruthy();
+  if (!fullInputId) {
+    throw new Error("Show full input must control the expanded input");
+  }
+  expect(screen.queryByTestId("approval-full-input")).toBeNull();
+  expect(screen.queryByText(tail)).toBeNull();
+
+  fireEvent.click(showFullInput);
+  const fullInput = screen.getByTestId("approval-full-input");
+  expect(fullInput.textContent).toContain(tail);
+  expect(fullInput.className).toContain("max-h-");
+  expect(fullInput.className).toContain("overflow-y-auto");
+  expect(fullInput.className).toContain("whitespace-pre-wrap");
+  expect(fullInput.className).toContain("break-words");
+  const hideFullInput = screen.getByRole("button", { name: "Hide full input" });
+  expect(hideFullInput.getAttribute("aria-expanded")).toBe("true");
+  expect(hideFullInput.getAttribute("aria-controls")).toBe(fullInputId);
+  expect(fullInput.id).toBe(fullInputId);
+});
+
+test("generic tool full input controls use unique IDs for each approval card", () => {
+  render(
+    <>
+      <ApprovalCard approval={approval({ requestId: "r1", tool: "webfetch", input: { body: "first" } })} />
+      <ApprovalCard approval={approval({ requestId: "r2", tool: "webfetch", input: { body: "second" } })} />
+    </>,
+  );
+
+  const fullInputButtons = screen.getAllByRole("button", { name: "Show full input" });
+  expect(fullInputButtons).toHaveLength(2);
+  expect(fullInputButtons[0].getAttribute("aria-controls")).not.toBe(fullInputButtons[1].getAttribute("aria-controls"));
+});
+
+test("bash and edit content blocks wrap with vertical scrolling", () => {
+  const { rerender } = render(<ApprovalCard approval={approval({})} />);
+  const bash = screen.getByText("rm -rf ./x").closest("pre");
+  expect(bash?.className).toContain("max-h-");
+  expect(bash?.className).toContain("overflow-y-auto");
+  expect(bash?.className).toContain("whitespace-pre-wrap");
+  expect(bash?.className).toContain("break-words");
+  expect(bash?.className).not.toContain("overflow-x-auto");
+
+  rerender(
+    <ApprovalCard
+      approval={approval({
+        tool: "edit",
+        summary: "Edit: src/a.ts",
+        input: { file_path: "src/a.ts", old_string: "const a = 1", new_string: "const a = 2" },
+      })}
+    />,
+  );
+  for (const text of ["const a = 1", "const a = 2"]) {
+    const block = screen.getByText(text).closest("pre");
+    expect(block?.className).toContain("max-h-");
+    expect(block?.className).toContain("overflow-y-auto");
+    expect(block?.className).toContain("whitespace-pre-wrap");
+    expect(block?.className).toContain("break-words");
+    expect(block?.className).not.toContain("overflow-x-auto");
+  }
 });
 
 test("hotkey fires the primary action on Cmd/Ctrl+Enter", async () => {
