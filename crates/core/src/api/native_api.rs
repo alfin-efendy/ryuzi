@@ -218,7 +218,7 @@ async fn native_commands(
 
 fn command_infos(registry: &CommandRegistry) -> Vec<CommandInfo> {
     registry
-        .all_with_origins()
+        .catalog()
         .into_iter()
         .map(|entry| CommandInfo {
             name: entry.command.name,
@@ -231,6 +231,7 @@ fn command_infos(registry: &CommandRegistry) -> Vec<CommandInfo> {
                 CommandOrigin::Global => CommandOriginInfo::Global,
                 CommandOrigin::Project => CommandOriginInfo::Project,
             },
+            effective: entry.effective,
             shadows_global: entry.shadows_global,
         })
         .collect()
@@ -252,7 +253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_command_listing_reports_effective_origins_and_global_shadowing() {
+    async fn native_command_listing_keeps_all_sources_and_reports_precedence() {
         let workdir = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workdir.path().join(".ryuzi/commands")).unwrap();
@@ -261,22 +262,45 @@ mod tests {
             "project ship",
         )
         .unwrap();
+        std::fs::write(
+            workdir.path().join(".ryuzi/commands/init.md"),
+            "project init",
+        )
+        .unwrap();
         std::fs::write(global.path().join("ship.md"), "global ship").unwrap();
+        std::fs::write(global.path().join("init.md"), "global init").unwrap();
         std::fs::write(global.path().join("deploy.md"), "global deploy").unwrap();
 
         let registry = CommandRegistry::load_from_dirs(workdir.path(), global.path());
         let commands = command_infos(&registry);
-        let command = |name: &str| {
+        let command = |name: &str, origin| {
             commands
                 .iter()
-                .find(|command| command.name == name)
+                .find(|command| command.name == name && command.origin == origin)
                 .unwrap()
         };
 
-        assert_eq!(command("init").origin, CommandOriginInfo::Builtin);
-        assert_eq!(command("deploy").origin, CommandOriginInfo::Global);
-        assert_eq!(command("ship").origin, CommandOriginInfo::Project);
-        assert!(command("ship").shadows_global);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.name == "ship")
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.name == "init")
+                .count(),
+            3
+        );
+        assert!(command("ship", CommandOriginInfo::Project).effective);
+        assert!(command("ship", CommandOriginInfo::Project).shadows_global);
+        assert!(!command("ship", CommandOriginInfo::Global).effective);
+        assert!(command("init", CommandOriginInfo::Builtin).effective);
+        assert!(!command("init", CommandOriginInfo::Global).effective);
+        assert!(!command("init", CommandOriginInfo::Project).effective);
+        assert!(command("deploy", CommandOriginInfo::Global).effective);
     }
 
     #[tokio::test]

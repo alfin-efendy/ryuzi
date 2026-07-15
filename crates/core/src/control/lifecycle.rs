@@ -785,18 +785,21 @@ impl ControlPlane {
         );
     }
 
-    /// Startup failed: surface it in the transcript, release the session
-    /// back to Idle so the user can retry, and broadcast the bus-terminal
-    /// `CoreEvent::Error` (mirroring `spawn_prompt`'s error arm). The
-    /// broadcast is load-bearing: the orchestrator's `watch_session` and the
-    /// scheduler's run watcher finish only on `Result`/`Error` for the
-    /// session, so without it they would hang to their 2h deadline instead
-    /// of reporting the real git/harness error. `demote_if_running` (not a
-    /// blind status write) so a stop that already marked it Interrupted
-    /// wins; it runs before the broadcast so a lagged watcher that falls
-    /// back to consulting the session row never reads a stale Running.
+    /// Startup failed: surface it in the transcript, terminally fail any linked
+    /// automation run, release the session back to Idle so the user can retry,
+    /// and broadcast the bus-terminal `CoreEvent::Error` (mirroring
+    /// `spawn_prompt`'s error arm). The broadcast is load-bearing: the
+    /// orchestrator's `watch_session` and the scheduler's run watcher finish
+    /// only on `Result`/`Error` for the session, so without it they would
+    /// hang to their 2h deadline instead of reporting the real git/harness
+    /// error. `demote_if_running` (not a blind status write) so a stop that
+    /// already marked it Interrupted wins; it runs before the broadcast so a
+    /// lagged watcher that falls back to consulting the session row never
+    /// reads a stale Running.
     async fn fail_startup(&self, session_pk: &str, message: &str) {
         self.emit_error(session_pk, message).await;
+        self.finish_automation_session(session_pk, "failed", Some(message))
+            .await;
         let _ = self.store.demote_if_running(session_pk, now_ms()).await;
         let _ = self.events.send(CoreEvent::Error {
             session_pk: session_pk.to_string(),

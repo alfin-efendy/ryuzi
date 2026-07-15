@@ -600,6 +600,10 @@ pub enum CommandOriginInfo {
     Project,
 }
 
+const fn default_command_effective() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandInfo {
@@ -611,6 +615,8 @@ pub struct CommandInfo {
     #[serde(default)]
     pub subtask: bool,
     pub origin: CommandOriginInfo,
+    #[serde(default = "default_command_effective")]
+    pub effective: bool,
     pub shadows_global: bool,
 }
 
@@ -1530,6 +1536,22 @@ mod tests {
             serde_json::json!([{ "name": "Authorization", "configured": true }])
         );
         assert!(!serialized.to_string().contains("Bearer secret"));
+    }
+
+    #[test]
+    fn command_info_defaults_effective_when_legacy_json_omits_it() {
+        let command: CommandInfo = serde_json::from_value(serde_json::json!({
+            "name": "ship",
+            "description": "Ship the current change",
+            "agent": null,
+            "model": null,
+            "subtask": false,
+            "origin": "project",
+            "shadowsGlobal": true
+        }))
+        .unwrap();
+
+        assert!(command.effective);
     }
 
     #[test]

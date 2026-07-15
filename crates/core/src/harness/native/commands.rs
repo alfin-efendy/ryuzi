@@ -175,19 +175,21 @@ fn builtin_commands() -> Vec<Command> {
     ]
 }
 
-/// An effective command together with its precedence source.
+/// A command source together with its precedence metadata.
 #[derive(Debug, Clone)]
 pub struct RegisteredCommand {
     pub command: Command,
     pub origin: CommandOrigin,
-    /// Whether the effective project command overrides a global command with
-    /// the same name.
+    /// Whether this source is the command that the runtime executes.
+    pub effective: bool,
+    /// Whether a project source has a global source with the same name.
     pub shadows_global: bool,
 }
 
 /// The set of available slash commands.
 pub struct CommandRegistry {
     commands: BTreeMap<String, RegisteredCommand>,
+    catalog: Vec<RegisteredCommand>,
 }
 
 impl CommandRegistry {
@@ -199,59 +201,81 @@ impl CommandRegistry {
     }
 
     pub(crate) fn load_from_dirs(work_dir: &Path, global_dir: &Path) -> CommandRegistry {
-        let mut commands = BTreeMap::new();
-        for command in read_command_dir(global_dir) {
-            commands.insert(
-                command.name.clone(),
-                RegisteredCommand {
-                    command,
-                    origin: CommandOrigin::Global,
-                    shadows_global: false,
-                },
-            );
+        let global_commands = read_command_dir(global_dir);
+        let project_commands = read_project_command_dir(work_dir);
+        let builtin_commands = builtin_commands();
+        let mut catalog = Vec::new();
+
+        for command in global_commands {
+            catalog.push(RegisteredCommand {
+                command,
+                origin: CommandOrigin::Global,
+                effective: false,
+                shadows_global: false,
+            });
         }
-        for command in read_project_command_dir(work_dir) {
-            let shadows_global = commands
-                .get(&command.name)
-                .is_some_and(|entry| entry.origin == CommandOrigin::Global);
-            commands.insert(
-                command.name.clone(),
-                RegisteredCommand {
-                    command,
-                    origin: CommandOrigin::Project,
-                    shadows_global,
-                },
-            );
+        for command in project_commands {
+            let shadows_global = catalog.iter().any(|entry| {
+                entry.command.name == command.name && entry.origin == CommandOrigin::Global
+            });
+            catalog.push(RegisteredCommand {
+                command,
+                origin: CommandOrigin::Project,
+                effective: false,
+                shadows_global,
+            });
         }
-        for command in builtin_commands() {
-            commands.insert(
-                command.name.clone(),
-                RegisteredCommand {
-                    command,
-                    origin: CommandOrigin::Builtin,
-                    shadows_global: false,
-                },
-            );
+        for command in builtin_commands {
+            catalog.push(RegisteredCommand {
+                command,
+                origin: CommandOrigin::Builtin,
+                effective: false,
+                shadows_global: false,
+            });
         }
-        CommandRegistry { commands }
+        let commands = catalog
+            .iter()
+            .cloned()
+            .map(|entry| (entry.command.name.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        for entry in &mut catalog {
+            entry.effective = commands
+                .get(&entry.command.name)
+                .is_some_and(|effective| effective.origin == entry.origin);
+        }
+        let commands = commands
+            .into_iter()
+            .map(|(name, mut entry)| {
+                entry.effective = true;
+                (name, entry)
+            })
+            .collect();
+        catalog.sort_by(|left, right| {
+            left.command
+                .name
+                .cmp(&right.command.name)
+                .then_with(|| left.origin.as_str().cmp(right.origin.as_str()))
+        });
+
+        CommandRegistry { commands, catalog }
     }
 
     pub fn builtin() -> CommandRegistry {
-        CommandRegistry {
-            commands: builtin_commands()
-                .into_iter()
-                .map(|command| {
-                    (
-                        command.name.clone(),
-                        RegisteredCommand {
-                            command,
-                            origin: CommandOrigin::Builtin,
-                            shadows_global: false,
-                        },
-                    )
-                })
-                .collect(),
-        }
+        let catalog = builtin_commands()
+            .into_iter()
+            .map(|command| RegisteredCommand {
+                command,
+                origin: CommandOrigin::Builtin,
+                effective: true,
+                shadows_global: false,
+            })
+            .collect::<Vec<_>>();
+        let commands = catalog
+            .iter()
+            .cloned()
+            .map(|entry| (entry.command.name.clone(), entry))
+            .collect();
+        CommandRegistry { commands, catalog }
     }
 
     pub fn get(&self, name: &str) -> Option<Command> {
@@ -273,6 +297,12 @@ impl CommandRegistry {
     /// All effective commands with their precedence source, for UI listing.
     pub fn all_with_origins(&self) -> Vec<RegisteredCommand> {
         self.commands.values().cloned().collect()
+    }
+
+    /// Every discovered command source, including sources shadowed by a
+    /// higher-precedence project or built-in command.
+    pub fn catalog(&self) -> Vec<RegisteredCommand> {
+        self.catalog.clone()
     }
 
     /// If `input` is a slash command (`/name args...`), return its expanded
@@ -410,6 +440,18 @@ fn command_name_from_path(root: &Path, path: &Path) -> Option<String> {
 
 /// Validate and normalize a project command name before it is resolved to a path.
 pub fn validate_project_command_name(name: &str) -> Result<ValidatedCommandName, CommandFileError> {
+    let name = validate_project_command_path_name(name)?;
+    if is_builtin_command_name(name.as_str()) {
+        return Err(CommandFileError::InvalidName(
+            "built-in commands cannot be created or updated".into(),
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_project_command_path_name(
+    name: &str,
+) -> Result<ValidatedCommandName, CommandFileError> {
     if name.is_empty() || name.len() > 80 {
         return Err(CommandFileError::InvalidName(
             "must contain 1 through 80 bytes".into(),
@@ -432,12 +474,11 @@ pub fn validate_project_command_name(name: &str) -> Result<ValidatedCommandName,
             "path segments must not be empty, '.' or '..'".into(),
         ));
     }
-    if matches!(name, "init" | "review" | "compact") {
-        return Err(CommandFileError::InvalidName(
-            "built-in commands cannot be created or updated".into(),
-        ));
-    }
     Ok(ValidatedCommandName(name.to_string()))
+}
+
+fn is_builtin_command_name(name: &str) -> bool {
+    matches!(name, "init" | "review" | "compact")
 }
 
 /// List every readable project command file, including its content revision.
@@ -456,7 +497,7 @@ pub fn read_project_command(
     work_dir: &Path,
     name: &str,
 ) -> Result<ProjectCommandRead, CommandFileError> {
-    let name = validate_project_command_name(name)?;
+    let name = validate_project_command_path_name(name)?;
     let Some(root) = project_command_root(work_dir, false)? else {
         return Err(CommandFileError::NotFound(name.0));
     };
@@ -469,12 +510,22 @@ pub fn write_project_command(
     input: ProjectCommandInput,
     expected_revision: Option<&str>,
 ) -> Result<ProjectCommandRead, CommandFileError> {
-    let name = validate_project_command_name(&input.name)?;
+    let name = validate_project_command_path_name(&input.name)?;
+    if is_builtin_command_name(name.as_str()) && expected_revision.is_none() {
+        return Err(CommandFileError::InvalidName(
+            "built-in commands cannot be created or updated".into(),
+        ));
+    }
     let root = project_command_root(work_dir, true)?.expect("command root was created");
     let mut lock = command_root_lock(&root)?;
     let _guard = lock.write()?;
     verify_locked_command_root(work_dir, &root)?;
     let path = project_command_path(&root, &name)?;
+    if !path.exists() && is_builtin_command_name(name.as_str()) {
+        return Err(CommandFileError::InvalidName(
+            "built-in commands cannot be created or updated".into(),
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         reject_symlink_path(&root, parent)?;
@@ -504,7 +555,7 @@ pub fn delete_project_command(
     name: &str,
     expected_revision: &str,
 ) -> Result<(), CommandFileError> {
-    let name = validate_project_command_name(name)?;
+    let name = validate_project_command_path_name(name)?;
     let Some(root) = project_command_root(work_dir, false)? else {
         return Err(CommandFileError::NotFound(name.0));
     };
@@ -621,7 +672,7 @@ fn list_project_commands_recursive(
         } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "md")
         {
             if let Some(name) = command_name_from_path(root, &path) {
-                if let Ok(name) = validate_project_command_name(&name) {
+                if let Ok(name) = validate_project_command_path_name(&name) {
                     commands.push(read_project_command_at(root, &name)?);
                 }
             }
@@ -872,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn builtins_win_and_project_overrides_global() {
+    fn catalog_keeps_every_source_while_runtime_precedence_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
@@ -889,20 +940,20 @@ mod tests {
             .contains("Analyze this codebase"));
         assert_eq!(registry.get("ship").unwrap().template, "project ship");
 
-        let commands = registry.all_with_origins();
-        let init = commands
-            .iter()
-            .find(|entry| entry.command.name == "init")
-            .unwrap();
-        assert_eq!(init.origin, CommandOrigin::Builtin);
-        assert!(!init.shadows_global);
+        let sources = registry.catalog();
+        let source = |name: &str, origin| {
+            sources
+                .iter()
+                .find(|entry| entry.command.name == name && entry.origin == origin)
+                .unwrap()
+        };
 
-        let ship = commands
-            .iter()
-            .find(|entry| entry.command.name == "ship")
-            .unwrap();
-        assert_eq!(ship.origin, CommandOrigin::Project);
-        assert!(ship.shadows_global);
+        assert!(source("ship", CommandOrigin::Project).effective);
+        assert!(source("ship", CommandOrigin::Project).shadows_global);
+        assert!(!source("ship", CommandOrigin::Global).effective);
+        assert!(!source("init", CommandOrigin::Global).effective);
+        assert!(!source("init", CommandOrigin::Project).effective);
+        assert!(source("init", CommandOrigin::Builtin).effective);
     }
 
     #[test]
@@ -919,6 +970,59 @@ mod tests {
             assert!(validate_project_command_name(name).is_err(), "{name}");
         }
         assert!(validate_project_command_name("review/security-2_ok").is_ok());
+    }
+
+    #[test]
+    fn existing_builtin_named_project_command_is_listed_and_mutable_but_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".ryuzi/commands");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("init.md"), "external project init").unwrap();
+
+        let existing = list_project_commands(dir.path()).unwrap();
+        assert_eq!(
+            existing
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["init"]
+        );
+
+        let updated = write_project_command(
+            dir.path(),
+            ProjectCommandInput {
+                name: "init".into(),
+                description: "External project init".into(),
+                template: "Updated init".into(),
+                agent: None,
+                model: None,
+                subtask: false,
+            },
+            Some(&existing[0].revision),
+        )
+        .unwrap();
+        assert_eq!(updated.template, "Updated init");
+        delete_project_command(dir.path(), "init", &updated.revision).unwrap();
+
+        let fresh = tempfile::tempdir().unwrap();
+        let error = write_project_command(
+            fresh.path(),
+            ProjectCommandInput {
+                name: "init".into(),
+                description: String::new(),
+                template: "New init".into(),
+                agent: None,
+                model: None,
+                subtask: false,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CommandFileError::InvalidName(_)));
+        assert!(
+            !fresh.path().join(".ryuzi").exists(),
+            "rejecting a new reserved command must not create command directories"
+        );
     }
 
     #[test]

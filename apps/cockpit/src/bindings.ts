@@ -1867,7 +1867,7 @@ export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
-export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean; origin: CommandOriginInfo; shadowsGlobal: boolean }
+export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean; origin: CommandOriginInfo; effective: boolean; shadowsGlobal: boolean }
 export type CommandOriginInfo = "builtin" | "global" | "project"
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**

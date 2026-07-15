@@ -162,7 +162,10 @@ export function HomeView() {
   }, [draft]);
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
-    return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
+    return nativeCommands
+      .filter((c) => c.effective)
+      .filter((c) => c.name.toLowerCase().startsWith(slashQuery))
+      .slice(0, 6);
   }, [nativeCommands, slashQuery]);
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;

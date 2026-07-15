@@ -11,10 +11,10 @@ import { useStore } from "@/store";
 const NAME_ALLOWED = /^[a-z0-9_-]+(?:\/[a-z0-9_-]+)*$/;
 const RESERVED_NAMES = new Set(["init", "review", "compact"]);
 
-export function projectCommandNameError(name: string): string | null {
+export function projectCommandNameError(name: string, editing = false): string | null {
   if (name.length === 0 || name.length > 80) return "Name must contain 1 through 80 characters.";
   if (!NAME_ALLOWED.test(name)) return "Use lowercase letters, digits, '-', '_', and '/' only.";
-  if (RESERVED_NAMES.has(name)) return "Built-in commands cannot be created or updated.";
+  if (!editing && RESERVED_NAMES.has(name)) return "Built-in commands cannot be created or updated.";
   return null;
 }
 
@@ -53,7 +53,7 @@ function CommandEditor({
   const [draft, setDraft] = useState<CommandDraft>(() => (command ? draftFor(command) : blankDraft()));
   const [saving, setSaving] = useState(false);
   const descriptionRef = useRef<HTMLInputElement>(null);
-  const nameError = projectCommandNameError(draft.name);
+  const nameError = projectCommandNameError(draft.name, command !== null);
   const valid = !nameError && draft.template.trim().length > 0;
 
   const save = async () => {
@@ -166,13 +166,37 @@ function OriginBadge({ origin }: { origin: CommandInfo["origin"] }) {
   return <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{label}</span>;
 }
 
-function ReadOnlyCommandRow({ command }: { command: CommandInfo }) {
+function commandStatus(
+  command: Pick<CommandInfo, "origin" | "effective" | "shadowsGlobal">,
+  effectiveOrigin: CommandInfo["origin"] | undefined,
+) {
+  if (command.effective) return command.origin === "project" && command.shadowsGlobal ? "Overrides global" : "Effective";
+  const source = effectiveOrigin === "builtin" ? "built-in" : (effectiveOrigin ?? "higher-precedence source");
+  return `Shadowed by ${source}`;
+}
+
+function StatusBadge({
+  command,
+  effectiveOrigin,
+}: {
+  command: Pick<CommandInfo, "origin" | "effective" | "shadowsGlobal">;
+  effectiveOrigin: CommandInfo["origin"] | undefined;
+}) {
+  return (
+    <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+      {commandStatus(command, effectiveOrigin)}
+    </span>
+  );
+}
+
+function ReadOnlyCommandRow({ command, effectiveOrigin }: { command: CommandInfo; effectiveOrigin: CommandInfo["origin"] | undefined }) {
   return (
     <SettingsCard className="flex min-h-[88px] items-stretch">
       <div className="min-w-0 flex-1 px-[18px] py-3">
         <div className="flex items-center gap-2">
           <span className="font-mono text-[13px] font-semibold">/{command.name}</span>
           <OriginBadge origin={command.origin} />
+          <StatusBadge command={command} effectiveOrigin={effectiveOrigin} />
           {command.subtask ? (
             <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Subtask</span>
           ) : null}
@@ -190,12 +214,14 @@ function ReadOnlyCommandRow({ command }: { command: CommandInfo }) {
 
 function CommandRow({
   command,
-  shadowsGlobal,
+  catalogCommand,
+  effectiveOrigin,
   onEdit,
   onDelete,
 }: {
   command: ProjectCommandInfo;
-  shadowsGlobal: boolean;
+  catalogCommand: CommandInfo | undefined;
+  effectiveOrigin: CommandInfo["origin"] | undefined;
   onEdit: () => void;
   onDelete: (trigger: HTMLButtonElement) => void;
 }) {
@@ -205,9 +231,7 @@ function CommandRow({
         <div className="flex items-center gap-2">
           <span className="font-mono text-[13px] font-semibold">/{command.name}</span>
           <OriginBadge origin="project" />
-          {shadowsGlobal ? (
-            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Overrides global</span>
-          ) : null}
+          {catalogCommand ? <StatusBadge command={catalogCommand} effectiveOrigin={effectiveOrigin} /> : null}
           {command.subtask ? (
             <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">Subtask</span>
           ) : null}
@@ -273,6 +297,10 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
     () => new Map((effectiveCommands ?? []).filter((command) => command.origin === "project").map((command) => [command.name, command])),
     [effectiveCommands],
   );
+  const effectiveOriginByName = useMemo(
+    () => new Map((effectiveCommands ?? []).filter((command) => command.effective).map((command) => [command.name, command.origin])),
+    [effectiveCommands],
+  );
   const projectOptions = availableProjects.map((project) => ({
     value: project.projectId,
     label: project.name,
@@ -321,7 +349,7 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
         </div>
 
         <SettingsCard className="px-[18px] py-3 text-xs text-muted-foreground">
-          Project commands are editable. Global and built-in commands are listed below as read-only effective commands.
+          Project commands are editable. Global and built-in command sources are read-only; status badges show which source executes.
         </SettingsCard>
 
         {selectedProject ? (
@@ -348,7 +376,8 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
                   <CommandRow
                     key={command.name}
                     command={command}
-                    shadowsGlobal={projectCommandsByName.get(command.name)?.shadowsGlobal ?? false}
+                    catalogCommand={projectCommandsByName.get(command.name)}
+                    effectiveOrigin={effectiveOriginByName.get(command.name)}
                     onEdit={() => setEditing(command)}
                     onDelete={(trigger) => setDeleting({ command, trigger })}
                   />
@@ -366,7 +395,13 @@ export function CommandsTab({ projects, defaultProjectId }: { projects?: Project
                   Loading global and built-in commands…
                 </SettingsCard>
               ) : externalCommands.length > 0 ? (
-                externalCommands.map((command) => <ReadOnlyCommandRow key={command.name} command={command} />)
+                externalCommands.map((command) => (
+                  <ReadOnlyCommandRow
+                    key={`${command.origin}:${command.name}`}
+                    command={command}
+                    effectiveOrigin={effectiveOriginByName.get(command.name)}
+                  />
+                ))
               ) : (
                 <SettingsCard className="p-6 text-center text-[13px] text-muted-foreground">No global commands.</SettingsCard>
               )}

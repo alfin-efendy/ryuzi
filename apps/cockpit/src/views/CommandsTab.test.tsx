@@ -37,8 +37,26 @@ const modelOption: SelectableModelInfo = {
 
 const createdCommand = { ...command, name: "ship", template: "Ship $ARGUMENTS" };
 const effectiveCommands: CommandInfo[] = [
-  { name: "audit", description: "Project audit", agent: null, model: null, subtask: false, origin: "project", shadowsGlobal: true },
-  { name: "deploy", description: "Deploy everywhere", agent: null, model: null, subtask: false, origin: "global", shadowsGlobal: false },
+  {
+    name: "audit",
+    description: "Project audit",
+    agent: null,
+    model: null,
+    subtask: false,
+    origin: "project",
+    effective: true,
+    shadowsGlobal: true,
+  },
+  {
+    name: "deploy",
+    description: "Deploy everywhere",
+    agent: null,
+    model: null,
+    subtask: false,
+    origin: "global",
+    effective: true,
+    shadowsGlobal: false,
+  },
   {
     name: "init",
     description: "Initialize the project",
@@ -46,6 +64,7 @@ const effectiveCommands: CommandInfo[] = [
     model: null,
     subtask: false,
     origin: "builtin",
+    effective: true,
     shadowsGlobal: false,
   },
 ];
@@ -96,9 +115,38 @@ test("disables command creation until a project is selected", () => {
 test("validates backend command names and previews positional placeholders", () => {
   expect(projectCommandNameError("Review")).toContain("lowercase");
   expect(projectCommandNameError("init")).toContain("Built-in");
+  expect(projectCommandNameError("init", true)).toBeNull();
   expect(projectCommandNameError("team/review")).toBeNull();
   expect(projectCommandPreview("review", "Review $ARGUMENTS; compare $1 with $2")).toBe(
     "/review <arguments>\nReview <arguments>; compare <argument 1> with <argument 2>",
+  );
+});
+
+test("saves an existing reserved command after editing its template", async () => {
+  const initCommand: ProjectCommandInfo = {
+    ...command,
+    name: "init",
+    description: "Initialize this project",
+    template: "Initial template",
+  };
+  useNative.setState({ projectCommandsByProject: { p1: [initCommand] } });
+  listProjectCommands.mockResolvedValueOnce({ status: "ok", data: [initCommand] });
+  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+
+  await screen.findByText("Initialize this project");
+  fireEvent.click(screen.getByRole("button", { name: "Edit /init" }));
+  expect((screen.getByLabelText("Name") as HTMLInputElement).disabled).toBe(true);
+  fireEvent.change(screen.getByLabelText("Template"), { target: { value: "Updated template" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() =>
+    expect(updateProjectCommand).toHaveBeenCalledWith(
+      "local",
+      "p1",
+      "init",
+      initCommand.revision,
+      expect.objectContaining({ template: "Updated template" }),
+    ),
   );
 });
 
@@ -114,6 +162,79 @@ test("renders global and built-in commands as read-only with visible origins", a
   expect(screen.queryByRole("button", { name: "Edit /deploy" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Delete /deploy" })).toBeNull();
   expect(screen.getByText("Overrides global")).toBeTruthy();
+});
+
+test("shows every colliding source with its effective status", async () => {
+  const catalog: CommandInfo[] = [
+    {
+      name: "ship",
+      description: "Project ship",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "project",
+      effective: true,
+      shadowsGlobal: true,
+    },
+    {
+      name: "ship",
+      description: "Global ship",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "global",
+      effective: false,
+      shadowsGlobal: false,
+    },
+    {
+      name: "init",
+      description: "Project init",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "project",
+      effective: false,
+      shadowsGlobal: true,
+    },
+    {
+      name: "init",
+      description: "Global init",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "global",
+      effective: false,
+      shadowsGlobal: false,
+    },
+    {
+      name: "init",
+      description: "Built-in init",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "builtin",
+      effective: true,
+      shadowsGlobal: false,
+    },
+  ];
+  const projectCommands = [
+    { ...command, name: "ship", description: "Project ship" },
+    { ...command, name: "init", description: "Project init" },
+  ];
+  listProjectCommands.mockResolvedValueOnce({ status: "ok", data: projectCommands });
+  nativeCommands.mockResolvedValueOnce({ status: "ok", data: catalog });
+
+  render(<CommandsTab projects={[project]} defaultProjectId="p1" />);
+
+  expect(await screen.findByText("Global ship")).toBeTruthy();
+  expect(screen.getByText("Global init")).toBeTruthy();
+  expect(screen.getByText("Built-in init")).toBeTruthy();
+  expect(screen.getByText("Overrides global")).toBeTruthy();
+  expect(screen.getAllByText("Shadowed by built-in")).toHaveLength(2);
+  expect(screen.getAllByText("Shadowed by project")).toHaveLength(1);
+  expect(screen.getAllByText("Effective")).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: "Edit /ship" })).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: "Edit /init" })).toHaveLength(1);
 });
 
 test("opens deletion confirmation from a trigger and confirms or cancels the requested command", async () => {

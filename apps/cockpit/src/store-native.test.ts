@@ -30,6 +30,7 @@ const effectiveGlobalCommand: CommandInfo = {
   model: null,
   subtask: false,
   origin: "global",
+  effective: true,
   shadowsGlobal: false,
 };
 

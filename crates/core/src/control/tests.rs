@@ -397,10 +397,13 @@ async fn test_control_plane_full(
 
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
 /// the cold-resume rollback path in `continue_session`.
-struct FailingHarnessFactory;
+struct FailingHarnessFactory {
+    message: String,
+}
+
 impl HarnessFactory for FailingHarnessFactory {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
-        Err(anyhow::anyhow!("boom: harness factory intentionally fails"))
+        Err(anyhow::anyhow!(self.message.clone()))
     }
 }
 
@@ -637,6 +640,187 @@ async fn inbound_webhook_preserves_accepted_size_payload_in_run_and_agent_prompt
 }
 
 #[tokio::test]
+async fn startup_failure_finishes_only_its_linked_agent_run_as_failed() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let mut regs = Registries::new();
+    regs.harness = Arc::new(FailingHarnessFactory {
+        message: format!("startup failure {}", "x".repeat(1_100)),
+    });
+    let cp = test_control_plane(store, regs).await;
+    seed_project(cp.store(), "project-1").await;
+    let hook = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "failing startup",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let unrelated = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "unrelated",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let unrelated_run = crate::automation::create_run(
+        cp.store(),
+        &unrelated.id,
+        serde_json::json!({ "unrelated": true }),
+    )
+    .await
+    .unwrap();
+    seed_session(
+        cp.store(),
+        "unrelated-session",
+        "project-1",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    cp.store()
+        .insert_hook_origin(
+            "unrelated-session",
+            &crate::automation::HookOrigin::new(&unrelated.id, &unrelated_run.id, 1),
+        )
+        .await
+        .unwrap();
+    assert!(crate::automation::link_run_session(
+        cp.store(),
+        &unrelated_run.id,
+        "unrelated-session"
+    )
+    .await
+    .unwrap());
+    let mut events = cp.subscribe();
+
+    cp.dispatch_automation_event(
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::SessionEnd,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("session", "test"),
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await;
+
+    let run = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("agent.run hook must create a run");
+    let session_pk = run
+        .session_pk
+        .clone()
+        .expect("agent.run hook must link its run to a session");
+    let startup_error = wait_for_message(cp.store(), &session_pk, |message| {
+        message.block_type == "error"
+    })
+    .await;
+
+    let failed = {
+        let mut terminal = None;
+        for _ in 0..400 {
+            let candidate = crate::automation::list_runs(cp.store(), &hook.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            if candidate.status != "running" {
+                terminal = Some(candidate);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        terminal.expect("startup failure must terminalize the linked hook run")
+    };
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.session_pk.as_deref(), Some(session_pk.as_str()));
+    let error = failed
+        .error
+        .as_deref()
+        .expect("startup error must be recorded");
+    assert!(error.starts_with("Couldn't start the agent: startup failure "));
+    assert_eq!(error.chars().count(), 1_024, "run errors are sanitized");
+    assert_eq!(
+        startup_error.payload["message"].as_str(),
+        Some(
+            format!(
+                "Couldn't start the agent: startup failure {}",
+                "x".repeat(1_100)
+            )
+            .as_str()
+        )
+    );
+
+    let unrelated_after = crate::automation::list_runs(cp.store(), &unrelated.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == unrelated_run.id)
+        .unwrap();
+    assert_eq!(unrelated_after.status, "running");
+    assert_eq!(
+        unrelated_after.session_pk.as_deref(),
+        Some("unrelated-session")
+    );
+    assert!(unrelated_after.error.is_none());
+
+    assert!(
+        !crate::automation::finish_run(
+            cp.store(),
+            &run.id,
+            "success",
+            Some("later-session"),
+            None,
+        )
+        .await
+        .unwrap(),
+        "the terminal startup failure must reject late completion"
+    );
+
+    let mut statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::AutomationHookRunChanged { run_id, status, .. } = event {
+            if run_id == run.id {
+                statuses.push(status);
+            }
+        }
+    }
+    assert!(
+        statuses.iter().any(|status| status == "failed"),
+        "startup failure must emit a failed run event, got: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "success"),
+        "startup failure must never emit a successful run event, got: {statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|status| matches!(status.as_str(), "running" | "failed")),
+        "startup failure must emit only running or failed events, got: {statuses:?}"
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
 async fn ending_a_hook_session_preserves_failed_run_and_never_emits_late_success() {
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
@@ -802,7 +986,9 @@ async fn control_plane_with_failing_factory(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness = Arc::new(FailingHarnessFactory);
+    regs.harness = Arc::new(FailingHarnessFactory {
+        message: "boom: harness factory intentionally fails".into(),
+    });
     let cp = test_control_plane(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
