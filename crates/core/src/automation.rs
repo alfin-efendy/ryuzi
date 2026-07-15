@@ -14,7 +14,7 @@ use specta::Type;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 const MAX_RUNS: u32 = 20;
@@ -346,7 +346,7 @@ pub fn dispatch_lifecycle_observation(
 }
 
 struct LifecycleDispatch {
-    sender: tokio::sync::mpsc::Sender<LifecycleObservation>,
+    sender: Mutex<tokio::sync::mpsc::Sender<LifecycleObservation>>,
 }
 
 struct LifecycleObservation {
@@ -364,8 +364,11 @@ impl LifecycleDispatch {
         session_pk: String,
         data: Value,
     ) {
-        if self
-            .sender
+        let mut sender = self.sender.lock().unwrap();
+        if sender.is_closed() {
+            *sender = spawn_lifecycle_worker();
+        }
+        if sender
             .try_send(LifecycleObservation {
                 sink,
                 trigger,
@@ -379,28 +382,32 @@ impl LifecycleDispatch {
     }
 }
 
+fn spawn_lifecycle_worker() -> tokio::sync::mpsc::Sender<LifecycleObservation> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(async move {
+        while let Some(observation) = receiver.recv().await {
+            let LifecycleObservation {
+                sink,
+                trigger,
+                session_pk,
+                data,
+            } = observation;
+            if let Err(error) =
+                std::panic::AssertUnwindSafe(sink.observe_lifecycle(trigger, session_pk, data))
+                    .catch_unwind()
+                    .await
+            {
+                tracing::error!(?error, "automation lifecycle observer panicked");
+            }
+        }
+    });
+    sender
+}
+
 fn lifecycle_dispatcher() -> &'static LifecycleDispatch {
     static DISPATCHER: OnceLock<LifecycleDispatch> = OnceLock::new();
-    DISPATCHER.get_or_init(|| {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
-        tokio::spawn(async move {
-            while let Some(observation) = receiver.recv().await {
-                let LifecycleObservation {
-                    sink,
-                    trigger,
-                    session_pk,
-                    data,
-                } = observation;
-                if let Err(error) =
-                    std::panic::AssertUnwindSafe(sink.observe_lifecycle(trigger, session_pk, data))
-                        .catch_unwind()
-                        .await
-                {
-                    tracing::error!(?error, "automation lifecycle observer panicked");
-                }
-            }
-        });
-        LifecycleDispatch { sender }
+    DISPATCHER.get_or_init(|| LifecycleDispatch {
+        sender: Mutex::new(spawn_lifecycle_worker()),
     })
 }
 
@@ -1557,6 +1564,56 @@ mod tests {
         Arc,
     };
     use tokio::sync::oneshot;
+
+    struct RecordingLifecycleSink {
+        sent: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AutomationEventSink for RecordingLifecycleSink {
+        async fn observe_lifecycle(&self, _trigger: TriggerKind, session_pk: String, _data: Value) {
+            let _ = self.sent.send(session_pk);
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_dispatcher_restarts_after_its_worker_runtime_stops() {
+        let dispatcher = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+                Arc::new(LifecycleDispatch {
+                    sender: Mutex::new(sender),
+                })
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(
+            dispatcher.sender.lock().unwrap().is_closed(),
+            "the test runtime dropped its worker"
+        );
+
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        dispatcher.dispatch(
+            Arc::new(RecordingLifecycleSink { sent }),
+            TriggerKind::SessionStart,
+            "recovered".into(),
+            Value::Null,
+        );
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+                .await
+                .expect("dispatcher must restart a closed worker")
+                .expect("lifecycle channel must remain open"),
+            "recovered"
+        );
+    }
 
     async fn loopback_status_server(
         statuses: Vec<StatusCode>,

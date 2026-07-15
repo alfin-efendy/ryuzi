@@ -2759,8 +2759,8 @@ mod tests {
     }
 
     struct BlockingAutomationSink {
-        entered: tokio::sync::Notify,
-        release: tokio::sync::Notify,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
     }
 
     #[async_trait::async_trait]
@@ -2771,8 +2771,12 @@ mod tests {
             _session_pk: String,
             _data: Value,
         ) {
-            self.entered.notify_one();
-            self.release.notified().await;
+            let _ = self.entered.send(());
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("test semaphore stays open");
         }
     }
 
@@ -2803,9 +2807,11 @@ mod tests {
             (selection, final_turn("done")),
         ]));
         let mut deps = deps_at(dir.path(), llm).await;
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let sink = Arc::new(BlockingAutomationSink {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
+            entered,
+            release: release.clone(),
         });
         deps.automation_events = Some(sink.clone());
         deps.extension_events = Some(Arc::new(FixedExtensionEvents {
@@ -2827,8 +2833,11 @@ mod tests {
             .find(|m| m.block_type == "tool_call")
             .expect("a tool_call row must exist");
         assert_eq!(tool_call.payload["output"], "blocked by policy extension");
-        sink.entered.notified().await;
-        sink.release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("automation lifecycle sink must run")
+            .expect("automation lifecycle channel must remain open");
+        release.add_permits(1);
     }
 
     #[tokio::test]
