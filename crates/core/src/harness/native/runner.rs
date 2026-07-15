@@ -3,7 +3,7 @@
 //! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
-use super::commands::CommandRegistry;
+use super::commands::{CommandRegistry, ResolvedCommand};
 use super::context_manager::{
     compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
     ContextManager,
@@ -132,6 +132,9 @@ pub struct RunnerDeps {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<CoreEvent>,
     pub approvals: Arc<ApprovalHub>,
+    /// Observational UI automation sink. It is deliberately separate from
+    /// native script/extension hook dispatch, so it can never gate a tool.
+    pub automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     pub llm: Arc<dyn LlmStream>,
     pub tools: Arc<ToolRegistry>,
     /// The selected primary agent for this session.
@@ -191,6 +194,59 @@ impl RunnerDeps {
     }
 }
 
+/// Normal-turn metadata that affects runtime execution without changing the
+/// prompt text persisted or sent to the model.
+#[derive(Debug, Clone, Default)]
+struct TurnOptions {
+    subtask: bool,
+}
+
+/// Return the resolved command's normal-turn runtime metadata. Kept separate
+/// from prompt expansion so the flag cannot leak into model-visible text.
+fn turn_options(command: &super::commands::ResolvedCommand) -> TurnOptions {
+    TurnOptions {
+        subtask: command.subtask,
+    }
+}
+
+async fn max_provider_turns(deps: &RunnerDeps, options: &TurnOptions) -> usize {
+    if options.subtask {
+        SUBAGENT_MAX_ITERS
+    } else {
+        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
+            .await
+    }
+}
+
+async fn command_root(deps: &RunnerDeps) -> PathBuf {
+    let Some(project_id) = deps.project_id.as_deref() else {
+        return deps.work_dir.clone();
+    };
+    match deps.store.get_project(project_id).await {
+        Ok(Some(project)) => PathBuf::from(project.workdir),
+        Ok(None) => deps.work_dir.clone(),
+        Err(error) => {
+            tracing::warn!(project_id, %error, "native: falling back to active worktree for command root");
+            deps.work_dir.clone()
+        }
+    }
+}
+
+/// Resolve a slash command from its current project root. Agent overrides use
+/// the matching root's registry; absent command agent metadata leaves the
+/// session's active-worktree agent unchanged.
+async fn resolve_slash_command(
+    deps: &RunnerDeps,
+    input: &str,
+) -> Option<(ResolvedCommand, Option<Agent>)> {
+    let root = command_root(deps).await;
+    let commands = CommandRegistry::load(&root);
+    let agents = AgentRegistry::load(&root);
+    let resolved = commands.resolve(input)?;
+    let agent = resolved.agent.as_deref().and_then(|name| agents.get(name));
+    Some((resolved, agent))
+}
+
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
 /// (end_turn / cancellation); the control plane then emits `CoreEvent::Result`.
 ///
@@ -203,21 +259,56 @@ pub async fn run_turn(
 ) -> anyhow::Result<()> {
     let trimmed = prompt.display.trim();
     let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
+    let force_subtask = prompt.force_subtask;
 
-    // Slash-command resolution on the raw user text.
-    let (agent_text, agent) = if manual_compact {
-        (prompt.agent.clone(), deps.agent.clone())
+    // Slash-command resolution on the raw user text. Reload only for a
+    // command-shaped prompt so project command CRUD becomes visible to a live
+    // session without adding filesystem work to ordinary turns. When the
+    // owning project is reachable, its canonical workdir is the command root;
+    // chat/bare or deleted-project sessions fall back to the active worktree.
+    // Command metadata stays outside the expanded prompt and is applied only
+    // to this turn.
+    let (agent_text, agent, command_model, mut options) = if manual_compact {
+        (
+            prompt.agent.clone(),
+            deps.agent.clone(),
+            None,
+            TurnOptions::default(),
+        )
     } else {
-        match deps.commands.resolve(&prompt.display) {
-            Some((expanded, override_agent)) => {
-                let agent = override_agent
-                    .and_then(|n| deps.agents.get(&n))
-                    .unwrap_or_else(|| deps.agent.clone());
-                (merge_agent_prompt_suffix(expanded, &prompt), agent)
+        let resolved = if trimmed.starts_with('/') {
+            resolve_slash_command(deps, &prompt.display).await
+        } else {
+            deps.commands
+                .resolve(&prompt.display)
+                .map(|resolved| (resolved, None))
+        };
+        match resolved {
+            Some((resolved, command_agent)) => {
+                let agent = command_agent.unwrap_or_else(|| deps.agent.clone());
+                let options = turn_options(&resolved);
+                (
+                    merge_agent_prompt_suffix(resolved.prompt, &prompt),
+                    agent,
+                    resolved.model,
+                    options,
+                )
             }
-            None => (prompt.agent.clone(), deps.agent.clone()),
+            None => (
+                prompt.agent.clone(),
+                deps.agent.clone(),
+                None,
+                TurnOptions::default(),
+            ),
         }
     };
+    // A caller-supplied override (currently: automation Hook agent runs)
+    // wins over slash-command resolution — the hook's `subtask` field must
+    // reach the same runtime budget a command's `subtask: true` frontmatter
+    // does, regardless of whether the prompt happened to start with `/`.
+    if let Some(force_subtask) = force_subtask {
+        options.subtask = force_subtask;
+    }
 
     // 1. Persist + broadcast the user's message (raw display text).
     emit_row(
@@ -237,7 +328,7 @@ pub async fn run_turn(
     // generation, and the sub-agent spawner — shares this immutable snapshot;
     // the original `deps` is never mutated, so in-flight turns and running
     // subagents keep the configuration they started with.
-    let turn_deps = refresh_turn_configuration(deps).await;
+    let turn_deps = refresh_turn_configuration(deps, command_model).await;
     let deps = &turn_deps;
 
     // /compact is an action, but it still snapshots the same complete turn
@@ -306,9 +397,7 @@ pub async fn run_turn(
     // `while budget.try_consume()` loop caps at exactly this many provider
     // turns per window, and each auto-continue re-grants a fresh window of the
     // same size (drive() re-reads the setting for that grant).
-    let max_provider_turns =
-        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
-            .await;
+    let max_provider_turns = max_provider_turns(deps, &options).await;
     let budget = IterationBudget::new(max_provider_turns);
     drive(
         deps,
@@ -420,24 +509,34 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
     }
 }
 
-/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the freshest
-/// resolution of the project's pinned model. Falls back to the session-start
-/// model when no project row is reachable (bare tests, ephemeral contexts) or
-/// when nothing resolves at all (empty store / no routable connection), so
-/// those contexts behave exactly as before. When the pinned model fails
-/// routing and a substitute is resolved, a status row announces the
-/// substitution — no silent swap.
-async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
+/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the command
+/// model override when present, otherwise the freshest project/session model.
+/// A command override wins only for this turn; it never changes persisted
+/// project or session settings. Falls back to the session-start model when no
+/// project row is reachable (bare tests, ephemeral contexts) or when nothing
+/// resolves at all (empty store / no routable connection), so those contexts
+/// behave exactly as before. When the chosen model fails routing and a
+/// substitute is resolved, a status row announces the substitution — no silent
+/// swap.
+async fn refresh_turn_configuration(
+    deps: &RunnerDeps,
+    command_model: Option<String>,
+) -> RunnerDeps {
     let project_pin = project_pinned_model(deps).await;
     let session_pin = if project_pin.is_none() {
         chat_session_pinned_model(&deps.store, &deps.session_pk).await
     } else {
         None
     };
-    let pinned = match project_pin.clone() {
-        Some(pinned) => pinned,
-        None => session_pin.clone().or_else(|| deps.model.clone()),
-    };
+    let has_command_model = command_model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty());
+    let pinned = command_model
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| match project_pin.clone() {
+            Some(pinned) => pinned,
+            None => session_pin.clone().or_else(|| deps.model.clone()),
+        });
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
         if !pinned.trim().is_empty() && pinned != resolved {
@@ -461,7 +560,7 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
         turn.model = resolved;
     }
     let model = turn.model.as_deref().unwrap_or("");
-    if project_pin.is_some() || session_pin.is_some() {
+    if has_command_model || project_pin.is_some() || session_pin.is_some() {
         turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
     }
     let policy = if let Some(project_id) = turn.project_id.as_deref() {
@@ -1677,6 +1776,12 @@ async fn run_tool_call(
         &json!({ "tool": t.name, "input": input }),
     )
     .await;
+    crate::automation::dispatch_lifecycle_observation(
+        deps.automation_events.clone(),
+        crate::automation::TriggerKind::ToolBefore,
+        deps.session_pk.clone(),
+        json!({ "tool": t.name, "input": input }),
+    );
     if !hook.allowed {
         let msg = hook
             .message
@@ -1791,13 +1896,20 @@ async fn run_tool_call(
     };
     // Observational: never gates, result ignored. Fires for both Ok and Err
     // outcomes now that the `ToolOutput` (or its error) has resolved.
+    let after_payload = json!({ "tool": t.name, "input": hook_input, "result": after_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolAfter,
-        &json!({ "tool": t.name, "input": hook_input, "result": after_summary }),
+        &after_payload,
     )
     .await;
+    crate::automation::dispatch_lifecycle_observation(
+        deps.automation_events.clone(),
+        crate::automation::TriggerKind::ToolAfter,
+        deps.session_pk.clone(),
+        after_payload,
+    );
     tool_use_result
 }
 
@@ -2485,7 +2597,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refreshed = refresh_turn_configuration(&deps).await;
+        let refreshed = refresh_turn_configuration(&deps, None).await;
         assert_eq!(refreshed.model.as_deref(), Some("anthropic/model-b"));
         assert_eq!(refreshed.meta.context_window, 222_222);
     }
@@ -2571,6 +2683,7 @@ mod tests {
             store,
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
             agent,
@@ -2645,6 +2758,28 @@ mod tests {
         reason: &'static str,
     }
 
+    struct BlockingAutomationSink {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::automation::AutomationEventSink for BlockingAutomationSink {
+        async fn observe_lifecycle(
+            &self,
+            _trigger: crate::automation::TriggerKind,
+            _session_pk: String,
+            _data: Value,
+        ) {
+            let _ = self.entered.send(());
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("test semaphore stays open");
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::plugins::extension::ExtensionEvents for FixedExtensionEvents {
         async fn dispatch(
@@ -2661,6 +2796,48 @@ mod tests {
                 crate::harness::native::hooks::HookResult::allow()
             }
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_lifecycle_sink_does_not_change_native_tool_gate_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection = route_selection("a", "Primary");
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = Arc::new(BlockingAutomationSink {
+            entered,
+            release: release.clone(),
+        });
+        deps.automation_events = Some(sink.clone());
+        deps.extension_events = Some(Arc::new(FixedExtensionEvents {
+            deny_event: crate::harness::native::hooks::HookEvent::ToolBefore,
+            reason: "blocked by policy extension",
+        }));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let tool_call = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("a tool_call row must exist");
+        assert_eq!(tool_call.payload["output"], "blocked by policy extension");
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("automation lifecycle sink must run")
+            .expect("automation lifecycle channel must remain open");
+        release.add_permits(1);
     }
 
     #[tokio::test]
@@ -3460,6 +3637,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_subtask_uses_subagent_turn_budget() {
+        use testutil::ScriptedLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "7",
+            )
+            .await
+            .unwrap();
+        let options = turn_options(&super::super::commands::ResolvedCommand {
+            prompt: "Ship now".into(),
+            agent: None,
+            model: None,
+            subtask: true,
+        });
+
+        assert_eq!(
+            max_provider_turns(&deps, &options).await,
+            SUBAGENT_MAX_ITERS
+        );
+        assert_eq!(
+            max_provider_turns(&deps, &TurnOptions::default()).await,
+            7,
+            "plain turns keep the configured normal budget"
+        );
+    }
+
+    /// `TurnPrompt.force_subtask` is the caller seam automation Hook agent
+    /// runs use to reach the exact same subagent budget a `subtask: true`
+    /// slash command reaches — proven directly against `run_turn`'s options
+    /// resolution rather than only the pure `turn_options` helper above.
+    #[tokio::test]
+    async fn turn_prompt_force_subtask_overrides_plain_text_turn_options() {
+        use testutil::ScriptedLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "7",
+            )
+            .await
+            .unwrap();
+
+        // Plain (non-command) text with no override keeps the configured
+        // normal budget.
+        let plain = TurnPrompt::text("hello", "hello");
+        assert_eq!(plain.force_subtask, None);
+        assert_eq!(max_provider_turns(&deps, &TurnOptions::default()).await, 7);
+
+        // A hook-run TurnPrompt forcing subtask=true reaches the same
+        // subagent budget as a `subtask: true` command, even though its
+        // text is plain (not a `/command`).
+        let mut hook_prompt = TurnPrompt::text("Review $EVENT", "Review $EVENT");
+        hook_prompt.force_subtask = Some(true);
+        let mut options = TurnOptions::default();
+        if let Some(force_subtask) = hook_prompt.force_subtask {
+            options.subtask = force_subtask;
+        }
+        assert_eq!(
+            max_provider_turns(&deps, &options).await,
+            SUBAGENT_MAX_ITERS
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_project_command_root_falls_back_to_active_worktree() {
+        use testutil::RecordingLlm;
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_workdir = dir.path().join("canonical-project");
+        std::fs::create_dir_all(&canonical_workdir).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".ryuzi/commands/fallback.md"),
+            "Active-worktree fallback $ARGUMENTS",
+        )
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("deleted-project".into());
+        deps.store
+            .insert_project(crate::domain::Project {
+                project_id: "deleted-project".into(),
+                name: "deleted-project".into(),
+                workdir: canonical_workdir.display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::BypassPermissions,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        deps.store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM projects WHERE project_id='deleted-project'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("/fallback command", "/fallback command"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert!(
+            body.to_string()
+                .contains("Active-worktree fallback command"),
+            "a missing project row must resolve slash commands from the active worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_model_overrides_the_project_model_for_one_turn() {
+        use crate::domain::{PermMode, Project, Session, SessionKind, SessionStatus};
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".ryuzi/commands/ship.md"),
+            "---\nmodel: anthropic/model-b\nsubtask: true\n---\nShip $ARGUMENTS",
+        )
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("p".into());
+        deps.commands = Arc::new(CommandRegistry::load(dir.path()));
+        add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
+        deps.store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "project".into(),
+                workdir: dir.path().display().to_string(),
+                source: None,
+                model: Some("anthropic/model-a".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        deps.store
+            .insert_session(Session {
+                session_pk: "s1".into(),
+                project_id: Some("p".into()),
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Project,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("/ship now", "/ship now"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/model-b");
+        assert!(!body.to_string().contains("subtask"));
+    }
+    #[tokio::test]
     async fn refresh_turn_configuration_reloads_model_effort_preferences_defaults_and_meta() {
         use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
         use crate::llm_router::model_effort::{
@@ -3602,7 +3976,10 @@ mod tests {
             }));
         }
         assert_eq!(
-            refresh_turn_configuration(&deps).await.meta.context_window,
+            refresh_turn_configuration(&deps, None)
+                .await
+                .meta
+                .context_window,
             222_222
         );
     }

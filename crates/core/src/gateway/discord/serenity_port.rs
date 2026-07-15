@@ -69,7 +69,7 @@ use crate::gateway::discord::{
     build_commands, DiscordGateway, DiscordPort, InboundHandlers, InboundInteraction,
     InboundMessage, PortApprovalRequest,
 };
-use crate::gateway::{Gateway, GatewayFactory};
+use crate::gateway::{Gateway, GatewayFactory, GatewayStatus, GatewayStatusPublisher};
 use crate::policy::can_approve;
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -171,6 +171,7 @@ struct Handler {
     handlers: Arc<dyn InboundHandlers>,
     connected: Arc<Mutex<Option<ConnectedState>>>,
     ready_tx: Mutex<Option<oneshot::Sender<()>>>,
+    status: Arc<GatewayStatusPublisher>,
 }
 
 #[async_trait]
@@ -186,9 +187,19 @@ impl EventHandler for Handler {
             shard: ctx.shard.clone(),
             bot_user_id: data_about_bot.user.id,
         });
+        self.status.publish(GatewayStatus::Connected);
         if let Some(tx) = self.ready_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
+    }
+
+    async fn shard_stage_update(&self, _ctx: Context, event: ShardStageUpdateEvent) {
+        let status = if event.new == ConnectionStage::Connected {
+            GatewayStatus::Connected
+        } else {
+            GatewayStatus::Offline
+        };
+        self.status.publish(status);
     }
 
     /// Normalizes a gateway message-create event into an [`InboundMessage`]
@@ -306,6 +317,7 @@ pub struct SerenityDiscordPort {
     http: Arc<Http>,
     connected: Arc<Mutex<Option<ConnectedState>>>,
     shard_manager: Mutex<Option<Arc<ShardManager>>>,
+    status: Arc<GatewayStatusPublisher>,
 }
 
 impl SerenityDiscordPort {
@@ -319,12 +331,14 @@ impl SerenityDiscordPort {
         let http = Http::new(&token);
         http.set_application_id(ApplicationId::new(app_id));
 
+        let status = Arc::new(GatewayStatusPublisher::new(GatewayStatus::Offline));
         Ok(SerenityDiscordPort {
             token,
             guild_id: GuildId::new(guild_id),
             http: Arc::new(http),
             connected: Arc::new(Mutex::new(None)),
             shard_manager: Mutex::new(None),
+            status,
         })
     }
 }
@@ -346,6 +360,7 @@ impl DiscordPort for SerenityDiscordPort {
             handlers,
             connected: Arc::clone(&self.connected),
             ready_tx: Mutex::new(Some(ready_tx)),
+            status: Arc::clone(&self.status),
         };
         let intents = GatewayIntents::GUILDS
             | GatewayIntents::GUILD_MESSAGES
@@ -357,16 +372,22 @@ impl DiscordPort for SerenityDiscordPort {
 
         *self.shard_manager.lock().unwrap() = Some(Arc::clone(&client.shard_manager));
 
+        let status = Arc::clone(&self.status);
         tokio::spawn(async move {
             if let Err(e) = client.start().await {
                 eprintln!("[discord] gateway client stopped: {e}");
             }
+            status.publish(GatewayStatus::Offline);
         });
 
         ready_rx
             .await
             .context("discord gateway disconnected before it became ready")?;
         Ok(())
+    }
+
+    fn subscribe_status(&self) -> Option<crate::gateway::GatewayStatusSubscription> {
+        Some(self.status.subscribe())
     }
 
     async fn disconnect(&self) -> anyhow::Result<()> {
@@ -378,6 +399,15 @@ impl DiscordPort for SerenityDiscordPort {
         if let Some(sm) = shard_manager {
             sm.shutdown_all().await;
         }
+        // Publish the terminal transition synchronously here rather than
+        // relying solely on the detached `client.start()` task's own tail
+        // publish (spawned in `connect`): that task's completion is
+        // unsynchronized with this method's return, so a caller awaiting
+        // `disconnect()` could observe it finish before `Offline` is
+        // enqueued on the broadcast channel. The detached task's own
+        // publish becomes a redundant no-op afterward (deduped by
+        // `GatewayStatusPublisher::publish`'s `send_if_modified`).
+        self.status.publish(GatewayStatus::Offline);
         Ok(())
     }
 

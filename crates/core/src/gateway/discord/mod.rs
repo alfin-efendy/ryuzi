@@ -67,7 +67,7 @@
 //! populated one.
 
 use crate::domain::{ApprovalDecision, ApprovalRequest, AttachmentRef, PermMode, Surface};
-use crate::gateway::{Gateway, GatewayFactory, MessageRef};
+use crate::gateway::{Gateway, GatewayFactory, GatewayStatusSubscription, MessageRef};
 use crate::router::{ConnectOpts, Router};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -171,6 +171,12 @@ pub trait DiscordPort: Send + Sync {
         conversation_id: &str,
         req: &PortApprovalRequest,
     ) -> anyhow::Result<(bool, String)>;
+
+    /// Subscribe to connection state observed by the port. Test ports and
+    /// alternate connectors retain a default no-op implementation.
+    fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
+        None
+    }
 }
 
 /// Handed to `DiscordPort::connect` so a real connector can dispatch inbound
@@ -432,6 +438,10 @@ impl Gateway for DiscordGateway {
 
     fn set_router(&self, router: Arc<Router>) {
         *self.inbound.router.write().unwrap() = Some(router);
+    }
+
+    fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
+        self.port.subscribe_status()
     }
 
     async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {

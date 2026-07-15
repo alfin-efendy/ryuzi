@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   Bot,
-  CalendarClock,
+  Workflow,
   ChevronRight,
   ChevronsUpDown,
   Folder,
@@ -61,7 +61,7 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
   { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
   { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail"] },
-  { label: "Scheduler", icon: CalendarClock, view: { kind: "scheduler" }, group: ["scheduler", "jobDetail", "jobNew"] },
+  { label: "Automations", icon: Workflow, view: { kind: "automations" }, group: ["automations", "scheduler", "jobDetail", "jobNew"] },
   { label: "Plugins", icon: LayoutGrid, view: { kind: "plugins" }, group: ["plugins", "appDetail", "pluginDetail"] },
   { label: "Agents", icon: Bot, view: { kind: "agents" }, group: ["agents", "agentDetail"] },
   { label: "Settings", icon: Settings, view: { kind: "settings" }, group: ["settings"] },

@@ -711,6 +711,12 @@ pub enum CoreEvent {
     SessionEnded {
         session_pk: String,
     },
+    /// A Hook run changed state (queued|running|success|failed|skipped).
+    AutomationHookRunChanged {
+        hook_id: String,
+        run_id: String,
+        status: String,
+    },
     /// A scheduled job run started or finished (status: running|success|failed).
     JobRunChanged {
         job_id: String,

@@ -2,6 +2,7 @@ mod accent;
 mod agent_cmd;
 mod apps_cmd;
 mod audit_cmd;
+mod automation_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
@@ -98,6 +99,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             scheduler_cmd::delete_job,
             scheduler_cmd::run_job_now,
             scheduler_cmd::parse_natural_schedule,
+            automation_cmd::list_automation_hooks,
+            automation_cmd::automation_hook_detail,
+            automation_cmd::create_automation_hook,
+            automation_cmd::update_automation_hook,
+            automation_cmd::toggle_automation_hook,
+            automation_cmd::delete_automation_hook,
+            automation_cmd::test_automation_hook,
             apps_cmd::list_apps,
             apps_cmd::add_app,
             apps_cmd::remove_app,
@@ -159,6 +167,11 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            native_cmd::list_project_commands,
+            native_cmd::read_project_command,
+            native_cmd::create_project_command,
+            native_cmd::update_project_command,
+            native_cmd::delete_project_command,
             native_cmd::session_queue,
             native_cmd::enqueue_session_message,
             native_cmd::remove_session_message,

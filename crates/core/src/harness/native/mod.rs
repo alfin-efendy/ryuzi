@@ -231,6 +231,15 @@ impl Harness for NativeHarness {
             }),
         )
         .await;
+        crate::automation::dispatch_lifecycle_observation(
+            ctx.automation_events.clone(),
+            crate::automation::TriggerKind::SessionStart,
+            ctx.session_pk.clone(),
+            json!({
+                "model": model.clone(),
+                "workDir": ctx.work_dir.display().to_string(),
+            }),
+        );
         // Connect MCP servers and expose their tools; the wrapping Arcs keep the
         // connections alive for the session's lifetime.
         let mut extra_tools = connect_mcp_tools(&ctx.mcp_servers, &ctx.mcp_principals).await;
@@ -277,6 +286,7 @@ impl Harness for NativeHarness {
         let nudge = seed_nudge_state(&ctx.store, &ctx.session_pk).await;
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
+            automation_events: ctx.automation_events.clone(),
             steer: steer.clone(),
             deps: runner::RunnerDeps {
                 session_pk: ctx.session_pk,
@@ -296,6 +306,7 @@ impl Harness for NativeHarness {
                 store: ctx.store,
                 events: ctx.events,
                 approvals: ctx.approvals,
+                automation_events: ctx.automation_events,
                 llm,
                 tools,
                 agent,
@@ -347,6 +358,7 @@ impl Harness for NativeHarness {
 pub struct NativeSession {
     deps: runner::RunnerDeps,
     session_pk: String,
+    automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     /// The in-flight turn's cancellation token, set for the duration of
     /// `send_prompt` so `cancel`/`end` can trip it.
     live_cancel: Mutex<Option<CancellationToken>>,
@@ -400,6 +412,12 @@ impl HarnessSession for NativeSession {
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
         .await;
+        crate::automation::dispatch_lifecycle_observation(
+            self.automation_events.clone(),
+            crate::automation::TriggerKind::SessionEnd,
+            self.session_pk.clone(),
+            json!({ "reason": "ended" }),
+        );
         Ok(())
     }
 
@@ -540,6 +558,7 @@ mod tests {
             extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            automation_events: None,
             background: super::background::BackgroundRegistry::new(),
             agent_knowledge: knowledge,
             learning_queue,
@@ -654,6 +673,210 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&capture).unwrap()).unwrap();
         assert_eq!(captured["session"], "sess");
         assert_eq!(captured["reason"], "ended");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn live_session_resolves_project_command_created_updated_and_deleted_after_start() {
+        use crate::domain::Project;
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        use commands::{delete_project_command, write_project_command, ProjectCommandInput};
+        use runner::testutil::{
+            input_json_delta, message_delta, message_stop, text_delta, tool_use_start, RecordingLlm,
+        };
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_workdir = dir.path().join("project");
+        let active_worktree = dir.path().join("session-worktree");
+        std::fs::create_dir_all(&canonical_workdir).unwrap();
+        std::fs::create_dir_all(&active_worktree).unwrap();
+        std::fs::create_dir_all(canonical_workdir.join(".ryuzi/agents")).unwrap();
+        std::fs::write(
+            canonical_workdir.join(".ryuzi/agents/reviewer.md"),
+            "---\ndescription: Canonical reviewer\n---\nYou are the canonical reviewer.",
+        )
+        .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        store
+            .insert_project(Project {
+                project_id: "project-1".into(),
+                name: "project".into(),
+                workdir: canonical_workdir.display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::BypassPermissions,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "canonical-model".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "canonical model".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(vec!["canonical-model".into()]),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "1",
+            )
+            .await
+            .unwrap();
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.auto_continue_budget",
+                "0",
+            )
+            .await
+            .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                text_delta("first"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+            vec![
+                text_delta("second"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "canonical-ls", "ls"),
+                input_json_delta(0, r#"{"path":"."}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                text_delta("canonical complete"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+            vec![
+                text_delta("third"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+        ]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+
+        let plugin = native_plugin_with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
+        let harness = plugin.harness.unwrap().create().unwrap();
+        let mut ctx = ctx_for(store.clone(), active_worktree.clone()).await;
+        ctx.project_id = Some("project-1".into());
+        ctx.kind = crate::domain::SessionKind::Project;
+        let session = harness.start_session(ctx).await.unwrap();
+
+        let created = write_project_command(
+            &canonical_workdir,
+            ProjectCommandInput {
+                name: "ship".into(),
+                description: "Ship a release".into(),
+                template: "Ship v1 $ARGUMENTS".into(),
+                agent: Some("reviewer".into()),
+                model: None,
+                subtask: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(canonical_workdir.join(".ryuzi/commands/ship.md").exists());
+        assert!(
+            !active_worktree.join(".ryuzi/commands/ship.md").exists(),
+            "the active session worktree must not supply this command"
+        );
+        session
+            .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
+            .await
+            .unwrap();
+
+        let updated = write_project_command(
+            &canonical_workdir,
+            ProjectCommandInput {
+                name: "ship".into(),
+                description: "Ship a release".into(),
+                template: "Ship v2 $ARGUMENTS".into(),
+                agent: Some("reviewer".into()),
+                model: None,
+                subtask: false,
+            },
+            Some(&created.revision),
+        )
+        .unwrap();
+        session
+            .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
+            .await
+            .unwrap();
+
+        let canonical = write_project_command(
+            &canonical_workdir,
+            ProjectCommandInput {
+                name: "ship".into(),
+                description: "Ship a release".into(),
+                template: "Ship canonical $ARGUMENTS".into(),
+                agent: None,
+                model: Some("canonical-model".into()),
+                subtask: true,
+            },
+            Some(&updated.revision),
+        )
+        .unwrap();
+        session
+            .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
+            .await
+            .unwrap();
+
+        delete_project_command(&canonical_workdir, "ship", &canonical.revision).unwrap();
+        session
+            .send_prompt(TurnPrompt::text("/ship release", "/ship release"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert!(bodies[0].to_string().contains("Ship v1 release"));
+        assert!(bodies[0]
+            .get("system")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|system| system.contains("You are the canonical reviewer.")));
+        assert!(bodies[1].to_string().contains("Ship v2 release"));
+        assert!(bodies[2].to_string().contains("Ship canonical release"));
+        assert_eq!(bodies[2]["model"], "canonical-model");
+        assert!(
+            !bodies[2]["system"]
+                .to_string()
+                .contains("You are the canonical reviewer."),
+            "an agent-less command must retain the session agent"
+        );
+        assert_eq!(
+            bodies.len(),
+            5,
+            "subtask commands get a second provider turn despite the one-turn parent setting"
+        );
+        assert!(bodies[4].to_string().contains("/ship release"));
     }
 
     #[tokio::test]

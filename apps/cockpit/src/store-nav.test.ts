@@ -4,6 +4,9 @@ import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHisto
 const home: View = { kind: "home" };
 const models: View = { kind: "models" };
 const detail: View = { kind: "providerDetail", provider: "openai" };
+const automations: View = { kind: "automations" };
+const scheduler: View = { kind: "scheduler" };
+const jobDetail: View = { kind: "jobDetail", id: "job-1" };
 
 const start: NavHistory = { back: [], current: home, forward: [] };
 
@@ -15,6 +18,15 @@ describe("nav history", () => {
     const h2 = navigateHistory(h1, detail);
     expect(h2.back).toEqual([home, models]);
     expect(h2.forward).toEqual([]);
+  });
+
+  test("automation hub routes retain legacy Scheduler history", () => {
+    const hub = navigateHistory(start, automations);
+    const legacyScheduler = navigateHistory(hub, scheduler);
+    const detail = navigateHistory(legacyScheduler, jobDetail);
+
+    expect(detail.back).toEqual([home, automations, scheduler]);
+    expect(goBackHistory(detail).current).toEqual(scheduler);
   });
 
   test("navigating to the same view is a no-op", () => {

@@ -428,6 +428,7 @@ impl Router {
                 self.state.remove(&session_pk);
             }
             CoreEvent::SessionCreated { .. }
+            | CoreEvent::AutomationHookRunChanged { .. }
             | CoreEvent::SessionQueueChanged { .. }
             | CoreEvent::ApprovalRequested { .. }
             | CoreEvent::JobRunChanged { .. }

@@ -12,7 +12,7 @@ use crate::agents::learning_queue::LearningQueue;
 use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
 use crate::domain::{ApprovalDecision, ApprovalRequest, CoreEvent, Principal, Surface};
-use crate::gateway::{Gateway, GatewayFactory};
+use crate::gateway::{Gateway, GatewayFactory, GatewayStatus};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
 use crate::llm_router::secrets;
@@ -27,8 +27,8 @@ use futures::FutureExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Inputs to [`build_daemon`].
@@ -72,6 +72,7 @@ pub struct Daemon {
     pub agent_knowledge: Arc<AgentKnowledgeStore>,
     pub learning_queue: Arc<LearningQueue>,
     telemetry: Arc<dyn Telemetry>,
+    gateway_status_handles: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
     /// Serializes the complete startup lifecycle, including gateway startup,
     /// recovery, and boot admission. A terminal boot failure is observed by a
@@ -166,6 +167,7 @@ impl Daemon {
                 for started in &self.gateways[..idx] {
                     let _ = started.stop().await;
                 }
+                self.abort_gateway_status_listeners();
                 return Err(e);
             }
         }
@@ -221,6 +223,7 @@ impl Daemon {
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.curator_handle.abort();
+        self.abort_gateway_status_listeners();
         self.router_server.stop().await;
     }
 
@@ -270,6 +273,18 @@ impl Daemon {
         for gw in &self.gateways {
             let _ = gw.stop().await;
         }
+        // Give already-enqueued listener/worker tasks one scheduling
+        // opportunity to begin processing a just-published terminal status
+        // transition (e.g. reach the point of persisting a `queued`
+        // automation run) before they are aborted below. This only yields
+        // once to the scheduler — it does not wait on network I/O or
+        // outbound hook delivery — so it reduces (but does not eliminate)
+        // the race between a gateway's own graceful-stop terminal status
+        // publish and its listener task being aborted, without
+        // reintroducing a synthesized start/stop event (rejected design:
+        // the gateway is the sole event producer).
+        tokio::task::yield_now().await;
+        self.abort_gateway_status_listeners();
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
@@ -285,10 +300,17 @@ impl Daemon {
         self.cp.shutdown_extensions().await;
         self.telemetry.shutdown();
     }
+
+    fn abort_gateway_status_listeners(&self) {
+        for listener in self.gateway_status_handles.lock().unwrap().drain(..) {
+            listener.abort();
+        }
+    }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        self.abort_gateway_status_listeners();
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
@@ -439,6 +461,8 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways.push(gw);
     }
 
+    let gateway_status_handles = Mutex::new(subscribe_gateway_statuses(Arc::clone(&cp), &gateways));
+
     // Two `Router` instances sharing the same `cp`/`store` — see `router.rs`'s
     // module doc. `router_out` drives the outbound render loop (`run`
     // consumes `self`); `router_in` is handed to every gateway via
@@ -468,6 +492,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
+    router_server.attach_control_plane(&cp);
 
     Ok(Daemon {
         cp,
@@ -479,6 +504,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         agent_knowledge: persistence.knowledge,
         learning_queue: persistence.learning,
         telemetry,
+        gateway_status_handles,
         stopped: AtomicBool::new(false),
         lifecycle: AsyncMutex::new(()),
         started: AtomicBool::new(false),
@@ -491,6 +517,85 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         learning_handle,
         curator_handle,
     })
+}
+
+/// Per-gateway queue bound between the broadcast receiver and its sole
+/// persistence worker. `send().await` deliberately applies backpressure after
+/// this many transitions rather than spawning unbounded hook-delivery tasks.
+const GATEWAY_STATUS_DELIVERY_CAPACITY: usize = 64;
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Subscribe to every status-capable gateway during daemon construction. The
+/// initial snapshot is a non-emitting baseline; every later distinct broadcast
+/// event is forwarded in receive order to one serial persistence worker.
+///
+/// If a receiver lags past the producer's bounded event buffer, the listener
+/// warns and resynchronizes its baseline to the publisher's newest snapshot.
+/// This consciously drops the unavailable intermediate transitions rather than
+/// fabricating a transition, while normal bursts fit within the 128-event
+/// producer buffer. The worker is owned by its listener task, so aborting the
+/// listener also aborts an in-flight hook delivery and drops the queue.
+fn subscribe_gateway_statuses(
+    cp: Arc<ControlPlane>,
+    gateways: &[Arc<dyn Gateway>],
+) -> Vec<JoinHandle<()>> {
+    let mut listeners = Vec::new();
+    for gateway in gateways {
+        let Some(mut subscription) = gateway.subscribe_status() else {
+            continue;
+        };
+        let gateway_id = gateway.id().to_string();
+        let listener_cp = Arc::clone(&cp);
+        listeners.push(tokio::spawn(async move {
+            let (delivery_tx, mut delivery_rx) =
+                mpsc::channel::<(GatewayStatus, GatewayStatus)>(GATEWAY_STATUS_DELIVERY_CAPACITY);
+            let worker_cp = Arc::clone(&listener_cp);
+            let worker_gateway_id = gateway_id.clone();
+            let _worker = AbortOnDrop(tokio::spawn(async move {
+                while let Some((previous, status)) = delivery_rx.recv().await {
+                    worker_cp
+                        .observe_gateway_status_transition(
+                            &worker_gateway_id,
+                            previous.as_str(),
+                            status.as_str(),
+                        )
+                        .await;
+                }
+            }));
+
+            let mut previous = subscription.initial;
+            loop {
+                match subscription.events.recv().await {
+                    Ok(status) if status != previous => {
+                        let transition = (previous, status);
+                        previous = status;
+                        if delivery_tx.send(transition).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        previous = subscription.resync();
+                        tracing::warn!(
+                            gateway_id = %gateway_id,
+                            skipped,
+                            status = previous.as_str(),
+                            "gateway status listener lagged; resynchronized baseline to latest status"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+    listeners
 }
 
 /// Subscribe to `cp`'s event bus and spawn one [`handle_approval`] task per
@@ -661,7 +766,7 @@ mod tests {
     use crate::domain::{
         NewMessage, PermMode, Project, QueuedSessionPrompt, Session, SessionKind, SessionStatus,
     };
-    use crate::gateway::MessageRef;
+    use crate::gateway::{GatewayStatus, MessageRef};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::telemetry::NoopTelemetry;
     use async_trait::async_trait;
@@ -670,8 +775,92 @@ mod tests {
     use std::sync::Mutex;
     use std::task::Poll;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ---------- shared test plumbing ----------
+
+    async fn drain_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+        let mut request = Vec::with_capacity(4096);
+        let mut request_len = None;
+        let mut buf = [0u8; 4096];
+        loop {
+            if request.len() == MAX_REQUEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP request exceeds 64 KiB test-server limit",
+                ));
+            }
+
+            let read_len = (MAX_REQUEST_BYTES - request.len()).min(buf.len());
+            let read = stream.read(&mut buf[..read_len]).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before complete HTTP request",
+                ));
+            }
+            request.extend_from_slice(&buf[..read]);
+
+            if request_len.is_none() {
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP headers are not valid UTF-8",
+                    )
+                })?;
+                let mut lines = headers.split("\r\n");
+                if lines.next().filter(|line| !line.is_empty()).is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP request line is missing",
+                    ));
+                }
+                let mut content_length = None;
+                for line in lines {
+                    let (name, value) = line.split_once(':').ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "HTTP header is malformed",
+                        )
+                    })?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        if content_length.is_some() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP Content-Length appears more than once",
+                            ));
+                        }
+                        content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP Content-Length is malformed",
+                            )
+                        })?);
+                    }
+                }
+                let total_len = (header_end + 4)
+                    .checked_add(content_length.unwrap_or(0))
+                    .filter(|&len| len <= MAX_REQUEST_BYTES)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "HTTP request exceeds 64 KiB test-server limit",
+                        )
+                    })?;
+                request_len = Some(total_len);
+            }
+
+            if request.len() >= request_len.expect("HTTP header end must set request length") {
+                return Ok(());
+            }
+        }
+    }
 
     fn temp_db_path() -> (tempfile::NamedTempFile, PathBuf) {
         let f = tempfile::NamedTempFile::new().unwrap();
@@ -724,6 +913,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
         }
     }
 
@@ -859,6 +1049,7 @@ mod tests {
         /// `release` before returning.
         start_block: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         fail_start: bool,
+        status: Option<Arc<crate::gateway::GatewayStatusPublisher>>,
     }
 
     impl FakeGateway {
@@ -875,6 +1066,7 @@ mod tests {
                 start_delay: Duration::ZERO,
                 start_block: None,
                 fail_start: false,
+                status: None,
             }
         }
 
@@ -890,6 +1082,23 @@ mod tests {
                 fail_start: true,
                 ..FakeGateway::new(gid, GwBehavior::Allow)
             }
+        }
+
+        fn with_status_subscription(gid: &str) -> Self {
+            let status = Arc::new(crate::gateway::GatewayStatusPublisher::new(
+                GatewayStatus::Offline,
+            ));
+            FakeGateway {
+                status: Some(status),
+                ..FakeGateway::new(gid, GwBehavior::Allow)
+            }
+        }
+
+        fn emit_status(&self, status: GatewayStatus) {
+            self.status
+                .as_ref()
+                .expect("status-emitting fake gateway")
+                .publish(status);
         }
 
         fn new_blocking_start(
@@ -926,6 +1135,9 @@ mod tests {
         async fn stop(&self) -> anyhow::Result<()> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+        fn subscribe_status(&self) -> Option<crate::gateway::GatewayStatusSubscription> {
+            self.status.as_ref().map(|publisher| publisher.subscribe())
         }
         async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
             Ok(format!("ws-{name}"))
@@ -985,6 +1197,32 @@ mod tests {
         }
     }
 
+    struct StaticGatewayFactory {
+        gateway: Arc<FakeGateway>,
+    }
+
+    impl GatewayFactory for StaticGatewayFactory {
+        fn create(&self, _config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
+            Ok(self.gateway.clone())
+        }
+    }
+
+    async fn wait_for_gateway_runs(store: &Store, hook_id: &str, expected: usize) {
+        for _ in 0..100 {
+            let runs = crate::automation::list_runs(store, hook_id).await.unwrap();
+            if runs.len() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let runs = crate::automation::list_runs(store, hook_id).await.unwrap();
+        assert_eq!(
+            runs.len(),
+            expected,
+            "gateway status transition did not produce the expected number of runs"
+        );
+    }
+
     #[tokio::test]
     async fn build_daemon_wires_known_gateways_and_skips_unknown_ids() {
         let (_guard, db_path) = temp_db_path();
@@ -1002,9 +1240,8 @@ mod tests {
         let factory: Arc<dyn GatewayFactory> = Arc::new(CapturingGatewayFactory {
             captured: captured.clone(),
         });
-
         let daemon = build_daemon(BuildDaemonOpts {
-            db_path: db_path.clone(),
+            db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
@@ -1013,19 +1250,260 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            daemon.gateways.len(),
-            1,
-            "only the known 'discord' id should be wired; 'bogus' must be skipped"
-        );
-        let cfg = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("factory must have been called");
+        assert_eq!(daemon.gateways.len(), 1);
+        let cfg = captured.lock().unwrap().clone().unwrap();
         assert_eq!(cfg["discord.token"], "tok-xyz");
         assert_eq!(cfg["discord.app_id"], "");
         assert_eq!(cfg["discord.guild_id"], "");
+    }
+
+    #[tokio::test]
+    async fn daemon_forwards_gateway_status_subscription_without_start_stop_transitions() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
+            gateway: gateway.clone(),
+        });
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        seed_project(&daemon.store, "project-1").await;
+        let hook = crate::automation::create_hook(
+            &daemon.store,
+            crate::automation::HookInput::agent_run(
+                "gateway lifecycle",
+                crate::automation::TriggerKind::GatewayStatusChanged,
+                "project-1",
+                "",
+                "local",
+                "ignore",
+            ),
+        )
+        .await
+        .unwrap();
+
+        daemon.start().await.unwrap();
+        assert!(crate::automation::list_runs(&daemon.store, &hook.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        gateway.emit_status(GatewayStatus::Connected);
+        wait_for_gateway_runs(&daemon.store, &hook.id, 1).await;
+        gateway.emit_status(GatewayStatus::Connected);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            crate::automation::list_runs(&daemon.store, &hook.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        gateway.emit_status(GatewayStatus::Offline);
+        wait_for_gateway_runs(&daemon.store, &hook.id, 2).await;
+        daemon.stop().await;
+        let runs = crate::automation::list_runs(&daemon.store, &hook.id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        let mut transitions: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.envelope["data"]["previousStatus"].as_str().unwrap(),
+                    run.envelope["data"]["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        transitions.sort_unstable();
+        assert_eq!(
+            transitions,
+            vec![("connected", "offline"), ("offline", "connected")]
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_records_gateway_transitions_while_outbound_delivery_is_slow() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
+            gateway: gateway.clone(),
+        });
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let hook = crate::automation::create_hook(
+            &daemon.store,
+            crate::automation::HookInput::outbound(
+                "slow gateway hook",
+                crate::automation::TriggerKind::GatewayStatusChanged,
+                endpoint,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            // Drain the request before responding. Writing (and this fake
+            // server dropping the socket at the end of scope) before the
+            // client finishes sending its POST body races the client's
+            // write with the server's close, which Windows surfaces as
+            // `ConnectionAborted` (RST) rather than a clean response.
+            drain_http_request(&mut stream).await.unwrap();
+            // `Connection: close` on every response — otherwise `reqwest`'s
+            // HTTP/1.1 keep-alive would try to reuse this same socket for the
+            // next status delivery, but this fake server's loop below expects
+            // a brand-new `accept()` per request. Without it, the second
+            // `accept()` blocks forever waiting for a connection reqwest
+            // never opens, wedging the daemon's serial delivery worker.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                drain_http_request(&mut stream).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        daemon.start().await.unwrap();
+        gateway.emit_status(GatewayStatus::Connected);
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("the first status delivery must reach the slow outbound hook")
+            .unwrap();
+        gateway.emit_status(GatewayStatus::Offline);
+        gateway.emit_status(GatewayStatus::Connected);
+        // The daemon-owned worker intentionally delivers serially. Releasing
+        // the first slow request proves later transitions remain queued
+        // rather than requiring detached, untracked delivery tasks.
+        let _ = release_tx.send(());
+
+        wait_for_gateway_runs(&daemon.store, &hook.id, 3).await;
+        let runs = crate::automation::list_runs(&daemon.store, &hook.id)
+            .await
+            .unwrap();
+        let transitions: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.envelope["data"]["previousStatus"].as_str().unwrap(),
+                    run.envelope["data"]["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![
+                ("offline", "connected"),
+                ("connected", "offline"),
+                ("offline", "connected"),
+            ]
+        );
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn daemon_start_and_stop_do_not_wait_for_slow_gateway_hook_delivery() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
+            gateway: gateway.clone(),
+        });
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let hook = crate::automation::create_hook(
+            &daemon.store,
+            crate::automation::HookInput::outbound(
+                "slow gateway hook",
+                crate::automation::TriggerKind::GatewayStatusChanged,
+                endpoint,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(250), daemon.start())
+            .await
+            .expect("daemon start must not wait for an unobserved gateway transition")
+            .unwrap();
+        gateway.emit_status(GatewayStatus::Connected);
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("the status listener must dispatch the hook")
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), daemon.stop())
+            .await
+            .expect("daemon stop must not wait for outbound hook delivery");
+        assert_eq!(
+            crate::automation::list_runs(&daemon.store, &hook.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1483,6 +1961,7 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
+            gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
             started: AtomicBool::new(false),
@@ -2027,6 +2506,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
         };
 
         daemon.start().await.unwrap();
@@ -2203,6 +2683,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
         });
 
         let (recovery_entered, release_recovery) =
@@ -2321,6 +2802,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
         });
 
         let (recovery_entered, release_recovery) =
@@ -2418,6 +2900,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
         });
 
         let (recovery_entered, release_recovery) =
@@ -2549,6 +3032,7 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
+            gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
             started: AtomicBool::new(false),
@@ -2661,6 +3145,7 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
+            gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
             started: AtomicBool::new(false),

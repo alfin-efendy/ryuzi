@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { CmdError, OpenTarget, Project, Result, Session } from "@/bindings";
+import type { CmdError, CommandInfo, OpenTarget, Project, Result, Session } from "@/bindings";
 import { LOCAL_RUNNER, refKey } from "@/lib/session-key";
 import { useNative } from "@/store-native";
 
@@ -13,7 +13,7 @@ const openIn = mock((): Promise<Result<null, CmdError>> => Promise.resolve({ sta
 const sessionWorkdir = mock(
   (_runnerId: string, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "C:\\code\\demo" }),
 );
-const nativeCommands = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const nativeCommands = mock((): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 // TodoPanel (always mounted by SessionView) fires this on mount — stubbed ok:[]
 // so its effect resolves cleanly; TodoPanel itself renders null for an empty list.
 const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
@@ -169,6 +169,7 @@ function seed(runnerId: string, status: Session["status"] = "idle") {
   });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ loaded: true });
+  useNative.setState({ commandsByProject: {} });
 }
 
 beforeEach(() => {
@@ -188,6 +189,75 @@ afterEach(() => {
   cleanup();
   useNav.setState({ bottomOpen: false });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
+  useNative.setState({ commandsByProject: {} });
+});
+
+test("only suggests each effective slash command from the catalog", async () => {
+  const catalog: CommandInfo[] = [
+    {
+      name: "ship",
+      description: "Project ship",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "project",
+      effective: true,
+      shadowsGlobal: true,
+    },
+    {
+      name: "ship",
+      description: "Global ship",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "global",
+      effective: false,
+      shadowsGlobal: false,
+    },
+    {
+      name: "init",
+      description: "Project init",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "project",
+      effective: false,
+      shadowsGlobal: true,
+    },
+    {
+      name: "init",
+      description: "Global init",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "global",
+      effective: false,
+      shadowsGlobal: false,
+    },
+    {
+      name: "init",
+      description: "Built-in init",
+      agent: null,
+      model: null,
+      subtask: false,
+      origin: "builtin",
+      effective: true,
+      shadowsGlobal: false,
+    },
+  ];
+  seed(LOCAL_RUNNER);
+  nativeCommands.mockResolvedValueOnce({ status: "ok", data: catalog });
+  render(<SessionView />);
+
+  fireEvent.change(screen.getByPlaceholderText("Ask for follow-up changes"), { target: { value: "/" } });
+
+  expect(await screen.findByText("Project ship")).toBeTruthy();
+  expect(screen.getAllByText("/ship")).toHaveLength(1);
+  expect(screen.queryByText("Global ship")).toBeNull();
+  expect(await screen.findByText("Built-in init")).toBeTruthy();
+  expect(screen.getAllByText("/init")).toHaveLength(1);
+  expect(screen.queryByText("Project init")).toBeNull();
+  expect(screen.queryByText("Global init")).toBeNull();
 });
 
 test("local session with the bottom panel open: terminal drawer mounts and both controls are enabled", async () => {

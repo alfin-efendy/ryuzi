@@ -6,6 +6,7 @@
 pub mod agent_api;
 pub mod apps_api;
 pub mod audit;
+pub mod automation_api;
 pub mod connections_api;
 pub mod endpoint_api;
 pub mod extension_status_api;
@@ -112,6 +113,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
     match method {
         m if sessions::HANDLES.contains(&m) => sessions::dispatch(state, m, p).await,
         m if scheduler_api::HANDLES.contains(&m) => scheduler_api::dispatch(state, m, p).await,
+        m if automation_api::HANDLES.contains(&m) => automation_api::dispatch(state, m, p).await,
         m if gateways_api::HANDLES.contains(&m) => gateways_api::dispatch(state, m, p).await,
         m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
         m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,

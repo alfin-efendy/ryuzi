@@ -605,6 +605,62 @@ async runJobNow(runnerId: string | null, id: string) : Promise<Result<JobInfo[],
 async parseNaturalSchedule(text: string) : Promise<string | null> {
     return await TAURI_INVOKE("parse_natural_schedule", { text });
 },
+async listAutomationHooks(runnerId: string | null) : Promise<Result<AutomationHookInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_automation_hooks", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async automationHookDetail(runnerId: string | null, id: string) : Promise<Result<AutomationHookDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("automation_hook_detail", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createAutomationHook(runnerId: string | null, input: AutomationHookInput) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_automation_hook", { runnerId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAutomationHook(runnerId: string | null, id: string, input: AutomationHookInput) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_automation_hook", { runnerId, id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleAutomationHook(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_automation_hook", { runnerId, id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteAutomationHook(runnerId: string | null, id: string) : Promise<Result<AutomationHookInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_automation_hook", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async testAutomationHook(runnerId: string | null, id: string) : Promise<Result<AutomationHookDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_automation_hook", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listApps(runnerId: string | null) : Promise<Result<AppInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_apps", { runnerId }) };
@@ -1175,6 +1231,46 @@ async sessionTodos(runnerId: string | null, sessionPk: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
+async listProjectCommands(runnerId: string | null, projectId: string) : Promise<Result<ProjectCommandInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_project_commands", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readProjectCommand(runnerId: string | null, projectId: string, name: string) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_project_command", { runnerId, projectId, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createProjectCommand(runnerId: string | null, projectId: string, input: ProjectCommandInputDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_project_command", { runnerId, projectId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string, input: ProjectCommandMutationDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_command", { runnerId, projectId, name, revision, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_project_command", { runnerId, projectId, name, revision }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * A session's durable queued messages.
  */
@@ -1669,6 +1765,7 @@ termOutputMsg: "term-output-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
+export type ActionKind = "agent.run" | "webhook.outbound"
 export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null;
 /**
  * stdio | http
@@ -1758,6 +1855,18 @@ origin: string; sessionPk: string | null;
  * Unix ms.
  */
 at: number }
+export type AutomationActionInfo = { kind: "agent.run"; config: AutomationAgentRunActionInput } | { kind: "webhook.outbound"; config: AutomationWebhookOutboundActionInfo }
+export type AutomationActionInput = { kind: "agent.run"; config: AutomationAgentRunActionInput } | { kind: "webhook.outbound"; config: AutomationWebhookOutboundActionInput }
+export type AutomationAgentRunActionInput = { projectId: string; branch: string; gatewayId: string; prompt: string; agentId: string | null; modelOverride: string | null; subtask: boolean }
+export type AutomationHookAttemptInfo = { runId: string; ordinal: number; startedAt: number; finishedAt: number | null; httpStatus: number | null; error: string | null }
+export type AutomationHookDetail = { hook: AutomationHookInfo; action: AutomationActionInfo; runs: AutomationHookRunInfo[] }
+export type AutomationHookInfo = { id: string; name: string; triggerKind: TriggerKind; actionKind: ActionKind; enabled: boolean; inboundPath: string | null; createdAt: number; updatedAt: number }
+export type AutomationHookInput = { name: string; triggerKind: TriggerKind; action: AutomationActionInput; enabled?: boolean }
+export type AutomationHookRunInfo = { id: string; hookId: string; status: string; sessionPk: string | null; error: string | null; attemptCount: number; lastHttpStatus: number | null; queuedAt: number; startedAt: number | null; finishedAt: number | null; attempts: AutomationHookAttemptInfo[] }
+export type AutomationWebhookHeaderInfo = { name: string; configured: boolean }
+export type AutomationWebhookHeaderInput = { name: string; value: string }
+export type AutomationWebhookOutboundActionInfo = { url: string; method: string; headers: AutomationWebhookHeaderInfo[]; payloadTemplate: string | null }
+export type AutomationWebhookOutboundActionInput = { url: string; method: string; headers?: AutomationWebhookHeaderInput[]; payloadTemplate: string | null }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type BranchList = {
 /**
@@ -1799,7 +1908,8 @@ export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
-export type CommandInfo = { name: string; description: string; agent: string | null }
+export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean; origin: CommandOriginInfo; effective?: boolean; shadowsGlobal: boolean }
+export type CommandOriginInfo = "builtin" | "global" | "project"
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and
@@ -1815,6 +1925,10 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * surface of a session.
  */
 { kind: "notice"; session_pk: string; text: string } | { kind: "sessionEnded"; session_pk: string } |
+/**
+ * A Hook run changed state (queued|running|success|failed|skipped).
+ */
+{ kind: "automationHookRunChanged"; hook_id: string; run_id: string; status: string } |
 /**
  * A scheduled job run started or finished (status: running|success|failed).
  */
@@ -2274,6 +2388,16 @@ export type Project = { projectId: string; name: string; workdir: string; source
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
+/**
+ * A project command and the revision that must accompany update or delete.
+ */
+export type ProjectCommandInfo = { name: string; description: string; template: string; agent: string | null; model: string | null; subtask: boolean; revision: string }
+export type ProjectCommandInputDto = ({ description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }) & { name: string }
+/**
+ * Editable fields for a project-owned slash command. The command name is
+ * supplied separately for updates so a save cannot rename a file by accident.
+ */
+export type ProjectCommandMutationDto = { description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }
 export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaCapability = "claude" | "codex"
@@ -2363,6 +2487,7 @@ export type ToolInfo = { name: string; desc: string; perm: string }
  * One persisted "don't ask again" rule (Settings → Permissions).
  */
 export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
+export type TriggerKind = "session.start" | "tool.before" | "tool.after" | "session.end" | "scheduler.run.success" | "scheduler.run.failed" | "gateway.status.changed" | "webhook.inbound"
 /**
  * Mirror of `crate::skills_install::TrustPrompt`. `total_bytes` stays a
  * `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's

@@ -56,6 +56,33 @@ impl ControlPlane {
         model_override: Option<String>,
         worker: Option<WorkerBinding>,
     ) -> anyhow::Result<Session> {
+        self.start_session_with_prompt_and_origin(
+            project_id,
+            prompt,
+            started_by,
+            attachments,
+            git,
+            perm_mode,
+            model_override,
+            worker,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_session_with_prompt_and_origin(
+        self: &Arc<Self>,
+        project_id: &str,
+        prompt: TurnPrompt,
+        started_by: &str,
+        attachments: &[AttachmentRef],
+        git: Option<SessionGitOptions>,
+        perm_mode: Option<PermMode>,
+        model_override: Option<String>,
+        worker: Option<WorkerBinding>,
+        automation_origin: Option<crate::automation::HookOrigin>,
+    ) -> anyhow::Result<Session> {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
@@ -136,6 +163,9 @@ impl ControlPlane {
             parent_session_pk: worker.as_ref().and_then(|w| w.home_session_pk.clone()),
         };
         self.store.insert_session(session.clone()).await?;
+        if let Some(origin) = automation_origin {
+            self.store.insert_hook_origin(&session_pk, &origin).await?;
+        }
         let _ = self.events.send(CoreEvent::SessionCreated {
             session_pk: session_pk.clone(),
             project_id: Some(project.project_id.clone()),
@@ -311,6 +341,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
         );
     }
@@ -546,6 +577,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
         );
         Ok(())
@@ -856,22 +888,26 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
         );
     }
 
-    /// Startup failed: surface it in the transcript, release the session
-    /// back to Idle so the user can retry, and broadcast the bus-terminal
-    /// `CoreEvent::Error` (mirroring `spawn_prompt`'s error arm). The
-    /// broadcast is load-bearing: the orchestrator's `watch_session` and the
-    /// scheduler's run watcher finish only on `Result`/`Error` for the
-    /// session, so without it they would hang to their 2h deadline instead
-    /// of reporting the real git/harness error. `demote_if_running` (not a
-    /// blind status write) so a stop that already marked it Interrupted
-    /// wins; it runs before the broadcast so a lagged watcher that falls
-    /// back to consulting the session row never reads a stale Running.
+    /// Startup failed: surface it in the transcript, terminally fail any linked
+    /// automation run, release the session back to Idle so the user can retry,
+    /// and broadcast the bus-terminal `CoreEvent::Error` (mirroring
+    /// `spawn_prompt`'s error arm). The broadcast is load-bearing: the
+    /// orchestrator's `watch_session` and the scheduler's run watcher finish
+    /// only on `Result`/`Error` for the session, so without it they would
+    /// hang to their 2h deadline instead of reporting the real git/harness
+    /// error. `demote_if_running` (not a blind status write) so a stop that
+    /// already marked it Interrupted wins; it runs before the broadcast so a
+    /// lagged watcher that falls back to consulting the session row never
+    /// reads a stale Running.
     async fn fail_startup(&self, session_pk: &str, message: &str) {
         self.emit_error(session_pk, message).await;
+        self.finish_automation_session(session_pk, "failed", Some(message))
+            .await;
         let _ = self.store.demote_if_running(session_pk, now_ms()).await;
         let _ = self.events.send(CoreEvent::Error {
             session_pk: session_pk.to_string(),
@@ -970,9 +1006,11 @@ impl ControlPlane {
         }
     }
 
-    /// On boot: resume every session a dead process left in Running. Each
-    /// resume is isolated so one bad session can't block the rest.
+    /// On boot: fail incomplete automation runs, then resume every session a
+    /// dead process left in Running. Each resume is isolated so one bad session
+    /// can't block the rest.
     pub async fn reconcile(self: &Arc<Self>) -> anyhow::Result<()> {
+        crate::automation::fail_incomplete_runs_on_restart(&self.store).await?;
         for s in self
             .store
             .list_sessions_by_status(SessionStatus::Running)
@@ -1134,6 +1172,9 @@ impl ControlPlane {
             extension_tools,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
+            automation_events: Some(Arc::new(super::ControlPlaneAutomationSink(Arc::downgrade(
+                self,
+            )))),
             background: self.background.clone(),
             agent_knowledge: persistence.knowledge.clone(),
             learning_queue: persistence.learning.clone(),
@@ -1333,6 +1374,8 @@ impl ControlPlane {
                     let _ = me.events.send(CoreEvent::Result {
                         session_pk: session_pk.clone(),
                     });
+                    me.finish_automation_session(&session_pk, "success", None)
+                        .await;
                     if me
                         .store
                         .demote_if_running(&session_pk, now_ms())
@@ -1352,6 +1395,8 @@ impl ControlPlane {
                     // "error" handler no longer appends its own transient
                     // copy). Mirrors `fail_startup`.
                     me.emit_error(&session_pk, &message).await;
+                    me.finish_automation_session(&session_pk, "failed", Some(&message))
+                        .await;
                     // Demote BEFORE the broadcast so a subscriber that
                     // refreshes on Error (the UI does) never reads a stale
                     // Running row.
@@ -1401,6 +1446,8 @@ impl ControlPlane {
         self.store
             .update_status(session_pk, SessionStatus::Interrupted, Some(now_ms()))
             .await?;
+        self.finish_automation_session(session_pk, "failed", Some("session cancelled"))
+            .await;
         Ok(())
     }
 
@@ -1419,6 +1466,14 @@ impl ControlPlane {
             token.cancel();
             self.wait_for_startup(session_pk).await;
         }
+        self.store
+            .update_status(session_pk, SessionStatus::Ended, Some(now_ms()))
+            .await?;
+        // A cancelled hook-origin turn can still return Ok while its handle is
+        // unwinding. Terminally fail its run before cancellation so that late
+        // completion loses the guarded transition.
+        self.finish_automation_session(session_pk, "failed", Some("session cancelled"))
+            .await;
         let handle = self.running.lock().unwrap().remove(session_pk);
         if let Some(handle) = handle {
             // Interrupt any in-flight turn first so teardown doesn't race a
@@ -1489,9 +1544,9 @@ impl ControlPlane {
         }
         // Best-effort cleanup of any downloaded attachments for this session.
         let _ = tokio::fs::remove_dir_all(self.attachment_dest_dir(session_pk).await).await;
-        self.store
-            .update_status(session_pk, SessionStatus::Ended, Some(now_ms()))
-            .await?;
+        // The terminal status was persisted before `handle.end()` so its
+        // lifecycle observer reads a final row. Do not finalize hook-run
+        // success here: a prior stop/cancel or turn failure owns that result.
         let _ = self.events.send(CoreEvent::SessionEnded {
             session_pk: session_pk.to_string(),
         });
@@ -1622,6 +1677,7 @@ impl ControlPlane {
             store: store.clone(),
             events: self.events.clone(),
             approvals: self.approvals.clone(),
+            automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
             agent: runner::review_agent(payload.system.clone()),

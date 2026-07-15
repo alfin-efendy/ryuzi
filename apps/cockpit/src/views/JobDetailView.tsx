@@ -220,7 +220,7 @@ export function JobDetailView({ id }: { id: string }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
       <div className="mx-auto max-w-[760px]">
-        <BackButton label="Scheduler" onClick={() => nav.navigate({ kind: "scheduler" })} />
+        <BackButton label="Automations" onClick={() => nav.navigate({ kind: "automations", tab: "scheduler" })} />
 
         <DetailHeader
           chip={
@@ -245,8 +245,9 @@ export function JobDetailView({ id }: { id: string }) {
             size="icon"
             title="Delete job"
             onClick={() => {
-              void remove(j.id);
-              nav.navigate({ kind: "scheduler" });
+              void remove(j.id).then((removed) => {
+                if (removed) nav.navigate({ kind: "automations", tab: "scheduler" });
+              });
             }}
           >
             <Trash2 aria-hidden size={13} strokeWidth={2} className="size-[13px]" />

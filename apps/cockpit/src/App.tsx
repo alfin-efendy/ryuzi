@@ -15,7 +15,7 @@ import { InboxView } from "./views/InboxView";
 import { SessionView } from "./views/SessionView";
 import { ModelsView } from "./views/ModelsView";
 import { ProviderDetailView } from "./views/ProviderDetailView";
-import { SchedulerView } from "./views/SchedulerView";
+import { AutomationsView } from "./views/AutomationsView";
 import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
 import { PluginsView } from "./views/PluginsView";
@@ -42,7 +42,9 @@ function MainView() {
     case "providerDetail":
       return <ProviderDetailView provider={view.provider} />;
     case "scheduler":
-      return <SchedulerView />;
+      return <AutomationsView key="scheduler" initialTab="scheduler" />;
+    case "automations":
+      return <AutomationsView key={view.tab ?? "scheduler"} initialTab={view.tab} />;
     case "jobDetail":
       return <JobDetailView id={view.id} />;
     case "jobNew":

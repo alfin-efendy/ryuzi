@@ -55,7 +55,7 @@ test("sidebar navigation leaves the Home view", async ({ page }) => {
   await page.goto("/");
   const homeHeading = page.getByRole("heading", { name: /What should we build/ });
   await expect(homeHeading).toBeVisible();
-  for (const label of ["Models", "Scheduler", "Plugins", "Settings"]) {
+  for (const label of ["Models", "Automations", "Plugins", "Settings"]) {
     await page.getByText(label, { exact: true }).first().click();
     await expect(homeHeading).toHaveCount(0);
     // back to Home for the next iteration

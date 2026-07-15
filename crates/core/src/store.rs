@@ -586,7 +586,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_35_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_37_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1070,7 +1070,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_35_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_37_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1125,7 +1125,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_35_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_37_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1172,8 +1172,75 @@ fn migrations() -> Migrations<'static> {
             CREATE INDEX IF NOT EXISTS idx_agent_learning_delivery \
                 ON agent_learning_queue(agent_id, status, sequence);",
         ),
+        // 35: durable per-session prompt queue.
         M::up(
             "CREATE TABLE IF NOT EXISTS session_prompt_queue (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                session_pk TEXT NOT NULL,\
+                position INTEGER NOT NULL,\
+                payload TEXT NOT NULL,\
+                status TEXT NOT NULL CHECK(status IN ('pending','claimed')) DEFAULT 'pending',\
+                created_at INTEGER NOT NULL,\
+                UNIQUE(session_pk, position)\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_session_prompt_queue_pending \
+                ON session_prompt_queue(session_pk, status, position);",
+        ),
+        // 36: Automations Hub hook configuration and immutable run history.
+        // Runs intentionally do not reference automation_hooks: deleting a hook
+        // must retain every historical run and attempt.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS automation_hooks (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,\
+                trigger_kind TEXT NOT NULL,\
+                action_kind TEXT NOT NULL,\
+                enabled INTEGER NOT NULL DEFAULT 1,\
+                inbound_path TEXT UNIQUE,\
+                config_json TEXT NOT NULL,\
+                created_at INTEGER NOT NULL,\
+                updated_at INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS automation_hook_runs (\
+                id TEXT PRIMARY KEY NOT NULL,\
+                hook_id TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                envelope_json TEXT NOT NULL,\
+                snapshot_json TEXT NOT NULL,\
+                session_pk TEXT,\
+                error TEXT,\
+                attempt_count INTEGER NOT NULL DEFAULT 0,\
+                last_http_status INTEGER,\
+                queued_at INTEGER NOT NULL,\
+                started_at INTEGER,\
+                finished_at INTEGER\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_automation_hook_runs_hook \
+                ON automation_hook_runs(hook_id, queued_at DESC);\
+            CREATE TABLE IF NOT EXISTS automation_hook_attempts (\
+                run_id TEXT NOT NULL,\
+                ordinal INTEGER NOT NULL,\
+                started_at INTEGER NOT NULL,\
+                finished_at INTEGER,\
+                http_status INTEGER,\
+                error TEXT,\
+                PRIMARY KEY(run_id, ordinal),\
+                FOREIGN KEY(run_id) REFERENCES automation_hook_runs(id)\
+            );",
+        ),
+        // 37: immutable origin for hook-created sessions. Repeating the queue
+        // DDL repairs databases previously opened from the feature branch,
+        // where automation migrations occupied v35/v36 before main's queue
+        // migration was introduced.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS session_automation_origins (\
+                session_pk TEXT PRIMARY KEY NOT NULL,\
+                kind TEXT NOT NULL,\
+                hook_id TEXT NOT NULL,\
+                run_id TEXT NOT NULL,\
+                depth INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS session_prompt_queue (\
                 id TEXT PRIMARY KEY NOT NULL,\
                 session_pk TEXT NOT NULL,\
                 position INTEGER NOT NULL,\
@@ -1890,6 +1957,39 @@ impl Store {
                 params![session_pk, model, effort, updated_at],
             )?;
             tx.commit()
+        })
+        .await
+    }
+
+    pub async fn insert_hook_origin(
+        &self,
+        session_pk: &str,
+        origin: &crate::automation::HookOrigin,
+    ) -> anyhow::Result<()> {
+        let session_pk = session_pk.to_string();
+        let origin = origin.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO session_automation_origins(session_pk,kind,hook_id,run_id,depth) VALUES(?1,?2,?3,?4,?5)",
+                params![session_pk, origin.kind, origin.hook_id, origin.run_id, origin.depth],
+            )?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn hook_origin(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<crate::automation::HookOrigin>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT kind,hook_id,run_id,depth FROM session_automation_origins WHERE session_pk=?1",
+                params![session_pk],
+                |row| Ok(crate::automation::HookOrigin {
+                    kind: row.get(0)?, hook_id: row.get(1)?, run_id: row.get(2)?, depth: row.get(3)?,
+                }),
+            ).optional()
         })
         .await
     }
@@ -4682,6 +4782,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automation_tables_exist_after_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let tables = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type='table' AND name LIKE 'automation_hook%' ORDER BY name",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tables,
+            [
+                "automation_hook_attempts",
+                "automation_hook_runs",
+                "automation_hooks"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_37_repairs_feature_branch_v36_missing_session_prompt_queue() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "DROP INDEX idx_session_prompt_queue_pending;\
+                     DROP TABLE session_prompt_queue;\
+                     PRAGMA user_version=36;",
+                )
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let upgraded = Store::open(tmp.path()).await.unwrap();
+        let (queue_table, queue_index, user_version): (bool, bool, i64) = upgraded
+            .with_conn(|c| {
+                let exists = |name: &str, object_type: &str| {
+                    c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                        rusqlite::params![object_type, name],
+                        |row| row.get(0),
+                    )
+                };
+                Ok((
+                    exists("session_prompt_queue", "table")?,
+                    exists("idx_session_prompt_queue_pending", "index")?,
+                    c.query_row("PRAGMA user_version", [], |row| row.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert!(queue_table, "v37 must restore the prompt queue table");
+        assert!(queue_index, "v37 must restore the prompt queue index");
+        assert_eq!(user_version, 37);
+    }
+
+    #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -6463,7 +6631,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 35, "forward migration must land at v35");
+        assert_eq!(user_version, 37, "forward migration must land at v37");
     }
 
     #[tokio::test]
@@ -6680,7 +6848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_35_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_37_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -6701,20 +6869,21 @@ mod tests {
         // 29 messages.speaker + orch_tasks home/breaker/steer columns;
         // 30 audit.session_pk + audit.origin;
         // 31 plugin_catalog_cache + catalog_feed_state;
-        // 34 agent_learning_state + agent_learning_queue; 35 session_prompt_queue — CREATE TABLE
-        // IF NOT EXISTS —
-        // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
-        // re-run on next open.
+        // 34 agent_learning_state + agent_learning_queue; 35 session_prompt_queue;
+        // 36 automation hooks/runs/attempts; 37 session_automation_origins and
+        // a compatibility queue repair all use convergent, existence-guarded DDL,
+        // so every migration through the latest version re-runs safely on the
+        // next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 35
-        // defined, wind back twenty-three.
+        // this test starts failing its assertions). With migrations through 37
+        // defined, wind back twenty-five.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 23)
+            c.pragma_update(None, "user_version", v - 25)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6912,7 +7081,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 35, "forward migration must land at v35");
+        assert_eq!(uv, 37, "forward migration must land at v37");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -6938,7 +7107,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 35, "forward migration must land at v35");
+        assert_eq!(uv, 37, "forward migration must land at v37");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 

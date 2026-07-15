@@ -459,10 +459,13 @@ async fn test_control_plane_full(
 
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
 /// the cold-resume rollback path in `continue_session`.
-struct FailingHarnessFactory;
+struct FailingHarnessFactory {
+    message: String,
+}
+
 impl HarnessFactory for FailingHarnessFactory {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
-        Err(anyhow::anyhow!("boom: harness factory intentionally fails"))
+        Err(anyhow::anyhow!(self.message.clone()))
     }
 }
 
@@ -589,6 +592,370 @@ fn parse_telemetry_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Val
 }
 
 #[tokio::test]
+async fn gateway_status_adapter_dispatches_only_matching_hook() {
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "project-1").await;
+    let matching = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "gateway status",
+            crate::automation::TriggerKind::GatewayStatusChanged,
+            "project-1",
+            "",
+            "local",
+            "record the gateway status",
+        ),
+    )
+    .await
+    .unwrap();
+    let other = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "session end",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "ignore",
+        ),
+    )
+    .await
+    .unwrap();
+
+    cp.observe_gateway_status_transition("discord", "offline", "connected")
+        .await;
+
+    let matching_runs = crate::automation::list_runs(&store, &matching.id)
+        .await
+        .unwrap();
+    assert_eq!(matching_runs.len(), 1);
+    assert_eq!(matching_runs[0].status, "running");
+    assert_eq!(matching_runs[0].envelope["source"]["kind"], "gateway");
+    assert_eq!(
+        matching_runs[0].envelope["data"]["previousStatus"],
+        "offline"
+    );
+    assert_eq!(matching_runs[0].envelope["data"]["status"], "connected");
+    assert!(crate::automation::list_runs(&store, &other.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn inbound_webhook_preserves_accepted_size_payload_in_run_and_agent_prompt() {
+    let (cp, store, prompts, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "project-1").await;
+    let hook = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "inbound payload",
+            crate::automation::TriggerKind::WebhookInbound,
+            "project-1",
+            "",
+            "local",
+            "Process the webhook",
+        ),
+    )
+    .await
+    .unwrap();
+    let payload_overhead = serde_json::to_vec(&serde_json::json!({ "payload": "" }))
+        .unwrap()
+        .len();
+    let body = "x".repeat(crate::automation::MAX_INBOUND_WEBHOOK_BODY_BYTES - payload_overhead);
+    assert_eq!(
+        serde_json::to_vec(&serde_json::json!({ "payload": &body }))
+            .unwrap()
+            .len(),
+        crate::automation::MAX_INBOUND_WEBHOOK_BODY_BYTES,
+        "the simulated JSON body must be valid at the endpoint's accepted size"
+    );
+
+    cp.dispatch_inbound_webhook(
+        hook.clone(),
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::WebhookInbound,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("webhook", "wh_test"),
+            serde_json::json!({ "request": { "body": { "payload": body.clone() } } }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let run = crate::automation::list_runs(&store, &hook.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        run.envelope["data"]["request"]["body"]["payload"]
+            .as_str()
+            .is_some_and(|payload| payload == body),
+        "the persisted run must retain the complete accepted payload"
+    );
+    wait_for_prompts(&prompts, 1).await;
+    assert!(
+        prompts.lock().unwrap()[0].contains(&body),
+        "the agent prompt must retain the complete accepted payload"
+    );
+}
+
+#[tokio::test]
+async fn startup_failure_finishes_only_its_linked_agent_run_as_failed() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let mut regs = Registries::new();
+    regs.harness = Arc::new(FailingHarnessFactory {
+        message: format!("startup failure {}", "x".repeat(1_100)),
+    });
+    let cp = test_control_plane(store, regs).await;
+    seed_project(cp.store(), "project-1").await;
+    let hook = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "failing startup",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let unrelated = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "unrelated",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let unrelated_run = crate::automation::create_run(
+        cp.store(),
+        &unrelated.id,
+        serde_json::json!({ "unrelated": true }),
+    )
+    .await
+    .unwrap();
+    seed_session(
+        cp.store(),
+        "unrelated-session",
+        "project-1",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    cp.store()
+        .insert_hook_origin(
+            "unrelated-session",
+            &crate::automation::HookOrigin::new(&unrelated.id, &unrelated_run.id, 1),
+        )
+        .await
+        .unwrap();
+    assert!(crate::automation::link_run_session(
+        cp.store(),
+        &unrelated_run.id,
+        "unrelated-session"
+    )
+    .await
+    .unwrap());
+    let mut events = cp.subscribe();
+
+    cp.dispatch_automation_event(
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::SessionEnd,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("session", "test"),
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await;
+
+    let run = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("agent.run hook must create a run");
+    let session_pk = run
+        .session_pk
+        .clone()
+        .expect("agent.run hook must link its run to a session");
+    let startup_error = wait_for_message(cp.store(), &session_pk, |message| {
+        message.block_type == "error"
+    })
+    .await;
+
+    let failed = {
+        let mut terminal = None;
+        for _ in 0..400 {
+            let candidate = crate::automation::list_runs(cp.store(), &hook.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            if candidate.status != "running" {
+                terminal = Some(candidate);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        terminal.expect("startup failure must terminalize the linked hook run")
+    };
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.session_pk.as_deref(), Some(session_pk.as_str()));
+    let error = failed
+        .error
+        .as_deref()
+        .expect("startup error must be recorded");
+    assert!(error.starts_with("Couldn't start the agent: startup failure "));
+    assert_eq!(error.chars().count(), 1_024, "run errors are sanitized");
+    assert_eq!(
+        startup_error.payload["message"].as_str(),
+        Some(
+            format!(
+                "Couldn't start the agent: startup failure {}",
+                "x".repeat(1_100)
+            )
+            .as_str()
+        )
+    );
+
+    let unrelated_after = crate::automation::list_runs(cp.store(), &unrelated.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == unrelated_run.id)
+        .unwrap();
+    assert_eq!(unrelated_after.status, "running");
+    assert_eq!(
+        unrelated_after.session_pk.as_deref(),
+        Some("unrelated-session")
+    );
+    assert!(unrelated_after.error.is_none());
+
+    assert!(
+        !crate::automation::finish_run(
+            cp.store(),
+            &run.id,
+            "success",
+            Some("later-session"),
+            None,
+        )
+        .await
+        .unwrap(),
+        "the terminal startup failure must reject late completion"
+    );
+
+    let mut statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::AutomationHookRunChanged { run_id, status, .. } = event {
+            if run_id == run.id {
+                statuses.push(status);
+            }
+        }
+    }
+    assert!(
+        statuses.iter().any(|status| status == "failed"),
+        "startup failure must emit a failed run event, got: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "success"),
+        "startup failure must never emit a successful run event, got: {statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|status| matches!(status.as_str(), "running" | "failed")),
+        "startup failure must emit only running or failed events, got: {statuses:?}"
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
+async fn ending_a_hook_session_preserves_failed_run_and_never_emits_late_success() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let cp = test_control_plane(store, registries(true)).await;
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = cp
+        .connect_project(project_dir.path(), "automation")
+        .await
+        .unwrap();
+    let hook = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "end race",
+            crate::automation::TriggerKind::ToolAfter,
+            &project.project_id,
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let mut events = cp.subscribe();
+
+    cp.dispatch_automation_event(
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::ToolAfter,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("tool", "test"),
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await;
+
+    let run = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let session_pk = run.session_pk.clone().expect("run is linked to a session");
+    wait_for_running_handle(&cp, &session_pk).await;
+
+    // The fake returns Ok only after cancellation, reproducing the late-success
+    // path that used to overwrite and emit success after end_session.
+    cp.end_session(&session_pk).await.unwrap();
+    for _ in 0..400 {
+        if cp.running_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(cp.running_count(), 0, "cancelled prompt must finish");
+
+    let stored = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap();
+    assert_eq!(stored[0].status, "failed");
+    assert_eq!(stored[0].error.as_deref(), Some("session cancelled"));
+
+    let mut run_statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::AutomationHookRunChanged { run_id, status, .. } = event {
+            if run_id == run.id {
+                run_statuses.push(status);
+            }
+        }
+    }
+    assert_eq!(run_statuses, ["running", "failed"]);
+    drop(db_guard);
+}
+
+#[tokio::test]
 #[serial]
 async fn start_session_emits_session_run_count_and_harness_run_span() {
     let _guard = StateDirGuard::new();
@@ -681,7 +1048,9 @@ async fn control_plane_with_failing_factory(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness = Arc::new(FailingHarnessFactory);
+    regs.harness = Arc::new(FailingHarnessFactory {
+        message: "boom: harness factory intentionally fails".into(),
+    });
     let cp = test_control_plane(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -1378,7 +1747,9 @@ async fn queued_prompt_delivery_restores_head_and_emits_change_when_continuation
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut registries = Registries::new();
-    registries.harness = Arc::new(FailingHarnessFactory);
+    registries.harness = Arc::new(FailingHarnessFactory {
+        message: "failing harness".into(),
+    });
     let cp = test_control_plane(store, registries).await;
     let store = cp.store.clone();
     let session_pk = "queued-restore";
@@ -1914,7 +2285,17 @@ async fn start_session_streams_events_and_records_agent_id() {
     .expect("session must emit a result or error");
     assert!(events.contains(&"working".to_string()));
 
-    let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+            if stored[0].status == crate::domain::SessionStatus::Idle {
+                return stored;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("session must demote to Idle after its result event");
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].agent_session_id.as_deref(), Some("agent-1"));
     assert_eq!(session.status, crate::domain::SessionStatus::Running);
@@ -2541,6 +2922,49 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
         prompts.contains(&"first".to_string()) && prompts.contains(&"second".to_string()),
         "both the startup prompt and the follow-up ran; got: {prompts:?}"
     );
+}
+
+#[tokio::test]
+async fn reconcile_fails_queued_automation_runs_while_resuming_running_sessions() {
+    let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "p1").await;
+    seed_session(
+        &store,
+        "s1",
+        "p1",
+        SessionStatus::Running,
+        Some("acp-123"),
+        0,
+    )
+    .await;
+    let hook = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::outbound(
+            "Restart queued",
+            crate::automation::TriggerKind::SessionEnd,
+            "https://example.com/hook",
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let run = crate::automation::create_run(&store, &hook.id, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    cp.reconcile().await.unwrap();
+    wait_for_prompts(&prompt_log, 1).await;
+
+    assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+    let stored = crate::automation::list_runs(&store, &hook.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|stored| stored.id == run.id)
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert_eq!(stored.error.as_deref(), Some("restart interrupted"));
+    assert!(stored.finished_at.is_some());
 }
 
 #[tokio::test]

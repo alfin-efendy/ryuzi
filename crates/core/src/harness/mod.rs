@@ -76,6 +76,9 @@ pub struct SessionCtx {
     /// Shared approval hub for tool-permission requests.
     pub approvals: Arc<ApprovalHub>,
     /// Shared async-delegation capacity gate (spec §6.2). Populated from
+    /// `ControlPlane` and cloned into native runner dependencies.
+    pub automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
+    /// Shared async-delegation capacity gate (spec §6.2). Populated from
     /// `ControlPlane::background`; the native runner's `task` tool uses it to
     /// bound `background: true` delegations against `max_concurrent_runs`.
     pub background: Arc<crate::harness::native::background::BackgroundRegistry>,
@@ -124,6 +127,14 @@ pub struct TurnPrompt {
     /// Display metadata persisted on the user transcript row —
     /// `[{name, path, contentType, size}]` per saved attachment.
     pub attachments: Vec<serde_json::Value>,
+    /// Force this turn's subtask runtime metadata (see the native runner's
+    /// `TurnOptions`), overriding whatever a resolved slash command would
+    /// otherwise set. `None` preserves ordinary slash-command resolution —
+    /// every existing caller is unaffected. Used by automation Hook agent
+    /// runs, whose `subtask` field must reach the same runtime budget a
+    /// command's `subtask: true` frontmatter does, without being encoded
+    /// into the prompt text itself.
+    pub force_subtask: Option<bool>,
 }
 
 impl TurnPrompt {
@@ -229,6 +240,7 @@ mod tests {
             extension_tools: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            automation_events: None,
             background: crate::harness::native::background::BackgroundRegistry::new(),
             agent_knowledge: knowledge,
             learning_queue,
