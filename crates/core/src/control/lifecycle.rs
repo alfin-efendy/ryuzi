@@ -1449,7 +1449,14 @@ impl ControlPlane {
             agent,
             isolated_target,
             work_dir: work_dir.to_path_buf(),
-            attachments_dir: Some(self.attachment_dest_dir(session_pk).await),
+            // Explicit-mention children are one-shot isolated harnesses: they
+            // share the parent session id for durable run rows, but never its
+            // attachment read root. Normal primary and retry starts retain it.
+            attachments_dir: if isolated_target {
+                None
+            } else {
+                Some(self.attachment_dest_dir(session_pk).await)
+            },
             perm_mode,
             model,
             effort,

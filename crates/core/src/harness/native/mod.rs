@@ -316,7 +316,6 @@ impl Harness for NativeHarness {
         // routes/models through that capability and fall back to a compatible
         // route/model when a stale project pins a target no connection
         // actually serves anymore.
-        let primary_turn = primary_turn_config(ctx.primary_agent.clone(), ctx.run_id.clone())?;
         let model = resolve_native_model(&ctx.store, ctx.model.clone()).await;
         let meta =
             crate::llm_router::model_meta::resolve(&ctx.store, model.as_deref().unwrap_or(""))
@@ -328,7 +327,6 @@ impl Harness for NativeHarness {
         // The durable snapshot owns this session's native persona. Legacy
         // worktree agents remain available only for slash-command/subagent
         // selection; they must never replace a durable primary by name.
-        let agent = primary_turn.agent_tools.clone();
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
@@ -353,6 +351,15 @@ impl Harness for NativeHarness {
         // path with no special-casing.
         extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
+        // The registry is complete only after MCP and extension attachment.
+        // Resolve this immutable profile against that final namespace so a
+        // constrained explicit target cannot fall back to `ToolFilter::All`.
+        let primary_turn = primary_turn_config_with_tools(
+            ctx.primary_agent.clone(),
+            ctx.run_id.clone(),
+            &tools.names(),
+        )?;
+        let agent = primary_turn.agent_tools.clone();
         let model_name = model.as_deref().unwrap_or("");
         let mut effort_policy =
             crate::llm_router::model_effort::build_utility_effort_policy(&ctx.store, model_name)
@@ -407,7 +414,12 @@ impl Harness for NativeHarness {
                 agent_knowledge: ctx.agent_knowledge,
                 kind: ctx.kind,
                 work_dir: ctx.work_dir,
-                attachments_dir: ctx.attachments_dir,
+                // Isolated explicit targets never inherit the parent session's
+                // attachment root, even if a caller constructs SessionCtx
+                // directly instead of going through the control plane.
+                attachments_dir: (!ctx.isolated_target)
+                    .then_some(ctx.attachments_dir)
+                    .flatten(),
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 extension_events: ctx.extension_events,
                 model,
@@ -429,10 +441,9 @@ impl Harness for NativeHarness {
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
                 background: ctx.background,
-                // The control plane only populates `ctx.app_control` for a
-                // top-level interactive session (`kind` Project/Chat); worker,
-                // review, and bare test contexts pass `None` through.
-                app_control: ctx.app_control,
+                // Explicit-target and noninteractive-session facades must
+                // never cross the harness boundary from their parent.
+                app_control: (!ctx.isolated_target).then_some(ctx.app_control).flatten(),
                 nudge,
                 review_tool_defs: None,
                 // Every agent tool call — even one an interactive human turn
@@ -785,6 +796,137 @@ mod tests {
         assert!(adapted.agent.tools.allows("read"));
         assert!(!adapted.agent.tools.allows("bash"));
         assert_eq!(adapted.allowed_skills, Some(vec!["release".into()]));
+    }
+
+    #[tokio::test]
+    async fn isolated_target_cannot_read_parent_attachments_or_use_parent_facade() {
+        use runner::testutil::{
+            input_json_delta, message_delta, message_stop, tool_use_start, RecordingLlm,
+        };
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        let attachment = attachments.path().join("parent-only.txt");
+        tokio::fs::write(&attachment, "parent-only attachment")
+            .await
+            .unwrap();
+        let attachment_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(attachment_db.path()).await.unwrap());
+        let mut ctx = ctx_for(store.clone(), work_dir.path().to_path_buf()).await;
+        let mut target = (*ctx.primary_agent).clone();
+        target.profile.id = "mentioned-target".into();
+        target.profile.name = "Mentioned target".into();
+        target.profile.tools.native = vec!["read".into(), "app_projects".into()];
+        target.profile.tools.plugins.clear();
+        target.profile.tools.apps.clear();
+        ctx.primary_agent = Arc::new(target);
+        ctx.main_agent_id = "mentioned-target".into();
+        ctx.isolated_target = true;
+        ctx.attachments_dir = Some(attachments.path().to_path_buf());
+        ctx.app_control = Some(Arc::new(tools::testutil::FakeAppControl::default()));
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "read-parent-attachment", "read"),
+                input_json_delta(0, &serde_json::json!({ "path": attachment }).to_string()),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "parent-facade", "app_projects"),
+                input_json_delta(0, r#"{"action":"list"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                runner::testutil::text_delta("done"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+        ]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(OneShotFactory(llm)));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("inspect attachment", "inspect attachment"))
+            .await
+            .unwrap();
+
+        let tool_rows = store.list_messages("sess").await.unwrap();
+        let tool_row = tool_rows
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("read-parent-attachment"))
+            .expect("the mentioned child records its read attempt");
+        assert_eq!(tool_row.status.as_deref(), Some("failed"));
+        assert!(
+            !tool_row.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("parent-only attachment")),
+            "the mentioned child must not receive its parent's attachment read root"
+        );
+        let facade_row = tool_rows
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("parent-facade"))
+            .expect("the mentioned child records its parent-facade attempt");
+        assert_eq!(facade_row.status.as_deref(), Some("failed"));
+        assert!(
+            facade_row.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("not available in this context")),
+            "the mentioned child must not receive its parent's app facade"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_target_uses_complete_profile_tool_allowlist_after_registry_attach() {
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let profile_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(profile_db.path()).await.unwrap());
+        let mut ctx = ctx_for(store, work_dir.path().to_path_buf()).await;
+        let mut target = (*ctx.primary_agent).clone();
+        target.profile.id = "mentioned-target".into();
+        target.profile.name = "Mentioned target".into();
+        target.profile.tools.native.clear();
+        target.profile.tools.plugins = vec!["github.search".into()];
+        target.profile.tools.apps = vec!["slack".into()];
+        ctx.primary_agent = Arc::new(target);
+        ctx.main_agent_id = "mentioned-target".into();
+        ctx.isolated_target = true;
+        let llm = Arc::new(RecordingLlm::new(vec![vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ]]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("inspect", "inspect"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let advertised = bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            advertised.is_empty(),
+            "unattached configured tools must not overgrant native tools: {advertised:?}"
+        );
     }
 
     #[test]

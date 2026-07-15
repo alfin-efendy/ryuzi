@@ -222,6 +222,13 @@ struct Counters {
     primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
     /// Historic session permission updates observed by a live session.
     perm_modes: Arc<Mutex<Vec<crate::domain::PermMode>>>,
+    /// Every attachments read-root received by a started harness, in start
+    /// order. Explicit mention tests use this to prove their one-shot child
+    /// does not inherit the parent session root.
+    attachment_dirs: Arc<Mutex<Vec<Option<std::path::PathBuf>>>>,
+    /// Whether each started harness received an app-control facade. An
+    /// explicit-mention child must never retain its parent's facade.
+    app_facades: Arc<Mutex<Vec<bool>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -243,6 +250,16 @@ struct FakeHarness {
 impl Harness for FakeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        self.counters
+            .attachment_dirs
+            .lock()
+            .unwrap()
+            .push(ctx.attachments_dir.clone());
+        self.counters
+            .app_facades
+            .lock()
+            .unwrap()
+            .push(ctx.app_control.is_some());
         *self.counters.mcp_servers.lock().unwrap() = Some(ctx.mcp_servers.clone());
         *self.counters.mcp_principals.lock().unwrap() = Some(ctx.mcp_principals.clone());
         Ok(Box::new(FakeSession {
@@ -783,6 +800,23 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
         .unwrap();
 
     wait_for_prompts(&counters.prompts, 2).await;
+    let attachment_dirs = counters.attachment_dirs.lock().unwrap();
+    assert!(
+        attachment_dirs[0].is_some(),
+        "the normal primary must retain its session attachment root"
+    );
+    assert_eq!(
+        attachment_dirs[1], None,
+        "the explicit-mention child must not inherit the parent attachment root"
+    );
+    drop(attachment_dirs);
+    let app_facades = counters.app_facades.lock().unwrap();
+    assert!(app_facades[0], "the primary retains its app-control facade");
+    assert!(
+        !app_facades[1],
+        "the explicit-mention child must not receive the parent app-control facade"
+    );
+    drop(app_facades);
     let runs = store
         .list_session_agent_runs(&session.session_pk)
         .await
@@ -3976,7 +4010,7 @@ async fn provision_project_git_url_flow_derives_name_and_records_source() {
     std::fs::create_dir_all(&upstream_dir).unwrap();
     init_repo(&upstream_dir);
 
-    let git_url = format!("{}/.git", upstream_dir.display());
+    let git_url = format!("{}/.git", upstream_dir.display()).replace('\\', "/");
     let mut req = provision_req("fake", "ws1", "u1");
     req.git_url = Some(git_url.clone());
     // A trailing "/.git" strips to the parent dir name ("upstream-repo") via basename.

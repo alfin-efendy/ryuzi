@@ -1536,7 +1536,9 @@ impl RunnerMainAgentSpawner {
                 &snapshot.profile.id,
                 child_deps.project_id.as_deref(),
             )?));
-            child_deps.app_control = self.deps.app_control.clone();
+            // A delegated target may advertise its configured app tool but
+            // never receives the parent's app-control facade to execute it.
+            child_deps.app_control = None;
             child_deps.perm_overrides = Arc::new(std::sync::Mutex::new(Default::default()));
             child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
             child_deps.model = primary_turn.model;
@@ -6352,6 +6354,12 @@ mod tests {
                 message_stop(),
             ],
             vec![
+                tool_use_start(0, "target-app-call", "app_projects"),
+                input_json_delta(0, r#"{"action":"list"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
                 tool_use_start(0, "target-mcp-call", "mcp__slack__send"),
                 input_json_delta(0, r#"{}"#),
                 message_delta("tool_use"),
@@ -6523,12 +6531,12 @@ mod tests {
         );
         assert_eq!(
             child.tool_count, 3,
-            "every target-owned known and allowed tool call is counted, including a permission denial"
+            "only target-owned, schema-admitted tool calls are counted; the facade-gated app attempt is rejected before admission"
         );
         let bodies = llm.bodies.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),
-            4,
+            5,
             "the target loop executes its configured turns"
         );
         let body = &bodies[0];
@@ -6546,12 +6554,16 @@ mod tests {
             .iter()
             .find(|row| row.tool_call_id.as_deref() == Some("target-app-call"))
             .expect("target app facade call is recorded");
-        assert_eq!(target_app_call.status.as_deref(), Some("completed"));
+        assert_eq!(
+            target_app_call.status.as_deref(),
+            Some("failed"),
+            "the target's app tool is advertised but cannot reach the parent's facade"
+        );
         assert!(
             target_app_call.payload["output"]
                 .as_str()
-                .is_some_and(|output| output.contains("Ryuzi [p1]")),
-            "the target's app facade is present and executable"
+                .is_some_and(|output| output.contains("not available in this context")),
+            "the target must not execute against the parent's app facade"
         );
         let target_mcp_call = tool_rows
             .iter()
