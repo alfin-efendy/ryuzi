@@ -590,28 +590,121 @@ const BUDGET_EXHAUSTED_PROMPT: &str = "You've reached the maximum number of \
     summarizing what you've found and accomplished so far, without calling \
     any more tools.";
 
-/// The tool definitions a turn advertises to the model: the registry's
-/// tools filtered by the agent's allow-list, with `orch_block` additionally
-/// hidden from every session kind but `Worker` (Task E6, spec §8) — the
-/// SCHEMA-level half of the gate. This is advisory, not the safety boundary:
-/// dispatch (`run_tool_call`'s `agent.tools.allows` check) still enforces the
-/// agent's real whitelist regardless of what's advertised, and `orch_block`'s
-/// own `Store::task_by_session` lookup is the authoritative RUNTIME guard — a
+/// Synthetic meta-tool name. `load_tools` is NOT a registry tool — its
+/// definition is injected here and its call is intercepted in `run_tool_call`.
+pub(crate) const LOAD_TOOLS_NAME: &str = "load_tools";
+
+/// Always-advertised built-ins. Everything else (niche built-ins + all MCP /
+/// extension tools) is deferred until the model loads it via `load_tools`.
+const HOT_TOOLS: &[&str] = &[
+    "read",
+    "ls",
+    "glob",
+    "grep",
+    "bash",
+    "edit",
+    "write",
+    "todowrite",
+    "todoread",
+    "skill",
+    "task",
+];
+
+fn is_hot(name: &str) -> bool {
+    HOT_TOOLS.contains(&name)
+}
+
+/// The synthetic `load_tools` definition, whose description carries the current
+/// deferred index (name + one-line summary) so the model knows what it can load.
+fn load_tools_definition(deferred_index: &[(String, String)]) -> Value {
+    let mut description = String::from(
+        "Load additional tools into this session by name so you can call them. \
+         Only the tools listed below can be loaded; call this with the exact \
+         names you need, then use them on your next step.\n\nAvailable to load:",
+    );
+    for (name, summary) in deferred_index {
+        description.push_str(&format!("\n- {name}: {summary}"));
+    }
+    json!({
+        "name": LOAD_TOOLS_NAME,
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "names": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Exact tool names to load, taken from the list in this description."
+                }
+            },
+            "required": ["names"]
+        }
+    })
+}
+
+/// Tool definitions advertised to the model this turn: the registry's tools
+/// filtered by the agent's allow-list, with `orch_block` additionally hidden
+/// from every session kind but `Worker` (Task E6, spec §8) — the SCHEMA-level
+/// half of the gate. This is advisory, not the safety boundary: dispatch
+/// (`run_tool_call`'s `agent.tools.allows` check) still enforces the agent's
+/// real whitelist regardless of what's advertised, and `orch_block`'s own
+/// `Store::task_by_session` lookup is the authoritative RUNTIME guard — a
 /// non-worker session has no orch task row for its `session_pk` even if it
 /// somehow called the tool anyway.
-fn visible_tool_defs(tools: &ToolRegistry, agent: &Agent, kind: SessionKind) -> Vec<Value> {
-    tools
-        .definitions()
-        .into_iter()
-        .filter(|d| {
-            d.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| {
-                    agent.tools.allows(n) && (n != "orch_block" || kind == SessionKind::Worker)
-                })
-                .unwrap_or(false)
-        })
-        .collect()
+///
+/// `activated = None` (sub-agents, review forks, tests): the full set filtered
+/// by the agent allow-list and the `orch_block`/`Worker` gate — unchanged
+/// behavior. `activated = Some(set)`: only the hot core plus deferred tools the
+/// model has already loaded, plus a synthetic `load_tools` carrying the index of
+/// what remains deferred. Dispatch (`run_tool_call`) still enforces the real
+/// whitelist, so a tool that is merely hidden here is refused, not executed, if
+/// the model somehow calls it.
+fn visible_tool_defs(
+    tools: &ToolRegistry,
+    agent: &Agent,
+    kind: SessionKind,
+    activated: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<Value> {
+    let allowed = |name: &str| {
+        agent.tools.allows(name) && (name != "orch_block" || kind == SessionKind::Worker)
+    };
+
+    let Some(activated) = activated else {
+        return tools
+            .definitions()
+            .into_iter()
+            .filter(|d| {
+                d.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(&allowed)
+                    .unwrap_or(false)
+            })
+            .collect();
+    };
+
+    let mut out: Vec<Value> = Vec::new();
+    let mut deferred_index: Vec<(String, String)> = Vec::new();
+    for def in tools.definitions() {
+        let Some(name) = def.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if !allowed(name) {
+            continue;
+        }
+        if is_hot(name) || activated.contains(name) {
+            out.push(def);
+        } else {
+            let summary = def
+                .get("description")
+                .and_then(|d| d.as_str())
+                .and_then(|d| d.lines().next())
+                .unwrap_or("")
+                .to_string();
+            deferred_index.push((name.to_string(), summary));
+        }
+    }
+    out.push(load_tools_definition(&deferred_index));
+    out
 }
 
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
@@ -656,7 +749,7 @@ async fn drive(
     // non-whitelisted call is refused, not merely hidden from the model.
     let tool_defs: Vec<Value> = match &deps.review_tool_defs {
         Some(captured) => captured.clone(),
-        None => visible_tool_defs(&deps.tools, agent, deps.kind),
+        None => visible_tool_defs(&deps.tools, agent, deps.kind, None),
     };
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
@@ -4598,14 +4691,118 @@ mod tests {
                 .collect()
         };
         for kind in [SessionKind::Chat, SessionKind::Project, SessionKind::Review] {
-            let defs = visible_tool_defs(&tools, &agent, kind);
+            let defs = visible_tool_defs(&tools, &agent, kind, None);
             assert!(
                 !names(&defs).contains(&"orch_block".to_string()),
                 "{kind:?} must not see orch_block"
             );
         }
-        let worker_defs = visible_tool_defs(&tools, &agent, SessionKind::Worker);
+        let worker_defs = visible_tool_defs(&tools, &agent, SessionKind::Worker, None);
         assert!(names(&worker_defs).contains(&"orch_block".to_string()));
+    }
+
+    #[test]
+    fn is_hot_classifies_core_vs_deferred() {
+        for n in [
+            "read",
+            "ls",
+            "glob",
+            "grep",
+            "bash",
+            "edit",
+            "write",
+            "todowrite",
+            "todoread",
+            "skill",
+            "task",
+        ] {
+            assert!(is_hot(n), "{n} must be hot");
+        }
+        for n in [
+            "webfetch",
+            "memory",
+            "lsp",
+            "session_search",
+            "mcp__srv__do",
+        ] {
+            assert!(!is_hot(n), "{n} must be deferred");
+        }
+    }
+
+    #[test]
+    fn visible_tool_defs_none_is_the_full_filtered_set() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent(); // tools: ToolFilter::All
+        let eager = visible_tool_defs(&tools, &agent, SessionKind::Chat, None);
+        // Full set (25) minus orch_block (hidden outside Worker) = 24, and no load_tools.
+        let names: Vec<String> = eager
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"webfetch".to_string()));
+        assert!(names.contains(&"read".to_string()));
+        assert!(
+            !names.iter().any(|n| n == LOAD_TOOLS_NAME),
+            "eager mode has no synthetic load_tools"
+        );
+    }
+
+    #[test]
+    fn visible_tool_defs_lazy_hides_deferred_and_adds_load_tools() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent();
+        let empty = std::collections::BTreeSet::new();
+        let lazy = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&empty));
+        let names: Vec<String> = lazy
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        // Hot core present, deferred hidden, load_tools present and last.
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&"bash".to_string()));
+        assert!(
+            !names.contains(&"webfetch".to_string()),
+            "deferred hidden until loaded"
+        );
+        assert!(!names.contains(&"memory".to_string()));
+        assert_eq!(names.last().map(String::as_str), Some(LOAD_TOOLS_NAME));
+        // load_tools description lists the deferred tools by name.
+        let lt = lazy.iter().find(|d| d["name"] == LOAD_TOOLS_NAME).unwrap();
+        let desc = lt["description"].as_str().unwrap();
+        assert!(
+            desc.contains("webfetch"),
+            "index must name deferred webfetch"
+        );
+        assert!(
+            !desc.contains("\n- read:"),
+            "hot tools are not in the load index"
+        );
+    }
+
+    #[test]
+    fn visible_tool_defs_lazy_reveals_an_activated_tool() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent();
+        let mut set = std::collections::BTreeSet::new();
+        set.insert("webfetch".to_string());
+        let lazy = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&set));
+        let names: Vec<String> = lazy
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            names.contains(&"webfetch".to_string()),
+            "activated tool is advertised in full"
+        );
+        // …and no longer in the load_tools index.
+        let lt = lazy.iter().find(|d| d["name"] == LOAD_TOOLS_NAME).unwrap();
+        assert!(!lt["description"]
+            .as_str()
+            .unwrap()
+            .contains("\n- webfetch:"));
+        // Deterministic order across calls.
+        let again = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&set));
+        assert_eq!(lazy, again);
     }
 
     #[test]
