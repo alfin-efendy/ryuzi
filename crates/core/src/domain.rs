@@ -733,6 +733,7 @@ pub enum CoreEvent {
         usable_window: u64,
         percent_left: u8,
         cache_read_tokens: u64,
+        cache_creation_tokens: u64,
         output_tokens: u64,
     },
     /// The native runtime compacted a session's history
@@ -883,6 +884,7 @@ mod tests {
             usable_window: 190_000,
             percent_left: 37,
             cache_read_tokens: 90_000,
+            cache_creation_tokens: 4_000,
             output_tokens: 512,
         };
         let j = serde_json::to_value(&e).unwrap();

@@ -72,6 +72,7 @@ type State = {
       percentLeft: number;
       contextWindow: number;
       cacheReadTokens: number;
+      cacheCreationTokens: number;
       outputTokens: number;
     }
   >;
@@ -304,6 +305,7 @@ export const useStore = create<State>((set, get) => ({
                 percentLeft: e.percent_left,
                 contextWindow: e.context_window,
                 cacheReadTokens: e.cache_read_tokens,
+                cacheCreationTokens: e.cache_creation_tokens,
                 outputTokens: e.output_tokens,
               },
             },

@@ -11,7 +11,15 @@ afterEach(cleanup);
 beforeEach(() => {
   useStore.setState({
     contextUsage: {
-      [KEY]: { activeTokens: 1000, usableWindow: 190000, percentLeft: 95, contextWindow: 200000, cacheReadTokens: 300, outputTokens: 512 },
+      [KEY]: {
+        activeTokens: 1000,
+        usableWindow: 190000,
+        percentLeft: 95,
+        contextWindow: 200000,
+        cacheReadTokens: 300,
+        cacheCreationTokens: 0,
+        outputTokens: 512,
+      },
     },
     sessionCost: {
       [KEY]: {

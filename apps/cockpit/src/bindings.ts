@@ -1828,7 +1828,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
  */
-{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; output_tokens: number } |
+{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; cache_creation_tokens: number; output_tokens: number } |
 /**
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
