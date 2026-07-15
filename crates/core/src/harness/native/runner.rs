@@ -19,7 +19,7 @@ use super::tools::{
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
 use crate::delegation::{RunHandle, SubagentRunRequest};
-use crate::domain::{BackgroundKind, CoreEvent, NewMessage, PermMode, SessionKind};
+use crate::domain::{CoreEvent, NewMessage, PermMode, SessionKind};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
 use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -1523,6 +1523,7 @@ impl RunnerMainAgentSpawner {
     ) -> MainDelegationResult {
         let background = request.background;
         let context = request.context.clone();
+        let originating_run_id = request.parent_run_id.clone();
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
@@ -1537,13 +1538,55 @@ impl RunnerMainAgentSpawner {
         let run_id = child_run.run.run_id.clone();
         let agent_id = child_run.run.executing_agent_id.clone().unwrap_or_default();
         if background {
+            let cap =
+                crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await;
+            let Some(reservation) = self.deps.background.try_reserve(cap, &self.deps.session_pk)
+            else {
+                let _ = self
+                    .deps
+                    .delegation
+                    .cancel_child(&self.deps.session_pk, &run_id)
+                    .await;
+                return MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Error,
+                    report: format!(
+                        "Async delegation capacity reached ({cap} running). Run this task synchronously."
+                    ),
+                };
+            };
             let worker = Self {
                 deps: self.deps.clone(),
             };
             let goal = child_run.run.task.clone();
+            let child_run_id = child_run.run.run_id.clone();
+            let session_pk = self.deps.session_pk.clone();
             tokio::spawn(async move {
-                let result = worker.execute_child(child_run, context).await;
-                worker.deliver_background_result(&goal, &result).await;
+                let reservation_cancel = reservation.token();
+                let execution = worker.execute_child(child_run, context);
+                tokio::pin!(execution);
+                let result = tokio::select! {
+                    _ = reservation_cancel.cancelled() => {
+                        // The terminal transition awaits SQLite; release the
+                        // capacity guard first so ending a session never holds
+                        // a slot hostage on that I/O.
+                        drop(reservation);
+                        let _ = worker
+                            .deps
+                            .delegation
+                            .cancel_child(&session_pk, &child_run_id)
+                            .await;
+                        return;
+                    }
+                    result = &mut execution => result,
+                };
+                if reservation_cancel.is_cancelled() {
+                    return;
+                }
+                worker
+                    .deliver_background_result(&originating_run_id, &goal, &result)
+                    .await;
             });
             return MainDelegationResult::completed(
                 run_id,
@@ -1688,7 +1731,12 @@ impl RunnerMainAgentSpawner {
         }
     }
 
-    async fn deliver_background_result(&self, goal: &str, result: &MainDelegationResult) {
+    async fn deliver_background_result(
+        &self,
+        originating_run_id: &str,
+        goal: &str,
+        result: &MainDelegationResult,
+    ) {
         let block = delegation::format_delegation_block(&delegation::DelegationResult {
             id: result.run_id.clone(),
             goal: goal.to_string(),
@@ -1701,11 +1749,7 @@ impl RunnerMainAgentSpawner {
         if let Err(error) = self
             .deps
             .store
-            .enqueue_background_event(
-                &self.deps.session_pk,
-                BackgroundKind::Delegation.as_str(),
-                &block,
-            )
+            .enqueue_background_delegation_event(&self.deps.session_pk, originating_run_id, &block)
             .await
         {
             tracing::warn!(
@@ -6049,6 +6093,18 @@ mod tests {
             .unwrap();
     }
 
+    async fn wait_for_background_release(
+        background: &crate::harness::native::background::BackgroundRegistry,
+    ) {
+        for _ in 0..200 {
+            if background.active() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("background reservation was not released within the poll window");
+    }
+
     /// Poll the rail (bounded) until the detached worker for `session_pk`
     /// writes its completion row, claiming (and thus returning) it.
     async fn wait_for_rail_row(store: &Store, session_pk: &str) -> crate::domain::BackgroundEvent {
@@ -6180,6 +6236,87 @@ mod tests {
             .payload
             .contains(&format!("[ASYNC DELEGATION COMPLETE — {id}]")));
         assert!(row.payload.contains("all done"));
+    }
+
+    #[tokio::test]
+    async fn background_main_delegate_reserves_a_cancellable_worker_and_never_enqueues_after_end() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (deps, registry) = deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Background target".into(),
+                description: "background target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let root_run_id = deps.run_id.clone();
+
+        let dispatched = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id,
+                target_agent_id: target.profile.id,
+                task: "wait for cancellation".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+        assert_eq!(
+            deps.background.active(),
+            1,
+            "main delegates reserve background capacity"
+        );
+
+        deps.background.interrupt_for_session(&deps.session_pk);
+        wait_for_background_release(&deps.background).await;
+        assert_eq!(
+            deps.background.active(),
+            0,
+            "cancellation releases the main delegate reservation"
+        );
+        assert_eq!(
+            deps.store.pending_background_count().await.unwrap(),
+            0,
+            "a cancelled main delegate cannot enqueue a stale rail row"
+        );
+        let child = deps
+            .delegation
+            .await_terminal(&dispatched.run_id)
+            .await
+            .expect("the cancelled worker records its terminal run");
+        assert_eq!(
+            child.status,
+            crate::domain::AgentRunStatus::Cancelled,
+            "cancelling the detached worker must mark its child run cancelled"
+        );
     }
 
     #[tokio::test]

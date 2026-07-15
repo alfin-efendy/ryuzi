@@ -114,6 +114,9 @@ impl SessionKind {
 pub struct BackgroundEvent {
     pub id: String,
     pub target_session_pk: String,
+    /// The primary run that dispatched a delegation outcome. `None` preserves
+    /// the normal rail behavior for non-delegation producers and legacy rows.
+    pub origin_run_id: Option<String>,
     pub kind: String,
     pub payload: String,
     pub created_at: i64,

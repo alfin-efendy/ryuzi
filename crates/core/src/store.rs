@@ -912,6 +912,17 @@ fn migrations() -> Migrations<'static> {
             if !has_override {
                 tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
             }
+            let has_origin_run_id = tx
+                .prepare("SELECT 1 FROM pragma_table_info('background_events') WHERE name='origin_run_id'")?
+                .exists([])?;
+            if !has_origin_run_id {
+                tx.execute("ALTER TABLE background_events ADD COLUMN origin_run_id TEXT", [])?;
+            }
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_background_events_origin \
+                 ON background_events(origin_run_id, delivered_at)",
+                [],
+            )?;
             Ok(())
         }),
         // Migration 28 — Remote catalog cache (origin/main #113).
@@ -3015,26 +3026,58 @@ impl Store {
         .await
     }
 
-    /// Enqueue a durable background-rail row (spec §6.1). Returns the new id.
+    /// Enqueue a durable background-rail row with no originating run. This
+    /// preserves the generic new-user-turn delivery semantics for jobs and
+    /// legacy producers.
     pub async fn enqueue_background_event(
         &self,
         target_session_pk: &str,
         kind: &str,
         payload: &str,
     ) -> anyhow::Result<String> {
+        self.enqueue_background_event_for_run(target_session_pk, None, kind, payload)
+            .await
+    }
+
+    /// Enqueue a durable background delegation outcome bound to the primary
+    /// run that dispatched it. The rail drainer attaches this to that run
+    /// instead of opening a new primary user turn.
+    pub async fn enqueue_background_delegation_event(
+        &self,
+        target_session_pk: &str,
+        origin_run_id: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        self.enqueue_background_event_for_run(
+            target_session_pk,
+            Some(origin_run_id),
+            crate::domain::BackgroundKind::Delegation.as_str(),
+            payload,
+        )
+        .await
+    }
+
+    async fn enqueue_background_event_for_run(
+        &self,
+        target_session_pk: &str,
+        origin_run_id: Option<&str>,
+        kind: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
         let id = crate::paths::new_id();
-        let (id2, target, kind, payload, now) = (
+        let (id2, target, origin, kind, payload, now) = (
             id.clone(),
             target_session_pk.to_string(),
+            origin_run_id.map(str::to_string),
             kind.to_string(),
             payload.to_string(),
             crate::paths::now_ms(),
         );
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO background_events(id, target_session_pk, kind, payload, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id2, target, kind, payload, now],
+                "INSERT INTO background_events(id, target_session_pk, origin_run_id, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id2, target, origin, kind, payload, now],
             )
             .map(|_| ())
         })
@@ -3079,18 +3122,19 @@ impl Store {
                 params![id, claimer],
             )?;
             let row = tx.query_row(
-                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                "SELECT id, target_session_pk, origin_run_id, kind, payload, created_at, claimed_by, delivered_at \
                  FROM background_events WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(crate::domain::BackgroundEvent {
                         id: r.get(0)?,
                         target_session_pk: r.get(1)?,
-                        kind: r.get(2)?,
-                        payload: r.get(3)?,
-                        created_at: r.get(4)?,
-                        claimed_by: r.get(5)?,
-                        delivered_at: r.get(6)?,
+                        origin_run_id: r.get(2)?,
+                        kind: r.get(3)?,
+                        payload: r.get(4)?,
+                        created_at: r.get(5)?,
+                        claimed_by: r.get(6)?,
+                        delivered_at: r.get(7)?,
                     })
                 },
             )?;
@@ -3133,18 +3177,19 @@ impl Store {
                 params![id, claimer],
             )?;
             let row = tx.query_row(
-                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                "SELECT id, target_session_pk, origin_run_id, kind, payload, created_at, claimed_by, delivered_at \
                  FROM background_events WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(crate::domain::BackgroundEvent {
                         id: r.get(0)?,
                         target_session_pk: r.get(1)?,
-                        kind: r.get(2)?,
-                        payload: r.get(3)?,
-                        created_at: r.get(4)?,
-                        claimed_by: r.get(5)?,
-                        delivered_at: r.get(6)?,
+                        origin_run_id: r.get(2)?,
+                        kind: r.get(3)?,
+                        payload: r.get(4)?,
+                        created_at: r.get(5)?,
+                        claimed_by: r.get(6)?,
+                        delivered_at: r.get(7)?,
                     })
                 },
             )?;

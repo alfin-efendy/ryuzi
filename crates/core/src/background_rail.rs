@@ -19,6 +19,7 @@
 //! failure, only left pending for the next attempt.
 
 use crate::control::ControlPlane;
+use crate::domain::{BackgroundKind, CoreEvent, NewMessage};
 use crate::harness::TurnPrompt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,17 +53,18 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                 break;
             }
         };
-        // `continue_session_with_prompt` is the ONLY delivery path: a clean
-        // new user turn onto a session `claim_deliverable_background_event`
-        // already proved is idle. Never a mid-turn splice.
-        match cp
-            .continue_session_with_prompt(
-                &event.target_session_pk,
-                TurnPrompt::text(event.payload.clone(), event.payload.clone()),
-                &[],
-            )
-            .await
-        {
+        // Delegation outcomes retain their origin run so they become a
+        // run-scoped system result, not a synthetic primary user turn. Every
+        // other producer keeps the generic idle-only continuation behavior.
+        let delivery = if event.kind == BackgroundKind::Delegation.as_str() {
+            match event.origin_run_id.as_deref() {
+                Some(origin_run_id) => deliver_delegation_outcome(cp, &event, origin_run_id).await,
+                None => deliver_as_user_turn(cp, &event).await,
+            }
+        } else {
+            deliver_as_user_turn(cp, &event).await
+        };
+        match delivery {
             Ok(()) => {
                 let _ = store.mark_background_delivered(&event.id).await;
             }
@@ -81,6 +83,49 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
     for id in failed_this_tick {
         let _ = store.release_background_claim(&id).await;
     }
+}
+
+async fn deliver_as_user_turn(
+    cp: &Arc<ControlPlane>,
+    event: &crate::domain::BackgroundEvent,
+) -> anyhow::Result<()> {
+    cp.continue_session_with_prompt(
+        &event.target_session_pk,
+        TurnPrompt::text(event.payload.clone(), event.payload.clone()),
+        &[],
+    )
+    .await
+}
+
+async fn deliver_delegation_outcome(
+    cp: &Arc<ControlPlane>,
+    event: &crate::domain::BackgroundEvent,
+    origin_run_id: &str,
+) -> anyhow::Result<()> {
+    let seq = cp
+        .store()
+        .insert_run_message(
+            origin_run_id,
+            NewMessage::block(
+                &event.target_session_pk,
+                "system",
+                "delegation_result",
+                serde_json::json!({ "text": event.payload }),
+            ),
+        )
+        .await?;
+    cp.emit(CoreEvent::Message {
+        session_pk: event.target_session_pk.clone(),
+        seq,
+        role: "system".to_string(),
+        block_type: "delegation_result".to_string(),
+        payload: serde_json::json!({ "text": event.payload }),
+        tool_call_id: None,
+        status: None,
+        tool_kind: None,
+        speaker: None,
+    });
+    Ok(())
 }
 
 /// The drainer's background loop: sleep, then drain a batch, forever.
@@ -326,6 +371,80 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for a matching message in {session_pk}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tick_delivers_a_delegation_to_its_originating_run_without_a_user_turn() {
+        let _guard = StateDirGuard::new();
+        let (cp, _db) = control_plane_with(Arc::new(FakeHarnessFactory)).await;
+        idle_chat(&cp, "chat-1").await;
+        let snapshot = cp
+            .registry()
+            .resolved_snapshot(&cp.registry().default_agent_id().await)
+            .await
+            .unwrap();
+        let root = cp
+            .delegation()
+            .begin_primary("chat-1", snapshot, "original task")
+            .await
+            .unwrap();
+        let mut events = cp.subscribe();
+        cp.store()
+            .enqueue_background_delegation_event(
+                "chat-1",
+                &root.run.run_id,
+                "[ASYNC DELEGATION COMPLETE — child-1]\nresult: done",
+            )
+            .await
+            .unwrap();
+
+        tick(&cp).await;
+
+        assert_eq!(cp.store().pending_background_count().await.unwrap(), 0);
+        assert!(
+            cp.store()
+                .list_provider_turns("chat-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a delegation outcome must not continue the session as a synthetic user turn"
+        );
+        assert_eq!(
+            cp.store()
+                .list_session_agent_runs("chat-1")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|run| run.parent_run_id.is_none())
+                .count(),
+            1,
+            "draining a delegation must not create another primary run"
+        );
+        let outcome = cp
+            .store()
+            .list_run_messages("chat-1", &root.run.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.block_type == "delegation_result")
+            .expect("delegation outcome is attached to its originating run");
+        assert_eq!(
+            outcome.payload["text"],
+            "[ASYNC DELEGATION COMPLETE — child-1]\nresult: done"
+        );
+        assert!(
+            (0..16).filter_map(|_| events.try_recv().ok()).any(|event| matches!(
+                event,
+                crate::domain::CoreEvent::Message { block_type, payload, .. }
+                    if block_type == "delegation_result"
+                        && payload["text"] == "[ASYNC DELEGATION COMPLETE — child-1]\nresult: done"
+            )),
+            "the run-scoped outcome is emitted to live subscribers"
+        );
+
+        cp.end_session("chat-1").await.unwrap();
+        assert_eq!(cp.store().pending_background_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
