@@ -1955,6 +1955,12 @@ async fn handle_load_tools(
         })
         .unwrap_or_default();
 
+    if requested.is_empty() {
+        let msg = "No tool names given. Provide the exact tool names to load, taken from the load_tools description.";
+        finish_tool_row(deps, &t.id, msg, true).await;
+        return tool_result(&t.id, msg, true);
+    }
+
     let (mut loaded, mut unknown) = (Vec::new(), Vec::new());
     for name in requested {
         if loadable.contains(&name) {
@@ -5054,6 +5060,53 @@ mod tests {
             .filter_map(|t| t["name"].as_str().map(String::from))
             .collect();
         assert!(!t2.contains(&"not_a_tool".to_string()));
+    }
+
+    #[tokio::test]
+    async fn load_tools_rejects_empty_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            message_start_with_usage(1_000, 0),
+            tool_use_start(0, "c1", "load_tools"),
+            input_json_delta(0, r#"{"names":[]}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            message_start_with_usage(1_000, 0),
+            text_delta("ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = std::sync::Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        let set = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeSet::new()));
+        deps.activated_tools = Some(set.clone());
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Nothing was activated; the empty request is rejected outright.
+        assert!(
+            set.lock().await.is_empty(),
+            "empty names must not activate anything"
+        );
+
+        // The tool_result the model sees must explain the problem, not
+        // falsely claim success while is_error is set.
+        let bodies = llm.bodies.lock().unwrap();
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let last = messages.last().expect("at least one message");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(
+            rendered.contains("No tool names"),
+            "message must explain the empty names error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Loaded:"),
+            "message must not claim success for empty names: {rendered}"
+        );
     }
 
     #[test]
