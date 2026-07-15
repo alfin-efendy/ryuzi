@@ -169,6 +169,17 @@ pub trait HarnessSession: Send + Sync {
     async fn end(&self) -> anyhow::Result<()>;
     fn agent_session_id(&self) -> Option<String>;
 
+    /// Dispatch an already-admitted subagent retry through this harness's native
+    /// executor. Other harness implementations retain the default rejection so
+    /// the control plane can terminalize the admitted run instead of leaving it
+    /// queued.
+    async fn dispatch_retry_child(
+        &self,
+        _child: crate::delegation::RunHandle,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("the active harness does not support subagent retries")
+    }
+
     /// Replace the primary configuration used for the next prompt. Existing
     /// in-flight prompts retain the snapshot captured when they began.
     async fn refresh_primary_turn(&self, _primary: PrimaryTurnConfig) {}

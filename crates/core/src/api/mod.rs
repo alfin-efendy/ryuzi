@@ -215,6 +215,19 @@ pub(crate) mod tests_support {
     /// executable — required by registry mutations, which re-validate the
     /// whole candidate registry.
     pub(crate) async fn state_with_agents() -> ApiState {
+        state_with_agents_and_registries(crate::plugins::Registries::new()).await
+    }
+
+    pub(crate) async fn state_with_native_llm(
+        llm_factory: Arc<dyn crate::harness::native::llm::LlmStreamFactory>,
+    ) -> ApiState {
+        let mut registries = crate::plugins::Registries::new();
+        registries.harness =
+            Arc::new(crate::harness::native::NativeHarnessFactory::with_llm_factory(llm_factory));
+        state_with_agents_and_registries(registries).await
+    }
+
+    async fn state_with_agents_and_registries(registries: crate::plugins::Registries) -> ApiState {
         use crate::llm_router::routes::{
             self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
         };
@@ -243,12 +256,7 @@ pub(crate) mod tests_support {
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
             .await
             .unwrap();
-        let cp = crate::control::ControlPlane::new(
-            store,
-            crate::plugins::Registries::new(),
-            persistence.clone(),
-        )
-        .await;
+        let cp = crate::control::ControlPlane::new(store, registries, persistence.clone()).await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(

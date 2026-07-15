@@ -530,6 +530,14 @@ impl HarnessSession for NativeSession {
         Ok(())
     }
 
+    async fn dispatch_retry_child(
+        &self,
+        child: crate::delegation::RunHandle,
+    ) -> anyhow::Result<()> {
+        let deps = self.deps.lock().unwrap().clone();
+        runner::dispatch_retry_subagent(deps, child)
+    }
+
     async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {
         // Share `turn_lock` with `send_prompt` so this can only replace the
         // queued turn's configuration. The in-flight turn holds a cloned

@@ -87,8 +87,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             }
             let run = state
                 .cp
-                .delegation()
-                .retry_child(&a.session_pk, &a.run_id)
+                .dispatch_child_retry(&a.session_pk, &a.run_id)
                 .await
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
             ok(run)
@@ -135,6 +134,10 @@ mod tests {
     use crate::domain::{
         AgentRunKind, AgentRunStatus, NewAgentRun, NewMessage, PermMode, Session, SessionKind,
         SessionStatus,
+    };
+    use crate::harness::native::llm::{LlmStream, LlmStreamFactory};
+    use crate::harness::native::runner::testutil::{
+        message_delta, message_stop, text_delta, ScriptedLlm,
     };
     use crate::serve::ApiState;
     use serde_json::json;
@@ -193,6 +196,25 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    struct FixedLlmFactory(Arc<dyn LlmStream>);
+
+    impl LlmStreamFactory for FixedLlmFactory {
+        fn create(&self, _store: Arc<crate::store::Store>) -> Arc<dyn LlmStream> {
+            self.0.clone()
+        }
+    }
+
+    async fn retry_terminal(s: &ApiState, run_id: &str) -> crate::domain::AgentRun {
+        for _ in 0..400 {
+            let run = s.cp.store().get_agent_run(run_id).await.unwrap().unwrap();
+            if run.status.is_terminal() {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for retry {run_id} to reach a terminal status");
     }
 
     #[tokio::test]
@@ -291,6 +313,133 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.status, 404, "{method}");
         }
+    }
+
+    #[tokio::test]
+    async fn retry_child_runs_dispatches_main_delegate_and_subagent_executors() {
+        let scripted: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![
+            vec![
+                text_delta("main retry complete"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+            vec![
+                text_delta("subagent retry complete"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+        ]));
+        let s = tests_support::state_with_native_llm(Arc::new(FixedLlmFactory(scripted))).await;
+        let root = primary(&s, "s").await;
+        let agent_id = s
+            .agents
+            .create(crate::agents::types::AgentMutationInput {
+                name: "Retry target".into(),
+                description: "retry target".into(),
+                avatar: crate::agents::types::AgentAvatar {
+                    color: "blue".into(),
+                },
+                model: crate::agents::types::AgentModel::Route {
+                    route: "smart".into(),
+                },
+                permissions: crate::agents::types::AgentPermissions {
+                    mode: PermMode::Default,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: crate::agents::types::AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: crate::agents::types::AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap()
+            .profile
+            .id;
+        let main =
+            s.cp.delegation()
+                .queue_main(MainDelegationRequest {
+                    parent_run_id: root.run.run_id.clone(),
+                    target_agent_id: agent_id,
+                    task: "retry main delegate".into(),
+                    context: None,
+                    background: false,
+                })
+                .await
+                .unwrap();
+        let sub = subagent(&s, &root.run.run_id, "general").await;
+        for run in [&main.run, &sub.run] {
+            s.cp.delegation().fail(&run.run_id, "failed").await.unwrap();
+        }
+
+        let main_retry = dispatch(
+            &s,
+            "retry_child_run",
+            json!({ "session_pk": "s", "run_id": main.run.run_id }),
+        )
+        .await
+        .unwrap();
+        let sub_retry = dispatch(
+            &s,
+            "retry_child_run",
+            json!({ "session_pk": "s", "run_id": sub.run.run_id }),
+        )
+        .await
+        .unwrap();
+
+        let main_terminal = retry_terminal(&s, main_retry["runId"].as_str().unwrap()).await;
+        let sub_terminal = retry_terminal(&s, sub_retry["runId"].as_str().unwrap()).await;
+        assert_eq!(main_terminal.status, AgentRunStatus::Completed);
+        assert_eq!(sub_terminal.status, AgentRunStatus::Completed);
+        assert!(
+            !s.cp
+                .store()
+                .list_run_messages("s", &main_terminal.run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "main-delegate retry must execute its isolated harness"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retry_subagent_terminalizes_when_the_active_harness_cannot_dispatch_it() {
+        let s = tests_support::state_with_fake_native().await;
+        let root = primary(&s, "s").await;
+        let child = subagent(&s, &root.run.run_id, "general").await;
+        s.cp.delegation()
+            .fail(&child.run.run_id, "failed")
+            .await
+            .unwrap();
+
+        let error = dispatch(
+            &s,
+            "retry_child_run",
+            json!({ "session_pk": "s", "run_id": child.run.run_id }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, 400);
+
+        let retried =
+            s.cp.store()
+                .list_session_agent_runs("s")
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|run| run.retry_of.as_deref() == Some(child.run.run_id.as_str()))
+                .expect("admitted retry must be retained for its terminal error");
+        assert_eq!(retried.status, AgentRunStatus::Failed);
+        assert!(retried
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("does not support subagent retries")));
     }
 
     #[tokio::test]

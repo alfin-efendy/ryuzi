@@ -1914,6 +1914,31 @@ impl RunnerSpawner {
     }
 }
 
+/// Dispatch an admitted subagent retry through the existing queued-child
+/// executor. The caller supplies a freshly started session harness so the
+/// retry inherits the current session configuration while retaining the
+/// persisted subagent type and task.
+pub(crate) fn dispatch_retry_subagent(deps: RunnerDeps, child: RunHandle) -> anyhow::Result<()> {
+    if child.run.agent_kind != crate::domain::AgentRunKind::Subagent {
+        anyhow::bail!("only subagent retries can use the subagent executor");
+    }
+    let spec = SubtaskSpec {
+        agent_type: child.run.executing_agent_name_snapshot.clone(),
+        prompt: child.run.task.clone(),
+    };
+    let cancel = child.cancel.clone();
+    let spawner = RunnerSpawner {
+        parent_run_id: child.run.parent_run_id.clone().unwrap_or_default(),
+        deps,
+        cancel: cancel.clone(),
+        depth: 0,
+    };
+    tokio::spawn(async move {
+        let _ = spawner.run_queued_child(0, spec, cancel, child).await;
+    });
+    Ok(())
+}
+
 #[async_trait]
 impl SubagentSpawner for RunnerSpawner {
     async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult> {

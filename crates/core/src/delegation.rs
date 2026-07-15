@@ -305,6 +305,14 @@ impl DelegationRuntime {
     }
 
     pub async fn retry_child(&self, session_pk: &str, run_id: &str) -> anyhow::Result<AgentRun> {
+        Ok(self.retry_child_handle(session_pk, run_id).await?.run)
+    }
+
+    pub async fn retry_child_handle(
+        &self,
+        session_pk: &str,
+        run_id: &str,
+    ) -> anyhow::Result<RunHandle> {
         let _admission = self.admission.lock().await;
         let previous = self
             .store
@@ -347,7 +355,7 @@ impl DelegationRuntime {
                 resolved_effort,
             })
             .await?;
-        Ok(self.register(run, snapshot).await.run)
+        Ok(self.register(run, snapshot).await)
     }
 
     pub async fn cancel_descendants_of_root(
