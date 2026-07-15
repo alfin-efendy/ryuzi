@@ -1152,9 +1152,16 @@ impl ControlPlane {
             .ok_or_else(|| anyhow::anyhow!("unknown agent run"))?;
         if previous.session_pk != session_pk
             || previous.parent_run_id.is_none()
-            || !previous.status.is_terminal()
+            || !matches!(
+                previous.status,
+                crate::domain::AgentRunStatus::Failed
+                    | crate::domain::AgentRunStatus::Cancelled
+                    | crate::domain::AgentRunStatus::Interrupted
+            )
         {
-            anyhow::bail!("only terminal child runs in this session can be retried");
+            anyhow::bail!(
+                "only failed, cancelled, or interrupted child runs in this session can be retried"
+            );
         }
         if matches!(previous.agent_kind, AgentRunKind::MainDelegate)
             && previous.executing_agent_id.is_none()
@@ -1167,24 +1174,78 @@ impl ControlPlane {
             .retry_child_handle(session_pk, run_id)
             .await?;
         let retry = child.run.clone();
-        let dispatch = match retry.agent_kind {
-            AgentRunKind::MainDelegate => {
-                let task = retry.task.clone();
-                let me = Arc::clone(self);
-                tokio::spawn(async move {
-                    let _ = me.run_explicit_mention_child(child, task).await;
-                });
-                Ok(())
-            }
-            AgentRunKind::Subagent => self.dispatch_subagent_retry(child).await,
-            AgentRunKind::Primary => Err(anyhow::anyhow!("only child runs can be retried")),
-        };
+        let dispatch = self.dispatch_admitted_child_retry(child).await;
         if let Err(error) = dispatch {
             let message = error.to_string();
             let _ = self.delegation.fail(&retry.run_id, &message).await;
             return Err(error);
         }
         Ok(retry)
+    }
+
+    async fn dispatch_admitted_child_retry(
+        self: &Arc<Self>,
+        child: crate::delegation::RunHandle,
+    ) -> anyhow::Result<()> {
+        match child.run.agent_kind {
+            AgentRunKind::MainDelegate => self.dispatch_main_delegate_retry(child).await,
+            AgentRunKind::Subagent => self.dispatch_subagent_retry(child).await,
+            AgentRunKind::Primary => anyhow::bail!("only child runs can be retried"),
+        }
+    }
+
+    async fn dispatch_main_delegate_retry(
+        self: &Arc<Self>,
+        child: crate::delegation::RunHandle,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .store
+            .get_session(&child.run.session_pk)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("parent session is unavailable"))?;
+        let primary_agent = self
+            .registry
+            .resolved_snapshot(&child.run.primary_agent_id)
+            .await?;
+        let project = match session.project_id.as_deref() {
+            Some(project_id) => Some(
+                self.store
+                    .get_project(project_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("parent project is unavailable"))?,
+            ),
+            None => None,
+        };
+        let work_dir = session
+            .worktree_path
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| match &project {
+                Some(project) => std::path::PathBuf::from(&project.workdir),
+                None => crate::paths::chat_scratch_dir(&child.run.session_pk),
+            });
+        if project.is_none() {
+            tokio::fs::create_dir_all(&work_dir).await?;
+        }
+        let handle = self
+            .start_harness_session_with_options(
+                project.as_ref(),
+                &child.run.session_pk,
+                &work_dir,
+                None,
+                PrimaryTurn {
+                    agent: primary_agent,
+                    run_id: child.run.parent_run_id.clone().unwrap_or_default(),
+                },
+                Some(SessionKind::Worker),
+                false,
+                false,
+            )
+            .await?;
+        let result = handle.dispatch_retry_child(child).await;
+        let _ = handle.end().await;
+        result
     }
 
     async fn dispatch_subagent_retry(

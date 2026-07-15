@@ -321,9 +321,14 @@ impl DelegationRuntime {
             .ok_or_else(|| anyhow!("unknown agent run"))?;
         if previous.session_pk != session_pk
             || previous.parent_run_id.is_none()
-            || !previous.status.is_terminal()
+            || !matches!(
+                previous.status,
+                AgentRunStatus::Failed | AgentRunStatus::Cancelled | AgentRunStatus::Interrupted
+            )
         {
-            bail!("only terminal child runs in this session can be retried");
+            bail!(
+                "only failed, cancelled, or interrupted child runs in this session can be retried"
+            );
         }
         let (_, _, root) = self.tree(&previous.run_id).await?;
         self.ensure_capacity(&root).await?;
@@ -985,6 +990,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_rejects_completed_children_without_creating_a_sibling() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, _) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let child = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id,
+                subagent_type: "child".into(),
+                task: "child".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        runtime.complete(&child.run.run_id, "done").await.unwrap();
+        let before = runtime
+            .store
+            .list_session_agent_runs("s")
+            .await
+            .unwrap()
+            .len();
+
+        let error = match runtime.retry_child_handle("s", &child.run.run_id).await {
+            Ok(_) => panic!("completed children must not be retryable"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("failed, cancelled, or interrupted"));
+        assert_eq!(
+            runtime
+                .store
+                .list_session_agent_runs("s")
+                .await
+                .unwrap()
+                .len(),
+            before,
+            "a rejected retry must not insert a sibling run"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_resolves_the_current_registry_snapshot() {
         let (runtime, registry, _, _directory) = runtime().await;
         let (first, second) = two_agents(&registry).await;
@@ -999,7 +1047,7 @@ mod tests {
             })
             .await
             .unwrap();
-        runtime.complete(&child.run.run_id, "done").await.unwrap();
+        runtime.fail(&child.run.run_id, "failed").await.unwrap();
 
         let mut profile = registry.get("second").await.unwrap().profile;
         profile.name = "Second, updated".into();
@@ -1049,7 +1097,7 @@ mod tests {
             })
             .await
             .unwrap();
-        runtime.complete(&child.run.run_id, "done").await.unwrap();
+        runtime.fail(&child.run.run_id, "failed").await.unwrap();
 
         let mut profile = registry.get("second").await.unwrap().profile;
         profile.name = "Second, retried".into();
@@ -1189,10 +1237,7 @@ mod tests {
             })
             .await
             .unwrap();
-        runtime
-            .complete(&terminal.run.run_id, "done")
-            .await
-            .unwrap();
+        runtime.fail(&terminal.run.run_id, "failed").await.unwrap();
         for number in 0..MAX_ACTIVE_CHILD_RUNS {
             runtime
                 .queue_subagent(SubagentRunRequest {

@@ -535,7 +535,13 @@ impl HarnessSession for NativeSession {
         child: crate::delegation::RunHandle,
     ) -> anyhow::Result<()> {
         let deps = self.deps.lock().unwrap().clone();
-        runner::dispatch_retry_subagent(deps, child)
+        match child.run.agent_kind {
+            crate::domain::AgentRunKind::MainDelegate => {
+                runner::dispatch_retry_main_delegate(deps, child)
+            }
+            crate::domain::AgentRunKind::Subagent => runner::dispatch_retry_subagent(deps, child),
+            crate::domain::AgentRunKind::Primary => anyhow::bail!("only child runs can be retried"),
+        }
     }
 
     async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {

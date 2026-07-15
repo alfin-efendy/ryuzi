@@ -395,16 +395,8 @@ mod tests {
         let main_terminal = retry_terminal(&s, main_retry["runId"].as_str().unwrap()).await;
         let sub_terminal = retry_terminal(&s, sub_retry["runId"].as_str().unwrap()).await;
         assert_eq!(main_terminal.status, AgentRunStatus::Completed);
+        assert_eq!(main_terminal.result.as_deref(), Some("main retry complete"));
         assert_eq!(sub_terminal.status, AgentRunStatus::Completed);
-        assert!(
-            !s.cp
-                .store()
-                .list_run_messages("s", &main_terminal.run_id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "main-delegate retry must execute its isolated harness"
-        );
     }
 
     #[tokio::test]
@@ -440,6 +432,43 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("does not support subagent retries")));
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_completed_child_without_creating_a_sibling() {
+        let s = tests_support::state_with_agents().await;
+        let root = primary(&s, "s").await;
+        let child = subagent(&s, &root.run.run_id, "completed").await;
+        s.cp.delegation()
+            .complete(&child.run.run_id, "done")
+            .await
+            .unwrap();
+        let before =
+            s.cp.store()
+                .list_session_agent_runs("s")
+                .await
+                .unwrap()
+                .len();
+
+        let error = dispatch(
+            &s,
+            "retry_child_run",
+            json!({ "session_pk": "s", "run_id": child.run.run_id }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("failed, cancelled, or interrupted"));
+        assert_eq!(
+            s.cp.store()
+                .list_session_agent_runs("s")
+                .await
+                .unwrap()
+                .len(),
+            before,
+            "the API must reject before a retry sibling is inserted"
+        );
     }
 
     #[tokio::test]

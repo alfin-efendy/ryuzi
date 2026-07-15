@@ -1417,6 +1417,7 @@ async fn max_spawn_depth(store: &Store) -> u8 {
 fn deps_for_subagent(deps: &RunnerDeps) -> RunnerDeps {
     let mut child = deps.clone();
     child.memory = None;
+    child.attachments_dir = None;
     child.allowed_skills = None;
     child.app_control = None;
     child
@@ -1950,6 +1951,24 @@ impl RunnerSpawner {
             Err(error) => result(SubtaskStatus::Error, error.to_string()),
         }
     }
+}
+
+/// Dispatch an admitted main-delegate retry through the same profile-isolated
+/// runner as a normal `delegate_agent` execution. The pre-existing session
+/// harness supplies the current project/worktree/MCP tool registry; the child
+/// snapshot supplies the effective target profile.
+pub(crate) fn dispatch_retry_main_delegate(
+    deps: RunnerDeps,
+    child: RunHandle,
+) -> anyhow::Result<()> {
+    if child.run.agent_kind != crate::domain::AgentRunKind::MainDelegate {
+        anyhow::bail!("only main-delegate retries can use the main-delegate executor");
+    }
+    let worker = RunnerMainAgentSpawner { deps };
+    tokio::spawn(async move {
+        let _ = worker.execute_child(child, None).await;
+    });
+    Ok(())
 }
 
 /// Dispatch an admitted subagent retry through the existing queued-child
@@ -5379,7 +5398,62 @@ mod tests {
         ));
         let child = deps_for_subagent(&parent);
         assert!(child.memory.is_none());
+        assert!(child.attachments_dir.is_none());
+        assert_eq!(child.work_dir, parent.work_dir);
+        assert_eq!(child.project_id, parent.project_id);
         assert!(child.app_control.is_none());
+    }
+
+    #[tokio::test]
+    async fn subagent_cannot_read_parent_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_attachments = tempfile::tempdir().unwrap();
+        let attachment_dir = parent_attachments.path().to_path_buf();
+        let attachment = attachment_dir.join("private.txt");
+        tokio::fs::write(&attachment, "parent-only attachment")
+            .await
+            .unwrap();
+        let child_turn = vec![
+            tool_use_start(0, "read-parent-attachment", "read"),
+            input_json_delta(
+                0,
+                &format!(
+                    r#"{{"path":{}}}"#,
+                    serde_json::to_string(&attachment).unwrap()
+                ),
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_turn, final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.attachments_dir = Some(attachment_dir);
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+
+        let result = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "try to read the parent attachment".into(),
+            }])
+            .await;
+
+        assert_eq!(result[0].status, SubtaskStatus::Completed);
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let read = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("read-parent-attachment"))
+            .expect("the attempted child read is recorded");
+        assert!(
+            !read.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("parent-only attachment")),
+            "the parent attachment content must never reach the subagent"
+        );
     }
 
     #[tokio::test]
@@ -6533,6 +6607,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_delegate_retry_uses_the_target_profile_runner() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("target retry complete")]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm.clone(), store).await;
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Restricted target".into(),
+                description: "target profile".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: Some("high".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: vec!["read".into()],
+                    plugins: vec!["github.search".into()],
+                    apps: vec!["slack".into()],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "github",
+                "search",
+                "GitHub search",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "slack",
+                "send",
+                "Slack send",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+        ]));
+        let failed = deps
+            .delegation
+            .queue_main(crate::delegation::MainDelegationRequest {
+                parent_run_id: deps.run_id.clone(),
+                target_agent_id: target.profile.id.clone(),
+                task: "retry only this target task".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        deps.delegation
+            .fail(&failed.run.run_id, "failed")
+            .await
+            .unwrap();
+        let retry = deps
+            .delegation
+            .retry_child_handle(&deps.session_pk, &failed.run.run_id)
+            .await
+            .unwrap();
+
+        let retry_id = retry.run.run_id.clone();
+        dispatch_retry_main_delegate(deps.clone(), retry).unwrap();
+        let terminal = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            deps.delegation.await_terminal(&retry_id),
+        )
+        .await
+        .expect("retry target must finish")
+        .unwrap();
+
+        assert_eq!(terminal.status, crate::domain::AgentRunStatus::Completed);
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/target-model");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "retry only this target task"
+        );
+        let advertised = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(advertised.contains(&"read"));
+        assert!(advertised.contains(&"task"));
+        assert!(advertised.contains(&"delegate_agent"));
+        assert!(advertised.contains(&"mcp__github__search"));
+        assert!(advertised.contains(&"mcp__slack__send"));
+        assert!(!advertised.contains(&"bash"));
+        assert!(!advertised.contains(&"write"));
+    }
+
+    #[tokio::test]
     async fn tool_counts_include_main_subagent_and_retry_but_not_denied_or_unknown_calls() {
         let dir = tempfile::tempdir().unwrap();
         let main_allowed = vec![
@@ -6571,7 +6757,7 @@ mod tests {
             main_unknown,
             final_turn("main done"),
             child_allowed,
-            final_turn("child done"),
+            vec![error_event("child failed")],
             retry_allowed,
             final_turn("retry done"),
         ]));
@@ -6620,7 +6806,7 @@ mod tests {
                 prompt: "run the child tool".into(),
             }])
             .await;
-        assert_eq!(child[0].status, SubtaskStatus::Completed);
+        assert_eq!(child[0].status, SubtaskStatus::Error);
         let first_child = deps
             .store
             .list_descendant_agent_runs(&deps.run_id)
