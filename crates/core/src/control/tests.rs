@@ -2285,7 +2285,17 @@ async fn start_session_streams_events_and_records_agent_id() {
     .expect("session must emit a result or error");
     assert!(events.contains(&"working".to_string()));
 
-    let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+            if stored[0].status == crate::domain::SessionStatus::Idle {
+                return stored;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("session must demote to Idle after its result event");
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].agent_session_id.as_deref(), Some("agent-1"));
     assert_eq!(session.status, crate::domain::SessionStatus::Running);

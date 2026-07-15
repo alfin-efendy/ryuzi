@@ -2132,6 +2132,19 @@ mod tests {
         }
     }
 
+    async fn wait_for_webhook_prompt(prompts: &Arc<Mutex<Vec<String>>>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(prompt) = prompts.lock().unwrap().first().cloned() {
+                    return prompt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for an inbound webhook prompt")
+    }
+
     struct WebhookHarnessFactory {
         prompts: Arc<Mutex<Vec<String>>>,
     }
@@ -2353,14 +2366,8 @@ mod tests {
         assert!(run.envelope["data"]["request"]["headers"]
             .get("x-over-budget")
             .is_none());
-        for _ in 0..100 {
-            if prompts.lock().unwrap().len() == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(prompts.lock().unwrap().len(), 1);
-        assert!(prompts.lock().unwrap()[0].contains(&body));
+        let prompt = wait_for_webhook_prompt(&prompts).await;
+        assert!(prompt.contains(&body));
         assert!(
             serde_json::to_vec(&run.envelope).unwrap().len()
                 <= automation::MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
@@ -2404,13 +2411,7 @@ mod tests {
                 <= automation::MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
         );
 
-        for _ in 0..100 {
-            if prompts.lock().unwrap().len() == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        let prompt = prompts.lock().unwrap().remove(0);
+        let prompt = wait_for_webhook_prompt(&prompts).await;
         let event_json = prompt
             .split_once("[UNTRUSTED AUTOMATION EVENT — JSON]\n")
             .unwrap()
@@ -2445,14 +2446,8 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(run.envelope["data"]["request"]["body"], body);
-        for _ in 0..100 {
-            if prompts.lock().unwrap().len() == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(prompts.lock().unwrap().len(), 1);
-        assert!(prompts.lock().unwrap()[0].contains(body));
+        let prompt = wait_for_webhook_prompt(&prompts).await;
+        assert!(prompt.contains(body));
     }
 
     #[tokio::test]
