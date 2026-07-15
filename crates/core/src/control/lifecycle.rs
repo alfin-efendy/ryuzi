@@ -32,16 +32,25 @@ fn agent_model_parts(model: &crate::agents::types::AgentModel) -> (Option<String
 pub(super) struct PrimaryTurn {
     agent: Arc<crate::agents::types::AgentSnapshot>,
     run_id: String,
+    root_run_id: String,
 }
 
 impl PrimaryTurn {
     #[cfg(test)]
     pub(super) fn new(agent: Arc<crate::agents::types::AgentSnapshot>, run_id: String) -> Self {
-        Self { agent, run_id }
+        Self {
+            agent,
+            root_run_id: run_id.clone(),
+            run_id,
+        }
     }
 
     fn config(&self) -> anyhow::Result<PrimaryTurnConfig> {
-        crate::harness::native::primary_turn_config(self.agent.clone(), self.run_id.clone())
+        crate::harness::native::primary_turn_config(
+            self.agent.clone(),
+            self.run_id.clone(),
+            self.root_run_id.clone(),
+        )
     }
 }
 
@@ -78,7 +87,7 @@ fn validate_executable_primary(
             anyhow::bail!("primary agent references unavailable app tools: {app}");
         }
     }
-    crate::harness::native::primary_turn_config(agent.clone(), String::new())?;
+    crate::harness::native::primary_turn_config(agent.clone(), String::new(), String::new())?;
     Ok(())
 }
 
@@ -294,6 +303,7 @@ impl ControlPlane {
                     cancel,
                     PrimaryTurn {
                         agent: primary_agent,
+                        root_run_id: stored_run.run_id.clone(),
                         run_id: stored_run.run_id,
                     },
                     resolved_mentions,
@@ -314,6 +324,7 @@ impl ControlPlane {
                     cancel,
                     PrimaryTurn {
                         agent: primary_agent,
+                        root_run_id: stored_run.run_id.clone(),
                         run_id: stored_run.run_id,
                     },
                     resolved_mentions,
@@ -365,6 +376,7 @@ impl ControlPlane {
             attachments,
             PrimaryTurn {
                 agent: primary_agent,
+                root_run_id: run_id.clone(),
                 run_id: run_id.clone(),
             },
             resolved_mentions,
@@ -404,6 +416,7 @@ impl ControlPlane {
             attachments,
             PrimaryTurn {
                 agent: primary_agent,
+                root_run_id: run_id.clone(),
                 run_id: run_id.clone(),
             },
             None,
@@ -1107,6 +1120,7 @@ impl ControlPlane {
             .await?;
         let primary_turn = PrimaryTurn {
             agent: primary_agent,
+            root_run_id: run.run.run_id.clone(),
             run_id: run.run.run_id,
         };
         let run_id = primary_turn.run_id.clone();
@@ -1228,6 +1242,11 @@ impl ControlPlane {
         if project.is_none() {
             tokio::fs::create_dir_all(&work_dir).await?;
         }
+        let root_run_id = self
+            .store
+            .root_agent_run_id(&child.run.run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("child run has no persisted root"))?;
         let handle = self
             .start_harness_session_with_options(
                 project.as_ref(),
@@ -1237,6 +1256,7 @@ impl ControlPlane {
                 PrimaryTurn {
                     agent: primary_agent,
                     run_id: child.run.parent_run_id.clone().unwrap_or_default(),
+                    root_run_id,
                 },
                 Some(SessionKind::Worker),
                 false,
@@ -1282,6 +1302,11 @@ impl ControlPlane {
         if project.is_none() {
             tokio::fs::create_dir_all(&work_dir).await?;
         }
+        let root_run_id = self
+            .store
+            .root_agent_run_id(&child.run.run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("child run has no persisted root"))?;
         let handle = self
             .start_harness_session_with_options(
                 project.as_ref(),
@@ -1291,6 +1316,7 @@ impl ControlPlane {
                 PrimaryTurn {
                     agent: primary_agent,
                     run_id: child.run.parent_run_id.clone().unwrap_or_default(),
+                    root_run_id,
                 },
                 Some(SessionKind::Worker),
                 false,
@@ -1414,6 +1440,7 @@ impl ControlPlane {
         let session_row = self.store.get_session(session_pk).await.ok().flatten();
         let primary_agent = primary_turn.agent;
         let run_id = primary_turn.run_id;
+        let root_run_id = primary_turn.root_run_id;
         let (model, effort) = agent_model_parts(&primary_agent.profile.model);
         let perm_mode = primary_agent.profile.permissions.mode;
         let kind = kind_override.unwrap_or_else(|| {
@@ -1442,6 +1469,7 @@ impl ControlPlane {
             session_pk: session_pk.to_string(),
             primary_agent: primary_agent.clone(),
             run_id,
+            root_run_id,
             delegation: self.delegation.clone(),
             main_agent_id: primary_agent.profile.id.clone(),
             project_id: project.map(|p| p.project_id.clone()),
@@ -1715,85 +1743,89 @@ impl ControlPlane {
         let run_id = child.run.run_id.clone();
         let agent_id = child.run.executing_agent_id.clone().unwrap_or_default();
         let agent_name = child.run.executing_agent_name_snapshot.clone();
-        let result = async {
-            self.delegation.mark_running(&run_id).await?;
-            if child.cancel.is_cancelled() {
-                anyhow::bail!("child run cancelled");
-            }
-            let target = child
-                .agent_snapshot
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("child agent snapshot is unavailable"))?;
-            let session = self
-                .store
-                .get_session(&child.run.session_pk)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("parent session is unavailable"))?;
-            let project = match session.project_id.as_deref() {
-                Some(project_id) => Some(
-                    self.store
-                        .get_project(project_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("parent project is unavailable"))?,
-                ),
-                None => None,
-            };
-            let work_dir = session
-                .worktree_path
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .filter(|path| path.exists())
-                .unwrap_or_else(|| match &project {
-                    Some(project) => std::path::PathBuf::from(&project.workdir),
-                    None => crate::paths::chat_scratch_dir(&child.run.session_pk),
-                });
-            let handle = self
-                .start_harness_session_with_options(
-                    project.as_ref(),
-                    &child.run.session_pk,
-                    &work_dir,
-                    None,
-                    PrimaryTurn {
-                        agent: target,
-                        run_id: run_id.clone(),
-                    },
-                    Some(SessionKind::Worker),
-                    true,
-                    false,
-                )
-                .await?;
-            let prompt = TurnPrompt::text(task.clone(), task.clone());
-            let turn = tokio::select! {
-                result = handle.send_prompt(prompt) => result,
-                () = child.cancel.cancelled() => {
-                    let _ = handle.cancel().await;
-                    Err(anyhow::anyhow!("child run cancelled"))
+        let result =
+            async {
+                self.delegation.mark_running(&run_id).await?;
+                if child.cancel.is_cancelled() {
+                    anyhow::bail!("child run cancelled");
                 }
-            };
-            let _ = handle.end().await;
-            turn?;
-            if child.cancel.is_cancelled() {
-                anyhow::bail!("child run cancelled");
+                let target = child
+                    .agent_snapshot
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("child agent snapshot is unavailable"))?;
+                let session = self
+                    .store
+                    .get_session(&child.run.session_pk)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("parent session is unavailable"))?;
+                let project = match session.project_id.as_deref() {
+                    Some(project_id) => Some(
+                        self.store
+                            .get_project(project_id)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("parent project is unavailable"))?,
+                    ),
+                    None => None,
+                };
+                let work_dir = session
+                    .worktree_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.exists())
+                    .unwrap_or_else(|| match &project {
+                        Some(project) => std::path::PathBuf::from(&project.workdir),
+                        None => crate::paths::chat_scratch_dir(&child.run.session_pk),
+                    });
+                let handle = self
+                    .start_harness_session_with_options(
+                        project.as_ref(),
+                        &child.run.session_pk,
+                        &work_dir,
+                        None,
+                        PrimaryTurn {
+                            agent: target,
+                            run_id: run_id.clone(),
+                            root_run_id: self.store.root_agent_run_id(&run_id).await?.ok_or_else(
+                                || anyhow::anyhow!("child run has no persisted root"),
+                            )?,
+                        },
+                        Some(SessionKind::Worker),
+                        true,
+                        false,
+                    )
+                    .await?;
+                let prompt = TurnPrompt::text(task.clone(), task.clone());
+                let turn = tokio::select! {
+                    result = handle.send_prompt(prompt) => result,
+                    () = child.cancel.cancelled() => {
+                        let _ = handle.cancel().await;
+                        Err(anyhow::anyhow!("child run cancelled"))
+                    }
+                };
+                let _ = handle.end().await;
+                turn?;
+                if child.cancel.is_cancelled() {
+                    anyhow::bail!("child run cancelled");
+                }
+                self.delegation.complete(&run_id, "").await?;
+                let terminal = self.delegation.await_terminal(&run_id).await?;
+                let messages = self
+                    .store
+                    .list_run_messages(&terminal.session_pk, &run_id)
+                    .await?;
+                let output = messages
+                    .iter()
+                    .filter(|message| message.role == "assistant")
+                    .filter_map(|message| message.payload["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok::<_, anyhow::Error>(if output.is_empty() {
+                    terminal.result.unwrap_or_default()
+                } else {
+                    output
+                })
             }
-            self.delegation.complete(&run_id, "").await?;
-            let terminal = self.delegation.await_terminal(&run_id).await?;
-            let messages = self
-                .store
-                .list_run_messages(&terminal.session_pk, &run_id)
-                .await?;
-            let output = messages
-                .iter()
-                .filter(|message| message.role == "assistant")
-                .filter_map(|message| message.payload["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok::<_, anyhow::Error>(if output.is_empty() {
-                terminal.result.unwrap_or_default()
-            } else {
-                output
-            })
-        }
-        .await;
+            .await;
         match result {
             Ok(result) => CoordinatorOutcome {
                 agent_id,

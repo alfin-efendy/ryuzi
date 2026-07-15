@@ -1620,6 +1620,7 @@ impl RunnerMainAgentSpawner {
             let primary_turn = super::primary_turn_config_with_tools(
                 snapshot.clone(),
                 run_id.clone(),
+                child_deps.root_run_id.clone(),
                 &child_deps.tools.names(),
             )?;
             child_deps.primary_agent = primary_turn.agent;
@@ -3285,6 +3286,7 @@ mod tests {
         deps.agent = crate::harness::native::primary_turn_config_with_tools(
             deps.primary_agent.clone(),
             deps.run_id.clone(),
+            deps.root_run_id.clone(),
             &deps.tools.names(),
         )
         .unwrap()
@@ -6485,6 +6487,222 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "enqueueing does not create a new primary turn; the generic rail owns delivery"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn continued_second_turn_background_main_and_task_rails_use_second_root() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            final_turn("background main result"),
+            final_turn("background task result"),
+        ]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let first_root = deps.root_run_id.clone();
+        let second = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "second turn")
+            .await
+            .unwrap();
+        let second_root = second.run.run_id;
+        deps.run_id = second_root.clone();
+        deps.root_run_id = second_root.clone();
+
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Background target".into(),
+                description: "background target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+
+        let main = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: second_root.clone(),
+                target_agent_id: target.profile.id,
+                task: "delegate in the background".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+        assert_eq!(main.status, SubtaskStatus::Completed);
+        let task = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: second_root.clone(),
+        }
+        .run_background(SubtaskSpec {
+            agent_type: "general".into(),
+            prompt: "task in the background".into(),
+        })
+        .await;
+        assert!(matches!(task, BackgroundDispatch::Dispatched { .. }));
+
+        let first_rail = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        let second_rail = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        for rail in [first_rail, second_rail] {
+            assert_eq!(rail.origin_run_id.as_deref(), Some(second_root.as_str()));
+            assert_ne!(rail.origin_run_id.as_deref(), Some(first_root.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_mention_nested_retry_background_rail_uses_outer_root_without_user_turn() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn(
+            "background retry result",
+        )]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let outer_root = deps.root_run_id.clone();
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Mentioned target".into(),
+                description: "mentioned target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let explicit_child = deps
+            .delegation
+            .queue_main(crate::delegation::MainDelegationRequest {
+                parent_run_id: outer_root.clone(),
+                target_agent_id: target.profile.id,
+                task: "explicit mention".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        let nested_child = deps
+            .delegation
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: explicit_child.run.run_id.clone(),
+                subagent_type: "general".into(),
+                task: "nested task".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        deps.delegation
+            .fail(&explicit_child.run.run_id, "failed mention")
+            .await
+            .unwrap();
+        deps.delegation
+            .fail(&nested_child.run.run_id, "failed nested task")
+            .await
+            .unwrap();
+        let main_retry = deps
+            .delegation
+            .retry_child_handle(&deps.session_pk, &explicit_child.run.run_id)
+            .await
+            .unwrap();
+        let nested_retry = deps
+            .delegation
+            .retry_child_handle(&deps.session_pk, &nested_child.run.run_id)
+            .await
+            .unwrap();
+        for retry in [&main_retry, &nested_retry] {
+            assert_eq!(
+                deps.store
+                    .root_agent_run_id(&retry.run.run_id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(outer_root.as_str())
+            );
+        }
+
+        deps.run_id = nested_retry.run.run_id.clone();
+        deps.root_run_id = deps
+            .store
+            .root_agent_run_id(&nested_retry.run.run_id)
+            .await
+            .unwrap()
+            .expect("nested retry has an outer primary root");
+        let dispatched = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: nested_retry.run.run_id,
+        }
+        .run_background(SubtaskSpec {
+            agent_type: "general".into(),
+            prompt: "retry in the background".into(),
+        })
+        .await;
+        assert!(matches!(dispatched, BackgroundDispatch::Dispatched { .. }));
+
+        let rail = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        assert_eq!(rail.origin_run_id.as_deref(), Some(outer_root.as_str()));
+        assert!(
+            deps.store
+                .list_messages(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.role != "user"),
+            "background delivery must stay on the rail instead of creating a user turn"
         );
     }
 

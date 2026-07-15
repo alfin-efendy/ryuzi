@@ -129,6 +129,7 @@ fn adapt_primary_profile(
 pub(crate) fn primary_turn_config(
     agent: Arc<crate::agents::types::AgentSnapshot>,
     run_id: String,
+    root_run_id: String,
 ) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
     let adapted = adapt_primary_profile(&agent.profile)?;
     let (model, effort) = match &agent.profile.model {
@@ -141,6 +142,7 @@ pub(crate) fn primary_turn_config(
         perm_mode: agent.profile.permissions.mode,
         agent,
         run_id,
+        root_run_id,
         model,
         effort,
         agent_tools: adapted.agent,
@@ -151,9 +153,10 @@ pub(crate) fn primary_turn_config(
 pub(crate) fn primary_turn_config_with_tools(
     agent: Arc<crate::agents::types::AgentSnapshot>,
     run_id: String,
+    root_run_id: String,
     available_tools: &[String],
 ) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
-    let mut config = primary_turn_config(agent.clone(), run_id)?;
+    let mut config = primary_turn_config(agent.clone(), run_id, root_run_id)?;
     config.agent_tools.tools = tool_filter_for_profile(&agent.profile, available_tools);
     Ok(config)
 }
@@ -357,6 +360,7 @@ impl Harness for NativeHarness {
         let primary_turn = primary_turn_config_with_tools(
             ctx.primary_agent.clone(),
             ctx.run_id.clone(),
+            ctx.root_run_id.clone(),
             &tools.names(),
         )?;
         let agent = primary_turn.agent_tools.clone();
@@ -407,7 +411,7 @@ impl Harness for NativeHarness {
                 session_pk: ctx.session_pk,
                 primary_agent: ctx.primary_agent,
                 run_id: ctx.run_id.clone(),
-                root_run_id: ctx.run_id,
+                root_run_id: ctx.root_run_id,
                 delegation: ctx.delegation,
                 isolated_target: ctx.isolated_target,
                 main_agent_id: ctx.main_agent_id,
@@ -564,6 +568,7 @@ impl HarnessSession for NativeSession {
         let mut deps = self.deps.lock().unwrap();
         deps.primary_agent = primary.agent;
         deps.run_id = primary.run_id;
+        deps.root_run_id = primary.root_run_id;
         deps.model = primary.model;
         deps.perm_mode = Arc::new(std::sync::Mutex::new(primary.perm_mode));
         deps.agent = primary.agent_tools;
@@ -740,7 +745,8 @@ mod tests {
         SessionCtx {
             session_pk: "sess".into(),
             primary_agent,
-            run_id: run.run.run_id,
+            run_id: run.run.run_id.clone(),
+            root_run_id: run.run.run_id,
             delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,

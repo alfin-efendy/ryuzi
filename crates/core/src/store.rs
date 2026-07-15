@@ -4291,6 +4291,19 @@ impl Store {
         }).await
     }
 
+    pub async fn root_agent_run_id(&self, run_id: &str) -> anyhow::Result<Option<String>> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "WITH RECURSIVE ancestors(run_id, parent_run_id) AS (SELECT run_id, parent_run_id FROM agent_runs WHERE run_id=?1 UNION ALL SELECT parent.run_id, parent.parent_run_id FROM agent_runs parent JOIN ancestors child ON child.parent_run_id=parent.run_id) SELECT run_id FROM ancestors WHERE parent_run_id IS NULL LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
     pub async fn list_descendant_agent_runs(
         &self,
         root_run_id: &str,

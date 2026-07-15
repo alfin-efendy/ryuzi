@@ -17,6 +17,9 @@ pub struct SessionCtx {
     pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
     /// The root primary run associated with this dispatched turn.
     pub run_id: String,
+    /// Persisted root ancestor for delegated/retried harnesses; equal to `run_id`
+    /// for an ordinary primary turn.
+    pub root_run_id: String,
     /// Shared lifecycle for this session's primary/delegated runs.
     pub delegation: Arc<crate::delegation::DelegationRuntime>,
     /// Temporary Plan 2 identity seam. Plan 4 replaces default selection with
@@ -155,6 +158,8 @@ impl TurnPrompt {
 pub struct PrimaryTurnConfig {
     pub agent: Arc<crate::agents::types::AgentSnapshot>,
     pub run_id: String,
+    /// The persisted primary root that owns the turn's background delegation rail.
+    pub root_run_id: String,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub perm_mode: PermMode,
@@ -266,6 +271,7 @@ mod tests {
             session_pk: "s1".into(),
             primary_agent,
             run_id: "r1".into(),
+            root_run_id: "r1".into(),
             delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,

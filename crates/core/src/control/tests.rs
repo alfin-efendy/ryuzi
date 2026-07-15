@@ -727,6 +727,7 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
         assert!(primary_turns[0].agent_tools.tools.allows("read"));
         assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
         assert_eq!(primary_turns[0].run_id, run_id);
+        assert_eq!(primary_turns[0].root_run_id, run_id);
     }
     assert_eq!(
         store
