@@ -1,20 +1,15 @@
 import { expect, test } from "@playwright/test";
 import type { AgentRun, AgentRunRosterInfo, CoreEvent, Message } from "../src/bindings";
-import {
-  ACCOUNT_CATALOG,
-  ACCOUNT_CONNECTIONS,
-  installMockIPC,
-  mockCalls,
-  PROVIDER_FAMILY_ROUTE_SELECTIONS,
-  SESSION,
-} from "./mock-ipc";
+import { ACCOUNT_CATALOG, ACCOUNT_CONNECTIONS, installMockIPC, mockCalls, PROVIDER_FAMILY_ROUTE_SELECTIONS, SESSION } from "./mock-ipc";
 
 test.beforeEach(async ({ page }, testInfo) => {
   const dispatchOverrides = testInfo.title.startsWith("agent dispatch:")
     ? {
         list_sessions: [dispatchSession],
         list_messages: [dispatchToolRow()],
-        agentRunRoster: roster([childRun(testInfo.title.includes("retry") ? { status: "failed", error: "The fixture worker timed out.", finishedAt: 3_000 } : {})]),
+        agentRunRoster: roster([
+          childRun(testInfo.title.includes("retry") ? { status: "failed", error: "The fixture worker timed out.", finishedAt: 3_000 } : {}),
+        ]),
         childMessages: testInfo.title.includes("retry")
           ? {
               [childRunId]: [
@@ -268,9 +263,11 @@ test("agent dispatch: retry keeps one card slot and both durable attempts", asyn
   await expect(retryCard).toHaveCount(1);
   await expect(retryCard).toContainText("Queued");
   await expect(retryCard).toContainText("Retry 2");
-  await expect.poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "retry_child_run").at(-1)?.args).toMatchObject({
-    runId: childRunId,
-  });
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "retry_child_run").at(-1)?.args)
+    .toMatchObject({
+      runId: childRunId,
+    });
 
   await page.reload();
   await page.getByText("Dispatch lifecycle", { exact: true }).click();

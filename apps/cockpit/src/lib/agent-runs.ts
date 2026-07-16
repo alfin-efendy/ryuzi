@@ -53,19 +53,13 @@ function attemptDepth(run: AgentRun, byId: Map<string, AgentRun>, seen = new Set
 }
 
 function compareAttempts(a: AgentRun, b: AgentRun, byId: Map<string, AgentRun>): number {
-  return (
-    attemptDepth(a, byId) - attemptDepth(b, byId) ||
-    (a.startedAt ?? 0) - (b.startedAt ?? 0) ||
-    a.runId.localeCompare(b.runId)
-  );
+  return attemptDepth(a, byId) - attemptDepth(b, byId) || (a.startedAt ?? 0) - (b.startedAt ?? 0) || a.runId.localeCompare(b.runId);
 }
 
 function selectTip(attempts: AgentRun[], byId: Map<string, AgentRun>): AgentRun {
   const referenced = new Set(attempts.flatMap((attempt) => (attempt.retryOf ? [attempt.retryOf] : [])));
   const candidates = attempts.filter((attempt) => !referenced.has(attempt.runId));
-  return (candidates.length ? candidates : attempts)
-    .slice()
-    .sort((a, b) => compareAttempts(b, a, byId))[0]!;
+  return (candidates.length ? candidates : attempts).slice().sort((a, b) => compareAttempts(b, a, byId))[0]!;
 }
 
 export function linkedDispatchSlots(ownerRunId: string | null, toolCallId: string | null, runs: AgentRun[]): DispatchSlot[] {
@@ -120,7 +114,13 @@ export function projectAgentRunPreview(run: AgentRun, messages: Message[]): Agen
   return {
     task: excerpt(run.task),
     activities: liveActivities(messages).slice(-3),
-    excerpt: terminal ? (terminalText?.trim() ? excerpt(terminalText) : run.status === "completed" ? "Completed with no report." : null) : latestLiveExcerpt(messages),
+    excerpt: terminal
+      ? terminalText?.trim()
+        ? excerpt(terminalText)
+        : run.status === "completed"
+          ? "Completed with no report."
+          : null
+      : latestLiveExcerpt(messages),
   };
 }
 

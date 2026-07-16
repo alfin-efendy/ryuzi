@@ -22,7 +22,14 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { toWorkspaceRelativePath } from "@/lib/paths";
-import { formatToolDuration, isAgentDispatchTool, partitionActivity, toolCardHeader, type ActivityFragment, type ActivityItem } from "@/lib/transcript";
+import {
+  formatToolDuration,
+  isAgentDispatchTool,
+  partitionActivity,
+  toolCardHeader,
+  type ActivityFragment,
+  type ActivityItem,
+} from "@/lib/transcript";
 import { AgentDispatchGroup } from "@/components/session/AgentDispatchGroup";
 import { TranscriptFileContext, useOpenWorkspaceFile } from "./TranscriptFileContext";
 
@@ -267,7 +274,14 @@ function ActivityItemRenderer({ item, live, runnerId, sessionPk, ownerRunId }: {
   return fallback;
 }
 
-function StepsFold({ items, runLength, live, runnerId, sessionPk, ownerRunId }: { items: ActivityItem[]; runLength: number; live: boolean } & ActivityContext) {
+function StepsFold({
+  items,
+  runLength,
+  live,
+  runnerId,
+  sessionPk,
+  ownerRunId,
+}: { items: ActivityItem[]; runLength: number; live: boolean } & ActivityContext) {
   const [open, setOpen] = useState(false);
   const label = `See ${runLength} step${runLength === 1 ? "" : "s"}`;
   return (

@@ -249,10 +249,15 @@ test("keeps a live equal-sequence child row when hydration resolves", async () =
     },
     local,
   );
-  pending.resolve({ status: "ok", data: [message({ blockType: "text", payload: { text: "stale snapshot" }, toolCallId: null, status: null, toolKind: null })] });
+  pending.resolve({
+    status: "ok",
+    data: [message({ blockType: "text", payload: { text: "stale snapshot" }, toolCallId: null, status: null, toolKind: null })],
+  });
   await loading;
 
-  expect(useDelegation.getState().transcriptByRun[delegationRunKey(local, sessionPk, "run-1")]?.[0]?.payload).toEqual({ text: "live wins" });
+  expect(useDelegation.getState().transcriptByRun[delegationRunKey(local, sessionPk, "run-1")]?.[0]?.payload).toEqual({
+    text: "live wins",
+  });
   getChildTranscript.mockRestore();
 });
 
@@ -267,7 +272,10 @@ test("agent-run metadata changes refresh only the scoped roster, not a selected 
 
   useDelegation
     .getState()
-    .applyCoreEvent({ kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: "root-1", status: "completed" }, local);
+    .applyCoreEvent(
+      { kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: "root-1", status: "completed" },
+      local,
+    );
   await Promise.resolve();
 
   expect(getChildRuns).toHaveBeenCalledWith(local, sessionPk);

@@ -54,7 +54,10 @@ function LoadingCard() {
 
 function UnavailableCard() {
   return (
-    <div role="status" className="flex min-h-[96px] w-full max-w-[640px] items-center gap-2 rounded-md border border-border bg-muted/20 px-3 text-[12px] text-muted-foreground">
+    <div
+      role="status"
+      className="flex min-h-[96px] w-full max-w-[640px] items-center gap-2 rounded-md border border-border bg-muted/20 px-3 text-[12px] text-muted-foreground"
+    >
       <AlertTriangle aria-hidden size={14} strokeWidth={2} />
       Agent run unavailable
     </div>
@@ -84,7 +87,9 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
   const dispatchOwnerRunId = item.ownerRunId ?? ownerRunId;
   const slots = linkedDispatchSlots(dispatchOwnerRunId, item.toolCallId, runs);
   const unavailable =
-    rosterState.status === "ready" ? knownUnavailableIndices(dispatchOwnerRunId, item.toolCallId, seenRuns, new Set(slots.map((slot) => slot.dispatchIndex))) : [];
+    rosterState.status === "ready"
+      ? knownUnavailableIndices(dispatchOwnerRunId, item.toolCallId, seenRuns, new Set(slots.map((slot) => slot.dispatchIndex)))
+      : [];
   const resolvedIndices = new Set([...slots.map((slot) => slot.dispatchIndex), ...unavailable]);
   const failures = (item.dispatchFailures ?? []).filter((failure) => !resolvedIndices.has(failure.dispatchIndex));
   const rows = [
@@ -99,7 +104,10 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
     if (rosterState.status === "error") {
       return (
         <div className="flex max-w-[640px] flex-col gap-2">
-          <div role="status" className="flex min-h-[96px] items-center gap-2 rounded-md border border-border bg-muted/20 px-3 text-[12px] text-muted-foreground">
+          <div
+            role="status"
+            className="flex min-h-[96px] items-center gap-2 rounded-md border border-border bg-muted/20 px-3 text-[12px] text-muted-foreground"
+          >
             <AlertTriangle aria-hidden size={14} strokeWidth={2} /> Agent runs could not be loaded.
           </div>
           <RetryLoad load={reload} label="Retry loading agent runs" />
@@ -112,7 +120,10 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
   return (
     <div className="flex w-full max-w-[640px] flex-col gap-1.5">
       {rosterState.status === "error" && (
-        <div role="status" className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-800 dark:text-amber-200">
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-800 dark:text-amber-200"
+        >
           <AlertTriangle aria-hidden size={12} strokeWidth={2} />
           Could not refresh agent runs.
           <RetryLoad load={reload} label="Retry loading agent runs" />
@@ -121,10 +132,16 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
       {rows.map((row) => {
         if (row.kind === "unavailable") return <UnavailableCard key={`unavailable-${row.dispatchIndex}`} />;
         if (row.kind === "failure") {
-          return renderAdmissionFailure?.(row.failure) ?? (
-            <div key={`failure-${row.dispatchIndex}`} role="status" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12px] text-destructive">
-              {row.failure.error}
-            </div>
+          return (
+            renderAdmissionFailure?.(row.failure) ?? (
+              <div
+                key={`failure-${row.dispatchIndex}`}
+                role="status"
+                className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12px] text-destructive"
+              >
+                {row.failure.error}
+              </div>
+            )
           );
         }
         const { slot } = row;

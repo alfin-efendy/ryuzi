@@ -115,10 +115,27 @@ test("linked dispatch replaces its ordinary task chip with a semantic child card
 test("orders batch cards by persistent dispatch index and shows retry and kind labels", () => {
   const key = delegationSessionKey(runnerId, sessionPk);
   const first = run({ runId: "one", dispatchIndex: 0, task: "First task", status: "queued" });
-  const second = run({ runId: "two", dispatchIndex: 1, task: "Second task", agentKind: "main-delegate", status: "completed", result: "Done" });
+  const second = run({
+    runId: "two",
+    dispatchIndex: 1,
+    task: "Second task",
+    agentKind: "main-delegate",
+    status: "completed",
+    result: "Done",
+  });
   const retried = run({ runId: "three", dispatchIndex: 2, task: "Third task", status: "failed", error: "Timed out" });
-  const retryTip = run({ runId: "four", retryOf: "three", dispatchIndex: 2, task: "Third task retry", status: "interrupted", error: "Interrupted" });
-  useDelegation.setState({ bySession: { [key]: [retryTip, second, retried, first] }, rosterStateBySession: { [key]: { status: "ready", error: null } } });
+  const retryTip = run({
+    runId: "four",
+    retryOf: "three",
+    dispatchIndex: 2,
+    task: "Third task retry",
+    status: "interrupted",
+    error: "Interrupted",
+  });
+  useDelegation.setState({
+    bySession: { [key]: [retryTip, second, retried, first] },
+    rosterStateBySession: { [key]: { status: "ready", error: null } },
+  });
 
   renderGroup();
 
@@ -189,7 +206,13 @@ test("uses stable loading and roster-error card states before metadata exists", 
 
   act(() => useDelegation.setState({ rosterStateBySession: { [key]: { status: "error", error: "offline" } } }));
   rerender(
-    <AgentDispatchGroup runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId} item={item()} fallback={<div>ordinary task chip</div>} />,
+    <AgentDispatchGroup
+      runnerId={runnerId}
+      sessionPk={sessionPk}
+      ownerRunId={ownerRunId}
+      item={item()}
+      fallback={<div>ordinary task chip</div>}
+    />,
   );
   expect(screen.getByText("Agent runs could not be loaded.")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Retry loading agent runs" })).toBeTruthy();
@@ -226,7 +249,13 @@ test("retains stale cards during a roster refresh error and marks vanished slots
 
   act(() => useDelegation.setState({ rosterStateBySession: { [key]: { status: "ready", error: null } } }));
   rerender(
-    <AgentDispatchGroup runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId} item={item()} fallback={<div>ordinary task chip</div>} />,
+    <AgentDispatchGroup
+      runnerId={runnerId}
+      sessionPk={sessionPk}
+      ownerRunId={ownerRunId}
+      item={item()}
+      fallback={<div>ordinary task chip</div>}
+    />,
   );
   expect(screen.getByText("Agent run unavailable")).toBeTruthy();
 });
@@ -252,7 +281,10 @@ test("keeps ordinary chips for successful terminal admission failures and legacy
 
 test("card click and shared-button keyboard activation open the exact Agents run", () => {
   const key = delegationSessionKey(runnerId, sessionPk);
-  useDelegation.setState({ bySession: { [key]: [run({ runId: "exact-run" })] }, rosterStateBySession: { [key]: { status: "ready", error: null } } });
+  useDelegation.setState({
+    bySession: { [key]: [run({ runId: "exact-run" })] },
+    rosterStateBySession: { [key]: { status: "ready", error: null } },
+  });
   renderGroup();
 
   const card = screen.getByRole("button", { name: /Open Researcher agent run/i });

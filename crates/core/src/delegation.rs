@@ -101,16 +101,16 @@ impl DelegationRuntime {
         let _admission = self.admission.lock().await;
         let run = self
             .store
-            .insert_primary_agent_run(new_run(
+            .insert_primary_agent_run(new_run(NewRunArgs {
                 session_pk,
-                None,
-                None,
-                &snapshot.profile.id,
-                Some(&snapshot),
-                AgentRunKind::Primary,
+                parent_run_id: None,
+                retry_of: None,
+                primary_agent_id: &snapshot.profile.id,
+                snapshot: Some(&snapshot),
+                agent_kind: AgentRunKind::Primary,
                 task,
-                None,
-            ))
+                dispatch: None,
+            }))
             .await?;
         Ok(self.register(run, Some(snapshot)).await)
     }
@@ -152,16 +152,16 @@ impl DelegationRuntime {
         self.ensure_capacity(&root).await?;
         let run = self
             .store
-            .insert_agent_run(new_run(
-                &parent.session_pk,
-                Some(&parent.run_id),
-                None,
-                &root.primary_agent_id,
-                Some(&target),
-                AgentRunKind::MainDelegate,
-                &request.task,
-                request.dispatch,
-            ))
+            .insert_agent_run(new_run(NewRunArgs {
+                session_pk: &parent.session_pk,
+                parent_run_id: Some(&parent.run_id),
+                retry_of: None,
+                primary_agent_id: &root.primary_agent_id,
+                snapshot: Some(&target),
+                agent_kind: AgentRunKind::MainDelegate,
+                task: &request.task,
+                dispatch: request.dispatch,
+            }))
             .await?;
         Ok(self.register(run, Some(target)).await)
     }
@@ -594,36 +594,41 @@ impl DelegationRuntime {
     }
 }
 
-fn new_run(
-    session_pk: &str,
-    parent_run_id: Option<&str>,
-    retry_of: Option<&str>,
-    primary_agent_id: &str,
-    snapshot: Option<&AgentSnapshot>,
+struct NewRunArgs<'a> {
+    session_pk: &'a str,
+    parent_run_id: Option<&'a str>,
+    retry_of: Option<&'a str>,
+    primary_agent_id: &'a str,
+    snapshot: Option<&'a AgentSnapshot>,
     agent_kind: AgentRunKind,
-    task: &str,
+    task: &'a str,
     dispatch: Option<AgentDispatchLink>,
-) -> NewAgentRun {
-    let (resolved_model, resolved_effort) = snapshot
+}
+
+fn new_run(args: NewRunArgs<'_>) -> NewAgentRun {
+    let (resolved_model, resolved_effort) = args
+        .snapshot
         .map(|snapshot| model_parts(&snapshot.profile.model))
         .unwrap_or((None, None));
-    let (source_tool_call_id, dispatch_index) = dispatch
+    let (source_tool_call_id, dispatch_index) = args
+        .dispatch
         .map(|link| (Some(link.source_tool_call_id), Some(link.dispatch_index)))
         .unwrap_or((None, None));
     NewAgentRun {
         run_id: uuid::Uuid::new_v4().to_string(),
-        session_pk: session_pk.to_string(),
-        parent_run_id: parent_run_id.map(str::to_string),
-        retry_of: retry_of.map(str::to_string),
+        session_pk: args.session_pk.to_string(),
+        parent_run_id: args.parent_run_id.map(str::to_string),
+        retry_of: args.retry_of.map(str::to_string),
         source_tool_call_id,
         dispatch_index,
-        primary_agent_id: primary_agent_id.to_string(),
-        executing_agent_id: snapshot.map(|snapshot| snapshot.profile.id.clone()),
-        executing_agent_name_snapshot: snapshot
+        primary_agent_id: args.primary_agent_id.to_string(),
+        executing_agent_id: args.snapshot.map(|snapshot| snapshot.profile.id.clone()),
+        executing_agent_name_snapshot: args
+            .snapshot
             .map(|snapshot| snapshot.profile.name.clone())
             .unwrap_or_else(|| "subagent".to_string()),
-        agent_kind,
-        task: task.to_string(),
+        agent_kind: args.agent_kind,
+        task: args.task.to_string(),
         status: AgentRunStatus::Queued,
         resolved_model,
         resolved_effort,

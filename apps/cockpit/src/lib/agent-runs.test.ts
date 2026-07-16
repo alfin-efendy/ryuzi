@@ -89,16 +89,13 @@ test("never links legacy runs without a complete dispatch identity", () => {
 });
 
 test("projects only the latest three live activity items plus the latest persisted excerpt", () => {
-  const preview = projectAgentRunPreview(
-    run(),
-    [
-      message({ seq: 1, toolCallId: "a" }),
-      message({ seq: 2, toolCallId: "b" }),
-      message({ seq: 3, toolCallId: "c" }),
-      message({ seq: 4, toolCallId: "d" }),
-      message({ seq: 5, blockType: "status", role: "system", payload: { summary: "Checking the final result" }, toolCallId: null }),
-    ],
-  );
+  const preview = projectAgentRunPreview(run(), [
+    message({ seq: 1, toolCallId: "a" }),
+    message({ seq: 2, toolCallId: "b" }),
+    message({ seq: 3, toolCallId: "c" }),
+    message({ seq: 4, toolCallId: "d" }),
+    message({ seq: 5, blockType: "status", role: "system", payload: { summary: "Checking the final result" }, toolCallId: null }),
+  ]);
 
   expect(preview.activities.map((item) => item.key)).toEqual(["s3", "s4", "s5"]);
   expect(preview.excerpt).toBe("Checking the final result");

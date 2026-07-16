@@ -308,7 +308,13 @@ export function Transcript({
                 case "summary":
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">
-                      <TurnSummary groups={g.groups} durationMs={g.durationMs} runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId} />
+                      <TurnSummary
+                        groups={g.groups}
+                        durationMs={g.durationMs}
+                        runnerId={runnerId}
+                        sessionPk={sessionPk}
+                        ownerRunId={ownerRunId}
+                      />
                       <FileChangeCards runnerId={runnerId} sessionPk={sessionPk} cards={g.editCards} />
                     </div>
                   );

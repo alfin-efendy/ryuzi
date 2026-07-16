@@ -23,12 +23,9 @@ function terminalFallback(run: AgentRun): string | null {
 export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }: AgentRunCardProps) {
   const duration = formatAgentRunDuration(run);
   const detail = run.status === "running" ? null : (preview.excerpt ?? terminalFallback(run));
-  const metadata = [
-    `${run.toolCount} ${run.toolCount === 1 ? "tool" : "tools"}`,
-    duration,
-    run.resolvedModel,
-    run.resolvedEffort,
-  ].filter((value): value is string => Boolean(value));
+  const metadata = [`${run.toolCount} ${run.toolCount === 1 ? "tool" : "tools"}`, duration, run.resolvedModel, run.resolvedEffort].filter(
+    (value): value is string => Boolean(value),
+  );
   const status = agentRunStatusPresentation(run.status);
 
   return (
@@ -52,7 +49,9 @@ export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }
         <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
           <span className="truncate font-medium text-foreground">{run.executingAgentNameSnapshot}</span>
           <span className="rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground">{kindLabel(run)}</span>
-          {attemptNumber > 1 && <span className="rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground">Retry {attemptNumber}</span>}
+          {attemptNumber > 1 && (
+            <span className="rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground">Retry {attemptNumber}</span>
+          )}
         </span>
         <span aria-live="polite" className={`mt-1 block text-[11px] font-medium ${status.tone}`}>
           {status.label}
@@ -61,13 +60,19 @@ export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }
         <span className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
           {metadata.map((entry, index) => (
             <span key={`${entry}-${index}`} className="inline-flex items-center gap-1">
-              {index === 0 ? <Wrench aria-hidden size={10} strokeWidth={2} /> : index === 1 ? <Clock3 aria-hidden size={10} strokeWidth={2} /> : null}
+              {index === 0 ? (
+                <Wrench aria-hidden size={10} strokeWidth={2} />
+              ) : index === 1 ? (
+                <Clock3 aria-hidden size={10} strokeWidth={2} />
+              ) : null}
               {entry}
             </span>
           ))}
         </span>
         {detail && (
-          <span className={`mt-2 block line-clamp-3 text-[11.5px] leading-relaxed ${run.status === "failed" ? "text-destructive" : "text-muted-foreground"}`}>
+          <span
+            className={`mt-2 block line-clamp-3 text-[11.5px] leading-relaxed ${run.status === "failed" ? "text-destructive" : "text-muted-foreground"}`}
+          >
             {run.status === "failed" && <CircleAlert aria-hidden size={11} strokeWidth={2} className="mr-1 inline-block align-[-1px]" />}
             {detail}
           </span>

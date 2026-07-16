@@ -229,12 +229,11 @@ impl Tool for DelegateAgent {
         let dispatch_failures = results
             .iter()
             .enumerate()
-            .filter_map(|(dispatch_index, result)| {
-                (result.status != SubtaskStatus::Completed).then(|| {
-                    json!({
-                        "dispatch_index": dispatch_index,
-                        "error": result.report,
-                    })
+            .filter(|(_, result)| result.status != SubtaskStatus::Completed)
+            .map(|(dispatch_index, result)| {
+                json!({
+                    "dispatch_index": dispatch_index,
+                    "error": result.report,
                 })
             })
             .collect::<Vec<_>>();

@@ -16,7 +16,7 @@ export function AgentRunPreview({ preview }: { preview: AgentRunPreviewModel }) 
   if (activities.length === 0 && !preview.excerpt) return null;
 
   return (
-    <div className="mt-2 flex min-w-0 flex-col gap-1 border-t border-border/70 pt-2" aria-label="Recent agent activity">
+    <section aria-label="Recent agent activity" className="mt-2 flex min-w-0 flex-col gap-1 border-t border-border/70 pt-2">
       {activities.map((activity) => {
         const Icon = activity.type === "tool" ? Wrench : FileText;
         return (
@@ -27,6 +27,6 @@ export function AgentRunPreview({ preview }: { preview: AgentRunPreviewModel }) 
         );
       })}
       {preview.excerpt && <p className="mb-0 line-clamp-2 text-[11.5px] leading-relaxed text-muted-foreground">{preview.excerpt}</p>}
-    </div>
+    </section>
   );
 }

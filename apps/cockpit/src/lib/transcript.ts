@@ -264,7 +264,7 @@ export function mergeToolRow(prev: Row, payload: unknown, status: string | null,
     toolExitCode: typeof p.exit_code === "number" ? p.exit_code : prev.toolExitCode,
     toolSummary: typeof p.summary === "string" && p.summary ? p.summary : prev.toolSummary,
     toolSubagent: typeof p.subagent === "string" && p.subagent ? p.subagent : prev.toolSubagent,
-    toolDispatchFailures: p.dispatch_failures !== undefined ? dispatchAdmissionFailures(p) : prev.toolDispatchFailures ?? [],
+    toolDispatchFailures: p.dispatch_failures !== undefined ? dispatchAdmissionFailures(p) : (prev.toolDispatchFailures ?? []),
   };
 }
 
