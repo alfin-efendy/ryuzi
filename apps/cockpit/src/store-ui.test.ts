@@ -179,3 +179,52 @@ test("reorderPinned reorders and persists pinnedOrder", () => {
   expect(useUi.getState().pinnedOrder).toEqual(["b", "c", "a"]);
   expect(JSON.parse(localStorage.getItem("cockpit.ui.pinnedOrder") ?? "[]")).toEqual(["b", "c", "a"]);
 });
+
+test("organizeBy defaults to project and toggles + persists", () => {
+  localStorage.clear();
+  useUi.setState({ organizeBy: "project" });
+  expect(useUi.getState().organizeBy).toBe("project");
+  useUi.getState().setOrganizeBy("task");
+  expect(useUi.getState().organizeBy).toBe("task");
+  expect(localStorage.getItem("cockpit.ui.organizeBy")).toBe("task");
+});
+
+test("task and project ordering persist independently", () => {
+  useUi.getState().setTaskOrdering("name");
+  useUi.getState().setProjectOrdering("manual");
+  expect(useUi.getState().taskOrdering).toBe("name");
+  expect(useUi.getState().projectOrdering).toBe("manual");
+  expect(localStorage.getItem("cockpit.ui.taskOrdering")).toBe("name");
+  expect(localStorage.getItem("cockpit.ui.projectOrdering")).toBe("manual");
+});
+
+test("reorderTasks seeds from currentIds when bucket empty, then persists per bucket", () => {
+  useUi.setState({ taskOrder: {} });
+  useUi.getState().reorderTasks("b1", "a", "c", ["a", "b", "c"]);
+  expect(useUi.getState().taskOrder.b1).toEqual(["b", "c", "a"]);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.taskOrder")!).b1).toEqual(["b", "c", "a"]);
+});
+
+test("reorderTasks normalizes a stale bucket to the current visible set", () => {
+  // stored order references a gone id ("x") and misses a new one ("d")
+  useUi.setState({ taskOrder: { b1: ["x", "a", "b"] } });
+  useUi.getState().reorderTasks("b1", "d", "a", ["a", "b", "d"]);
+  // normalized base = [a, b, d]; move d before a → [d, a, b]
+  expect(useUi.getState().taskOrder.b1).toEqual(["d", "a", "b"]);
+});
+
+test("reorderProjects seeds from currentIds and persists", () => {
+  useUi.setState({ projectOrder: [] });
+  useUi.getState().reorderProjects("p2", "p1", ["p1", "p2", "p3"]);
+  expect(useUi.getState().projectOrder).toEqual(["p2", "p1", "p3"]);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.projectOrder")!)).toEqual(["p2", "p1", "p3"]);
+});
+
+test("toggleCollapsed flips a key and persists", () => {
+  useUi.setState({ collapsed: {} });
+  useUi.getState().toggleCollapsed("__tasks__");
+  expect(useUi.getState().collapsed["__tasks__"]).toBe(true);
+  useUi.getState().toggleCollapsed("__tasks__");
+  expect(useUi.getState().collapsed["__tasks__"]).toBe(false);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.collapsed")!)["__tasks__"]).toBe(false);
+});
