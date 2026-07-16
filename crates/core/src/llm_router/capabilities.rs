@@ -54,14 +54,17 @@ pub fn tool_transport_requirements_from_body(body: &Value) -> ToolTransportRequi
             .get("strict")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        requirements.tool_output_schema |= tool.get("output_schema").is_some()
-            || function.get("output_schema").is_some()
+        requirements.tool_output_schema |= has_non_null(tool, "output_schema")
+            || has_non_null(function, "output_schema")
             || tool
                 .get("custom")
-                .and_then(|custom| custom.get("output_schema"))
-                .is_some();
+                .is_some_and(|custom| has_non_null(custom, "output_schema"));
     }
     requirements
+}
+
+fn has_non_null(value: &Value, key: &str) -> bool {
+    value.get(key).is_some_and(|value| !value.is_null())
 }
 
 impl RequiredCapabilities {
@@ -222,5 +225,24 @@ mod tests {
         assert!(requirements.custom_freeform_tools);
         assert!(requirements.strict_function_schema);
         assert!(requirements.tool_output_schema);
+    }
+
+    #[test]
+    fn null_output_schema_is_absent_but_a_schema_is_required() {
+        let absent = tool_transport_requirements_from_body(&json!({
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "output_schema": null
+            }}]
+        }));
+        let required = tool_transport_requirements_from_body(&json!({
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "output_schema": {"type": "string"}
+            }}]
+        }));
+
+        assert!(!absent.tool_output_schema);
+        assert!(required.tool_output_schema);
     }
 }

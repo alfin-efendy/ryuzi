@@ -2,7 +2,7 @@
 //! can route requests through. Secrets live in the `data` JSON blob, encrypted
 //! at rest field-by-field via [`crate::llm_router::secrets`] (decrypted
 //! transparently on read).
-use crate::llm_router::registry::ProviderDescriptor;
+use crate::llm_router::registry::{ProviderDescriptor, ProviderEndpointSource};
 use crate::llm_router::secrets;
 use crate::store::Store;
 use rusqlite::{params, OptionalExtension, Row};
@@ -302,6 +302,19 @@ pub fn effective_base_url(desc: &ProviderDescriptor, row: &ConnectionRow) -> Opt
         .clone()
         .or_else(|| desc.base_url.map(|s| s.to_string()))
         .map(|s| s.trim_end_matches('/').to_string())
+}
+
+pub fn endpoint_source(row: &ConnectionRow) -> ProviderEndpointSource {
+    if row
+        .data
+        .base_url_override
+        .as_deref()
+        .is_some_and(|base_url| !base_url.trim().is_empty())
+    {
+        ProviderEndpointSource::ConnectionOverride
+    } else {
+        ProviderEndpointSource::Catalog
+    }
 }
 
 pub fn effective_models(desc: &ProviderDescriptor, row: &ConnectionRow) -> Vec<String> {

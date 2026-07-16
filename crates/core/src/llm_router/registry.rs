@@ -30,6 +30,15 @@ pub enum ProviderCategory {
     Free,
 }
 
+/// Whether a connection uses the endpoint declared by the provider catalog
+/// or substitutes a user-configured compatible endpoint. Catalog-specific
+/// extensions cannot be assumed for an override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderEndpointSource {
+    Catalog,
+    ConnectionOverride,
+}
+
 /// Typed facts about the provider adapter's tool wire contract. These facts
 /// belong to the adapter, never to a requested model identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +78,18 @@ impl ProviderToolTransport {
 
     pub const fn capabilities(self) -> TransportToolCapabilities {
         self.capabilities
+    }
+
+    pub const fn capabilities_for_endpoint(
+        self,
+        endpoint_source: ProviderEndpointSource,
+    ) -> TransportToolCapabilities {
+        match endpoint_source {
+            ProviderEndpointSource::Catalog => self.capabilities,
+            ProviderEndpointSource::ConnectionOverride => {
+                TransportToolCapabilities::function_only(self.capabilities.wire_protocol)
+            }
+        }
     }
 }
 
@@ -831,6 +852,23 @@ mod tests {
         );
         assert_eq!(descriptor("openai").unwrap().format, ApiFormat::OpenAi);
         assert!(descriptor("nope").is_none());
+    }
+
+    #[test]
+    fn first_party_openai_responses_declares_its_typed_tool_contract() {
+        let capabilities = descriptor("openai-oauth")
+            .unwrap()
+            .tool_transport
+            .capabilities();
+
+        assert_eq!(
+            capabilities.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiResponses
+        );
+        assert!(capabilities.supports_function_tools);
+        assert!(capabilities.supports_custom_freeform_tools);
+        assert!(capabilities.supports_strict_function_schema);
+        assert!(capabilities.supports_tool_output_schema);
     }
 
     #[test]
