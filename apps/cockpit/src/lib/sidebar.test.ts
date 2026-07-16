@@ -5,9 +5,11 @@ import {
   chatSessions,
   isUnreadVisible,
   orderProjects,
+  orderTasks,
   reorder,
   sessionsForProject,
   sessionTitle,
+  visibleTasks,
   type SessionFilterCtx,
 } from "./sidebar";
 import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
@@ -279,4 +281,60 @@ test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-r
   const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
   // a pinned, b not → a first despite older lastActive (no pinnedOrder arg → default [])
   expect(sessionsForProject(sessions, "p", "", false, { [K("a")]: true }, {}, noFilter).map((s) => s.sessionPk)).toEqual(["a", "b"]);
+});
+
+describe("orderProjects manual", () => {
+  test("manual sorts by the order array; unknown ids keep original order", () => {
+    const projects = [
+      { projectId: "a", name: "a" },
+      { projectId: "b", name: "b" },
+      { projectId: "c", name: "c" },
+    ] as Project[];
+    expect(orderProjects(projects, "manual", ["c", "a"]).map((p) => p.projectId)).toEqual(["c", "a", "b"]);
+    // empty order → unchanged
+    expect(orderProjects(projects, "manual", []).map((p) => p.projectId)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("visibleTasks", () => {
+  const rows = [
+    { runnerId: LOCAL_RUNNER, sessionPk: "c1", projectId: null, kind: "chat", title: "chat one", status: "idle", lastActive: 1 },
+    { runnerId: LOCAL_RUNNER, sessionPk: "p1", projectId: "p", kind: "project", title: "proj one", status: "idle", lastActive: 2 },
+    { runnerId: LOCAL_RUNNER, sessionPk: "w1", projectId: "p", kind: "worker", title: "worker", status: "idle", lastActive: 3 },
+  ] as unknown as UiSession[];
+
+  test("scope 'chat' keeps only chat-kind tasks", () => {
+    expect(visibleTasks(rows, "chat", "", false, {}).map((s) => s.sessionPk)).toEqual(["c1"]);
+  });
+  test("scope 'all' keeps chat + project, never worker/review", () => {
+    expect(visibleTasks(rows, "all", "", false, {}).map((s) => s.sessionPk)).toEqual(["c1", "p1"]);
+  });
+  test("scope by projectId keeps only that project's project-kind tasks", () => {
+    expect(visibleTasks(rows, { projectId: "p" }, "", false, {}).map((s) => s.sessionPk)).toEqual(["p1"]);
+  });
+  test("query filters by title; archived hidden unless revealed", () => {
+    expect(visibleTasks(rows, "all", "proj", false, {}).map((s) => s.sessionPk)).toEqual(["p1"]);
+    expect(visibleTasks(rows, "all", "", false, { [K("c1")]: true }).map((s) => s.sessionPk)).toEqual(["p1"]);
+    expect(visibleTasks(rows, "all", "", true, { [K("c1")]: true }).map((s) => s.sessionPk)).toEqual(["c1", "p1"]);
+  });
+});
+
+describe("orderTasks", () => {
+  const mk = (pk: string, lastActive: number, title = pk) =>
+    ({ runnerId: LOCAL_RUNNER, sessionPk: pk, projectId: "p", kind: "project", title, status: "idle", lastActive }) as unknown as UiSession;
+  const rows = [mk("a", 100), mk("b", 300), mk("c", 200)];
+
+  test("updated → newest first", () => {
+    expect(orderTasks(rows, {}, [], "updated", []).map((s) => s.sessionPk)).toEqual(["b", "c", "a"]);
+  });
+  test("name → alphabetical by title", () => {
+    const named = [mk("a", 1, "Zeta"), mk("b", 2, "Alpha")];
+    expect(orderTasks(named, {}, [], "name", []).map((s) => s.sessionPk)).toEqual(["b", "a"]);
+  });
+  test("manual → by taskOrder index, unknown ids fall to recency after ordered ones", () => {
+    expect(orderTasks(rows, {}, [], "manual", [K("c"), K("a")]).map((s) => s.sessionPk)).toEqual(["c", "a", "b"]);
+  });
+  test("pinned float to top by pinnedOrder, ahead of the ordering", () => {
+    expect(orderTasks(rows, { [K("a")]: true }, [K("a")], "updated", []).map((s) => s.sessionPk)).toEqual(["a", "b", "c"]);
+  });
 });
