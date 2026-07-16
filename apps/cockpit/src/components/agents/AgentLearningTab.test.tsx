@@ -59,8 +59,7 @@ function seedLearning(snapshot: AgentLearningInfo) {
 }
 
 beforeEach(() => {
-  for (const fn of [load, createConcept, updateConcept, deleteConcept, validateRaw, replaceRaw, deleteInvalid, rollback])
-    fn.mockClear();
+  for (const fn of [load, createConcept, updateConcept, deleteConcept, validateRaw, replaceRaw, deleteInvalid, rollback]) fn.mockClear();
   useStore.setState({ projects: [] });
   seedLearning(reviewerLearning);
 });

@@ -446,9 +446,7 @@ test("history: legacy and deleted-owner sessions stay read-only", async ({ page 
   // makes "reviewer" genuinely absent, not a fixture-only deletion flag.
   await expect(page.getByText("Reviewer (Deleted)", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("This is the preserved reviewer transcript.")).toBeVisible();
-  await expect(
-    page.getByPlaceholder("The session’s primary agent was deleted, so this session is read-only."),
-  ).toBeDisabled();
+  await expect(page.getByPlaceholder("The session’s primary agent was deleted, so this session is read-only.")).toBeDisabled();
   await expect(page.getByTitle("Send")).toBeDisabled();
   await expect(page.getByRole("button", { name: "Repair agent" })).toHaveCount(0);
   await expect(page.getByTitle("Stop")).toHaveCount(0);
