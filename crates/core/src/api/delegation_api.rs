@@ -193,6 +193,7 @@ mod tests {
                 task: task.into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap()
@@ -369,6 +370,7 @@ mod tests {
                     task: "retry main delegate".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();
@@ -553,6 +555,7 @@ mod tests {
                     task: "delegated".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();

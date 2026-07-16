@@ -151,10 +151,13 @@ impl Tool for Task {
                     use super::BackgroundDispatch;
                     return Ok(
                         match spawner
-                            .run_background(super::SubtaskSpec {
-                                agent_type: ty.to_string(),
-                                prompt: prompt.to_string(),
-                            })
+                            .run_background(
+                                &ctx.tool_call_id,
+                                super::SubtaskSpec {
+                                    agent_type: ty.to_string(),
+                                    prompt: prompt.to_string(),
+                                },
+                            )
                             .await
                         {
                             BackgroundDispatch::Dispatched { id } => ToolOutput::ok(format!(
@@ -165,7 +168,7 @@ impl Tool for Task {
                         },
                     );
                 }
-                match spawner.run(ty, prompt).await {
+                match spawner.run(&ctx.tool_call_id, ty, prompt).await {
                     Ok(report) => Ok(ToolOutput::ok(report)),
                     Err(e) => Ok(ToolOutput::error(format!(
                         "task: sub-agent `{ty}` failed: {e} (available: {})",
@@ -179,7 +182,7 @@ impl Tool for Task {
                     Err(e) => return Ok(ToolOutput::error(e.to_string())),
                 };
                 let total = specs.len();
-                let results = spawner.run_many(specs).await;
+                let results = spawner.run_many(&ctx.tool_call_id, specs).await;
                 let ok = results
                     .iter()
                     .filter(|r| r.status == SubtaskStatus::Completed)
@@ -217,12 +220,24 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// A scripted spawner: echoes prompts back, failing agent type `bad`.
-    struct EchoSpawner;
+    /// A scripted spawner: echoes prompts back, failing agent type `bad`, and
+    /// records the dispatch identity the tool contract supplies.
+    #[derive(Default)]
+    struct RecordingSpawner {
+        dispatches: std::sync::Mutex<Vec<(String, Vec<usize>)>>,
+    }
 
     #[async_trait]
-    impl SubagentSpawner for EchoSpawner {
-        async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult> {
+    impl SubagentSpawner for RecordingSpawner {
+        async fn run_many(
+            &self,
+            source_tool_call_id: &str,
+            specs: Vec<SubtaskSpec>,
+        ) -> Vec<SubtaskResult> {
+            self.dispatches
+                .lock()
+                .unwrap()
+                .push((source_tool_call_id.to_string(), (0..specs.len()).collect()));
             specs
                 .into_iter()
                 .enumerate()
@@ -248,23 +263,33 @@ mod tests {
         fn available(&self) -> Vec<String> {
             vec!["general".into(), "explore".into()]
         }
-        async fn run_background(&self, _spec: SubtaskSpec) -> super::super::BackgroundDispatch {
+        async fn run_background(
+            &self,
+            source_tool_call_id: &str,
+            _spec: SubtaskSpec,
+        ) -> super::super::BackgroundDispatch {
+            self.dispatches
+                .lock()
+                .unwrap()
+                .push((source_tool_call_id.to_string(), vec![0]));
             super::super::BackgroundDispatch::Dispatched {
                 id: "bg-1".to_string(),
             }
         }
     }
 
-    async fn ctx_with_spawner(dir: &std::path::Path) -> ToolCtx {
+    async fn ctx_with_spawner(dir: &std::path::Path) -> (ToolCtx, Arc<RecordingSpawner>) {
         let mut ctx = ctx_at(dir).await;
-        ctx.spawn = Some(Arc::new(EchoSpawner));
-        ctx
+        ctx.tool_call_id = "test-tool-call".into();
+        let spawner = Arc::new(RecordingSpawner::default());
+        ctx.spawn = Some(spawner.clone());
+        (ctx, spawner)
     }
 
     #[tokio::test]
     async fn batch_digest_orders_reports_and_summarizes() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_spawner(dir.path()).await;
+        let (ctx, _) = ctx_with_spawner(dir.path()).await;
         let out = Task
             .execute(
                 &ctx,
@@ -292,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn both_forms_at_once_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_spawner(dir.path()).await;
+        let (ctx, _) = ctx_with_spawner(dir.path()).await;
         let out = Task
             .execute(&ctx, json!({"prompt": "x", "tasks": [{"prompt": "y"}]}))
             .await
@@ -304,16 +329,16 @@ mod tests {
     #[tokio::test]
     async fn empty_batch_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_spawner(dir.path()).await;
+        let (ctx, _) = ctx_with_spawner(dir.path()).await;
         let out = Task.execute(&ctx, json!({"tasks": []})).await.unwrap();
         assert!(out.is_error);
         assert!(out.for_model.contains("must not be empty"));
     }
 
     #[tokio::test]
-    async fn single_form_still_works() {
+    async fn dispatch_link_single_form_uses_tool_call_id_and_zero_index() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_spawner(dir.path()).await;
+        let (ctx, spawner) = ctx_with_spawner(dir.path()).await;
         let out = Task
             .execute(
                 &ctx,
@@ -323,12 +348,38 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(out.for_model, "echo: find it");
+        assert_eq!(
+            *spawner.dispatches.lock().unwrap(),
+            vec![("test-tool-call".to_string(), vec![0])]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_batch_uses_tool_call_id_and_input_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, spawner) = ctx_with_spawner(dir.path()).await;
+        let out = Task
+            .execute(
+                &ctx,
+                json!({"tasks": [
+                    {"prompt": "first"},
+                    {"prompt": "second"},
+                    {"prompt": "third"}
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert_eq!(
+            *spawner.dispatches.lock().unwrap(),
+            vec![("test-tool-call".to_string(), vec![0, 1, 2])]
+        );
     }
 
     #[tokio::test]
     async fn background_single_form_dispatches_without_blocking() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_spawner(dir.path()).await;
+        let (ctx, spawner) = ctx_with_spawner(dir.path()).await;
         let out = Task
             .execute(
                 &ctx,
@@ -340,6 +391,10 @@ mod tests {
         assert!(out.for_model.contains("dispatched"), "{}", out.for_model);
         // Not the synchronous echo — the turn was not blocked on the child.
         assert!(!out.for_model.contains("echo: long job"));
+        assert_eq!(
+            *spawner.dispatches.lock().unwrap(),
+            vec![("test-tool-call".to_string(), vec![0])]
+        );
     }
 
     #[tokio::test]
@@ -350,7 +405,7 @@ mod tests {
         // would return "bg-1"; its absence here proves `run_many` — the
         // synchronous batch path — is what actually ran).
         let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_with_spawner(dir.path()).await;
+        let (ctx, _) = ctx_with_spawner(dir.path()).await;
         let out = Task
             .execute(
                 &ctx,

@@ -1840,6 +1840,7 @@ impl ControlPlane {
                                 task,
                                 context: None,
                                 background: false,
+                                dispatch: None,
                             })
                             .await;
                         (agent_id, agent_name, queued)

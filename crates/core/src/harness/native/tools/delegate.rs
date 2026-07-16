@@ -1,7 +1,7 @@
 //! `delegate_agent` — delegate work to complete autonomous agent profiles.
 
 use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
-use crate::delegation::MainDelegationRequest;
+use crate::delegation::{AgentDispatchLink, MainDelegationRequest};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -41,13 +41,23 @@ fn parse_spec(value: &Value, batch_item: bool) -> anyhow::Result<DelegationSpec>
     })
 }
 
-fn request(parent_run_id: &str, spec: DelegationSpec, background: bool) -> MainDelegationRequest {
+fn request(
+    parent_run_id: &str,
+    source_tool_call_id: &str,
+    dispatch_index: usize,
+    spec: DelegationSpec,
+    background: bool,
+) -> MainDelegationRequest {
     MainDelegationRequest {
         parent_run_id: parent_run_id.to_string(),
         target_agent_id: spec.agent_id,
         task: spec.task,
         context: spec.context,
         background,
+        dispatch: Some(AgentDispatchLink {
+            source_tool_call_id: source_tool_call_id.to_string(),
+            dispatch_index: i64::try_from(dispatch_index).expect("delegation index fits i64"),
+        }),
     }
 }
 
@@ -152,7 +162,7 @@ impl Tool for DelegateAgent {
                 )));
             }
             let result = spawner
-                .run_one(request(&ctx.run_id, spec, background))
+                .run_one(request(&ctx.run_id, &ctx.tool_call_id, 0, spec, background))
                 .await;
             return Ok(match result.status {
                 super::SubtaskStatus::Completed => {
@@ -186,7 +196,7 @@ impl Tool for DelegateAgent {
         }
         let mut ids = HashSet::new();
         let mut requests = Vec::with_capacity(entries.len());
-        for entry in entries {
+        for (dispatch_index, entry) in entries.iter().enumerate() {
             let spec = match parse_spec(entry, true) {
                 Ok(spec) => spec,
                 Err(error) => return Ok(ToolOutput::error(error.to_string())),
@@ -203,7 +213,13 @@ impl Tool for DelegateAgent {
                     spec.agent_id
                 )));
             }
-            requests.push(request(&ctx.run_id, spec, background));
+            requests.push(request(
+                &ctx.run_id,
+                &ctx.tool_call_id,
+                dispatch_index,
+                spec,
+                background,
+            ));
         }
         let results = spawner.run_many(requests).await;
         let text = results
@@ -293,6 +309,13 @@ mod tests {
         assert_eq!(requests[0].task, "audit");
         assert_eq!(requests[0].context.as_deref(), Some("focus auth"));
         assert!(!requests[0].background);
+        assert_eq!(
+            requests[0].dispatch,
+            Some(crate::delegation::AgentDispatchLink {
+                source_tool_call_id: "test-call".into(),
+                dispatch_index: 0,
+            })
+        );
     }
 
     #[tokio::test]
@@ -311,6 +334,16 @@ mod tests {
         assert_eq!(requests[1].target_agent_id, "tester");
         assert_eq!(requests[1].task, "test");
         assert_eq!(requests[1].context, None);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request
+                    .dispatch
+                    .as_ref()
+                    .map(|link| { (link.source_tool_call_id.as_str(), link.dispatch_index) }))
+                .collect::<Vec<_>>(),
+            vec![Some(("test-call", 0)), Some(("test-call", 1))]
+        );
     }
 
     #[tokio::test]
@@ -326,7 +359,15 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.for_model);
         assert!(out.for_model.contains("run-1"));
-        assert!(spawner.requests.lock().unwrap()[0].background);
+        let requests = spawner.requests.lock().unwrap();
+        assert!(requests[0].background);
+        assert_eq!(
+            requests[0].dispatch,
+            Some(crate::delegation::AgentDispatchLink {
+                source_tool_call_id: "test-call".into(),
+                dispatch_index: 0,
+            })
+        );
     }
 
     #[tokio::test]

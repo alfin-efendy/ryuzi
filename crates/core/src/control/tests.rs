@@ -3838,6 +3838,7 @@ async fn end_session_cancels_deferred_background_descendants_before_they_can_del
             task: "deferred background work".into(),
             context: None,
             background: true,
+            dispatch: None,
         })
         .await
         .unwrap();
