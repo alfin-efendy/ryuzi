@@ -59,7 +59,7 @@ test("sidebar navigation leaves the Home view", async ({ page }) => {
     await page.getByText(label, { exact: true }).first().click();
     await expect(homeHeading).toHaveCount(0);
     // back to Home for the next iteration
-    await page.getByText("New session", { exact: true }).first().click();
+    await page.getByText("New Task", { exact: true }).first().click();
     await expect(homeHeading).toBeVisible();
   }
 });

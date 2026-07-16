@@ -21,7 +21,7 @@ export const GW_FS_MODES: { id: GatewayFsMode; label: string; desc: string }[] =
 
 // Command entries surfaced by the ⌘K palette.
 export const SEARCH_COMMANDS: { id: string; label: string; keywords: string }[] = [
-  { id: "new-session", label: "New session", keywords: "new session start compose" },
+  { id: "new-session", label: "New Task", keywords: "new task session start compose" },
   { id: "toggle-terminal", label: "Toggle terminal panel", keywords: "terminal bottom panel shell" },
   { id: "toggle-right", label: "Toggle right panel", keywords: "review files right panel" },
   { id: "gateways", label: "Manage gateways", keywords: "gateway workspace ssh daemon connect" },

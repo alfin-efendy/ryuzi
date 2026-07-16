@@ -25,8 +25,8 @@ export function orderProjects(projects: Project[], ordering: Ordering, order: st
       const ia = orderIndex(order, a.projectId);
       const ib = orderIndex(order, b.projectId);
       // Compare indices before subtracting: two absent ids are both +Infinity, and
-      // `Infinity - Infinity` is NaN (treated as "equal" by sort, but unsafe). The
-      // `!==` guard keeps them stable in their original order instead.
+      // `Infinity - Infinity` is NaN (treated as "equal" by sort, but unsafe). Equal
+      // indices (both absent → both Infinity, or same position) sort as 0, avoiding NaN.
       return ia === ib ? 0 : ia - ib;
     });
   }
@@ -118,11 +118,6 @@ export function orderTasks(
     }
     return (b.lastActive ?? 0) - (a.lastActive ?? 0); // "updated" & manual fallback
   });
-}
-
-// Chat-first sessions (no project attached) — the sidebar's own "Chat" bucket.
-export function chatSessions(sessions: UiSession[]): UiSession[] {
-  return sessions.filter((s) => s.kind === "chat");
 }
 
 export function archivedCount(sessions: UiSession[], projectId: string, archived: Record<string, true>): number {
