@@ -5436,7 +5436,7 @@ mod tests {
                     session_pk TEXT NOT NULL,
                     parent_run_id TEXT
                  );
-                 INSERT INTO agent_runs(run_id) VALUES ('legacy-run');
+                 INSERT INTO agent_runs(run_id,session_pk) VALUES ('legacy-run','legacy-session');
                  PRAGMA user_version=38;",
             )
             .unwrap();
@@ -7595,10 +7595,26 @@ mod tests {
         index_only.source_tool_call_id = None;
         assert!(store.insert_agent_run(index_only).await.is_err());
 
-        let mut negative_index = linked_input;
+        let mut negative_index = linked_input.clone();
         negative_index.run_id = "negative-index".into();
         negative_index.dispatch_index = Some(-1);
         assert!(store.insert_agent_run(negative_index).await.is_err());
+
+        let mut blank_source = linked_input.clone();
+        blank_source.run_id = "blank-source".into();
+        blank_source.source_tool_call_id = Some("   ".into());
+        assert!(store.insert_agent_run(blank_source).await.is_err());
+
+        let mut linked_root = agent_run_input(
+            "linked-root",
+            None,
+            None,
+            AgentRunKind::Primary,
+            AgentRunStatus::Queued,
+        );
+        linked_root.source_tool_call_id = Some("tool-dispatch-1".into());
+        linked_root.dispatch_index = Some(2);
+        assert!(store.insert_primary_agent_run(linked_root).await.is_err());
     }
 
     #[tokio::test]
