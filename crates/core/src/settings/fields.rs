@@ -1,4 +1,4 @@
-//! ConfigField schema: the 26 global settings fields. Keys, labels, help
+//! ConfigField schema: the 25 global settings fields. Keys, labels, help
 //! text, and defaults are user-visible contracts — settings stored under
 //! these keys must keep resolving across releases.
 
@@ -38,7 +38,7 @@ pub const BASE: ConfigField = ConfigField {
     default: None,
 };
 
-/// The 26 global settings fields.
+/// The 25 global settings fields.
 pub static GLOBAL_FIELDS: &[ConfigField] = &[
     ConfigField {
         key: "workdir_root",
@@ -246,9 +246,10 @@ mod tests {
         let fields = all_fields();
         assert_eq!(fields.len(), 29); // 26 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
-        // list order: globals first, then discord fields
+        // list order: 26 globals first, then 3 discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
+        assert!(keys.contains(&"approval_timeout_ms"));
         assert_eq!(
             &keys[26..],
             &["discord.token", "discord.app_id", "discord.guild_id"]

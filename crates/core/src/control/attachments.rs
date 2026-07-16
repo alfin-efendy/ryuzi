@@ -3,7 +3,7 @@
 
 use super::ControlPlane;
 use crate::attachments::{build_manifest, materialize_attachments, MaterializeOpts};
-use crate::domain::AttachmentRef;
+use crate::domain::{AttachmentRef, QueuedSessionPrompt};
 use crate::settings::{expand_home, SettingsStore};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +48,20 @@ impl ControlPlane {
     /// (`end_session`).
     pub(super) async fn attachment_dest_dir(&self, session_pk: &str) -> PathBuf {
         self.attachments_root().await.join(session_pk)
+    }
+
+    /// Delete queue-owned attachment copies for one prompt, without following
+    /// arbitrary file URLs supplied by external clients.
+    pub(super) async fn cleanup_queue_attachments(&self, prompt: &QueuedSessionPrompt) {
+        let owned_dir = self.attachments_root().await.join("queue").join(&prompt.id);
+        if prompt.attachments.iter().any(|attachment| {
+            url::Url::parse(&attachment.url)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .is_some_and(|path| path.starts_with(&owned_dir))
+        }) {
+            let _ = tokio::fs::remove_dir_all(owned_dir).await;
+        }
     }
 
     /// The live `attachment_max_bytes` setting — the same cap

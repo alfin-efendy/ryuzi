@@ -10,6 +10,7 @@ export type View =
   | { kind: "models" }
   | { kind: "providerDetail"; provider: string }
   | { kind: "scheduler" }
+  | { kind: "automations"; tab?: "scheduler" | "hooks" | "commands" }
   | { kind: "jobDetail"; id: string }
   | { kind: "jobNew" }
   | { kind: "plugins" }

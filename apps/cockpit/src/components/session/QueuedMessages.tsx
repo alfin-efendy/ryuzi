@@ -1,13 +1,21 @@
+import { useEffect } from "react";
 import { Button } from "@ryuzi/ui";
 import { ListPlus, X } from "lucide-react";
-import { useStore } from "@/store";
+import { useNative } from "@/store-native";
 import { sessKey } from "@/lib/session-key";
 
-/** The pending type-ahead queue for a session, shown above the composer.
+/** The durable type-ahead queue for a session, shown above the composer.
  *  Renders nothing when the queue is empty. */
 export function QueuedMessages({ runnerId, sessionPk }: { runnerId: string; sessionPk: string }) {
-  const queued = useStore((s) => s.queued[sessKey(runnerId, sessionPk)]);
-  const removeQueued = useStore((s) => s.removeQueued);
+  const key = sessKey(runnerId, sessionPk);
+  const queued = useNative((s) => s.queuedBySession[key]);
+  const loadQueue = useNative((s) => s.loadQueue);
+  const removeQueueMessage = useNative((s) => s.removeQueueMessage);
+
+  useEffect(() => {
+    void loadQueue(runnerId, sessionPk);
+  }, [loadQueue, runnerId, sessionPk]);
+
   if (!queued || queued.length === 0) return null;
   return (
     <div className="mx-auto mb-1.5 flex w-full max-w-3xl flex-col gap-1">
@@ -22,7 +30,7 @@ export function QueuedMessages({ runnerId, sessionPk }: { runnerId: string; sess
             variant="ghost"
             size="icon-sm"
             title="Remove from queue"
-            onClick={() => removeQueued(runnerId, sessionPk, m.id)}
+            onClick={() => void removeQueueMessage(runnerId, sessionPk, m.id)}
             className="rounded-full"
           >
             <X aria-hidden size={13} strokeWidth={2} className="size-[13px]" />

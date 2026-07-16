@@ -39,6 +39,9 @@ pub struct UpstreamCtx {
     /// (post-401) refresh path. `None` in production, which uses each
     /// provider's static `registry::oauth_config` token_url.
     pub oauth_token_url_override: Option<String>,
+    /// Test-only override for Kiro's hard-coded `generateAssistantResponse`
+    /// endpoint. `None` uses the production endpoint selection.
+    pub kiro_base_override: Option<String>,
     /// Test-only override for the MiMo free-tier bootstrap endpoint that
     /// mints the anti-abuse JWT. `None` in production
     /// ([`mimo::BOOTSTRAP_URL`]).
@@ -52,6 +55,7 @@ impl UpstreamCtx {
             store,
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: None,
         }
     }
@@ -67,7 +71,6 @@ pub struct RouteTarget {
     pub desc: &'static ProviderDescriptor,
     pub upstream_model: String,
     pub route_target_key: Option<crate::llm_router::model_effort::RouteTargetEffortKey>,
-    pub request_compatibility_effort: Option<String>,
 }
 
 #[derive(Clone)]
@@ -227,7 +230,7 @@ async fn route_models_for_body_matching_with_cache(
                 .await?
         {
             if let Some(desc) = registry::descriptor(&conn.provider) {
-                let Some((upstream_model, request_compatibility_effort)) =
+                let Some(upstream_model) =
                     resolved_requested_model(&conn, desc, requested, model, true)
                 else {
                     continue;
@@ -238,7 +241,6 @@ async fn route_models_for_body_matching_with_cache(
                         desc,
                         upstream_model,
                         route_target_key: None,
-                        request_compatibility_effort,
                     },
                     reason,
                 });
@@ -284,7 +286,6 @@ async fn route_models_for_body_matching_with_cache(
                         desc,
                         upstream_model: requested.to_string(),
                         route_target_key: None,
-                        request_compatibility_effort: None,
                     },
                     reason: combine_order_reason(
                         cross_provider_ordered.then_some(RouteSelectionReason::Ordered),
@@ -371,7 +372,6 @@ async fn expanded_route_targets(
                     desc,
                     upstream_model: target.model.clone(),
                     route_target_key: None,
-                    request_compatibility_effort: None,
                 },
                 reason: combine_order_reason(Some(route_reason.clone()), account_reason),
             })
@@ -493,14 +493,14 @@ fn resolved_requested_model(
     requested: &str,
     model: &str,
     allow_unlisted: bool,
-) -> Option<(String, Option<String>)> {
+) -> Option<String> {
     if connection_serves_model(desc, conn, model, allow_unlisted) {
-        return Some((model.to_string(), None));
+        return Some(model.to_string());
     }
     if conn.provider != "openai-oauth" {
         return None;
     }
-    let (canonical, effort) = model_effort::parse_legacy_codex_selection(requested)?;
+    let (canonical, _) = model_effort::parse_legacy_codex_selection(requested)?;
     let (family, canonical_model) = canonical
         .split_once('/')
         .map_or(("openai", canonical.as_str()), |(family, model)| {
@@ -514,23 +514,16 @@ fn resolved_requested_model(
         || canonical_model
             .strip_suffix("-review")
             .is_some_and(|base| models.iter().any(|served| served == base));
-    known.then(|| (canonical_model.to_string(), Some(effort)))
+    known.then(|| canonical_model.to_string())
 }
 
 fn resolve_target_effort(
     policy: &model_effort::TurnEffortPolicy,
     route_target_key: Option<&model_effort::RouteTargetEffortKey>,
-    request_compatibility_effort: Option<&str>,
     preference_key: &model_effort::ModelPreferenceKey,
     surface: &model_effort::ExecutionSurfaceKey,
 ) -> model_effort::EffectiveEffort {
-    model_effort::resolve_for_target(
-        policy,
-        route_target_key,
-        request_compatibility_effort,
-        preference_key,
-        surface,
-    )
+    model_effort::resolve_for_target(policy, route_target_key, preference_key, surface)
 }
 
 async fn ordered_provider_connections(
@@ -821,7 +814,7 @@ pub async fn selectable_native_models(
                         .map(|value| {
                             (
                                 Some(value.to_string()),
-                                model_effort::EffectiveEffortSource::RouteCompatibility,
+                                model_effort::EffectiveEffortSource::RouteTarget,
                             )
                         })
                         .or_else(|| {
@@ -841,10 +834,6 @@ pub async fn selectable_native_models(
                                 .as_ref()
                                 .filter(|value| supports(value))
                                 .cloned()
-                                .or_else(|| {
-                                    (capability.supported.len() == 1)
-                                        .then(|| capability.supported[0].value.clone())
-                                })
                                 .map(|value| {
                                     (Some(value), model_effort::EffectiveEffortSource::Provider)
                                 })
@@ -963,7 +952,7 @@ pub async fn selectable_native_models(
     Ok(out)
 }
 
-pub async fn named_route_compatibility_default(
+pub async fn named_route_target_default(
     store: &Store,
     requested: &str,
     supported: &[model_effort::ReasoningEffortOption],
@@ -1030,7 +1019,19 @@ fn strip_thinking(body: &mut Value) {
     }
 }
 
-fn target_effort(
+pub(crate) fn strip_kiro_effort(body: &mut Value) {
+    if let Some(output) = body.get_mut("output_config").and_then(Value::as_object_mut) {
+        output.remove("effort");
+    }
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.remove("effort");
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+}
+
+pub(crate) fn target_effort(
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
 ) -> model_effort::EffectiveEffort {
@@ -1046,7 +1047,6 @@ fn target_effort(
     resolve_target_effort(
         policy,
         target.route_target_key.as_ref(),
-        target.request_compatibility_effort.as_deref(),
         &preference_key,
         &surface,
     )
@@ -1070,7 +1070,6 @@ fn selection_for_accepted_target(
     let effective = model_effort::resolve_for_target(
         policy,
         target.route_target_key.as_ref(),
-        target.request_compatibility_effort.as_deref(),
         &preference_key,
         &surface,
     );
@@ -1103,7 +1102,7 @@ fn accepted_reason(
         .unwrap_or(origin)
 }
 
-fn apply_anthropic_effort(
+pub(crate) fn apply_anthropic_effort(
     body: &mut Value,
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
@@ -1115,7 +1114,7 @@ fn apply_anthropic_effort(
     }
 }
 
-fn apply_openai_effort(
+pub(crate) fn apply_openai_effort(
     body: &mut Value,
     target: &RouteTarget,
     policy: &model_effort::TurnEffortPolicy,
@@ -1123,7 +1122,7 @@ fn apply_openai_effort(
 ) {
     if let Some(effort) = target_effort(target, policy).value {
         body["reasoning_effort"] = json!(effort);
-    } else if !caller_supplied_thinking {
+    } else if target.route_target_key.is_some() || !caller_supplied_thinking {
         if let Some(object) = body.as_object_mut() {
             object.remove("reasoning_effort");
         }
@@ -1918,6 +1917,7 @@ pub async fn anthropic_messages_stream(
         // fallback target, matching the other providers' behavior.
         if target.conn.provider == "kiro" {
             strip_thinking(&mut attempt_body);
+            strip_kiro_effort(&mut attempt_body);
             match kiro_stream(ctx, &mut target, &attempt_body, started).await {
                 Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
                     StreamProbe::Deliver { buffered, rest } => {
@@ -2430,10 +2430,12 @@ pub(crate) fn kiro_upstream_request(
 ) -> reqwest::RequestBuilder {
     let data = &target.conn.data;
     let auth_method = connections::kiro_auth_method(data);
-    let url = kiro_endpoints(&auth_method, &connections::kiro_region(data))
-        .into_iter()
-        .next()
-        .expect("kiro_endpoints always returns at least one URL");
+    let url = ctx.kiro_base_override.clone().unwrap_or_else(|| {
+        kiro_endpoints(&auth_method, &connections::kiro_region(data))
+            .into_iter()
+            .next()
+            .expect("kiro_endpoints always returns at least one URL")
+    });
     let token = data.access_token.clone().unwrap_or_default();
     let mut req = ctx
         .http
@@ -2624,7 +2626,6 @@ async fn codex_stream(
     let effort = resolve_target_effort(
         effort_policy,
         target.route_target_key.as_ref(),
-        target.request_compatibility_effort.as_deref(),
         &preference_key,
         &surface,
     );
@@ -2767,8 +2768,8 @@ mod tests {
         };
         model_effort::TurnEffortPolicy {
             requested_model: format!("{}/{}", target.desc.family, target.upstream_model),
-            project_override: None,
-            route_compatibility: Default::default(),
+            caller_override: None,
+            route_targets: Default::default(),
             configured: Default::default(),
             surfaces: std::collections::HashMap::from([(
                 surface.clone(),
@@ -2787,49 +2788,57 @@ mod tests {
     }
 
     #[test]
-    fn single_option_implicit_default_is_sent_to_wire() {
+    fn kiro_protocol_strips_all_client_effort_fields() {
+        let mut body = json!({
+            "output_config": {"effort": "low", "other": true},
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "high", "summary": "detailed"}
+        });
+
+        strip_kiro_effort(&mut body);
+
+        assert!(body["output_config"].get("effort").is_none());
+        assert_eq!(body["output_config"]["other"], true);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body["reasoning"].get("effort").is_none());
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn single_option_without_advertised_default_is_omitted_from_wire() {
         let anthropic = RouteTarget {
             conn: mk_conn("a1", "anthropic", "api_key", ConnectionData::default()),
             desc: registry::descriptor("anthropic").unwrap(),
             upstream_model: "claude-one".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let policy = single_option_policy(&anthropic, "focused");
         let mut anthropic_body = json!({"messages": []});
         apply_anthropic_effort(&mut anthropic_body, &anthropic, &policy);
-        assert_eq!(anthropic_body["output_config"]["effort"], "focused");
+        assert!(anthropic_body
+            .get("output_config")
+            .and_then(|output| output.get("effort"))
+            .is_none());
 
         let openai = RouteTarget {
             conn: mk_conn("o1", "openai", "api_key", ConnectionData::default()),
             desc: registry::descriptor("openai").unwrap(),
             upstream_model: "gpt-one".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let policy = single_option_policy(&openai, "focused");
         let mut chat_body = json!({"messages": []});
         apply_openai_effort(&mut chat_body, &openai, &policy, false);
-        assert_eq!(chat_body["reasoning_effort"], "focused");
+        assert!(chat_body.get("reasoning_effort").is_none());
 
         let codex = RouteTarget {
             conn: mk_conn("c1", "openai-oauth", "oauth", ConnectionData::default()),
             desc: registry::descriptor("openai-oauth").unwrap(),
             upstream_model: "gpt-codex".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let policy = single_option_policy(&codex, "ultra");
-        let selected = target_effort(&codex, &policy).value.unwrap();
-        assert_eq!(selected, "ultra", "policy identity stays provider-native");
-        let mut responses = json!({"input": []});
-        crate::llm_router::codex::normalize_codex_responses_body(
-            &mut responses,
-            "gpt-codex",
-            Some(&selected),
-            None,
-        );
-        assert_eq!(responses["reasoning"]["effort"], "max");
+        assert!(target_effort(&codex, &policy).value.is_none());
     }
 
     #[tokio::test]
@@ -2883,8 +2892,8 @@ mod tests {
         };
         let policy = Arc::new(model_effort::TurnEffortPolicy {
             requested_model: "openai/gpt-wire".into(),
-            project_override: Some("ultra".into()),
-            route_compatibility: Default::default(),
+            caller_override: Some("ultra".into()),
+            route_targets: Default::default(),
             configured: Default::default(),
             surfaces: std::collections::HashMap::from([(
                 surface.clone(),
@@ -2915,8 +2924,8 @@ mod tests {
 
         let unsupported = Arc::new(model_effort::TurnEffortPolicy {
             requested_model: "openai/gpt-wire".into(),
-            project_override: Some("ultra".into()),
-            route_compatibility: Default::default(),
+            caller_override: Some("ultra".into()),
+            route_targets: Default::default(),
             configured: Default::default(),
             surfaces: Default::default(),
         });
@@ -2931,10 +2940,229 @@ mod tests {
         assert!(captured[1].get("reasoning").is_none());
     }
 
+    #[tokio::test]
+    async fn named_route_target_effort_overrides_caller_and_uses_model_then_provider_defaults() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Mutex as StdMutex;
+
+        async fn capture(
+            State(captured): State<Arc<StdMutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> ([(&'static str, &'static str); 1], &'static str) {
+            captured.lock().unwrap().push(body);
+            (
+                [("content-type", "text/event-stream")],
+                "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            )
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "route-wire",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("test-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 100 * 24 * 60 * 60 * 1_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    needs_relogin: Some(false),
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    models_override: Some(vec!["gpt-5.5".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "route-effort".into(),
+                name: "smart-wire".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-5.5".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let surface = model_effort::ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: Some("route-wire".into()),
+            model: "gpt-5.5".into(),
+        };
+        let preference = model_effort::ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-5.5".into(),
+        };
+        let capability = model_effort::ExecutionModelEffortCapabilities {
+            surface: surface.clone(),
+            model_display_name: "GPT Route Wire".into(),
+            supported: ["low", "medium", "high"]
+                .into_iter()
+                .map(|value| model_effort::ReasoningEffortOption {
+                    value: value.into(),
+                    label: value.into(),
+                    description: None,
+                })
+                .collect(),
+            provider_default: Some("high".into()),
+        };
+        let request = || {
+            json!({
+                "model": "smart-wire",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+        };
+        let mut base_policy = model_effort::build_utility_effort_policy(&ctx.store, "smart-wire")
+            .await
+            .unwrap();
+        base_policy.caller_override = Some("low".into());
+        base_policy.configured = std::collections::HashMap::from([(preference, "medium".into())]);
+        base_policy.surfaces = std::collections::HashMap::from([(surface, capability)]);
+
+        let first = anthropic_messages_stream(&ctx, request(), &Arc::new(base_policy.clone()))
+            .await
+            .unwrap();
+        let _ = collect_stream(first.events).await;
+
+        let mut model_default = base_policy;
+        model_default.route_targets.clear();
+        let second = anthropic_messages_stream(&ctx, request(), &Arc::new(model_default.clone()))
+            .await
+            .unwrap();
+        let _ = collect_stream(second.events).await;
+
+        model_default.configured.clear();
+        let third = anthropic_messages_stream(&ctx, request(), &Arc::new(model_default))
+            .await
+            .unwrap();
+        let _ = collect_stream(third.events).await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0]["reasoning"]["effort"], "high");
+        assert_eq!(captured[1]["reasoning"]["effort"], "medium");
+        assert_eq!(captured[2]["reasoning"]["effort"], "high");
+    }
+
     async fn test_ctx() -> UpstreamCtx {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    #[tokio::test]
+    async fn native_kiro_stream_strips_all_client_effort_fields_before_translation() {
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::response::Response;
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Mutex as StdMutex;
+
+        fn frame(event_type: &str, payload: &str) -> Vec<u8> {
+            let name = ":event-type";
+            let mut headers = Vec::new();
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7);
+            headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+            headers.extend_from_slice(event_type.as_bytes());
+            let payload = payload.as_bytes();
+            let total = 12 + headers.len() + payload.len() + 4;
+            let mut out = Vec::with_capacity(total);
+            out.extend_from_slice(&(total as u32).to_be_bytes());
+            out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&headers);
+            out.extend_from_slice(payload);
+            out.extend_from_slice(&[0; 4]);
+            out
+        }
+
+        async fn capture(
+            State(captured): State<Arc<StdMutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Response {
+            captured.lock().unwrap().push(body);
+            let mut response = frame("assistantResponseEvent", r#"{"content":"ok"}"#);
+            response.extend(frame("messageStopEvent", "{}"));
+            Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                .body(Body::from(response))
+                .unwrap()
+        }
+
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/generateAssistantResponse", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut ctx = test_ctx().await;
+        ctx.kiro_base_override = Some(format!("http://127.0.0.1:{port}/generateAssistantResponse"));
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "kiro-native",
+                "kiro",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("kiro-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 86_400_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    models_override: Some(vec!["claude-sonnet-4.5".into()]),
+                    provider_specific: Some(json!({"authMethod": "builder-id"})),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": "kiro/claude-sonnet-4.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"},
+                "reasoning_effort": "medium",
+                "reasoning": {"effort": "high"}
+            }),
+            utility_policy(&ctx, "kiro/claude-sonnet-4.5")
+                .await
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        let _ = collect_stream(routed.events).await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0]["inferenceConfig"].get("maxTokens").is_some());
+        assert!(captured[0].pointer("/output_config/effort").is_none());
+        assert!(captured[0].get("reasoning_effort").is_none());
+        assert!(captured[0].pointer("/reasoning/effort").is_none());
     }
 
     async fn utility_policy(ctx: &UpstreamCtx, model: &str) -> Arc<model_effort::TurnEffortPolicy> {
@@ -4051,7 +4279,6 @@ mod tests {
             desc,
             upstream_model: "claude-x".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "claude-x",
@@ -4125,7 +4352,6 @@ mod tests {
             desc,
             upstream_model: "claude-x".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "claude-x",
@@ -4183,7 +4409,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2-codex".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
         let req = upstream_request(&ctx, &target, &body)
@@ -4221,7 +4446,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2-codex".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2-codex", "input": "hi"});
         let req = upstream_request(&ctx, &target, &body)
@@ -4534,10 +4758,6 @@ mod tests {
             );
             assert_eq!(targets[0].conn.provider, "openai-oauth");
             assert_eq!(targets[0].upstream_model, "gpt-5.5-review");
-            assert_eq!(
-                targets[0].request_compatibility_effort.as_deref(),
-                Some("high")
-            );
             assert!(targets[0].route_target_key.is_none());
         }
     }
@@ -4640,56 +4860,7 @@ mod tests {
 
         let target = route_model(&ctx.store, "fast-high").await.unwrap().unwrap();
         assert_eq!(target.upstream_model, "real-model");
-        assert_eq!(target.request_compatibility_effort, None);
         assert!(target.route_target_key.is_some());
-    }
-
-    #[test]
-    fn request_compatibility_effort_reaches_resolved_target_policy() {
-        let surface = model_effort::ExecutionSurfaceKey {
-            provider_id: "openai-oauth".into(),
-            connection_id: Some("codex".into()),
-            model: "gpt-5.5-review".into(),
-        };
-        let preference = model_effort::ModelPreferenceKey {
-            family: "openai".into(),
-            model: "gpt-5.5-review".into(),
-        };
-        let capabilities = model_effort::ExecutionModelEffortCapabilities {
-            surface: surface.clone(),
-            model_display_name: "gpt-5.5-review".into(),
-            supported: vec![
-                model_effort::ReasoningEffortOption {
-                    value: "low".into(),
-                    label: "Low".into(),
-                    description: None,
-                },
-                model_effort::ReasoningEffortOption {
-                    value: "high".into(),
-                    label: "High".into(),
-                    description: None,
-                },
-            ],
-            provider_default: Some("low".into()),
-        };
-        let mut policy = model_effort::TurnEffortPolicy {
-            requested_model: "openai/gpt-5.5-review-high".into(),
-            project_override: None,
-            route_compatibility: Default::default(),
-            configured: Default::default(),
-            surfaces: [(surface.clone(), capabilities)].into(),
-        };
-
-        let resolved = resolve_target_effort(&policy, None, Some("high"), &preference, &surface);
-        assert_eq!(resolved.value.as_deref(), Some("high"));
-        assert_eq!(
-            resolved.source,
-            model_effort::EffectiveEffortSource::RouteCompatibility
-        );
-        policy.project_override = Some("low".into());
-        let project = resolve_target_effort(&policy, None, Some("high"), &preference, &surface);
-        assert_eq!(project.value.as_deref(), Some("low"));
-        assert_eq!(project.source, model_effort::EffectiveEffortSource::Project);
     }
 
     #[tokio::test]
@@ -4843,7 +5014,6 @@ mod tests {
         assert_eq!(bare.len(), 1);
         assert_eq!(bare[0].conn.id, "generic-bare");
         assert_eq!(bare[0].upstream_model, "gpt-known-high");
-        assert_eq!(bare[0].request_compatibility_effort, None);
 
         let unknown = route_model(&ctx.store, "openai/gpt-unknown-high")
             .await
@@ -4851,14 +5021,12 @@ mod tests {
             .unwrap();
         assert_eq!(unknown.conn.provider, "openai");
         assert_eq!(unknown.upstream_model, "gpt-unknown-high");
-        assert_eq!(unknown.request_compatibility_effort, None);
 
         let anthropic = route_model(&ctx.store, "anthropic/claude-high")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(anthropic.upstream_model, "claude-high");
-        assert_eq!(anthropic.request_compatibility_effort, None);
     }
 
     #[tokio::test]
@@ -4993,26 +5161,27 @@ mod tests {
         let resolved = resolve_target_effort(
             &policy,
             target.route_target_key.as_ref(),
-            None,
             &preference,
             &surface,
         );
         assert_eq!(resolved.value.as_deref(), Some("high"));
         assert_eq!(
             resolved.source,
-            model_effort::EffectiveEffortSource::RouteCompatibility
+            model_effort::EffectiveEffortSource::RouteTarget
         );
         let mut project_policy = policy.clone();
-        project_policy.project_override = Some("medium".into());
+        project_policy.caller_override = Some("medium".into());
         let project = resolve_target_effort(
             &project_policy,
             target.route_target_key.as_ref(),
-            None,
             &preference,
             &surface,
         );
-        assert_eq!(project.value.as_deref(), Some("medium"));
-        assert_eq!(project.source, model_effort::EffectiveEffortSource::Project);
+        assert_eq!(project.value.as_deref(), Some("high"));
+        assert_eq!(
+            project.source,
+            model_effort::EffectiveEffortSource::RouteTarget
+        );
         let concrete = models
             .iter()
             .find(|model| model.request_value == "openai/gpt-x")
@@ -5762,7 +5931,6 @@ mod tests {
             desc,
             upstream_model: "mimo-auto".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({
             "model": "mimo-auto",
@@ -5824,7 +5992,6 @@ mod tests {
             desc,
             upstream_model: "grok-code".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({"model": "grok-code", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -5856,7 +6023,6 @@ mod tests {
             desc,
             upstream_model: "mimo-auto".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({"model": "mimo-auto", "messages": []});
         let req = upstream_request(&ctx, &target, &body)
@@ -5886,7 +6052,6 @@ mod tests {
             desc,
             upstream_model: "qwen3-coder-plus".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -5918,7 +6083,6 @@ mod tests {
             desc,
             upstream_model: "qwen3-coder-plus".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({ "model": "qwen3-coder-plus", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -5949,7 +6113,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({ "model": "gpt-5.2", "messages": [] });
         let req = upstream_request(&ctx, &target, &body)
@@ -6022,7 +6185,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let body = json!({"model": "gpt-5.2", "messages": []});
         let req = upstream_request(&ctx, &target, &body)

@@ -5,6 +5,7 @@
 //! byte-identical to the source it was moved from.
 
 use crate::domain::SessionGitOptions;
+use crate::harness::native::commands::{ProjectCommandInput, ProjectCommandRead};
 use crate::llm_router::model_effort::{
     EffectiveEffortSource, SelectableModelInfo, StoredEffortStatus,
 };
@@ -45,6 +46,20 @@ impl From<GitOptions> for SessionGitOptions {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRequestOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub context: Option<ChatContextArg>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    /// None => engine default (worktree ON, new engine-named branch from HEAD).
+    pub git: Option<GitOptions>,
+    /// Initial permission mode for a legacy/composer session.
+    pub perm_mode: Option<crate::domain::PermMode>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMention {
@@ -64,6 +79,13 @@ pub struct TurnInput {
     #[serde(default)]
     pub attachments: Vec<String>,
     pub git: Option<GitOptions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedMessageInfo {
+    pub id: String,
+    pub text: String,
 }
 
 pub(crate) fn chat_agent_prompt(prompt: &str, context: Option<&ChatContextArg>) -> String {
@@ -205,7 +227,287 @@ pub struct JobInput {
     pub model_override: Option<String>,
 }
 
-// --- gateways_api (moved verbatim from apps/cockpit/src-tauri/src/gateways_cmd.rs) ---
+// --- automation_api (Hook persistence contract; RPC wiring follows in Task 5) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationAgentRunActionInput {
+    pub project_id: String,
+    pub branch: String,
+    pub gateway_id: String,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub model_override: Option<String>,
+    pub subtask: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationWebhookHeaderInput {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationWebhookOutboundActionInput {
+    pub url: String,
+    pub method: String,
+    #[serde(default)]
+    pub headers: Vec<AutomationWebhookHeaderInput>,
+    pub payload_template: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", content = "config", deny_unknown_fields)]
+pub enum AutomationActionInput {
+    #[serde(rename = "agent.run")]
+    AgentRun(AutomationAgentRunActionInput),
+    #[serde(rename = "webhook.outbound")]
+    WebhookOutbound(AutomationWebhookOutboundActionInput),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationHookInput {
+    pub name: String,
+    pub trigger_kind: crate::automation::TriggerKind,
+    pub action: AutomationActionInput,
+    #[serde(default = "automation_enabled_by_default")]
+    pub enabled: bool,
+}
+
+const fn automation_enabled_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationHookInfo {
+    pub id: String,
+    pub name: String,
+    pub trigger_kind: crate::automation::TriggerKind,
+    pub action_kind: crate::automation::ActionKind,
+    pub enabled: bool,
+    pub inbound_path: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationHookRunInfo {
+    pub id: String,
+    pub hook_id: String,
+    pub status: String,
+    pub session_pk: Option<String>,
+    pub error: Option<String>,
+    pub attempt_count: i64,
+    pub last_http_status: Option<i64>,
+    pub queued_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub attempts: Vec<AutomationHookAttemptInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationHookAttemptInfo {
+    pub run_id: String,
+    pub ordinal: i64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub http_status: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationWebhookHeaderInfo {
+    pub name: String,
+    pub configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationWebhookOutboundActionInfo {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<AutomationWebhookHeaderInfo>,
+    pub payload_template: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", content = "config")]
+pub enum AutomationActionInfo {
+    #[serde(rename = "agent.run")]
+    AgentRun(AutomationAgentRunActionInput),
+    #[serde(rename = "webhook.outbound")]
+    WebhookOutbound(AutomationWebhookOutboundActionInfo),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationHookDetail {
+    pub hook: AutomationHookInfo,
+    pub action: AutomationActionInfo,
+    pub runs: Vec<AutomationHookRunInfo>,
+}
+
+impl From<AutomationAgentRunActionInput> for crate::automation::AgentRunAction {
+    fn from(value: AutomationAgentRunActionInput) -> Self {
+        Self {
+            project_id: value.project_id,
+            branch: value.branch,
+            gateway_id: value.gateway_id,
+            prompt: value.prompt,
+            agent_id: value.agent_id,
+            model_override: value.model_override,
+            subtask: value.subtask,
+        }
+    }
+}
+
+impl From<AutomationWebhookHeaderInput> for crate::automation::WebhookHeader {
+    fn from(value: AutomationWebhookHeaderInput) -> Self {
+        Self {
+            name: value.name,
+            value: value.value,
+        }
+    }
+}
+
+impl From<AutomationWebhookOutboundActionInput> for crate::automation::WebhookOutboundAction {
+    fn from(value: AutomationWebhookOutboundActionInput) -> Self {
+        Self {
+            url: value.url,
+            method: value.method,
+            headers: value.headers.into_iter().map(Into::into).collect(),
+            payload_template: value.payload_template,
+        }
+    }
+}
+
+impl From<AutomationActionInput> for crate::automation::HookActionInput {
+    fn from(value: AutomationActionInput) -> Self {
+        match value {
+            AutomationActionInput::AgentRun(config) => Self::AgentRun(config.into()),
+            AutomationActionInput::WebhookOutbound(config) => Self::WebhookOutbound(config.into()),
+        }
+    }
+}
+
+impl From<AutomationHookInput> for crate::automation::HookInput {
+    fn from(value: AutomationHookInput) -> Self {
+        Self {
+            name: value.name,
+            trigger_kind: value.trigger_kind,
+            action: value.action.into(),
+            enabled: value.enabled,
+        }
+    }
+}
+
+impl From<crate::automation::WebhookHeader> for AutomationWebhookHeaderInfo {
+    fn from(value: crate::automation::WebhookHeader) -> Self {
+        Self {
+            name: value.name,
+            configured: true,
+        }
+    }
+}
+
+impl From<crate::automation::HookActionInput> for AutomationActionInfo {
+    fn from(value: crate::automation::HookActionInput) -> Self {
+        match value {
+            crate::automation::HookActionInput::AgentRun(config) => {
+                Self::AgentRun(AutomationAgentRunActionInput {
+                    project_id: config.project_id,
+                    branch: config.branch,
+                    gateway_id: config.gateway_id,
+                    prompt: config.prompt,
+                    agent_id: config.agent_id,
+                    model_override: config.model_override,
+                    subtask: config.subtask,
+                })
+            }
+            crate::automation::HookActionInput::WebhookOutbound(config) => {
+                Self::WebhookOutbound(AutomationWebhookOutboundActionInfo {
+                    url: config.url,
+                    method: config.method,
+                    headers: config.headers.into_iter().map(Into::into).collect(),
+                    payload_template: config.payload_template,
+                })
+            }
+        }
+    }
+}
+
+impl From<crate::automation::HookAttemptRow> for AutomationHookAttemptInfo {
+    fn from(value: crate::automation::HookAttemptRow) -> Self {
+        Self {
+            run_id: value.run_id,
+            ordinal: value.ordinal,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            http_status: value.http_status,
+            error: value.error,
+        }
+    }
+}
+
+impl From<crate::automation::HookRunRow> for AutomationHookRunInfo {
+    fn from(value: crate::automation::HookRunRow) -> Self {
+        Self {
+            id: value.id,
+            hook_id: value.hook_id,
+            status: value.status,
+            session_pk: value.session_pk,
+            error: value.error,
+            attempt_count: value.attempt_count,
+            last_http_status: value.last_http_status,
+            queued_at: value.queued_at,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            attempts: value
+                .attempts
+                .into_iter()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl From<crate::automation::HookDetail> for AutomationHookDetail {
+    fn from(value: crate::automation::HookDetail) -> Self {
+        let action = value.hook.action.clone().into();
+        Self {
+            hook: value.hook.into(),
+            action,
+            runs: value.runs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<crate::automation::HookRow> for AutomationHookInfo {
+    fn from(value: crate::automation::HookRow) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            trigger_kind: value.trigger_kind,
+            action_kind: value.action_kind,
+            enabled: value.enabled,
+            inbound_path: value.inbound_path,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -317,12 +619,99 @@ pub struct AgentInfo {
     pub builtin: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandOriginInfo {
+    Builtin,
+    Global,
+    Project,
+}
+
+const fn default_command_effective() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandInfo {
     pub name: String,
     pub description: String,
     pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub subtask: bool,
+    pub origin: CommandOriginInfo,
+    #[serde(default = "default_command_effective")]
+    pub effective: bool,
+    pub shadows_global: bool,
+}
+
+/// Editable fields for a project-owned slash command. The command name is
+/// supplied separately for updates so a save cannot rename a file by accident.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectCommandMutationDto {
+    pub description: String,
+    pub template: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub subtask: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectCommandInputDto {
+    pub name: String,
+    #[serde(flatten)]
+    pub command: ProjectCommandMutationDto,
+}
+
+impl ProjectCommandMutationDto {
+    pub fn with_name(self, name: &str) -> ProjectCommandInput {
+        ProjectCommandInput {
+            name: name.to_string(),
+            description: self.description,
+            template: self.template,
+            agent: self.agent,
+            model: self.model,
+            subtask: self.subtask,
+        }
+    }
+}
+
+impl From<ProjectCommandInputDto> for ProjectCommandInput {
+    fn from(value: ProjectCommandInputDto) -> Self {
+        value.command.with_name(&value.name)
+    }
+}
+
+/// A project command and the revision that must accompany update or delete.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCommandInfo {
+    pub name: String,
+    pub description: String,
+    pub template: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub subtask: bool,
+    pub revision: String,
+}
+
+impl From<ProjectCommandRead> for ProjectCommandInfo {
+    fn from(value: ProjectCommandRead) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            template: value.template,
+            agent: value.agent,
+            model: value.model,
+            subtask: value.subtask,
+            revision: value.revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

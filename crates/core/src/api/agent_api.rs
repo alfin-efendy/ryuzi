@@ -560,6 +560,22 @@ fn clean_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn effective_model_default(
+    model_info: Option<&model_effort::SelectableModelInfo>,
+) -> (Option<String>, EffectiveEffortSource) {
+    let Some(info) = model_info else {
+        return (None, EffectiveEffortSource::None);
+    };
+    let source = match info.default_source {
+        ModelDefaultSource::Configured => EffectiveEffortSource::Configured,
+        ModelDefaultSource::Provider => EffectiveEffortSource::Provider,
+        ModelDefaultSource::VariesByTarget | ModelDefaultSource::None => {
+            EffectiveEffortSource::None
+        }
+    };
+    (info.resolved_default.clone(), source)
+}
+
 async fn project_runtime_info(
     state: &ApiState,
     project_id: String,
@@ -594,9 +610,9 @@ async fn project_runtime_info(
             .as_ref()
             .is_some_and(|info| info.supported.iter().any(|option| &option.value == *effort))
     });
-    let route_compatibility = match (project.model.as_deref(), model_info.as_ref()) {
+    let route_target_default = match (project.model.as_deref(), model_info.as_ref()) {
         (Some(model), Some(info)) => {
-            crate::llm_router::client::named_route_compatibility_default(
+            crate::llm_router::client::named_route_target_default(
                 state.cp.store(),
                 model,
                 &info.supported,
@@ -605,21 +621,19 @@ async fn project_runtime_info(
         }
         _ => None,
     };
-    let (effective_effort, effective_source) = if let Some(effort) = project_effort {
+    let is_named_route = model_info
+        .as_ref()
+        .is_some_and(|info| info.kind == model_effort::SelectableModelKind::NamedRoute);
+    let (effective_effort, effective_source) = if is_named_route {
+        route_target_default
+            .map(|effort| (Some(effort), EffectiveEffortSource::RouteTarget))
+            .unwrap_or_else(|| effective_model_default(model_info.as_ref()))
+    } else if let Some(effort) = project_effort {
         (Some(effort.clone()), EffectiveEffortSource::Project)
-    } else if let Some(effort) = route_compatibility {
-        (Some(effort), EffectiveEffortSource::RouteCompatibility)
-    } else if let Some(info) = &model_info {
-        let source = match info.default_source {
-            ModelDefaultSource::Configured => EffectiveEffortSource::Configured,
-            ModelDefaultSource::Provider => EffectiveEffortSource::Provider,
-            ModelDefaultSource::VariesByTarget | ModelDefaultSource::None => {
-                EffectiveEffortSource::None
-            }
-        };
-        (info.resolved_default.clone(), source)
+    } else if let Some(effort) = route_target_default {
+        (Some(effort), EffectiveEffortSource::RouteTarget)
     } else {
-        (None, EffectiveEffortSource::None)
+        effective_model_default(model_info.as_ref())
     };
     let effective_effort_label = effective_effort.as_ref().and_then(|value| {
         model_info.as_ref().and_then(|info| {
@@ -689,9 +703,9 @@ async fn session_runtime_info(
             .as_ref()
             .is_some_and(|info| info.supported.iter().any(|option| &option.value == *effort))
     });
-    let route_compatibility = match (runtime.model.as_deref(), model_info.as_ref()) {
+    let route_target_default = match (runtime.model.as_deref(), model_info.as_ref()) {
         (Some(model), Some(info)) => {
-            crate::llm_router::client::named_route_compatibility_default(
+            crate::llm_router::client::named_route_target_default(
                 state.cp.store(),
                 model,
                 &info.supported,
@@ -700,19 +714,19 @@ async fn session_runtime_info(
         }
         _ => None,
     };
-    let (effective_effort, effective_source) = if let Some(effort) = explicit {
+    let is_named_route = model_info
+        .as_ref()
+        .is_some_and(|info| info.kind == model_effort::SelectableModelKind::NamedRoute);
+    let (effective_effort, effective_source) = if is_named_route {
+        route_target_default
+            .map(|effort| (Some(effort), EffectiveEffortSource::RouteTarget))
+            .unwrap_or_else(|| effective_model_default(model_info.as_ref()))
+    } else if let Some(effort) = explicit {
         (Some(effort.clone()), EffectiveEffortSource::Session)
-    } else if let Some(effort) = route_compatibility {
-        (Some(effort), EffectiveEffortSource::RouteCompatibility)
-    } else if let Some(info) = &model_info {
-        let source = match info.default_source {
-            ModelDefaultSource::Configured => EffectiveEffortSource::Configured,
-            ModelDefaultSource::Provider => EffectiveEffortSource::Provider,
-            _ => EffectiveEffortSource::None,
-        };
-        (info.resolved_default.clone(), source)
+    } else if let Some(effort) = route_target_default {
+        (Some(effort), EffectiveEffortSource::RouteTarget)
     } else {
-        (None, EffectiveEffortSource::None)
+        effective_model_default(model_info.as_ref())
     };
     let effective_effort_label = effective_effort.as_ref().and_then(|value| {
         model_info.as_ref().and_then(|info| {

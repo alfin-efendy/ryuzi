@@ -1,21 +1,28 @@
 //! The local endpoint server: Anthropic + OpenAI compatible surface on
 //! 127.0.0.1, gated by endpoint keys, routed to provider connections.
+use crate::automation::{
+    self, AutomationEnvelope, AutomationSource, TriggerKind, MAX_INBOUND_WEBHOOK_BODY_BYTES,
+    MAX_INBOUND_WEBHOOK_HEADERS_BYTES,
+};
+use crate::control::ControlPlane;
 use crate::llm_router::client::{
     ensure_fresh_for_attempt, route_models_for_body, send_upstream, RouteTarget, UpstreamCtx,
 };
 use crate::llm_router::codex::normalize_codex_responses_body;
+use crate::llm_router::model_effort;
 use crate::llm_router::registry::{self, ApiFormat};
 use crate::llm_router::{
     claude_cloak, connections, keys, oauth, routes, sse::SseParser, translate,
 };
 use crate::store::Store;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -34,6 +41,7 @@ struct Inner {
 
 pub struct RouterServer {
     store: Arc<Store>,
+    control: std::sync::RwLock<std::sync::Weak<ControlPlane>>,
     inner: Mutex<Inner>,
     oauth_token_url_override: Mutex<Option<String>>,
     kiro_base_override: Mutex<Option<String>>,
@@ -42,6 +50,7 @@ pub struct RouterServer {
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
+    control: std::sync::Weak<ControlPlane>,
     http: reqwest::Client,
     /// Test-only override for the OAuth token endpoint used by the reactive
     /// (post-401) refresh path. `None` in production, which uses each
@@ -63,6 +72,7 @@ impl AppState {
             store: self.store.clone(),
             http: self.http.clone(),
             oauth_token_url_override: self.oauth_token_url_override.clone(),
+            kiro_base_override: self.kiro_base_override.clone(),
             mimo_bootstrap_url_override: None,
         }
     }
@@ -72,6 +82,7 @@ impl RouterServer {
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
+            control: std::sync::RwLock::new(std::sync::Weak::new()),
             inner: Mutex::new(Inner {
                 shutdown: None,
                 port: 0,
@@ -79,6 +90,13 @@ impl RouterServer {
             oauth_token_url_override: Mutex::new(None),
             kiro_base_override: Mutex::new(None),
         }
+    }
+
+    /// Attach the daemon's existing control plane before starting the endpoint
+    /// server. A weak reference avoids creating a lifecycle cycle while still
+    /// ensuring inbound webhooks use the daemon's one true dispatcher.
+    pub fn attach_control_plane(&self, control: &Arc<ControlPlane>) {
+        *self.control.write().unwrap() = Arc::downgrade(control);
     }
 
     /// Test-only seam: point the reactive (post-401) OAuth refresh path at a
@@ -118,6 +136,7 @@ impl RouterServer {
         let bound = listener.local_addr()?.port();
         let state = AppState {
             store: self.store.clone(),
+            control: self.control.read().unwrap().clone(),
             http: reqwest::Client::new(),
             oauth_token_url_override: self.oauth_token_url_override.lock().unwrap().clone(),
             kiro_base_override: self.kiro_base_override.lock().unwrap().clone(),
@@ -128,6 +147,14 @@ impl RouterServer {
             .route("/v1/chat/completions", post(handle_chat))
             .route("/v1/responses", post(handle_responses))
             .route("/v1/models", get(handle_models))
+            // Webhook requests are materially smaller than model traffic; bound
+            // this route before its body is buffered by the Bytes extractor.
+            .route(
+                "/v1/automations/hooks/{path}",
+                post(handle_inbound_webhook).layer(axum::extract::DefaultBodyLimit::max(
+                    MAX_INBOUND_WEBHOOK_BODY_BYTES,
+                )),
+            )
             // Agent conversations with inline images exceed axum's 2 MB default.
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
             .with_state(state);
@@ -212,6 +239,174 @@ async fn check_auth(
     }
 }
 
+fn inbound_webhook_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "error": { "message": message } }))).into_response()
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn filtered_webhook_headers(headers: &HeaderMap) -> serde_json::Map<String, Value> {
+    let mut filtered = serde_json::Map::new();
+    let mut seen = HashSet::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let sensitive = matches!(
+            name.as_str(),
+            "authorization" | "x-api-key" | "cookie" | "set-cookie"
+        ) || name.ends_with("-token")
+            || name.ends_with("-secret")
+            || name.ends_with("-key");
+        if sensitive {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        let candidate = Value::String(value.to_string());
+        filtered.insert(name.clone(), candidate);
+        if serde_json::to_vec(&filtered).map_or(true, |bytes| {
+            bytes.len() > MAX_INBOUND_WEBHOOK_HEADERS_BYTES
+        }) {
+            filtered.remove(&name);
+        }
+    }
+    filtered
+}
+
+async fn handle_inbound_webhook(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let Some(key) = presented_key(&headers) else {
+        return inbound_webhook_error(StatusCode::UNAUTHORIZED, "missing API key");
+    };
+    match keys::verify_key(&state.store, &key).await {
+        Ok(true) => {}
+        Ok(false) => return inbound_webhook_error(StatusCode::UNAUTHORIZED, "invalid API key"),
+        Err(error) => {
+            tracing::warn!("inbound webhook key verification failed: {error}");
+            return inbound_webhook_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication unavailable",
+            );
+        }
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return inbound_webhook_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "request body exceeds 1 MiB",
+            )
+        }
+    };
+    if !is_json_content_type(&headers) {
+        return inbound_webhook_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content type must be application/json",
+        );
+    }
+    if body.len() > MAX_INBOUND_WEBHOOK_BODY_BYTES {
+        return inbound_webhook_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "request body exceeds 1 MiB",
+        );
+    }
+    let body_text = match String::from_utf8(body.to_vec()) {
+        Ok(body) => body,
+        Err(_) => {
+            return inbound_webhook_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "request body must be valid JSON",
+            )
+        }
+    };
+    if serde_json::from_str::<Value>(&body_text).is_err() {
+        return inbound_webhook_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "request body must be valid JSON",
+        );
+    }
+    let hook = match automation::find_inbound_hook(&state.store, &path).await {
+        Ok(Some(hook)) => hook,
+        Ok(None) => {
+            return inbound_webhook_error(StatusCode::NOT_FOUND, "inbound webhook hook not found")
+        }
+        Err(error) => {
+            tracing::warn!(path, "inbound webhook hook lookup failed: {error}");
+            return inbound_webhook_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "webhook lookup unavailable",
+            );
+        }
+    };
+    if !hook.enabled {
+        return inbound_webhook_error(StatusCode::CONFLICT, "inbound webhook hook is disabled");
+    }
+    let Some(control) = state.control.upgrade() else {
+        return inbound_webhook_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "automation dispatcher unavailable",
+        );
+    };
+    let envelope = AutomationEnvelope::new(
+        TriggerKind::WebhookInbound,
+        chrono::Utc::now().to_rfc3339(),
+        AutomationSource::new("webhook", path.clone()),
+        json!({
+            "request": {
+                "method": method.as_str(),
+                "path": format!("/v1/automations/hooks/{path}"),
+                "headers": filtered_webhook_headers(&headers),
+                "body": body_text.clone(),
+            }
+        }),
+    );
+    match control.dispatch_inbound_webhook(hook, envelope).await {
+        Ok(result) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "hookId": result.hook_id,
+                "runId": result.run_id,
+                "sessionPk": result.session_pk,
+            })),
+        )
+            .into_response(),
+        Err(crate::control::InboundWebhookError::Invalid(error)) => {
+            inbound_webhook_error(StatusCode::UNPROCESSABLE_ENTITY, &error)
+        }
+        Err(crate::control::InboundWebhookError::RateLimited) => {
+            let mut response = inbound_webhook_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "automation rate limit exceeded",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+            response
+        }
+        Err(crate::control::InboundWebhookError::Unavailable(error)) => {
+            tracing::warn!("inbound webhook dispatch unavailable: {error}");
+            inbound_webhook_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "automation dispatch unavailable",
+            )
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 //
@@ -260,6 +455,54 @@ async fn ensure_fresh_or_reconnect_error(
     None
 }
 
+fn response_effort(body: &Value) -> Option<String> {
+    [
+        body.pointer("/reasoning/effort"),
+        body.get("reasoning_effort"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|effort| !effort.is_empty())
+    .map(str::to_string)
+}
+
+fn anthropic_effort(body: &Value) -> Option<String> {
+    body.pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .filter(|effort| !effort.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn resolved_effort(
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) -> Option<String> {
+    crate::llm_router::client::target_effort(target, policy).value
+}
+
+fn apply_responses_effort(
+    body: &mut Value,
+    target: &RouteTarget,
+    policy: &model_effort::TurnEffortPolicy,
+) -> Option<String> {
+    let effort = resolved_effort(target, policy);
+    if target.route_target_key.is_some() {
+        if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+            reasoning.remove("effort");
+        }
+        if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+        }
+    }
+    effort
+}
+
+fn apply_kiro_effort_policy(body: &mut Value) {
+    crate::llm_router::client::strip_kiro_effort(body);
+}
+
 /// Client speaks Anthropic. `client_fmt` differs from `handle_chat` only in
 /// error shape + translation direction.
 async fn handle_messages(
@@ -294,11 +537,24 @@ async fn handle_messages(
         );
     }
 
+    let policy = match model_effort::build_request_effort_policy(
+        &state.store,
+        &requested,
+        anthropic_effort(&body),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(e) => return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::Anthropic, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::Anthropic, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -318,6 +574,11 @@ async fn handle_messages(
 
         let outcome: Result<Response, AttemptError> = match target.desc.format {
             ApiFormat::Anthropic => {
+                crate::llm_router::client::apply_anthropic_effort(
+                    &mut attempt_body,
+                    &target,
+                    &policy,
+                );
                 let started = crate::paths::now_ms();
                 match proxy_passthrough(&state, &mut target, &attempt_body).await {
                     Ok(resp) => {
@@ -343,6 +604,12 @@ async fn handle_messages(
                     Ok(b) => b,
                     Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e.to_string()),
                 };
+                crate::llm_router::client::apply_openai_effort(
+                    &mut upstream_body,
+                    &target,
+                    &policy,
+                    body.get("thinking").is_some(),
+                );
                 crate::llm_router::client::apply_max_completion_tokens(
                     target.desc,
                     &mut upstream_body,
@@ -440,11 +707,24 @@ async fn handle_chat(
         );
     }
 
+    let policy = match model_effort::build_request_effort_policy(
+        &state.store,
+        &requested,
+        response_effort(&body),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::OpenAi, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::OpenAi, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -461,6 +741,7 @@ async fn handle_chat(
         let stream = body["stream"].as_bool().unwrap_or(false);
         let mut attempt_body = body.clone();
         attempt_body["model"] = json!(target.upstream_model);
+        crate::llm_router::client::apply_openai_effort(&mut attempt_body, &target, &policy, false);
 
         let outcome: Result<Response, AttemptError> = match target.desc.format {
             ApiFormat::OpenAi => {
@@ -484,10 +765,16 @@ async fn handle_chat(
                 }
             }
             ApiFormat::Anthropic => {
-                let upstream_body = match translate::openai_to_anthropic_request(&attempt_body) {
+                let mut upstream_body = match translate::openai_to_anthropic_request(&attempt_body)
+                {
                     Ok(b) => b,
                     Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
                 };
+                crate::llm_router::client::apply_anthropic_effort(
+                    &mut upstream_body,
+                    &target,
+                    &policy,
+                );
                 if stream {
                     let ctx = RecordCtx {
                         conn_id: target.conn.id.clone(),
@@ -575,12 +862,25 @@ async fn handle_responses(
     }
 
     let stream = chat["stream"].as_bool().unwrap_or(false);
+    let policy = match model_effort::build_request_effort_policy(
+        &state.store,
+        &requested,
+        response_effort(&body),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(e) => return openai_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
 
     let mut failures = Vec::new();
     for mut target in targets {
-        // Kiro keeps its dedicated single-shot pipeline (as today).
+        // Kiro's CodeWhisperer protocol has no effort field. Strip every
+        // client-surface spelling before its dedicated translation pipeline.
         if target.conn.provider == "kiro" {
-            return serve_kiro(&state, target, ClientFormat::Responses, &body).await;
+            let mut attempt_body = body.clone();
+            apply_kiro_effort_policy(&mut attempt_body);
+            return serve_kiro(&state, target, ClientFormat::Responses, &attempt_body).await;
         }
         if let Err(failure) = ensure_fresh_for_attempt(&state.ctx(), &mut target).await {
             let try_next = crate::llm_router::client::should_try_next_target(&failure);
@@ -597,10 +897,11 @@ async fn handle_responses(
         // same-format.
         if target.conn.provider == "openai-oauth" {
             let mut passthrough_body = body.clone();
+            let effort = apply_responses_effort(&mut passthrough_body, &target, &policy);
             normalize_codex_responses_body(
                 &mut passthrough_body,
                 &target.upstream_model,
-                target.request_compatibility_effort.as_deref(),
+                effort.as_deref(),
                 None,
             );
             let started = crate::paths::now_ms();
@@ -646,6 +947,7 @@ async fn handle_responses(
 
         let mut attempt_chat = chat.clone();
         attempt_chat["model"] = json!(target.upstream_model);
+        crate::llm_router::client::apply_openai_effort(&mut attempt_chat, &target, &policy, false);
         let started = crate::paths::now_ms();
 
         // Normalize the upstream response to OpenAI chat shape, then encode Responses.
@@ -656,7 +958,10 @@ async fn handle_responses(
                 b
             }
             ApiFormat::Anthropic => match translate::openai_to_anthropic_request(&attempt_chat) {
-                Ok(b) => b,
+                Ok(mut body) => {
+                    crate::llm_router::client::apply_anthropic_effort(&mut body, &target, &policy);
+                    body
+                }
                 Err(e) => return openai_error(StatusCode::BAD_REQUEST, &e.to_string()),
             },
         };
@@ -1794,8 +2099,12 @@ async fn serve_kiro(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{PermMode, Project};
+    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::llm_router::client::{route_model, route_model_for_body};
     use crate::llm_router::connections::{ConnectionData, ConnectionRow};
+    use crate::plugins::Registries;
+    use axum::body::to_bytes;
 
     fn mk_conn(id: &str, provider: &str, auth_type: &str, data: ConnectionData) -> ConnectionRow {
         ConnectionRow {
@@ -1816,10 +2125,539 @@ mod tests {
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         AppState {
             store,
+            control: std::sync::Weak::new(),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
             kiro_base_override: None,
         }
+    }
+
+    async fn wait_for_webhook_prompt(prompts: &Arc<Mutex<Vec<String>>>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(prompt) = prompts.lock().unwrap().first().cloned() {
+                    return prompt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for an inbound webhook prompt")
+    }
+
+    struct WebhookHarnessFactory {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct WebhookHarness {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct WebhookSession {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessSession for WebhookSession {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            self.prompts.lock().unwrap().push(prompt.agent);
+            Ok(())
+        }
+
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn agent_session_id(&self) -> Option<String> {
+            None
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for WebhookHarness {
+        async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            Ok(Box::new(WebhookSession {
+                prompts: self.prompts.clone(),
+            }))
+        }
+    }
+
+    impl HarnessFactory for WebhookHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(WebhookHarness {
+                prompts: self.prompts.clone(),
+            }))
+        }
+    }
+
+    async fn webhook_state() -> (
+        AppState,
+        Arc<ControlPlane>,
+        String,
+        String,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        crate::llm_router::secrets::use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut registries = Registries::new();
+        registries.harness = Arc::new(WebhookHarnessFactory {
+            prompts: prompts.clone(),
+        });
+        // The default Ryuzi profile's model route (`smart`) and the shared
+        // subagent route (`fast`) must resolve to an enabled, executable
+        // connection before agent persistence bootstraps — otherwise the
+        // default primary owner is persisted but rejected as non-executable
+        // by every session start this test drives.
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            registries,
+            Arc::new(crate::telemetry::NoopTelemetry),
+            persistence,
+        )
+        .await;
+        let project_dir = tempfile::tempdir().unwrap();
+        let workdir = project_dir.keep();
+        store
+            .insert_project(Project {
+                project_id: "project-1".into(),
+                name: "Webhook project".into(),
+                workdir: workdir.to_string_lossy().into_owned(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let hook = automation::create_hook(
+            &store,
+            automation::HookInput::agent_run(
+                "Inbound",
+                TriggerKind::WebhookInbound,
+                "project-1",
+                "",
+                "local",
+                "Process the webhook",
+            ),
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&store, "webhook").await.unwrap();
+        let state = AppState {
+            store,
+            control: Arc::downgrade(&cp),
+            http: reqwest::Client::new(),
+            oauth_token_url_override: None,
+            kiro_base_override: None,
+        };
+        (state, cp, key.key, hook.inbound_path.unwrap(), prompts)
+    }
+
+    fn webhook_request(path: &str, key: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/automations/hooks/{path}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header("X-Visible", "retained")
+            .header("X-Token", "secret")
+            .header("Cookie", "session=secret")
+            .body(Body::from(r#"{"event":"opened"}"#))
+            .unwrap()
+    }
+
+    async fn invoke_webhook(state: AppState, request: axum::http::Request<Body>) -> Response {
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        handle_inbound_webhook(
+            State(state),
+            Path(parts.uri.path().rsplit('/').next().unwrap().to_string()),
+            parts.method,
+            parts.headers,
+            Ok(bytes),
+        )
+        .await
+    }
+
+    #[test]
+    fn filtered_webhook_headers_retains_the_first_duplicate_value() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-retained", header::HeaderValue::from_static("first"));
+        headers.append("x-retained", header::HeaderValue::from_static("second"));
+
+        let filtered = filtered_webhook_headers(&headers);
+
+        assert_eq!(filtered["x-retained"], "first");
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_is_served_by_router_server() {
+        let (state, cp, key, path, _prompts) = webhook_state().await;
+        let router_server = RouterServer::new(state.store.clone());
+        router_server.attach_control_plane(&cp);
+        let port = router_server.start(0).await.unwrap();
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/v1/automations/hooks/{path}"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .json(&json!({"event": "opened"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        router_server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_preserves_an_exact_1mib_exponent_body_in_run_and_prompt() {
+        let (state, cp, key, path, prompts) = webhook_state().await;
+        let body = format!(
+            "[{}]",
+            std::iter::repeat_n("1e15", (MAX_INBOUND_WEBHOOK_BODY_BYTES - 1) / 5)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(body.len(), MAX_INBOUND_WEBHOOK_BODY_BYTES);
+        assert!(serde_json::from_str::<Value>(&body).is_ok());
+        assert!(
+            serde_json::to_string(&serde_json::from_str::<Value>(&body).unwrap())
+                .unwrap()
+                .len()
+                > body.len()
+        );
+
+        let mut request = webhook_request(&path, &key);
+        *request.body_mut() = Body::from(body.clone());
+        request
+            .headers_mut()
+            .insert("x-retained", "r".repeat(128).parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-over-budget", "x".repeat(64 * 1024).parse().unwrap());
+        assert_eq!(
+            invoke_webhook(state, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let hook = automation::find_inbound_hook(cp.store(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            run.envelope["data"]["request"]["body"].as_str(),
+            Some(body.as_str()),
+            "the persisted run must retain the accepted wire JSON text"
+        );
+        assert_eq!(
+            run.envelope["data"]["request"]["headers"]["x-retained"],
+            "r".repeat(128)
+        );
+        assert!(run.envelope["data"]["request"]["headers"]
+            .get("x-over-budget")
+            .is_none());
+        let prompt = wait_for_webhook_prompt(&prompts).await;
+        assert!(prompt.contains(&body));
+        assert!(
+            serde_json::to_vec(&run.envelope).unwrap().len()
+                <= automation::MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_preserves_exact_1mib_whitespace_body_in_run_and_prompt() {
+        let (state, cp, key, path, prompts) = webhook_state().await;
+        let whitespace = "\n\t".repeat((MAX_INBOUND_WEBHOOK_BODY_BYTES - 4) / 4);
+        let body = format!("{whitespace}null{whitespace}");
+        assert_eq!(body.len(), MAX_INBOUND_WEBHOOK_BODY_BYTES);
+        assert!(serde_json::from_str::<Value>(&body).is_ok());
+
+        let mut request = webhook_request(&path, &key);
+        *request.body_mut() = Body::from(body.clone());
+        assert_eq!(
+            invoke_webhook(state, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let hook = automation::find_inbound_hook(cp.store(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            run.envelope["data"]["request"]["body"].as_str(),
+            Some(body.as_str()),
+            "the persisted run must retain the accepted wire JSON text"
+        );
+        assert_eq!(
+            run.envelope["data"]["request"]["headers"]["x-visible"],
+            "retained"
+        );
+        assert!(
+            serde_json::to_vec(&run.envelope).unwrap().len()
+                <= automation::MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES
+        );
+
+        let prompt = wait_for_webhook_prompt(&prompts).await;
+        let event_json = prompt
+            .split_once("[UNTRUSTED AUTOMATION EVENT — JSON]\n")
+            .unwrap()
+            .1
+            .strip_suffix("\n[END UNTRUSTED AUTOMATION EVENT]")
+            .unwrap();
+        let prompted_envelope = serde_json::from_str::<Value>(event_json).unwrap();
+        assert_eq!(
+            prompted_envelope["data"]["request"]["body"].as_str(),
+            Some(body.as_str()),
+            "the agent prompt JSON must retain the exact wire body"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_preserves_negative_zero_and_exponent_lexemes() {
+        let (state, cp, key, path, prompts) = webhook_state().await;
+        let body = "[-0,1e15]";
+        let mut request = webhook_request(&path, &key);
+        *request.body_mut() = Body::from(body);
+        assert_eq!(
+            invoke_webhook(state, request).await.status(),
+            StatusCode::ACCEPTED
+        );
+
+        let hook = automation::find_inbound_hook(cp.store(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = automation::list_runs(cp.store(), &hook.id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.envelope["data"]["request"]["body"], body);
+        let prompt = wait_for_webhook_prompt(&prompts).await;
+        assert!(prompt.contains(body));
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_route_rejects_oversized_body_with_422() {
+        let (state, cp, key, path, _prompts) = webhook_state().await;
+        let router_server = RouterServer::new(state.store.clone());
+        router_server.attach_control_plane(&cp);
+        let port = router_server.start(0).await.unwrap();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/v1/automations/hooks/{path}"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(vec![b'x'; MAX_INBOUND_WEBHOOK_BODY_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        router_server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_accepts_bearer_and_x_api_key_and_redacts_sensitive_headers() {
+        let (state, cp, key, path, _prompts) = webhook_state().await;
+        let response = invoke_webhook(state.clone(), webhook_request(&path, &key)).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let mut x_api_key_request = webhook_request(&path, &key);
+        x_api_key_request
+            .headers_mut()
+            .remove(header::AUTHORIZATION);
+        x_api_key_request
+            .headers_mut()
+            .insert("x-api-key", key.parse().unwrap());
+        assert_eq!(
+            invoke_webhook(state.clone(), x_api_key_request)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+
+        let run = automation::list_runs(
+            cp.store(),
+            &automation::find_inbound_hook(cp.store(), &path)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        assert_eq!(run.envelope["source"]["kind"], "webhook");
+        assert_eq!(run.envelope["source"]["id"], path);
+        assert_eq!(run.envelope["data"]["request"]["method"], "POST");
+        assert_eq!(
+            run.envelope["data"]["request"]["headers"]["x-visible"],
+            "retained"
+        );
+        assert!(run.envelope["data"]["request"]["headers"]
+            .get("authorization")
+            .is_none());
+        assert!(run.envelope["data"]["request"]["headers"]
+            .get("x-token")
+            .is_none());
+        assert!(run.envelope["data"]["request"]["headers"]
+            .get("cookie")
+            .is_none());
+        assert!(keys::list_keys(cp.store()).await.unwrap()[0]
+            .last_used_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_returns_required_statuses() {
+        let (state, _cp, key, path, _prompts) = webhook_state().await;
+        let missing = invoke_webhook(state.clone(), webhook_request(&path, "wrong")).await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let unknown = invoke_webhook(state.clone(), webhook_request("wh_missing", &key)).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let mut nonjson = webhook_request(&path, &key);
+        nonjson
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        assert_eq!(
+            invoke_webhook(state.clone(), nonjson).await.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        let mut invalid = webhook_request(&path, &key);
+        *invalid.body_mut() = Body::from("not JSON");
+        assert_eq!(
+            invoke_webhook(state.clone(), invalid).await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        automation::toggle_hook(
+            &state.store,
+            &automation::find_inbound_hook(&state.store, &path)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            invoke_webhook(state, webhook_request(&path, &key))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_per_hook_rate_limit_returns_retry_after() {
+        let (state, cp, key, path, _prompts) = webhook_state().await;
+        let router_server = RouterServer::new(state.store.clone());
+        router_server.attach_control_plane(&cp);
+        let port = router_server.start(0).await.unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/automations/hooks/{path}");
+
+        for _ in 0..60 {
+            assert_eq!(
+                client
+                    .post(&url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .json(&json!({"event": "opened"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+        }
+
+        let response = client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .json(&json!({"event": "opened"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+
+        let other_hook = automation::create_hook(
+            &state.store,
+            automation::HookInput::agent_run(
+                "Other inbound",
+                TriggerKind::WebhookInbound,
+                "project-1",
+                "",
+                "local",
+                "Process the other webhook",
+            ),
+        )
+        .await
+        .unwrap();
+        let other_url = format!(
+            "http://127.0.0.1:{port}/v1/automations/hooks/{}",
+            other_hook.inbound_path.unwrap()
+        );
+        assert_eq!(
+            client
+                .post(other_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .json(&json!({"event": "opened"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        router_server.stop().await;
     }
 
     #[tokio::test]
@@ -2069,7 +2907,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let kiro_body = json!({"conversationState": {}});
         let req = kiro_upstream_request(&state, &target, &kiro_body)
@@ -2152,7 +2989,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2186,7 +3022,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2215,7 +3050,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = kiro_upstream_request(&state, &target, &json!({}))
             .build()
@@ -2249,6 +3083,21 @@ mod tests {
             kiro_endpoints("idc", "eu-west-1")[0],
             "https://codewhisperer.eu-west-1.amazonaws.com/generateAssistantResponse"
         );
+    }
+
+    #[test]
+    fn kiro_request_body_ignores_client_effort_fields() {
+        let data = ConnectionData::default();
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "low"},
+            "reasoning_effort": "medium",
+            "reasoning": {"effort": "high"}
+        });
+
+        let out = kiro_request_body(&body, ClientFormat::OpenAi, "m", &data, "c1");
+
+        assert_eq!(out["inferenceConfig"], json!({"maxTokens": 32000}));
     }
 
     #[test]
@@ -2320,5 +3169,548 @@ mod tests {
         assert_eq!(tc["function"]["name"], "get_weather");
         assert_eq!(tc["function"]["arguments"], "{\"city\":\"Paris\"}");
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    async fn effort_capture_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
+        use axum::{extract::State, routing::post, Json, Router};
+
+        async fn capture(
+            State(captured): State<Arc<Mutex<Vec<Value>>>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            captured.lock().unwrap().push(body);
+            Json(json!({"id": "captured"}))
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/messages", post(capture))
+            .route("/v1/chat/completions", post(capture))
+            .route("/responses", post(capture))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, captured)
+    }
+
+    fn effort_meta(default: &str) -> crate::llm_router::model_effort::DiscoveredModelMeta {
+        crate::llm_router::model_effort::DiscoveredModelMeta {
+            display_name: None,
+            effort_options: Some(
+                ["low", "medium", "high"]
+                    .into_iter()
+                    .map(
+                        |value| crate::llm_router::model_effort::ReasoningEffortOption {
+                            value: value.into(),
+                            label: value.into(),
+                            description: None,
+                        },
+                    )
+                    .collect(),
+            ),
+            default_effort_advertised: true,
+            default_effort: Some(default.into()),
+        }
+    }
+
+    async fn post_router(port: u16, key: &str, path: &str, body: Value) {
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}{path}"))
+            .header("x-api-key", key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{response:?}");
+        let _ = response.bytes().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "anthropic-route",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["claude-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "claude-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "anthropic-effort-route".into(),
+                name: "smart-anthropic".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/messages",
+            json!({
+                "model": "smart-anthropic",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"}
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            captured.lock().unwrap()[0]["output_config"]["effort"],
+            "high"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_named_route_uses_configured_then_provider_default_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-route",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "openai-effort-route".into(),
+                name: "smart-openai".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-route".into(),
+                    effort: None,
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let preference = crate::llm_router::model_effort::ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-route".into(),
+        };
+        crate::llm_router::model_effort::set_preference(&state.store, &preference, Some("medium"))
+            .await
+            .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+        let request = || {
+            json!({
+                "model": "smart-openai",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low"
+            })
+        };
+
+        post_router(port, &key.key, "/v1/chat/completions", request()).await;
+        crate::llm_router::model_effort::set_preference(&state.store, &preference, None)
+            .await
+            .unwrap();
+        post_router(port, &key.key, "/v1/chat/completions", request()).await;
+
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured[0]["reasoning_effort"], "medium");
+            assert_eq!(captured[1]["reasoning_effort"], "high");
+        }
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn responses_codex_named_route_replaces_caller_effort_with_target_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "codex-route",
+                "openai-oauth",
+                "oauth",
+                ConnectionData {
+                    access_token: Some("test-token".into()),
+                    expires_at: Some(crate::paths::now_ms() + 100 * 24 * 60 * 60 * 1_000),
+                    last_refresh_at: Some(crate::paths::now_ms()),
+                    needs_relogin: Some(false),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}")),
+                    models_override: Some(vec!["gpt-codex-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-codex-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "codex-effort-route".into(),
+                name: "smart-codex".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-codex-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/responses",
+            json!({
+                "model": "smart-codex",
+                "input": "hi",
+                "reasoning": {"effort": "low", "summary": "detailed"}
+            }),
+        )
+        .await;
+
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured[0]["reasoning"]["effort"], "high");
+            assert_eq!(captured[0]["reasoning"]["summary"], "detailed");
+        }
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_direct_model_keeps_caller_effort_first() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-direct",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-direct".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-direct".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/chat/completions",
+            json!({
+                "model": "openai/gpt-direct",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low"
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "low");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn messages_translation_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-messages-route",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-messages-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-messages-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "openai-messages-effort-route".into(),
+                name: "smart-openai-messages".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-messages-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/messages",
+            json!({
+                "model": "smart-openai-messages",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "low"}
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "high");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn chat_translation_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "anthropic-chat-route",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["claude-chat-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "claude-chat-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "anthropic-chat-effort-route".into(),
+                name: "smart-anthropic-chat".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-chat-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/chat/completions",
+            json!({
+                "model": "smart-anthropic-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            captured.lock().unwrap()[0]["output_config"]["effort"],
+            "high"
+        );
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn responses_named_route_uses_target_effort_over_caller_effort() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-responses-route",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-responses-route".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-responses-route".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        crate::llm_router::routes::save_model_route(
+            &state.store,
+            crate::llm_router::routes::ModelRouteInfo {
+                id: "openai-responses-effort-route".into(),
+                name: "smart-openai-responses".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "gpt-responses-route".into(),
+                    effort: Some("high".into()),
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/responses",
+            json!({
+                "model": "smart-openai-responses",
+                "input": "hi",
+                "reasoning": {"effort": "low"}
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "high");
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn direct_responses_uses_flat_caller_effort_when_nested_effort_is_empty() {
+        let state = test_state().await;
+        let (upstream_port, captured) = effort_capture_upstream().await;
+        connections::add_connection(
+            &state.store,
+            mk_conn(
+                "openai-direct-responses",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    base_url_override: Some(format!("http://127.0.0.1:{upstream_port}/v1")),
+                    models_override: Some(vec!["gpt-direct-responses".into()]),
+                    model_meta_overrides: Some(std::collections::HashMap::from([(
+                        "gpt-direct-responses".into(),
+                        effort_meta("high"),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let key = keys::create_key(&state.store, "test").await.unwrap();
+        let server = RouterServer::new(state.store.clone());
+        let port = server.start(0).await.unwrap();
+
+        post_router(
+            port,
+            &key.key,
+            "/v1/responses",
+            json!({
+                "model": "openai/gpt-direct-responses",
+                "input": "hi",
+                "reasoning": {"effort": ""},
+                "reasoning_effort": "low"
+            }),
+        )
+        .await;
+
+        assert_eq!(captured.lock().unwrap()[0]["reasoning_effort"], "low");
+        server.stop().await;
     }
 }

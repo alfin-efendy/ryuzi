@@ -2,7 +2,8 @@ use crate::domain::{ApprovalDecision, ApprovalRequest, Surface};
 use crate::registry::Registry;
 use crate::router::Router;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 pub mod discord;
 
@@ -14,6 +15,92 @@ pub mod discord;
 pub struct MessageRef {
     pub surface: Surface,
     pub message_id: String,
+}
+
+/// The normalized operational state a gateway reports after observing its
+/// underlying connection, rather than after a start or stop method returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayStatus {
+    Connected,
+    Offline,
+}
+
+impl GatewayStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+/// Number of status transitions retained for a subscriber that is briefly
+/// delayed. This is deliberately bounded: a sustained flapping gateway is
+/// backpressured by the daemon's bounded delivery queue rather than creating
+/// unbounded tasks or memory use.
+pub const GATEWAY_STATUS_EVENT_CAPACITY: usize = 128;
+
+/// A gap-free status subscription: `initial` establishes the non-emitting
+/// baseline and `events` carries every subsequent distinct transition in order.
+///
+/// Publishers must create `events` before reading `initial` while holding the
+/// same state lock, so a transition cannot fall between the snapshot and the
+/// receiver subscription.
+pub struct GatewayStatusSubscription {
+    pub initial: GatewayStatus,
+    pub events: broadcast::Receiver<GatewayStatus>,
+    state: Arc<Mutex<GatewayStatus>>,
+}
+
+impl GatewayStatusSubscription {
+    /// Discard queued events and atomically establish a fresh baseline after a
+    /// lag gap. The publisher holds this same lock while updating state and
+    /// sending, so no transition can fall between the new receiver and snapshot.
+    pub fn resync(&mut self) -> GatewayStatus {
+        let state = self.state.lock().unwrap();
+        self.events = self.events.resubscribe();
+        *state
+    }
+}
+
+/// Holds the current status and bounded event publisher for a gateway. Keeping
+/// subscription creation and publication under one mutex makes snapshot/event
+/// handoff race-free.
+pub struct GatewayStatusPublisher {
+    state: Arc<Mutex<GatewayStatus>>,
+    events: broadcast::Sender<GatewayStatus>,
+}
+
+impl GatewayStatusPublisher {
+    pub fn new(initial: GatewayStatus) -> Self {
+        let (events, _) = broadcast::channel(GATEWAY_STATUS_EVENT_CAPACITY);
+        Self {
+            state: Arc::new(Mutex::new(initial)),
+            events,
+        }
+    }
+
+    pub fn subscribe(&self) -> GatewayStatusSubscription {
+        let state = self.state.lock().unwrap();
+        let events = self.events.subscribe();
+        GatewayStatusSubscription {
+            initial: *state,
+            events,
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Publishes a distinct transition after updating the snapshot, preserving
+    /// the publisher's chronological event order.
+    pub fn publish(&self, next: GatewayStatus) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if *state == next {
+            return false;
+        }
+        *state = next;
+        let _ = self.events.send(next);
+        true
+    }
 }
 
 /// A channel/surface driver: creates workspaces/conversations, renders
@@ -63,6 +150,12 @@ pub trait Gateway: Send + Sync {
     /// called are dropped with a warning — see
     /// `gateway::discord::DiscordGateway`.
     fn set_router(&self, _router: Arc<Router>) {}
+
+    /// Subscribe to operational connection changes. Gateways without an
+    /// independently observed runtime status retain the default no-op.
+    fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
+        None
+    }
 }
 
 pub trait GatewayFactory: Send + Sync {

@@ -69,7 +69,9 @@ mock.module("@/components/session/RightPanel", () => ({
 mock.module("@/components/session/BottomTerminalDrawer", () => ({
   BottomTerminalDrawer: () => <div data-testid="bottom-terminal">terminal</div>,
 }));
-mock.module("@/components/session/TodoPanel", () => ({ TodoPanel: () => null }));
+mock.module("@/components/session/TodoPanel", () => ({
+  TodoPanel: () => <div data-testid="todo-panel">TODO List</div>,
+}));
 mock.module("@/components/session/QueuedMessages", () => ({ QueuedMessages: () => null }));
 mock.module("@/components/session/SessionCostPanel", () => ({ SessionCostPanel: () => null }));
 mock.module("@/components/session/OpenInMenu", () => ({ OpenInMenu: () => null }));
@@ -158,6 +160,18 @@ test("bottom terminal is outside the horizontal main row", async () => {
   expect(mainRow.contains(terminal)).toBe(false);
   expect(bottomRow.contains(terminal)).toBe(true);
   expect(mainRow.parentElement).toBe(bottomRow.parentElement);
+});
+
+test("TODO List overlays the transcript before it and remains outside the composer", async () => {
+  render(<SessionView />);
+  await act(async () => {});
+  const todoPanel = screen.getByTestId("todo-panel");
+  const transcript = screen.getByTestId("transcript");
+  const composer = screen.getByRole("textbox");
+
+  expect(todoPanel.parentElement).toBe(transcript.parentElement);
+  expect(todoPanel.compareDocumentPosition(transcript) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(composer.contains(todoPanel)).toBe(false);
 });
 
 test("workspace toggles remain rendered and update panel state when panels close", async () => {

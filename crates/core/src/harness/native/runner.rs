@@ -3,7 +3,7 @@
 //! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
-use super::commands::CommandRegistry;
+use super::commands::{CommandRegistry, ResolvedCommand};
 use super::context_manager::{
     compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
     ContextManager,
@@ -145,6 +145,9 @@ pub struct RunnerDeps {
     pub store: Arc<Store>,
     pub events: broadcast::Sender<CoreEvent>,
     pub approvals: Arc<ApprovalHub>,
+    /// Observational UI automation sink. It is deliberately separate from
+    /// native script/extension hook dispatch, so it can never gate a tool.
+    pub automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     pub llm: Arc<dyn LlmStream>,
     pub tools: Arc<ToolRegistry>,
     /// The selected primary agent for this session.
@@ -186,6 +189,13 @@ pub struct RunnerDeps {
     /// fork's real whitelist regardless of what's advertised. `None` for
     /// every non-review turn (parent and sub-agent).
     pub review_tool_defs: Option<Vec<Value>>,
+    /// Per-session set of deferred tools the model has loaded via `load_tools`
+    /// (Phase 2 lazy tools). `Some` on primary sessions (lazy advertising on);
+    /// `None` for sub-agents and review forks, which keep the eager filtered
+    /// set. `BTreeSet` order keeps the advertised tools array deterministic so
+    /// the prompt cache holds across turns with an unchanged set.
+    pub activated_tools:
+        Option<std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeSet<String>>>>,
     /// Which actor is driving this session's tool calls (Phase 4 §7) —
     /// threaded into every `ToolCtx` this session's `run_tool_call` builds.
     /// `User` for ordinary interactive sessions; the background review fork
@@ -211,6 +221,59 @@ impl RunnerDeps {
     }
 }
 
+/// Normal-turn metadata that affects runtime execution without changing the
+/// prompt text persisted or sent to the model.
+#[derive(Debug, Clone, Default)]
+struct TurnOptions {
+    subtask: bool,
+}
+
+/// Return the resolved command's normal-turn runtime metadata. Kept separate
+/// from prompt expansion so the flag cannot leak into model-visible text.
+fn turn_options(command: &super::commands::ResolvedCommand) -> TurnOptions {
+    TurnOptions {
+        subtask: command.subtask,
+    }
+}
+
+async fn max_provider_turns(deps: &RunnerDeps, options: &TurnOptions) -> usize {
+    if options.subtask {
+        SUBAGENT_MAX_ITERS
+    } else {
+        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
+            .await
+    }
+}
+
+async fn command_root(deps: &RunnerDeps) -> PathBuf {
+    let Some(project_id) = deps.project_id.as_deref() else {
+        return deps.work_dir.clone();
+    };
+    match deps.store.get_project(project_id).await {
+        Ok(Some(project)) => PathBuf::from(project.workdir),
+        Ok(None) => deps.work_dir.clone(),
+        Err(error) => {
+            tracing::warn!(project_id, %error, "native: falling back to active worktree for command root");
+            deps.work_dir.clone()
+        }
+    }
+}
+
+/// Resolve a slash command from its current project root. Agent overrides use
+/// the matching root's registry; absent command agent metadata leaves the
+/// session's active-worktree agent unchanged.
+async fn resolve_slash_command(
+    deps: &RunnerDeps,
+    input: &str,
+) -> Option<(ResolvedCommand, Option<Agent>)> {
+    let root = command_root(deps).await;
+    let commands = CommandRegistry::load(&root);
+    let agents = AgentRegistry::load(&root);
+    let resolved = commands.resolve(input)?;
+    let agent = resolved.agent.as_deref().and_then(|name| agents.get(name));
+    Some((resolved, agent))
+}
+
 /// Run one prompt to completion. Returns `Ok(())` once the turn settles
 /// (end_turn / cancellation); the control plane then emits `CoreEvent::Result`.
 ///
@@ -223,21 +286,56 @@ pub async fn run_turn(
 ) -> anyhow::Result<()> {
     let trimmed = prompt.display.trim();
     let manual_compact = trimmed == "/compact" || trimmed.starts_with("/compact ");
+    let force_subtask = prompt.force_subtask;
 
-    // Slash-command resolution on the raw user text.
-    let (agent_text, agent) = if manual_compact {
-        (prompt.agent.clone(), deps.agent.clone())
+    // Slash-command resolution on the raw user text. Reload only for a
+    // command-shaped prompt so project command CRUD becomes visible to a live
+    // session without adding filesystem work to ordinary turns. When the
+    // owning project is reachable, its canonical workdir is the command root;
+    // chat/bare or deleted-project sessions fall back to the active worktree.
+    // Command metadata stays outside the expanded prompt and is applied only
+    // to this turn.
+    let (agent_text, agent, command_model, mut options) = if manual_compact {
+        (
+            prompt.agent.clone(),
+            deps.agent.clone(),
+            None,
+            TurnOptions::default(),
+        )
     } else {
-        match deps.commands.resolve(&prompt.display) {
-            Some((expanded, override_agent)) => {
-                let agent = override_agent
-                    .and_then(|n| deps.agents.get(&n))
-                    .unwrap_or_else(|| deps.agent.clone());
-                (merge_agent_prompt_suffix(expanded, &prompt), agent)
+        let resolved = if trimmed.starts_with('/') {
+            resolve_slash_command(deps, &prompt.display).await
+        } else {
+            deps.commands
+                .resolve(&prompt.display)
+                .map(|resolved| (resolved, None))
+        };
+        match resolved {
+            Some((resolved, command_agent)) => {
+                let agent = command_agent.unwrap_or_else(|| deps.agent.clone());
+                let options = turn_options(&resolved);
+                (
+                    merge_agent_prompt_suffix(resolved.prompt, &prompt),
+                    agent,
+                    resolved.model,
+                    options,
+                )
             }
-            None => (prompt.agent.clone(), deps.agent.clone()),
+            None => (
+                prompt.agent.clone(),
+                deps.agent.clone(),
+                None,
+                TurnOptions::default(),
+            ),
         }
     };
+    // A caller-supplied override (currently: automation Hook agent runs)
+    // wins over slash-command resolution — the hook's `subtask` field must
+    // reach the same runtime budget a command's `subtask: true` frontmatter
+    // does, regardless of whether the prompt happened to start with `/`.
+    if let Some(force_subtask) = force_subtask {
+        options.subtask = force_subtask;
+    }
 
     // 1. Persist + broadcast the user's message (raw display text).
     emit_row(
@@ -257,7 +355,7 @@ pub async fn run_turn(
     // generation, and the sub-agent spawner — shares this immutable snapshot;
     // the original `deps` is never mutated, so in-flight turns and running
     // subagents keep the configuration they started with.
-    let turn_deps = refresh_turn_configuration(deps).await;
+    let turn_deps = refresh_turn_configuration(deps, command_model).await;
     let deps = &turn_deps;
 
     // /compact is an action, but it still snapshots the same complete turn
@@ -297,6 +395,7 @@ pub async fn run_turn(
                         .as_u64()
                         .unwrap_or(st.percent_left as u64) as u8,
                     cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
                     output_tokens: 0,
                 });
                 // Re-emit the accumulated session cost from what's already
@@ -334,9 +433,7 @@ pub async fn run_turn(
     // `while budget.try_consume()` loop caps at exactly this many provider
     // turns per window, and each auto-continue re-grants a fresh window of the
     // same size (drive() re-reads the setting for that grant).
-    let max_provider_turns =
-        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
-            .await;
+    let max_provider_turns = max_provider_turns(deps, &options).await;
     let budget = IterationBudget::new(max_provider_turns);
     drive(
         deps,
@@ -457,7 +554,10 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
 /// those contexts behave exactly as before. When the pinned model fails
 /// routing and a substitute is resolved, a status row announces the
 /// substitution — no silent swap.
-async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
+async fn refresh_turn_configuration(
+    deps: &RunnerDeps,
+    command_model: Option<String>,
+) -> RunnerDeps {
     let scheduler_override = scheduler_model_override(deps).await;
     let project_pin = project_pinned_model(deps).await;
     let session_pin = if project_pin.is_none() {
@@ -465,8 +565,12 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
     } else {
         None
     };
-    let pinned = scheduler_override
-        .clone()
+    let has_command_model = command_model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty());
+    let pinned = command_model
+        .filter(|model| !model.trim().is_empty())
+        .or(scheduler_override.clone())
         .or_else(|| deps.model.clone())
         .or_else(|| project_pin.clone().flatten())
         .or(session_pin.clone());
@@ -494,7 +598,8 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
     }
     let model = turn.model.as_deref().unwrap_or("");
     let primary_model = agent_model_name(&turn.primary_agent.profile.model);
-    if scheduler_override.is_some()
+    if has_command_model
+        || scheduler_override.is_some()
         || project_pin.is_some()
         || session_pin.is_some()
         || turn.model != deps.model
@@ -514,12 +619,13 @@ async fn refresh_turn_configuration(deps: &RunnerDeps) -> RunnerDeps {
         .await
     };
     if let Ok(mut policy) = policy {
-        policy.project_override = if turn.agent.mode.is_subagent() {
-            turn.turn_effort_policy.project_override.clone()
+        policy.caller_override = if turn.agent.mode.is_subagent() {
+            turn.turn_effort_policy.caller_override.clone()
         } else {
             policy
-                .project_override
-                .or_else(|| turn.turn_effort_policy.project_override.clone())
+                .caller_override
+                .clone()
+                .or_else(|| turn.turn_effort_policy.caller_override.clone())
                 .or_else(|| agent_effort(&turn.primary_agent.profile.model))
         };
         turn.turn_effort_policy = Arc::new(policy);
@@ -668,19 +774,121 @@ const BUDGET_EXHAUSTED_PROMPT: &str = "You've reached the maximum number of \
     summarizing what you've found and accomplished so far, without calling \
     any more tools.";
 
-/// The tool definitions a turn advertises to the model, filtered by the
-/// agent's allow-list.
-fn visible_tool_defs(tools: &ToolRegistry, agent: &Agent, _kind: SessionKind) -> Vec<Value> {
-    tools
-        .definitions()
-        .into_iter()
-        .filter(|d| {
-            d.get("name")
-                .and_then(|n| n.as_str())
-                .map(|n| agent.tools.allows(n))
-                .unwrap_or(false)
-        })
-        .collect()
+/// Synthetic meta-tool name. `load_tools` is NOT a registry tool — its
+/// definition is injected here and its call is intercepted in `run_tool_call`.
+pub(crate) const LOAD_TOOLS_NAME: &str = "load_tools";
+
+/// Always-advertised built-ins. Everything else (niche built-ins + all MCP /
+/// extension tools) is deferred until the model loads it via `load_tools`.
+const HOT_TOOLS: &[&str] = &[
+    "read",
+    "ls",
+    "glob",
+    "grep",
+    "bash",
+    "edit",
+    "write",
+    "todowrite",
+    "todoread",
+    "skill",
+    "task",
+];
+
+fn is_hot(name: &str) -> bool {
+    HOT_TOOLS.contains(&name)
+}
+
+/// The synthetic `load_tools` definition, whose description carries the current
+/// deferred index (name + one-line summary) so the model knows what it can load.
+fn load_tools_definition(deferred_index: &[(String, String)]) -> Value {
+    let mut description = String::from(
+        "Load additional tools into this session by name so you can call them.          Only the tools listed below can be loaded; call this with the exact          names you need, then use them on your next step.
+
+Available to load:",
+    );
+    for (name, summary) in deferred_index {
+        description.push_str(&format!(
+            "
+- {name}: {summary}"
+        ));
+    }
+    json!({
+        "name": LOAD_TOOLS_NAME,
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "names": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Exact tool names to load, taken from the list in this description."
+                }
+            },
+            "required": ["names"]
+        }
+    })
+}
+
+/// Tool definitions advertised to the model this turn. `activated = None`
+/// preserves eager filtered advertisement for subagents/review workers; a
+/// primary session advertises the hot core plus loaded deferred tools.
+fn visible_tool_defs(
+    tools: &ToolRegistry,
+    agent: &Agent,
+    activated: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<Value> {
+    let allowed = |name: &str| agent.tools.allows(name);
+
+    let Some(activated) = activated else {
+        return tools
+            .definitions()
+            .into_iter()
+            .filter(|definition| {
+                definition
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .map(&allowed)
+                    .unwrap_or(false)
+            })
+            .collect();
+    };
+
+    let mut advertised = Vec::new();
+    let mut deferred_index = Vec::new();
+    for definition in tools.definitions() {
+        let Some(name) = definition.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        if !allowed(name) {
+            continue;
+        }
+        if is_hot(name) || activated.contains(name) {
+            advertised.push(definition);
+        } else {
+            let summary = definition
+                .get("description")
+                .and_then(|description| description.as_str())
+                .and_then(|description| description.lines().next())
+                .unwrap_or("")
+                .to_string();
+            deferred_index.push((name.to_string(), summary));
+        }
+    }
+    advertised.push(load_tools_definition(&deferred_index));
+    advertised
+}
+
+/// The tool definitions to send this provider turn: the review fork's captured
+/// set verbatim (cache parity), else an activation-aware snapshot.
+async fn current_tool_defs(deps: &RunnerDeps, agent: &Agent) -> Vec<Value> {
+    if let Some(captured) = &deps.review_tool_defs {
+        return captured.clone();
+    }
+    let activated = match &deps.activated_tools {
+        Some(activated) => Some(activated.lock().await.clone()),
+        None => None,
+    };
+    visible_tool_defs(&deps.tools, agent, activated.as_ref())
 }
 
 fn with_delegation_catalog(system: String, catalog: &[(String, String, String)]) -> String {
@@ -708,6 +916,7 @@ async fn drive(
     display: DisplayMode,
     budget: &IterationBudget,
 ) -> anyhow::Result<String> {
+    let mut system_breakdown: Option<Vec<(&'static str, u64)>> = None;
     let system = match &agent.prompt {
         Some(p) => p.clone(),
         None => {
@@ -715,12 +924,21 @@ async fn drive(
                 Some(memory) => memory.snapshot().await?,
                 None => None,
             };
-            context::assemble_system(
+            let t0 = std::time::Instant::now();
+            let sections = context::build_sections(
                 &deps.work_dir,
                 &deps.extra_skill_dirs,
                 memory.as_deref(),
                 deps.allowed_skills.as_deref(),
-            )
+            );
+            system_breakdown = Some(context::breakdown_of(&sections));
+            let text = context::join_sections(&sections);
+            tracing::debug!(
+                target: "ryuzi::context",
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "native: system prompt assembled"
+            );
+            text
         }
     };
     let system = with_delegation_catalog(system, &deps.delegation_catalog);
@@ -732,12 +950,26 @@ async fn drive(
     // non-whitelisted call is refused, not merely hidden from the model.
     let tool_defs: Vec<Value> = match &deps.review_tool_defs {
         Some(captured) => captured.clone(),
-        None => visible_tool_defs(&deps.tools, agent, deps.kind),
+        None => current_tool_defs(deps, agent).await,
     };
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
     cm.set_baseline(&system, &tool_defs);
+    if let Some(mut bd) = system_breakdown.take() {
+        let tools_tokens: u64 = tool_defs
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0) as u64)
+            .sum::<u64>()
+            / 4;
+        bd.push(("tools", tools_tokens));
+        tracing::debug!(
+            target: "ryuzi::context",
+            breakdown = ?bd,
+            baseline_tokens = cm.status().active_tokens,
+            "native: context baseline breakdown"
+        );
+    }
     let settings_cap =
         crate::settings::usize_setting(&deps.store, "context.max_output_tokens", 1).await;
     // usize_setting floors at 1; treat 1 (the "unset" default) as no cap.
@@ -828,6 +1060,7 @@ async fn drive(
             } else {
                 json!(system)
             };
+            let tool_defs = current_tool_defs(deps, agent).await;
             let body = json!({
                 "model": model,
                 "system": system_value,
@@ -850,6 +1083,8 @@ async fn drive(
                     observation: observation.clone(),
                 },
             };
+            let ttft_start = std::time::Instant::now();
+            let mut ttft_logged = false;
             let RoutedStream {
                 selection,
                 events: mut rx,
@@ -899,6 +1134,14 @@ async fn drive(
                 let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
                     continue;
                 };
+                if !ttft_logged {
+                    ttft_logged = true;
+                    tracing::debug!(
+                        target: "ryuzi::context",
+                        ttft_ms = ttft_start.elapsed().as_millis() as u64,
+                        "native: first stream event received"
+                    );
+                }
                 match decoded {
                     MessageStreamEvent::TextDelta { text, .. } => {
                         turn.text.push_str(&text);
@@ -1430,7 +1673,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
     let mut effort_policy =
         crate::llm_router::model_effort::build_utility_effort_policy(&deps.store, model_name)
             .await?;
-    effort_policy.project_override = agent_effort(&shared_model);
+    effort_policy.caller_override = agent_effort(&shared_model);
     let meta = crate::llm_router::model_meta::resolve(&deps.store, model_name).await;
 
     Ok(RunnerDeps {
@@ -1457,6 +1700,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         store: deps.store.clone(),
         events: deps.events.clone(),
         approvals: deps.approvals.clone(),
+        automation_events: deps.automation_events.clone(),
         llm: deps.llm.clone(),
         tools: deps.tools.clone(),
         agent: deps.agent.clone(),
@@ -1470,6 +1714,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         app_control: None,
         nudge: deps.nudge.clone(),
         review_tool_defs: None,
+        activated_tools: None,
         write_origin: deps.write_origin,
         delegation_catalog: deps.delegation_catalog.clone(),
     })
@@ -1648,7 +1893,7 @@ impl RunnerMainAgentSpawner {
                 child_deps.model.as_deref().unwrap_or(""),
             )
             .await?;
-            effort_policy.project_override = primary_turn.effort;
+            effort_policy.caller_override = primary_turn.effort;
             child_deps.turn_effort_policy = Arc::new(effort_policy);
             child_deps.allowed_skills = primary_turn.allowed_skills;
             child_deps.agent = primary_turn.agent_tools;
@@ -2219,6 +2464,9 @@ async fn run_tool_call(
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
 ) -> Value {
+    if t.name == LOAD_TOOLS_NAME {
+        return handle_load_tools(deps, agent, t, display).await;
+    }
     let input = t.parsed_input();
     let Some(tool) = deps.tools.get(&t.name) else {
         let msg = format!("unknown tool `{}`", t.name);
@@ -2258,6 +2506,12 @@ async fn run_tool_call(
         &json!({ "tool": t.name, "input": input }),
     )
     .await;
+    crate::automation::dispatch_lifecycle_observation(
+        deps.automation_events.clone(),
+        crate::automation::TriggerKind::ToolBefore,
+        deps.session_pk.clone(),
+        json!({ "tool": t.name, "input": input }),
+    );
     if !hook.allowed {
         let msg = hook
             .message
@@ -2381,14 +2635,102 @@ async fn run_tool_call(
     };
     // Observational: never gates, result ignored. Fires for both Ok and Err
     // outcomes now that the `ToolOutput` (or its error) has resolved.
+    let after_payload = json!({ "tool": t.name, "input": hook_input, "result": after_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolAfter,
-        &json!({ "tool": t.name, "input": hook_input, "result": after_summary }),
+        &after_payload,
     )
     .await;
+    crate::automation::dispatch_lifecycle_observation(
+        deps.automation_events.clone(),
+        crate::automation::TriggerKind::ToolAfter,
+        deps.session_pk.clone(),
+        after_payload,
+    );
     tool_use_result
+}
+
+/// Handle the synthetic `load_tools` meta-call: activate the requested deferred
+/// tools into `deps.activated_tools` so they are advertised from the next
+/// provider turn. Validated against the tools this agent may actually load
+/// (registry tools that are allowed, not hot, and not gated out). Skips the
+/// permission gate and worktree snapshot — it mutates advertisement state only.
+async fn handle_load_tools(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    t: &ToolAccum,
+    display: &DisplayMode,
+) -> Value {
+    let input = t.parsed_input();
+    insert_tool_row(deps, t, &input, "other", display.subagent()).await;
+
+    let Some(activated) = deps.activated_tools.as_ref() else {
+        let msg = "load_tools is not available in this session";
+        finish_tool_row(deps, &t.id, msg, true).await;
+        return tool_result(&t.id, msg, true);
+    };
+
+    let loadable: std::collections::BTreeSet<String> = deps
+        .tools
+        .names()
+        .into_iter()
+        .filter(|n| agent.tools.allows(n) && !is_hot(n))
+        .collect();
+
+    let requested: Vec<String> = input
+        .get("names")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if requested.is_empty() {
+        let msg = "No tool names given. Provide the exact tool names to load, taken from the load_tools description.";
+        finish_tool_row(deps, &t.id, msg, true).await;
+        return tool_result(&t.id, msg, true);
+    }
+
+    let (mut loaded, mut unknown) = (Vec::new(), Vec::new());
+    for name in requested {
+        if loadable.contains(&name) {
+            loaded.push(name);
+        } else {
+            unknown.push(name);
+        }
+    }
+    if !loaded.is_empty() {
+        let mut set = activated.lock().await;
+        for n in &loaded {
+            set.insert(n.clone());
+        }
+    }
+
+    let is_error = loaded.is_empty();
+    let msg = if unknown.is_empty() {
+        format!(
+            "Loaded: {}. These tools are now available to call.",
+            loaded.join(", ")
+        )
+    } else if loaded.is_empty() {
+        format!(
+            "No tools loaded. Unknown or unavailable: {}. Loadable tools: {}.",
+            unknown.join(", "),
+            loadable.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    } else {
+        format!(
+            "Loaded: {}. Ignored (unknown/unavailable): {}.",
+            loaded.join(", "),
+            unknown.join(", ")
+        )
+    };
+    finish_tool_row(deps, &t.id, &msg, is_error).await;
+    tool_result(&t.id, &msg, is_error)
 }
 
 /// Insert the initial `tool_call` row (`{name, input}`, in_progress).
@@ -2596,6 +2938,7 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         usable_window: st.usable_window,
         percent_left: st.percent_left,
         cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
         output_tokens: cm.last_output(),
     });
 
@@ -2665,6 +3008,7 @@ async fn emit_context_display(deps: &RunnerDeps, cm: &ContextManager, emit: bool
         usable_window: st.usable_window,
         percent_left: st.percent_left,
         cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
         output_tokens: cm.last_output(),
     });
 
@@ -3094,11 +3438,11 @@ mod tests {
             .await
             .unwrap();
 
-        let refreshed = refresh_turn_configuration(&deps).await;
+        let refreshed = refresh_turn_configuration(&deps, None).await;
         assert_eq!(refreshed.model.as_deref(), Some("anthropic/model-b"));
         assert_eq!(refreshed.meta.context_window, 222_222);
         assert_eq!(
-            refreshed.turn_effort_policy.project_override.as_deref(),
+            refreshed.turn_effort_policy.caller_override.as_deref(),
             Some("high")
         );
     }
@@ -3213,8 +3557,8 @@ mod tests {
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {
                 requested_model: "test/model".into(),
-                project_override: None,
-                route_compatibility: Default::default(),
+                caller_override: None,
+                route_targets: Default::default(),
                 configured: Default::default(),
                 surfaces: Default::default(),
             }),
@@ -3225,6 +3569,7 @@ mod tests {
             store,
             events,
             approvals: Arc::new(ApprovalHub::new()),
+            automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
             agent,
@@ -3238,6 +3583,7 @@ mod tests {
             app_control: None,
             nudge: Arc::new(NudgeState::default()),
             review_tool_defs: None,
+            activated_tools: None,
             write_origin: crate::domain::WriteOrigin::User,
             delegation_catalog: Vec::new(),
         };
@@ -3351,6 +3697,28 @@ mod tests {
         reason: &'static str,
     }
 
+    struct BlockingAutomationSink {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::automation::AutomationEventSink for BlockingAutomationSink {
+        async fn observe_lifecycle(
+            &self,
+            _trigger: crate::automation::TriggerKind,
+            _session_pk: String,
+            _data: Value,
+        ) {
+            let _ = self.entered.send(());
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("test semaphore stays open");
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::plugins::extension::ExtensionEvents for FixedExtensionEvents {
         async fn dispatch(
@@ -3367,6 +3735,48 @@ mod tests {
                 crate::harness::native::hooks::HookResult::allow()
             }
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_lifecycle_sink_does_not_change_native_tool_gate_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection = route_selection("a", "Primary");
+        let llm = Arc::new(ScriptedLlm::with_selections(vec![
+            (selection.clone(), tool_turn()),
+            (selection, final_turn("done")),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = Arc::new(BlockingAutomationSink {
+            entered,
+            release: release.clone(),
+        });
+        deps.automation_events = Some(sink.clone());
+        deps.extension_events = Some(Arc::new(FixedExtensionEvents {
+            deny_event: crate::harness::native::hooks::HookEvent::ToolBefore,
+            reason: "blocked by policy extension",
+        }));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        let tool_call = msgs
+            .iter()
+            .find(|m| m.block_type == "tool_call")
+            .expect("a tool_call row must exist");
+        assert_eq!(tool_call.payload["output"], "blocked by policy extension");
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("automation lifecycle sink must run")
+            .expect("automation lifecycle channel must remain open");
+        release.add_permits(1);
     }
 
     #[tokio::test]
@@ -4137,6 +4547,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_subtask_uses_subagent_turn_budget() {
+        use testutil::ScriptedLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "7",
+            )
+            .await
+            .unwrap();
+        let options = turn_options(&super::super::commands::ResolvedCommand {
+            prompt: "Ship now".into(),
+            agent: None,
+            model: None,
+            subtask: true,
+        });
+
+        assert_eq!(
+            max_provider_turns(&deps, &options).await,
+            SUBAGENT_MAX_ITERS
+        );
+        assert_eq!(
+            max_provider_turns(&deps, &TurnOptions::default()).await,
+            7,
+            "plain turns keep the configured normal budget"
+        );
+    }
+
+    /// `TurnPrompt.force_subtask` is the caller seam automation Hook agent
+    /// runs use to reach the exact same subagent budget a `subtask: true`
+    /// slash command reaches — proven directly against `run_turn`'s options
+    /// resolution rather than only the pure `turn_options` helper above.
+    #[tokio::test]
+    async fn turn_prompt_force_subtask_overrides_plain_text_turn_options() {
+        use testutil::ScriptedLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.max_provider_turns",
+                "7",
+            )
+            .await
+            .unwrap();
+
+        // Plain (non-command) text with no override keeps the configured
+        // normal budget.
+        let plain = TurnPrompt::text("hello", "hello");
+        assert_eq!(plain.force_subtask, None);
+        assert_eq!(max_provider_turns(&deps, &TurnOptions::default()).await, 7);
+
+        // A hook-run TurnPrompt forcing subtask=true reaches the same
+        // subagent budget as a `subtask: true` command, even though its
+        // text is plain (not a `/command`).
+        let mut hook_prompt = TurnPrompt::text("Review $EVENT", "Review $EVENT");
+        hook_prompt.force_subtask = Some(true);
+        let mut options = TurnOptions::default();
+        if let Some(force_subtask) = hook_prompt.force_subtask {
+            options.subtask = force_subtask;
+        }
+        assert_eq!(
+            max_provider_turns(&deps, &options).await,
+            SUBAGENT_MAX_ITERS
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_project_command_root_falls_back_to_active_worktree() {
+        use testutil::RecordingLlm;
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_workdir = dir.path().join("canonical-project");
+        std::fs::create_dir_all(&canonical_workdir).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".ryuzi/commands/fallback.md"),
+            "Active-worktree fallback $ARGUMENTS",
+        )
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("deleted-project".into());
+        deps.store
+            .insert_project(crate::domain::Project {
+                project_id: "deleted-project".into(),
+                name: "deleted-project".into(),
+                workdir: canonical_workdir.display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::BypassPermissions,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        deps.store
+            .with_conn(|conn| {
+                conn.execute(
+                    "DELETE FROM projects WHERE project_id='deleted-project'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("/fallback command", "/fallback command"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert!(
+            body.to_string()
+                .contains("Active-worktree fallback command"),
+            "a missing project row must resolve slash commands from the active worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_model_overrides_the_project_model_for_one_turn() {
+        use crate::domain::{PermMode, Project};
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ryuzi/commands")).unwrap();
+        std::fs::write(
+            dir.path().join(".ryuzi/commands/ship.md"),
+            "---\nmodel: anthropic/model-b\nsubtask: true\n---\nShip $ARGUMENTS",
+        )
+        .unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.project_id = Some("p".into());
+        deps.commands = Arc::new(CommandRegistry::load(dir.path()));
+        add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
+        deps.store
+            .insert_project(Project {
+                project_id: "p".into(),
+                name: "project".into(),
+                workdir: dir.path().display().to_string(),
+                source: None,
+                model: Some("anthropic/model-a".into()),
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("/ship now", "/ship now"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/model-b");
+        // The command's `subtask: true` frontmatter controls only the turn's
+        // runtime iteration budget (see `turn_options`/`max_provider_turns`);
+        // it must never appear as a message/system-prompt field. The
+        // available `task` tool's own description legitimately contains the
+        // substring "subtasks", so assert on the user message content
+        // specifically rather than the whole serialized body.
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Ship now");
+    }
+    #[tokio::test]
     async fn refresh_turn_configuration_reloads_model_effort_preferences_defaults_and_meta() {
         use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
         use crate::llm_router::model_effort::{
@@ -4266,13 +4857,13 @@ mod tests {
         {
             let policies = llm.policies.lock().unwrap();
             assert_eq!(policies[0].requested_model, "anthropic/model-a");
-            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(policies[0].caller_override.as_deref(), Some("high"));
             assert_eq!(
                 policies[0].configured.get(&key_a).map(String::as_str),
                 Some("low")
             );
             assert_eq!(policies[1].requested_model, "anthropic/model-b");
-            assert_eq!(policies[1].project_override, None);
+            assert_eq!(policies[1].caller_override, None);
             assert!(!policies[1].configured.contains_key(&key_a));
             assert_eq!(
                 policies[1].configured.get(&key_b).map(String::as_str),
@@ -4283,7 +4874,10 @@ mod tests {
             }));
         }
         assert_eq!(
-            refresh_turn_configuration(&deps).await.meta.context_window,
+            refresh_turn_configuration(&deps, None)
+                .await
+                .meta
+                .context_window,
             222_222
         );
     }
@@ -4660,6 +5254,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_context_usage_reports_cache_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+        let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        cm.observe_message_start(&json!({
+            "usage": { "input_tokens": 30_000, "cache_creation_input_tokens": 12_000 }
+        }));
+        cm.commit_response();
+
+        let mut rx = deps.events.subscribe();
+        emit_context_usage(&deps, &cm, true).await;
+
+        let mut creation = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::ContextUsage {
+                cache_creation_tokens,
+                ..
+            } = ev
+            {
+                creation = Some(cache_creation_tokens);
+                break;
+            }
+        }
+        assert_eq!(
+            creation,
+            Some(12_000),
+            "cache_creation must be surfaced on the event"
+        );
+    }
+
+    #[tokio::test]
     async fn pre_turn_compaction_triggers_and_continues_the_turn() {
         let dir = tempfile::tempdir().unwrap();
         // ScriptedLlm turn 0 answers the summarize call; turn 1 is the real turn.
@@ -4833,7 +5462,7 @@ mod tests {
             let policies = llm.policies.lock().unwrap();
             assert_eq!(policies.len(), 1, "manual compact makes one utility call");
             assert_eq!(policies[0].requested_model, "anthropic/model-a");
-            assert_eq!(policies[0].project_override.as_deref(), Some("high"));
+            assert_eq!(policies[0].caller_override.as_deref(), Some("high"));
         }
         // A notice row records it in the transcript.
         let msgs = deps.store.list_messages("s1").await.unwrap();
@@ -5248,6 +5877,283 @@ mod tests {
         assert!(filter.allows("delegate_agent"));
         assert!(!filter.allows("bash"));
         assert!(!filter.allows("write"));
+    }
+
+    #[test]
+    fn is_hot_classifies_core_vs_deferred() {
+        for n in [
+            "read",
+            "ls",
+            "glob",
+            "grep",
+            "bash",
+            "edit",
+            "write",
+            "todowrite",
+            "todoread",
+            "skill",
+            "task",
+        ] {
+            assert!(is_hot(n), "{n} must be hot");
+        }
+        for n in [
+            "webfetch",
+            "memory",
+            "lsp",
+            "session_search",
+            "mcp__srv__do",
+        ] {
+            assert!(!is_hot(n), "{n} must be deferred");
+        }
+    }
+
+    #[test]
+    fn visible_tool_defs_none_is_the_full_filtered_set() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent(); // tools: ToolFilter::All
+        let eager = visible_tool_defs(&tools, &agent, None);
+        // Full filtered set, no load_tools.
+        let names: Vec<String> = eager
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"webfetch".to_string()));
+        assert!(names.contains(&"read".to_string()));
+        assert!(
+            !names.iter().any(|n| n == LOAD_TOOLS_NAME),
+            "eager mode has no synthetic load_tools"
+        );
+    }
+
+    #[test]
+    fn visible_tool_defs_lazy_hides_deferred_and_adds_load_tools() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent();
+        let empty = std::collections::BTreeSet::new();
+        let lazy = visible_tool_defs(&tools, &agent, Some(&empty));
+        let names: Vec<String> = lazy
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        // Hot core present, deferred hidden, load_tools present and last.
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&"bash".to_string()));
+        assert!(
+            !names.contains(&"webfetch".to_string()),
+            "deferred hidden until loaded"
+        );
+        assert!(!names.contains(&"memory".to_string()));
+        assert_eq!(names.last().map(String::as_str), Some(LOAD_TOOLS_NAME));
+        // load_tools description lists the deferred tools by name.
+        let lt = lazy.iter().find(|d| d["name"] == LOAD_TOOLS_NAME).unwrap();
+        let desc = lt["description"].as_str().unwrap();
+        assert!(
+            desc.contains("webfetch"),
+            "index must name deferred webfetch"
+        );
+        assert!(
+            !desc.contains("\n- read:"),
+            "hot tools are not in the load index"
+        );
+    }
+
+    #[test]
+    fn visible_tool_defs_lazy_reveals_an_activated_tool() {
+        let tools = ToolRegistry::builtin();
+        let agent = AgentRegistry::builtin().default_agent();
+        let mut set = std::collections::BTreeSet::new();
+        set.insert("webfetch".to_string());
+        let lazy = visible_tool_defs(&tools, &agent, Some(&set));
+        let names: Vec<String> = lazy
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            names.contains(&"webfetch".to_string()),
+            "activated tool is advertised in full"
+        );
+        // …and no longer in the load_tools index.
+        let lt = lazy.iter().find(|d| d["name"] == LOAD_TOOLS_NAME).unwrap();
+        assert!(!lt["description"]
+            .as_str()
+            .unwrap()
+            .contains("\n- webfetch:"));
+        // Deterministic order across calls.
+        let again = visible_tool_defs(&tools, &agent, Some(&set));
+        assert_eq!(lazy, again);
+    }
+
+    #[tokio::test]
+    async fn primary_deps_advertise_hot_core_and_load_tools_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = std::sync::Arc::new(ScriptedLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        // Primary session: lazy tools on.
+        deps.activated_tools = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::BTreeSet::new(),
+        )));
+        let defs = current_tool_defs(&deps, &deps.agent).await;
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&LOAD_TOOLS_NAME.to_string()));
+        assert!(
+            !names.contains(&"webfetch".to_string()),
+            "deferred hidden for primary until loaded"
+        );
+
+        // Eager (sub-agent style): full set, no load_tools.
+        deps.activated_tools = None;
+        let eager = current_tool_defs(&deps, &deps.agent).await;
+        let enames: Vec<String> = eager
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(String::from))
+            .collect();
+        assert!(enames.contains(&"webfetch".to_string()));
+        assert!(!enames.contains(&LOAD_TOOLS_NAME.to_string()));
+    }
+
+    #[tokio::test]
+    async fn load_tools_reveals_a_deferred_tool_on_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1: the model calls load_tools(["webfetch"]).
+        let turn1 = vec![
+            message_start_with_usage(1_000, 0),
+            tool_use_start(0, "c1", "load_tools"),
+            input_json_delta(0, r#"{"names":["webfetch"]}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // Turn 2: the model finishes.
+        let turn2 = vec![
+            message_start_with_usage(1_000, 0),
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = std::sync::Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.activated_tools = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            std::collections::BTreeSet::new(),
+        )));
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "two provider turns");
+        let names_of = |b: &serde_json::Value| -> Vec<String> {
+            b["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(String::from))
+                .collect()
+        };
+        let t1 = names_of(&bodies[0]);
+        let t2 = names_of(&bodies[1]);
+        // Turn 1: hot core + load_tools, webfetch deferred.
+        assert!(t1.contains(&"load_tools".to_string()));
+        assert!(t1.contains(&"read".to_string()));
+        assert!(
+            !t1.contains(&"webfetch".to_string()),
+            "webfetch deferred on turn 1"
+        );
+        // Turn 2: webfetch now advertised (loaded).
+        assert!(
+            t2.contains(&"webfetch".to_string()),
+            "webfetch loaded on turn 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_tools_rejects_unknown_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            message_start_with_usage(1_000, 0),
+            tool_use_start(0, "c1", "load_tools"),
+            input_json_delta(0, r#"{"names":["not_a_tool"]}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            message_start_with_usage(1_000, 0),
+            text_delta("ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = std::sync::Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        let set = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeSet::new()));
+        deps.activated_tools = Some(set.clone());
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Nothing was activated; turn 2 still has no bogus tool.
+        assert!(
+            set.lock().await.is_empty(),
+            "unknown name must not be activated"
+        );
+        let bodies = llm.bodies.lock().unwrap();
+        let t2: Vec<String> = bodies[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        assert!(!t2.contains(&"not_a_tool".to_string()));
+    }
+
+    #[tokio::test]
+    async fn load_tools_rejects_empty_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            message_start_with_usage(1_000, 0),
+            tool_use_start(0, "c1", "load_tools"),
+            input_json_delta(0, r#"{"names":[]}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            message_start_with_usage(1_000, 0),
+            text_delta("ok"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = std::sync::Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        let set = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeSet::new()));
+        deps.activated_tools = Some(set.clone());
+
+        run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Nothing was activated; the empty request is rejected outright.
+        assert!(
+            set.lock().await.is_empty(),
+            "empty names must not activate anything"
+        );
+
+        // The tool_result the model sees must explain the problem, not
+        // falsely claim success while is_error is set.
+        let bodies = llm.bodies.lock().unwrap();
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let last = messages.last().expect("at least one message");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(
+            rendered.contains("No tool names"),
+            "message must explain the empty names error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Loaded:"),
+            "message must not claim success for empty names: {rendered}"
+        );
     }
 
     #[test]
@@ -6915,7 +7821,7 @@ mod tests {
             "the target model metadata controls its output context"
         );
         assert_eq!(
-            llm.policies.lock().unwrap()[0].project_override.as_deref(),
+            llm.policies.lock().unwrap()[0].caller_override.as_deref(),
             Some("high")
         );
         let tool_rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
@@ -7394,7 +8300,7 @@ mod tests {
         let body = llm.bodies.lock().unwrap().pop().unwrap();
         assert_eq!(body["model"], "anthropic/target-model");
         let policy = llm.policies.lock().unwrap().pop().unwrap();
-        assert_eq!(policy.project_override.as_deref(), Some("high"));
+        assert_eq!(policy.caller_override.as_deref(), Some("high"));
         let child = deps
             .store
             .list_descendant_agent_runs(&deps.run_id)

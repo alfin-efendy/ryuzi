@@ -6,6 +6,7 @@
 pub mod agent_api;
 pub mod apps_api;
 pub mod audit;
+pub mod automation_api;
 pub mod connections_api;
 pub mod delegation_api;
 pub mod endpoint_api;
@@ -121,6 +122,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
     match method {
         m if sessions::HANDLES.contains(&m) => sessions::dispatch(state, m, p).await,
         m if scheduler_api::HANDLES.contains(&m) => scheduler_api::dispatch(state, m, p).await,
+        m if automation_api::HANDLES.contains(&m) => automation_api::dispatch(state, m, p).await,
         m if gateways_api::HANDLES.contains(&m) => gateways_api::dispatch(state, m, p).await,
         m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
         m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,
@@ -270,10 +272,30 @@ pub(crate) mod tests_support {
         }
     }
 
-    /// Like `state()`, but with one connected project (`"p1"`) already in the
-    /// store — for command families whose calls need a real `project_id` to
-    /// validate against.
-    ///
+    /// Like `state_with_agents()`, but with one connected project (`"p1"`)
+    /// already in the store — for command families whose calls need a real
+    /// `project_id` to validate against.
+    pub(crate) async fn state_with_project() -> ApiState {
+        let state = state_with_agents().await;
+        state
+            .cp
+            .store()
+            .insert_project(crate::domain::Project {
+                project_id: "p1".into(),
+                name: "project".into(),
+                workdir: std::env::temp_dir().display().to_string(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: None,
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        state
+    }
+
     /// A no-op `HarnessSession` — the RPC tests that use
     /// `state_with_fake_native` only assert on the session row a start call
     /// returns synchronously, before the background startup ever drives a

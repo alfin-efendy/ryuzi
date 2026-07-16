@@ -65,7 +65,7 @@ pub enum StoredEffortStatus {
 pub enum EffectiveEffortSource {
     Project,
     Session,
-    RouteCompatibility,
+    RouteTarget,
     Configured,
     Provider,
     None,
@@ -102,8 +102,8 @@ pub struct RouteTargetEffortKey {
 #[derive(Debug, Clone)]
 pub struct TurnEffortPolicy {
     pub requested_model: String,
-    pub project_override: Option<String>,
-    pub route_compatibility: HashMap<RouteTargetEffortKey, String>,
+    pub caller_override: Option<String>,
+    pub route_targets: HashMap<RouteTargetEffortKey, String>,
     pub configured: HashMap<ModelPreferenceKey, String>,
     pub surfaces: HashMap<ExecutionSurfaceKey, ExecutionModelEffortCapabilities>,
 }
@@ -149,9 +149,6 @@ impl DiscoveredModelMeta {
         {
             base.default_reasoning_effort = None;
         }
-        if base.default_reasoning_effort.is_none() && base.reasoning_efforts.len() == 1 {
-            base.default_reasoning_effort = Some(base.reasoning_efforts[0].value.clone());
-        }
         base
     }
 }
@@ -192,9 +189,6 @@ pub(crate) fn intersect_capabilities(
                 .as_ref()
                 .filter(|default| surface.supported.iter().any(|o| &o.value == *default))
                 .cloned()
-                .or_else(|| {
-                    (surface.supported.len() == 1).then(|| surface.supported[0].value.clone())
-                })
         })
         .collect();
     let first_default = defaults.first().cloned().flatten();
@@ -228,24 +222,21 @@ fn resolved_surface_default(capabilities: &ExecutionModelEffortCapabilities) -> 
                 .any(|option| &option.value == *value)
         })
         .cloned()
-        .or_else(|| {
-            (capabilities.supported.len() == 1).then(|| capabilities.supported[0].value.clone())
-        })
 }
 
 pub fn resolve_for_target(
     policy: &TurnEffortPolicy,
     route_target_key: Option<&RouteTargetEffortKey>,
-    request_compatibility_effort: Option<&str>,
     preference_key: &ModelPreferenceKey,
     surface: &ExecutionSurfaceKey,
 ) -> EffectiveEffort {
+    let named_route = route_target_key.is_some();
     let Some(capabilities) = policy.surfaces.get(surface) else {
         return EffectiveEffort {
             value: None,
             label: None,
             source: EffectiveEffortSource::None,
-            stored_status: Some(if policy.project_override.is_some() {
+            stored_status: Some(if !named_route && policy.caller_override.is_some() {
                 StoredEffortStatus::UnknownMetadata
             } else {
                 StoredEffortStatus::Valid
@@ -258,35 +249,42 @@ pub fn resolve_for_target(
             .iter()
             .any(|option| option.value == value)
     };
-    let stored_status = Some(match policy.project_override.as_deref() {
-        Some(value) if !supported(value) => StoredEffortStatus::Unsupported,
-        _ => StoredEffortStatus::Valid,
+    let stored_status = Some(
+        match (!named_route)
+            .then_some(policy.caller_override.as_deref())
+            .flatten()
+        {
+            Some(value) if !supported(value) => StoredEffortStatus::Unsupported,
+            _ => StoredEffortStatus::Valid,
+        },
+    );
+    let configured = policy.configured.get(preference_key).map(String::as_str);
+    let selected = if let Some(key) = route_target_key {
+        [
+            (
+                policy.route_targets.get(key).map(String::as_str),
+                EffectiveEffortSource::RouteTarget,
+            ),
+            (configured, EffectiveEffortSource::Configured),
+        ]
+    } else {
+        [
+            (
+                policy.caller_override.as_deref(),
+                EffectiveEffortSource::Project,
+            ),
+            (configured, EffectiveEffortSource::Configured),
+        ]
+    }
+    .into_iter()
+    .find_map(|(value, source)| {
+        value
+            .filter(|value| supported(value))
+            .map(|value| (value.to_string(), source))
+    })
+    .or_else(|| {
+        resolved_surface_default(capabilities).map(|value| (value, EffectiveEffortSource::Provider))
     });
-    let route_value = route_target_key
-        .and_then(|key| policy.route_compatibility.get(key).map(String::as_str))
-        .or(request_compatibility_effort);
-    let candidates = [
-        (
-            policy.project_override.as_deref(),
-            EffectiveEffortSource::Project,
-        ),
-        (route_value, EffectiveEffortSource::RouteCompatibility),
-        (
-            policy.configured.get(preference_key).map(String::as_str),
-            EffectiveEffortSource::Configured,
-        ),
-    ];
-    let selected = candidates
-        .into_iter()
-        .find_map(|(value, source)| {
-            value
-                .filter(|value| supported(value))
-                .map(|value| (value.to_string(), source))
-        })
-        .or_else(|| {
-            resolved_surface_default(capabilities)
-                .map(|value| (value, EffectiveEffortSource::Provider))
-        });
     let (value, source) = selected
         .map_or((None, EffectiveEffortSource::None), |(value, source)| {
             (Some(value), source)
@@ -378,7 +376,7 @@ async fn selection_capabilities(
     if let Some(route) = routes::route_by_name(&route_list, requested_model) {
         let mut keys = Vec::new();
         let mut surfaces = Vec::new();
-        let mut compatibility = HashMap::new();
+        let mut route_targets = HashMap::new();
         for (index, target) in route.targets.iter().enumerate() {
             let key = ModelPreferenceKey {
                 family: target.provider.clone(),
@@ -387,7 +385,7 @@ async fn selection_capabilities(
             surfaces.extend(capabilities_for_preference(store, &key).await?);
             keys.push(key);
             if let Some(effort) = &target.effort {
-                compatibility.insert(
+                route_targets.insert(
                     RouteTargetEffortKey {
                         route_id: route.id.clone(),
                         target_index: index as u32,
@@ -396,7 +394,7 @@ async fn selection_capabilities(
                 );
             }
         }
-        return Ok(Some((keys, surfaces, compatibility, true)));
+        return Ok(Some((keys, surfaces, route_targets, true)));
     }
     let Some((family, model)) = requested_model.split_once('/') else {
         return Ok(None);
@@ -437,7 +435,7 @@ pub async fn legacy_effort_supported_for_selection(
 
 async fn build_effort_policy(
     store: &Store,
-    project_override: Option<String>,
+    caller_override: Option<String>,
     requested_model: &str,
 ) -> anyhow::Result<TurnEffortPolicy> {
     let configured = store
@@ -445,7 +443,7 @@ async fn build_effort_policy(
         .await?
         .into_iter()
         .collect();
-    let (_, capabilities, route_compatibility, _) = selection_capabilities(store, requested_model)
+    let (_, capabilities, route_targets, _) = selection_capabilities(store, requested_model)
         .await?
         .unwrap_or_default();
     let surfaces = capabilities
@@ -454,8 +452,8 @@ async fn build_effort_policy(
         .collect();
     Ok(TurnEffortPolicy {
         requested_model: requested_model.to_string(),
-        project_override,
-        route_compatibility,
+        caller_override,
+        route_targets,
         configured,
         surfaces,
     })
@@ -466,11 +464,11 @@ pub async fn build_turn_effort_policy(
     project_id: &str,
     requested_model: &str,
 ) -> anyhow::Result<TurnEffortPolicy> {
-    let project_override = store
+    let caller_override = store
         .get_project(project_id)
         .await?
         .and_then(|project| project.effort);
-    build_effort_policy(store, project_override, requested_model).await
+    build_effort_policy(store, caller_override, requested_model).await
 }
 
 pub async fn build_session_effort_policy(
@@ -483,6 +481,14 @@ pub async fn build_session_effort_policy(
         .await?
         .and_then(|runtime| runtime.effort);
     build_effort_policy(store, session_override, requested_model).await
+}
+
+pub async fn build_request_effort_policy(
+    store: &Store,
+    requested_model: &str,
+    caller_effort: Option<String>,
+) -> anyhow::Result<TurnEffortPolicy> {
+    build_effort_policy(store, caller_effort, requested_model).await
 }
 
 pub async fn build_utility_effort_policy(
@@ -604,6 +610,10 @@ mod tests {
             serde_json::to_value(StoredEffortStatus::UnknownMetadata).unwrap(),
             "unknownMetadata"
         );
+        assert_eq!(
+            serde_json::to_value(EffectiveEffortSource::RouteTarget).unwrap(),
+            "routeTarget"
+        );
     }
 
     #[test]
@@ -652,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_one_option_models_are_valid_and_single_option_is_default() {
+    fn zero_and_one_option_models_are_valid_but_do_not_guess_defaults() {
         let zero = intersect_capabilities(&[capabilities("zero", vec![], None)]);
         assert!(zero.supported.is_empty());
         assert_eq!(zero.resolved_default, None);
@@ -664,8 +674,8 @@ mod tests {
             None,
         )]);
         assert_eq!(one.supported, vec![option("ultra", "ultra", None)]);
-        assert_eq!(one.resolved_default.as_deref(), Some("ultra"));
-        assert_eq!(one.default_source, ModelDefaultSource::Provider);
+        assert_eq!(one.resolved_default, None);
+        assert_eq!(one.default_source, ModelDefaultSource::None);
     }
 
     #[test]
@@ -734,6 +744,57 @@ mod tests {
     }
 
     #[test]
+    fn named_target_effort_precedence_ignores_caller_override() {
+        let preference = ModelPreferenceKey {
+            family: "openai".into(),
+            model: "gpt-custom".into(),
+        };
+        let surface = ExecutionSurfaceKey {
+            provider_id: "openai-oauth".into(),
+            connection_id: Some("c1".into()),
+            model: "gpt-custom".into(),
+        };
+        let target = RouteTargetEffortKey {
+            route_id: "smart".into(),
+            target_index: 0,
+        };
+        let policy = TurnEffortPolicy {
+            requested_model: "smart".into(),
+            caller_override: Some("low".into()),
+            route_targets: HashMap::from([(target.clone(), "high".into())]),
+            configured: HashMap::from([(preference.clone(), "medium".into())]),
+            surfaces: HashMap::from([(
+                surface.clone(),
+                capabilities(
+                    "openai-oauth",
+                    vec![
+                        option("low", "Low", None),
+                        option("medium", "Medium", None),
+                        option("high", "High", None),
+                    ],
+                    Some("high"),
+                ),
+            )]),
+        };
+
+        let explicit = resolve_for_target(&policy, Some(&target), &preference, &surface);
+        assert_eq!(explicit.value.as_deref(), Some("high"));
+
+        let mut model_default = policy.clone();
+        model_default.route_targets.clear();
+        let inherited = resolve_for_target(&model_default, Some(&target), &preference, &surface);
+        assert_eq!(inherited.value.as_deref(), Some("medium"));
+
+        let mut provider_default = model_default;
+        provider_default.configured.clear();
+        let fallback = resolve_for_target(&provider_default, Some(&target), &preference, &surface);
+        assert_eq!(fallback.value.as_deref(), Some("high"));
+
+        let direct = resolve_for_target(&policy, None, &preference, &surface);
+        assert_eq!(direct.value.as_deref(), Some("low"));
+    }
+
+    #[test]
     fn effective_resolution_audits_stale_values_and_falls_through() {
         let preference = ModelPreferenceKey {
             family: "openai".into(),
@@ -751,27 +812,27 @@ mod tests {
         );
         let mut policy = TurnEffortPolicy {
             requested_model: "openai/gpt-custom".into(),
-            project_override: Some("stale".into()),
-            route_compatibility: HashMap::new(),
+            caller_override: Some("stale".into()),
+            route_targets: HashMap::new(),
             configured: HashMap::from([(preference.clone(), "also-stale".into())]),
             surfaces: HashMap::from([(surface.clone(), capabilities)]),
         };
 
-        let result = resolve_for_target(&policy, None, None, &preference, &surface);
+        let result = resolve_for_target(&policy, None, &preference, &surface);
         assert_eq!(result.value.as_deref(), Some("low"));
         assert_eq!(result.source, EffectiveEffortSource::Provider);
         assert_eq!(result.stored_status, Some(StoredEffortStatus::Unsupported));
 
         policy.surfaces.clear();
-        let result = resolve_for_target(&policy, None, None, &preference, &surface);
+        let result = resolve_for_target(&policy, None, &preference, &surface);
         assert_eq!(result.value, None);
         assert_eq!(
             result.stored_status,
             Some(StoredEffortStatus::UnknownMetadata)
         );
 
-        policy.project_override = None;
-        let result = resolve_for_target(&policy, None, None, &preference, &surface);
+        policy.caller_override = None;
+        let result = resolve_for_target(&policy, None, &preference, &surface);
         assert_eq!(result.stored_status, Some(StoredEffortStatus::Valid));
     }
 
@@ -840,13 +901,59 @@ mod tests {
             default_effort: Some("invalid".into()),
             ..Default::default()
         };
+        assert_eq!(invalid.merge_over(fallback).default_reasoning_effort, None);
+    }
+
+    #[test]
+    fn merge_does_not_guess_default_from_a_single_unadvertised_option() {
+        let discovered = DiscoveredModelMeta {
+            effort_options: Some(vec![option("high", "High", None)]),
+            ..Default::default()
+        };
+
         assert_eq!(
-            invalid
-                .merge_over(fallback)
-                .default_reasoning_effort
-                .as_deref(),
-            Some("ultra")
+            discovered
+                .merge_over(crate::llm_router::model_meta::FALLBACK.clone())
+                .default_reasoning_effort,
+            None
         );
+    }
+
+    #[test]
+    fn selection_omits_unadvertised_discovery_default_after_no_target_or_global() {
+        let surface = ExecutionSurfaceKey {
+            provider_id: "openai".into(),
+            connection_id: Some("openai-connection".into()),
+            model: "gpt-single".into(),
+        };
+        let policy = TurnEffortPolicy {
+            requested_model: "openai/gpt-single".into(),
+            caller_override: None,
+            route_targets: Default::default(),
+            configured: Default::default(),
+            surfaces: HashMap::from([(
+                surface.clone(),
+                ExecutionModelEffortCapabilities {
+                    surface: surface.clone(),
+                    model_display_name: "GPT Single".into(),
+                    supported: vec![option("high", "High", None)],
+                    provider_default: None,
+                },
+            )]),
+        };
+
+        let resolved = resolve_for_target(
+            &policy,
+            None,
+            &ModelPreferenceKey {
+                family: "openai".into(),
+                model: "gpt-single".into(),
+            },
+            &surface,
+        );
+
+        assert_eq!(resolved.value, None);
+        assert_eq!(resolved.source, EffectiveEffortSource::None);
     }
 
     #[tokio::test]
@@ -1049,6 +1156,6 @@ mod tests {
         let policy = build_session_effort_policy(&store, "chat-effort", "openai/gpt-5.5")
             .await
             .unwrap();
-        assert_eq!(policy.project_override.as_deref(), Some("high"));
+        assert_eq!(policy.caller_override.as_deref(), Some("high"));
     }
 }

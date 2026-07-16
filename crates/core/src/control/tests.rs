@@ -1,8 +1,8 @@
 use super::lifecycle::PrimaryTurn;
 use super::*;
 use crate::domain::{
-    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, SessionKind,
-    SessionStatus,
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, QueuedSessionPrompt,
+    SessionKind, SessionStatus,
 };
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;
@@ -307,6 +307,68 @@ impl HarnessFactory for FakeHarnessFactory {
             counters: self.counters.clone(),
         }))
     }
+}
+
+/// A controllable live session: every prompt is recorded, then waits for one
+/// permit. Queue-delivery tests release permits one turn at a time.
+struct ControlledSession {
+    prompts: Arc<Mutex<Vec<String>>>,
+    releases: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl HarnessSession for ControlledSession {
+    async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+        self.prompts.lock().unwrap().push(prompt.display);
+        self.releases.acquire().await.unwrap().forget();
+        Ok(())
+    }
+
+    async fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn end(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn agent_session_id(&self) -> Option<String> {
+        None
+    }
+}
+
+struct ErroringSession;
+
+#[async_trait]
+impl HarnessSession for ErroringSession {
+    async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("intentional turn error"))
+    }
+
+    async fn cancel(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn end(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn agent_session_id(&self) -> Option<String> {
+        None
+    }
+}
+
+async fn wait_for_controlled_prompts(prompts: &Arc<Mutex<Vec<String>>>, expected: usize) {
+    for _ in 0..400 {
+        if prompts.lock().unwrap().len() >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "timed out waiting for {expected} controlled prompt(s); got {:?}",
+        prompts.lock().unwrap()
+    );
 }
 
 /// A harness whose `start_session` parks until `release` is notified —
@@ -1623,10 +1685,13 @@ async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime()
 }
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
 /// the cold-resume rollback path in `continue_session`.
-struct FailingHarnessFactory;
+struct FailingHarnessFactory {
+    message: String,
+}
+
 impl HarnessFactory for FailingHarnessFactory {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
-        Err(anyhow::anyhow!("boom: harness factory intentionally fails"))
+        Err(anyhow::anyhow!(self.message.clone()))
     }
 }
 
@@ -1766,6 +1831,370 @@ fn parse_telemetry_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<serde_json::Val
 }
 
 #[tokio::test]
+async fn gateway_status_adapter_dispatches_only_matching_hook() {
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "project-1").await;
+    let matching = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "gateway status",
+            crate::automation::TriggerKind::GatewayStatusChanged,
+            "project-1",
+            "",
+            "local",
+            "record the gateway status",
+        ),
+    )
+    .await
+    .unwrap();
+    let other = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "session end",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "ignore",
+        ),
+    )
+    .await
+    .unwrap();
+
+    cp.observe_gateway_status_transition("discord", "offline", "connected")
+        .await;
+
+    let matching_runs = crate::automation::list_runs(&store, &matching.id)
+        .await
+        .unwrap();
+    assert_eq!(matching_runs.len(), 1);
+    assert_eq!(matching_runs[0].status, "running");
+    assert_eq!(matching_runs[0].envelope["source"]["kind"], "gateway");
+    assert_eq!(
+        matching_runs[0].envelope["data"]["previousStatus"],
+        "offline"
+    );
+    assert_eq!(matching_runs[0].envelope["data"]["status"], "connected");
+    assert!(crate::automation::list_runs(&store, &other.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn inbound_webhook_preserves_accepted_size_payload_in_run_and_agent_prompt() {
+    let (cp, store, prompts, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "project-1").await;
+    let hook = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::agent_run(
+            "inbound payload",
+            crate::automation::TriggerKind::WebhookInbound,
+            "project-1",
+            "",
+            "local",
+            "Process the webhook",
+        ),
+    )
+    .await
+    .unwrap();
+    let payload_overhead = serde_json::to_vec(&serde_json::json!({ "payload": "" }))
+        .unwrap()
+        .len();
+    let body = "x".repeat(crate::automation::MAX_INBOUND_WEBHOOK_BODY_BYTES - payload_overhead);
+    assert_eq!(
+        serde_json::to_vec(&serde_json::json!({ "payload": &body }))
+            .unwrap()
+            .len(),
+        crate::automation::MAX_INBOUND_WEBHOOK_BODY_BYTES,
+        "the simulated JSON body must be valid at the endpoint's accepted size"
+    );
+
+    cp.dispatch_inbound_webhook(
+        hook.clone(),
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::WebhookInbound,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("webhook", "wh_test"),
+            serde_json::json!({ "request": { "body": { "payload": body.clone() } } }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let run = crate::automation::list_runs(&store, &hook.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        run.envelope["data"]["request"]["body"]["payload"]
+            .as_str()
+            .is_some_and(|payload| payload == body),
+        "the persisted run must retain the complete accepted payload"
+    );
+    wait_for_prompts(&prompts, 1).await;
+    assert!(
+        prompts.lock().unwrap()[0].contains(&body),
+        "the agent prompt must retain the complete accepted payload"
+    );
+}
+
+#[tokio::test]
+async fn startup_failure_finishes_only_its_linked_agent_run_as_failed() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let mut regs = Registries::new();
+    regs.harness = Arc::new(FailingHarnessFactory {
+        message: format!("startup failure {}", "x".repeat(1_100)),
+    });
+    let cp = test_control_plane(store, regs).await;
+    seed_project(cp.store(), "project-1").await;
+    let hook = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "failing startup",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let unrelated = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "unrelated",
+            crate::automation::TriggerKind::SessionEnd,
+            "project-1",
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let unrelated_run = crate::automation::create_run(
+        cp.store(),
+        &unrelated.id,
+        serde_json::json!({ "unrelated": true }),
+    )
+    .await
+    .unwrap();
+    seed_session(
+        cp.store(),
+        "unrelated-session",
+        "project-1",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    cp.store()
+        .insert_hook_origin(
+            "unrelated-session",
+            &crate::automation::HookOrigin::new(&unrelated.id, &unrelated_run.id, 1),
+        )
+        .await
+        .unwrap();
+    assert!(crate::automation::link_run_session(
+        cp.store(),
+        &unrelated_run.id,
+        "unrelated-session"
+    )
+    .await
+    .unwrap());
+    let mut events = cp.subscribe();
+
+    cp.dispatch_automation_event(
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::SessionEnd,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("session", "test"),
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await;
+
+    let run = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("agent.run hook must create a run");
+    let session_pk = run
+        .session_pk
+        .clone()
+        .expect("agent.run hook must link its run to a session");
+    let startup_error = wait_for_message(cp.store(), &session_pk, |message| {
+        message.block_type == "error"
+    })
+    .await;
+
+    let failed = {
+        let mut terminal = None;
+        for _ in 0..400 {
+            let candidate = crate::automation::list_runs(cp.store(), &hook.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            if candidate.status != "running" {
+                terminal = Some(candidate);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        terminal.expect("startup failure must terminalize the linked hook run")
+    };
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.session_pk.as_deref(), Some(session_pk.as_str()));
+    let error = failed
+        .error
+        .as_deref()
+        .expect("startup error must be recorded");
+    assert!(error.starts_with("Couldn't start the agent: startup failure "));
+    assert_eq!(error.chars().count(), 1_024, "run errors are sanitized");
+    assert_eq!(
+        startup_error.payload["message"].as_str(),
+        Some(
+            format!(
+                "Couldn't start the agent: startup failure {}",
+                "x".repeat(1_100)
+            )
+            .as_str()
+        )
+    );
+
+    let unrelated_after = crate::automation::list_runs(cp.store(), &unrelated.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == unrelated_run.id)
+        .unwrap();
+    assert_eq!(unrelated_after.status, "running");
+    assert_eq!(
+        unrelated_after.session_pk.as_deref(),
+        Some("unrelated-session")
+    );
+    assert!(unrelated_after.error.is_none());
+
+    assert!(
+        !crate::automation::finish_run(
+            cp.store(),
+            &run.id,
+            "success",
+            Some("later-session"),
+            None,
+        )
+        .await
+        .unwrap(),
+        "the terminal startup failure must reject late completion"
+    );
+
+    let mut statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::AutomationHookRunChanged { run_id, status, .. } = event {
+            if run_id == run.id {
+                statuses.push(status);
+            }
+        }
+    }
+    assert!(
+        statuses.iter().any(|status| status == "failed"),
+        "startup failure must emit a failed run event, got: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "success"),
+        "startup failure must never emit a successful run event, got: {statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|status| matches!(status.as_str(), "running" | "failed")),
+        "startup failure must emit only running or failed events, got: {statuses:?}"
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
+async fn ending_a_hook_session_preserves_failed_run_and_never_emits_late_success() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let cp = test_control_plane(store, registries(true)).await;
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = cp
+        .connect_project(project_dir.path(), "automation")
+        .await
+        .unwrap();
+    let hook = crate::automation::create_hook(
+        cp.store(),
+        crate::automation::HookInput::agent_run(
+            "end race",
+            crate::automation::TriggerKind::ToolAfter,
+            &project.project_id,
+            "",
+            "local",
+            "run",
+        ),
+    )
+    .await
+    .unwrap();
+    let mut events = cp.subscribe();
+
+    cp.dispatch_automation_event(
+        crate::automation::AutomationEnvelope::new(
+            crate::automation::TriggerKind::ToolAfter,
+            "2026-01-01T00:00:00Z",
+            crate::automation::AutomationSource::new("tool", "test"),
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await;
+
+    let run = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let session_pk = run.session_pk.clone().expect("run is linked to a session");
+    wait_for_running_handle(&cp, &session_pk).await;
+
+    // The fake returns Ok only after cancellation, reproducing the late-success
+    // path that used to overwrite and emit success after end_session.
+    cp.end_session(&session_pk).await.unwrap();
+    for _ in 0..400 {
+        if cp.running_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(cp.running_count(), 0, "cancelled prompt must finish");
+
+    let stored = crate::automation::list_runs(cp.store(), &hook.id)
+        .await
+        .unwrap();
+    assert_eq!(stored[0].status, "failed");
+    assert_eq!(stored[0].error.as_deref(), Some("session cancelled"));
+
+    let mut run_statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::AutomationHookRunChanged { run_id, status, .. } = event {
+            if run_id == run.id {
+                run_statuses.push(status);
+            }
+        }
+    }
+    assert_eq!(run_statuses, ["running", "failed"]);
+    drop(db_guard);
+}
+
+#[tokio::test]
 #[serial]
 async fn start_session_emits_session_run_count_and_harness_run_span() {
     let _guard = StateDirGuard::new();
@@ -1862,7 +2291,9 @@ async fn control_plane_with_failing_factory(
     let (db_guard, db_path) = temp_db_path();
     let store = crate::store::Store::open(&db_path).await.unwrap();
     let mut regs = Registries::new();
-    regs.harness = Arc::new(FailingHarnessFactory);
+    regs.harness = Arc::new(FailingHarnessFactory {
+        message: "boom: harness factory intentionally fails".into(),
+    });
     let cp = test_control_plane(store, regs).await;
     let store_ref = cp.store.clone();
     (cp, store_ref, db_guard)
@@ -1958,6 +2389,25 @@ async fn wait_for_primary_run_statuses(
             other => {
                 panic!("timed out waiting for primary run {run_id} lifecycle events: {other:?}")
             }
+        }
+    }
+}
+
+/// Receive events until one matches `predicate`, skipping any interleaved
+/// `AgentRunChanged` lifecycle events a Plan4 owned turn also emits — tests
+/// written against the plain event stream only care about their own named
+/// event, not every intermediate run-status transition.
+async fn recv_event_matching(
+    rx: &mut broadcast::Receiver<CoreEvent>,
+    predicate: impl Fn(&CoreEvent) -> bool,
+) -> CoreEvent {
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for matching event")
+            .unwrap();
+        if predicate(&event) {
+            return event;
         }
     }
 }
@@ -2064,6 +2514,611 @@ async fn wait_for_session_ctx_principals(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!("timed out waiting for the harness SessionCtx");
+}
+
+#[tokio::test]
+async fn delivering_a_queued_prompt_cleans_its_owned_copy_but_not_external_file() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-delivery-cleanup";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let owned_dir = root.join("queue").join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    let owned = owned_dir.join("note.txt");
+    tokio::fs::write(&owned, b"owned").await.unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("external.txt");
+    tokio::fs::write(&external, b"external").await.unwrap();
+    let attachment = |name: &str, path: &std::path::Path| AttachmentRef {
+        name: name.into(),
+        url: crate::attachments::file_url_for_path(path)
+            .unwrap()
+            .to_string(),
+        content_type: None,
+        size: 0,
+    };
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![
+                attachment("owned", &owned),
+                attachment("external", &external),
+            ],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    cp.deliver_next_queued_session_prompt(session_pk)
+        .await
+        .unwrap();
+    assert!(!owned_dir.exists());
+    assert!(external.exists());
+}
+
+#[tokio::test]
+async fn removing_a_queued_prompt_cleans_its_owned_copy_but_not_external_file() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-remove-cleanup";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let owned_dir = root.join("queue").join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    let owned = owned_dir.join("note.txt");
+    tokio::fs::write(&owned, b"owned").await.unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("external.txt");
+    tokio::fs::write(&external, b"external").await.unwrap();
+    let attachment = |name: &str, path: &std::path::Path| AttachmentRef {
+        name: name.into(),
+        url: crate::attachments::file_url_for_path(path)
+            .unwrap()
+            .to_string(),
+        content_type: None,
+        size: 0,
+    };
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![
+                attachment("owned", &owned),
+                attachment("external", &external),
+            ],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    assert!(cp.remove_session_prompt(session_pk, "owned").await.unwrap());
+    assert!(!owned_dir.exists());
+    assert!(external.exists());
+}
+
+#[tokio::test]
+async fn removing_a_queued_prompt_does_not_clean_an_owned_dir_for_a_queue_root_url() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-remove-root-url";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let queue_dir = root.join("queue");
+    let owned_dir = queue_dir.join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    tokio::fs::write(owned_dir.join("note.txt"), b"owned")
+        .await
+        .unwrap();
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![AttachmentRef {
+                name: "queue".into(),
+                url: crate::attachments::file_url_for_path(&queue_dir)
+                    .unwrap()
+                    .to_string(),
+                content_type: None,
+                size: 0,
+            }],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    assert!(cp.remove_session_prompt(session_pk, "owned").await.unwrap());
+    assert!(
+        owned_dir.exists(),
+        "a queue-root URL does not own this prompt directory"
+    );
+}
+
+#[tokio::test]
+async fn end_session_purges_pending_and_claimed_prompts_and_cleans_owned_copies() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-end-cleanup";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let root = cp.attachments_root().await;
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("external.txt");
+    tokio::fs::write(&external, b"external").await.unwrap();
+    for id in ["claimed", "pending"] {
+        let owned_dir = root.join("queue").join(id);
+        tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+        let owned = owned_dir.join("note.txt");
+        tokio::fs::write(&owned, id).await.unwrap();
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: id.into(),
+                session_pk: session_pk.into(),
+                agent: id.into(),
+                display: id.into(),
+                attachments: vec![
+                    AttachmentRef {
+                        name: "owned".into(),
+                        url: crate::attachments::file_url_for_path(&owned)
+                            .unwrap()
+                            .to_string(),
+                        content_type: None,
+                        size: 0,
+                    },
+                    AttachmentRef {
+                        name: "external".into(),
+                        url: crate::attachments::file_url_for_path(&external)
+                            .unwrap()
+                            .to_string(),
+                        content_type: None,
+                        size: 0,
+                    },
+                ],
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .claim_next_session_prompt("queued-end-cleanup")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "claimed"
+    );
+
+    cp.end_session(session_pk).await.unwrap();
+
+    assert!(store
+        .list_session_prompt_queue(session_pk)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .take_completed_claimed_session_prompt("claimed")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!root.join("queue").join("claimed").exists());
+    assert!(!root.join("queue").join("pending").exists());
+    assert!(external.exists());
+}
+
+#[tokio::test]
+async fn failed_queued_delivery_restores_the_prompt_and_keeps_its_owned_copy() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-delivery-failure";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let workdir_root = tempfile::tempdir().unwrap();
+    SettingsStore::new(store.clone())
+        .set("workdir_root", workdir_root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let owned_dir = cp.attachments_root().await.join("queue").join("owned");
+    tokio::fs::create_dir_all(&owned_dir).await.unwrap();
+    let owned = owned_dir.join("note.txt");
+    tokio::fs::write(&owned, b"owned").await.unwrap();
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "owned".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![AttachmentRef {
+                name: "owned".into(),
+                url: crate::attachments::file_url_for_path(&owned)
+                    .unwrap()
+                    .to_string(),
+                content_type: None,
+                size: 0,
+            }],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+    cp.draining.store(true, Ordering::SeqCst);
+
+    assert!(cp
+        .deliver_next_queued_session_prompt(session_pk)
+        .await
+        .is_err());
+    assert!(owned_dir.exists());
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["owned"]
+    );
+    assert_eq!(
+        store.get_session(session_pk).await.unwrap().unwrap().status,
+        SessionStatus::Idle
+    );
+}
+
+#[tokio::test]
+async fn enqueue_for_idle_session_starts_the_fifo_head_once() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-idle";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let releases = Arc::new(tokio::sync::Semaphore::new(0));
+    cp.running.lock().unwrap().insert(
+        session_pk.into(),
+        Arc::new(ControlledSession {
+            prompts: prompts.clone(),
+            releases: releases.clone(),
+        }),
+    );
+    for (id, display) in [("first", "first queued"), ("second", "second queued")] {
+        cp.enqueue_session_prompt(QueuedSessionPrompt {
+            id: id.into(),
+            session_pk: session_pk.into(),
+            agent: display.into(),
+            display: display.into(),
+            attachments: vec![],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+    }
+
+    wait_for_controlled_prompts(&prompts, 1).await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["first queued"]);
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["second"]
+    );
+    releases.add_permits(1);
+    wait_for_controlled_prompts(&prompts, 2).await;
+    assert_eq!(
+        prompts.lock().unwrap().as_slice(),
+        ["first queued", "second queued"]
+    );
+}
+
+#[tokio::test]
+async fn queued_prompt_delivers_one_head_per_successful_turn() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-turns";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let releases = Arc::new(tokio::sync::Semaphore::new(0));
+    cp.running.lock().unwrap().insert(
+        session_pk.into(),
+        Arc::new(ControlledSession {
+            prompts: prompts.clone(),
+            releases: releases.clone(),
+        }),
+    );
+    for (id, display) in [("first", "first queued"), ("second", "second queued")] {
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: id.into(),
+                session_pk: session_pk.into(),
+                agent: format!("agent {display}"),
+                display: display.into(),
+                attachments: vec![],
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut events = cp.subscribe();
+    cp.continue_session_with_prompt(session_pk, TurnPrompt::text("current", "current"), &[])
+        .await
+        .unwrap();
+    wait_for_controlled_prompts(&prompts, 1).await;
+    assert_eq!(prompts.lock().unwrap().as_slice(), ["current"]);
+
+    releases.add_permits(1);
+    wait_for_controlled_prompts(&prompts, 2).await;
+    assert!(matches!(
+        recv_event_matching(&mut events, |e| matches!(e, CoreEvent::Result { .. })).await,
+        CoreEvent::Result { session_pk: event_session } if event_session == session_pk
+    ));
+    assert!(matches!(
+        recv_event_matching(&mut events, |e| matches!(e, CoreEvent::SessionQueueChanged { .. })).await,
+        CoreEvent::SessionQueueChanged { session_pk: event_session } if event_session == session_pk
+    ));
+    assert_eq!(
+        prompts.lock().unwrap().as_slice(),
+        ["current", "first queued"]
+    );
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["second"]
+    );
+
+    releases.add_permits(1);
+    wait_for_controlled_prompts(&prompts, 3).await;
+    assert_eq!(
+        prompts.lock().unwrap().as_slice(),
+        ["current", "first queued", "second queued"]
+    );
+    releases.add_permits(1);
+    for _ in 0..400 {
+        if store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("queued prompts were not fully delivered");
+}
+
+#[tokio::test]
+async fn errored_turn_does_not_drain_queued_prompt() {
+    let (cp, store, _db_guard) = fake_control_plane_any_harness().await;
+    let session_pk = "queued-error";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    cp.running
+        .lock()
+        .unwrap()
+        .insert(session_pk.into(), Arc::new(ErroringSession));
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "pending".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    cp.continue_session_with_prompt(session_pk, TurnPrompt::text("current", "current"), &[])
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if store.get_session(session_pk).await.unwrap().unwrap().status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["pending"]
+    );
+}
+
+#[tokio::test]
+async fn stopped_turn_does_not_drain_queued_prompt() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(true, counters.clone())).await;
+    let store = cp.store.clone();
+    let session_pk = "queued-stop";
+    seed_project(&store, "project").await;
+    seed_session(
+        &store,
+        session_pk,
+        "project",
+        SessionStatus::Running,
+        None,
+        0,
+    )
+    .await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    cp.running.lock().unwrap().insert(
+        session_pk.into(),
+        Arc::new(FakeSession {
+            store: store.clone(),
+            events: cp.events.clone(),
+            session_pk: session_pk.into(),
+            run_id: "run-".to_string() + session_pk,
+            isolated_target: false,
+            block_until_cancel: true,
+            completion_gate: None,
+            failure: None,
+            cancelled,
+            send_count: counters.sends.clone(),
+            ended: counters.ended.clone(),
+            cancels: counters.cancels.clone(),
+            prompts: counters.prompts.clone(),
+            steered: counters.steered.clone(),
+            primary_turns: counters.primary_turns.clone(),
+            perm_modes: counters.perm_modes.clone(),
+        }),
+    );
+    store
+        .enqueue_session_prompt(QueuedSessionPrompt {
+            id: "pending".into(),
+            session_pk: session_pk.into(),
+            agent: "queued".into(),
+            display: "queued".into(),
+            attachments: vec![],
+            created_at: now_ms(),
+        })
+        .await
+        .unwrap();
+
+    cp.continue_session_with_prompt(session_pk, TurnPrompt::text("current", "current"), &[])
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if counters.sends.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    cp.stop_session(session_pk).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["pending"]
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
+async fn queued_prompt_delivery_restores_head_and_emits_change_when_continuation_fails() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let mut registries = Registries::new();
+    registries.harness = Arc::new(FailingHarnessFactory {
+        message: "failing harness".into(),
+    });
+    let cp = test_control_plane(store, registries).await;
+    let store = cp.store.clone();
+    let session_pk = "queued-restore";
+    seed_project(&store, "project").await;
+    seed_session(&store, session_pk, "project", SessionStatus::Idle, None, 0).await;
+    for (id, display) in [("first", "first queued"), ("second", "second queued")] {
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: id.into(),
+                session_pk: session_pk.into(),
+                agent: display.into(),
+                display: display.into(),
+                attachments: vec![],
+                created_at: now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut events = cp.subscribe();
+    assert!(cp
+        .deliver_next_queued_session_prompt(session_pk)
+        .await
+        .is_err());
+    assert!(matches!(
+        recv_event_matching(&mut events, |e| matches!(e, CoreEvent::SessionQueueChanged { .. })).await,
+        CoreEvent::SessionQueueChanged { session_pk: event_session } if event_session == session_pk
+    ));
+    let status = store.get_session(session_pk).await.unwrap().unwrap().status;
+    assert_eq!(status, SessionStatus::Idle);
+    assert_eq!(
+        store
+            .list_session_prompt_queue(session_pk)
+            .await
+            .unwrap()
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    drop(db_guard);
 }
 
 #[tokio::test]
@@ -2627,7 +3682,17 @@ async fn start_session_streams_events_and_records_agent_id() {
     .expect("session must emit a result or error");
     assert!(events.contains(&"working".to_string()));
 
-    let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let stored = cp.list_sessions(Some(&project.project_id)).await.unwrap();
+            if stored[0].status == crate::domain::SessionStatus::Idle {
+                return stored;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("session must demote to Idle after its result event");
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].agent_session_id.as_deref(), Some("agent-1"));
     assert_eq!(session.status, crate::domain::SessionStatus::Running);
@@ -2962,7 +4027,7 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .unwrap();
     assert!(stored.worktree_path.is_some(), "worktree path backfilled");
     let branch = stored.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"), "got: {branch}");
+    assert!(branch.starts_with("ryuzi/"), "got: {branch}");
     assert!(stored.branch_owned);
 
     // …and the progress rows landed in order.
@@ -2974,7 +4039,7 @@ async fn start_returns_the_session_before_workspace_prep_and_backfills_it() {
         .collect();
     assert_eq!(statuses[0], "Creating worktree…");
     assert!(
-        statuses[1].starts_with("Created and checked out branch harness/"),
+        statuses[1].starts_with("Created and checked out branch ryuzi/"),
         "got: {statuses:?}"
     );
     assert_eq!(statuses[2], "Connecting tools…");
@@ -3384,6 +4449,49 @@ async fn continue_during_startup_waits_and_reuses_the_startup_handle() {
         prompts.contains(&"first".to_string()) && prompts.contains(&"second".to_string()),
         "both the startup prompt and the follow-up ran; got: {prompts:?}"
     );
+}
+
+#[tokio::test]
+async fn reconcile_fails_queued_automation_runs_while_resuming_running_sessions() {
+    let (cp, store, prompt_log, _db_guard) = fake_control_plane().await;
+    seed_project(&store, "p1").await;
+    seed_session(
+        &store,
+        "s1",
+        "p1",
+        SessionStatus::Running,
+        Some("acp-123"),
+        0,
+    )
+    .await;
+    let hook = crate::automation::create_hook(
+        &store,
+        crate::automation::HookInput::outbound(
+            "Restart queued",
+            crate::automation::TriggerKind::SessionEnd,
+            "https://example.com/hook",
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let run = crate::automation::create_run(&store, &hook.id, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    cp.reconcile().await.unwrap();
+    wait_for_prompts(&prompt_log, 1).await;
+
+    assert_eq!(prompt_log.lock().unwrap()[0], RESUME_NUDGE);
+    let stored = crate::automation::list_runs(&store, &hook.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|stored| stored.id == run.id)
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert_eq!(stored.error.as_deref(), Some("restart interrupted"));
+    assert!(stored.finished_at.is_some());
 }
 
 #[tokio::test]
@@ -4903,7 +6011,7 @@ async fn engine_named_branch_is_deleted_on_end_session() {
         .unwrap()
         .unwrap();
     let branch = stored.branch.clone().unwrap();
-    assert!(branch.starts_with("harness/"));
+    assert!(branch.starts_with("ryuzi/"));
 
     cp.end_session(&session.session_pk).await.unwrap();
 

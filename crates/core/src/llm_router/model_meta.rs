@@ -257,9 +257,6 @@ fn finalize_default(mut meta: ModelMeta) -> ModelMeta {
     {
         meta.default_reasoning_effort = None;
     }
-    if meta.default_reasoning_effort.is_none() && meta.reasoning_efforts.len() == 1 {
-        meta.default_reasoning_effort = Some(meta.reasoning_efforts[0].value.clone());
-    }
     meta
 }
 
@@ -596,6 +593,21 @@ mod tests {
                 "must always resolve to the lexicographically smallest key (m-20240101)"
             );
         }
+    }
+
+    #[test]
+    fn finalize_default_does_not_guess_from_a_single_effort_option() {
+        let meta = finalize_default(ModelMeta {
+            reasoning_efforts: vec![ReasoningEffortOption {
+                value: "ultra".into(),
+                label: "Ultra".into(),
+                description: None,
+            }],
+            default_reasoning_effort: None,
+            ..FALLBACK
+        });
+
+        assert_eq!(meta.default_reasoning_effort, None);
     }
 
     #[test]

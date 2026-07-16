@@ -1,11 +1,11 @@
 //! Session lifecycle: start/continue/resume/reconcile/stop/end, plus the
 //! harness-session wiring and the background prompt driver.
 
-use super::{ControlPlane, RESUME_NUDGE};
+use super::{ControlPlane, WorkerBinding, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
 use crate::domain::{
-    AgentRunKind, AttachmentRef, CoreEvent, NewAgentRun, NewMessage, PermMode, Project, Session,
-    SessionGitOptions, SessionKind, SessionStatus, WriteOrigin,
+    AgentRunKind, AttachmentRef, CoreEvent, NewAgentRun, NewMessage, PermMode, Project,
+    QueuedSessionPrompt, Session, SessionGitOptions, SessionKind, SessionStatus, WriteOrigin,
 };
 use crate::harness::{HarnessSession, PrimaryTurnConfig, SessionCtx, TurnPrompt};
 use crate::mentions::{
@@ -176,7 +176,7 @@ impl ControlPlane {
         started_by: &str,
         attachments: &[AttachmentRef],
         git: Option<SessionGitOptions>,
-        _worker: Option<()>,
+        worker: Option<WorkerBinding>,
         model_override: Option<String>,
         resolved_mentions: Option<ResolvedMentions>,
     ) -> anyhow::Result<Session> {
@@ -210,7 +210,7 @@ impl ControlPlane {
                     .is_git
                     .then(|| git.branch_name.clone().or_else(|| git.base_branch.clone()))
                     .flatten();
-                let kind = if _worker.is_some() {
+                let kind = if worker.is_some() {
                     SessionKind::Worker
                 } else {
                     SessionKind::Project
@@ -239,9 +239,11 @@ impl ControlPlane {
             resume_attempts: 0,
             branch_owned,
             kind,
-            speaker: None,
-            agent: None,
-            parent_session_pk: None,
+            speaker: worker.as_ref().map(|worker| worker.agent.clone()),
+            agent: worker.as_ref().map(|worker| worker.agent.clone()),
+            parent_session_pk: worker
+                .as_ref()
+                .and_then(|worker| worker.home_session_pk.clone()),
         };
         let model_override = model_override.filter(|model| !model.trim().is_empty());
         let (resolved_model, resolved_effort) = model_override
@@ -435,21 +437,62 @@ impl ControlPlane {
         git: Option<SessionGitOptions>,
         _perm_mode: Option<PermMode>,
         model_override: Option<String>,
-        _worker: Option<()>,
+        worker: Option<WorkerBinding>,
     ) -> anyhow::Result<Session> {
-        let primary_agent_id = self.registry.default_agent_id().await;
-        self.start_owned_agent_session_with_prompt(
-            Some(project_id),
-            &primary_agent_id,
+        self.start_session_with_prompt_and_origin(
+            project_id,
             prompt,
             started_by,
             attachments,
             git,
-            _worker,
+            _perm_mode,
             model_override,
+            worker,
             None,
         )
         .await
+    }
+
+    /// Start an automation-origin session while preserving Plan4 primary ownership.
+    /// The automation action agent, when set, is the durable primary owner;
+    /// otherwise the registry default owns the session.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_session_with_prompt_and_origin(
+        self: &Arc<Self>,
+        project_id: &str,
+        prompt: TurnPrompt,
+        started_by: &str,
+        attachments: &[AttachmentRef],
+        git: Option<SessionGitOptions>,
+        _perm_mode: Option<PermMode>,
+        model_override: Option<String>,
+        worker: Option<WorkerBinding>,
+        automation_origin: Option<crate::automation::HookOrigin>,
+    ) -> anyhow::Result<Session> {
+        let primary_agent_id = worker
+            .as_ref()
+            .map(WorkerBinding::primary_agent_id)
+            .map(str::to_owned)
+            .unwrap_or(self.registry.default_agent_id().await);
+        let session = self
+            .start_owned_agent_session_with_prompt(
+                Some(project_id),
+                &primary_agent_id,
+                prompt,
+                started_by,
+                attachments,
+                git,
+                worker,
+                model_override,
+                None,
+            )
+            .await?;
+        if let Some(origin) = automation_origin {
+            self.store
+                .insert_hook_origin(&session.session_pk, &origin)
+                .await?;
+        }
+        Ok(session)
     }
 
     /// Start a project-less (`kind = Chat`) session: no project, no git prep,
@@ -566,6 +609,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
             resolved_mentions,
         );
@@ -587,6 +631,88 @@ impl ControlPlane {
             .await
     }
 
+    /// Remove a pending queue row and clean up only attachments owned by that row.
+    pub async fn remove_session_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+        id: &str,
+    ) -> anyhow::Result<bool> {
+        let removed = self.store.take_session_prompt(session_pk, id).await?;
+        if let Some(prompt) = removed {
+            self.cleanup_queue_attachments(&prompt).await;
+            let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                session_pk: session_pk.to_string(),
+            });
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Persist a queued prompt, notify queue observers, and opportunistically
+    /// start its FIFO head if this session is idle. A failed delivery kick
+    /// leaves the accepted row durable for a later idle transition.
+    pub async fn enqueue_session_prompt(
+        self: &Arc<Self>,
+        prompt: QueuedSessionPrompt,
+    ) -> anyhow::Result<()> {
+        let session_pk = prompt.session_pk.clone();
+        self.store.enqueue_session_prompt(prompt).await?;
+        let _ = self.events.send(CoreEvent::SessionQueueChanged {
+            session_pk: session_pk.clone(),
+        });
+        let _ = self.deliver_next_queued_session_prompt(&session_pk).await;
+        Ok(())
+    }
+
+    /// Claim and deliver one durable queued prompt after a session becomes idle.
+    /// A claimed row stays claimed until the continuation has been accepted;
+    /// a failed start restores the row at its original FIFO position.
+    pub async fn deliver_next_queued_session_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+    ) -> anyhow::Result<()> {
+        let Some(queued) = self
+            .store
+            .claim_next_session_prompt_if_idle(session_pk)
+            .await?
+        else {
+            return Ok(());
+        };
+        let id = queued.id.clone();
+        let attachments = queued.attachments.clone();
+        let prompt = queued.into_turn_prompt();
+
+        match self
+            .continue_reserved_session_with_prompt(session_pk, prompt, &attachments)
+            .await
+        {
+            Ok(()) => {
+                if let Some(delivered) = self
+                    .store
+                    .take_completed_claimed_session_prompt(&id)
+                    .await?
+                {
+                    self.cleanup_queue_attachments(&delivered).await;
+                }
+                let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                    session_pk: session_pk.to_string(),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.store.restore_claimed_session_prompt(&id).await?;
+                // The queue claim already marked the session Running. Restore its
+                // idle state so the FIFO head remains deliverable later.
+                let _ = self.store.demote_if_running(session_pk, now_ms()).await;
+                let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                    session_pk: session_pk.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
     pub async fn continue_session_with_prompt(
         self: &Arc<Self>,
         session_pk: &str,
@@ -596,6 +722,48 @@ impl ControlPlane {
         self.continue_agent_session_with_prompt(session_pk, prompt, attachments)
             .await
             .map(|_| ())
+    }
+
+    /// Deliver a queue row whose claim already promoted the session to Running.
+    /// It creates exactly one Plan4 primary run and does not repeat the
+    /// ordinary continuation's status reservation.
+    async fn continue_reserved_session_with_prompt(
+        self: &Arc<Self>,
+        session_pk: &str,
+        prompt: TurnPrompt,
+        attachments: &[AttachmentRef],
+    ) -> anyhow::Result<()> {
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("daemon is draining for an update; try again shortly");
+        }
+        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
+            .await?
+        {
+            SessionAgentAccess::Executable { agent_id } => agent_id,
+            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
+            SessionAgentAccess::DeletedReadOnly { .. } => {
+                anyhow::bail!("the session's primary agent was deleted")
+            }
+        };
+        let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
+        validate_executable_primary(&self.registries, &primary_agent)?;
+        let run = self
+            .delegation
+            .begin_primary(session_pk, primary_agent.clone(), &prompt.display)
+            .await?;
+        let run_id = run.run.run_id.clone();
+        self.continue_session_with_primary_turn(
+            session_pk,
+            prompt,
+            attachments,
+            PrimaryTurn {
+                agent: primary_agent,
+                root_run_id: run_id.clone(),
+                run_id,
+            },
+            None,
+        )
+        .await
     }
 
     async fn continue_session_with_primary_turn(
@@ -617,10 +785,6 @@ impl ControlPlane {
 
         let primary_config = primary_turn.config()?;
         let run_id = primary_turn.run_id.clone();
-
-        self.store
-            .update_status(session_pk, SessionStatus::Running, None)
-            .await?;
 
         // A session still in background startup has no live handle yet, and its
         // FIRST prompt hasn't been driven. Cold-resuming now would spawn a
@@ -712,6 +876,7 @@ impl ControlPlane {
                     display: prompt.display,
                     blocks: prepared.image_blocks,
                     attachments: prepared.attachments_meta,
+                    force_subtask: prompt.force_subtask,
                 },
                 Some(resolved_mentions),
             );
@@ -725,6 +890,7 @@ impl ControlPlane {
                     display: prompt.display,
                     blocks: prepared.image_blocks,
                     attachments: prepared.attachments_meta,
+                    force_subtask: prompt.force_subtask,
                 },
             );
         }
@@ -1014,6 +1180,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                force_subtask: prompt.force_subtask,
             },
             resolved_mentions,
         );
@@ -1032,6 +1199,8 @@ impl ControlPlane {
     async fn fail_startup(&self, session_pk: &str, run_id: &str, message: &str) {
         let _ = self.delegation.fail(run_id, message).await;
         self.emit_error(session_pk, message).await;
+        self.finish_automation_session(session_pk, "failed", Some(message))
+            .await;
         let _ = self.store.demote_if_running(session_pk, now_ms()).await;
         let _ = self.events.send(CoreEvent::Error {
             session_pk: session_pk.to_string(),
@@ -1331,6 +1500,7 @@ impl ControlPlane {
     /// On boot: resume every session a dead process left in Running. Each
     /// resume is isolated so one bad session can't block the rest.
     pub async fn reconcile(self: &Arc<Self>) -> anyhow::Result<()> {
+        crate::automation::fail_incomplete_runs_on_restart(&self.store).await?;
         for s in self
             .store
             .list_sessions_by_status(SessionStatus::Running)
@@ -1496,6 +1666,9 @@ impl ControlPlane {
             extension_tools,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
+            automation_events: Some(Arc::new(super::ControlPlaneAutomationSink(Arc::downgrade(
+                self,
+            )))),
             background: self.background.clone(),
             agent_knowledge: self.agent_persistence.knowledge.clone(),
             learning_queue: self.agent_persistence.learning.clone(),
@@ -1932,7 +2105,16 @@ impl ControlPlane {
                     let _ = me.events.send(CoreEvent::Result {
                         session_pk: session_pk.clone(),
                     });
-                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
+                    me.finish_automation_session(&session_pk, "success", None)
+                        .await;
+                    if me
+                        .store
+                        .demote_if_running(&session_pk, now_ms())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        let _ = me.deliver_next_queued_session_prompt(&session_pk).await;
+                    }
                 }
                 Err(e) => {
                     let message = e.to_string();
@@ -1956,6 +2138,8 @@ impl ControlPlane {
                     // "error" handler no longer appends its own transient
                     // copy). Mirrors `fail_startup`.
                     me.emit_error(&session_pk, &message).await;
+                    me.finish_automation_session(&session_pk, "failed", Some(&message))
+                        .await;
                     // Demote BEFORE the broadcast so a subscriber that
                     // refreshes on Error (the UI does) never reads a stale
                     // Running row.
@@ -2022,6 +2206,8 @@ impl ControlPlane {
         self.store
             .update_status(session_pk, SessionStatus::Interrupted, Some(now_ms()))
             .await?;
+        self.finish_automation_session(session_pk, "failed", Some("session cancelled"))
+            .await;
         Ok(())
     }
 
@@ -2040,12 +2226,29 @@ impl ControlPlane {
             token.cancel();
             self.wait_for_startup(session_pk).await;
         }
+        self.store
+            .update_status(session_pk, SessionStatus::Ended, Some(now_ms()))
+            .await?;
+        // A cancelled hook-origin turn can still return Ok while its handle is
+        // unwinding. Terminally fail its run before cancellation so that late
+        // completion loses the guarded transition.
+        self.finish_automation_session(session_pk, "failed", Some("session cancelled"))
+            .await;
         let handle = self.running.lock().unwrap().remove(session_pk);
         if let Some(handle) = handle {
             // Interrupt any in-flight turn first so teardown doesn't race a
             // still-working agent inside the worktree we're about to delete.
             let _ = handle.cancel().await;
             let _ = handle.end().await;
+        }
+        let removed_prompts = self.store.take_all_session_prompts(session_pk).await?;
+        for prompt in &removed_prompts {
+            self.cleanup_queue_attachments(prompt).await;
+        }
+        if !removed_prompts.is_empty() {
+            let _ = self.events.send(CoreEvent::SessionQueueChanged {
+                session_pk: session_pk.to_string(),
+            });
         }
         // Cancel every active delegation tree after the primary turn is
         // interrupted, matching `stop_session`: a detached main or background
@@ -2122,9 +2325,9 @@ impl ControlPlane {
         }
         // Best-effort cleanup of any downloaded attachments for this session.
         let _ = tokio::fs::remove_dir_all(self.attachment_dest_dir(session_pk).await).await;
-        self.store
-            .update_status(session_pk, SessionStatus::Ended, Some(now_ms()))
-            .await?;
+        // The terminal status was persisted before `handle.end()` so its
+        // lifecycle observer reads a final row. Do not finalize hook-run
+        // success here: a prior stop/cancel or turn failure owns that result.
         let _ = self.events.send(CoreEvent::SessionEnded {
             session_pk: session_pk.to_string(),
         });
@@ -2265,6 +2468,7 @@ impl ControlPlane {
             store: store.clone(),
             events: self.events.clone(),
             approvals: self.approvals.clone(),
+            automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
             agent: runner::review_agent(payload.system.clone()),
@@ -2290,6 +2494,9 @@ impl ControlPlane {
             // Cache parity: advertise the parent's FULL captured tool set —
             // dispatch (`agent.tools`, above) still enforces the whitelist.
             review_tool_defs: Some(payload.tool_defs.clone()),
+            // Irrelevant: `current_tool_defs` short-circuits on
+            // `review_tool_defs` above before ever consulting this field.
+            activated_tools: None,
             write_origin: WriteOrigin::BackgroundReview,
             // The review fork's `Agent` sets `can_delegate: false` and its
             // tool whitelist excludes `delegate_agent` entirely — it is an

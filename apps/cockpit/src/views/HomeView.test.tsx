@@ -132,6 +132,7 @@ const { useConnections } = await import("@/store-connections");
 const { useAgents } = await import("@/store-agents");
 const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
+const { useNative } = await import("@/store-native");
 
 function project(overrides: Partial<Project> = {}): Project {
   return {
@@ -221,6 +222,7 @@ beforeEach(() => {
   });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
+  useNative.setState({ commandsByProject: {} });
   useNav.setState({ composerBranch: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
@@ -241,6 +243,7 @@ afterEach(() => {
   useAgents.setState({ registry: null, models: [] });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
+  useNative.setState({ commandsByProject: {} });
 });
 
 test("git project: branch pill shows and branches are fetched", async () => {
@@ -260,6 +263,75 @@ test("non-git project: no branch pill, no worktree toggle, no list_branches call
   // Let the other mount effect flush so a stray branch fetch would have fired by now.
   await waitFor(() => expect(nativeCommands).toHaveBeenCalledWith(LOCAL_RUNNER, "p1"));
   expect(listBranches).not.toHaveBeenCalled();
+});
+
+test("only suggests each effective slash command from the catalog", async () => {
+  nativeCommands.mockResolvedValueOnce({
+    status: "ok",
+    data: [
+      {
+        name: "ship",
+        description: "Project ship",
+        agent: null,
+        model: null,
+        subtask: false,
+        origin: "project",
+        effective: true,
+        shadowsGlobal: true,
+      },
+      {
+        name: "ship",
+        description: "Global ship",
+        agent: null,
+        model: null,
+        subtask: false,
+        origin: "global",
+        effective: false,
+        shadowsGlobal: false,
+      },
+      {
+        name: "init",
+        description: "Project init",
+        agent: null,
+        model: null,
+        subtask: false,
+        origin: "project",
+        effective: false,
+        shadowsGlobal: true,
+      },
+      {
+        name: "init",
+        description: "Global init",
+        agent: null,
+        model: null,
+        subtask: false,
+        origin: "global",
+        effective: false,
+        shadowsGlobal: false,
+      },
+      {
+        name: "init",
+        description: "Built-in init",
+        agent: null,
+        model: null,
+        subtask: false,
+        origin: "builtin",
+        effective: true,
+        shadowsGlobal: false,
+      },
+    ],
+  });
+  render(<HomeView />);
+
+  fireEvent.change(screen.getByPlaceholderText("Do anything"), { target: { value: "/" } });
+
+  expect(await screen.findByText("Project ship")).toBeTruthy();
+  expect(screen.getAllByText("/ship")).toHaveLength(1);
+  expect(screen.queryByText("Global ship")).toBeNull();
+  expect(await screen.findByText("Built-in init")).toBeTruthy();
+  expect(screen.getAllByText("/init")).toHaveLength(1);
+  expect(screen.queryByText("Project init")).toBeNull();
+  expect(screen.queryByText("Global init")).toBeNull();
 });
 
 test("composer text is read from the persisted draft map (key home:{projectId})", async () => {

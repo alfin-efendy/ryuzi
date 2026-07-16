@@ -69,7 +69,18 @@ export function SessionCostPanel({ runnerId, sessionPk }: { runnerId: string; se
                     <span>{fmtUsd(m.usd)}</span>
                   </div>
                   <div className="text-muted-foreground">
-                    {fmtTokens(m.input)} in · {fmtTokens(m.output)} out · {fmtTokens(m.cacheRead + m.cacheCreation)} cache
+                    <div className="flex justify-between">
+                      <span>In</span>
+                      <span>{fmtTokens(m.input)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Out</span>
+                      <span>{fmtTokens(m.output)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Cache</span>
+                      <span>{fmtTokens(m.cacheRead + m.cacheCreation)}</span>
+                    </div>
                   </div>
                 </div>
               ))

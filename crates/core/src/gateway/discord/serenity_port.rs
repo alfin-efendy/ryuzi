@@ -38,19 +38,19 @@
 //!   is fetched first. Deliberate divergence from the original TS
 //!   implementation (which silently no-opped when a channel lookup came
 //!   back empty): this port's
-//!   `edit_message`/`send_message`/`create_thread`/`create_text_channel`
-//!   let a missing-channel HTTP error propagate as an `anyhow::Error` —
-//!   only `request_approval` has an explicit "missing channel" tuple
-//!   return, so only that method does an explicit existence check first.
+//!   `edit_message`/`send_message`/`create_thread`/`create_text_channel`/
+//!   `request_approval` propagate a missing-channel HTTP error as an
+//!   `anyhow::Error`, so a lost surface cannot be mistaken for a denial.
 //! - `EventHandler::{ready, message, interaction_create}` take `(&self, ctx:
 //!   Context, ..data)` (macro-generated; default no-op bodies, so only the
 //!   three actually used are overridden here).
 //! - `ComponentInteraction{member: Option<Member>, user: User, data.custom_id}` —
 //!   matches; `Member.roles: Vec<RoleId>`.
-//! - `ComponentInteractionCollector::new(&shard).message_id(id).timeout(dur).stream()`
-//!   returns a `Stream` (not a callback-based collector) that ends when the
-//!   timeout elapses — consumed via a `.next().await` loop (see
-//!   `SerenityDiscordPort::request_approval`'s doc for the loop semantics).
+//! - `ComponentInteractionCollector::new(&shard).message_id(id).stream()`
+//!   returns a `Stream` (not a callback-based collector); when a caller
+//!   supplies a timeout, `.timeout(dur)` ends the stream after it elapses.
+//!   The daemon deliberately supplies no approval timeout, so the collector
+//!   waits for an explicit interaction or cancellation.
 //!
 //! **Disclosed design choice — `is_thread` needs an HTTP round-trip per
 //! inbound message:** this port's minimal feature set omits serenity's
@@ -69,7 +69,7 @@ use crate::gateway::discord::{
     build_commands, DiscordGateway, DiscordPort, InboundHandlers, InboundInteraction,
     InboundMessage, PortApprovalRequest,
 };
-use crate::gateway::{Gateway, GatewayFactory};
+use crate::gateway::{Gateway, GatewayFactory, GatewayStatus, GatewayStatusPublisher};
 use crate::policy::can_approve;
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -171,6 +171,7 @@ struct Handler {
     handlers: Arc<dyn InboundHandlers>,
     connected: Arc<Mutex<Option<ConnectedState>>>,
     ready_tx: Mutex<Option<oneshot::Sender<()>>>,
+    status: Arc<GatewayStatusPublisher>,
 }
 
 #[async_trait]
@@ -186,9 +187,19 @@ impl EventHandler for Handler {
             shard: ctx.shard.clone(),
             bot_user_id: data_about_bot.user.id,
         });
+        self.status.publish(GatewayStatus::Connected);
         if let Some(tx) = self.ready_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
+    }
+
+    async fn shard_stage_update(&self, _ctx: Context, event: ShardStageUpdateEvent) {
+        let status = if event.new == ConnectionStage::Connected {
+            GatewayStatus::Connected
+        } else {
+            GatewayStatus::Offline
+        };
+        self.status.publish(status);
     }
 
     /// Normalizes a gateway message-create event into an [`InboundMessage`]
@@ -306,6 +317,7 @@ pub struct SerenityDiscordPort {
     http: Arc<Http>,
     connected: Arc<Mutex<Option<ConnectedState>>>,
     shard_manager: Mutex<Option<Arc<ShardManager>>>,
+    status: Arc<GatewayStatusPublisher>,
 }
 
 impl SerenityDiscordPort {
@@ -319,12 +331,14 @@ impl SerenityDiscordPort {
         let http = Http::new(&token);
         http.set_application_id(ApplicationId::new(app_id));
 
+        let status = Arc::new(GatewayStatusPublisher::new(GatewayStatus::Offline));
         Ok(SerenityDiscordPort {
             token,
             guild_id: GuildId::new(guild_id),
             http: Arc::new(http),
             connected: Arc::new(Mutex::new(None)),
             shard_manager: Mutex::new(None),
+            status,
         })
     }
 }
@@ -346,6 +360,7 @@ impl DiscordPort for SerenityDiscordPort {
             handlers,
             connected: Arc::clone(&self.connected),
             ready_tx: Mutex::new(Some(ready_tx)),
+            status: Arc::clone(&self.status),
         };
         let intents = GatewayIntents::GUILDS
             | GatewayIntents::GUILD_MESSAGES
@@ -357,16 +372,22 @@ impl DiscordPort for SerenityDiscordPort {
 
         *self.shard_manager.lock().unwrap() = Some(Arc::clone(&client.shard_manager));
 
+        let status = Arc::clone(&self.status);
         tokio::spawn(async move {
             if let Err(e) = client.start().await {
                 eprintln!("[discord] gateway client stopped: {e}");
             }
+            status.publish(GatewayStatus::Offline);
         });
 
         ready_rx
             .await
             .context("discord gateway disconnected before it became ready")?;
         Ok(())
+    }
+
+    fn subscribe_status(&self) -> Option<crate::gateway::GatewayStatusSubscription> {
+        Some(self.status.subscribe())
     }
 
     async fn disconnect(&self) -> anyhow::Result<()> {
@@ -378,6 +399,15 @@ impl DiscordPort for SerenityDiscordPort {
         if let Some(sm) = shard_manager {
             sm.shutdown_all().await;
         }
+        // Publish the terminal transition synchronously here rather than
+        // relying solely on the detached `client.start()` task's own tail
+        // publish (spawned in `connect`): that task's completion is
+        // unsynchronized with this method's return, so a caller awaiting
+        // `disconnect()` could observe it finish before `Offline` is
+        // enqueued on the broadcast channel. The detached task's own
+        // publish becomes a redundant no-op afterward (deduped by
+        // `GatewayStatusPublisher::publish`'s `send_if_modified`).
+        self.status.publish(GatewayStatus::Offline);
         Ok(())
     }
 
@@ -423,28 +453,28 @@ impl DiscordPort for SerenityDiscordPort {
     }
 
     /// Sends the Approve/Deny buttons, then collects component interactions
-    /// against a total timeout via a `Stream::next()` loop
-    /// (`ComponentInteractionCollector` is a `Stream`, not an event
-    /// emitter) — `stream.next() == None` means the timeout elapsed with no
-    /// settled decision; each `Some` item is one button click. The loop
-    /// processes items strictly one at a time, so no "already settled"
-    /// guard flag is needed — returning ends the loop and drops the stream
-    /// (which unregisters the collector), so no later item can ever be
-    /// processed after a decision. The decision is computed and ready to
-    /// return BEFORE the (fallible, swallowed-error) `UpdateMessage` edit —
-    /// straight-line sequencing guarantees the decision is locked before
-    /// the edit can fail.
+    /// through a `Stream::next()` loop (`ComponentInteractionCollector` is a
+    /// `Stream`, not an event emitter). With `Some(timeout)`, `stream.next()
+    /// == None` means that timeout elapsed without a settled decision; with
+    /// `None`, stream termination is an unavailable collector and returns an
+    /// error. Each `Some` item is one button click. The loop processes items
+    /// strictly one at a time, so no "already settled" guard flag is needed —
+    /// returning ends the loop and drops the stream (which unregisters the
+    /// collector), so no later item can ever be processed after a decision.
+    /// The decision is computed and ready to return BEFORE the (fallible,
+    /// swallowed-error) `UpdateMessage` edit — straight-line sequencing
+    /// guarantees the decision is locked before the edit can fail.
     async fn request_approval(
         &self,
         conversation_id: &str,
         req: &PortApprovalRequest,
     ) -> anyhow::Result<(bool, String)> {
-        let Some(channel_id) = channel_id_from_str(conversation_id) else {
-            return Ok((false, "no-channel".to_string()));
-        };
-        if self.http.get_channel(channel_id).await.is_err() {
-            return Ok((false, "no-channel".to_string()));
-        }
+        let channel_id =
+            channel_id_from_str(conversation_id).context("invalid Discord approval channel id")?;
+        self.http
+            .get_channel(channel_id)
+            .await
+            .context("Discord approval channel is unavailable")?;
 
         let content = format!("🔐 Approve **{}**?\n```\n{}\n```", req.tool, req.summary);
         let components = vec![CreateActionRow::Buttons(vec![
@@ -470,14 +500,20 @@ impl DiscordPort for SerenityDiscordPort {
             .map(|c| c.shard.clone());
         let shard = shard.context("discord port not connected")?;
 
-        let mut stream = ComponentInteractionCollector::new(&shard)
-            .message_id(sent.id)
-            .timeout(Duration::from_millis(req.timeout_ms))
-            .stream();
+        let collector = ComponentInteractionCollector::new(&shard).message_id(sent.id);
+        let mut stream = match req.timeout_ms {
+            Some(timeout_ms) => collector
+                .timeout(Duration::from_millis(timeout_ms))
+                .stream(),
+            None => collector.stream(),
+        };
 
         loop {
             let Some(interaction) = stream.next().await else {
-                return Ok((false, "timeout".to_string()));
+                if req.timeout_ms.is_some() {
+                    return Ok((false, "timeout".to_string()));
+                }
+                anyhow::bail!("Discord approval interaction collector ended unexpectedly");
             };
 
             let clicker_role_ids: Vec<String> = interaction
@@ -506,8 +542,9 @@ impl DiscordPort for SerenityDiscordPort {
             } else if interaction.data.custom_id.ends_with(":deny") {
                 false
             } else {
-                // Unexpected custom_id — ignore (fail-closed; a timeout
-                // denies if nothing valid ever arrives).
+                // Unexpected custom_id — ignore. With Some(timeout), the
+                // collector eventually returns a timeout denial; without one,
+                // only an explicit valid decision settles the request.
                 continue;
             };
 

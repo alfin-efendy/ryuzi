@@ -6,6 +6,7 @@
 use super::{ok, params, ApiError};
 use crate::api::types::*;
 use crate::branches::BranchList;
+use crate::control::ControlPlane;
 use crate::domain::{AttachmentRef, Session, SessionGitOptions};
 use crate::harness::TurnPrompt;
 use crate::serve::ApiState;
@@ -27,6 +28,9 @@ pub(crate) const HANDLES: &[&str] = &[
     "start_session",
     "start_chat_session",
     "continue_session",
+    "session_queue",
+    "enqueue_session_message",
+    "remove_session_message",
     "steer",
     "stop_session",
     "end_session",
@@ -102,6 +106,17 @@ struct ContinueP {
 struct AgentSessionsP {
     agent_id: String,
     limit: u32,
+}
+#[derive(Deserialize)]
+struct EnqueueSessionMessageP {
+    session_pk: String,
+    prompt: String,
+    options: Option<ChatRequestOptions>,
+}
+#[derive(Deserialize)]
+struct RemoveSessionMessageP {
+    session_pk: String,
+    id: String,
 }
 #[derive(Deserialize)]
 struct SessionPkP {
@@ -202,6 +217,20 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "continue_session" => {
             let a: ContinueP = params(p)?;
             ok(continue_session(state, &a.session_pk, a.turn).await?)
+        }
+        "session_queue" => {
+            let a: SessionPkP = params(p)?;
+            ok(session_queue(cp, &a.session_pk).await?)
+        }
+        "enqueue_session_message" => {
+            let a: EnqueueSessionMessageP = params(p)?;
+            ok(enqueue_session_message(state, &a.session_pk, &a.prompt, a.options).await?)
+        }
+        "remove_session_message" => {
+            let a: RemoveSessionMessageP = params(p)?;
+            ensure_session_exists(cp, &a.session_pk).await?;
+            let removed = cp.remove_session_prompt(&a.session_pk, &a.id).await?;
+            ok(removed)
         }
         "steer" => {
             let a: SteerP = params(p)?;
@@ -331,6 +360,129 @@ async fn continue_session(
         )
         .await?;
     Ok(())
+}
+
+async fn ensure_session_exists(cp: &ControlPlane, session_pk: &str) -> Result<(), ApiError> {
+    if cp.store().get_session(session_pk).await?.is_none() {
+        return Err(ApiError::not_found(format!(
+            "unknown session: {session_pk}"
+        )));
+    }
+    Ok(())
+}
+
+async fn session_queue(
+    cp: &ControlPlane,
+    session_pk: &str,
+) -> Result<Vec<QueuedMessageInfo>, ApiError> {
+    ensure_session_exists(cp, session_pk).await?;
+    Ok(cp
+        .store()
+        .list_session_prompt_queue(session_pk)
+        .await?
+        .into_iter()
+        .map(|prompt| QueuedMessageInfo {
+            id: prompt.id,
+            text: prompt.display,
+        })
+        .collect())
+}
+
+async fn enqueue_session_message(
+    state: &ApiState,
+    session_pk: &str,
+    prompt: &str,
+    options: Option<ChatRequestOptions>,
+) -> Result<QueuedMessageInfo, ApiError> {
+    let cp = &state.cp;
+    ensure_session_exists(cp, session_pk).await?;
+    let options = options.unwrap_or_default();
+    let id = crate::paths::new_id();
+    let attachments = queue_owned_attachments(
+        cp,
+        &id,
+        attachment_refs_from_paths(&options.attachments).await?,
+    )
+    .await?;
+    let queued = crate::domain::QueuedSessionPrompt {
+        id: id.clone(),
+        session_pk: session_pk.to_string(),
+        agent: chat_agent_prompt(prompt, options.context.as_ref()),
+        display: prompt.to_string(),
+        attachments,
+        created_at: crate::paths::now_ms(),
+    };
+    cp.enqueue_session_prompt(queued).await?;
+    Ok(QueuedMessageInfo {
+        id,
+        text: prompt.to_string(),
+    })
+}
+
+async fn queue_owned_attachments(
+    cp: &ControlPlane,
+    message_id: &str,
+    attachments: Vec<AttachmentRef>,
+) -> Result<Vec<AttachmentRef>, ApiError> {
+    let root = cp.attachments_root().await;
+    let staging = root.join("staging");
+    let staging = tokio::fs::canonicalize(&staging).await.ok();
+    let destination_dir = root.join("queue").join(message_id);
+    let mut durable = Vec::with_capacity(attachments.len());
+    for mut attachment in attachments {
+        let Ok(source) = url::Url::parse(&attachment.url)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .ok_or(())
+        else {
+            durable.push(attachment);
+            continue;
+        };
+        let source = tokio::fs::canonicalize(source)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if staging.as_ref().is_some_and(|dir| source.starts_with(dir)) {
+            tokio::fs::create_dir_all(&destination_dir)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let file_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(crate::api::types::sanitize_file_name)
+                .unwrap_or_else(|| "file".to_string());
+            let mut queued_name = file_name.clone();
+            let mut destination = destination_dir.join(&queued_name);
+            let mut duplicate = 2;
+            while tokio::fs::try_exists(&destination)
+                .await
+                .map_err(anyhow::Error::from)?
+            {
+                let path = Path::new(&file_name);
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("file");
+                let extension = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| format!(".{extension}"))
+                    .unwrap_or_default();
+                queued_name = format!("{stem} ({duplicate}){extension}");
+                destination = destination_dir.join(&queued_name);
+                duplicate += 1;
+            }
+            tokio::fs::copy(&source, &destination)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let destination = tokio::fs::canonicalize(&destination)
+                .await
+                .map_err(anyhow::Error::from)?;
+            attachment.name = queued_name;
+            attachment.url = crate::attachments::file_url_for_path(&destination)?.to_string();
+        }
+        durable.push(attachment);
+    }
+    Ok(durable)
 }
 
 /// Write pasted bytes into the attachments staging area and return the

@@ -1,26 +1,15 @@
-import { afterAll, test, expect, mock, spyOn } from "bun:test";
-import { useStore, markFocusedSessionReadOnEvent, drainQueueOnEvent } from "./store";
+import { test, expect, mock, spyOn } from "bun:test";
+import { useStore, markFocusedSessionReadOnEvent } from "./store";
 import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
-import type { QueuedMessage } from "./lib/queue";
 import type { AgentSummaryInfo, TurnInput } from "./bindings";
 import { LAST_PRIMARY_AGENT_KEY, choosePrimaryAgent } from "./store-nav";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const k1 = sessKey(LOCAL_RUNNER, "s1");
 const k2 = sessKey(LOCAL_RUNNER, "s2");
-
-// The sendNextQueued suite below overwrites the store's real `send` action with
-// stubs via `setState({ send })`. `useStore` is a process-global singleton shared
-// with every other test file in the same `bun test` run, so leaving a stub in
-// place leaks into later files (e.g. later send-routing tests). Snapshot the
-// genuine implementation at module load and reinstate it once this file is done.
-const realSendImpl = useStore.getState().send;
-afterAll(() => {
-  useStore.setState({ send: realSendImpl });
-});
 
 // refresh() (called fire-and-forget by start/startChat/send/stop/end/cloneProject, and by the
 // result/error event handlers, and awaited directly by send()) always fans out to
@@ -44,7 +33,6 @@ function reset() {
     contextUsage: {},
     projectRuntimeById: {},
     sessionCost: {},
-    queued: {},
   });
 }
 
@@ -816,7 +804,7 @@ test("result event flips the session status back to idle (so the composer leaves
 test("result event triggers a refresh so the git/harness backfill (branch, worktreePath) lands in the UI", async () => {
   reset();
   useStore.setState({ sessions: [runningSession("s1")] });
-  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "harness/s1", worktreePath: "C:\\wt\\s1" };
+  const backfilled = { ...runningSession("s1"), status: "idle" as const, branch: "ryuzi/s1", worktreePath: "C:\\wt\\s1" };
   const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [backfilled] });
   const listGateways = mockGateways();
@@ -830,7 +818,7 @@ test("result event triggers a refresh so the git/harness backfill (branch, workt
 
   expect(listProjects).toHaveBeenCalled();
   expect(listSessions).toHaveBeenCalled();
-  expect(useStore.getState().sessions[0].branch).toBe("harness/s1");
+  expect(useStore.getState().sessions[0].branch).toBe("ryuzi/s1");
   expect(useStore.getState().sessions[0].worktreePath).toBe("C:\\wt\\s1");
 
   listProjects.mockRestore();
@@ -966,7 +954,7 @@ test("start forwards chat options so composer model, context, and attachments re
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
-      branch: "harness/s1",
+      branch: "ryuzi/s1",
       title: "/review",
       status: "running",
       permMode: "default",
@@ -1473,72 +1461,4 @@ test("two runners with the same session_pk keep separate transcripts and separat
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
   useStore.getState().setFocused({ runnerId: remote, pk: "s1" });
   expect(useStore.getState().focusedSession).toEqual({ runnerId: remote, pk: "s1" });
-});
-
-const qmsg = (id: string, text = id, options: QueuedMessage["options"] = null): QueuedMessage => ({ id, text, options });
-
-test("enqueueMessage appends per session; removeQueued removes by id", () => {
-  useStore.setState({ queued: {} });
-  useStore.getState().enqueueMessage(LOCAL_RUNNER, "s1", qmsg("a"));
-  useStore.getState().enqueueMessage(LOCAL_RUNNER, "s1", qmsg("b"));
-  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["a", "b"]);
-  useStore.getState().removeQueued(LOCAL_RUNNER, "s1", "a");
-  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
-});
-
-test("sendNextQueued sends structured mentions and removes the head on success", async () => {
-  const calls: Array<[string, string, TurnInput]> = [];
-  const mentions = [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }];
-  useStore.setState({
-    queued: { [k1]: [qmsg("a", "@Ada review", { mentions }), qmsg("b", "world")] },
-    send: async (runnerId, pk, turn) => {
-      calls.push([runnerId, pk, turn]);
-      return true;
-    },
-  });
-  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
-  expect(calls).toEqual([[LOCAL_RUNNER, "s1", { text: "@Ada review", mentions, context: null, attachments: [], git: null }]]);
-  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["b"]);
-});
-
-test("sendNextQueued restores the structured head when send fails", async () => {
-  const mentions = [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }];
-  const queued = qmsg("a", "@Ada review", { mentions });
-  useStore.setState({
-    queued: { [k1]: [queued] },
-    send: async () => false,
-  });
-  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
-  expect(useStore.getState().queued[k1]).toEqual([queued]);
-});
-
-test("sendNextQueued unshifts the head back when send fails", async () => {
-  useStore.setState({
-    queued: { [k1]: [qmsg("a", "hello")] },
-    send: async () => false,
-  });
-  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
-  expect(useStore.getState().queued[k1].map((m) => m.id)).toEqual(["a"]); // still queued
-});
-
-test("sendNextQueued on an empty queue does not call send", async () => {
-  let called = false;
-  useStore.setState({
-    queued: {},
-    send: async () => {
-      called = true;
-      return true;
-    },
-  });
-  await useStore.getState().sendNextQueued(LOCAL_RUNNER, "s1");
-  expect(called).toBe(false);
-});
-
-test("drainQueueOnEvent drains on result but not on error", () => {
-  const drained: string[] = [];
-  useStore.setState({ sendNextQueued: async (_runnerId, pk) => void drained.push(pk) });
-  drainQueueOnEvent({ kind: "error", session_pk: "s1" } as never, LOCAL_RUNNER);
-  expect(drained).toEqual([]);
-  drainQueueOnEvent({ kind: "result", session_pk: "s1" } as never, LOCAL_RUNNER);
-  expect(drained).toEqual(["s1"]);
 });

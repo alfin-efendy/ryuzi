@@ -39,7 +39,7 @@ export function SessionView() {
     pendingApprovals,
     projects,
   } = useStore();
-  const enqueueMessage = useStore((s) => s.enqueueMessage);
+  const enqueueQueueMessage = useNative((s) => s.enqueueQueueMessage);
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
   // switching sessions/views (SessionView renders un-keyed in App.tsx) swaps
@@ -82,6 +82,8 @@ export function SessionView() {
   const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
   const [contextHits, setContextHits] = useState<string[]>([]);
   const [listening, setListening] = useState(false);
+  const submitInFlight = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
   const stopVoice = useRef<(() => void) | null>(null);
 
   const rows = (focusedSession && transcripts[refKey(focusedSession)]) || [];
@@ -165,7 +167,10 @@ export function SessionView() {
   }, [draft]);
   const slashMatches = useMemo(() => {
     if (slashQuery === null) return [];
-    return nativeCommands.filter((c) => c.name.toLowerCase().startsWith(slashQuery)).slice(0, 6);
+    return nativeCommands
+      .filter((c) => c.effective)
+      .filter((c) => c.name.toLowerCase().startsWith(slashQuery))
+      .slice(0, 6);
   }, [nativeCommands, slashQuery]);
   const mentionQuery = useMemo(() => activeAgentMentionQuery(draft, mentionCaret), [draft, mentionCaret]);
   const mentionMatches = useMemo(
@@ -211,7 +216,7 @@ export function SessionView() {
       : "The session’s primary agent is not executable.";
 
   const submit = () => {
-    if (composeReadOnly) return;
+    if (composeReadOnly || submitInFlight.current) return;
     const t = draft;
     if (!t.trim() && composerFiles.attachments.length === 0) return;
     const key = session.sessionPk;
@@ -233,29 +238,67 @@ export function SessionView() {
       attachments: options.attachments ?? [],
       git: null,
     };
-    // Clear only after a successful send; queued turns retain their complete
-    // structured payload, including agent mentions.
     if (running) {
-      enqueueMessage(runnerId, key, { id: crypto.randomUUID(), text: t, options });
-      useNav.getState().clearDraft(key);
-      historyRef.current = HISTORY_IDLE;
-      composerFiles.clear();
-      setContextRefs([]);
-      setMentions([]);
+      // The durable queue backend accepts ChatRequestOptions, which currently
+      // has no structured mentions field. Preserve the full TurnInput for
+      // immediate sends; queued prompts cross the generated IPC boundary with
+      // only its supported options.
+      const queueOptions = {
+        model: null,
+        effort: null,
+        context: turn.context,
+        attachments: turn.attachments,
+        git: turn.git,
+        permMode: null,
+      };
+      submitInFlight.current = true;
+      setSubmitting(true);
+      void enqueueQueueMessage(runnerId, key, t, queueOptions)
+        .then((ok) => {
+          if (ok) {
+            useNav.getState().clearDraft(draftKey);
+            historyRef.current = HISTORY_IDLE;
+            composerFiles.clear();
+            setContextRefs([]);
+            setMentions([]);
+          } else {
+            useNav.getState().restoreDraft(draftKey, typed);
+            setMentions(typedMentions);
+          }
+        })
+        .catch(() => {
+          useNav.getState().restoreDraft(draftKey, typed);
+          setMentions(typedMentions);
+        })
+        .finally(() => {
+          submitInFlight.current = false;
+          setSubmitting(false);
+        });
       return;
     }
-    void send(runnerId, key, turn).then((ok) => {
-      if (ok) {
-        useNav.getState().clearDraft(key);
-        historyRef.current = HISTORY_IDLE;
-        composerFiles.clear();
-        setContextRefs([]);
-        setMentions([]);
-      } else {
-        useNav.getState().restoreDraft(key, typed);
+    submitInFlight.current = true;
+    setSubmitting(true);
+    void send(runnerId, key, turn)
+      .then((ok) => {
+        if (ok) {
+          useNav.getState().clearDraft(draftKey);
+          historyRef.current = HISTORY_IDLE;
+          composerFiles.clear();
+          setContextRefs([]);
+          setMentions([]);
+        } else {
+          useNav.getState().restoreDraft(draftKey, typed);
+          setMentions(typedMentions);
+        }
+      })
+      .catch(() => {
+        useNav.getState().restoreDraft(draftKey, typed);
         setMentions(typedMentions);
-      }
-    });
+      })
+      .finally(() => {
+        submitInFlight.current = false;
+        setSubmitting(false);
+      });
   };
 
   const pickContext = (path: string) => {
@@ -361,7 +404,7 @@ export function SessionView() {
             <OpenInMenu runnerId={runnerId} sessionPk={session.sessionPk} />
           </div>
 
-          {/* Transcript, with the floating plan panel overlaying it */}
+          {/* Transcript, with the TODO List overlaying it */}
           <div className="relative flex min-h-0 flex-1 flex-col">
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
               <Transcript
@@ -379,8 +422,6 @@ export function SessionView() {
                 ))}
               </Transcript>
             </TranscriptFileContext.Provider>
-            {/* Agent plan (todowrite) — floating rounded panel */}
-            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
           </div>
 
           {/* Session composer */}
@@ -427,7 +468,7 @@ export function SessionView() {
                   }
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    submit();
+                    void submit();
                     return;
                   }
                   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
@@ -505,7 +546,7 @@ export function SessionView() {
                     <span className="h-[11px] w-[11px] rounded-[2px] bg-current" />
                   </Button>
                 ) : (
-                  <Button size="icon" title="Send" onClick={submit} disabled={composeReadOnly} className="rounded-full">
+                  <Button size="icon" title="Send" onClick={submit} disabled={composeReadOnly || submitting} className="rounded-full">
                     <ArrowUp aria-hidden size={14} strokeWidth={2.2} className="size-3.5" />
                   </Button>
                 )}

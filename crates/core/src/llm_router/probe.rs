@@ -201,6 +201,7 @@ pub async fn probe_model(
         store: store.clone(),
         http: http.clone(),
         oauth_token_url_override: None,
+        kiro_base_override: None,
         mimo_bootstrap_url_override: None,
     };
     probe_model_with_ctx(&ctx, desc, conn, model).await
@@ -220,7 +221,6 @@ pub(crate) async fn probe_model_with_ctx(
         desc,
         upstream_model: model.to_string(),
         route_target_key: None,
-        request_compatibility_effort: None,
     };
     if connections::is_oauth(&target.conn) {
         if let Err(err) =
@@ -353,7 +353,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2")
             .unwrap()
@@ -387,7 +386,6 @@ mod tests {
             desc,
             upstream_model: "mimo-auto".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "mimo-auto")
             .unwrap()
@@ -479,6 +477,7 @@ mod tests {
             store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: Some(format!("http://127.0.0.1:{port}/bootstrap")),
         };
         let conn = mk_conn(
@@ -542,6 +541,7 @@ mod tests {
             store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: Some(format!("http://127.0.0.1:{port}/bootstrap")),
         };
         let conn = mk_conn(
@@ -591,6 +591,7 @@ mod tests {
             store: Arc::new(crate::store::Store::open(tmp.path()).await.unwrap()),
             http: reqwest::Client::new(),
             oauth_token_url_override: None,
+            kiro_base_override: None,
             mimo_bootstrap_url_override: Some("http://127.0.0.1:1/never".into()),
         };
         let conn = mk_conn(
@@ -627,7 +628,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-4-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-sonnet-4-5")
             .unwrap()
@@ -715,7 +715,6 @@ mod tests {
             desc,
             upstream_model: "claude-sonnet-5".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-sonnet-5")
             .unwrap()
@@ -762,7 +761,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2-codex-high".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2-codex-high")
             .unwrap()
@@ -824,7 +822,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.2-codex".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.2-codex")
             .unwrap()
@@ -850,7 +847,6 @@ mod tests {
             desc,
             upstream_model: "gpt-5.4-review".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "gpt-5.4-review")
             .unwrap()
@@ -877,7 +873,6 @@ mod tests {
             desc,
             upstream_model: "claude-opus-4-8".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-opus-4-8")
             .unwrap()
@@ -924,7 +919,6 @@ mod tests {
             desc,
             upstream_model: "claude-opus-4-8".into(),
             route_target_key: None,
-            request_compatibility_effort: None,
         };
         let req = probe_request(&ctx, &target, "claude-opus-4-8")
             .unwrap()

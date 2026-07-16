@@ -114,7 +114,7 @@ mod tests {
         create(
             repo_dir.path(),
             "abcdef01",
-            "harness/abcdef01",
+            "ryuzi/abcdef01",
             &wt_path,
             None,
         )
@@ -123,20 +123,20 @@ mod tests {
 
         let repo = git2::Repository::open(repo_dir.path()).unwrap();
         assert!(repo
-            .find_branch("harness/abcdef01", git2::BranchType::Local)
+            .find_branch("ryuzi/abcdef01", git2::BranchType::Local)
             .is_ok());
 
         remove(
             repo_dir.path(),
             "abcdef01",
-            Some("harness/abcdef01"),
+            Some("ryuzi/abcdef01"),
             &wt_path,
         )
         .unwrap();
         assert!(!wt_path.exists());
         // The session branch is engine-owned and must go with the worktree.
         assert!(
-            repo.find_branch("harness/abcdef01", git2::BranchType::Local)
+            repo.find_branch("ryuzi/abcdef01", git2::BranchType::Local)
                 .is_err(),
             "session branch must be deleted with its worktree"
         );
@@ -152,7 +152,7 @@ mod tests {
         create(
             repo_dir.path(),
             "abcdef02",
-            "harness/abcdef02",
+            "ryuzi/abcdef02",
             &wt_path,
             None,
         )
@@ -161,7 +161,7 @@ mod tests {
 
         let repo = git2::Repository::open(repo_dir.path()).unwrap();
         assert!(repo
-            .find_branch("harness/abcdef02", git2::BranchType::Local)
+            .find_branch("ryuzi/abcdef02", git2::BranchType::Local)
             .is_ok());
     }
 
@@ -205,14 +205,14 @@ mod tests {
         create(
             repo_dir.path(),
             "abcdef03",
-            "harness/abcdef03",
+            "ryuzi/abcdef03",
             &wt_path,
             Some("feature"),
         )
         .unwrap();
 
         let tip = repo
-            .find_branch("harness/abcdef03", git2::BranchType::Local)
+            .find_branch("ryuzi/abcdef03", git2::BranchType::Local)
             .unwrap()
             .get()
             .peel_to_commit()

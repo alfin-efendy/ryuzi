@@ -3,8 +3,7 @@
 //! approval fan-out.
 //!
 //! [`build_daemon`] is the single entry point; [`Daemon::start`]/`stop` drive
-//! the lifecycle. The approval fan-out — the piece that finally consumes
-//! `approval_timeout_ms` — is kept in a standalone, unit-testable
+//! the lifecycle. The approval fan-out is kept in a standalone, unit-testable
 //! `pub(crate)` function ([`handle_approval`]) separate from the broadcast
 //! loop that spawns it.
 
@@ -12,10 +11,8 @@ use crate::agents::knowledge::AgentKnowledgeStore;
 use crate::agents::learning_queue::LearningQueue;
 use crate::agents::registry::AgentRegistry;
 use crate::control::ControlPlane;
-use crate::domain::{
-    ApprovalDecision, ApprovalRequest, ApprovalResponse, CoreEvent, Principal, Surface,
-};
-use crate::gateway::{Gateway, GatewayFactory};
+use crate::domain::{ApprovalDecision, ApprovalRequest, CoreEvent, Principal, Surface};
+use crate::gateway::{Gateway, GatewayFactory, GatewayStatus};
 use crate::harness::native::native_plugin;
 use crate::harness::HarnessFactory;
 use crate::llm_router::secrets;
@@ -30,9 +27,9 @@ use futures::FutureExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Inputs to [`build_daemon`].
@@ -61,6 +58,10 @@ pub struct Daemon {
     pub cp: Arc<ControlPlane>,
     pub store: Arc<Store>,
     pub gateways: Vec<Arc<dyn Gateway>>,
+    /// The boot-gated inbound Router passed to production gateways. It stays
+    /// closed through boot recovery so gateway events cannot mutate sessions
+    /// while reconciliation takes its startup snapshot.
+    router_in: Arc<Router>,
     /// The local Anthropic/OpenAI-compatible endpoint server. The daemon
     /// always constructs it (cheap — it does not bind a port until
     /// `start()`'s autostart branch, or an explicit RPC, calls
@@ -72,7 +73,18 @@ pub struct Daemon {
     pub agent_knowledge: Arc<AgentKnowledgeStore>,
     pub learning_queue: Arc<LearningQueue>,
     telemetry: Arc<dyn Telemetry>,
+    gateway_status_handles: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
+    /// Serializes the complete startup lifecycle, including gateway startup,
+    /// recovery, and boot admission. A terminal boot failure is observed by a
+    /// waiting caller before it can acquire any gateway resources.
+    lifecycle: AsyncMutex<()>,
+    /// Set only after the boot admission latch is open. Under `lifecycle`, a
+    /// repeated successful start is a no-op rather than a second gateway boot.
+    started: AtomicBool,
+    /// Completion state for boot recovery. Access occurs under `lifecycle`, so
+    /// an atomic flag is sufficient and avoids a nested recovery mutex.
+    prompt_claim_recovery_complete: AtomicBool,
     /// The outbound `Router`'s broadcast-consumer task, tracked so `stop()`
     /// can abort it. Otherwise it (and the `Arc<ControlPlane>` clone its
     /// closure holds) would keep running — and keep the control plane
@@ -108,9 +120,17 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Start every gateway, then fire-and-forget `cp.reconcile()` (resumes
-    /// any session a dead process left `Running`). Reconcile runs in the
-    /// background so a slow/hanging resume can't block daemon startup.
+    /// Start every gateway and perform endpoint autostart before the serial,
+    /// boot-only recovery latch. The latch recovers abandoned prompt claims,
+    /// awaits best-effort reconciliation of prior-process `Running` sessions,
+    /// then starts one pending FIFO head for every idle session. Reconcile's
+    /// snapshot completes before delivery can make an idle session `Running`,
+    /// preventing a second harness and `RESUME_NUDGE` for the new delivery.
+    ///
+    /// Gateway startup comes first because reconciliation emits resumed status
+    /// events that must be routable to an already-connected gateway. A boot
+    /// failure is terminal for this `Daemon`; callers must construct a new one
+    /// before retrying, so stopped tasks and gateway ownership are never reused.
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
@@ -121,23 +141,24 @@ impl Daemon {
     /// a `start()` error (e.g. `daemon_cmd::build_and_start`) is a safe
     /// no-op instead of re-stopping gateway 0..N-1 a second time.
     ///
-    /// This task is deliberately left UNTRACKED (unlike `router_handle` /
-    /// `fanout_handle`): boot does not await or hold onto its reconcile
-    /// call. A
-    /// resume it kicks off is its own independent `spawn_prompt` background
-    /// turn (tracked/owned by `ControlPlane`, not by `Daemon`), so there is
-    /// nothing here for `stop()` to meaningfully cancel — this handle only
-    /// covers the `reconcile()` scan itself, which is expected to finish
-    /// quickly regardless of `Daemon`'s lifecycle.
+    /// Reconcile itself is not a tracked task: it completes during the boot
+    /// sequence, while each resume it starts is an independent `spawn_prompt`
+    /// background turn owned by `ControlPlane`.
     ///
-    /// After reconcile is kicked off, endpoint autostart runs: if the
-    /// persisted `endpoint_autostart` setting is `"1"`, `router_server` is
-    /// started on the persisted `endpoint_port` (default 21128) — the same
-    /// autostart Cockpit's setup hook used to perform. A failure here is
-    /// logged and swallowed rather than propagated: a broken endpoint
-    /// server must not prevent the rest of the daemon (gateways, sessions)
-    /// from coming up.
+    /// After gateway startup, endpoint autostart runs: if the persisted
+    /// `endpoint_autostart` setting is `"1"`, `router_server` is started on the
+    /// persisted `endpoint_port` (default 21128) — the same autostart Cockpit's
+    /// setup hook used to perform. A failure here is logged and swallowed rather
+    /// than propagated: a broken endpoint server must not prevent boot
+    /// recovery, reconciliation, or idle queue delivery.
     pub async fn start(&self) -> anyhow::Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.stopped.load(Ordering::SeqCst) {
+            anyhow::bail!("daemon failed to boot");
+        }
+        if self.started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
                 if !self.stopped.swap(true, Ordering::SeqCst) {
@@ -151,13 +172,10 @@ impl Daemon {
                     self.learning_handle.abort();
                     self.curator_handle.abort();
                 }
+                self.abort_gateway_status_listeners();
                 return Err(e);
             }
         }
-        let cp = Arc::clone(&self.cp);
-        tokio::spawn(async move {
-            let _ = cp.reconcile().await;
-        });
 
         // Endpoint autostart (moved from Cockpit's setup hook).
         let settings = crate::settings::SettingsStore::new(Arc::clone(&self.store));
@@ -180,6 +198,68 @@ impl Daemon {
                 eprintln!("[ryuzi] endpoint autostart failed: {e}");
             }
         }
+        if let Err(error) = self
+            .recover_reconcile_and_deliver_idle_queues_on_boot()
+            .await
+        {
+            self.fail_boot_and_rollback().await;
+            for gateway in &self.gateways {
+                let _ = gateway.stop().await;
+            }
+            return Err(error);
+        }
+        self.router_in.open_boot_admission();
+        self.started.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Mark boot admission failed and abort the background tasks exactly once.
+    /// Callers stop any gateways already started by this daemon separately,
+    /// because start failure knows precisely which of them acquired resources.
+    async fn fail_boot_and_rollback(&self) {
+        self.router_in.fail_boot_admission();
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.router_handle.abort();
+        self.fanout_handle.abort();
+        self.scheduler_handle.abort();
+        self.rail_handle.abort();
+        self.learning_handle.abort();
+        self.curator_handle.abort();
+        self.abort_gateway_status_listeners();
+        self.router_server.stop().await;
+    }
+
+    /// Recover prior-process claims, reconcile prior-process Running sessions,
+    /// and drain pending idle queue heads exactly once for this daemon. The
+    /// startup lifecycle lock serializes all three phases: reconcile's Running-session
+    /// snapshot completes before delivery can make an idle session Running.
+    /// Completion is set only after recovery and delivery finish.
+    async fn recover_reconcile_and_deliver_idle_queues_on_boot(&self) -> anyhow::Result<()> {
+        if self.prompt_claim_recovery_complete.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.store.recover_abandoned_session_prompt_claims().await?;
+        // Reconcile was previously best-effort and detached; keep an error
+        // non-fatal while awaiting its scan so delivery cannot race it.
+        let _ = self.cp.reconcile().await;
+        self.deliver_pending_idle_session_prompts_on_boot().await?;
+        self.prompt_claim_recovery_complete
+            .store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Start one pending FIFO head for each idle session after recovery and
+    /// reconcile have completed. The control plane's atomic Idle-to-Running
+    /// claim prevents a concurrent start from duplicating a delivery.
+    async fn deliver_pending_idle_session_prompts_on_boot(&self) -> anyhow::Result<()> {
+        for session_pk in self.store.pending_session_prompt_session_pks().await? {
+            let _ = self
+                .cp
+                .deliver_next_queued_session_prompt(&session_pk)
+                .await;
+        }
         Ok(())
     }
 
@@ -197,6 +277,18 @@ impl Daemon {
         for gw in &self.gateways {
             let _ = gw.stop().await;
         }
+        // Give already-enqueued listener/worker tasks one scheduling
+        // opportunity to begin processing a just-published terminal status
+        // transition (e.g. reach the point of persisting a `queued`
+        // automation run) before they are aborted below. This only yields
+        // once to the scheduler — it does not wait on network I/O or
+        // outbound hook delivery — so it reduces (but does not eliminate)
+        // the race between a gateway's own graceful-stop terminal status
+        // publish and its listener task being aborted, without
+        // reintroducing a synthesized start/stop event (rejected design:
+        // the gateway is the sole event producer).
+        tokio::task::yield_now().await;
+        self.abort_gateway_status_listeners();
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
@@ -211,10 +303,17 @@ impl Daemon {
         self.cp.shutdown_extensions().await;
         self.telemetry.shutdown();
     }
+
+    fn abort_gateway_status_listeners(&self) {
+        for listener in self.gateway_status_handles.lock().unwrap().drain(..) {
+            listener.abort();
+        }
+    }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        self.abort_gateway_status_listeners();
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
@@ -372,6 +471,8 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways.push(gw);
     }
 
+    let gateway_status_handles = Mutex::new(subscribe_gateway_statuses(Arc::clone(&cp), &gateways));
+
     // Two `Router` instances sharing the same `cp`/`store` — see `router.rs`'s
     // module doc. `router_out` drives the outbound render loop (`run`
     // consumes `self`); `router_in` is handed to every gateway via
@@ -384,7 +485,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let router_out = Router::new(Arc::clone(&cp), gateways.clone());
     let router_handle = tokio::spawn(router_out.run(cp.subscribe()));
 
-    let router_in = Arc::new(Router::new(Arc::clone(&cp), gateways.clone()));
+    let router_in = Arc::new(Router::new_boot_gated(Arc::clone(&cp), gateways.clone()));
     for gw in &gateways {
         gw.set_router(Arc::clone(&router_in));
     }
@@ -399,17 +500,23 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
+    router_server.attach_control_plane(&cp);
 
     Ok(Daemon {
         cp,
         store,
         gateways,
+        router_in,
         router_server,
         agents: persistence.registry,
         agent_knowledge: persistence.knowledge,
         learning_queue: persistence.learning,
         telemetry,
+        gateway_status_handles,
         stopped: AtomicBool::new(false),
+        lifecycle: AsyncMutex::new(()),
+        started: AtomicBool::new(false),
+        prompt_claim_recovery_complete: AtomicBool::new(false),
         router_handle,
         fanout_handle,
         scheduler_handle,
@@ -417,6 +524,85 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         learning_handle,
         curator_handle,
     })
+}
+
+/// Per-gateway queue bound between the broadcast receiver and its sole
+/// persistence worker. `send().await` deliberately applies backpressure after
+/// this many transitions rather than spawning unbounded hook-delivery tasks.
+const GATEWAY_STATUS_DELIVERY_CAPACITY: usize = 64;
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Subscribe to every status-capable gateway during daemon construction. The
+/// initial snapshot is a non-emitting baseline; every later distinct broadcast
+/// event is forwarded in receive order to one serial persistence worker.
+///
+/// If a receiver lags past the producer's bounded event buffer, the listener
+/// warns and resynchronizes its baseline to the publisher's newest snapshot.
+/// This consciously drops the unavailable intermediate transitions rather than
+/// fabricating a transition, while normal bursts fit within the 128-event
+/// producer buffer. The worker is owned by its listener task, so aborting the
+/// listener also aborts an in-flight hook delivery and drops the queue.
+fn subscribe_gateway_statuses(
+    cp: Arc<ControlPlane>,
+    gateways: &[Arc<dyn Gateway>],
+) -> Vec<JoinHandle<()>> {
+    let mut listeners = Vec::new();
+    for gateway in gateways {
+        let Some(mut subscription) = gateway.subscribe_status() else {
+            continue;
+        };
+        let gateway_id = gateway.id().to_string();
+        let listener_cp = Arc::clone(&cp);
+        listeners.push(tokio::spawn(async move {
+            let (delivery_tx, mut delivery_rx) =
+                mpsc::channel::<(GatewayStatus, GatewayStatus)>(GATEWAY_STATUS_DELIVERY_CAPACITY);
+            let worker_cp = Arc::clone(&listener_cp);
+            let worker_gateway_id = gateway_id.clone();
+            let _worker = AbortOnDrop(tokio::spawn(async move {
+                while let Some((previous, status)) = delivery_rx.recv().await {
+                    worker_cp
+                        .observe_gateway_status_transition(
+                            &worker_gateway_id,
+                            previous.as_str(),
+                            status.as_str(),
+                        )
+                        .await;
+                }
+            }));
+
+            let mut previous = subscription.initial;
+            loop {
+                match subscription.events.recv().await {
+                    Ok(status) if status != previous => {
+                        let transition = (previous, status);
+                        previous = status;
+                        if delivery_tx.send(transition).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        previous = subscription.resync();
+                        tracing::warn!(
+                            gateway_id = %gateway_id,
+                            skipped,
+                            status = previous.as_str(),
+                            "gateway status listener lagged; resynchronized baseline to latest status"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+    listeners
 }
 
 /// Subscribe to `cp`'s event bus and spawn one [`handle_approval`] task per
@@ -450,23 +636,7 @@ fn spawn_approval_fanout(
                     input: _,
                     principal,
                 }) => {
-                    // Gateways only render binary tool prompts. Plan/Question
-                    // prompts are Cockpit/CLI-only surfaces — a headless
-                    // daemon/gateway session has nothing that will ever answer
-                    // them. Rather than `continue` and leave the turn parked
-                    // forever, spawn a timeout into the same `inflight` set
-                    // that resolves the request to `Cancel` once
-                    // `approval_timeout_ms` elapses, so the blocked tool call
-                    // reports "no interactive surface" instead of hanging.
-                    // `resolve_approval` is a harmless no-op if a real surface
-                    // (Cockpit, CLI) already answered it first.
                     if approval_kind != crate::domain::ApprovalKind::Tool {
-                        let cp = Arc::clone(&cp);
-                        let store = Arc::clone(&store);
-                        inflight.spawn(async move {
-                            schedule_non_tool_approval_cancel(&cp, &store, &run_id, &request_id)
-                                .await;
-                        });
                         continue;
                     }
                     let cp = Arc::clone(&cp);
@@ -497,55 +667,19 @@ fn spawn_approval_fanout(
     })
 }
 
-/// Headless fallback for Plan/Question approvals: gateways can't render
-/// them, so there's no surface to answer the request in a daemon/gateway
-/// session. Instead of leaving the turn parked forever, sleep for
-/// `approval_timeout_ms` (same setting, same default, as [`handle_approval`])
-/// then resolve the request as `Cancel` — distinct from an ordinary reject so
-/// `exitplanmode`/`askuserquestion` can report "no interactive surface"
-/// rather than "the user rejected this". `resolve_approval` returns `false`
-/// (and does nothing) if the request was already resolved by a real surface,
-/// so racing this against Cockpit/CLI is harmless.
-pub(crate) async fn schedule_non_tool_approval_cancel(
-    cp: &Arc<ControlPlane>,
-    store: &Arc<Store>,
-    run_id: &str,
-    request_id: &str,
-) {
-    let settings = SettingsStore::new(Arc::clone(store));
-    let timeout_ms: u64 = settings
-        .get("approval_timeout_ms")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300_000);
-    tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-    cp.resolve_approval(
-        run_id,
-        request_id,
-        ApprovalResponse {
-            decision: ApprovalDecision::Cancel,
-            scope: None,
-            payload: None,
-        },
-    );
-}
-
 /// Core approval fan-out decision, callable directly (no broadcast loop
-/// needed) so it's unit-testable: reads `approval_timeout_ms` /
-/// `approver_role_ids` from settings and `started_by` from the session, then
-/// resolves via `cp.resolve_approval_bool`.
+/// needed) so it's unit-testable: reads `approver_role_ids` from settings and
+/// `started_by` from the session, then resolves gateway decisions through
+/// `cp.resolve_approval_bool`.
 ///
 /// - No surfaces bound to the session (after filtering to gateways we know
-///   about) → immediate deny.
+///   about) → leaves the request pending for Cockpit.
 /// - Otherwise races `gw.request_approval` across every known surface via a
 ///   loop over `futures::future::select_all`: a per-gateway `Err` REMOVES
 ///   that future from the race (so one erroring gateway can never out-race a
 ///   slower legitimate human approval on another surface) and the remaining
-///   futures keep racing; only once every future has errored does the race
-///   resolve to a deny. The whole race is wrapped in `tokio::time::timeout`;
-///   elapsing also denies.
+///   futures keep racing. If every gateway errors, the request stays pending
+///   so Cockpit can still provide the explicit response.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_approval(
     cp: &Arc<ControlPlane>,
@@ -601,7 +735,8 @@ pub(crate) async fn handle_approval(
         .collect();
 
     if known_surfaces.is_empty() {
-        cp.resolve_approval_bool(run_id, request_id, false);
+        // No gateway surface can answer this — leave it pending for Cockpit
+        // rather than auto-denying it.
         return;
     }
 
@@ -627,8 +762,8 @@ pub(crate) async fn handle_approval(
         .collect();
 
     // Loop over `select_all`, dropping any future that resolves `Err` from
-    // the race instead of treating it as an instant deny vote — only once
-    // every future has errored (the pool is empty) do we fall back to deny.
+    // the race instead of treating it as an instant deny vote. If every
+    // gateway errors, leave the approval pending for another surface.
     let race = async move {
         let mut futs = futs;
         loop {
@@ -643,34 +778,130 @@ pub(crate) async fn handle_approval(
         }
     };
 
-    let decision = match tokio::time::timeout(Duration::from_millis(timeout_ms), race).await {
-        Ok(Some(decision)) => decision,
-        Ok(None) | Err(_) => ApprovalDecision::RejectOnce,
-    };
-
-    cp.resolve_approval_bool(
-        run_id,
-        request_id,
-        matches!(
-            decision,
-            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
-        ),
-    );
+    // A genuine `approval_timeout_ms` elapse auto-rejects (there is no
+    // reasonable default decision otherwise). But every gateway simply
+    // erroring — with time still remaining — must NOT be treated the same as
+    // a timeout: it must leave the request pending for another surface or
+    // Cockpit, exactly like the fully-surfaceless case above.
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), race).await {
+        Ok(Some(decision)) => {
+            cp.resolve_approval_bool(
+                run_id,
+                request_id,
+                matches!(
+                    decision,
+                    ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+                ),
+            );
+        }
+        Ok(None) => {}
+        Err(_) => {
+            cp.resolve_approval_bool(run_id, request_id, false);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NewMessage, PermMode, Project, Session, SessionKind, SessionStatus};
-    use crate::gateway::MessageRef;
+    use crate::domain::{
+        NewMessage, PermMode, Project, QueuedSessionPrompt, Session, SessionKind, SessionStatus,
+    };
+    use crate::gateway::{GatewayStatus, MessageRef};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
     use crate::telemetry::NoopTelemetry;
     use async_trait::async_trait;
     use serial_test::serial;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::task::Poll;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ---------- shared test plumbing ----------
+
+    async fn drain_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+        let mut request = Vec::with_capacity(4096);
+        let mut request_len = None;
+        let mut buf = [0u8; 4096];
+        loop {
+            if request.len() == MAX_REQUEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP request exceeds 64 KiB test-server limit",
+                ));
+            }
+
+            let read_len = (MAX_REQUEST_BYTES - request.len()).min(buf.len());
+            let read = stream.read(&mut buf[..read_len]).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before complete HTTP request",
+                ));
+            }
+            request.extend_from_slice(&buf[..read]);
+
+            if request_len.is_none() {
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP headers are not valid UTF-8",
+                    )
+                })?;
+                let mut lines = headers.split("\r\n");
+                if lines.next().filter(|line| !line.is_empty()).is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP request line is missing",
+                    ));
+                }
+                let mut content_length = None;
+                for line in lines {
+                    let (name, value) = line.split_once(':').ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "HTTP header is malformed",
+                        )
+                    })?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        if content_length.is_some() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP Content-Length appears more than once",
+                            ));
+                        }
+                        content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "HTTP Content-Length is malformed",
+                            )
+                        })?);
+                    }
+                }
+                let total_len = (header_end + 4)
+                    .checked_add(content_length.unwrap_or(0))
+                    .filter(|&len| len <= MAX_REQUEST_BYTES)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "HTTP request exceeds 64 KiB test-server limit",
+                        )
+                    })?;
+                request_len = Some(total_len);
+            }
+
+            if request.len() >= request_len.expect("HTTP header end must set request length") {
+                return Ok(());
+            }
+        }
+    }
 
     fn temp_db_path() -> (tempfile::NamedTempFile, PathBuf) {
         let f = tempfile::NamedTempFile::new().unwrap();
@@ -720,6 +951,43 @@ mod tests {
         crate::agents::bootstrap::initialize_agent_persistence(config_root, store)
             .await
             .unwrap()
+    }
+
+    async fn prompt_recovery_test_daemon(store: Arc<Store>) -> Daemon {
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            Registries::new(),
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
+        let router_in = Arc::new(Router::new(Arc::clone(&cp), vec![]));
+        Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![],
+            router_in,
+            router_server: Arc::new(RouterServer::new(store)),
+            agents,
+            agent_knowledge,
+            learning_queue,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
+        }
     }
 
     fn capturing_console_telemetry() -> (Arc<Mutex<Vec<String>>>, Arc<dyn Telemetry>) {
@@ -842,9 +1110,9 @@ mod tests {
         Allow,
         SleepThenAllow(u64),
         /// Returns `Err` the instant it's called — used to prove a
-        /// per-gateway error no longer wins the race outright (it must be
-        /// removed from the race instead), and that all-erroring surfaces
-        /// still deny.
+        /// per-gateway error no longer wins the race outright. The failed
+        /// surface is removed so another surface, including Cockpit, can
+        /// resolve the request.
         ErrImmediately,
     }
 
@@ -852,11 +1120,20 @@ mod tests {
         gid: String,
         behavior: GwBehavior,
         calls: Arc<AtomicUsize>,
+        starts: Arc<AtomicUsize>,
+        status_posts: Arc<AtomicUsize>,
+        status_posts_before_start: Arc<AtomicUsize>,
         stops: Arc<AtomicUsize>,
         last_req: Arc<Mutex<Option<ApprovalRequest>>>,
-        /// When true, `start()` always fails — used to exercise
-        /// `Daemon::start`'s partial-failure rollback.
+        /// When non-zero, `start()` pauses before recording the gateway as
+        /// started so a test can expose events emitted before gateway startup.
+        start_delay: Duration,
+        /// Test coordination for racing concurrent `Daemon::start()` calls.
+        /// `start()` signals `entered` after recording its call, then waits for
+        /// `release` before returning.
+        start_block: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         fail_start: bool,
+        status: Option<Arc<crate::gateway::GatewayStatusPublisher>>,
     }
 
     impl FakeGateway {
@@ -865,15 +1142,56 @@ mod tests {
                 gid: gid.to_string(),
                 behavior,
                 calls: Arc::new(AtomicUsize::new(0)),
+                starts: Arc::new(AtomicUsize::new(0)),
+                status_posts: Arc::new(AtomicUsize::new(0)),
+                status_posts_before_start: Arc::new(AtomicUsize::new(0)),
                 stops: Arc::new(AtomicUsize::new(0)),
                 last_req: Arc::new(Mutex::new(None)),
+                start_delay: Duration::ZERO,
+                start_block: None,
                 fail_start: false,
+                status: None,
+            }
+        }
+
+        fn new_delayed_start(gid: &str, behavior: GwBehavior, start_delay: Duration) -> Self {
+            FakeGateway {
+                start_delay,
+                ..FakeGateway::new(gid, behavior)
             }
         }
 
         fn new_failing_start(gid: &str) -> Self {
             FakeGateway {
                 fail_start: true,
+                ..FakeGateway::new(gid, GwBehavior::Allow)
+            }
+        }
+
+        fn with_status_subscription(gid: &str) -> Self {
+            let status = Arc::new(crate::gateway::GatewayStatusPublisher::new(
+                GatewayStatus::Offline,
+            ));
+            FakeGateway {
+                status: Some(status),
+                ..FakeGateway::new(gid, GwBehavior::Allow)
+            }
+        }
+
+        fn emit_status(&self, status: GatewayStatus) {
+            self.status
+                .as_ref()
+                .expect("status-emitting fake gateway")
+                .publish(status);
+        }
+
+        fn new_blocking_start(
+            gid: &str,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            FakeGateway {
+                start_block: Some((entered, release)),
                 ..FakeGateway::new(gid, GwBehavior::Allow)
             }
         }
@@ -888,11 +1206,22 @@ mod tests {
             if self.fail_start {
                 anyhow::bail!("start failed for gateway {}", self.gid);
             }
+            tokio::time::sleep(self.start_delay).await;
+            let start_number = self.starts.fetch_add(1, Ordering::SeqCst);
+            if start_number == 0 {
+                if let Some((entered, release)) = &self.start_block {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+            }
             Ok(())
         }
         async fn stop(&self) -> anyhow::Result<()> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+        fn subscribe_status(&self) -> Option<crate::gateway::GatewayStatusSubscription> {
+            self.status.as_ref().map(|publisher| publisher.subscribe())
         }
         async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
             Ok(format!("ws-{name}"))
@@ -901,6 +1230,11 @@ mod tests {
             Ok("conv".into())
         }
         async fn post_status(&self, surface: &Surface, _text: &str) -> anyhow::Result<MessageRef> {
+            self.status_posts.fetch_add(1, Ordering::SeqCst);
+            if self.starts.load(Ordering::SeqCst) == 0 {
+                self.status_posts_before_start
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             Ok(MessageRef {
                 surface: surface.clone(),
                 message_id: "m".into(),
@@ -947,6 +1281,32 @@ mod tests {
         }
     }
 
+    struct StaticGatewayFactory {
+        gateway: Arc<FakeGateway>,
+    }
+
+    impl GatewayFactory for StaticGatewayFactory {
+        fn create(&self, _config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
+            Ok(self.gateway.clone())
+        }
+    }
+
+    async fn wait_for_gateway_runs(store: &Store, hook_id: &str, expected: usize) {
+        for _ in 0..100 {
+            let runs = crate::automation::list_runs(store, hook_id).await.unwrap();
+            if runs.len() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let runs = crate::automation::list_runs(store, hook_id).await.unwrap();
+        assert_eq!(
+            runs.len(),
+            expected,
+            "gateway status transition did not produce the expected number of runs"
+        );
+    }
+
     #[tokio::test]
     async fn build_daemon_wires_known_gateways_and_skips_unknown_ids() {
         let (_guard, db_path) = temp_db_path();
@@ -964,9 +1324,8 @@ mod tests {
         let factory: Arc<dyn GatewayFactory> = Arc::new(CapturingGatewayFactory {
             captured: captured.clone(),
         });
-
         let daemon = build_daemon(BuildDaemonOpts {
-            db_path: db_path.clone(),
+            db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
@@ -975,19 +1334,260 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            daemon.gateways.len(),
-            1,
-            "only the known 'discord' id should be wired; 'bogus' must be skipped"
-        );
-        let cfg = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("factory must have been called");
+        assert_eq!(daemon.gateways.len(), 1);
+        let cfg = captured.lock().unwrap().clone().unwrap();
         assert_eq!(cfg["discord.token"], "tok-xyz");
         assert_eq!(cfg["discord.app_id"], "");
         assert_eq!(cfg["discord.guild_id"], "");
+    }
+
+    #[tokio::test]
+    async fn daemon_forwards_gateway_status_subscription_without_start_stop_transitions() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
+            gateway: gateway.clone(),
+        });
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        seed_project(&daemon.store, "project-1").await;
+        let hook = crate::automation::create_hook(
+            &daemon.store,
+            crate::automation::HookInput::agent_run(
+                "gateway lifecycle",
+                crate::automation::TriggerKind::GatewayStatusChanged,
+                "project-1",
+                "",
+                "local",
+                "ignore",
+            ),
+        )
+        .await
+        .unwrap();
+
+        daemon.start().await.unwrap();
+        assert!(crate::automation::list_runs(&daemon.store, &hook.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        gateway.emit_status(GatewayStatus::Connected);
+        wait_for_gateway_runs(&daemon.store, &hook.id, 1).await;
+        gateway.emit_status(GatewayStatus::Connected);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            crate::automation::list_runs(&daemon.store, &hook.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        gateway.emit_status(GatewayStatus::Offline);
+        wait_for_gateway_runs(&daemon.store, &hook.id, 2).await;
+        daemon.stop().await;
+        let runs = crate::automation::list_runs(&daemon.store, &hook.id)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        let mut transitions: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.envelope["data"]["previousStatus"].as_str().unwrap(),
+                    run.envelope["data"]["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        transitions.sort_unstable();
+        assert_eq!(
+            transitions,
+            vec![("connected", "offline"), ("offline", "connected")]
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_records_gateway_transitions_while_outbound_delivery_is_slow() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
+            gateway: gateway.clone(),
+        });
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let hook = crate::automation::create_hook(
+            &daemon.store,
+            crate::automation::HookInput::outbound(
+                "slow gateway hook",
+                crate::automation::TriggerKind::GatewayStatusChanged,
+                endpoint,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            // Drain the request before responding. Writing (and this fake
+            // server dropping the socket at the end of scope) before the
+            // client finishes sending its POST body races the client's
+            // write with the server's close, which Windows surfaces as
+            // `ConnectionAborted` (RST) rather than a clean response.
+            drain_http_request(&mut stream).await.unwrap();
+            // `Connection: close` on every response — otherwise `reqwest`'s
+            // HTTP/1.1 keep-alive would try to reuse this same socket for the
+            // next status delivery, but this fake server's loop below expects
+            // a brand-new `accept()` per request. Without it, the second
+            // `accept()` blocks forever waiting for a connection reqwest
+            // never opens, wedging the daemon's serial delivery worker.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                drain_http_request(&mut stream).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        daemon.start().await.unwrap();
+        gateway.emit_status(GatewayStatus::Connected);
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("the first status delivery must reach the slow outbound hook")
+            .unwrap();
+        gateway.emit_status(GatewayStatus::Offline);
+        gateway.emit_status(GatewayStatus::Connected);
+        // The daemon-owned worker intentionally delivers serially. Releasing
+        // the first slow request proves later transitions remain queued
+        // rather than requiring detached, untracked delivery tasks.
+        let _ = release_tx.send(());
+
+        wait_for_gateway_runs(&daemon.store, &hook.id, 3).await;
+        let runs = crate::automation::list_runs(&daemon.store, &hook.id)
+            .await
+            .unwrap();
+        let transitions: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.envelope["data"]["previousStatus"].as_str().unwrap(),
+                    run.envelope["data"]["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![
+                ("offline", "connected"),
+                ("connected", "offline"),
+                ("offline", "connected"),
+            ]
+        );
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn daemon_start_and_stop_do_not_wait_for_slow_gateway_hook_delivery() {
+        let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "discord").await.unwrap();
+            settings.set("discord.token", "tok-xyz").await.unwrap();
+        }
+
+        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
+            gateway: gateway.clone(),
+        });
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let hook = crate::automation::create_hook(
+            &daemon.store,
+            crate::automation::HookInput::outbound(
+                "slow gateway hook",
+                crate::automation::TriggerKind::GatewayStatusChanged,
+                endpoint,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(250), daemon.start())
+            .await
+            .expect("daemon start must not wait for an unobserved gateway transition")
+            .unwrap();
+        gateway.emit_status(GatewayStatus::Connected);
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("the status listener must dispatch the hook")
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), daemon.stop())
+            .await
+            .expect("daemon stop must not wait for outbound hook delivery");
+        assert_eq!(
+            crate::automation::list_runs(&daemon.store, &hook.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1123,6 +1723,69 @@ mod tests {
     // ---------- (b)/(c)/(d) handle_approval unit tests ----------
 
     #[tokio::test]
+    async fn handle_approval_without_gateway_surface_stays_pending_until_cockpit_resolves() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
+        seed_project(&store, "p1").await;
+        seed_session(&store, "s1", "p1", None).await;
+        let approval = cp.approvals_for_test_register("run-cockpit-only", "req-cockpit-only");
+
+        handle_approval(
+            &cp,
+            &store,
+            &[],
+            "s1",
+            "run-cockpit-only",
+            "agent-cockpit-only",
+            "Agent Cockpit Only",
+            "req-cockpit-only",
+            "Bash",
+            "ls",
+            None,
+        )
+        .await;
+
+        let mut approval = tokio::spawn(async move { approval.await.unwrap() });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut approval)
+                .await
+                .is_err(),
+            "a Cockpit-only approval must remain pending without a gateway surface"
+        );
+        assert!(cp.resolve_approval_bool("run-cockpit-only", "req-cockpit-only", true));
+        assert!(approval.await.unwrap().allowed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_fanout_keeps_question_requests_pending_until_cockpit_resolves() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
+        let _fanout = spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), vec![]);
+        let approval = cp.approvals_for_test_register("run-question", "req-question");
+
+        cp.emit(CoreEvent::ApprovalRequested {
+            session_pk: "s1".into(),
+            run_id: "run-question".into(),
+            requesting_agent_id: "agent-question".into(),
+            requesting_agent_name: "Agent Question".into(),
+            request_id: "req-question".into(),
+            tool: "clarify".into(),
+            summary: "Choose one".into(),
+            approval_kind: crate::domain::ApprovalKind::Question,
+            input: serde_json::json!({}),
+            principal: None,
+        });
+
+        let mut approval = tokio::spawn(async move { approval.await.unwrap() });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut approval)
+                .await
+                .is_err(),
+            "a Question approval must not be auto-cancelled by the fan-out"
+        );
+        assert!(cp.resolve_approval_bool("run-question", "req-question", true));
+        assert!(approval.await.unwrap().allowed());
+    }
+
+    #[tokio::test]
     async fn handle_approval_allow_resolves_true() {
         let (lines, telemetry) = capturing_console_telemetry();
         let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
@@ -1175,7 +1838,11 @@ mod tests {
             captured.approver_role_ids,
             vec!["role-a".to_string(), "role-b".to_string()]
         );
-        assert_eq!(captured.timeout_ms, Some(300_000)); // default
+        assert_eq!(
+            captured.timeout_ms,
+            Some(300_000),
+            "handle_approval must forward the resolved approval_timeout_ms default to the gateway"
+        );
         assert_eq!(captured.tool, "Bash");
         assert_eq!(captured.summary, "ls -la");
         assert_eq!(
@@ -1187,19 +1854,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_approval_timeout_denies() {
+    async fn handle_approval_waits_for_a_slow_gateway_decision() {
         let (lines, telemetry) = capturing_console_telemetry();
         let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
         store.add_surface("discord", "chan1", "s1").await.unwrap();
-        SettingsStore::new(store.clone())
-            .set("approval_timeout_ms", "100")
-            .await
-            .unwrap();
 
-        let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(2_000));
+        let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(150));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
+        let approval = cp.approvals_for_test_register("run-2", "req-2");
 
         handle_approval(
             &cp, &store, &gateways, "s1", "run-2", "agent-2", "Agent 2", "req-2", "Bash", "sleep",
@@ -1207,19 +1871,19 @@ mod tests {
         )
         .await;
 
+        assert!(approval.await.unwrap().allowed());
         let parsed = parse_telemetry_lines(&lines);
         assert!(
             parsed
                 .iter()
-                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
-            "a timed-out race must deny, got: {parsed:?}"
+                .any(|v| v["kind"] == "count" && v["name"] == "approval.allow"),
+            "a gateway's explicit allow must resolve after an arbitrary delay, got: {parsed:?}"
         );
     }
 
     #[tokio::test]
-    async fn handle_approval_no_surfaces_denies_immediately() {
-        let (lines, telemetry) = capturing_console_telemetry();
-        let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
+    async fn handle_approval_without_gateway_surfaces_leaves_request_pending() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
         // Deliberately no add_surface.
@@ -1227,6 +1891,7 @@ mod tests {
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
+        let approval = cp.approvals_for_test_register("run-3", "req-3");
 
         handle_approval(
             &cp, &store, &gateways, "s1", "run-3", "agent-3", "Agent 3", "req-3", "Bash", "ls",
@@ -1239,13 +1904,13 @@ mod tests {
             0,
             "no surfaces means the gateway must never be asked"
         );
-        let parsed = parse_telemetry_lines(&lines);
         assert!(
-            parsed
-                .iter()
-                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
-            "no surfaces must deny immediately, got: {parsed:?}"
+            tokio::time::timeout(Duration::from_millis(50), approval)
+                .await
+                .is_err(),
+            "no gateway surfaces must leave the Cockpit approval pending"
         );
+        assert!(cp.resolve_approval_bool("run-3", "req-3", false));
     }
 
     // ---------- fan-out error tolerance (MUST-FIX 1) ----------
@@ -1291,17 +1956,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_approval_denies_only_once_every_gateway_has_errored() {
-        let (lines, telemetry) = capturing_console_telemetry();
-        let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
+    async fn handle_approval_an_unavailable_gateway_leaves_request_pending_for_cockpit() {
+        let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
-        store.add_surface("err-gw-1", "c1", "s1").await.unwrap();
-        store.add_surface("err-gw-2", "c2", "s1").await.unwrap();
+        // The persisted Discord surface can become unavailable after session
+        // setup (for example, the channel was deleted or permissions changed).
+        store
+            .add_surface("discord", "deleted-channel", "s1")
+            .await
+            .unwrap();
 
-        let gw1 = FakeGateway::new("err-gw-1", GwBehavior::ErrImmediately);
-        let gw2 = FakeGateway::new("err-gw-2", GwBehavior::ErrImmediately);
-        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw1), Arc::new(gw2)];
+        let discord = FakeGateway::new("discord", GwBehavior::ErrImmediately);
+        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(discord)];
+        let mut approval = cp.approvals_for_test_register("run-race-2", "req-race-2");
 
         handle_approval(
             &cp,
@@ -1318,12 +1986,19 @@ mod tests {
         )
         .await;
 
-        let parsed = parse_telemetry_lines(&lines);
         assert!(
-            parsed
-                .iter()
-                .any(|v| v["kind"] == "count" && v["name"] == "approval.deny"),
-            "once every gateway in the race has errored, the approval must deny, got: {parsed:?}"
+            tokio::time::timeout(Duration::from_millis(50), &mut approval)
+                .await
+                .is_err(),
+            "an unavailable Discord surface must leave the approval pending for Cockpit"
+        );
+        assert!(
+            cp.resolve_approval_bool("run-race-2", "req-race-2", true),
+            "Cockpit must be able to resolve an approval after Discord is unavailable"
+        );
+        assert!(
+            approval.await.unwrap().allowed(),
+            "the explicit Cockpit approval must reach the waiting tool"
         );
     }
 
@@ -1382,6 +2057,7 @@ mod tests {
         });
 
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
             store: store.clone(),
             gateways,
@@ -1390,7 +2066,11 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
+            gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle,
             fanout_handle,
             scheduler_handle,
@@ -1702,7 +2382,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn approval_fanout_times_out_plan_kind_requests_to_cancel() {
+    async fn approval_fanout_keeps_plan_kind_requests_pending_until_cockpit_resolves() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
         let store = Arc::new(Store::open(&db_path).await.unwrap());
@@ -1727,10 +2407,6 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
-
-        // Spawn the REAL fan-out loop under test (no gateways — Plan-kind
-        // requests never touch them) instead of driving `handle_approval`
-        // manually, so this exercises the actual skip-branch fix.
         let _fanout = spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), vec![]);
 
         let mut rx = cp.subscribe();
@@ -1739,30 +2415,38 @@ mod tests {
             .await
             .unwrap();
 
-        let mut saw_result = false;
-        for _ in 0..40 {
+        let (run_id, request_id) = loop {
             match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(CoreEvent::Result { .. })) => {
-                    saw_result = true;
-                    break;
-                }
+                Ok(Ok(CoreEvent::ApprovalRequested {
+                    run_id, request_id, ..
+                })) => break (run_id, request_id),
                 Ok(Ok(_)) => {}
-                Ok(Err(_)) | Err(_) => break,
+                Ok(Err(error)) => panic!("approval event receiver failed: {error}"),
+                Err(_) => panic!("the Plan approval was not requested"),
             }
-        }
-        assert!(
-            saw_result,
-            "the real spawn_approval_fanout must time out the parked Plan approval to Cancel \
-             so the blocked turn completes instead of hanging forever"
-        );
+        };
 
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let msgs = store.list_messages(&session.session_pk).await.unwrap();
         assert!(
-            msgs.iter()
+            !msgs
+                .iter()
                 .any(|m| m.role == "assistant" && m.payload["text"] == "Cancel"),
-            "expected the timed-out Plan approval to resolve with ApprovalDecision::Cancel, \
-             got: {msgs:?}"
+            "the fan-out must not auto-cancel a Plan approval"
         );
+
+        assert!(cp.resolve_approval_bool(&run_id, &request_id, true));
+        for _ in 0..10 {
+            let msgs = store.list_messages(&session.session_pk).await.unwrap();
+            if msgs
+                .iter()
+                .any(|m| m.role == "assistant" && m.payload["text"] == "AllowOnce")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the Plan approval must resolve only after Cockpit responds");
     }
 
     // ---------- (e) Daemon::start fires reconcile ----------
@@ -1821,6 +2505,644 @@ mod tests {
         }
     }
 
+    struct BootQueueFakeSession {
+        prompts: Arc<Mutex<Vec<String>>>,
+        sent: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl HarnessSession for BootQueueFakeSession {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            self.prompts.lock().unwrap().push(prompt.agent);
+            self.sent.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            Some("boot-queue-agent".into())
+        }
+    }
+    struct BootQueueFakeHarness {
+        prompts: Arc<Mutex<Vec<String>>>,
+        starts: Arc<AtomicUsize>,
+        sent: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Harness for BootQueueFakeHarness {
+        async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(BootQueueFakeSession {
+                prompts: self.prompts.clone(),
+                sent: self.sent.clone(),
+                release: self.release.clone(),
+            }))
+        }
+    }
+    struct BootQueueFakeHarnessFactory {
+        prompts: Arc<Mutex<Vec<String>>>,
+        starts: Arc<AtomicUsize>,
+        sent: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl HarnessFactory for BootQueueFakeHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(BootQueueFakeHarness {
+                prompts: self.prompts.clone(),
+                starts: self.starts.clone(),
+                sent: self.sent.clone(),
+                release: self.release.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_start_delivers_one_pending_idle_queue_head_after_crash_window() {
+        let _state_dir = StateDirGuard::new();
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Store::open(&db_path).await.unwrap();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut regs = Registries::new();
+        regs.harness = Arc::new(BootQueueFakeHarnessFactory {
+            prompts: prompts.clone(),
+            starts: starts.clone(),
+            sent: sent.clone(),
+            release: release.clone(),
+        });
+        let store = Arc::new(store);
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
+        let store = cp.store().clone();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: "idle-queued".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
+                project_id: None,
+                agent_session_id: Some("interrupted-agent".into()),
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        // Simulate a process crash after the durable enqueue commit, before its
+        // best-effort delivery kick can run.
+        for (id, created_at) in [("first", 1), ("second", 2)] {
+            store
+                .enqueue_session_prompt(QueuedSessionPrompt {
+                    id: id.into(),
+                    session_pk: "idle-queued".into(),
+                    agent: id.into(),
+                    display: id.into(),
+                    attachments: vec![],
+                    created_at,
+                })
+                .await
+                .unwrap();
+        }
+
+        let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
+            cp,
+            store: store.clone(),
+            gateways: vec![],
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents,
+            agent_knowledge,
+            learning_queue,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
+        };
+
+        daemon.start().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sent.notified())
+            .await
+            .expect("boot must start the pending idle queue head");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(prompts.lock().unwrap().as_slice(), ["first"]);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "reconcile must not resume the boot-delivered queue session"
+        );
+        assert!(
+            !prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|prompt| prompt == crate::control::RESUME_NUDGE),
+            "reconcile must not send a resume nudge to the boot-delivered queue session"
+        );
+        assert_eq!(
+            store
+                .list_session_prompt_queue("idle-queued")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|prompt| prompt.id)
+                .collect::<Vec<_>>(),
+            ["second"],
+            "boot must claim only the FIFO head"
+        );
+
+        daemon.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a repeated start must not create another harness session"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().as_slice(),
+            ["first"],
+            "a repeated start must not send another prompt"
+        );
+        release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn daemon_start_recovers_abandoned_prompt_claims_once_under_concurrency() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "queued".into(),
+                session_pk: "s1".into(),
+                agent: "queued".into(),
+                display: "queued".into(),
+                attachments: vec![],
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "queued"
+        );
+
+        let daemon = Arc::new(prompt_recovery_test_daemon(store.clone()).await);
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let recovery_wait = recovery_entered.notified();
+        tokio::pin!(recovery_wait);
+        assert!(matches!(
+            futures::poll!(recovery_wait.as_mut()),
+            Poll::Pending
+        ));
+        let first_daemon = Arc::clone(&daemon);
+        let first = tokio::spawn(async move { first_daemon.start().await });
+        recovery_wait.await;
+
+        let second_daemon = Arc::clone(&daemon);
+        let mut second = tokio::spawn(async move { second_daemon.start().await });
+        tokio::task::yield_now().await;
+        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
+        release_recovery.notify_one();
+
+        first.await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .claim_next_session_prompt("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "queued"
+        );
+        second.await.unwrap().unwrap();
+        assert!(
+            store
+                .list_session_prompt_queue("s1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the second concurrent boot recovery must not reset the live claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_holds_inbound_reply_until_boot_recovery_finishes() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut regs = Registries::new();
+        regs.harness = Arc::new(ResumeFakeHarnessFactory {
+            prompts: prompts.clone(),
+        });
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp =
+            ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry), persistence)
+                .await;
+        let store = cp.store().clone();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: "inbound-session".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_surface("discord", "inbound-conversation", "inbound-session")
+            .await
+            .unwrap();
+
+        let router_in = Arc::new(Router::new_boot_gated(Arc::clone(&cp), vec![]));
+        let daemon = Arc::new(Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![],
+            router_in: Arc::clone(&router_in),
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents,
+            agent_knowledge,
+            learning_queue,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
+        });
+
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let boot_daemon = Arc::clone(&daemon);
+        let boot = tokio::spawn(async move { boot_daemon.start().await });
+        recovery_entered.notified().await;
+
+        let reply_router = Arc::clone(&router_in);
+        let mut reply = tokio::spawn(async move {
+            reply_router
+                .on_reply(
+                    "discord",
+                    "inbound-conversation",
+                    "actor",
+                    "inbound prompt",
+                    &[],
+                )
+                .await
+        });
+        // Yield so the spawned task reaches the admission wait before its
+        // JoinHandle is polled.
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(futures::poll!(&mut reply), Poll::Pending),
+            "the inbound reply must remain pending while boot recovery is paused"
+        );
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "the inbound reply must not start a harness before boot recovery completes"
+        );
+
+        release_recovery.notify_one();
+        boot.await.unwrap().unwrap();
+        reply.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if prompts.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            prompts.lock().unwrap().as_slice(),
+            ["inbound prompt"],
+            "the admitted reply must start exactly one harness prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_rejects_waiting_inbound_work_and_rolls_back_after_boot_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut regs = Registries::new();
+        regs.harness = Arc::new(ResumeFakeHarnessFactory {
+            prompts: prompts.clone(),
+        });
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp =
+            ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry), persistence)
+                .await;
+        let store = cp.store().clone();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: "inbound-session".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_surface("discord", "inbound-conversation", "inbound-session")
+            .await
+            .unwrap();
+
+        let gateway = FakeGateway::new("discord", GwBehavior::Allow);
+        let starts = gateway.starts.clone();
+        let stops = gateway.stops.clone();
+        let gateway: Arc<dyn Gateway> = Arc::new(gateway);
+        let router_in = Arc::new(Router::new_boot_gated(
+            Arc::clone(&cp),
+            vec![Arc::clone(&gateway)],
+        ));
+        let daemon = Arc::new(Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![gateway],
+            router_in: Arc::clone(&router_in),
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents,
+            agent_knowledge,
+            learning_queue,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
+        });
+
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let boot_daemon = Arc::clone(&daemon);
+        let boot = tokio::spawn(async move { boot_daemon.start().await });
+        recovery_entered.notified().await;
+
+        let reply_router = Arc::clone(&router_in);
+        let mut reply = tokio::spawn(async move {
+            reply_router
+                .on_reply(
+                    "discord",
+                    "inbound-conversation",
+                    "actor",
+                    "inbound prompt",
+                    &[],
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(futures::poll!(&mut reply), Poll::Pending),
+            "the inbound reply must remain pending while boot recovery is paused"
+        );
+
+        store
+            .with_conn(|conn| conn.execute_batch("DROP TABLE session_prompt_queue"))
+            .await
+            .unwrap();
+        release_recovery.notify_one();
+
+        assert!(boot.await.unwrap().is_err(), "boot recovery must fail");
+        let reply_error = reply
+            .await
+            .expect("inbound task must not panic")
+            .expect_err("failed boot must reject the inbound reply");
+        assert_eq!(reply_error.to_string(), "daemon failed to boot");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            1,
+            "the started gateway must be stopped during boot-failure rollback"
+        );
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "the failed boot must not admit the inbound prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_serializes_concurrent_boot_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp = ControlPlane::new_with_telemetry(
+            store,
+            Registries::new(),
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
+        let store = cp.store().clone();
+        let (start_entered, release_start) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let gateway = FakeGateway::new_blocking_start(
+            "discord",
+            Arc::clone(&start_entered),
+            Arc::clone(&release_start),
+        );
+        let starts = Arc::clone(&gateway.starts);
+        let stops = Arc::clone(&gateway.stops);
+        let gateway: Arc<dyn Gateway> = Arc::new(gateway);
+        let router_in = Arc::new(Router::new_boot_gated(
+            Arc::clone(&cp),
+            vec![Arc::clone(&gateway)],
+        ));
+        let daemon = Arc::new(Daemon {
+            cp,
+            store: store.clone(),
+            gateways: vec![gateway],
+            router_in: Arc::clone(&router_in),
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents,
+            agent_knowledge,
+            learning_queue,
+            telemetry: Arc::new(NoopTelemetry),
+            stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle: tokio::spawn(async {}),
+            fanout_handle: tokio::spawn(async {}),
+            scheduler_handle: tokio::spawn(async {}),
+            rail_handle: tokio::spawn(async {}),
+            learning_handle: tokio::spawn(async {}),
+            curator_handle: tokio::spawn(async {}),
+            gateway_status_handles: Mutex::new(Vec::new()),
+        });
+
+        let (recovery_entered, release_recovery) =
+            store.pause_next_session_prompt_claim_recovery_for_test();
+        let first_daemon = Arc::clone(&daemon);
+        let first = tokio::spawn(async move { first_daemon.start().await });
+        start_entered.notified().await;
+        release_start.notify_waiters();
+        recovery_entered.notified().await;
+
+        let second_daemon = Arc::clone(&daemon);
+        let mut second = tokio::spawn(async move { second_daemon.start().await });
+        tokio::task::yield_now().await;
+        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "the second start must wait rather than start the gateway again"
+        );
+
+        store
+            .with_conn(|conn| conn.execute_batch("DROP TABLE session_prompt_queue"))
+            .await
+            .unwrap();
+        release_recovery.notify_one();
+        let first_error = first.await.unwrap().unwrap_err();
+        let second_error = second.await.unwrap().unwrap_err();
+        assert!(first_error.to_string().contains("session_prompt_queue"));
+        assert_eq!(second_error.to_string(), "daemon failed to boot");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+        let inbound_error = router_in
+            .on_reply("discord", "inbound-conversation", "actor", "prompt", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(inbound_error.to_string(), "daemon failed to boot");
+    }
+
+    #[tokio::test]
+    async fn daemon_start_does_not_retry_after_prompt_claim_recovery_failure() {
+        let (_db_guard, db_path) = temp_db_path();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        store
+            .enqueue_session_prompt(QueuedSessionPrompt {
+                id: "queued".into(),
+                session_pk: "s1".into(),
+                agent: "queued".into(),
+                display: "queued".into(),
+                attachments: vec![],
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        store.claim_next_session_prompt("s1").await.unwrap();
+
+        let daemon = prompt_recovery_test_daemon(store.clone()).await;
+        store.fail_next_session_prompt_claim_recovery_for_test();
+        assert!(daemon.start().await.is_err());
+        assert!(!daemon.prompt_claim_recovery_complete.load(Ordering::SeqCst));
+
+        let retry_err = daemon.start().await.unwrap_err();
+        assert_eq!(retry_err.to_string(), "daemon failed to boot");
+    }
+
     #[tokio::test]
     async fn daemon_start_fires_reconcile_and_resumes_running_sessions() {
         let (_db_guard, db_path) = temp_db_path();
@@ -1831,19 +3153,18 @@ mod tests {
             prompts: prompts.clone(),
         });
         let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
         let cp = ControlPlane::new_with_telemetry(
             store.clone(),
             regs,
             Arc::new(NoopTelemetry),
-            persistence.clone(),
+            persistence,
         )
         .await;
         seed_project(&store, "p1").await;
-        let primary_agent = persistence
-            .registry
-            .resolved_snapshot("ryuzi")
-            .await
-            .unwrap();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
         let now = crate::paths::now_ms();
         store
             .insert_session(Session {
@@ -1874,17 +3195,39 @@ mod tests {
             .await
             .unwrap();
 
+        store
+            .add_surface("discord", "resumed-session", "s1")
+            .await
+            .unwrap();
+
+        let gw = FakeGateway::new_delayed_start(
+            "discord",
+            GwBehavior::Allow,
+            Duration::from_millis(100),
+        );
+        let gateway_starts = gw.starts.clone();
+        let status_posts = gw.status_posts.clone();
+        let status_posts_before_start = gw.status_posts_before_start.clone();
+        let gw: Arc<dyn Gateway> = Arc::new(gw);
+        let router_handle =
+            tokio::spawn(Router::new(Arc::clone(&cp), vec![Arc::clone(&gw)]).run(cp.subscribe()));
+
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![Arc::clone(&gw)])),
             cp,
             store: store.clone(),
-            gateways: vec![],
-            router_server: Arc::new(RouterServer::new(store)),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            gateways: vec![gw],
+            router_server: Arc::new(RouterServer::new(store.clone())),
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
+            gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
-            router_handle: tokio::spawn(async {}),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
+            router_handle,
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
@@ -1901,9 +3244,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
-            prompts.lock().unwrap().first().cloned(),
-            Some(crate::control::RESUME_NUDGE.to_string()),
-            "Daemon::start must fire reconcile, resuming the Running session with the nudge"
+            gateway_starts.load(Ordering::SeqCst),
+            1,
+            "the gateway must start before boot reconciliation"
+        );
+        assert_eq!(
+            status_posts.load(Ordering::SeqCst),
+            1,
+            "reconciliation must emit the resumed status to its bound surface"
+        );
+        assert_eq!(
+            status_posts_before_start.load(Ordering::SeqCst),
+            0,
+            "the resumed status must not be routed before Gateway::start"
+        );
+        assert_eq!(
+            prompts.lock().unwrap().as_slice(),
+            [crate::control::RESUME_NUDGE],
+            "Daemon::start must issue exactly one resume nudge for the recovered Running session"
         );
     }
 
@@ -1961,6 +3319,7 @@ mod tests {
         });
 
         let daemon = Daemon {
+            router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
             store: store.clone(),
             gateways,
@@ -1969,7 +3328,11 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             telemetry: Arc::new(NoopTelemetry),
+            gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
+            started: AtomicBool::new(false),
+            prompt_claim_recovery_complete: AtomicBool::new(false),
             router_handle,
             fanout_handle,
             scheduler_handle,

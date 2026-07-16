@@ -272,7 +272,7 @@ pub struct Session {
     pub created_at: Option<i64>,
     pub last_active: Option<i64>,
     pub resume_attempts: i64,
-    /// True when the engine auto-generated the branch name (`harness/{short}`).
+    /// True when the engine auto-generated the branch name (`ryuzi/{short}`).
     /// `end_session` deletes the branch ONLY when this is set; user-named and
     /// pre-existing branches survive teardown.
     pub branch_owned: bool,
@@ -422,7 +422,7 @@ pub struct NewAgentRun {
 pub struct SessionGitOptions {
     pub use_worktree: bool,
     pub create_branch: bool,
-    /// User-typed branch name; `None` => auto `harness/{short}`.
+    /// User-typed branch name; `None` => auto `ryuzi/{short}`.
     pub branch_name: Option<String>,
     /// Branch to cut from (`create_branch`) or run on (`!create_branch`);
     /// `None` => repo HEAD / current branch (legacy behavior).
@@ -497,6 +497,26 @@ pub struct AttachmentRef {
     pub url: String,
     pub content_type: Option<String>,
     pub size: u64,
+}
+
+/// A persisted prompt waiting for a session to become available. Attachment
+/// references remain durable inputs; turn blocks and display metadata are
+/// reconstructed only when the prompt is delivered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedSessionPrompt {
+    pub id: String,
+    pub session_pk: String,
+    pub agent: String,
+    pub display: String,
+    pub attachments: Vec<AttachmentRef>,
+    pub created_at: i64,
+}
+
+impl QueuedSessionPrompt {
+    pub fn into_turn_prompt(self) -> crate::harness::TurnPrompt {
+        crate::harness::TurnPrompt::text(self.agent, self.display)
+    }
 }
 
 /// Identifies the plugin an approvable action originates from — attribution
@@ -765,6 +785,9 @@ pub enum CoreEvent {
         /// database and wire compatibility.
         speaker: Option<String>,
     },
+    SessionQueueChanged {
+        session_pk: String,
+    },
     Result {
         session_pk: String,
     },
@@ -810,6 +833,12 @@ pub enum CoreEvent {
         parent_run_id: Option<String>,
         status: String,
     },
+    /// A Hook run changed state (queued|running|success|failed|skipped).
+    AutomationHookRunChanged {
+        hook_id: String,
+        run_id: String,
+        status: String,
+    },
     /// A scheduled job run started or finished (status: running|success|failed).
     JobRunChanged {
         job_id: String,
@@ -825,6 +854,7 @@ pub enum CoreEvent {
         usable_window: u64,
         percent_left: u8,
         cache_read_tokens: u64,
+        cache_creation_tokens: u64,
         output_tokens: u64,
     },
     /// The native runtime compacted a session's history
@@ -975,6 +1005,7 @@ mod tests {
             usable_window: 190_000,
             percent_left: 37,
             cache_read_tokens: 90_000,
+            cache_creation_tokens: 4_000,
             output_tokens: 512,
         };
         let j = serde_json::to_value(&e).unwrap();

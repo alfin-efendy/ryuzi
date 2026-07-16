@@ -589,6 +589,62 @@ async runJobNow(runnerId: string | null, id: string) : Promise<Result<JobInfo[],
 async parseNaturalSchedule(text: string) : Promise<string | null> {
     return await TAURI_INVOKE("parse_natural_schedule", { text });
 },
+async listAutomationHooks(runnerId: string | null) : Promise<Result<AutomationHookInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_automation_hooks", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async automationHookDetail(runnerId: string | null, id: string) : Promise<Result<AutomationHookDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("automation_hook_detail", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createAutomationHook(runnerId: string | null, input: AutomationHookInput) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_automation_hook", { runnerId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateAutomationHook(runnerId: string | null, id: string, input: AutomationHookInput) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_automation_hook", { runnerId, id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async toggleAutomationHook(runnerId: string | null, id: string, enabled: boolean) : Promise<Result<AutomationHookInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("toggle_automation_hook", { runnerId, id, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteAutomationHook(runnerId: string | null, id: string) : Promise<Result<AutomationHookInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_automation_hook", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async testAutomationHook(runnerId: string | null, id: string) : Promise<Result<AutomationHookDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("test_automation_hook", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listApps(runnerId: string | null) : Promise<Result<AppInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_apps", { runnerId }) };
@@ -1020,6 +1076,14 @@ async listModelRoutes(runnerId: string | null) : Promise<Result<ModelRouteInfo[]
     else return { status: "error", error: e  as any };
 }
 },
+async listModelRouteTargetCapabilities(runnerId: string | null) : Promise<Result<ModelRouteTargetCapability[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_model_route_target_capabilities", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async saveModelRoute(runnerId: string | null, route: ModelRouteInfo) : Promise<Result<ModelRouteInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_model_route", { runnerId, route }) };
@@ -1146,6 +1210,79 @@ async nativeCommands(runnerId: string | null, projectId: string) : Promise<Resul
 async sessionTodos(runnerId: string | null, sessionPk: string) : Promise<Result<TodoItem[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("session_todos", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listProjectCommands(runnerId: string | null, projectId: string) : Promise<Result<ProjectCommandInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_project_commands", { runnerId, projectId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readProjectCommand(runnerId: string | null, projectId: string, name: string) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_project_command", { runnerId, projectId, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async createProjectCommand(runnerId: string | null, projectId: string, input: ProjectCommandInputDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_project_command", { runnerId, projectId, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async updateProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string, input: ProjectCommandMutationDto) : Promise<Result<ProjectCommandInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("update_project_command", { runnerId, projectId, name, revision, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteProjectCommand(runnerId: string | null, projectId: string, name: string, revision: string) : Promise<Result<null, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_project_command", { runnerId, projectId, name, revision }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * A session's durable queued messages.
+ */
+async sessionQueue(runnerId: string | null, sessionPk: string) : Promise<Result<QueuedMessageInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_queue", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Queue a durable message for a session.
+ */
+async enqueueSessionMessage(runnerId: string | null, sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<QueuedMessageInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("enqueue_session_message", { runnerId, sessionPk, prompt, options }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove a durable queued message from a session.
+ */
+async removeSessionMessage(runnerId: string | null, sessionPk: string, id: string) : Promise<Result<boolean, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_session_message", { runnerId, sessionPk, id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1612,6 +1749,7 @@ termOutputMsg: "term-output-msg"
 /** user-defined types **/
 
 export type AccentChangedMsg = { hex: string }
+export type ActionKind = "agent.run" | "webhook.outbound"
 export type AddAppInput = { id: string | null; name: string; description: string; kind: string | null;
 /**
  * stdio | http
@@ -1709,6 +1847,18 @@ origin: string; sessionPk: string | null;
  * Unix ms.
  */
 at: number }
+export type AutomationActionInfo = { kind: "agent.run"; config: AutomationAgentRunActionInput } | { kind: "webhook.outbound"; config: AutomationWebhookOutboundActionInfo }
+export type AutomationActionInput = { kind: "agent.run"; config: AutomationAgentRunActionInput } | { kind: "webhook.outbound"; config: AutomationWebhookOutboundActionInput }
+export type AutomationAgentRunActionInput = { projectId: string; branch: string; gatewayId: string; prompt: string; agentId: string | null; modelOverride: string | null; subtask: boolean }
+export type AutomationHookAttemptInfo = { runId: string; ordinal: number; startedAt: number; finishedAt: number | null; httpStatus: number | null; error: string | null }
+export type AutomationHookDetail = { hook: AutomationHookInfo; action: AutomationActionInfo; runs: AutomationHookRunInfo[] }
+export type AutomationHookInfo = { id: string; name: string; triggerKind: TriggerKind; actionKind: ActionKind; enabled: boolean; inboundPath: string | null; createdAt: number; updatedAt: number }
+export type AutomationHookInput = { name: string; triggerKind: TriggerKind; action: AutomationActionInput; enabled?: boolean }
+export type AutomationHookRunInfo = { id: string; hookId: string; status: string; sessionPk: string | null; error: string | null; attemptCount: number; lastHttpStatus: number | null; queuedAt: number; startedAt: number | null; finishedAt: number | null; attempts: AutomationHookAttemptInfo[] }
+export type AutomationWebhookHeaderInfo = { name: string; configured: boolean }
+export type AutomationWebhookHeaderInput = { name: string; value: string }
+export type AutomationWebhookOutboundActionInfo = { url: string; method: string; headers: AutomationWebhookHeaderInfo[]; payloadTemplate: string | null }
+export type AutomationWebhookOutboundActionInput = { url: string; method: string; headers?: AutomationWebhookHeaderInput[]; payloadTemplate: string | null }
 export type BackdropCapability = "mica" | "vibrancy" | "none"
 export type BranchList = {
 /**
@@ -1736,11 +1886,21 @@ family: string; color: string; initial: string; category: string; format: string
  */
 export type CatalogStatus = { sequence: number; lastFetchAt: number | null; outcome: string | null; entries: number; blocked: number }
 export type ChatContextArg = { branch: string | null; voiceTranscript: string | null; references?: string[] }
+export type ChatRequestOptions = { model: string | null; effort: string | null; context: ChatContextArg | null; attachments?: string[];
+/**
+ * None => engine default (worktree ON, new engine-named branch from HEAD).
+ */
+git: GitOptions | null;
+/**
+ * Initial permission mode for a legacy/composer session.
+ */
+permMode: PermMode | null }
 export type CmdError = { message: string }
 export type CodexResetCreditInfo = { status: string; grantedAt: string | null; expiresAt: string | null }
 export type CodexResetCreditResult = { reset: boolean; code: string | null; windowsReset: number; message: string | null; redeemRequestId: string | null }
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
-export type CommandInfo = { name: string; description: string; agent: string | null }
+export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean; origin: CommandOriginInfo; effective?: boolean; shadowsGlobal: boolean }
+export type CommandOriginInfo = "builtin" | "global" | "project"
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and
@@ -1750,7 +1910,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; run_id: string; requesting_agent_id: string; requesting_agent_name: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "sessionQueueChanged"; session_pk: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; run_id: string; requesting_agent_id: string; requesting_agent_name: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
@@ -1761,6 +1921,10 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  */
 { kind: "agentRunChanged"; session_pk: string; run_id: string; parent_run_id: string | null; status: string } |
 /**
+ * A Hook run changed state (queued|running|success|failed|skipped).
+ */
+{ kind: "automationHookRunChanged"; hook_id: string; run_id: string; status: string } |
+/**
  * A scheduled job run started or finished (status: running|success|failed).
  */
 { kind: "jobRunChanged"; job_id: string; run_id: string; status: string } |
@@ -1768,7 +1932,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
  */
-{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; output_tokens: number } |
+{ kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; cache_creation_tokens: number; output_tokens: number } |
 /**
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
@@ -1830,7 +1994,7 @@ severity: string;
  * see `crate::plugins::doctor::plugin_doctor`'s extension section).
  */
 kind: string; message: string; suggestedAction: string }
-export type EffectiveEffortSource = "project" | "session" | "routeCompatibility" | "configured" | "provider" | "none"
+export type EffectiveEffortSource = "project" | "session" | "routeTarget" | "configured" | "provider" | "none"
 export type EndpointKeyInfo = { id: string; name: string; key: string; createdAt: number; lastUsedAt: number | null }
 export type EndpointStatusInfo = { running: boolean; port: number; baseUrl: string; autostart: boolean; keychainStatus: KeychainStatus }
 /**
@@ -1956,7 +2120,8 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
- * Group-chat attribution: the agent name for a labeled worker bubble.
+ * Legacy group-chat attribution retained so existing databases and event
+ * payloads remain readable. New message constructors leave it unset.
  */
 speaker: string | null }
 /**
@@ -1977,10 +2142,10 @@ export type ModelRouteTarget = {
  */
 provider: string; model: string;
 /**
- * Compatibility-only storage for legacy Codex virtual model suffixes.
- * New route writes cannot edit this value directly.
+ * Explicit effort policy; `None` uses the model default.
  */
 effort?: string | null }
+export type ModelRouteTargetCapability = { provider: string; model: string; supported: ReasoningEffortOption[]; providerDefault: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
@@ -2181,10 +2346,21 @@ export type Project = { projectId: string; name: string; workdir: string; source
  * NOT a DB column. Self-corrects if the user later runs `git init`.
  */
 isGit: boolean }
+/**
+ * A project command and the revision that must accompany update or delete.
+ */
+export type ProjectCommandInfo = { name: string; description: string; template: string; agent: string | null; model: string | null; subtask: boolean; revision: string }
+export type ProjectCommandInputDto = ({ description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }) & { name: string }
+/**
+ * Editable fields for a project-owned slash command. The command name is
+ * supplied separately for updates so a save cannot rename a file by accident.
+ */
+export type ProjectCommandMutationDto = { description: string; template: string; agent: string | null; model: string | null; subtask?: boolean }
 export type ProjectRuntimeInfo = { projectId: string; model: string | null; storedEffort: string | null; effectiveEffort: string | null; effectiveEffortLabel: string | null; effectiveSource: EffectiveEffortSource; storedEffortStatus: StoredEffortStatus; modelInfo: SelectableModelInfo | null }
 export type ProviderAccountRouteInfo = { provider: string; strategy: ModelRouteStrategy }
 export type ProviderQuotaCapability = "claude" | "codex"
 export type ProviderQuotaInfo = { provider: string; plan: string | null; message: string | null; limitReached: boolean; reviewLimitReached: boolean; resetCredits: CodexResetCreditsInfo | null; quotas: QuotaWindowInfo[] }
+export type QueuedMessageInfo = { id: string; text: string }
 export type QuotaWindowInfo = { label: string; used: number; total: number; remaining: number; usedPercentage: number; remainingPercentage: number; resetAt: string | null; unlimited: boolean }
 export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
@@ -2213,7 +2389,7 @@ projectId: string | null; agentSessionId: string | null; worktreePath: string | 
  */
 permMode: PermMode; startedBy: string | null; createdAt: number | null; lastActive: number | null; resumeAttempts: number;
 /**
- * True when the engine auto-generated the branch name (`harness/{short}`).
+ * True when the engine auto-generated the branch name (`ryuzi/{short}`).
  * `end_session` deletes the branch ONLY when this is set; user-named and
  * pre-existing branches survive teardown.
  */
@@ -2279,6 +2455,7 @@ export type ToolInfo = { name: string; desc: string; perm: string }
  * One persisted "don't ask again" rule (Settings → Permissions).
  */
 export type ToolPolicyRow = { projectId: string; tool: string; decision: string }
+export type TriggerKind = "session.start" | "tool.before" | "tool.after" | "session.end" | "scheduler.run.success" | "scheduler.run.failed" | "gateway.status.changed" | "webhook.inbound"
 /**
  * Mirror of `crate::skills_install::TrustPrompt`. `total_bytes` stays a
  * `u64` (not narrowed to `u32`) to avoid silently truncating a large pack's

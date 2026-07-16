@@ -410,13 +410,29 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         messages: MockMessage[];
         route: RouteIdentity | null;
         routeRequests: number;
+        modelRoutes: Array<{
+          id: string;
+          name: string;
+          enabled: boolean;
+          strategy: string;
+          targets: Array<{ provider: string; model: string; effort: string | null }>;
+          createdAt: number;
+          updatedAt: number;
+        }>;
       };
       const stored = localStorage.getItem(storageKey);
       const durable: DurableState = stored
         ? (JSON.parse(stored) as DurableState)
-        : { sessions: fixtures.list_sessions as (typeof SESSION)[], messages: [], route: null, routeRequests: 0 };
+        : {
+            sessions: fixtures.list_sessions as (typeof SESSION)[],
+            messages: [],
+            route: null,
+            routeRequests: 0,
+            modelRoutes: fixtures.list_model_routes as DurableState["modelRoutes"],
+          };
       let sessions = durable.sessions;
       let connections = fixtures.list_connections as ConnectionInfo[];
+      let modelRoutes = durable.modelRoutes;
       const quotaAttempts = new Map<string, number>();
       const pendingQuota = new Map<string, (value: unknown) => void>();
       let projectRuntime = fixtures.project_runtime_info as {
@@ -457,6 +473,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
 
       const persist = () => {
         durable.sessions = sessions;
+        durable.modelRoutes = modelRoutes;
         localStorage.setItem(storageKey, JSON.stringify(durable));
       };
 
@@ -581,6 +598,15 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           if (cmd === "list_sessions") return Promise.resolve(sessions);
           if (cmd === "list_connections") return Promise.resolve(connections);
           if (cmd === "list_messages") return Promise.resolve(durable.messages);
+          if (cmd === "list_model_routes") return Promise.resolve(modelRoutes);
+          if (cmd === "save_model_route") {
+            const { route } = args as { route: (typeof modelRoutes)[number] };
+            modelRoutes = modelRoutes.some((current) => current.id === route.id)
+              ? modelRoutes.map((current) => (current.id === route.id ? route : current))
+              : [...modelRoutes, route];
+            persist();
+            return Promise.resolve(modelRoutes);
+          }
           if (cmd === "start_session") {
             const session = fixtures.start_session as typeof SESSION;
             sessions = [session];

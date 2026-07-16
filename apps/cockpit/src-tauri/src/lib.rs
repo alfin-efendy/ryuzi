@@ -2,6 +2,7 @@ mod accent;
 mod agent_cmd;
 mod apps_cmd;
 mod audit_cmd;
+mod automation_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
@@ -97,6 +98,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             scheduler_cmd::delete_job,
             scheduler_cmd::run_job_now,
             scheduler_cmd::parse_natural_schedule,
+            automation_cmd::list_automation_hooks,
+            automation_cmd::automation_hook_detail,
+            automation_cmd::create_automation_hook,
+            automation_cmd::update_automation_hook,
+            automation_cmd::toggle_automation_hook,
+            automation_cmd::delete_automation_hook,
+            automation_cmd::test_automation_hook,
             apps_cmd::list_apps,
             apps_cmd::add_app,
             apps_cmd::remove_app,
@@ -145,6 +153,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::connection_provider_quota,
             connections_cmd::reset_codex_credit,
             connections_cmd::list_model_routes,
+            connections_cmd::list_model_route_target_capabilities,
             connections_cmd::save_model_route,
             connections_cmd::delete_model_route,
             connections_cmd::provider_account_route,
@@ -157,6 +166,14 @@ fn make_builder() -> Builder<tauri::Wry> {
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
+            native_cmd::list_project_commands,
+            native_cmd::read_project_command,
+            native_cmd::create_project_command,
+            native_cmd::update_project_command,
+            native_cmd::delete_project_command,
+            native_cmd::session_queue,
+            native_cmd::enqueue_session_message,
+            native_cmd::remove_session_message,
             skills_cmd::list_skills,
             skills_cmd::install_skill,
             skills_cmd::remove_skill,
@@ -222,6 +239,30 @@ pub fn export_bindings(out: &std::path::Path) {
             out,
         )
         .expect("export bindings");
+
+    let bindings = std::fs::read_to_string(out).expect("read exported bindings");
+    let normalized = normalize_binding_whitespace(&bindings);
+    if normalized != bindings {
+        std::fs::write(out, normalized).expect("write normalized bindings");
+    }
+}
+
+fn normalize_binding_whitespace(bindings: &str) -> String {
+    let mut normalized = String::with_capacity(bindings.len());
+
+    for line in bindings.split_inclusive('\n') {
+        let (content, line_ending) = match line.strip_suffix('\n') {
+            Some(line) => match line.strip_suffix('\r') {
+                Some(line) => (line, "\r\n"),
+                None => (line, "\n"),
+            },
+            None => (line, ""),
+        };
+        normalized.push_str(content.trim_end_matches([' ', '\t']));
+        normalized.push_str(line_ending);
+    }
+
+    normalized
 }
 
 pub fn run() {
@@ -312,6 +353,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_trailing_horizontal_whitespace_without_changing_line_endings() {
+        let source = "first \t\r\nsecond\t \nthird \t";
+
+        assert_eq!(
+            normalize_binding_whitespace(source),
+            "first\r\nsecond\nthird"
+        );
+    }
 
     /// Generates `src/bindings.ts` without launching the Tauri GUI.
     /// Run via: `cargo test -p ryuzi-cockpit export_bindings -- --nocapture`
