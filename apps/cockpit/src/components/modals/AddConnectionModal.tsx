@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
 import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
 import { Chip } from "@/components/common/bits";
-import { Button, ChoiceCard, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
+import { Button, ChoiceCard, Combobox, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
 import {
   DEVICE_SIGNIN_ACTION,
   KIRO_DEVICE_CODE_HINT,
@@ -25,6 +25,21 @@ const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
 };
 
+type MimoRegion = { id: string; label: string; baseUrl: string };
+// The MiMo Token Plan is region-specific: the picker sets the connection's
+// base_url_override to the chosen cluster host (sgp is the default).
+const MIMO_REGIONS: MimoRegion[] = [
+  { id: "sgp", label: "Singapore (sgp)", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1" },
+  { id: "cn", label: "China (cn)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
+  { id: "ams", label: "Amsterdam (ams)", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1" },
+];
+
+/** Where to obtain the subscription credential, by member id. */
+const KEY_SOURCE_HINTS: Record<string, string> = {
+  mimo: "Get a Token Plan key (starts with tp-) at mimo.xiaomi.com.",
+  opencode: "Get a Go plan key at opencode.ai/auth.",
+};
+
 function signInFlow(entry: CatalogEntry): SignInFlow {
   if (usesDeviceSignin(entry)) return "device";
   if (entry.category === "oauth") return "oauth";
@@ -41,7 +56,11 @@ function authMethodLabel(entry: CatalogEntry): string {
     case "free":
       return "Free tier";
     case "apiKey":
-      return "API Key";
+      // An API-key member that joins another family's head (its id differs from
+      // its family) is a paid upgrade to that free tier — a "Subscription"
+      // (e.g. MiMo Token Plan, OpenCode Go). Standalone API-key providers, whose
+      // id equals their family, keep the plain "API Key" label.
+      return entry.id !== entry.family ? "Subscription" : "API Key";
   }
 }
 
@@ -74,7 +93,10 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
       setSelectedId(null);
       setLabel("");
       setApiKey("");
-      setBaseUrl("");
+      // The default-selected member (api-key member, else the first) drives the
+      // initial base URL; MiMo's Token Plan defaults to its sgp region host.
+      const defaultMember = members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
+      setBaseUrl(defaultMember?.id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
       setSaving(false);
       setOauthWaiting(false);
       setOauthAuthorizeUrl("");
@@ -138,6 +160,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     if (shortCommitBusy || id === selected?.id) return;
     operationRef.current += 1;
     setSelectedId(id);
+    setBaseUrl(id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
     setSaving(false);
     setOauthWaiting(false);
     setOauthAuthorizeUrl("");
@@ -326,26 +349,40 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             </FormField>
             {flow === "apiKey" && (
               <>
+                {KEY_SOURCE_HINTS[selected.id] && <p className="text-xs text-muted-foreground">{KEY_SOURCE_HINTS[selected.id]}</p>}
                 <FormField label="API Key">
                   <Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-..." />
                 </FormField>
-                <FormField
-                  label={
-                    selected.requiresBaseUrl ? (
-                      "Base URL"
-                    ) : (
-                      <>
-                        Base URL override<span className="font-normal text-muted-foreground"> - optional</span>
-                      </>
-                    )
-                  }
-                >
-                  <Input
-                    value={baseUrl}
-                    onChange={(event) => setBaseUrl(event.target.value)}
-                    placeholder={BASE_URL_PLACEHOLDERS[selected.id] ?? "https://host/v1"}
-                  />
-                </FormField>
+                {selected.id === "mimo" ? (
+                  <FormField label="Region">
+                    <Combobox
+                      aria-label="Region"
+                      value={MIMO_REGIONS.find((region) => region.baseUrl === baseUrl)?.id ?? MIMO_REGIONS[0].id}
+                      onValueChange={(regionId) =>
+                        setBaseUrl(MIMO_REGIONS.find((region) => region.id === regionId)?.baseUrl ?? MIMO_REGIONS[0].baseUrl)
+                      }
+                      options={MIMO_REGIONS.map((region) => ({ value: region.id, label: region.label }))}
+                    />
+                  </FormField>
+                ) : (
+                  <FormField
+                    label={
+                      selected.requiresBaseUrl ? (
+                        "Base URL"
+                      ) : (
+                        <>
+                          Base URL override<span className="font-normal text-muted-foreground"> - optional</span>
+                        </>
+                      )
+                    }
+                  >
+                    <Input
+                      value={baseUrl}
+                      onChange={(event) => setBaseUrl(event.target.value)}
+                      placeholder={BASE_URL_PLACEHOLDERS[selected.id] ?? "https://host/v1"}
+                    />
+                  </FormField>
+                )}
               </>
             )}
           </div>

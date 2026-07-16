@@ -91,9 +91,68 @@ const kiroProvider: CatalogEntry = {
   riskNotice: true,
   usesDeviceGrant: false,
 };
+const mimoFree: CatalogEntry = {
+  id: "mimo-free",
+  name: "MiMo (free)",
+  family: "mimo-free",
+  color: "#ff6900",
+  initial: "M",
+  category: "free",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: ["mimo-auto"],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+const mimo: CatalogEntry = {
+  id: "mimo",
+  name: "MiMo (Token Plan)",
+  family: "mimo-free",
+  color: "#ff6900",
+  initial: "M",
+  category: "api_key",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: ["mimo-v2.5-pro", "mimo-v2.5"],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+const opencodeFree: CatalogEntry = {
+  id: "opencode-free",
+  name: "OpenCode (free)",
+  family: "opencode-free",
+  color: "#f5a623",
+  initial: "OC",
+  category: "free",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: [],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+const opencode: CatalogEntry = {
+  id: "opencode",
+  name: "OpenCode (Go)",
+  family: "opencode-free",
+  color: "#f5a623",
+  initial: "OC",
+  category: "api_key",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: ["glm-5.2", "kimi-k2.7-code", "deepseek-v4-pro", "mimo-v2.5-pro"],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
 
 beforeEach(() => {
-  useConnections.setState({ catalog: [anthropic, claudeOauth, customOpenAi, kiroProvider], connections: [] });
+  useConnections.setState({
+    catalog: [anthropic, claudeOauth, customOpenAi, kiroProvider, mimoFree, mimo, opencodeFree, opencode],
+    connections: [],
+  });
   addConnection.mockClear();
   connectOauth.mockClear();
   listenOauthAuthorizeUrl.mockClear();
@@ -145,6 +204,48 @@ test("submitting api key for anthropic family calls addConnection with the membe
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic", "Anthropic", "sk-ant-test", null);
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("mimo family offers Free tier vs Subscription and a region picker", async () => {
+  render(<AddConnectionModal open onClose={() => {}} family="mimo-free" />);
+  const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
+  expect(within(group).getByRole("radio", { name: /free tier/i })).toBeTruthy();
+  expect(within(group).getByRole("radio", { name: /subscription/i })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
+  expect(screen.getByLabelText("API Key", { selector: "input" })).toBeTruthy();
+  // The region picker is present for the MiMo Token Plan.
+  expect(screen.getByText(/region/i)).toBeTruthy();
+});
+
+test("submitting the mimo subscription sends the region base URL", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="mimo-free" />);
+  fireEvent.click(screen.getByRole("radio", { name: /subscription/i }));
+  fireEvent.change(screen.getByLabelText("API Key", { selector: "input" }), { target: { value: "tp-test" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  expect(addConnection).toHaveBeenCalledWith(
+    LOCAL_RUNNER,
+    "mimo",
+    "MiMo (Token Plan)",
+    "tp-test",
+    "https://token-plan-sgp.xiaomimimo.com/v1",
+  );
+});
+
+test("opencode subscription shows a key hint, no region picker, and sends its descriptor base URL", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="opencode-free" />);
+  const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
+  expect(within(group).getByRole("radio", { name: /free tier/i })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
+  expect(screen.getByText(/opencode\.ai\/auth/i)).toBeTruthy();
+  // OpenCode Go has no region picker — only a Base URL override field.
+  expect(screen.queryByText(/^Region$/)).toBeNull();
+  fireEvent.change(screen.getByLabelText("API Key", { selector: "input" }), { target: { value: "sk-oc" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode", "OpenCode (Go)", "sk-oc", null);
 });
 
 test("connecting subscription calls connectOauth with the oauth member id and tracks the authorize URL", async () => {
