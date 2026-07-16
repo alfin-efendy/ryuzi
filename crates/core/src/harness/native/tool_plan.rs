@@ -165,18 +165,20 @@ pub async fn compile_candidate(
     }
 
     let review_by_name = review_tool_defs.map(index_review_definitions).transpose()?;
-    let mut canonical_names = BTreeSet::new();
+    let canonical_names = registry
+        .canonical_snapshot()
+        .map(|registered| registered.descriptor.canonical_name.clone())
+        .collect::<BTreeSet<_>>();
     let mut legacy_names = BTreeMap::<String, BTreeSet<String>>::new();
-    for legacy_name in registry.names() {
-        let Some(tool) = registry.get(&legacy_name) else {
-            continue;
-        };
-        let canonical_name = tool.descriptor().canonical_name;
-        legacy_names
-            .entry(canonical_name.clone())
-            .or_default()
-            .insert(legacy_name);
-        canonical_names.insert(canonical_name);
+    for (legacy_name, canonical_aliases) in registry.legacy_to_canonical() {
+        for canonical_name in canonical_aliases {
+            if canonical_names.contains(canonical_name) {
+                legacy_names
+                    .entry(canonical_name.clone())
+                    .or_default()
+                    .insert(legacy_name.clone());
+            }
+        }
     }
 
     let selected_names = match &review_by_name {
@@ -185,7 +187,6 @@ pub async fn compile_candidate(
     };
     let mut planned_tools = Vec::new();
     let mut visible_definitions = Vec::new();
-    let mut policy_aliases = BTreeMap::new();
 
     for canonical_name in selected_names {
         let Some(registered) = registry.registered(&canonical_name) else {
@@ -243,9 +244,6 @@ pub async fn compile_candidate(
 
         let mut descriptor = registered.descriptor.clone();
         descriptor.input_schema = registered.canonical_schema.clone();
-        for alias in &descriptor.policy_aliases {
-            policy_aliases.insert(alias.clone(), canonical_name.clone());
-        }
         let planned = PlannedTool {
             canonical_name: canonical_name.clone(),
             contract_hash: planned_contract_hash(
@@ -265,6 +263,8 @@ pub async fn compile_candidate(
 
     visible_definitions.sort_by(|left, right| definition_name(left).cmp(definition_name(right)));
     planned_tools.sort_by(|left, right| left.canonical_name.cmp(&right.canonical_name));
+    let policy_aliases =
+        derive_policy_aliases(&planned_tools).map_err(ToolPlanError::unavailable)?;
     let definition_bytes = serde_json::to_vec(&visible_definitions).map_err(|error| {
         ToolPlanError::unavailable(format!("tool definitions cannot be serialized: {error}"))
     })?;
@@ -338,7 +338,16 @@ pub async fn freeze_plan(
     run_id: &str,
     plan: impl AsRef<SessionToolPlan>,
 ) -> Result<StoredNativeToolPlan, ToolPlanError> {
-    let plan = plan.as_ref();
+    let supplied = plan.as_ref();
+    validate_body(&supplied.body)?;
+    let plan = SessionToolPlan::from_body(supplied.body.clone()).map_err(|_| {
+        ToolPlanError::invalid_persisted("tool plan cannot be canonicalized before freezing")
+    })?;
+    if plan.plan_hash != supplied.plan_hash || plan.canonical_json != supplied.canonical_json {
+        return Err(ToolPlanError::invalid_persisted(
+            "tool plan wrapper is inconsistent with its body",
+        ));
+    }
     store
         .insert_native_tool_plan(
             run_id,
@@ -392,6 +401,13 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
             "stored plan uses an unsupported contract version",
         ));
     }
+    if body.capability_profile.interaction_mode == ToolInteractionMode::CodeOrchestrator
+        && !body.canonical_tools.is_empty()
+    {
+        return Err(ToolPlanError::invalid_persisted(
+            "stored code-orchestrator plan contains direct function tools",
+        ));
+    }
     if !body.deferred_catalog.is_empty() {
         return Err(ToolPlanError::invalid_persisted(
             "stored transitional plan has a deferred catalog",
@@ -428,7 +444,6 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
             || definition_name(definition) != planned.canonical_name
             || planned.descriptor.v1_only
             || planned.descriptor.kind == "internal"
-            || (planned.strict && !body.capability_profile.supports_strict_function_schema)
         {
             return Err(ToolPlanError::invalid_persisted(
                 "stored tool metadata is inconsistent",
@@ -444,10 +459,26 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
                 "stored tool schema is invalid",
             ));
         }
-        let expected_wire_schema = if planned.strict {
-            compile_openai_strict_schema(&planned.canonical_schema).map_err(|_| {
-                ToolPlanError::invalid_persisted("stored strict tool schema is invalid")
-            })?
+        if planned
+            .descriptor
+            .output_schema
+            .as_ref()
+            .is_some_and(|schema| jsonschema::validator_for(schema).is_err())
+        {
+            return Err(ToolPlanError::invalid_persisted(
+                "stored tool output schema is invalid",
+            ));
+        }
+        let strict_schema = compile_openai_strict_schema(&planned.canonical_schema);
+        let expected_strict =
+            body.capability_profile.supports_strict_function_schema && strict_schema.is_ok();
+        if planned.strict != expected_strict {
+            return Err(ToolPlanError::invalid_persisted(
+                "stored tool strict selection is inconsistent",
+            ));
+        }
+        let expected_wire_schema = if expected_strict {
+            strict_schema.expect("strict eligibility was checked above")
         } else {
             planned.canonical_schema.clone()
         };
@@ -475,7 +506,38 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
             ));
         }
     }
+    let derived_policy_aliases =
+        derive_policy_aliases(&body.canonical_tools).map_err(ToolPlanError::invalid_persisted)?;
+    if body.policy_aliases != derived_policy_aliases {
+        return Err(ToolPlanError::invalid_persisted(
+            "stored policy aliases do not match planned descriptors",
+        ));
+    }
     Ok(())
+}
+
+fn derive_policy_aliases(
+    planned_tools: &[PlannedTool],
+) -> Result<BTreeMap<String, String>, &'static str> {
+    let canonical_names = planned_tools
+        .iter()
+        .map(|tool| tool.canonical_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut aliases = BTreeMap::new();
+    for planned in planned_tools {
+        for alias in &planned.descriptor.policy_aliases {
+            if canonical_names.contains(alias.as_str()) && alias != &planned.canonical_name {
+                return Err("tool policy alias conflicts with a canonical tool name");
+            }
+            if aliases
+                .insert(alias.clone(), planned.canonical_name.clone())
+                .is_some_and(|existing| existing != planned.canonical_name)
+            {
+                return Err("tool policy alias resolves to multiple canonical tools");
+            }
+        }
+    }
+    Ok(aliases)
 }
 
 fn is_sorted_unique<'a>(values: impl Iterator<Item = &'a str>) -> bool {
@@ -606,9 +668,90 @@ mod tests {
     use crate::harness::native::tool_contract::{
         FacadePriority, ResourceScopeHint, ToolDescriptor, ToolEffect,
     };
-    use crate::harness::native::tools::ToolRegistry;
+    use crate::harness::native::tools::{PermissionSpec, Tool, ToolCtx, ToolOutput, ToolRegistry};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct SnapshotTestTool {
+        legacy_name: &'static str,
+        description: &'static str,
+        schema: Value,
+        first_canonical_name: &'static str,
+        later_canonical_name: &'static str,
+        policy_aliases: Vec<String>,
+        descriptor_calls: AtomicUsize,
+    }
+
+    impl SnapshotTestTool {
+        fn new(legacy_name: &'static str, canonical_name: &'static str, schema: Value) -> Self {
+            Self {
+                legacy_name,
+                description: "snapshot test tool",
+                schema,
+                first_canonical_name: canonical_name,
+                later_canonical_name: canonical_name,
+                policy_aliases: Vec::new(),
+                descriptor_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_later_canonical_name(mut self, canonical_name: &'static str) -> Self {
+            self.later_canonical_name = canonical_name;
+            self
+        }
+
+        fn with_policy_alias(mut self, alias: &str) -> Self {
+            self.policy_aliases.push(alias.to_string());
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SnapshotTestTool {
+        fn name(&self) -> &str {
+            self.legacy_name
+        }
+
+        fn description(&self) -> &str {
+            self.description
+        }
+
+        fn input_schema(&self) -> Value {
+            self.schema.clone()
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            let call = self.descriptor_calls.fetch_add(1, Ordering::SeqCst);
+            let mut descriptor = ToolDescriptor::conservative(
+                self.name(),
+                self.description(),
+                self.input_schema(),
+                self.kind(),
+            );
+            descriptor.canonical_name = if call == 0 {
+                self.first_canonical_name
+            } else {
+                self.later_canonical_name
+            }
+            .to_string();
+            descriptor.policy_aliases = self.policy_aliases.clone();
+            descriptor
+        }
+
+        fn permission(&self, _input: &Value) -> PermissionSpec {
+            PermissionSpec::new(self.legacy_name, "snapshot test")
+        }
+
+        async fn execute(&self, _ctx: &ToolCtx, _input: Value) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::ok("ok"))
+        }
+    }
 
     fn profile(schema_budget_tokens: u32) -> ToolCapabilityProfile {
         ToolCapabilityProfile {
@@ -786,6 +929,81 @@ mod tests {
         assert_eq!(error.code, "capability_unavailable");
     }
 
+    #[tokio::test]
+    async fn review_regression_candidate_keeps_all_canonical_tools_on_legacy_name_collision() {
+        let first: Arc<dyn Tool> = Arc::new(SnapshotTestTool::new(
+            "shared_legacy_name",
+            "collision_first",
+            json!({"type":"object"}),
+        ));
+        let second: Arc<dyn Tool> = Arc::new(SnapshotTestTool::new(
+            "shared_legacy_name",
+            "collision_second",
+            json!({"type":"object"}),
+        ));
+        let registry = ToolRegistry::with_extra(vec![first, second]);
+
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+
+        assert!(candidate.canonical_tools.contains_key("collision_first"));
+        assert!(candidate.canonical_tools.contains_key("collision_second"));
+    }
+
+    #[tokio::test]
+    async fn review_regression_candidate_never_recomputes_a_registered_descriptor() {
+        let stateful = Arc::new(
+            SnapshotTestTool::new(
+                "stateful_descriptor",
+                "captured_canonical_name",
+                json!({"type":"object"}),
+            )
+            .with_later_canonical_name("mutated_canonical_name"),
+        );
+        let registry = ToolRegistry::with_extra(vec![stateful.clone()]);
+        assert_eq!(stateful.descriptor_calls.load(Ordering::SeqCst), 1);
+
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+
+        assert!(candidate
+            .canonical_tools
+            .contains_key("captured_canonical_name"));
+        assert!(!candidate
+            .canonical_tools
+            .contains_key("mutated_canonical_name"));
+        assert_eq!(stateful.descriptor_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn review_regression_candidate_rejects_ambiguous_policy_aliases() {
+        let first: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "ambiguous_alias_first_legacy",
+                "ambiguous_alias_first",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("shared_policy_alias"),
+        );
+        let second: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "ambiguous_alias_second_legacy",
+                "ambiguous_alias_second",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("shared_policy_alias"),
+        );
+        let registry = ToolRegistry::with_extra(vec![first, second]);
+
+        let error = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "capability_unavailable");
+    }
+
     async fn store_with_run() -> (tempfile::NamedTempFile, Store) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -833,6 +1051,52 @@ mod tests {
         (tmp, store)
     }
 
+    fn refresh_planned_tool(body: &mut SessionToolPlanBody, canonical_name: &str) {
+        let index = body
+            .canonical_tools
+            .iter()
+            .position(|tool| tool.canonical_name == canonical_name)
+            .unwrap();
+        let planned = &mut body.canonical_tools[index];
+        planned.contract_hash = planned_contract_hash(
+            &planned.descriptor,
+            &planned.canonical_schema,
+            &planned.wire_schema,
+            planned.strict,
+        )
+        .unwrap();
+        body.visible_definitions[index] =
+            definition_from_planned(planned, &body.capability_profile);
+        body.limits.estimated_schema_tokens = serde_json::to_vec(&body.visible_definitions)
+            .unwrap()
+            .len()
+            .div_ceil(4) as u32;
+    }
+
+    async fn replace_stored_body(store: &Store, body: SessionToolPlanBody) {
+        let plan = SessionToolPlan::from_body(body).unwrap();
+        let schema_version = i64::from(plan.body.schema_version);
+        let registry_generation = i64::try_from(plan.body.registry_generation).unwrap();
+        let plan_hash = plan.plan_hash;
+        let canonical_json = plan.canonical_json;
+        store
+            .with_conn(move |connection| {
+                connection.execute(
+                    "UPDATE native_tool_plans SET plan_schema_version=?1,registry_generation=?2,\
+                     plan_hash=?3,plan_json=?4 WHERE run_id='plan-run'",
+                    rusqlite::params![
+                        schema_version,
+                        registry_generation,
+                        plan_hash,
+                        canonical_json
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn frozen_plan_loads_exact_persisted_schemas_without_a_registry() {
         let (_tmp, store) = store_with_run().await;
@@ -845,6 +1109,221 @@ mod tests {
 
         let loaded = load_plan(&store, "plan-run").await.unwrap().unwrap();
         assert_eq!(loaded, candidate);
+    }
+
+    #[tokio::test]
+    async fn review_regression_freeze_rejects_inconsistent_public_plan_wrapper() {
+        let registry = ToolRegistry::builtin();
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        let mut forged_plans = Vec::new();
+
+        let mut forged_hash = candidate.plan.clone();
+        forged_hash.plan_hash = "forged-hash".into();
+        forged_plans.push(forged_hash);
+
+        let mut forged_json = candidate.plan.clone();
+        forged_json.canonical_json = "{}".into();
+        forged_plans.push(forged_json);
+
+        let mut forged_body = candidate.plan.clone();
+        forged_body.body.registry_generation += 1;
+        forged_plans.push(forged_body);
+
+        for forged in forged_plans {
+            let (_tmp, store) = store_with_run().await;
+            assert_eq!(
+                freeze_plan(&store, "plan-run", &forged)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_persisted_tool_plan"
+            );
+            assert!(store
+                .get_native_tool_plan("plan-run")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn review_regression_load_rejects_direct_definitions_for_code_orchestrator() {
+        let (_tmp, store) = store_with_run().await;
+        let registry = ToolRegistry::builtin();
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let mut body = candidate.plan.body;
+        body.capability_profile.interaction_mode = ToolInteractionMode::CodeOrchestrator;
+        replace_stored_body(&store, body).await;
+
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_load_enforces_strict_iff_eligible_and_preserves_fallback() {
+        let strict_eligible: Arc<dyn Tool> = Arc::new(SnapshotTestTool::new(
+            "strict_eligible_legacy",
+            "strict_eligible_test",
+            json!({"type":"object","properties":{"value":{"type":"string"}}}),
+        ));
+        let strict_ineligible: Arc<dyn Tool> = Arc::new(SnapshotTestTool::new(
+            "strict_ineligible_legacy",
+            "strict_ineligible_test",
+            json!({
+                "type":"object",
+                "properties":{"value":{"type":["string","null"]}}
+            }),
+        ));
+        let registry = ToolRegistry::with_extra(vec![strict_eligible, strict_ineligible]);
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        assert!(candidate.canonical_tools["strict_eligible_test"].strict);
+        assert!(!candidate.canonical_tools["strict_ineligible_test"].strict);
+
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+        assert!(load_plan(&store, "plan-run").await.unwrap().is_some());
+
+        let mut body = candidate.plan.body;
+        let planned = body
+            .canonical_tools
+            .iter_mut()
+            .find(|tool| tool.canonical_name == "strict_eligible_test")
+            .unwrap();
+        planned.strict = false;
+        planned.wire_schema = planned.canonical_schema.clone();
+        refresh_planned_tool(&mut body, "strict_eligible_test");
+        replace_stored_body(&store, body).await;
+
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_load_requires_exact_derived_policy_aliases() {
+        let aliased: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "policy_alias_legacy",
+                "policy_alias_tool",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("approved_policy_alias"),
+        );
+        let registry = ToolRegistry::with_extra(vec![aliased]);
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidate.plan.body.policy_aliases["approved_policy_alias"],
+            "policy_alias_tool"
+        );
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let mut extra = candidate.plan.body.clone();
+        extra
+            .policy_aliases
+            .insert("forged_alias".into(), "policy_alias_tool".into());
+        replace_stored_body(&store, extra).await;
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
+
+        let mut missing = candidate.plan.body.clone();
+        missing.policy_aliases.clear();
+        replace_stored_body(&store, missing).await;
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
+
+        let mut wrong_target = candidate.plan.body;
+        wrong_target.policy_aliases.insert(
+            "approved_policy_alias".into(),
+            "different_canonical_tool".into(),
+        );
+        replace_stored_body(&store, wrong_target).await;
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_load_rejects_ambiguous_derived_policy_aliases() {
+        let first: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "persisted_alias_first_legacy",
+                "persisted_alias_first",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("first_unique_alias"),
+        );
+        let second: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "persisted_alias_second_legacy",
+                "persisted_alias_second",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("second_unique_alias"),
+        );
+        let registry = ToolRegistry::with_extra(vec![first, second]);
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let mut body = candidate.plan.body;
+        let second = body
+            .canonical_tools
+            .iter_mut()
+            .find(|tool| tool.canonical_name == "persisted_alias_second")
+            .unwrap();
+        second.descriptor.policy_aliases = vec!["first_unique_alias".into()];
+        refresh_planned_tool(&mut body, "persisted_alias_second");
+        body.policy_aliases.clear();
+        body.policy_aliases
+            .insert("first_unique_alias".into(), "persisted_alias_second".into());
+        replace_stored_body(&store, body).await;
+
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_load_rejects_malformed_output_schema() {
+        let (_tmp, store) = store_with_run().await;
+        let registry = ToolRegistry::builtin();
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let mut body = candidate.plan.body;
+        let name = body.canonical_tools[0].canonical_name.clone();
+        body.canonical_tools[0].descriptor.output_schema = Some(json!({"type": 7}));
+        refresh_planned_tool(&mut body, &name);
+        replace_stored_body(&store, body).await;
+
+        assert_eq!(
+            load_plan(&store, "plan-run").await.unwrap_err().code,
+            "invalid_persisted_tool_plan"
+        );
     }
 
     #[tokio::test]

@@ -5556,11 +5556,24 @@ mod tests {
             .unwrap();
         assert_eq!(same, first);
 
-        let error = store
-            .insert_native_tool_plan("run-1", 1, 8, "hash-b", r#"{"schema_version":1}"#)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("already frozen"));
+        for (schema_version, registry_generation, plan_hash, plan_json) in [
+            (2, 7, "hash-a", r#"{"schema_version":1}"#),
+            (1, 8, "hash-a", r#"{"schema_version":1}"#),
+            (1, 7, "hash-b", r#"{"schema_version":1}"#),
+            (1, 7, "hash-a", r#"{"schema_version":2}"#),
+        ] {
+            let error = store
+                .insert_native_tool_plan(
+                    "run-1",
+                    schema_version,
+                    registry_generation,
+                    plan_hash,
+                    plan_json,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("already frozen"));
+        }
     }
 
     #[tokio::test]

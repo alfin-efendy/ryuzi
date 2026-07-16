@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -541,6 +541,7 @@ static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub struct ToolRegistry {
     legacy_tools: BTreeMap<String, Arc<RegisteredTool>>,
     canonical_tools: BTreeMap<String, Arc<RegisteredTool>>,
+    legacy_to_canonical: BTreeMap<String, BTreeSet<String>>,
     generation: u64,
     availability: BTreeMap<String, Arc<tokio::sync::Mutex<Option<AvailabilityCacheEntry>>>>,
 }
@@ -566,6 +567,16 @@ impl ToolRegistry {
 
     pub fn registered(&self, name: &str) -> Option<Arc<RegisteredTool>> {
         self.canonical_tools.get(name).cloned()
+    }
+
+    /// The immutable canonical contracts captured when this registry was built.
+    pub fn canonical_snapshot(&self) -> impl Iterator<Item = &Arc<RegisteredTool>> {
+        self.canonical_tools.values()
+    }
+
+    /// The immutable legacy-name aliases captured when this registry was built.
+    pub fn legacy_to_canonical(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.legacy_to_canonical
     }
 
     /// The Anthropic `tools` array for a provider request.
@@ -697,10 +708,17 @@ impl ToolRegistry {
     fn from_complete_list(list: Vec<Arc<dyn Tool>>) -> Self {
         let mut legacy_tools = BTreeMap::new();
         let mut canonical_tools = BTreeMap::new();
+        let mut legacy_to_canonical = BTreeMap::<String, BTreeSet<String>>::new();
         for tool in list {
             let registered = Arc::new(compile_registered_tool(tool));
-            legacy_tools.insert(registered.tool.name().to_string(), registered.clone());
-            canonical_tools.insert(registered.descriptor.canonical_name.clone(), registered);
+            let legacy_name = registered.tool.name().to_string();
+            let canonical_name = registered.descriptor.canonical_name.clone();
+            legacy_to_canonical
+                .entry(legacy_name.clone())
+                .or_default()
+                .insert(canonical_name.clone());
+            legacy_tools.insert(legacy_name, registered.clone());
+            canonical_tools.insert(canonical_name, registered);
         }
         let availability = canonical_tools
             .keys()
@@ -709,6 +727,7 @@ impl ToolRegistry {
         Self {
             legacy_tools,
             canonical_tools,
+            legacy_to_canonical,
             generation: next_registry_generation(),
             availability,
         }
@@ -1766,6 +1785,20 @@ mod tests {
         );
         let registry =
             ToolRegistry::with_extra(vec![first, second, canonical_first, canonical_second]);
+
+        let canonical_snapshot = registry
+            .canonical_snapshot()
+            .map(|registered| registered.descriptor.canonical_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(canonical_snapshot.contains("first_canonical"));
+        assert!(canonical_snapshot.contains("second_canonical"));
+        assert_eq!(
+            registry.legacy_to_canonical().get("shared_alias").unwrap(),
+            &std::collections::BTreeSet::from([
+                "first_canonical".to_string(),
+                "second_canonical".to_string()
+            ])
+        );
 
         assert_eq!(
             registry.get("shared_alias").unwrap().description(),
