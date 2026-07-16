@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
 import { Badge, Button } from "@ryuzi/ui";
-import { Archive, Pin } from "lucide-react";
+import { Archive, Loader2, Pin } from "lucide-react";
 import type { UiSession } from "@/lib/session-key";
-import { StatusDot, TreeGuide } from "@/components/common/bits";
+import { TreeGuide } from "@/components/common/bits";
 import { statusMeta } from "@/lib/status";
 import { sessionTitle } from "@/lib/sidebar";
 
@@ -22,6 +22,8 @@ export type SessionRowProps = {
   onToggleArchive: () => void;
   /** Optional drag handle rendered after the tree guide (sortable variant). */
   dragHandle?: ReactNode;
+  /** Flat rows (the Tasks section) omit the tree guide. Default true. */
+  showGuide?: boolean;
 };
 
 export function SessionRow({
@@ -37,11 +39,12 @@ export function SessionRow({
   onTogglePin,
   onToggleArchive,
   dragHandle,
+  showGuide = true,
 }: SessionRowProps) {
   const m = statusMeta(session.status);
   return (
     <div className={`group flex min-h-7 items-stretch text-sidebar-foreground ${isArchived ? "opacity-55" : ""}`}>
-      <TreeGuide tail={hasTail} reach={3} />
+      {showGuide && <TreeGuide tail={hasTail} reach={3} />}
       {dragHandle}
       <span
         className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-[7px] pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
@@ -52,7 +55,17 @@ export function SessionRow({
           onClick={onOpen}
           className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
         >
-          <StatusDot color={m.color} pulse={m.pulse} />
+          <span className="flex size-[7px] shrink-0 items-center justify-center">
+            {session.status === "running" && (
+              <Loader2
+                aria-hidden
+                data-testid={`running-spinner-${session.sessionPk}`}
+                className="size-[11px] animate-spin"
+                strokeWidth={2.25}
+                style={{ color: m.color }}
+              />
+            )}
+          </span>
           <span className={`min-w-0 flex-1 truncate ${unread ? "font-semibold text-foreground" : ""}`}>{sessionTitle(session)}</span>
           {runnerLabel && (
             <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">

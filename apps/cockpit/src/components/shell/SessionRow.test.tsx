@@ -58,3 +58,17 @@ test("dragHandle renders when provided", () => {
   render(<SessionRow {...base} dragHandle={<span data-testid="grip" />} />);
   expect(screen.getByTestId("grip")).toBeTruthy();
 });
+
+test("shows a spinner only while running", () => {
+  const { rerender } = render(<SessionRow {...base} session={{ ...base.session, status: "running" }} />);
+  expect(screen.getByTestId("running-spinner-s1")).toBeTruthy();
+  rerender(<SessionRow {...base} session={{ ...base.session, status: "idle" }} />);
+  expect(screen.queryByTestId("running-spinner-s1")).toBeNull();
+});
+
+test("omits the tree guide when showGuide is false", () => {
+  const { rerender } = render(<SessionRow {...base} />);
+  expect(screen.getByTestId("tree-guide")).toBeTruthy();
+  rerender(<SessionRow {...base} showGuide={false} />);
+  expect(screen.queryByTestId("tree-guide")).toBeNull();
+});
