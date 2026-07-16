@@ -1814,29 +1814,44 @@ impl RunnerMainAgentSpawner {
             let session_pk = self.deps.session_pk.clone();
             tokio::spawn(async move {
                 let reservation_cancel = reservation.token();
-                let execution = worker.execute_child(child_run, context);
-                tokio::pin!(execution);
-                let result = tokio::select! {
-                    _ = reservation_cancel.cancelled() => {
-                        // The terminal transition awaits SQLite; release the
-                        // capacity guard first so ending a session never holds
-                        // a slot hostage on that I/O.
+                // Race the child execution against a cancellation of this
+                // background slot. The execution future is scoped to this inner
+                // block so it is DROPPED before the cancellation cleanup runs:
+                // otherwise the still-pinned `execute_child` future keeps the
+                // store connection (and delegation guards) it was suspended on,
+                // and `cancel_child`'s own store access deadlocks against it on
+                // the single-threaded runtime — hanging the child's terminal
+                // transition forever.
+                let outcome = {
+                    let execution = worker.execute_child(child_run, context);
+                    tokio::pin!(execution);
+                    tokio::select! {
+                        _ = reservation_cancel.cancelled() => None,
+                        result = &mut execution => Some(result),
+                    }
+                };
+                match outcome {
+                    None => {
+                        // Cancelled: `execution` is dropped above, so release
+                        // the capacity guard (ending a session never holds a
+                        // slot hostage on SQLite) and persist the child's
+                        // Cancelled terminal without contending with it.
                         drop(reservation);
                         let _ = worker
                             .deps
                             .delegation
                             .cancel_child(&session_pk, &child_run_id)
                             .await;
-                        return;
                     }
-                    result = &mut execution => result,
-                };
-                if reservation_cancel.is_cancelled() {
-                    return;
+                    Some(result) => {
+                        if reservation_cancel.is_cancelled() {
+                            return;
+                        }
+                        worker
+                            .deliver_background_result(&root_run_id, &goal, &result)
+                            .await;
+                    }
                 }
-                worker
-                    .deliver_background_result(&root_run_id, &goal, &result)
-                    .await;
             });
             return MainDelegationResult::completed(
                 run_id,
