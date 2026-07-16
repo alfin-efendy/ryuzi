@@ -49,6 +49,20 @@ html[data-backdrop] {
   }
 }
 
+/* Reduced-motion: neutralize the decorative infinite loops (status pulses,
+   spinners) and enter/exit animations so the compositor can idle when the OS
+   asks for less motion. Only `animation` is touched — functional transitions
+   (hover, focus, panel resize) are left alone. The !important overrides the
+   inline `animation` styles that drive relay-pulse. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
