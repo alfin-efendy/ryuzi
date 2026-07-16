@@ -13,7 +13,7 @@ use crate::mentions::{
     COORDINATOR_SYNTHESIS_INSTRUCTION,
 };
 use crate::paths::{new_id, now_ms, worktree_path_for};
-use crate::sessions::ownership::{resolve_session_agent_access, SessionAgentAccess};
+use crate::sessions::ownership::require_executable_session_agent;
 use crate::settings::SettingsStore;
 use crate::worktree;
 use std::path::Path;
@@ -347,15 +347,8 @@ impl ControlPlane {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         let resolved_mentions = if mentions.is_empty() {
@@ -396,15 +389,8 @@ impl ControlPlane {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         let run = self
@@ -736,15 +722,8 @@ impl ControlPlane {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         let run = self
@@ -1232,15 +1211,8 @@ impl ControlPlane {
             },
             None => None,
         };
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         if session.agent_session_id.is_none() {
@@ -2171,6 +2143,9 @@ impl ControlPlane {
     }
 
     pub async fn stop_session(&self, session_pk: &str) -> anyhow::Result<()> {
+        // Historical (legacy / deleted-owner) sessions are read-only: reject
+        // before any state transition, through the one centralized guard.
+        require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         // A session still in background startup has no live handle yet —
         // cancel its startup task; it checks the token between phases.
         if let Some(token) = self.starting.lock().unwrap().get(session_pk) {
@@ -2216,6 +2191,9 @@ impl ControlPlane {
     /// teardown), after which the worktree is cleaned up and the session
     /// marked `Ended`.
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
+        // Historical (legacy / deleted-owner) sessions are read-only: reject
+        // before any teardown or store mutation, through the one central guard.
+        require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         // Abort any in-flight background startup and WAIT for it to unwind
         // before tearing down: the teardown below must read the FINAL
         // workspace columns (git prep backfills them at its checkpoint), or

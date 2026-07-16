@@ -88,8 +88,30 @@ impl From<crate::mentions::MentionError> for ApiError {
     }
 }
 
+impl From<crate::sessions::ownership::SessionAccessError> for ApiError {
+    fn from(e: crate::sessions::ownership::SessionAccessError) -> Self {
+        use crate::sessions::ownership::SessionAccessError;
+        match e {
+            // Read-only historical session (legacy or deleted owner): a 409
+            // conflict carrying the exact user-facing message.
+            SessionAccessError::ReadOnly(message) => ApiError::conflict(message),
+            // Unknown / corrupt session ownership: surfaces as a 500 the same
+            // way the underlying resolve error did before this guard existed.
+            SessionAccessError::Resolve(message) => ApiError {
+                status: 500,
+                message,
+            },
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // A read-only rejection can bubble up through a ControlPlane
+        // `anyhow::Result`; recover its exact 409 rather than a blanket 500.
+        if let Some(access) = e.downcast_ref::<crate::sessions::ownership::SessionAccessError>() {
+            return ApiError::from(access.clone());
+        }
         if let Some(mention) = e.downcast_ref::<crate::mentions::MentionError>() {
             return ApiError::from(mention.clone());
         }

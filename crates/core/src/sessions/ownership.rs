@@ -41,6 +41,57 @@ pub async fn resolve_session_agent_access(
     }
 }
 
+/// A typed failure for the centralized session-access guard. Modeled on
+/// [`crate::mentions::MentionError`] (`Clone` + `std::error::Error`) so it can
+/// ride an `anyhow::Error` up through a `ControlPlane` result and still be
+/// recovered by `downcast_ref` at the API boundary into the right HTTP status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAccessError {
+    /// The session's agent history is read-only (legacy or deleted owner). The
+    /// carried string is the exact, user-facing conflict message.
+    ReadOnly(String),
+    /// Resolving the session's agent access failed (unknown or corrupt
+    /// session). The carried string is the underlying error's message.
+    Resolve(String),
+}
+
+impl std::fmt::Display for SessionAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadOnly(message) | Self::Resolve(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SessionAccessError {}
+
+impl From<anyhow::Error> for SessionAccessError {
+    fn from(error: anyhow::Error) -> Self {
+        SessionAccessError::Resolve(error.to_string())
+    }
+}
+
+/// The single guard every run/mutation entry point funnels through: it returns
+/// the session's executable primary-agent id, or a typed [`SessionAccessError`]
+/// that maps to a 409 conflict (read-only) at the API boundary. Historical
+/// sessions — legacy (no owner) and deleted-owner alike — are refused here, so
+/// no call site special-cases `primary_agent_id.is_none()`.
+pub async fn require_executable_session_agent(
+    store: &Store,
+    registry: &AgentRegistry,
+    session_pk: &str,
+) -> Result<String, SessionAccessError> {
+    match resolve_session_agent_access(store, registry, session_pk).await? {
+        SessionAgentAccess::Executable { agent_id } => Ok(agent_id),
+        SessionAgentAccess::LegacyReadOnly => Err(SessionAccessError::ReadOnly(
+            "Legacy agent history is read-only.".into(),
+        )),
+        SessionAgentAccess::DeletedReadOnly { snapshot } => Err(SessionAccessError::ReadOnly(
+            format!("{} was deleted; this history is read-only.", snapshot.name),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

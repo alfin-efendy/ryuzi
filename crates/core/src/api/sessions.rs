@@ -162,6 +162,12 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "update_session_perm_mode" => {
             let a: UpdateSessionPermModeP = params(p)?;
+            crate::sessions::ownership::require_executable_session_agent(
+                cp.store(),
+                &state.agents,
+                &a.session_pk,
+            )
+            .await?;
             ok(cp
                 .store()
                 .update_session_perm_mode(&a.session_pk, a.perm_mode)

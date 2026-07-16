@@ -35,10 +35,17 @@ use crate::agents::bootstrap::{
 };
 use crate::agents::okf::{ConceptArea, KnowledgeConceptInput, KnowledgeScope};
 use crate::agents::transaction::TransactionFailpoint;
-use crate::domain::{PermMode, Project, Session, SessionKind, SessionStatus};
+use crate::api::dispatch;
+use crate::api::tests_support::state;
+use crate::domain::{
+    AgentIdentitySnapshot, AgentRunKind, AgentRunStatus, NewAgentRun, NewMessage, NewProviderTurn,
+    PermMode, Project, Session, SessionKind, SessionStatus,
+};
 use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use crate::llm_router::routes::{self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget};
+use crate::sessions::ownership::{resolve_session_agent_access, SessionAgentAccess};
 use crate::store::{PluginInstallRecord, Store};
+use serde_json::json;
 
 /// A valid, non-registered agent profile used to prove that bundle files
 /// created after convergence are never destructively replayed away.
@@ -642,4 +649,307 @@ async fn plan2_journal_committed_before_sql_cleanup_converges() {
     assert_sentinels_survive(&store).await;
 
     assert_markers_gate_only_their_own_cleanup(&fixture, store).await;
+}
+
+// --------------------------------------------------------------------------
+// Plan 6 Task 3: public upgrade compatibility + read-only historical sessions.
+//
+// The two tests above prove destructive cleanup converges without wiping
+// unrelated history. These two prove the *positive* upgrade contract a public
+// user experiences: a pre-feature session survives the upgrade untouched, is
+// still readable/exportable, and yet rejects every run/mutation through one
+// centralized read-only guard — legacy (no owner) and deleted-owner alike.
+// --------------------------------------------------------------------------
+
+/// A pre-feature (Plan-4-unaware) session: no primary-agent ownership at all.
+fn legacy_session(session_pk: &str, project_id: Option<&str>) -> Session {
+    Session {
+        session_pk: session_pk.into(),
+        primary_agent_id: None,
+        primary_agent_snapshot: None,
+        project_id: project_id.map(str::to_string),
+        agent_session_id: None,
+        worktree_path: None,
+        branch: None,
+        title: Some("Historical chat".into()),
+        status: SessionStatus::Idle,
+        perm_mode: PermMode::Default,
+        started_by: None,
+        created_at: Some(1),
+        last_active: Some(1),
+        resume_attempts: 0,
+        branch_owned: false,
+        kind: SessionKind::Chat,
+        speaker: None,
+        agent: None,
+        parent_session_pk: None,
+    }
+}
+
+/// A session whose primary owner has since been deleted: the owner id and its
+/// immutable identity snapshot both persist, but the agent is gone from the
+/// registry.
+fn deleted_owner_session(session_pk: &str, snapshot: AgentIdentitySnapshot) -> Session {
+    Session {
+        primary_agent_id: Some(snapshot.id.clone()),
+        primary_agent_snapshot: Some(snapshot),
+        ..legacy_session(session_pk, None)
+    }
+}
+
+/// A run row for the read-only session, used only so the child-run read/control
+/// paths have a real target to resolve.
+fn historical_run(session_pk: &str, run_id: &str, parent_run_id: Option<&str>) -> NewAgentRun {
+    NewAgentRun {
+        run_id: run_id.into(),
+        session_pk: session_pk.into(),
+        parent_run_id: parent_run_id.map(str::to_string),
+        retry_of: None,
+        primary_agent_id: "reviewer".into(),
+        executing_agent_id: Some("reviewer".into()),
+        executing_agent_name_snapshot: "Reviewer".into(),
+        agent_kind: if parent_run_id.is_some() {
+            AgentRunKind::Subagent
+        } else {
+            AgentRunKind::Primary
+        },
+        task: "history".into(),
+        status: AgentRunStatus::Failed,
+        resolved_model: None,
+        resolved_effort: None,
+    }
+}
+
+/// Step 1: a pre-feature database survives the Plan 2 upgrade bootstrap
+/// unchanged, the legacy session resolves as read-only against the upgraded
+/// registry, and the upgrade still lands exactly one built-in `Ryuzi` agent.
+/// No row is ever re-owned by `Ryuzi`.
+#[tokio::test]
+async fn legacy_pre_feature_database_survives_upgrade_and_resolves_read_only() {
+    let fixture = Fixture::new();
+    let store = fixture.open_store().await;
+    seed_routes(&store).await;
+
+    store
+        .insert_project(Project {
+            project_id: "p-keep".into(),
+            name: "Keep project".into(),
+            workdir: "/keep".into(),
+            source: None,
+            model: None,
+            effort: None,
+            perm_mode: PermMode::Default,
+            created_at: Some(1),
+            is_git: false,
+        })
+        .await
+        .unwrap();
+    connections::add_connection(
+        &store,
+        ConnectionRow {
+            id: "provider-keep".into(),
+            provider: "anthropic".into(),
+            auth_type: "api_key".into(),
+            label: "Keep provider".into(),
+            priority: 0,
+            enabled: true,
+            data: ConnectionData::default(),
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .await
+    .unwrap();
+    store
+        .insert_session(legacy_session("legacy-s", Some("p-keep")))
+        .await
+        .unwrap();
+    store
+        .insert_message(NewMessage::block(
+            "legacy-s",
+            "user",
+            "text",
+            json!({ "text": "old single-agent turn" }),
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_provider_turn(NewProviderTurn::new(
+            "legacy-s",
+            "user",
+            json!([{ "type": "text", "text": "old single-agent turn" }]),
+        ))
+        .await
+        .unwrap();
+    fixture.write_legacy_memory();
+
+    let bootstrap = initialize_agent_registry(fixture.config_root(), store.clone())
+        .await
+        .unwrap();
+    assert_eq!(bootstrap.reason, BootstrapReason::FirstUpgrade);
+
+    // Historical data is preserved byte-for-byte.
+    assert_eq!(
+        store
+            .list_projects()
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.project_id.as_str())
+            .collect::<Vec<_>>(),
+        ["p-keep"]
+    );
+    assert!(connections::get_connection(&store, "provider-keep")
+        .await
+        .unwrap()
+        .is_some());
+    let legacy = store.get_session("legacy-s").await.unwrap().unwrap();
+    assert_eq!(legacy.primary_agent_id, None);
+    assert_eq!(legacy.primary_agent_snapshot, None);
+    assert_eq!(store.list_messages("legacy-s").await.unwrap().len(), 1);
+    assert_eq!(store.list_provider_turns("legacy-s").await.unwrap().len(), 1);
+
+    // The legacy session resolves as read-only against the upgraded registry.
+    assert!(matches!(
+        resolve_session_agent_access(&store, &bootstrap.registry, "legacy-s")
+            .await
+            .unwrap(),
+        SessionAgentAccess::LegacyReadOnly
+    ));
+
+    // The upgrade lands exactly one built-in Ryuzi; nothing is re-owned by it.
+    let snapshot = bootstrap.registry.snapshot().await;
+    assert_eq!(snapshot.agents.len(), 1);
+    assert_eq!(snapshot.agents[0].profile.name, "Ryuzi");
+    assert_eq!(
+        store
+            .get_session("legacy-s")
+            .await
+            .unwrap()
+            .unwrap()
+            .primary_agent_id,
+        None,
+        "the upgrade must never assign an owner to an old row"
+    );
+}
+
+/// Step 2: every run/mutation entry point rejects a read-only session with a
+/// 409 conflict and the exact per-case message (legacy vs. deleted-owner),
+/// while every read/list/export path still succeeds for both.
+#[tokio::test]
+async fn historical_sessions_reject_runs_and_mutations_but_stay_readable() {
+    let state = state().await;
+    let store = state.cp.store().clone();
+
+    store
+        .insert_session(legacy_session("legacy-s", None))
+        .await
+        .unwrap();
+    store
+        .insert_session(deleted_owner_session(
+            "deleted-s",
+            AgentIdentitySnapshot {
+                id: "reviewer".into(),
+                name: "Reviewer".into(),
+                avatar_color: "violet".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    // Seed one message and one child run per read-only session so the read /
+    // list / transcript paths have something real to resolve, and the child-run
+    // controls have a concrete target the read-only guard must still refuse.
+    for pk in ["legacy-s", "deleted-s"] {
+        store
+            .insert_message(NewMessage::block(
+                pk,
+                "user",
+                "text",
+                json!({ "text": "history" }),
+            ))
+            .await
+            .unwrap();
+        let root = store
+            .insert_primary_agent_run(historical_run(pk, &format!("{pk}-root"), None))
+            .await
+            .unwrap();
+        store
+            .insert_agent_run(historical_run(pk, &format!("{pk}-child"), Some(&root.run_id)))
+            .await
+            .unwrap();
+    }
+
+    // The resolver classifies each session as the expected read-only variant.
+    assert!(matches!(
+        resolve_session_agent_access(&store, &state.agents, "legacy-s")
+            .await
+            .unwrap(),
+        SessionAgentAccess::LegacyReadOnly
+    ));
+    assert!(matches!(
+        resolve_session_agent_access(&store, &state.agents, "deleted-s")
+            .await
+            .unwrap(),
+        SessionAgentAccess::DeletedReadOnly { .. }
+    ));
+
+    for (pk, expected) in [
+        ("legacy-s", "Legacy agent history is read-only."),
+        ("deleted-s", "Reviewer was deleted; this history is read-only."),
+    ] {
+        let child = format!("{pk}-child");
+        let blocked: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "continue_session",
+                json!({ "sessionPk": pk, "turn": { "text": "", "attachments": [] } }),
+            ),
+            ("steer", json!({ "session_pk": pk, "text": "again" })),
+            ("stop_session", json!({ "session_pk": pk })),
+            ("end_session", json!({ "session_pk": pk })),
+            (
+                "update_session_runtime",
+                json!({ "session_pk": pk, "model": null, "effort": null }),
+            ),
+            (
+                "update_session_perm_mode",
+                json!({ "session_pk": pk, "perm_mode": "default" }),
+            ),
+            (
+                "retry_child_run",
+                json!({ "session_pk": pk, "run_id": child }),
+            ),
+            (
+                "cancel_child_run",
+                json!({ "session_pk": pk, "run_id": child }),
+            ),
+        ];
+        for (method, params) in blocked {
+            let error = dispatch(&state, method, params).await.unwrap_err();
+            assert_eq!(error.status, 409, "{method} on {pk} must be a 409 conflict");
+            assert_eq!(error.message, expected, "{method} on {pk} message");
+        }
+
+        // Read / list / transcript / export paths remain open on the same
+        // read-only session.
+        dispatch(&state, "list_sessions", json!({ "project_id": null }))
+            .await
+            .unwrap();
+        dispatch(&state, "list_messages", json!({ "session_pk": pk }))
+            .await
+            .unwrap();
+        dispatch(&state, "get_child_runs", json!({ "session_pk": pk }))
+            .await
+            .unwrap();
+        dispatch(
+            &state,
+            "get_child_transcript",
+            json!({ "session_pk": pk, "run_id": child }),
+        )
+        .await
+        .unwrap();
+        dispatch(&state, "export_session", json!({ "session_pk": pk }))
+            .await
+            .unwrap();
+    }
 }
