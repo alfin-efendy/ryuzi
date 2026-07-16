@@ -55,6 +55,9 @@ pub(crate) const HANDLES: &[&str] = &[
     "reconnect_oauth",
     "complete_oauth_manual",
     "add_free_connection",
+    "list_installed_providers",
+    "install_provider",
+    "uninstall_provider",
     "start_kiro_device_flow",
     "await_kiro_device_flow",
     "import_kiro_token",
@@ -285,6 +288,17 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "add_free_connection" => {
             let a: AddFreeConnectionP = params(p)?;
             ok(add_free_connection(cp, a.provider, a.label).await?)
+        }
+        "list_installed_providers" => {
+            ok(crate::llm_router::installed::list_installed_providers(cp.store()).await?)
+        }
+        "install_provider" => {
+            let a: FamilyP = params(p)?;
+            ok(crate::llm_router::installed::install_provider(cp.store(), &a.family).await?)
+        }
+        "uninstall_provider" => {
+            let a: FamilyP = params(p)?;
+            ok(crate::llm_router::installed::uninstall_provider(cp.store(), &a.family).await?)
         }
         "start_kiro_device_flow" => ok(start_kiro_device_flow().await?),
         "await_kiro_device_flow" => {

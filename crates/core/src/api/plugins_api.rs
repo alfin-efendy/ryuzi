@@ -1096,12 +1096,14 @@ async fn exchange_plugin_oauth_code(
 struct InstalledCtx {
     connections: Vec<crate::llm_router::connections::ConnectionRow>,
     installed_skills: Vec<crate::skills_install::InstalledSkillInfo>,
+    installed_providers: Vec<String>,
 }
 
 async fn installed_ctx(store: &Store) -> anyhow::Result<InstalledCtx> {
     Ok(InstalledCtx {
         connections: crate::llm_router::connections::list_connections(store).await?,
         installed_skills: crate::skills_install::list_installed_skills().unwrap_or_default(),
+        installed_providers: crate::llm_router::installed::list_installed_providers(store).await?,
     })
 }
 
@@ -1119,6 +1121,7 @@ async fn compute_installed(
         ctx.connections
             .iter()
             .any(|c| provider_family(&c.provider) == family)
+            || crate::llm_router::installed::is_installed(&ctx.installed_providers, &family)
     };
     let gateway_settings_complete = if kind == "gateway" {
         // A gateway with no manifest settings has nothing to configure, so its
@@ -1888,6 +1891,7 @@ mod tests {
         let ctx = InstalledCtx {
             connections: vec![],
             installed_skills: vec![],
+            installed_providers: vec![],
         };
 
         let installed_when_enabled =
@@ -1906,6 +1910,37 @@ mod tests {
         assert!(
             !installed_when_disabled,
             "disabled settings-less gateway is not installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_installed_provider_follows_installed_set_without_connection() {
+        // A default-installed provider with zero connections is "installed"
+        // because it is in the persisted set; a provider that is neither seeded
+        // nor connected is not.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        crate::llm_router::installed::ensure_default_installed_providers(&store)
+            .await
+            .unwrap();
+        let ctx = installed_ctx(&store).await.unwrap();
+
+        // `anthropic` is in DEFAULT_INSTALLED; no connection exists.
+        let anthropic = provider_only("anthropic");
+        assert!(
+            compute_installed(&store, &anthropic, "provider", false, false, &ctx)
+                .await
+                .unwrap(),
+            "a default-installed provider is installed with zero connections"
+        );
+
+        // `xai` is not a default and has no connection.
+        let xai = provider_only("xai");
+        assert!(
+            !compute_installed(&store, &xai, "provider", false, false, &ctx)
+                .await
+                .unwrap(),
+            "a non-installed, connectionless provider is not installed"
         );
     }
 
