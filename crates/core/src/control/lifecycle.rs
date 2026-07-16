@@ -2372,6 +2372,14 @@ impl ControlPlane {
 
         let payload: LearningPayload = serde_json::from_str(payload)?;
         let store = self.store.clone();
+        if payload.native_tools_version
+            == crate::harness::native::capabilities::NativeToolsVersion::V2
+            && payload.tool_capability_profile.is_none()
+        {
+            anyhow::bail!(
+                "capability_unavailable: V2 review payload has no typed capability profile"
+            );
+        }
 
         // Resolve the review model: `auxiliary.review.model` if configured,
         // else the parent's captured model. Only an EXACT match with the
@@ -2403,6 +2411,21 @@ impl ControlPlane {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| crate::paths::chat_scratch_dir(&payload.parent_session_pk));
 
+        // Resolve every fallible input that does not depend on the new review
+        // session before creating durable Running state.
+        let settings = SettingsStore::new(store.clone());
+        let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
+        let effort_policy =
+            crate::llm_router::model_effort::build_utility_effort_policy(&store, &model).await?;
+        let llm = self.review_llm_factory().create(store.clone());
+        let persistence = self.agent_persistence();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot(&persistence.registry.default_agent_id().await)
+            .await?;
+        let main_agent_id = persistence.registry.default_agent_id().await;
+        let tools = Arc::new(ToolRegistry::builtin());
+
         let review_pk = new_id();
         let now = now_ms();
         self.store
@@ -2428,151 +2451,132 @@ impl ControlPlane {
                 parent_session_pk: Some(payload.parent_session_pk.clone()),
             })
             .await?;
-        let stored_native_version = store
-            .get_or_insert_native_tool_session_version(
-                &review_pk,
-                payload.native_tools_version.as_str(),
-            )
-            .await?;
-        let native_tools_version = crate::harness::native::capabilities::NativeToolsVersion::parse(
-            &stored_native_version.version,
-        )?;
-        if native_tools_version == crate::harness::native::capabilities::NativeToolsVersion::V2
-            && payload.tool_capability_profile.is_none()
-        {
-            anyhow::bail!(
-                "capability_unavailable: V2 review payload has no typed capability profile"
-            );
-        }
 
-        let settings = SettingsStore::new(store.clone());
-        let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
-        let effort_policy =
-            crate::llm_router::model_effort::build_utility_effort_policy(&store, &model).await?;
-        let llm = self.review_llm_factory().create(store.clone());
+        // From this point onward every failure goes through one finalization
+        // path. In particular, a setup failure after the root row is inserted
+        // must fail that run and end the throwaway review session.
+        let mut run_created = false;
+        let operation = async {
+            store
+                .insert_primary_agent_run(crate::domain::NewAgentRun {
+                    run_id: review_pk.clone(),
+                    session_pk: review_pk.clone(),
+                    parent_run_id: None,
+                    retry_of: None,
+                    primary_agent_id: primary_agent.profile.id.clone(),
+                    executing_agent_id: Some(primary_agent.profile.id.clone()),
+                    executing_agent_name_snapshot: primary_agent.profile.name.clone(),
+                    agent_kind: crate::domain::AgentRunKind::Primary,
+                    task: format!("{} learning review", payload.review_kind),
+                    status: crate::domain::AgentRunStatus::Running,
+                    resolved_model: Some(model.clone()),
+                    resolved_effort: None,
+                })
+                .await?;
+            run_created = true;
 
-        let persistence = self.agent_persistence();
-        let primary_agent = persistence
-            .registry
-            .resolved_snapshot(&persistence.registry.default_agent_id().await)
-            .await?;
-        store
-            .insert_primary_agent_run(crate::domain::NewAgentRun {
-                run_id: review_pk.clone(),
+            let stored_native_version = store
+                .get_or_insert_native_tool_session_version(
+                    &review_pk,
+                    payload.native_tools_version.as_str(),
+                )
+                .await?;
+            let native_tools_version =
+                crate::harness::native::capabilities::NativeToolsVersion::parse(
+                    &stored_native_version.version,
+                )?;
+            let deps = RunnerDeps {
                 session_pk: review_pk.clone(),
-                parent_run_id: None,
-                retry_of: None,
-                primary_agent_id: primary_agent.profile.id.clone(),
-                executing_agent_id: Some(primary_agent.profile.id.clone()),
-                executing_agent_name_snapshot: primary_agent.profile.name.clone(),
-                agent_kind: crate::domain::AgentRunKind::Primary,
-                task: format!("{} learning review", payload.review_kind),
-                status: crate::domain::AgentRunStatus::Running,
-                resolved_model: Some(model.clone()),
-                resolved_effort: None,
-            })
-            .await?;
-        let tools = Arc::new(ToolRegistry::builtin());
-        let deps = RunnerDeps {
-            session_pk: review_pk.clone(),
-            primary_agent,
-            run_id: review_pk.clone(),
-            root_run_id: review_pk.clone(),
-            delegation: self.delegation.clone(),
-            isolated_target: false,
-            main_agent_id: persistence.registry.default_agent_id().await,
-            learning_queue: persistence.learning.clone(),
-            agent_knowledge: persistence.knowledge.clone(),
-            kind: SessionKind::Review,
-            work_dir,
-            attachments_dir: None,
-            extra_skill_dirs,
-            model: Some(model.clone()),
-            turn_effort_policy: Arc::new(effort_policy),
-            meta,
-            // BypassPermissions: the review fork is unattended — no human
-            // can ever answer an approval prompt — and the ONLY tools it can
-            // reach at dispatch are `memory`/`skill`/`skill_manage`, whose
-            // real safety boundary is Task 6's origin × provenance guard
-            // (via `write_origin` below), not the interactive gate.
-            perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
-            project_id: project_id.clone(),
-            perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
-            store: store.clone(),
-            events: self.events.clone(),
-            approvals: self.approvals.clone(),
-            automation_events: None,
-            llm,
-            tools,
-            native_tools_version,
-            native_tool_runtime_surfaces:
-                crate::harness::native::capabilities::RuntimeToolSurfaces::direct_only(),
-            native_tool_override_mode: None,
-            captured_tool_capability_profile: payload.tool_capability_profile.clone(),
-            agent: runner::review_agent(payload.system.clone()),
-            agents: Arc::new(AgentRegistry::builtin()),
-            commands: Arc::new(CommandRegistry::builtin()),
-            allowed_skills: None,
-            memory: None,
-            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            steer: SteerBuffer::new(),
-            background: self.background.clone(),
-            // The review fork is never a top-level interactive session — no
-            // app-control facade, mirroring the primary builder's default.
-            app_control: None,
-            // Isolated background session: no extension host/event sink, like
-            // sub-agent and test builders.
-            extension_events: None,
-            // A fresh, unshared `NudgeState`: the review fork's own tool
-            // iterations must never feed the PARENT's nudge counters (that
-            // would be a feedback loop), and it drives under
-            // `DisplayMode::Silent` so its own end_turn never fires a nudge
-            // regardless.
-            nudge: Arc::new(NudgeState::default()),
-            // Cache parity: advertise the parent's FULL captured tool set —
-            // dispatch (`agent.tools`, above) still enforces the whitelist.
-            review_tool_defs: Some(payload.tool_defs.clone()),
-            // Irrelevant: `current_tool_defs` short-circuits on
-            // `review_tool_defs` above before ever consulting this field.
-            activated_tools: None,
-            write_origin: WriteOrigin::BackgroundReview,
-            // The review fork's `Agent` sets `can_delegate: false` and its
-            // tool whitelist excludes `delegate_agent` entirely — it is an
-            // unattended background critique loop, never a delegation
-            // source — so there is no catalog to render.
-            delegation_catalog: Vec::new(),
-        };
+                primary_agent,
+                run_id: review_pk.clone(),
+                root_run_id: review_pk.clone(),
+                delegation: self.delegation.clone(),
+                isolated_target: false,
+                main_agent_id,
+                learning_queue: persistence.learning.clone(),
+                agent_knowledge: persistence.knowledge.clone(),
+                kind: SessionKind::Review,
+                work_dir,
+                attachments_dir: None,
+                extra_skill_dirs,
+                model: Some(model.clone()),
+                turn_effort_policy: Arc::new(effort_policy),
+                meta,
+                // BypassPermissions: the review fork is unattended — no human
+                // can ever answer an approval prompt — and the ONLY tools it can
+                // reach at dispatch are `memory`/`skill`/`skill_manage`, whose
+                // real safety boundary is Task 6's origin × provenance guard
+                // (via `write_origin` below), not the interactive gate.
+                perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
+                project_id: project_id.clone(),
+                perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
+                store: store.clone(),
+                events: self.events.clone(),
+                approvals: self.approvals.clone(),
+                automation_events: None,
+                llm,
+                tools,
+                native_tools_version,
+                native_tool_runtime_surfaces:
+                    crate::harness::native::capabilities::RuntimeToolSurfaces::direct_only(),
+                native_tool_override_mode: None,
+                captured_tool_capability_profile: payload.tool_capability_profile.clone(),
+                agent: runner::review_agent(payload.system.clone()),
+                agents: Arc::new(AgentRegistry::builtin()),
+                commands: Arc::new(CommandRegistry::builtin()),
+                allowed_skills: None,
+                memory: None,
+                snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                steer: SteerBuffer::new(),
+                background: self.background.clone(),
+                // The review fork is never a top-level interactive session — no
+                // app-control facade, mirroring the primary builder's default.
+                app_control: None,
+                // Isolated background session: no extension host/event sink, like
+                // sub-agent and test builders.
+                extension_events: None,
+                // A fresh, unshared `NudgeState`: the review fork's own tool
+                // iterations must never feed the PARENT's nudge counters (that
+                // would be a feedback loop), and it drives under
+                // `DisplayMode::Silent` so its own end_turn never fires a nudge
+                // regardless.
+                nudge: Arc::new(NudgeState::default()),
+                // Cache parity: advertise the parent's FULL captured tool set —
+                // dispatch (`agent.tools`, above) still enforces the whitelist.
+                review_tool_defs: Some(payload.tool_defs.clone()),
+                // Irrelevant: `current_tool_defs` short-circuits on
+                // `review_tool_defs` above before ever consulting this field.
+                activated_tools: None,
+                write_origin: WriteOrigin::BackgroundReview,
+                // The review fork's `Agent` sets `can_delegate: false` and its
+                // tool whitelist excludes `delegate_agent` entirely — it is an
+                // unattended background critique loop, never a delegation
+                // source — so there is no catalog to render.
+                delegation_catalog: Vec::new(),
+            };
 
-        let cfg = ContextConfig::with_meta(deps.meta.clone());
-        let mut cm = if cache_parity {
-            ContextManager::seed_projected(&review_pk, cfg, payload.messages.clone())
-        } else {
-            ContextManager::seed_digest(&review_pk, cfg, payload.messages.clone(), 24)
-        };
-        cm.append_user_text(&runner::review_prompt_text(&payload.review_kind))
-            .await?;
+            let cfg = ContextConfig::with_meta(deps.meta.clone());
+            let mut cm = if cache_parity {
+                ContextManager::seed_projected(&review_pk, cfg, payload.messages.clone())
+            } else {
+                ContextManager::seed_digest(&review_pk, cfg, payload.messages.clone(), 24)
+            };
+            cm.append_user_text(&runner::review_prompt_text(&payload.review_kind))
+                .await?;
 
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = runner::drive_review(&deps, &deps.agent, &mut cm, &cancel).await;
-
-        match &result {
-            Ok(text) => {
-                let _ = self.delegation.complete(&review_pk, text).await;
-            }
-            Err(error) => {
-                let _ = self.delegation.fail(&review_pk, &error.to_string()).await;
-            }
+            let cancel = tokio_util::sync::CancellationToken::new();
+            runner::drive_review(&deps, &deps.agent, &mut cm, &cancel).await
         }
-
-        // The review session is throwaway — never resumed, hidden from every
-        // picker by `kind` — so it never lingers as `running`, whether the
-        // drive succeeded or errored.
-        let _ = self
-            .store
-            .update_status(&review_pk, SessionStatus::Ended, Some(now_ms()))
-            .await;
-
-        let final_text = result?;
+        .await;
+        let finalization = finalize_review_lifecycle(
+            &store,
+            &self.delegation,
+            &review_pk,
+            run_created,
+            &operation,
+        )
+        .await;
+        let final_text = combine_review_operation_and_finalization(operation, finalization)?;
         let outcome_line = {
             let t = final_text.trim();
             if t.is_empty() {
@@ -2611,6 +2615,79 @@ impl ControlPlane {
             });
         }
         Ok(())
+    }
+}
+
+async fn finalize_review_lifecycle(
+    store: &crate::store::Store,
+    delegation: &crate::delegation::DelegationRuntime,
+    review_pk: &str,
+    run_created: bool,
+    operation: &anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+
+    if run_created {
+        let expected = if operation.is_ok() {
+            crate::domain::AgentRunStatus::Completed
+        } else {
+            crate::domain::AgentRunStatus::Failed
+        };
+        let transition = match operation {
+            Ok(text) => delegation.complete(review_pk, text).await,
+            Err(error) => delegation.fail(review_pk, &error.to_string()).await,
+        };
+        if let Err(error) = transition {
+            failures.push(format!("agent-run terminal transition failed: {error}"));
+        }
+        match store.get_agent_run(review_pk).await {
+            Ok(Some(run)) if run.status == expected => {}
+            Ok(Some(run)) => failures.push(format!(
+                "agent run remained {:?}; expected {:?}",
+                run.status, expected
+            )),
+            Ok(None) => failures.push("agent run disappeared during finalization".into()),
+            Err(error) => failures.push(format!("agent-run terminal verification failed: {error}")),
+        }
+    }
+
+    if let Err(error) = store
+        .update_status(review_pk, SessionStatus::Ended, Some(now_ms()))
+        .await
+    {
+        failures.push(format!("session terminal transition failed: {error}"));
+    }
+    match store.get_session(review_pk).await {
+        Ok(Some(session)) if session.status == SessionStatus::Ended => {}
+        Ok(Some(session)) => failures.push(format!(
+            "review session remained {:?}; expected Ended",
+            session.status
+        )),
+        Ok(None) => failures.push("review session disappeared during finalization".into()),
+        Err(error) => failures.push(format!("session terminal verification failed: {error}")),
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "review lifecycle finalization failed: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn combine_review_operation_and_finalization<T>(
+    operation: anyhow::Result<T>,
+    finalization: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (operation, finalization) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(finalization)) => Err(finalization),
+        (Err(error), Err(finalization)) => {
+            Err(anyhow::anyhow!("{error}; additionally, {finalization}"))
+        }
     }
 }
 

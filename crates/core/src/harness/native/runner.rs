@@ -281,6 +281,39 @@ impl RunToolPlan {
     }
 }
 
+fn is_valid_response_event(event: &MessageStreamEvent) -> bool {
+    match event {
+        MessageStreamEvent::MessageStart(message) => message
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty()),
+        MessageStreamEvent::TextDelta { text, .. }
+        | MessageStreamEvent::ThinkingDelta { text, .. } => !text.is_empty(),
+        MessageStreamEvent::ContentBlockStart { block, .. } => {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => block.get("text").is_some_and(Value::is_string),
+                Some("thinking") => block.get("thinking").is_some_and(Value::is_string),
+                Some("redacted_thinking") => block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty()),
+                Some("tool_use") => {
+                    block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.trim().is_empty())
+                        && block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.trim().is_empty())
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 async fn resolve_run_tool_plan(deps: &RunnerDeps, agent: &Agent) -> anyhow::Result<RunToolPlan> {
     if let Some(plan) = tool_plan::load_plan(&deps.store, &deps.run_id).await? {
         return Ok(RunToolPlan::FrozenV2(plan));
@@ -1245,13 +1278,7 @@ async fn drive(
                 let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
                     continue;
                 };
-                let valid_response_event = matches!(
-                    &decoded,
-                    MessageStreamEvent::MessageStart(_)
-                        | MessageStreamEvent::TextDelta { .. }
-                        | MessageStreamEvent::ThinkingDelta { .. }
-                        | MessageStreamEvent::ContentBlockStart { .. }
-                );
+                let valid_response_event = is_valid_response_event(&decoded);
                 if run_tool_plan.version() == NativeToolsVersion::V2
                     && !v2_plan_verified
                     && valid_response_event
@@ -6591,6 +6618,74 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn v2_malformed_or_empty_response_events_do_not_freeze_before_error() {
+        let malformed_heads = vec![
+            vec![("message_start".into(), json!({"type": "message_start"}))],
+            vec![(
+                "content_block_delta".into(),
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta"}}),
+            )],
+            vec![(
+                "content_block_delta".into(),
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "thinking_delta", "thinking": ""}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "unknown"}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text"}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "thinking"}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "redacted_thinking"}}),
+            )],
+        ];
+
+        for (case, mut events) in malformed_heads.into_iter().enumerate() {
+            events.push(error_event("boom after malformed head"));
+            let dir = tempfile::tempdir().unwrap();
+            let llm = Arc::new(V2RecordingLlm::new(vec![events]));
+            let mut deps = deps_at(dir.path(), llm).await;
+            enable_v2(&mut deps);
+
+            assert!(
+                run_turn(
+                    &deps,
+                    TurnPrompt::text("go", "go"),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+                "case {case} must terminate with the scripted error"
+            );
+            assert!(
+                deps.store
+                    .get_native_tool_plan(&deps.run_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "case {case} must not freeze on a malformed or empty event"
+            );
+        }
+    }
+
     fn result_text(result: &Value) -> String {
         result
             .get("content")
@@ -6742,10 +6837,10 @@ mod tests {
     #[tokio::test]
     async fn v2_child_run_resolves_its_own_plan_instead_of_inheriting_parent_filtering() {
         let dir = tempfile::tempdir().unwrap();
-        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let llm = Arc::new(V2RecordingLlm::new(vec![final_turn("child done")]));
         let mut parent = deps_at(dir.path(), llm).await;
         enable_v2(&mut parent);
-        parent.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
+        parent.agent.tools = super::super::agents::ToolFilter::All;
         let RunToolPlan::CandidateV2(parent_plan) =
             resolve_run_tool_plan(&parent, &parent.agent).await.unwrap()
         else {
@@ -6755,22 +6850,37 @@ mod tests {
             .await
             .unwrap();
 
-        let mut child = parent.clone();
-        child.run_id = "opaque-child-run".into();
-        child.agent.tools = super::super::agents::ToolFilter::Only(vec!["bash".into()]);
-        let RunToolPlan::CandidateV2(child_plan) =
-            resolve_run_tool_plan(&child, &child.agent).await.unwrap()
-        else {
-            panic!("new child V2 run must compile its own candidate")
+        let spawner = RunnerSpawner {
+            deps: parent.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: parent.run_id.clone(),
         };
+        let results = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "explore".into(),
+                prompt: "inspect the workspace".into(),
+            }])
+            .await;
+        assert_eq!(results[0].status, SubtaskStatus::Completed);
+
+        let child = parent
+            .store
+            .list_session_agent_runs(&parent.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.agent_kind == crate::domain::AgentRunKind::Subagent)
+            .expect("the real subagent constructor must persist its child run");
+        let child_plan = crate::harness::native::tool_plan::load_plan(&parent.store, &child.run_id)
+            .await
+            .unwrap()
+            .expect("the real child drive must freeze a plan under its admitted run_id");
         assert_ne!(
             parent_plan.visible_definitions,
             child_plan.visible_definitions
         );
-        assert_eq!(
-            child_plan.visible_definitions[0]["name"],
-            Value::String("bash".into())
-        );
+        assert_ne!(child.run_id, parent.run_id);
     }
 
     #[tokio::test]

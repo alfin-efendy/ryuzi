@@ -6247,6 +6247,20 @@ async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_wr
     std::env::remove_var("RYUZI_TEST_CONFIG_ROOT");
     result.unwrap();
 
+    let reviews = cp.store().list_sessions_by_kind("review").await.unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, SessionStatus::Ended);
+    let review_runs = cp
+        .store()
+        .list_session_agent_runs(&reviews[0].session_pk)
+        .await
+        .unwrap();
+    assert_eq!(review_runs.len(), 1);
+    assert_eq!(
+        review_runs[0].status,
+        crate::domain::AgentRunStatus::Completed
+    );
+
     let md = std::fs::read_to_string(skills_dir.path().join("skills/deploy/SKILL.md"))
         .expect("skill_manage create must have written SKILL.md");
     assert!(md.contains("Run make deploy."));
@@ -6271,4 +6285,135 @@ async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_wr
     let text = notice.payload["text"].as_str().unwrap();
     assert!(text.starts_with(SELF_IMPROVEMENT_NOTICE_PREFIX));
     assert!(text.contains("Captured a deploy skill."));
+}
+
+fn v2_review_payload(
+    profile: Option<crate::harness::native::capabilities::ToolCapabilityProfile>,
+) -> crate::harness::native::runner::LearningPayload {
+    crate::harness::native::runner::LearningPayload {
+        native_tools_version: crate::harness::native::capabilities::NativeToolsVersion::V2,
+        tool_capability_profile: profile,
+        review_kind: "memory".into(),
+        parent_session_pk: "missing-parent-is-allowed".into(),
+        model: "test/model".into(),
+        supports_prompt_cache: false,
+        system: "review".into(),
+        tool_defs: vec![serde_json::json!({
+            "name": "read",
+            "description": "stale captured definition",
+            "input_schema": {"type": "object"},
+            "strict": false
+        })],
+        messages: vec![],
+    }
+}
+
+fn direct_review_profile() -> crate::harness::native::capabilities::ToolCapabilityProfile {
+    use crate::harness::native::capabilities::{
+        CapabilitySource, ToolCapabilityProfile, ToolInteractionMode, WireProtocol,
+        CAPABILITY_SCHEMA_VERSION,
+    };
+    ToolCapabilityProfile {
+        interaction_mode: ToolInteractionMode::DirectFunctions,
+        wire_protocol: WireProtocol::OpenAiResponses,
+        supports_custom_freeform_tools: false,
+        supports_parallel_tool_calls: true,
+        supports_strict_function_schema: true,
+        supports_tool_output_schema: true,
+        schema_budget_tokens: 16_000,
+        supports_prompt_cache: false,
+        capability_source: CapabilitySource::TransportDefault,
+        capability_schema_version: CAPABILITY_SCHEMA_VERSION,
+    }
+}
+
+#[tokio::test]
+async fn v2_review_missing_profile_fails_before_creating_durable_review_state() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let cp = test_control_plane(store, registries(false)).await;
+    let error = cp
+        .run_review_fork(&serde_json::to_string(&v2_review_payload(None)).unwrap())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("capability_unavailable"));
+    assert!(cp
+        .store()
+        .list_sessions_by_kind("review")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn review_setup_failure_after_root_insert_terminalizes_session_and_run() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let cp = test_control_plane(store, registries(false)).await;
+    rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_review_version BEFORE INSERT ON native_tool_session_versions
+             BEGIN SELECT RAISE(ABORT, 'injected review version setup failure'); END;",
+        )
+        .unwrap();
+
+    let payload = v2_review_payload(Some(direct_review_profile()));
+    let error = cp
+        .run_review_fork(&serde_json::to_string(&payload).unwrap())
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected review version setup failure"));
+
+    let reviews = cp.store().list_sessions_by_kind("review").await.unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, SessionStatus::Ended);
+    let runs = cp
+        .store()
+        .list_session_agent_runs(&reviews[0].session_pk)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, crate::domain::AgentRunStatus::Failed);
+    assert!(runs[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("injected review version setup failure")));
+}
+
+#[tokio::test]
+async fn review_operation_and_cleanup_failures_are_combined() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let cp = test_control_plane(store, registries(false)).await;
+    rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_review_session_cleanup BEFORE UPDATE OF status ON sessions
+             WHEN OLD.kind = 'review' AND NEW.status = 'ended'
+             BEGIN SELECT RAISE(ABORT, 'injected review cleanup failure'); END;",
+        )
+        .unwrap();
+
+    let payload = v2_review_payload(Some(direct_review_profile()));
+    let error = cp
+        .run_review_fork(&serde_json::to_string(&payload).unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("capability_unavailable"), "{error}");
+    assert!(error.contains("injected review cleanup failure"), "{error}");
+
+    let reviews = cp.store().list_sessions_by_kind("review").await.unwrap();
+    assert_eq!(reviews.len(), 1);
+    let runs = cp
+        .store()
+        .list_session_agent_runs(&reviews[0].session_pk)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, crate::domain::AgentRunStatus::Failed);
 }
