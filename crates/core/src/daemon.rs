@@ -406,6 +406,10 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // persistence has materialized the profiles and after connections are
     // available; a fresh daemon with none remains intentionally unconfigured.
     crate::agents::bootstrap::ensure_default_routes(&store).await?;
+    // Refine the `free` route in the background: probe the MiMo/OpenCode free
+    // models and keep only the ones that answer, leaving the synchronous
+    // first-concrete baseline in place if none do. Non-blocking; boot proceeds.
+    crate::agents::free_route::spawn_free_route_rebuild(Arc::clone(&store));
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
     // the atomicity/idempotency/degraded-state contract.
