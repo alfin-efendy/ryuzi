@@ -25,6 +25,7 @@ test.beforeEach(async ({ page }, testInfo) => {
               ],
             }
           : { [childRunId]: [] },
+        retryChildMessages: testInfo.title.includes("retry") ? { [childRunId]: [retryChildTextRow()] } : {},
       }
     : {};
   const accountOverrides = testInfo.title.startsWith("accounts:")
@@ -60,6 +61,7 @@ const dispatchToolCallId = "dispatch-tool-call";
 const childRunId = "release-scout-run";
 const retryRunId = `${childRunId}-retry`;
 const childPreviewText = "Child found the release script.";
+const retryTranscriptText = "The replacement attempt is checking the release checklist from the beginning.";
 const terminalResult = "Release checklist is ready for review.";
 
 function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
@@ -136,6 +138,15 @@ function childTextRow(): Message {
   };
 }
 
+function retryChildTextRow(): Message {
+  return {
+    ...childTextRow(),
+    seq: 1,
+    payload: { text: retryTranscriptText },
+    createdAt: 2_200,
+  };
+}
+
 type MockCoreEventInput = {
   event: CoreEvent;
   roster?: AgentRunRosterInfo;
@@ -146,6 +157,10 @@ async function emitMockCoreEvent(page: import("@playwright/test").Page, input: M
   await page.evaluate((payload) => {
     (window as unknown as { __emitMockCoreEvent: (input: MockCoreEventInput) => void }).__emitMockCoreEvent(payload);
   }, input);
+}
+
+function selectedAgentRunDetail(page: import("@playwright/test").Page) {
+  return page.getByRole("button", { name: "Back to Agents" }).locator("xpath=../..");
 }
 
 test("agent dispatch: lifecycle cards hydrate, stream, complete, and reload", async ({ page }) => {
@@ -257,19 +272,33 @@ test("agent dispatch: retry keeps one card slot and both durable attempts", asyn
     runId: childRunId,
   });
 
-  await expect(page.getByRole("button", { name: "Back to Agents" })).toBeVisible();
+  await page.reload();
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+  const rehydratedCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(rehydratedCard).toHaveCount(1);
+  await expect(rehydratedCard).toContainText("Queued");
+  await expect(rehydratedCard).toContainText("Retry 2");
+  await rehydratedCard.click();
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
+
   await page.getByRole("button", { name: "Back to Agents" }).click();
   await expect(page.getByText("Done (1)", { exact: true })).toBeVisible();
   await expect(page.getByText("Active (1)", { exact: true })).toBeVisible();
-  await page.getByText("Release Scout", { exact: true }).last().click();
-  await expect(page.getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
+  const activeRoster = page.getByText("Active (1)", { exact: true }).locator("xpath=..");
+  const doneRoster = page.getByText("Done (1)", { exact: true }).locator("xpath=..");
+  await expect(activeRoster.getByText("Release Scout", { exact: true })).toHaveCount(1);
+  await expect(doneRoster.getByText("Release Scout", { exact: true })).toHaveCount(1);
+  await activeRoster.getByText("Release Scout", { exact: true }).click();
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Back to Agents" }).click();
-  await page.getByText("Release Scout", { exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Back to Agents" })).toBeVisible();
+  await doneRoster.getByText("Release Scout", { exact: true }).click();
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(0);
   await expect
     .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "get_child_transcript").map((call) => call.args?.runId))
     .toEqual(expect.arrayContaining([childRunId, retryRunId]));
-  expect((await mockCalls(page)).filter((call) => call.cmd === "get_child_transcript").at(-1)?.args).toMatchObject({ runId: retryRunId });
 });
 
 test("boots to Home with the project loaded", async ({ page }) => {

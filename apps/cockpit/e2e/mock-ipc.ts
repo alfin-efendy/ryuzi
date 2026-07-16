@@ -316,14 +316,21 @@ const AGENT_REGISTRY = {
 };
 
 const EMPTY_AGENT_RUN_ROSTER: AgentRunRosterInfo = { rootRunId: null, runs: [] };
+type ChildRunMockState = {
+  agentRunRoster: AgentRunRosterInfo;
+  childMessages: Record<string, Message[]>;
+  retryChildMessages: Record<string, Message[]>;
+};
+export type MockIPCOverrides = Record<string, unknown> & Partial<ChildRunMockState>;
 
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
-const FIXTURES: Record<string, unknown> = {
+const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   list_projects: [PROJECT],
   list_sessions: [],
   list_messages: [],
   agentRunRoster: EMPTY_AGENT_RUN_ROSTER,
   childMessages: {} as Record<string, Message[]>,
+  retryChildMessages: {} as Record<string, Message[]>,
   list_agents: AGENT_REGISTRY,
   refresh_agents: [],
   list_providers: [],
@@ -379,7 +386,7 @@ const FIXTURES: Record<string, unknown> = {
  * missing Tauri bridge. `plugin:*` invokes (event listen, window show)
  * resolve to null. Every call is recorded on `window.__mockCalls`.
  */
-export async function installMockIPC(page: Page, overrides: Record<string, unknown> = {}): Promise<void> {
+export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {}): Promise<void> {
   await page.addInitScript(
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
@@ -533,7 +540,10 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           error: null,
         };
         agentRunRoster = { ...agentRunRoster, runs: [...agentRunRoster.runs, retried] };
-        if (!childMessages[retried.runId]) childMessages = { ...childMessages, [retried.runId]: [] };
+        childMessages = {
+          ...childMessages,
+          [retried.runId]: fixtures.retryChildMessages?.[previous.runId] ?? childMessages[retried.runId] ?? [],
+        };
         persist();
         return retried;
       };
