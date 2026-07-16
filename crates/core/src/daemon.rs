@@ -402,6 +402,10 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // install has runnable models (and the `free` route below has candidates)
     // without any "Add account" step. Idempotent + respects user deletion.
     crate::agents::bootstrap::ensure_free_providers_seeded(&store).await?;
+    // Seed the explicit "installed providers" set once (defaults ∪ families
+    // that already have a connection) so the Models list gates on it. Visibility
+    // only — routing still uses enabled connections. Idempotent.
+    crate::llm_router::installed::ensure_default_installed_providers(&store).await?;
     // Default durable profiles target the `free` route. Create it only after
     // persistence has materialized the profiles and after connections are
     // available; a fresh daemon with none remains intentionally unconfigured.
