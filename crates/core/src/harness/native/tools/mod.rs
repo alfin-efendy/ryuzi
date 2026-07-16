@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -541,7 +541,7 @@ static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub struct ToolRegistry {
     legacy_tools: BTreeMap<String, Arc<RegisteredTool>>,
     canonical_tools: BTreeMap<String, Arc<RegisteredTool>>,
-    legacy_to_canonical: BTreeMap<String, BTreeSet<String>>,
+    legacy_to_canonical: BTreeMap<String, String>,
     generation: u64,
     availability: BTreeMap<String, Arc<tokio::sync::Mutex<Option<AvailabilityCacheEntry>>>>,
 }
@@ -574,8 +574,9 @@ impl ToolRegistry {
         self.canonical_tools.values()
     }
 
-    /// The immutable legacy-name aliases captured when this registry was built.
-    pub fn legacy_to_canonical(&self) -> &BTreeMap<String, BTreeSet<String>> {
+    /// The immutable effective legacy aliases captured with [`Self::get`]
+    /// last-wins semantics when this registry was built.
+    pub fn legacy_to_canonical(&self) -> &BTreeMap<String, String> {
         &self.legacy_to_canonical
     }
 
@@ -708,15 +709,12 @@ impl ToolRegistry {
     fn from_complete_list(list: Vec<Arc<dyn Tool>>) -> Self {
         let mut legacy_tools = BTreeMap::new();
         let mut canonical_tools = BTreeMap::new();
-        let mut legacy_to_canonical = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut legacy_to_canonical = BTreeMap::new();
         for tool in list {
             let registered = Arc::new(compile_registered_tool(tool));
             let legacy_name = registered.tool.name().to_string();
             let canonical_name = registered.descriptor.canonical_name.clone();
-            legacy_to_canonical
-                .entry(legacy_name.clone())
-                .or_default()
-                .insert(canonical_name.clone());
+            legacy_to_canonical.insert(legacy_name.clone(), canonical_name.clone());
             legacy_tools.insert(legacy_name, registered.clone());
             canonical_tools.insert(canonical_name, registered);
         }
@@ -1794,10 +1792,7 @@ mod tests {
         assert!(canonical_snapshot.contains("second_canonical"));
         assert_eq!(
             registry.legacy_to_canonical().get("shared_alias").unwrap(),
-            &std::collections::BTreeSet::from([
-                "first_canonical".to_string(),
-                "second_canonical".to_string()
-            ])
+            "second_canonical"
         );
 
         assert_eq!(

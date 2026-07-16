@@ -170,14 +170,12 @@ pub async fn compile_candidate(
         .map(|registered| registered.descriptor.canonical_name.clone())
         .collect::<BTreeSet<_>>();
     let mut legacy_names = BTreeMap::<String, BTreeSet<String>>::new();
-    for (legacy_name, canonical_aliases) in registry.legacy_to_canonical() {
-        for canonical_name in canonical_aliases {
-            if canonical_names.contains(canonical_name) {
-                legacy_names
-                    .entry(canonical_name.clone())
-                    .or_default()
-                    .insert(legacy_name.clone());
-            }
+    for (legacy_name, canonical_name) in registry.legacy_to_canonical() {
+        if canonical_names.contains(canonical_name) {
+            legacy_names
+                .entry(canonical_name.clone())
+                .or_default()
+                .insert(legacy_name.clone());
         }
     }
 
@@ -949,6 +947,65 @@ mod tests {
 
         assert!(candidate.canonical_tools.contains_key("collision_first"));
         assert!(candidate.canonical_tools.contains_key("collision_second"));
+    }
+
+    #[tokio::test]
+    async fn review_regression_legacy_policy_collision_authorizes_only_effective_lookup_target() {
+        let shadowed: Arc<dyn Tool> = Arc::new(SnapshotTestTool::new(
+            "shared_policy_legacy",
+            "policy_shadowed",
+            json!({"type":"object"}),
+        ));
+        let effective: Arc<dyn Tool> = Arc::new(SnapshotTestTool::new(
+            "shared_policy_legacy",
+            "policy_effective",
+            json!({"type":"object"}),
+        ));
+        let registry = ToolRegistry::with_extra(vec![shadowed, effective]);
+
+        let legacy_selected = compile_candidate(
+            &registry,
+            &ToolFilter::Only(vec!["shared_policy_legacy".into()]),
+            profile(16_000),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy_selected
+                .canonical_tools
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["policy_effective"]
+        );
+        assert_eq!(
+            legacy_selected
+                .visible_definitions
+                .iter()
+                .map(definition_name)
+                .collect::<Vec<_>>(),
+            ["policy_effective"]
+        );
+
+        for canonical_name in ["policy_shadowed", "policy_effective"] {
+            let direct_selected = compile_candidate(
+                &registry,
+                &ToolFilter::Only(vec![canonical_name.into()]),
+                profile(16_000),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                direct_selected
+                    .canonical_tools
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [canonical_name]
+            );
+        }
     }
 
     #[tokio::test]
