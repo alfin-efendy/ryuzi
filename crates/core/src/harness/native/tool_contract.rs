@@ -11,6 +11,10 @@ thread_local! {
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 16 * 1024;
 pub const MAX_TOOL_METADATA_ENTRIES: usize = 8;
+const MAX_TOOL_METADATA_TOKEN_BYTES: usize = 32;
+const INVALID_TOOL_METADATA_TOKEN: &str = "Tool metadata token is invalid";
+const INVALID_TOOL_METADATA_ENTRY: &str = "Tool metadata entry is invalid";
+const TOOL_METADATA_LIMIT: &str = "tool metadata exceeds the bounded fact limit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,7 +172,7 @@ pub struct ToolInputCtx<'a> {
     pub extra_skill_dirs: &'a [PathBuf],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMetadataToken {
     Workspace,
@@ -183,6 +187,12 @@ pub enum ToolMetadataToken {
 
 impl ToolMetadataToken {
     pub fn parse(value: &str) -> Result<Self, ToolError> {
+        if value.len() > MAX_TOOL_METADATA_TOKEN_BYTES || !value.is_ascii() {
+            return Err(ToolError::caller(
+                "invalid_tool_metadata_token",
+                INVALID_TOOL_METADATA_TOKEN,
+            ));
+        }
         match value {
             "workspace" => Ok(Self::Workspace),
             "attachments" => Ok(Self::Attachments),
@@ -194,13 +204,39 @@ impl ToolMetadataToken {
             "native" => Ok(Self::Native),
             _ => Err(ToolError::caller(
                 "invalid_tool_metadata_token",
-                "Tool metadata token is not in the stable redaction-safe vocabulary",
+                INVALID_TOOL_METADATA_TOKEN,
             )),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for ToolMetadataToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TokenVisitor;
+
+        impl serde::de::Visitor<'_> for TokenVisitor {
+            type Value = ToolMetadataToken;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a stable tool metadata token")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ToolMetadataToken::parse(value).map_err(|_| E::custom(INVALID_TOOL_METADATA_TOKEN))
+            }
+        }
+
+        deserializer.deserialize_str(TokenVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ToolMetadataEntry {
     WorkspaceResolution(ToolMetadataToken),
@@ -212,6 +248,231 @@ pub enum ToolMetadataEntry {
     MatchCount(u64),
     CacheHit(bool),
     Truncated(bool),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ToolMetadataKind {
+    WorkspaceResolution,
+    AttachmentResolution,
+    SkillResolution,
+    Coercion,
+    ResourceCount,
+    CandidateCount,
+    MatchCount,
+    CacheHit,
+    Truncated,
+}
+
+impl<'de> Deserialize<'de> for ToolMetadataKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KindVisitor;
+
+        impl serde::de::Visitor<'_> for KindVisitor {
+            type Value = ToolMetadataKind;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a stable tool metadata kind")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() > MAX_TOOL_METADATA_TOKEN_BYTES || !value.is_ascii() {
+                    return Err(E::custom(INVALID_TOOL_METADATA_ENTRY));
+                }
+                match value {
+                    "workspace_resolution" => Ok(ToolMetadataKind::WorkspaceResolution),
+                    "attachment_resolution" => Ok(ToolMetadataKind::AttachmentResolution),
+                    "skill_resolution" => Ok(ToolMetadataKind::SkillResolution),
+                    "coercion" => Ok(ToolMetadataKind::Coercion),
+                    "resource_count" => Ok(ToolMetadataKind::ResourceCount),
+                    "candidate_count" => Ok(ToolMetadataKind::CandidateCount),
+                    "match_count" => Ok(ToolMetadataKind::MatchCount),
+                    "cache_hit" => Ok(ToolMetadataKind::CacheHit),
+                    "truncated" => Ok(ToolMetadataKind::Truncated),
+                    _ => Err(E::custom(INVALID_TOOL_METADATA_ENTRY)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(KindVisitor)
+    }
+}
+
+enum PendingMetadataValue {
+    Token(ToolMetadataToken),
+    Count(u64),
+    Flag(bool),
+}
+
+impl<'de> Deserialize<'de> for PendingMetadataValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ValueVisitor;
+
+        impl serde::de::Visitor<'_> for ValueVisitor {
+            type Value = PendingMetadataValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded typed tool metadata value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ToolMetadataToken::parse(value)
+                    .map(PendingMetadataValue::Token)
+                    .map_err(|_| E::custom(INVALID_TOOL_METADATA_TOKEN))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(PendingMetadataValue::Count(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                u64::try_from(value)
+                    .map(PendingMetadataValue::Count)
+                    .map_err(|_| E::custom(INVALID_TOOL_METADATA_ENTRY))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(PendingMetadataValue::Flag(value))
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ToolMetadataField {
+    Kind,
+    Value,
+}
+
+impl<'de> Deserialize<'de> for ToolMetadataField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+            type Value = ToolMetadataField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a tool metadata entry field")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "kind" => Ok(ToolMetadataField::Kind),
+                    "value" => Ok(ToolMetadataField::Value),
+                    _ => Err(E::custom(INVALID_TOOL_METADATA_ENTRY)),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolMetadataEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = ToolMetadataEntry;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded typed tool metadata entry")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut kind = None;
+                let mut value = None;
+                while let Some(field) = map.next_key::<ToolMetadataField>()? {
+                    match field {
+                        ToolMetadataField::Kind => {
+                            if kind.is_some() {
+                                return Err(serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY));
+                            }
+                            kind = Some(map.next_value::<ToolMetadataKind>()?);
+                        }
+                        ToolMetadataField::Value => {
+                            if value.is_some() {
+                                return Err(serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY));
+                            }
+                            value = Some(map.next_value::<PendingMetadataValue>()?);
+                        }
+                    }
+                }
+
+                let kind =
+                    kind.ok_or_else(|| serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY))?;
+                let value =
+                    value.ok_or_else(|| serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY))?;
+                match (kind, value) {
+                    (ToolMetadataKind::WorkspaceResolution, PendingMetadataValue::Token(value)) => {
+                        Ok(ToolMetadataEntry::WorkspaceResolution(value))
+                    }
+                    (
+                        ToolMetadataKind::AttachmentResolution,
+                        PendingMetadataValue::Token(value),
+                    ) => Ok(ToolMetadataEntry::AttachmentResolution(value)),
+                    (ToolMetadataKind::SkillResolution, PendingMetadataValue::Token(value)) => {
+                        Ok(ToolMetadataEntry::SkillResolution(value))
+                    }
+                    (ToolMetadataKind::Coercion, PendingMetadataValue::Token(value)) => {
+                        Ok(ToolMetadataEntry::Coercion(value))
+                    }
+                    (ToolMetadataKind::ResourceCount, PendingMetadataValue::Count(value)) => {
+                        Ok(ToolMetadataEntry::ResourceCount(value))
+                    }
+                    (ToolMetadataKind::CandidateCount, PendingMetadataValue::Count(value)) => {
+                        Ok(ToolMetadataEntry::CandidateCount(value))
+                    }
+                    (ToolMetadataKind::MatchCount, PendingMetadataValue::Count(value)) => {
+                        Ok(ToolMetadataEntry::MatchCount(value))
+                    }
+                    (ToolMetadataKind::CacheHit, PendingMetadataValue::Flag(value)) => {
+                        Ok(ToolMetadataEntry::CacheHit(value))
+                    }
+                    (ToolMetadataKind::Truncated, PendingMetadataValue::Flag(value)) => {
+                        Ok(ToolMetadataEntry::Truncated(value))
+                    }
+                    _ => Err(serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY)),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(EntryVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -300,12 +561,41 @@ impl<'de> Deserialize<'de> for ToolMetadata {
     where
         D: serde::Deserializer<'de>,
     {
-        let entries = Vec::<ToolMetadataEntry>::deserialize(deserializer)?;
-        let mut metadata = Self::default();
-        for entry in entries {
-            metadata.insert(entry).map_err(serde::de::Error::custom)?;
+        struct MetadataVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MetadataVisitor {
+            type Value = ToolMetadata;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded sequence of typed tool metadata entries")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|size| size > MAX_TOOL_METADATA_ENTRIES)
+                {
+                    return Err(serde::de::Error::custom(TOOL_METADATA_LIMIT));
+                }
+
+                let mut metadata = ToolMetadata::default();
+                for _ in 0..MAX_TOOL_METADATA_ENTRIES {
+                    let Some(entry) = sequence.next_element::<ToolMetadataEntry>()? else {
+                        return Ok(metadata);
+                    };
+                    metadata.insert(entry).map_err(serde::de::Error::custom)?;
+                }
+                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::custom(TOOL_METADATA_LIMIT));
+                }
+                Ok(metadata)
+            }
         }
-        Ok(metadata)
+
+        deserializer.deserialize_seq(MetadataVisitor)
     }
 }
 
@@ -419,29 +709,30 @@ fn close_object_shapes(value: &mut Value) {
     }
 }
 
-fn visit_schema_children_mut(object: &mut Map<String, Value>, mut visit: impl FnMut(&mut Value)) {
-    const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
-        "additionalProperties",
-        "contains",
-        "contentSchema",
-        "else",
-        "if",
-        "items",
-        "not",
-        "propertyNames",
-        "then",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    ];
-    const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
-    const SCHEMA_MAP_KEYWORDS: &[&str] = &[
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-        "patternProperties",
-        "properties",
-    ];
+const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
+    "additionalItems",
+    "additionalProperties",
+    "contains",
+    "contentSchema",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
 
+fn visit_schema_children_mut(object: &mut Map<String, Value>, mut visit: impl FnMut(&mut Value)) {
     for keyword in SINGLE_SCHEMA_KEYWORDS {
         if let Some(schema) = object.get_mut(*keyword) {
             visit(schema);
@@ -461,34 +752,19 @@ fn visit_schema_children_mut(object: &mut Map<String, Value>, mut visit: impl Fn
             }
         }
     }
+    if let Some(Value::Object(dependencies)) = object.get_mut("dependencies") {
+        for schema in dependencies.values_mut() {
+            if schema.is_object() || schema.is_boolean() {
+                visit(schema);
+            }
+        }
+    }
 }
 
 fn visit_schema_children(
     object: &Map<String, Value>,
     mut visit: impl FnMut(&Value) -> bool,
 ) -> bool {
-    const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
-        "additionalProperties",
-        "contains",
-        "contentSchema",
-        "else",
-        "if",
-        "items",
-        "not",
-        "propertyNames",
-        "then",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-    ];
-    const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
-    const SCHEMA_MAP_KEYWORDS: &[&str] = &[
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-        "patternProperties",
-        "properties",
-    ];
-
     SINGLE_SCHEMA_KEYWORDS
         .iter()
         .filter_map(|keyword| object.get(*keyword))
@@ -502,7 +778,16 @@ fn visit_schema_children(
             .iter()
             .filter_map(|keyword| object.get(*keyword).and_then(Value::as_object))
             .flat_map(Map::values)
-            .any(visit)
+            .any(&mut visit)
+        || object
+            .get("dependencies")
+            .and_then(Value::as_object)
+            .is_some_and(|dependencies| {
+                dependencies
+                    .values()
+                    .filter(|schema| schema.is_object() || schema.is_boolean())
+                    .any(visit)
+            })
 }
 
 fn type_includes(value: &Option<&Value>, expected: &str) -> bool {
@@ -674,6 +959,7 @@ fn has_object_semantics(object: &Map<String, Value>) -> bool {
         "additionalProperties",
         "dependentRequired",
         "dependentSchemas",
+        "dependencies",
         "maxProperties",
         "minProperties",
         "patternProperties",
@@ -964,6 +1250,87 @@ mod tests {
     }
 
     #[test]
+    fn canonical_schema_traverses_legacy_draft_schema_positions() {
+        let schema = compile_canonical_schema(json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {
+                "tuple": {
+                    "type": "array",
+                    "items": [{"type": "string"}],
+                    "additionalItems": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}}
+                    }
+                }
+            },
+            "dependencies": {
+                "payload": {
+                    "dependencies": {"name": ["id"]}
+                },
+                "typed_payload": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}}
+                },
+                "disabled": false,
+                "related": ["payload", "additionalProperties"]
+            }
+        }));
+
+        jsonschema::validator_for(&schema).unwrap();
+        assert_eq!(
+            schema["properties"]["tuple"]["additionalItems"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["dependencies"]["payload"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["dependencies"]["payload"]["dependencies"]["name"],
+            json!(["id"])
+        );
+        assert_eq!(
+            schema["dependencies"]["typed_payload"]["additionalProperties"],
+            false
+        );
+        assert_eq!(schema["dependencies"]["disabled"], false);
+        assert_eq!(
+            schema["dependencies"]["related"],
+            json!(["payload", "additionalProperties"])
+        );
+        assert!(!explicit_open_object_schema(&schema));
+    }
+
+    #[test]
+    fn open_schema_detection_checks_legacy_schema_values_but_not_dependency_names() {
+        let dependency_names_only = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "dependencies": {
+                "related": ["additionalProperties"]
+            }
+        });
+        let open_additional_items = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "array",
+            "items": [{"type": "string"}],
+            "additionalItems": {"type": "object", "additionalProperties": true}
+        });
+        let open_dependency_schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "dependencies": {
+                "payload": {"type": "object", "additionalProperties": true}
+            }
+        });
+
+        assert!(!explicit_open_object_schema(&dependency_names_only));
+        assert!(explicit_open_object_schema(&open_additional_items));
+        assert!(explicit_open_object_schema(&open_dependency_schema));
+    }
+
+    #[test]
     fn strict_schema_rejects_ambiguous_optional_null() {
         let error = compile_openai_strict_schema(&json!({
             "type": "object",
@@ -1231,6 +1598,67 @@ mod tests {
             let error = ToolMetadataToken::parse(rejected).unwrap_err();
             assert_eq!(error.code, "invalid_tool_metadata_token");
             assert!(!error.message.contains(rejected));
+        }
+    }
+
+    #[test]
+    fn metadata_deserialization_is_capped_and_redacts_rejected_content() {
+        fn errors_for(metadata: serde_json::Value) -> [String; 2] {
+            let direct = serde_json::from_value::<ToolMetadata>(metadata.clone())
+                .unwrap_err()
+                .to_string();
+            let preflight = serde_json::from_value::<PreflightMeta>(json!({
+                "metadata": metadata
+            }))
+            .unwrap_err()
+            .to_string();
+            [direct, preflight]
+        }
+
+        fn assert_redacted(metadata: serde_json::Value, marker: &str) {
+            for error in errors_for(metadata) {
+                assert!(!error.contains(marker), "metadata error leaked marker");
+            }
+        }
+
+        let over_cap_marker = "OVER_CAP_SECRET_MARKER_4f7d";
+        let mut over_cap = vec![
+            json!({"kind": "workspace_resolution", "value": "workspace"}),
+            json!({"kind": "attachment_resolution", "value": "attachments"}),
+            json!({"kind": "skill_resolution", "value": "skill_directory"}),
+            json!({"kind": "coercion", "value": "lossless_integer"}),
+            json!({"kind": "resource_count", "value": 1}),
+            json!({"kind": "candidate_count", "value": 2}),
+            json!({"kind": "match_count", "value": 3}),
+            json!({"kind": "cache_hit", "value": true}),
+        ];
+        over_cap.push(json!({"kind": over_cap_marker, "value": "raw"}));
+        for error in errors_for(serde_json::Value::Array(over_cap)) {
+            assert!(error.contains("tool metadata exceeds the bounded fact limit"));
+            assert!(!error.contains(over_cap_marker));
+        }
+
+        let unknown_kind = "UNKNOWN_KIND_SECRET_MARKER_91c2";
+        assert_redacted(json!([{"kind": unknown_kind, "value": true}]), unknown_kind);
+
+        for token in [
+            "UNKNOWN_TOKEN_SECRET_MARKER_a8e1".to_string(),
+            "wørkspace_secret_marker".to_string(),
+            "../../raw/secret-marker.txt".to_string(),
+            "bearer-sensitive-secret-marker".to_string(),
+            "x".repeat(512),
+        ] {
+            assert_redacted(
+                json!([{"kind": "workspace_resolution", "value": &token}]),
+                &token,
+            );
+        }
+
+        for error in errors_for(json!([
+            {"kind": "cache_hit", "value": true},
+            {"kind": "cache_hit", "value": false}
+        ])) {
+            assert!(error.contains("duplicate_tool_metadata"));
         }
     }
 

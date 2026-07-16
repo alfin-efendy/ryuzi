@@ -539,7 +539,8 @@ static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The set of tools available to a session, keyed by name. Built-ins plus any
 /// per-session MCP tools.
 pub struct ToolRegistry {
-    tools: BTreeMap<String, Arc<RegisteredTool>>,
+    legacy_tools: BTreeMap<String, Arc<RegisteredTool>>,
+    canonical_tools: BTreeMap<String, Arc<RegisteredTool>>,
     generation: u64,
     availability: BTreeMap<String, Arc<tokio::sync::Mutex<Option<AvailabilityCacheEntry>>>>,
 }
@@ -558,25 +559,25 @@ impl ToolRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools
+        self.legacy_tools
             .get(name)
             .map(|registered| registered.tool.clone())
     }
 
     pub fn registered(&self, name: &str) -> Option<Arc<RegisteredTool>> {
-        self.tools.get(name).cloned()
+        self.canonical_tools.get(name).cloned()
     }
 
     /// The Anthropic `tools` array for a provider request.
     pub fn definitions(&self) -> Vec<Value> {
-        self.tools
+        self.legacy_tools
             .values()
             .map(|registered| registered.tool.definition())
             .collect()
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.legacy_tools.keys().cloned().collect()
     }
 
     pub fn generation(&self) -> u64 {
@@ -594,7 +595,7 @@ impl ToolRegistry {
                 "Direct function tools are unavailable for this capability profile",
             ));
         }
-        let registered = self.tools.get(name).ok_or_else(|| {
+        let registered = self.canonical_tools.get(name).ok_or_else(|| {
             ToolError::precondition("tool_not_found", "Tool is not present in this registry")
         })?;
         if !registered.v2_schema_eligible {
@@ -631,7 +632,7 @@ impl ToolRegistry {
     }
 
     pub async fn available(&self, name: &str) -> Result<Option<AvailableTool>, ToolError> {
-        let Some(registered) = self.tools.get(name).cloned() else {
+        let Some(registered) = self.canonical_tools.get(name).cloned() else {
             return Ok(None);
         };
         let cache = self
@@ -694,17 +695,20 @@ impl ToolRegistry {
     }
 
     fn from_complete_list(list: Vec<Arc<dyn Tool>>) -> Self {
-        let mut tools = BTreeMap::new();
+        let mut legacy_tools = BTreeMap::new();
+        let mut canonical_tools = BTreeMap::new();
         for tool in list {
             let registered = Arc::new(compile_registered_tool(tool));
-            tools.insert(registered.descriptor.canonical_name.clone(), registered);
+            legacy_tools.insert(registered.tool.name().to_string(), registered.clone());
+            canonical_tools.insert(registered.descriptor.canonical_name.clone(), registered);
         }
-        let availability = tools
+        let availability = canonical_tools
             .keys()
             .map(|name| (name.clone(), Arc::new(tokio::sync::Mutex::new(None))))
             .collect();
         Self {
-            tools,
+            legacy_tools,
+            canonical_tools,
             generation: next_registry_generation(),
             availability,
         }
@@ -1685,12 +1689,9 @@ mod tests {
         );
         let registry = ToolRegistry::with_extra(vec![first.clone(), second.clone()]);
 
-        assert!(registry.get("first_alias").is_none());
-        assert!(registry.get("second_alias").is_none());
-        assert_eq!(
-            registry.get("canonical_contract").unwrap().name(),
-            "second_alias"
-        );
+        assert_eq!(registry.get("first_alias").unwrap().name(), "first_alias");
+        assert_eq!(registry.get("second_alias").unwrap().name(), "second_alias");
+        assert!(registry.get("canonical_contract").is_none());
         assert_eq!(
             registry
                 .registered("canonical_contract")
@@ -1713,6 +1714,95 @@ mod tests {
         assert_eq!(first.probes.load(Ordering::SeqCst), 0);
         assert_eq!(second.probes.load(Ordering::SeqCst), 1);
         assert!(registry.available("second_alias").await.unwrap().is_none());
+
+        let v1_names = registry
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(v1_names.iter().any(|name| name == "first_alias"));
+        assert!(v1_names.iter().any(|name| name == "second_alias"));
+        for name in v1_names {
+            assert!(
+                registry.get(&name).is_some(),
+                "V1 definition {name} must resolve through get"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_and_canonical_collisions_each_preserve_last_wins() {
+        let first: Arc<dyn Tool> = Arc::new(
+            ContractTool::new(
+                "shared_alias",
+                "legacy first",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_canonical_name("first_canonical"),
+        );
+        let second: Arc<dyn Tool> = Arc::new(
+            ContractTool::new(
+                "shared_alias",
+                "legacy second",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_canonical_name("second_canonical"),
+        );
+        let canonical_first: Arc<dyn Tool> = Arc::new(
+            ContractTool::new(
+                "first_canonical_alias",
+                "canonical first",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_canonical_name("shared_canonical"),
+        );
+        let canonical_second: Arc<dyn Tool> = Arc::new(
+            ContractTool::new(
+                "second_canonical_alias",
+                "canonical second",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_canonical_name("shared_canonical"),
+        );
+        let registry =
+            ToolRegistry::with_extra(vec![first, second, canonical_first, canonical_second]);
+
+        assert_eq!(
+            registry.get("shared_alias").unwrap().description(),
+            "legacy second"
+        );
+        assert_eq!(
+            registry
+                .registered("first_canonical")
+                .unwrap()
+                .descriptor
+                .description,
+            "legacy first"
+        );
+        assert_eq!(
+            registry
+                .registered("second_canonical")
+                .unwrap()
+                .descriptor
+                .description,
+            "legacy second"
+        );
+        assert_eq!(
+            registry
+                .registered("shared_canonical")
+                .unwrap()
+                .descriptor
+                .description,
+            "canonical second"
+        );
+
+        let shared_alias_definitions = registry
+            .definitions()
+            .into_iter()
+            .filter(|definition| definition["name"] == "shared_alias")
+            .collect::<Vec<_>>();
+        assert_eq!(shared_alias_definitions.len(), 1);
+        assert_eq!(shared_alias_definitions[0]["description"], "legacy second");
     }
 
     #[test]
