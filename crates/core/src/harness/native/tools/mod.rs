@@ -339,9 +339,8 @@ pub struct ToolCtx {
     /// `User` for interactive turns; the background review fork
     /// (`WriteOrigin::BackgroundReview`) and sub-agent turns
     /// (`WriteOrigin::Agent`) set it explicitly at their own `ToolCtx` build
-    /// sites. Consulted by `skill_manage` and the app-control negative-space
-    /// guard (Phase 6) to gate autonomous writes more strictly than
-    /// human-driven ones.
+    /// sites. Consulted by the app-control negative-space guard (Phase 6) to
+    /// gate autonomous writes more strictly than human-driven ones.
     pub write_origin: crate::domain::WriteOrigin,
 }
 

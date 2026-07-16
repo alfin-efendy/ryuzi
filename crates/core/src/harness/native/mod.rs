@@ -435,17 +435,15 @@ impl Harness for NativeHarness {
                 },
                 // Every agent tool call — even one an interactive human turn
                 // triggers — is the AGENT deciding to call a tool, not a
-                // direct human action, so a top-level Project/Chat session is
-                // `Agent` origin (tightening skill_manage's autonomous-write
-                // Every autonomous agent session (Project/Chat/Worker) runs as
-                // `Agent` so the negative-space storage guard + the skill_manage
-                // guard engage; the human acts as `User` through Cockpit/TUI. A
-                // Worker is an unattended agent — it must be at least as
-                // guarded as an attended chat, never less (avoiding the
-                // "unattended-with-more-power" inversion). Review never routes
-                // through here: its fork builds `RunnerDeps` directly with
-                // `BackgroundReview`, so the `Review` arm below is defensively
-                // dead.
+                // direct human action, so every autonomous agent session
+                // (Project/Chat/Worker) runs as `Agent` origin, engaging the
+                // negative-space storage guard; the human acts as `User`
+                // through Cockpit/TUI instead. A Worker is an unattended
+                // agent — it must be at least as guarded as an attended
+                // chat, never less (avoiding the "unattended-with-more-power"
+                // inversion). Review never routes through here: its fork
+                // builds `RunnerDeps` directly with `BackgroundReview`, so
+                // the `Review` arm below is defensively dead.
                 write_origin: match ctx.kind {
                     crate::domain::SessionKind::Project
                     | crate::domain::SessionKind::Chat
