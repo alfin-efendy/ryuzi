@@ -3395,6 +3395,50 @@ mod tests {
         }
     }
 
+    /// A three-child LLM double that holds each child at a shared start gate,
+    /// then lets the test release completions in a chosen order.
+    struct CompletionGatedLlm {
+        start: Arc<tokio::sync::Barrier>,
+        release: [Arc<tokio::sync::Notify>; 3],
+    }
+
+    impl CompletionGatedLlm {
+        fn new() -> Self {
+            Self {
+                // Three concurrent children plus the test coordinator.
+                start: Arc::new(tokio::sync::Barrier::new(4)),
+                release: std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new())),
+            }
+        }
+
+        fn release(&self, index: usize) {
+            self.release[index].notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl LlmStream for CompletionGatedLlm {
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            let body = request.body.to_string();
+            let index = (0..3)
+                .find(|index| body.contains(&format!("job {index}")))
+                .expect("each gated child prompt identifies its input index");
+            self.start.wait().await;
+            self.release[index].notified().await;
+
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            for event in final_turn(&format!("completed job {index}")) {
+                tx.send(Ok(event))
+                    .await
+                    .expect("the bounded scripted stream accepts its final events");
+            }
+            Ok(RoutedStream {
+                selection: test_route_selection(),
+                events: rx,
+            })
+        }
+    }
+
     #[async_trait]
     impl crate::harness::native::mcp_client::McpCaller for StaticMcpCaller {
         async fn call(
@@ -3657,6 +3701,46 @@ mod tests {
         )
         .unwrap()
         .agent_tools;
+    }
+
+    async fn create_main_delegate_target(
+        registry: &crate::agents::registry::AgentRegistry,
+        name: &str,
+    ) -> String {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        registry
+            .create(AgentMutationInput {
+                name: name.to_string(),
+                description: format!("{name} delegated target"),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap()
+            .profile
+            .id
     }
 
     /// Feature C1a: a real tool call (the bash tool, actually executed —
@@ -5798,6 +5882,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_link_delegate_agent_foreground_batch_persists_tool_identity_and_input_order()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) = deps_with_executable_profile_registry(
+            dir.path(),
+            Arc::new(ScriptedLlm::new(vec![])),
+            store,
+        )
+        .await;
+        let reviewer = create_main_delegate_target(&registry, "Reviewer").await;
+        let tester = create_main_delegate_target(&registry, "Tester").await;
+        let input = json!({
+            "delegations": [
+                {"agent_id": reviewer, "task": "audit the auth changes"},
+                {"agent_id": tester, "task": "run the focused tests"}
+            ]
+        })
+        .to_string();
+        let parent = vec![
+            tool_use_start(0, "delegate-foreground-batch-call", "delegate_agent"),
+            input_json_delta(0, &input),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        deps.llm = Arc::new(ScriptedLlm::new(vec![
+            parent,
+            final_turn("delegated child complete"),
+            final_turn("delegated child complete"),
+            final_turn("parent complete"),
+        ]));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate the audit", "delegate the audit"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|child| child.agent_kind == crate::domain::AgentRunKind::MainDelegate)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.dispatch_index);
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| (
+                    child.source_tool_call_id.as_deref(),
+                    child.dispatch_index,
+                    child.task.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some("delegate-foreground-batch-call"),
+                    Some(0),
+                    "audit the auth changes",
+                ),
+                (
+                    Some("delegate-foreground-batch-call"),
+                    Some(1),
+                    "run the focused tests",
+                ),
+            ]
+        );
+        assert!(children
+            .iter()
+            .all(|child| child.status == crate::domain::AgentRunStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_delegate_agent_background_persists_tool_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) = deps_with_executable_profile_registry(
+            dir.path(),
+            Arc::new(ScriptedLlm::new(vec![])),
+            store,
+        )
+        .await;
+        let reviewer = create_main_delegate_target(&registry, "Background reviewer").await;
+        let input = json!({
+            "agent_id": reviewer,
+            "task": "review the async job",
+            "background": true,
+        })
+        .to_string();
+        let parent = vec![
+            tool_use_start(0, "delegate-background-call", "delegate_agent"),
+            input_json_delta(0, &input),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // The parent continuation and detached child may race to take these
+        // final text-only turns; either ordering is valid for this linkage test.
+        deps.llm = Arc::new(ScriptedLlm::new(vec![
+            parent,
+            final_turn("done"),
+            final_turn("done"),
+        ]));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate in background", "delegate in background"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|child| child.agent_kind == crate::domain::AgentRunKind::MainDelegate)
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            (
+                children[0].source_tool_call_id.as_deref(),
+                children[0].dispatch_index,
+                children[0].task.as_str(),
+            ),
+            (
+                Some("delegate-background-call"),
+                Some(0),
+                "review the async job",
+            )
+        );
+        let tool_row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("delegate-background-call"))
+            .expect("the background delegate_agent tool call is terminal");
+        assert_eq!(tool_row.status.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
     async fn dispatch_link_admission_failure_leaves_no_child_and_records_tool_error() {
         let dir = tempfile::tempdir().unwrap();
         let parent = vec![
@@ -6358,38 +6593,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_link_indices_follow_input_when_children_finish_out_of_order() {
+    async fn run_many_persists_input_indices_when_children_finish_in_reverse_order() {
         let dir = tempfile::tempdir().unwrap();
-        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        let llm = Arc::new(CompletionGatedLlm::new());
+        let deps = deps_at(dir.path(), llm.clone()).await;
         let root_run_id = deps.run_id.clone();
-        let store = deps.store.clone();
-        let mut children = Vec::new();
-        for (dispatch_index, task) in ["first", "second", "third"].into_iter().enumerate() {
-            children.push(
-                deps.delegation
-                    .queue_subagent(SubagentRunRequest {
-                        parent_run_id: root_run_id.clone(),
-                        subagent_type: "explore".into(),
-                        task: task.into(),
-                        context: None,
-                        background: false,
-                        dispatch: Some(crate::delegation::AgentDispatchLink {
-                            source_tool_call_id: "out-of-order-tool-call".into(),
-                            dispatch_index: i64::try_from(dispatch_index)
-                                .expect("test index fits i64"),
-                        }),
-                    })
+        deps.store
+            .set_setting(crate::domain::WriteOrigin::User, "max_concurrent_runs", "3")
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: root_run_id.clone(),
+        };
+        let worker = tokio::spawn(async move {
+            spawner
+                .run_many(
+                    "reverse-completion-tool-call",
+                    (0..3)
+                        .map(|index| SubtaskSpec {
+                            agent_type: "explore".into(),
+                            prompt: format!("job {index}"),
+                        })
+                        .collect(),
+                )
+                .await
+        });
+
+        // All three children have been admitted and reached their stream
+        // gates. Release exactly one at a time to force terminalization 2→1→0.
+        llm.start.wait().await;
+        for index in [2, 1, 0] {
+            llm.release(index);
+            for _ in 0..200 {
+                if deps
+                    .store
+                    .list_descendant_agent_runs(&root_run_id)
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .iter()
+                    .any(|child| {
+                        child.dispatch_index
+                            == Some(i64::try_from(index).expect("test index fits i64"))
+                            && child.status == crate::domain::AgentRunStatus::Completed
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                deps.store
+                    .list_descendant_agent_runs(&root_run_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|child| {
+                        child.dispatch_index
+                            == Some(i64::try_from(index).expect("test index fits i64"))
+                            && child.status == crate::domain::AgentRunStatus::Completed
+                    }),
+                "child {index} must complete before releasing the next gate"
             );
         }
-        for child in [2, 0, 1] {
-            deps.delegation
-                .complete(&children[child].run.run_id, "done")
-                .await
-                .unwrap();
-        }
-        let mut children = store
+        let results = worker.await.unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let mut children = deps
+            .store
             .list_descendant_agent_runs(&root_run_id)
             .await
             .unwrap();
@@ -6401,15 +6680,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(2)]
         );
-        assert!(children.iter().all(|child| {
-            child.source_tool_call_id.as_deref() == Some("out-of-order-tool-call")
-        }));
+        assert!(children
+            .iter()
+            .all(|child| child.source_tool_call_id.as_deref()
+                == Some("reverse-completion-tool-call")));
         assert_eq!(
             children
                 .iter()
                 .map(|child| child.task.as_str())
                 .collect::<Vec<_>>(),
-            vec!["first", "second", "third"]
+            vec!["job 0", "job 1", "job 2"]
         );
     }
 
