@@ -276,6 +276,35 @@ test("agent-run metadata changes refresh only the scoped roster, not a selected 
   getChildTranscript.mockRestore();
 });
 
+test("reconciles a completion event that arrives during roster hydration", async () => {
+  const staleRoster = deferred<{ status: "ok"; data: AgentRunRosterInfo }>();
+  const currentRoster = deferred<{ status: "ok"; data: AgentRunRosterInfo }>();
+  const getChildRuns = spyOn(commands, "getChildRuns")
+    .mockImplementationOnce(() => staleRoster.promise as never)
+    .mockImplementationOnce(() => currentRoster.promise as never);
+  const getChildTranscript = spyOn(commands, "getChildTranscript").mockResolvedValue({ status: "ok", data: [] });
+
+  const initialLoad = useDelegation.getState().load(local, sessionPk);
+  useDelegation
+    .getState()
+    .applyCoreEvent(
+      { kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: "root-1", status: "completed" },
+      local,
+    );
+  staleRoster.resolve({ status: "ok", data: roster([run({ status: "running" })]) });
+  await initialLoad;
+
+  expect(getChildRuns).toHaveBeenCalledTimes(2);
+  currentRoster.resolve({ status: "ok", data: roster([run({ status: "completed", finishedAt: 2_000, result: "Done" })]) });
+  await Promise.resolve();
+
+  const runs = useDelegation.getState().bySession[delegationSessionKey(local, sessionPk)];
+  expect(runs).toEqual([run({ status: "completed", finishedAt: 2_000, result: "Done" })]);
+  expect(getChildRuns).toHaveBeenCalledTimes(2);
+  getChildRuns.mockRestore();
+  getChildTranscript.mockRestore();
+});
+
 test("retry appends the returned attempt and selects it", async () => {
   const retried = run({ runId: "run-2", retryOf: "run-1", status: "queued" });
   const retryChildRun = spyOn(commands, "retryChildRun").mockResolvedValue({ status: "ok", data: retried });

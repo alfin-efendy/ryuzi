@@ -24,6 +24,7 @@ type DelegationState = {
 };
 
 const rosterRequests = new Map<string, Promise<void>>();
+const pendingRosterRefreshes = new Set<string>();
 const transcriptRequests = new Map<string, Promise<void>>();
 
 function errorMessage(error: unknown): string {
@@ -122,6 +123,9 @@ export const useDelegation = create<DelegationState>((set, get) => ({
         }));
       } finally {
         rosterRequests.delete(key);
+        if (pendingRosterRefreshes.delete(key)) {
+          void get().load(runnerId, sessionPk);
+        }
       }
     })();
     rosterRequests.set(key, request);
@@ -194,7 +198,12 @@ export const useDelegation = create<DelegationState>((set, get) => ({
 
   applyCoreEvent: (event, runnerId) => {
     if (event.kind === "agentRunChanged") {
-      void get().load(runnerId, event.session_pk);
+      const key = delegationSessionKey(runnerId, event.session_pk);
+      if (rosterRequests.has(key)) {
+        pendingRosterRefreshes.add(key);
+      } else {
+        void get().load(runnerId, event.session_pk);
+      }
       return;
     }
     if (event.kind !== "agentRunMessage") return;
