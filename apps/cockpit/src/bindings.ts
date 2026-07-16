@@ -1183,6 +1183,34 @@ async addFreeConnection(runnerId: string | null, provider: string, label: string
 }
 },
 /**
+ * The explicit "installed providers" set gates the Models list. These proxy
+ * the engine RPCs; the set is visibility-only and independent of connections.
+ */
+async listInstalledProviders(runnerId: string | null) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_installed_providers", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async installProvider(runnerId: string | null, family: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_provider", { runnerId, family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async uninstallProvider(runnerId: string | null, family: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("uninstall_provider", { runnerId, family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The agents available for a project (built-ins plus discovered custom agents).
  */
 async nativeAgents(runnerId: string | null, projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
@@ -1770,8 +1798,8 @@ export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: Inv
 export type AgentMention = { agentId: string; labelSnapshot: string; startUtf16: number; endUtf16: number }
 /**
  * An agent's model assignment: either a concrete provider model (with an
- * optional effort override) or a symbolic router route (`smart`, `fast`,
- * ...). Routes never carry an effort — `deny_unknown_fields` makes a
+ * optional effort override) or a symbolic router route (`free`, ...).
+ * Routes never carry an effort — `deny_unknown_fields` makes a
  * `{"kind":"route", ..., "effort": ...}` payload a decode error rather
  * than a silently dropped field.
  */

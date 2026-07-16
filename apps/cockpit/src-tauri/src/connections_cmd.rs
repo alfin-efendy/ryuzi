@@ -485,6 +485,46 @@ pub async fn add_free_connection(
         .await
 }
 
+/// The explicit "installed providers" set gates the Models list. These proxy
+/// the engine RPCs; the set is visibility-only and independent of connections.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_installed_providers(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("list_installed_providers", serde_json::json!({}))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn install_provider(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    family: String,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("install_provider", serde_json::json!({ "family": family }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn uninstall_provider(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    family: String,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("uninstall_provider", serde_json::json!({ "family": family }))
+        .await
+}
+
 /// Start Kiro's AWS SSO-OIDC device-code flow: registers a public client,
 /// starts a device authorization, opens the browser to the verification URL,
 /// and stashes the in-flight state under a fresh `flow_id` for
