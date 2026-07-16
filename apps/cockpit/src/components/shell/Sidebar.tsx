@@ -58,7 +58,7 @@ import { SessionRow } from "@/components/shell/SessionRow";
 import { SortableSessionRow } from "@/components/shell/SortableSessionRow";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
-  { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
+  { label: "New Task", icon: Pencil, view: { kind: "home" }, group: ["home"] },
   { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail"] },
   { label: "Automations", icon: Workflow, view: { kind: "automations" }, group: ["automations", "scheduler", "jobDetail", "jobNew"] },
@@ -70,6 +70,88 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
 
+// Slim Organize/Ordering popover shared by the Tasks and Projects headers —
+// each caller supplies its own open/close state and the Ordering slice it
+// controls (task vs. project), but "Organize" (chat-first vs. per-project
+// grouping) is global, so both instances read/write the same organizeBy.
+function OrganizeMenu({
+  open,
+  onClose,
+  organizeBy,
+  setOrganizeBy,
+  ordering,
+  setOrdering,
+  className,
+}: {
+  open: boolean;
+  onClose: () => void;
+  organizeBy: "project" | "task";
+  setOrganizeBy: (v: "project" | "task") => void;
+  ordering: Ordering;
+  setOrdering: (o: Ordering) => void;
+  className: string;
+}) {
+  const [orgSub, setOrgSub] = useState(false);
+  const [ordSub, setOrdSub] = useState(false);
+  if (!open) return null;
+  const orgLabel = organizeBy === "task" ? "By Task" : "By Project";
+  const ordLabel = ordering === "name" ? "Name" : ordering === "manual" ? "Manual Order" : "Updated";
+  return (
+    <MenuPanel onClose={onClose} className={className}>
+      <MenuItem
+        onClick={() => {
+          setOrgSub((v) => !v);
+          setOrdSub(false);
+        }}
+      >
+        <span className="flex-1">Organize</span>
+        <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
+          {orgLabel} <ChevronRight aria-hidden size={11} strokeWidth={2} />
+        </span>
+      </MenuItem>
+      {orgSub &&
+        (["project", "task"] as const).map((v) => (
+          <MenuItem
+            key={v}
+            selected={organizeBy === v}
+            onClick={() => {
+              setOrganizeBy(v);
+              setOrgSub(false);
+            }}
+            className="py-1.5 pl-[22px] text-[12.5px]"
+          >
+            <span className="flex-1">{v === "task" ? "By Task" : "By Project"}</span>
+          </MenuItem>
+        ))}
+      <MenuItem
+        onClick={() => {
+          setOrdSub((v) => !v);
+          setOrgSub(false);
+        }}
+      >
+        <span className="flex-1">Ordering</span>
+        <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
+          {ordLabel} <ChevronRight aria-hidden size={11} strokeWidth={2} />
+        </span>
+      </MenuItem>
+      {ordSub &&
+        (["updated", "name", "manual"] as const).map((o) => (
+          <MenuItem
+            key={o}
+            selected={ordering === o}
+            onClick={() => {
+              setOrdering(o);
+              setOrdSub(false);
+            }}
+            className="py-1.5 pl-[22px] text-[12.5px]"
+          >
+            <span className="flex-1">{o === "name" ? "Name" : o === "manual" ? "Manual Order" : "Updated"}</span>
+          </MenuItem>
+        ))}
+    </MenuPanel>
+  );
+}
+
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSession, selectProject, end } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
@@ -79,12 +161,14 @@ export function Sidebar() {
     togglePin,
     setArchived,
     readAt,
-    sessionFilter,
-    toggleStatusFilter,
-    toggleUnreadOnly,
-    markAllRead,
     pinnedOrder,
     reorderPinned,
+    organizeBy,
+    setOrganizeBy,
+    taskOrdering,
+    setTaskOrdering,
+    projectOrdering,
+    setProjectOrdering,
   } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: UiSession; reason: string } | null>(null);
   const archiveCancelRef = useRef<HTMLButtonElement>(null);
@@ -159,16 +243,20 @@ export function Sidebar() {
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
-  const [archivedGlobal, setArchivedGlobal] = useState(false);
-  const [ordering, setOrdering] = useState<Ordering>("updated");
+  // The old Projects-header menu's "Archived" toggle was removed along with
+  // the rest of that menu in this task (see OrganizeMenu above); there is no
+  // UI trigger for a global archived reveal right now, so this always reads
+  // false. Per-project archived reveal (the "N archived" link below) still
+  // works independently of this flag.
+  const [archivedGlobal] = useState(false);
   const [projectsMenuOpen, setProjectsMenuOpen] = useState(false);
-  const [orderingSubOpen, setOrderingSubOpen] = useState(false);
+  const [tasksMenuOpen, setTasksMenuOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
 
   const q = nav.searchQuery;
   const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
-  const projList = orderProjects(projects, ordering);
+  const projList = orderProjects(projects, projectOrdering);
   // Chat-first sessions (no project) get their own bucket above the project
   // tree — same query/archived/pin treatment as a project's session list,
   // just flat (no project to nest under).
@@ -181,8 +269,10 @@ export function Sidebar() {
       if (pin !== 0) return pin;
       return (b.lastActive ?? 0) - (a.lastActive ?? 0);
     });
-  const filter = { statuses: sessionFilter.statuses, unreadOnly: sessionFilter.unreadOnly, readAt, focusedSession };
-  const filterActive = Object.keys(sessionFilter.statuses).length > 0 || sessionFilter.unreadOnly;
+  // Temporary shim until Task 6 rewires the lists onto visibleTasks/orderTasks —
+  // sessionsForProject still expects a SessionFilterCtx, but the Sidebar no
+  // longer tracks status/unread filters itself.
+  const inertFilter = { statuses: {}, unreadOnly: false, readAt, focusedSession };
 
   const openSession = (s: UiSession) => {
     setFocused(refOf(s));
@@ -232,7 +322,30 @@ export function Sidebar() {
       {chatList.length > 0 && (
         <div className="box-border flex w-[260px] flex-col gap-px px-2.5">
           <div className="flex items-center gap-[2px] py-2 pl-2.5 pr-1.5">
-            <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Chat</span>
+            <div className="relative flex flex-1 items-center gap-[2px]">
+              <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Tasks</span>
+              <span className="relative">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className={iconBtn}
+                  title="Sort and organize"
+                  onClick={() => setTasksMenuOpen((v) => !v)}
+                >
+                  <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                </Button>
+              </span>
+              <OrganizeMenu
+                open={tasksMenuOpen}
+                onClose={() => setTasksMenuOpen(false)}
+                organizeBy={organizeBy}
+                setOrganizeBy={setOrganizeBy}
+                ordering={taskOrdering}
+                setOrdering={setTaskOrdering}
+                className="left-2.5 top-8 z-[70] w-[238px]"
+              />
+            </div>
           </div>
           {chatList.map((s) => {
             const m = statusMeta(s.status);
@@ -296,15 +409,11 @@ export function Sidebar() {
             variant="ghost"
             size="icon-xs"
             className={iconBtn}
-            title="Sort and filter"
-            onClick={() => {
-              setProjectsMenuOpen((v) => !v);
-              setOrderingSubOpen(false);
-            }}
+            title="Sort and organize"
+            onClick={() => setProjectsMenuOpen((v) => !v)}
           >
             <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
           </Button>
-          {filterActive && <span aria-hidden className="pointer-events-none absolute right-0 top-0 size-1.5 rounded-full bg-primary" />}
         </span>
         <Button
           type="button"
@@ -317,73 +426,22 @@ export function Sidebar() {
           <FolderPlus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
         </Button>
 
-        {projectsMenuOpen && (
-          <MenuPanel onClose={() => setProjectsMenuOpen(false)} className="left-2.5 top-8 z-[70] w-[238px]">
-            <MenuItem>
-              <span className="flex-1">Grouping</span>
-              <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
-                Project <ChevronRight aria-hidden size={11} strokeWidth={2} />
-              </span>
-            </MenuItem>
-            <MenuItem onClick={() => setOrderingSubOpen((v) => !v)}>
-              <span className="flex-1">Ordering</span>
-              <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
-                {ordering === "name" ? "Name" : "Updated"} <ChevronRight aria-hidden size={11} strokeWidth={2} />
-              </span>
-            </MenuItem>
-            {orderingSubOpen &&
-              (["updated", "name"] as const).map((o) => (
-                <MenuItem
-                  key={o}
-                  selected={ordering === o}
-                  onClick={() => {
-                    setOrdering(o);
-                    setOrderingSubOpen(false);
-                  }}
-                  className="py-1.5 pl-[22px] text-[12.5px]"
-                >
-                  <span className="flex-1">{o === "name" ? "Name" : "Updated"}</span>
-                </MenuItem>
-              ))}
-            <MenuSeparator />
-            <MenuSectionLabel>Status</MenuSectionLabel>
-            {(["idle", "running", "interrupted", "ended"] as const).map((st) => (
-              <MenuItem key={st} selected={!!sessionFilter.statuses[st]} onClick={() => toggleStatusFilter(st)}>
-                <span className="flex-1 capitalize">{st}</span>
-              </MenuItem>
-            ))}
-            <MenuItem selected={sessionFilter.unreadOnly} onClick={() => toggleUnreadOnly()}>
-              <span className="flex-1">Unread only</span>
-            </MenuItem>
-            <MenuItem selected={archivedGlobal} onClick={() => setArchivedGlobal((v) => !v)}>
-              <span className="flex-1">Archived</span>
-            </MenuItem>
-            <MenuSeparator />
-            <MenuItem
-              onClick={() => {
-                setExpanded(Object.fromEntries(projects.map((p) => [p.projectId, false])));
-                setProjectsMenuOpen(false);
-              }}
-            >
-              Collapse all
-            </MenuItem>
-            <MenuItem
-              onClick={() => {
-                markAllRead(sessions);
-                setProjectsMenuOpen(false);
-              }}
-            >
-              Mark all as read
-            </MenuItem>
-          </MenuPanel>
-        )}
+        <OrganizeMenu
+          open={projectsMenuOpen}
+          onClose={() => setProjectsMenuOpen(false)}
+          organizeBy={organizeBy}
+          setOrganizeBy={setOrganizeBy}
+          ordering={projectOrdering}
+          setOrdering={setProjectOrdering}
+          className="left-2.5 top-8 z-[70] w-[238px]"
+        />
       </div>
 
       {/* Projects tree */}
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
         {projList.map((p) => {
           const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter, pinnedOrder);
+          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, inertFilter, pinnedOrder);
           const archCount = archivedCount(sessions, p.projectId, archived);
           const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
           return (
@@ -416,7 +474,7 @@ export function Sidebar() {
                   type="button"
                   variant="ghost"
                   size="icon-xs"
-                  title="New session"
+                  title="New task"
                   className={`${iconBtn} hidden group-hover:flex`}
                   onClick={() => {
                     selectProject(p.projectId);

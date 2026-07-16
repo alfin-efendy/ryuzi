@@ -183,3 +183,27 @@ test("does not show an unread dot for the focused session even if unseen", () =>
   render(<Sidebar />);
   expect(screen.queryByTestId("unread-dot-s1")).toBeNull();
 });
+
+test("renders New Task nav and a Tasks section header, not the old labels", () => {
+  useStore.setState({
+    projects: [project],
+    sessions: [{ ...session, projectId: null, kind: "chat" }],
+    pendingApprovals: [],
+    focusedSession: null,
+  });
+  render(<Sidebar />);
+  expect(screen.getByRole("button", { name: "New Task" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
+  expect(screen.getByText("Tasks")).toBeTruthy();
+  expect(screen.queryByText("Chat")).toBeNull();
+});
+
+test("Organize menu switches By Project / By Task and offers Manual Order; no Status filter", () => {
+  render(<Sidebar />);
+  // open the Projects-header menu
+  fireEvent.click(screen.getAllByTitle("Sort and organize")[0]);
+  expect(screen.getByText("Organize")).toBeTruthy();
+  expect(screen.queryByText("Status")).toBeNull();
+  expect(screen.queryByText("Collapse all")).toBeNull();
+  expect(screen.queryByText("Mark all as read")).toBeNull();
+});
