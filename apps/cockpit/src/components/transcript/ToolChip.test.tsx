@@ -142,3 +142,49 @@ test("routes linked task rows to agent cards while ordinary tools retain ToolChi
   expect(screen.getByText((content) => content.includes("src/ordinary.ts"))).toBeTruthy();
   expect(screen.queryByText((content) => content.includes("src/dispatch.ts"))).toBeNull();
 });
+
+test("retains a terminal ToolChip for an unadmitted batch slot beside admitted dispatch cards", () => {
+  const runnerId = "local";
+  const sessionPk = "session-1";
+  useDelegation.setState({
+    bySession: {
+      [delegationSessionKey(runnerId, sessionPk)]: [
+        {
+          runId: "admitted-child",
+          sessionPk,
+          parentRunId: "root-1",
+          retryOf: null,
+          sourceToolCallId: "delegate-batch",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "worker",
+          executingAgentNameSnapshot: "Researcher",
+          agentKind: "main-delegate",
+          task: "Admitted work",
+          status: "running",
+          startedAt: 1,
+          finishedAt: null,
+          toolCount: 0,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: null,
+          error: null,
+        },
+      ],
+    },
+    rosterStateBySession: { [delegationSessionKey(runnerId, sessionPk)]: { status: "ready", error: null } },
+  });
+  const dispatch = {
+    ...toolItem("delegate-batch"),
+    name: "delegate_agent",
+    kind: "other",
+    toolCallId: "delegate-batch",
+    output: "one delegation was rejected",
+    dispatchFailures: [{ dispatchIndex: 1, error: "Async delegation capacity reached (1 running). Run this task synchronously." }],
+  };
+
+  render(<ActivityCluster runnerId={runnerId} sessionPk={sessionPk} live ownerRunId="root-1" items={[dispatch]} />);
+
+  expect(screen.getByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
+  expect(screen.getByText(/Async delegation capacity reached/)).toBeTruthy();
+});

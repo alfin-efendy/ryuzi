@@ -676,6 +676,9 @@ pub struct AuditRow {
 pub struct Message {
     pub session_pk: String,
     pub seq: i64,
+    /// The durable agent-run owner when this row was emitted by a run. Rows
+    /// created outside a run (for example startup notices) remain unowned.
+    pub run_id: Option<String>,
     pub role: String,       // user | assistant | system
     pub block_type: String, // text | thought | tool_call | plan | status | error
     pub payload: serde_json::Value,
@@ -787,6 +790,10 @@ pub enum CoreEvent {
     Message {
         session_pk: String,
         seq: i64,
+        /// The primary run that owns this row, when applicable. This lets
+        /// consumers resolve a tool row against its own turn rather than a
+        /// session-wide root selected by position.
+        run_id: Option<String>,
         role: String,
         block_type: String,
         payload: serde_json::Value,

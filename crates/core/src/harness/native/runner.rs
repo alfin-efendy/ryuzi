@@ -1774,12 +1774,36 @@ impl RunnerMainAgentSpawner {
         let background = request.background;
         let context = request.context.clone();
         let root_run_id = self.deps.root_run_id.clone();
+        let requested_agent_id = request.target_agent_id.clone();
+        // Reserve capacity before queueing a background child. Queueing first
+        // used to create a durable child and immediately cancel it on
+        // rejection, leaving a linked terminal card that hid the parent
+        // tool's useful capacity error.
+        let reservation = if background {
+            let cap =
+                crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await;
+            match self.deps.background.try_reserve(cap, &self.deps.session_pk) {
+                Some(reservation) => Some(reservation),
+                None => {
+                    return MainDelegationResult {
+                        run_id: String::new(),
+                        agent_id: requested_agent_id,
+                        status: SubtaskStatus::Error,
+                        report: format!(
+                            "Async delegation capacity reached ({cap} running). Run this task synchronously."
+                        ),
+                    };
+                }
+            }
+        } else {
+            None
+        };
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
                 return MainDelegationResult {
                     run_id: String::new(),
-                    agent_id: String::new(),
+                    agent_id: requested_agent_id,
                     status: SubtaskStatus::Error,
                     report: error.to_string(),
                 };
@@ -1788,24 +1812,7 @@ impl RunnerMainAgentSpawner {
         let run_id = child_run.run.run_id.clone();
         let agent_id = child_run.run.executing_agent_id.clone().unwrap_or_default();
         if background {
-            let cap =
-                crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await;
-            let Some(reservation) = self.deps.background.try_reserve(cap, &self.deps.session_pk)
-            else {
-                let _ = self
-                    .deps
-                    .delegation
-                    .cancel_child(&self.deps.session_pk, &run_id)
-                    .await;
-                return MainDelegationResult {
-                    run_id,
-                    agent_id,
-                    status: SubtaskStatus::Error,
-                    report: format!(
-                        "Async delegation capacity reached ({cap} running). Run this task synchronously."
-                    ),
-                };
-            };
+            let reservation = reservation.expect("background delegation reserved before queueing");
             let worker = Self {
                 deps: self.deps.clone(),
             };
@@ -2885,6 +2892,7 @@ fn run_message_event(deps: &RunnerDeps, message: MessageEventFields) -> CoreEven
         CoreEvent::Message {
             session_pk: deps.session_pk.clone(),
             seq: message.seq,
+            run_id: Some(deps.run_id.clone()),
             role: message.role,
             block_type: message.block_type,
             payload: message.payload,
@@ -2967,6 +2975,7 @@ async fn observe_route_selection(
             let _ = deps.events.send(CoreEvent::Message {
                 session_pk: message.session_pk,
                 seq: message.seq,
+                run_id: message.run_id,
                 role: message.role,
                 block_type: message.block_type,
                 payload: message.payload,
@@ -6181,6 +6190,75 @@ mod tests {
             .find(|row| row.tool_call_id.as_deref() == Some("delegate-background-call"))
             .expect("the background delegate_agent tool call is terminal");
         assert_eq!(tool_row.status.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_background_delegate_capacity_rejection_leaves_no_child_and_records_tool_error(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) = deps_with_executable_profile_registry(
+            dir.path(),
+            Arc::new(ScriptedLlm::new(vec![])),
+            store,
+        )
+        .await;
+        let reviewer = create_main_delegate_target(&registry, "Capacity reviewer").await;
+        deps.store
+            .set_setting(crate::domain::WriteOrigin::User, "max_concurrent_runs", "1")
+            .await
+            .unwrap();
+        let _held = deps
+            .background
+            .try_reserve(1, &deps.session_pk)
+            .expect("the test must exhaust the only background slot");
+        let input = json!({
+            "agent_id": reviewer,
+            "task": "review the async job",
+            "background": true,
+        })
+        .to_string();
+        let parent = vec![
+            tool_use_start(0, "delegate-capacity-call", "delegate_agent"),
+            input_json_delta(0, &input),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        deps.llm = Arc::new(ScriptedLlm::new(vec![parent, final_turn("handled")]));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate in background", "delegate in background"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap();
+        assert!(
+            children
+                .iter()
+                .all(|child| child.source_tool_call_id.as_deref() != Some("delegate-capacity-call")),
+            "a rejected background dispatch must not persist a cancelled linked child"
+        );
+        let tool_row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("delegate-capacity-call"))
+            .expect("the parent delegate_agent tool row is persisted");
+        assert_eq!(tool_row.status.as_deref(), Some("failed"));
+        assert!(tool_row.payload["output"]
+            .as_str()
+            .expect("tool output")
+            .contains("Async delegation capacity reached"));
     }
 
     #[tokio::test]

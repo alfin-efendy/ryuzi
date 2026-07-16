@@ -240,7 +240,29 @@ function ActivityItemRenderer({ item, live, runnerId, sessionPk, ownerRunId }: {
   if (item.type !== "tool") return <StatusChip text={item.text} />;
   const fallback = <ToolChip item={item} live={live} />;
   if (isAgentDispatchTool(item.name) && runnerId && sessionPk) {
-    return <AgentDispatchGroup runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId ?? null} item={item} fallback={fallback} />;
+    return (
+      <AgentDispatchGroup
+        runnerId={runnerId}
+        sessionPk={sessionPk}
+        ownerRunId={item.ownerRunId ?? ownerRunId ?? null}
+        item={item}
+        fallback={fallback}
+        renderAdmissionFailure={(failure) => (
+          <ToolChip
+            key={`failure-${failure.dispatchIndex}`}
+            item={{
+              ...item,
+              key: `${item.key}-dispatch-failure-${failure.dispatchIndex}`,
+              status: "failed",
+              output: failure.error,
+              summary: `Delegation ${failure.dispatchIndex + 1} admission failed`,
+              dispatchFailures: [],
+            }}
+            live={live}
+          />
+        )}
+      />
+    );
   }
   return fallback;
 }

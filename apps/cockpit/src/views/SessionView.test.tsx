@@ -318,6 +318,116 @@ test("hydrates the delegation roster on session mount and gives main transcript 
   expect(screen.getByText("Hydrated result")).toBeTruthy();
 });
 
+test("resolves each primary turn dispatch against that row's durable owner", async () => {
+  seed(LOCAL_RUNNER);
+  getChildRuns.mockResolvedValueOnce({
+    status: "ok" as const,
+    data: {
+      rootRunId: "first-primary",
+      runs: [
+        {
+          runId: "first-child",
+          sessionPk: "s1",
+          parentRunId: "first-primary",
+          retryOf: null,
+          sourceToolCallId: "first-dispatch",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "researcher",
+          executingAgentNameSnapshot: "Researcher",
+          agentKind: "subagent" as const,
+          task: "Inspect the first turn",
+          status: "completed" as const,
+          startedAt: 1,
+          finishedAt: 2,
+          toolCount: 1,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: "First turn result",
+          error: null,
+        },
+        {
+          runId: "second-child",
+          sessionPk: "s1",
+          parentRunId: "second-primary",
+          retryOf: null,
+          sourceToolCallId: "second-dispatch",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "verifier",
+          executingAgentNameSnapshot: "Verifier",
+          agentKind: "subagent" as const,
+          task: "Verify the later turn",
+          status: "completed" as const,
+          startedAt: 3,
+          finishedAt: 4,
+          toolCount: 1,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: "Second turn result",
+          error: null,
+        },
+      ],
+    },
+  });
+  useStore.setState({
+    transcripts: {
+      [sessKey(LOCAL_RUNNER, "s1")]: [
+        {
+          seq: 1,
+          role: "assistant",
+          blockType: "tool_call",
+          text: "",
+          ownerRunId: "first-primary",
+          toolCallId: "first-dispatch",
+          toolStatus: "completed",
+          toolKind: "task",
+          toolName: "task",
+          toolOutput: "first ordinary output",
+          createdAt: 1,
+          attachments: [],
+          toolPath: null,
+          toolInput: { prompt: "Inspect" },
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+          toolDispatchFailures: [],
+        },
+        {
+          seq: 2,
+          role: "assistant",
+          blockType: "tool_call",
+          text: "",
+          ownerRunId: "second-primary",
+          toolCallId: "second-dispatch",
+          toolStatus: "completed",
+          toolKind: "other",
+          toolName: "delegate_agent",
+          toolOutput: "second ordinary output",
+          createdAt: 3,
+          attachments: [],
+          toolPath: null,
+          toolInput: { task: "Verify" },
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+          toolDispatchFailures: [],
+        },
+      ],
+    },
+  });
+
+  render(<SessionView />);
+
+  expect(await screen.findByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /Open Verifier agent run/i })).toBeTruthy();
+  expect(screen.getByText("First turn result")).toBeTruthy();
+  expect(screen.getByText("Second turn result")).toBeTruthy();
+  expect(screen.queryByText("second ordinary output")).toBeNull();
+});
+
 test("only suggests each effective slash command from the catalog", async () => {
   const catalog: CommandInfo[] = [
     {

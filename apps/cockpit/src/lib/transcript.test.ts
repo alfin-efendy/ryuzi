@@ -540,6 +540,24 @@ test("groupRows tool items carry input/duration/exitCode/summary", () => {
   expect(groups[0].items[0].summary).toBeNull();
 });
 
+test("groupRows preserves each tool row's durable owner and indexed dispatch admission failures", () => {
+  const groups = groupRows([
+    row({
+      seq: 1,
+      blockType: "tool_call",
+      ownerRunId: "later-primary",
+      toolCallId: "delegate-call",
+      toolName: "delegate_agent",
+      toolKind: "other",
+      toolStatus: "completed",
+      toolDispatchFailures: [{ dispatchIndex: 1, error: "capacity reached" }],
+    }),
+  ]);
+  if (groups[0].type !== "activity" || groups[0].items[0].type !== "tool") throw new Error("expected a tool item");
+  expect(groups[0].items[0].ownerRunId).toBe("later-primary");
+  expect(groups[0].items[0].dispatchFailures).toEqual([{ dispatchIndex: 1, error: "capacity reached" }]);
+});
+
 test("toolInputSummary derives a header line from the input shape", () => {
   expect(toolInputSummary({ command: "bun test\n# second line" }, null)).toBe("$ bun test");
   expect(toolInputSummary({ pattern: "TODO|FIXME" }, null)).toBe("TODO|FIXME");

@@ -7,6 +7,8 @@ import { basename } from "./paths";
 export type Row = {
   /** DB seq; 0 for transient error events (they carry no wire seq). */
   seq: number;
+  /** Durable primary-run owner for this row; null for unowned/legacy rows. */
+  ownerRunId?: string | null;
   /** user | assistant | system */
   role: string;
   /** text | thought | tool_call | status | error (unknown values render as text) */
@@ -35,6 +37,13 @@ export type Row = {
   toolSummary: string | null;
   /** Sub-agent label when this tool ran inside a dispatched sub-agent (payload.subagent). */
   toolSubagent: string | null;
+  /** Batch dispatches rejected before child-run admission, keyed by item index. */
+  toolDispatchFailures?: DispatchAdmissionFailure[];
+};
+
+export type DispatchAdmissionFailure = {
+  dispatchIndex: number;
+  error: string;
 };
 
 export type RowAttachment = {
@@ -66,6 +75,8 @@ export type ActivityItem =
       exitCode: number | null;
       summary: string | null;
       subagent: string | null;
+      ownerRunId?: string | null;
+      dispatchFailures?: DispatchAdmissionFailure[];
     }
   | { type: "status"; key: string; text: string };
 
@@ -183,6 +194,19 @@ function toolPathOf(p: Record<string, unknown>): string | null {
   return null;
 }
 
+function dispatchAdmissionFailures(p: Record<string, unknown>): DispatchAdmissionFailure[] {
+  if (!Array.isArray(p.dispatch_failures)) return [];
+  return p.dispatch_failures.flatMap((failure) => {
+    if (!failure || typeof failure !== "object") return [];
+    const value = failure as Record<string, unknown>;
+    const dispatchIndex = value.dispatch_index;
+    const error = value.error;
+    return Number.isInteger(dispatchIndex) && (dispatchIndex as number) >= 0 && typeof error === "string" && error.trim()
+      ? [{ dispatchIndex: dispatchIndex as number, error }]
+      : [];
+  });
+}
+
 // Projects a persisted/streamed message block onto the render Row shape.
 // Unknown block types fall through as text (forward compatibility).
 export function messageToRow(
@@ -197,13 +221,15 @@ export function messageToRow(
   // Only user rows ever carry attachments, so most call sites (tool_call/
   // status/assistant rows, and every existing test of those) have no reason
   // to pass this — optional with an inert default rather than a required
-  // 9th positional arg everywhere.
+  // 9th/10th positional args everywhere.
   sessionPk = "",
+  ownerRunId: string | null = null,
 ): Row {
   const p = (payload ?? {}) as Record<string, unknown>;
   const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
   return {
     seq,
+    ownerRunId,
     role,
     blockType,
     text,
@@ -220,6 +246,7 @@ export function messageToRow(
     toolExitCode: blockType === "tool_call" && typeof p.exit_code === "number" ? p.exit_code : null,
     toolSummary: blockType === "tool_call" && typeof p.summary === "string" && p.summary ? p.summary : null,
     toolSubagent: blockType === "tool_call" && typeof p.subagent === "string" && p.subagent ? p.subagent : null,
+    toolDispatchFailures: blockType === "tool_call" ? dispatchAdmissionFailures(p) : [],
   };
 }
 
@@ -237,6 +264,7 @@ export function mergeToolRow(prev: Row, payload: unknown, status: string | null,
     toolExitCode: typeof p.exit_code === "number" ? p.exit_code : prev.toolExitCode,
     toolSummary: typeof p.summary === "string" && p.summary ? p.summary : prev.toolSummary,
     toolSubagent: typeof p.subagent === "string" && p.subagent ? p.subagent : prev.toolSubagent,
+    toolDispatchFailures: p.dispatch_failures !== undefined ? dispatchAdmissionFailures(p) : prev.toolDispatchFailures ?? [],
   };
 }
 
@@ -285,6 +313,8 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
               exitCode: row.toolExitCode,
               summary: row.toolSummary,
               subagent: row.toolSubagent,
+              ...(row.ownerRunId ? { ownerRunId: row.ownerRunId } : {}),
+              ...(row.toolDispatchFailures?.length ? { dispatchFailures: row.toolDispatchFailures } : {}),
             }
           : { type: "status", key, text: row.text };
       if (item.type === "status" && !item.text.trim()) return;

@@ -682,6 +682,7 @@ mod tests {
         CoreEvent::Message {
             session_pk: session_pk.into(),
             seq,
+            run_id: None,
             role: "assistant".into(),
             block_type: "text".into(),
             payload: serde_json::json!({ "text": text }),
@@ -696,6 +697,7 @@ mod tests {
         CoreEvent::Message {
             session_pk: session_pk.into(),
             seq: 1,
+            run_id: None,
             role: "system".into(),
             block_type: "status".into(),
             payload: serde_json::json!({ "summary": text }),

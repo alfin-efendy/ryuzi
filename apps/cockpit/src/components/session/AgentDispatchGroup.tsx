@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { AlertTriangle, Bot, RefreshCw } from "lucide-react";
 import { Button } from "@ryuzi/ui";
-import type { ActivityItem } from "@/lib/transcript";
+import type { ActivityItem, DispatchAdmissionFailure } from "@/lib/transcript";
 import { linkedDispatchSlots, projectAgentRunPreview } from "@/lib/agent-runs";
 import { useDelegation, delegationRunKey, delegationSessionKey } from "@/store-delegation";
 import { useNav } from "@/store-nav";
@@ -13,6 +13,7 @@ export type AgentDispatchGroupProps = {
   ownerRunId: string | null;
   item: Extract<ActivityItem, { type: "tool" }>;
   fallback: ReactNode;
+  renderAdmissionFailure?: (failure: DispatchAdmissionFailure) => ReactNode;
 };
 
 const idleRosterState = { status: "idle" as const, error: null };
@@ -69,7 +70,7 @@ function RetryLoad({ load, label }: { load: () => void; label: string }) {
 }
 
 /** Resolves the durable agent-run slots for one dispatch tool row. */
-export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fallback }: AgentDispatchGroupProps) {
+export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fallback, renderAdmissionFailure }: AgentDispatchGroupProps) {
   const sessionKey = delegationSessionKey(runnerId, sessionPk);
   const runs = useDelegation((state) => state.bySession[sessionKey] ?? []);
   const rosterState = useDelegation((state) => state.rosterStateBySession[sessionKey] ?? idleRosterState);
@@ -80,16 +81,20 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
   const select = useDelegation((state) => state.select);
   const setRightOpen = useNav((state) => state.setRightOpen);
   const setRightTab = useNav((state) => state.setRightTab);
-  const slots = linkedDispatchSlots(ownerRunId, item.toolCallId, runs);
+  const dispatchOwnerRunId = item.ownerRunId ?? ownerRunId;
+  const slots = linkedDispatchSlots(dispatchOwnerRunId, item.toolCallId, runs);
   const unavailable =
-    rosterState.status === "ready" ? knownUnavailableIndices(ownerRunId, item.toolCallId, seenRuns, new Set(slots.map((slot) => slot.dispatchIndex))) : [];
+    rosterState.status === "ready" ? knownUnavailableIndices(dispatchOwnerRunId, item.toolCallId, seenRuns, new Set(slots.map((slot) => slot.dispatchIndex))) : [];
+  const resolvedIndices = new Set([...slots.map((slot) => slot.dispatchIndex), ...unavailable]);
+  const failures = (item.dispatchFailures ?? []).filter((failure) => !resolvedIndices.has(failure.dispatchIndex));
   const rows = [
-    ...slots.map((slot) => ({ dispatchIndex: slot.dispatchIndex, slot })),
-    ...unavailable.map((dispatchIndex) => ({ dispatchIndex, slot: null })),
+    ...slots.map((slot) => ({ dispatchIndex: slot.dispatchIndex, kind: "slot" as const, slot })),
+    ...unavailable.map((dispatchIndex) => ({ dispatchIndex, kind: "unavailable" as const })),
+    ...failures.map((failure) => ({ dispatchIndex: failure.dispatchIndex, kind: "failure" as const, failure })),
   ].sort((a, b) => a.dispatchIndex - b.dispatchIndex);
   const reload = () => void load(runnerId, sessionPk);
 
-  if (slots.length === 0 && unavailable.length === 0) {
+  if (slots.length === 0 && unavailable.length === 0 && failures.length === 0) {
     if (rosterState.status === "idle" || rosterState.status === "loading") return <LoadingCard />;
     if (rosterState.status === "error") {
       return (
@@ -113,8 +118,16 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
           <RetryLoad load={reload} label="Retry loading agent runs" />
         </div>
       )}
-      {rows.map(({ dispatchIndex, slot }) => {
-        if (slot === null) return <UnavailableCard key={`unavailable-${dispatchIndex}`} />;
+      {rows.map((row) => {
+        if (row.kind === "unavailable") return <UnavailableCard key={`unavailable-${row.dispatchIndex}`} />;
+        if (row.kind === "failure") {
+          return renderAdmissionFailure?.(row.failure) ?? (
+            <div key={`failure-${row.dispatchIndex}`} role="status" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12px] text-destructive">
+              {row.failure.error}
+            </div>
+          );
+        }
+        const { slot } = row;
         const current = slot.current;
         const preview = projectAgentRunPreview(current, transcripts[delegationRunKey(runnerId, sessionPk, current.runId)] ?? []);
         return (

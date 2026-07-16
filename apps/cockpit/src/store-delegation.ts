@@ -63,10 +63,13 @@ function mergeHydratedMessages(fetched: Message[], live: Message[]): Message[] {
   return merged.sort((a, b) => a.seq - b.seq);
 }
 
-function eventMessage(event: Extract<CoreEvent, { kind: "agentRunMessage" }>): Message {
+type OwnedMessage = Message & { runId: string | null };
+
+function eventMessage(event: Extract<CoreEvent, { kind: "agentRunMessage" }>): OwnedMessage {
   return {
     sessionPk: event.session_pk,
     seq: event.seq,
+    runId: "run_id" in event && typeof event.run_id === "string" ? event.run_id : null,
     role: event.role,
     blockType: event.block_type,
     payload: event.payload,

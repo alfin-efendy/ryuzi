@@ -2584,6 +2584,7 @@ impl Store {
                     Ok(Message {
                         session_pk: session_pk.clone(),
                         seq,
+                        run_id: None,
                         role: "system".into(),
                         block_type: "notice".into(),
                         payload,
@@ -2629,27 +2630,13 @@ impl Store {
         let session_pk = session_pk.to_string();
         self.with_conn(move |c| -> rusqlite::Result<Vec<Message>> {
             let mut stmt = c.prepare(
-                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker \
-                 FROM messages WHERE session_pk=?1 ORDER BY seq",
+                "SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker,rm.run_id \
+                 FROM messages m \
+                 LEFT JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq \
+                 WHERE m.session_pk=?1 ORDER BY m.seq",
             )?;
             let items = stmt
-                .query_map(params![session_pk], |r| {
-                    let payload: String = r.get(4)?;
-                    Ok(Message {
-                        session_pk: r.get(0)?,
-                        seq: r.get(1)?,
-                        role: r.get(2)?,
-                        block_type: r.get(3)?,
-                        payload: serde_json::from_str(&payload).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
-                        })?,
-                        tool_call_id: r.get(5)?,
-                        status: r.get(6)?,
-                        tool_kind: r.get(7)?,
-                        created_at: r.get(8)?,
-                        speaker: r.get(9)?,
-                    })
-                })?
+                .query_map(params![session_pk], row_to_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
@@ -2664,7 +2651,7 @@ impl Store {
         self.with_conn(move |c| {
             let mut stmt = c.prepare(
                 "SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,\
-                        m.status,m.tool_kind,m.created_at,m.speaker \
+                        m.status,m.tool_kind,m.created_at,m.speaker,rm.run_id \
                  FROM messages m \
                  LEFT JOIN agent_run_messages rm \
                    ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq \
@@ -5015,7 +5002,7 @@ impl Store {
         let session_pk = session_pk.to_string();
         let run_id = run_id.to_string();
         self.with_conn(move |c| {
-            let mut stmt = c.prepare("SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker FROM messages m JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq WHERE rm.session_pk=?1 AND rm.run_id=?2 ORDER BY m.seq")?;
+            let mut stmt = c.prepare("SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker,rm.run_id FROM messages m JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq WHERE rm.session_pk=?1 AND rm.run_id=?2 ORDER BY m.seq")?;
             let rows = stmt
                 .query_map(params![session_pk, run_id], row_to_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5177,6 +5164,7 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
     Ok(Message {
         session_pk: r.get(0)?,
         seq: r.get(1)?,
+        run_id: r.get(10)?,
         role: r.get(2)?,
         block_type: r.get(3)?,
         payload: serde_json::from_str(&payload).map_err(|error| from_sql_json_error(4, error))?,
@@ -6538,6 +6526,14 @@ mod tests {
                 .map(|message| message.payload["text"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             ["unowned", "root owned"]
+        );
+        assert_eq!(
+            primary
+                .iter()
+                .map(|message| message.run_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("root")],
+            "the transcript must retain the owning primary run for every persisted row"
         );
         assert_eq!(store.list_messages("s1").await.unwrap().len(), 3);
         let child = store.list_run_messages("s1", "child").await.unwrap();

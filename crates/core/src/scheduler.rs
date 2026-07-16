@@ -1231,6 +1231,7 @@ mod tests {
                 let _ = self.events.send(CoreEvent::Message {
                     session_pk: self.session_pk.clone(),
                     seq,
+                    run_id: None,
                     role: "assistant".into(),
                     block_type: "text".into(),
                     payload: serde_json::json!({ "text": "done" }),

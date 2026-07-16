@@ -132,6 +132,7 @@ impl HarnessSession for FakeSession {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: self.session_pk.clone(),
                 seq,
+                run_id: self.isolated_target.then(|| self.run_id.clone()),
                 role: "assistant".into(),
                 block_type: "text".into(),
                 payload: serde_json::json!({ "text": "working" }),

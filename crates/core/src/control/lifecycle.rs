@@ -938,6 +938,7 @@ impl ControlPlane {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: session_pk.to_string(),
                 seq,
+                run_id: None,
                 role: "system".to_string(),
                 block_type: "status".to_string(),
                 payload,
@@ -958,6 +959,7 @@ impl ControlPlane {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: session_pk.to_string(),
                 seq,
+                run_id: None,
                 role: "system".to_string(),
                 block_type: "error".to_string(),
                 payload,
@@ -2557,6 +2559,7 @@ impl ControlPlane {
             self.emit(CoreEvent::Message {
                 session_pk: payload.parent_session_pk.clone(),
                 seq,
+                run_id: None,
                 role: "system".into(),
                 block_type: "notice".into(),
                 payload: notice_payload,

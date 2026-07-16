@@ -117,6 +117,7 @@ async fn deliver_delegation_outcome(
     cp.emit(CoreEvent::Message {
         session_pk: event.target_session_pk.clone(),
         seq,
+        run_id: Some(origin_run_id.to_string()),
         role: "system".to_string(),
         block_type: "delegation_result".to_string(),
         payload: serde_json::json!({ "text": event.payload }),
