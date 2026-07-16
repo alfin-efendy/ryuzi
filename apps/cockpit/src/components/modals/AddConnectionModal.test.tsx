@@ -123,24 +123,24 @@ test("single-member family (kiro) goes straight to its device form, no chooser s
   expect(screen.getByLabelText("Label")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Sign in with Kiro" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Import from Kiro IDE" })).toBeTruthy();
-  expect(screen.queryByLabelText("API key")).toBeNull();
+  expect(screen.queryByLabelText("API Key")).toBeNull();
 });
 
-test("anthropic family offers API key vs Claude subscription, then the chosen form", () => {
+test("anthropic family offers API Key vs Subscription, then the chosen form", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
   expect(within(group).getByRole("radio", { name: /api key/i })).toBeTruthy();
-  expect(within(group).getByRole("radio", { name: /claude subscription/i })).toBeTruthy();
-  expect(screen.getByLabelText("API key", { selector: "input" })).toBeTruthy();
-  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  expect(within(group).getByRole("radio", { name: /subscription/i })).toBeTruthy();
+  expect(screen.getByLabelText("API Key", { selector: "input" })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
   expect(screen.getByRole("button", { name: /connect with browser/i })).toBeTruthy();
-  expect(screen.queryByLabelText("API key", { selector: "input" })).toBeNull();
+  expect(screen.queryByLabelText("API Key", { selector: "input" })).toBeNull();
 });
 
 test("submitting api key for anthropic family calls addConnection with the member id", async () => {
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.change(screen.getByLabelText("API key", { selector: "input" }), { target: { value: "sk-ant-test" } });
+  fireEvent.change(screen.getByLabelText("API Key", { selector: "input" }), { target: { value: "sk-ant-test" } });
   fireEvent.click(screen.getByRole("button", { name: "Add account" }));
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic", "Anthropic", "sk-ant-test", null);
@@ -152,7 +152,7 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
   Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
-  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
   expect(connectOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic-oauth", "Claude Code");
 
@@ -168,7 +168,7 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
 test("switching auth method mid-flight clears the latched OAuth waiting state", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
-  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
   expect(connectOauth).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("button", { name: /connect with browser/i })).toBeNull();
@@ -183,7 +183,7 @@ test("single-member custom-openai family requires a base URL before it can be su
   const submit = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
   expect(submit.disabled).toBe(true);
   fireEvent.change(screen.getByLabelText("Label"), { target: { value: "Local router" } });
-  fireEvent.change(screen.getByLabelText("API key"), { target: { value: "sk-test-123" } });
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test-123" } });
   fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
   expect(submit.disabled).toBe(false);
   fireEvent.click(submit);
@@ -197,7 +197,7 @@ test("account methods are Choice Cards without category chips", () => {
   expect(screen.getAllByRole("radio").length).toBeGreaterThan(1);
   const chooser = screen.getByRole("radiogroup", { name: "Sign-in method" });
   expect(within(chooser).queryByText(/^OAuth$/)).toBeNull();
-  expect(within(chooser).getAllByText(/^API key$/)).toHaveLength(1);
+  expect(within(chooser).getAllByText(/^API Key$/)).toHaveLength(1);
   const connect = screen.getByRole("button", { name: /Add account|Connect with browser/ });
   expect(connect.closest('[data-slot="modal-footer"]')).not.toBeNull();
   expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
@@ -213,7 +213,7 @@ test("closing a pending OAuth flow ignores its late completion", async () => {
   );
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
   await act(async () => {
@@ -232,12 +232,12 @@ test("external close and reopen invalidates a pending OAuth completion", async (
   );
   const onClose = mock(() => {});
   const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
 
   view.rerender(<AddConnectionModal open={false} onClose={onClose} family="anthropic" />);
   view.rerender(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  const currentApiKey = screen.getByLabelText("API key", { selector: "input" });
+  const currentApiKey = screen.getByLabelText("API Key", { selector: "input" });
   fireEvent.change(currentApiKey, { target: { value: "current-session-key" } });
 
   await act(async () => {
@@ -258,7 +258,7 @@ test("family transition invalidates a pending OAuth completion", async () => {
   );
   const onClose = mock(() => {});
   const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
 
   view.rerender(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
@@ -283,7 +283,7 @@ test("unmount invalidates a pending OAuth completion", async () => {
   );
   const onClose = mock(() => {});
   const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
   view.unmount();
 

@@ -21,11 +21,6 @@ import { usesDeviceSignin } from "./deviceSignin";
 type DeviceStep = "form" | "waiting";
 type SignInFlow = "device" | "oauth" | "apiKey" | "free";
 
-const SUBSCRIPTION_LABELS: Record<string, string> = {
-  "anthropic-oauth": "Claude subscription",
-  "openai-oauth": "ChatGPT subscription",
-};
-
 const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
 };
@@ -42,11 +37,11 @@ function authMethodLabel(entry: CatalogEntry): string {
     case "device":
       return "Device sign-in";
     case "oauth":
-      return SUBSCRIPTION_LABELS[entry.id] ?? "Subscription";
+      return "Subscription";
     case "free":
       return "Free tier";
     case "apiKey":
-      return "API key";
+      return "API Key";
   }
 }
 
@@ -331,7 +326,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             </FormField>
             {flow === "apiKey" && (
               <>
-                <FormField label="API key">
+                <FormField label="API Key">
                   <Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-..." />
                 </FormField>
                 <FormField
