@@ -11,6 +11,14 @@ thread_local! {
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 16 * 1024;
 pub const MAX_TOOL_METADATA_ENTRIES: usize = 8;
+pub const MAX_TOOL_ERROR_FIELD_ERRORS: usize = 8;
+pub const MAX_TOOL_ERROR_CANDIDATES: usize = 8;
+const MAX_TOOL_ERROR_MESSAGE_BYTES: usize = 512;
+const MAX_TOOL_ERROR_DETAIL_STRING_BYTES: usize = 256;
+const MAX_TOOL_ERROR_DETAIL_ENTRIES: usize = 8;
+const MAX_TOOL_ERROR_DETAIL_DEPTH: usize = 3;
+const MAX_TOOL_RESULT_LABEL_BYTES: usize = 128;
+const MAX_TOOL_RESULT_CURSOR_BYTES: usize = 256;
 const MAX_TOOL_METADATA_TOKEN_BYTES: usize = 32;
 const INVALID_TOOL_METADATA_TOKEN: &str = "Tool metadata token is invalid";
 const INVALID_TOOL_METADATA_ENTRY: &str = "Tool metadata entry is invalid";
@@ -113,13 +121,52 @@ pub enum ToolErrorCategory {
     Internal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorStrategy {
+    Retry,
+    ReviseInput,
+    RequestPermission,
+    Wait,
+    ContactSupport,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFieldError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl ToolFieldError {
+    pub fn new(
+        field: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            field: truncate_utf8_bytes(&field.into(), MAX_TOOL_RESULT_LABEL_BYTES),
+            code: stable_error_code(&code.into()),
+            message: truncate_utf8_bytes(&message.into(), MAX_TOOL_ERROR_MESSAGE_BYTES),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolError {
     pub category: ToolErrorCategory,
     pub code: String,
     pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub strategy: Option<ToolErrorStrategy>,
+    #[serde(default)]
+    pub field_errors: Box<Vec<ToolFieldError>>,
+    #[serde(default)]
+    pub candidates: Box<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
+    pub details: Option<Box<Value>>,
 }
 
 impl ToolError {
@@ -130,8 +177,15 @@ impl ToolError {
     ) -> Self {
         Self {
             category,
-            code: code.into(),
-            message: message.into(),
+            code: stable_error_code(&code.into()),
+            message: truncate_utf8_bytes(&message.into(), MAX_TOOL_ERROR_MESSAGE_BYTES),
+            retryable: matches!(
+                category,
+                ToolErrorCategory::Transient | ToolErrorCategory::Timeout
+            ),
+            strategy: None,
+            field_errors: Box::default(),
+            candidates: Box::default(),
             details: None,
         }
     }
@@ -153,8 +207,244 @@ impl ToolError {
     }
 
     pub fn with_details(mut self, details: Value) -> Self {
-        self.details = Some(details);
+        self.details = Some(Box::new(details));
         self
+    }
+
+    pub fn with_strategy(mut self, strategy: ToolErrorStrategy) -> Self {
+        self.strategy = Some(strategy);
+        self
+    }
+
+    pub fn with_field_error(mut self, error: ToolFieldError) -> Self {
+        if self.field_errors.len() < MAX_TOOL_ERROR_FIELD_ERRORS {
+            self.field_errors.push(error);
+        }
+        self
+    }
+
+    pub fn with_candidate(mut self, candidate: impl Into<String>) -> Self {
+        if self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES {
+            self.candidates.push(truncate_utf8_bytes(
+                &candidate.into(),
+                MAX_TOOL_RESULT_LABEL_BYTES,
+            ));
+        }
+        self
+    }
+}
+
+impl Serialize for ToolError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let message = if self.category == ToolErrorCategory::Internal {
+            "Tool execution failed".to_string()
+        } else {
+            truncate_utf8_bytes(&self.message, MAX_TOOL_ERROR_MESSAGE_BYTES)
+        };
+        let field_errors = self
+            .field_errors
+            .iter()
+            .take(MAX_TOOL_ERROR_FIELD_ERRORS)
+            .map(|error| {
+                json!({
+                    "field": truncate_utf8_bytes(&error.field, MAX_TOOL_RESULT_LABEL_BYTES),
+                    "code": stable_error_code(&error.code),
+                    "message": truncate_utf8_bytes(&error.message, MAX_TOOL_ERROR_MESSAGE_BYTES),
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidates = self
+            .candidates
+            .iter()
+            .take(MAX_TOOL_ERROR_CANDIDATES)
+            .map(|candidate| truncate_utf8_bytes(candidate, MAX_TOOL_RESULT_LABEL_BYTES))
+            .collect::<Vec<_>>();
+        let mut stable = json!({
+            "code": stable_error_code(&self.code),
+            "category": self.category,
+            "message": message,
+            "retryable": self.retryable,
+            "strategy": self.strategy,
+            "field_errors": field_errors,
+            "candidates": candidates,
+        });
+        if let Some(details) = self.details.as_ref() {
+            stable["details"] = bounded_detail(details, 0);
+        }
+        stable.serialize(serializer)
+    }
+}
+
+fn stable_error_code(code: &str) -> String {
+    let valid = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        code.to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn bounded_detail(value: &Value, depth: usize) -> Value {
+    if depth >= MAX_TOOL_ERROR_DETAIL_DEPTH {
+        return Value::Null;
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(text) => Value::String(stable_detail_text(text)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(MAX_TOOL_ERROR_DETAIL_ENTRIES)
+                .map(|value| bounded_detail(value, depth + 1))
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            Value::Object(
+                entries
+                    .into_iter()
+                    .take(MAX_TOOL_ERROR_DETAIL_ENTRIES)
+                    .map(|(key, value)| {
+                        (
+                            truncate_utf8_bytes(key, MAX_TOOL_RESULT_LABEL_BYTES),
+                            bounded_detail(value, depth + 1),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+fn stable_detail_text(text: &str) -> String {
+    let bounded = truncate_utf8_bytes(text, MAX_TOOL_ERROR_DETAIL_STRING_BYTES);
+    let stable_token = bounded.len() <= 64
+        && !bounded.is_empty()
+        && bounded.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        });
+    if stable_token {
+        bounded
+    } else {
+        "[redacted]".to_string()
+    }
+}
+
+pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut boundary = max_bytes.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text[..boundary].to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolResultMeta {
+    pub tool: String,
+    pub trace_id: String,
+    pub duration_ms: u64,
+    pub truncated: bool,
+    pub next_cursor: Option<String>,
+    pub mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalization: Option<ToolMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<ToolMetadata>,
+}
+
+impl ToolResultMeta {
+    pub fn new(tool: impl Into<String>, trace_id: impl Into<String>, duration_ms: u64) -> Self {
+        Self {
+            tool: truncate_utf8_bytes(&tool.into(), MAX_TOOL_RESULT_LABEL_BYTES),
+            trace_id: truncate_utf8_bytes(&trace_id.into(), MAX_TOOL_RESULT_LABEL_BYTES),
+            duration_ms,
+            truncated: false,
+            next_cursor: None,
+            mutation_id: None,
+            normalization: None,
+            preflight: None,
+        }
+    }
+
+    pub fn with_next_cursor(mut self, cursor: Option<&str>) -> Self {
+        self.next_cursor =
+            cursor.map(|value| truncate_utf8_bytes(value, MAX_TOOL_RESULT_CURSOR_BYTES));
+        self
+    }
+
+    pub fn with_mutation_id(mut self, mutation_id: Option<&str>) -> Self {
+        self.mutation_id =
+            mutation_id.map(|value| truncate_utf8_bytes(value, MAX_TOOL_RESULT_LABEL_BYTES));
+        self
+    }
+
+    pub fn with_execution_metadata(
+        mut self,
+        normalization: Option<ToolMetadata>,
+        preflight: Option<ToolMetadata>,
+    ) -> Self {
+        self.normalization = normalization.filter(|metadata| !metadata.is_empty());
+        self.preflight = preflight.filter(|metadata| !metadata.is_empty());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResultEnvelope {
+    ok: bool,
+    data: Option<Value>,
+    error: Option<ToolError>,
+    meta: ToolResultMeta,
+}
+
+impl ToolResultEnvelope {
+    pub fn success(data: Value, meta: ToolResultMeta) -> Self {
+        Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+            meta,
+        }
+    }
+
+    pub fn failure(error: ToolError, meta: ToolResultMeta) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(error),
+            meta,
+        }
+    }
+}
+
+impl Serialize for ToolResultEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = match (&self.data, &self.error) {
+            (Some(data), None) if self.ok => json!({"ok": true, "data": data, "meta": self.meta}),
+            (None, Some(error)) if !self.ok => {
+                json!({"ok": false, "error": error, "meta": self.meta})
+            }
+            _ => {
+                return Err(serde::ser::Error::custom(
+                    "tool result envelope payload mismatch",
+                ))
+            }
+        };
+        value.serialize(serializer)
     }
 }
 
@@ -1113,8 +1403,9 @@ mod tests {
     use super::{
         compile_canonical_schema, compile_openai_strict_schema, explicit_open_object_schema,
         FacadePriority, NormalizedInput, PreflightMeta, ResourceScopeHint, ToolDescriptor,
-        ToolEffect, ToolErrorCategory, ToolMetadata, ToolMetadataEntry, ToolMetadataToken,
-        MAX_TOOL_METADATA_ENTRIES,
+        ToolEffect, ToolError, ToolErrorCategory, ToolErrorStrategy, ToolFieldError, ToolMetadata,
+        ToolMetadataEntry, ToolMetadataToken, ToolResultEnvelope, ToolResultMeta,
+        MAX_TOOL_ERROR_CANDIDATES, MAX_TOOL_ERROR_FIELD_ERRORS, MAX_TOOL_METADATA_ENTRIES,
     };
     use serde_json::json;
 
@@ -1678,6 +1969,83 @@ mod tests {
         assert_eq!(
             serde_json::to_value(preflight).unwrap(),
             json!({"metadata": [{"kind": "resource_count", "value": 1}]})
+        );
+    }
+
+    #[test]
+    fn tool_result_envelope_has_exactly_one_payload_branch() {
+        let meta = ToolResultMeta::new("read", "trace-123", 17);
+        let success = serde_json::to_value(ToolResultEnvelope::success(
+            json!({"text": "done"}),
+            meta.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            success,
+            json!({
+                "ok": true,
+                "data": {"text": "done"},
+                "meta": {
+                    "tool": "read",
+                    "trace_id": "trace-123",
+                    "duration_ms": 17,
+                    "truncated": false,
+                    "next_cursor": null,
+                    "mutation_id": null
+                }
+            })
+        );
+        assert!(success.get("error").is_none());
+
+        let error = ToolError::caller("invalid_input", "Input is invalid");
+        let failure = serde_json::to_value(ToolResultEnvelope::failure(error, meta)).unwrap();
+        assert_eq!(failure["ok"], false);
+        assert!(failure.get("data").is_none());
+        assert_eq!(failure["error"]["code"], "invalid_input");
+        assert_eq!(failure["error"]["category"], "caller");
+    }
+
+    #[test]
+    fn tool_error_serialization_is_stable_redacted_and_bounded() {
+        let raw = "os error 267: provider source chain bearer-secret";
+        let nested = (0..16)
+            .map(|_| json!({"value": "y".repeat(4_096)}))
+            .collect::<Vec<_>>();
+        let mut error = ToolError::internal("tool_internal_error", raw)
+            .with_strategy(ToolErrorStrategy::Retry)
+            .with_details(json!({
+                "raw": raw,
+                "safe": "x".repeat(4_096),
+                "nested": nested
+            }));
+        for index in 0..16 {
+            error = error.with_field_error(ToolFieldError::new(
+                format!("field-{index}"),
+                "invalid",
+                "invalid value",
+            ));
+            error = error.with_candidate(format!("candidate-{index}"));
+        }
+
+        let serialized = serde_json::to_value(error).unwrap();
+        let text = serialized.to_string();
+        assert_eq!(serialized["code"], "tool_internal_error");
+        assert_eq!(serialized["category"], "internal");
+        assert_eq!(serialized["retryable"], false);
+        assert_eq!(serialized["strategy"], "retry");
+        assert_eq!(
+            serialized["field_errors"].as_array().unwrap().len(),
+            MAX_TOOL_ERROR_FIELD_ERRORS
+        );
+        assert_eq!(
+            serialized["candidates"].as_array().unwrap().len(),
+            MAX_TOOL_ERROR_CANDIDATES
+        );
+        assert!(!text.contains(raw));
+        assert!(!text.contains("bearer-secret"));
+        assert!(
+            text.len() < 4_096,
+            "bounded error exceeded safe envelope size"
         );
     }
 }

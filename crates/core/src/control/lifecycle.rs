@@ -1673,6 +1673,7 @@ impl ControlPlane {
             agent_knowledge: self.agent_persistence.knowledge.clone(),
             learning_queue: self.agent_persistence.learning.clone(),
             store: self.store.clone(),
+            telemetry: self.telemetry.clone(),
             app_control,
         };
 
@@ -2511,6 +2512,7 @@ impl ControlPlane {
                 project_id: project_id.clone(),
                 perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
                 store: store.clone(),
+                telemetry: self.telemetry.clone(),
                 events: self.events.clone(),
                 approvals: self.approvals.clone(),
                 automation_events: None,

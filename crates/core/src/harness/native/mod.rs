@@ -467,6 +467,7 @@ impl Harness for NativeHarness {
                 project_id,
                 perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
                 store: ctx.store,
+                telemetry: ctx.telemetry,
                 events: ctx.events,
                 approvals: ctx.approvals,
                 automation_events: ctx.automation_events,
@@ -835,6 +836,7 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             store,
+            telemetry: Arc::new(crate::telemetry::NoopTelemetry),
             app_control: None,
         }
     }

@@ -9,18 +9,20 @@ use super::capabilities::{
 };
 use super::commands::{CommandRegistry, ResolvedCommand};
 use super::context_manager::{
-    compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
-    ContextManager,
+    compaction::CompactionOutcome, is_context_overflow, ContextConfig, ContextManager,
 };
 use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_ITERS};
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
-use super::tool_contract::ToolError;
-use super::tool_plan::{self, CompiledSessionToolPlan};
+use super::tool_contract::{
+    truncate_utf8_bytes, ToolError, ToolErrorCategory, ToolInputCtx, ToolMetadata,
+    ToolMetadataEntry, ToolResultEnvelope, ToolResultMeta,
+};
+use super::tool_plan::{self, CompiledSessionToolPlan, PlannedTool};
 use super::tools::{
     BackgroundDispatch, MainAgentSpawner, MainDelegationResult, OutputCaps, SubagentSpawner,
-    SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
+    SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolOutput, ToolRegistry,
 };
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
@@ -55,6 +57,8 @@ const TEXT_FLUSH_BYTES: usize = 120;
 /// but an external hook script is a different trust boundary than the LLM,
 /// so the observational payload still gets a hard size ceiling.
 const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
+const PERSISTED_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const TOOL_DISPLAY_SUMMARY_BYTES: usize = 240;
 
 /// Prefix of the `💾 Self-improvement review: …` notice the review fork
 /// (Phase 4 Task 9) persists into the PARENT transcript when a learning row
@@ -153,6 +157,7 @@ pub struct RunnerDeps {
     /// Per-session "don't ask again" sets, applied by the permission gate.
     pub perm_overrides: Arc<std::sync::Mutex<super::permission::SessionPermOverrides>>,
     pub store: Arc<Store>,
+    pub telemetry: Arc<dyn crate::telemetry::Telemetry>,
     pub events: broadcast::Sender<CoreEvent>,
     pub approvals: Arc<ApprovalHub>,
     /// Observational UI automation sink. It is deliberately separate from
@@ -316,9 +321,15 @@ fn is_valid_response_event(event: &MessageStreamEvent) -> bool {
 
 async fn resolve_run_tool_plan(deps: &RunnerDeps, agent: &Agent) -> anyhow::Result<RunToolPlan> {
     if let Some(plan) = tool_plan::load_plan(&deps.store, &deps.run_id).await? {
+        record_native_tool_plan_metric(
+            &deps.telemetry,
+            NativeToolsVersion::V2,
+            Some(&plan.plan.body.capability_profile),
+        );
         return Ok(RunToolPlan::FrozenV2(plan));
     }
     if deps.native_tools_version == NativeToolsVersion::V1 {
+        record_native_tool_plan_metric(&deps.telemetry, NativeToolsVersion::V1, None);
         return Ok(RunToolPlan::V1);
     }
 
@@ -344,6 +355,11 @@ async fn resolve_run_tool_plan(deps: &RunnerDeps, agent: &Agent) -> anyhow::Resu
         deps.review_tool_defs.as_deref(),
     )
     .await?;
+    record_native_tool_plan_metric(
+        &deps.telemetry,
+        NativeToolsVersion::V2,
+        Some(&plan.plan.body.capability_profile),
+    );
     Ok(RunToolPlan::CandidateV2(plan))
 }
 
@@ -1858,6 +1874,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         project_id: deps.project_id.clone(),
         perm_overrides: deps.perm_overrides.clone(),
         store: deps.store.clone(),
+        telemetry: deps.telemetry.clone(),
         events: deps.events.clone(),
         approvals: deps.approvals.clone(),
         automation_events: deps.automation_events.clone(),
@@ -2629,31 +2646,50 @@ async fn run_tool_call(
     cancel: &CancellationToken,
     run_tool_plan: &RunToolPlan,
 ) -> Value {
-    let input = t.parsed_input();
-    let tool = match run_tool_plan {
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let fallback_input = t.parsed_input();
+    let (tool, planned) = match run_tool_plan {
         RunToolPlan::V1 => {
             if t.name == LOAD_TOOLS_NAME {
                 return handle_load_tools(deps, agent, t, display).await;
             }
             let Some(tool) = deps.tools.get(&t.name) else {
                 let msg = format!("unknown tool `{}`", t.name);
-                insert_tool_row(deps, t, &input, "unknown", display.subagent()).await;
-                finish_tool_row(deps, &t.id, &msg, true).await;
-                return tool_result(&t.id, &msg, true);
+                insert_tool_row(deps, t, &fallback_input, "unknown", display.subagent()).await;
+                return complete_tool_call(
+                    deps,
+                    &t.id,
+                    ToolCompletionContext {
+                        version: NativeToolsVersion::V1,
+                        planned: None,
+                        tool_name: &t.name,
+                        tool_kind: "other",
+                        trace_id: &trace_id,
+                        duration_ms: 0,
+                        normalization: None,
+                        preflight: None,
+                    },
+                    ToolCompletionOutcome::Error {
+                        error: ToolError::precondition("tool_not_found", "Tool was not found"),
+                        legacy_text: msg,
+                    },
+                )
+                .await
+                .provider_result;
             };
-            tool
+            (tool, None)
         }
         RunToolPlan::CandidateV2(_) => {
             return reject_v2_tool_call(
                 deps,
                 t,
-                &input,
+                &fallback_input,
                 display,
                 ToolError::precondition(
                     "capability_unavailable",
                     "The V2 tool facade is not frozen",
                 ),
-                "unknown",
+                v2_completion_context(None, &t.name, "unknown", &trace_id),
             )
             .await;
         }
@@ -2662,13 +2698,13 @@ async fn run_tool_call(
                 return reject_v2_tool_call(
                     deps,
                     t,
-                    &input,
+                    &fallback_input,
                     display,
                     ToolError::precondition(
                         "tool_not_in_plan",
-                        format!("Tool `{}` is not part of this run's frozen facade", t.name),
+                        "Tool is not part of this run's frozen facade",
                     ),
-                    "unknown",
+                    v2_completion_context(None, &t.name, "unknown", &trace_id),
                 )
                 .await;
             };
@@ -2680,27 +2716,31 @@ async fn run_tool_call(
                     return reject_v2_tool_call(
                         deps,
                         t,
-                        &input,
+                        &fallback_input,
                         display,
-                        unavailable(format!(
-                            "Tool `{}` is missing from the current registry",
-                            t.name
-                        )),
-                        &planned.descriptor.kind,
+                        unavailable("Tool is missing from the current registry".to_string()),
+                        v2_completion_context(
+                            Some(planned),
+                            &t.name,
+                            &planned.descriptor.kind,
+                            &trace_id,
+                        ),
                     )
                     .await;
                 }
-                Err(error) => {
+                Err(_error) => {
                     return reject_v2_tool_call(
                         deps,
                         t,
-                        &input,
+                        &fallback_input,
                         display,
-                        unavailable(format!(
-                            "Tool `{}` is currently unavailable: {}",
-                            t.name, error.message
-                        )),
-                        &planned.descriptor.kind,
+                        unavailable("Tool is currently unavailable".to_string()),
+                        v2_completion_context(
+                            Some(planned),
+                            &t.name,
+                            &planned.descriptor.kind,
+                            &trace_id,
+                        ),
                     )
                     .await;
                 }
@@ -2713,19 +2753,25 @@ async fn run_tool_call(
                 return reject_v2_tool_call(
                     deps,
                     t,
-                    &input,
+                    &fallback_input,
                     display,
-                    unavailable(format!(
-                        "Tool `{}` no longer matches its frozen contract",
-                        t.name
-                    )),
-                    &planned.descriptor.kind,
+                    unavailable("Tool no longer matches its frozen contract".to_string()),
+                    v2_completion_context(
+                        Some(planned),
+                        &t.name,
+                        &planned.descriptor.kind,
+                        &trace_id,
+                    ),
                 )
                 .await;
             }
-            available.registered.tool.clone()
+            (available.registered.tool.clone(), Some(planned))
         }
     };
+    let version = run_tool_plan.version();
+    let tool_kind = planned
+        .map(|planned| planned.descriptor.kind.as_str())
+        .unwrap_or_else(|| tool.kind());
     // Enforce the agent's tool allow-list.
     // A normal V2 plan was already filtered against the run's agent policy at
     // compile time. Review forks intentionally advertise the parent's wider
@@ -2737,11 +2783,33 @@ async fn run_tool_call(
             "tool `{}` is not permitted for the `{}` agent",
             t.name, agent.name
         );
-        insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
-        finish_tool_row(deps, &t.id, &msg, true).await;
-        return tool_result(&t.id, &msg, true);
+        insert_tool_row(deps, t, &fallback_input, tool_kind, display.subagent()).await;
+        return complete_tool_call(
+            deps,
+            &t.id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name: &t.name,
+                tool_kind,
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    "permission_denied",
+                    "Tool is not permitted for this agent",
+                ),
+                legacy_text: msg,
+            },
+        )
+        .await
+        .provider_result;
     }
-    if insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await {
+    if insert_tool_row(deps, t, &fallback_input, tool_kind, display.subagent()).await {
         if let Err(error) = deps
             .store
             .increment_agent_run_tool_count(&deps.run_id)
@@ -2753,6 +2821,122 @@ async fn run_tool_call(
             );
         }
     }
+
+    let (input, normalization, preflight) = if version == NativeToolsVersion::V2 {
+        let input = match t.parsed_input_checked() {
+            Ok(input) => input,
+            Err(error) => {
+                return complete_tool_call(
+                    deps,
+                    &t.id,
+                    ToolCompletionContext {
+                        version,
+                        planned,
+                        tool_name: &t.name,
+                        tool_kind,
+                        trace_id: &trace_id,
+                        duration_ms: 0,
+                        normalization: None,
+                        preflight: None,
+                    },
+                    ToolCompletionOutcome::Error {
+                        legacy_text: error.message.clone(),
+                        error,
+                    },
+                )
+                .await
+                .provider_result;
+            }
+        };
+        let input_context = ToolInputCtx {
+            work_dir: &deps.work_dir,
+            attachments_dir: deps.attachments_dir.as_deref(),
+            extra_skill_dirs: &deps.extra_skill_dirs,
+        };
+        let normalized = match tool.normalize_input(&input_context, input) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                return complete_tool_call(
+                    deps,
+                    &t.id,
+                    ToolCompletionContext {
+                        version,
+                        planned,
+                        tool_name: &t.name,
+                        tool_kind,
+                        trace_id: &trace_id,
+                        duration_ms: 0,
+                        normalization: None,
+                        preflight: None,
+                    },
+                    ToolCompletionOutcome::Error {
+                        legacy_text: error.message.clone(),
+                        error,
+                    },
+                )
+                .await
+                .provider_result;
+            }
+        };
+        if normalized.normalized {
+            let mut emitted = false;
+            for entry in normalized.metadata().entries() {
+                let repair_kind = match entry {
+                    ToolMetadataEntry::Coercion(token) => match token {
+                        super::tool_contract::ToolMetadataToken::LosslessInteger => {
+                            "lossless_integer"
+                        }
+                        super::tool_contract::ToolMetadataToken::LosslessBoolean => {
+                            "lossless_boolean"
+                        }
+                        _ => "other",
+                    },
+                    ToolMetadataEntry::WorkspaceResolution(_)
+                    | ToolMetadataEntry::AttachmentResolution(_)
+                    | ToolMetadataEntry::SkillResolution(_) => "path_resolution",
+                    _ => continue,
+                };
+                record_native_tool_argument_repair(&deps.telemetry, repair_kind);
+                emitted = true;
+            }
+            if !emitted {
+                record_native_tool_argument_repair(&deps.telemetry, "json_repair");
+            }
+        }
+        let preflight = match tool.preflight(&input_context, &normalized.value).await {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                return complete_tool_call(
+                    deps,
+                    &t.id,
+                    ToolCompletionContext {
+                        version,
+                        planned,
+                        tool_name: &t.name,
+                        tool_kind,
+                        trace_id: &trace_id,
+                        duration_ms: 0,
+                        normalization: Some(normalized.metadata().clone()),
+                        preflight: None,
+                    },
+                    ToolCompletionOutcome::Error {
+                        legacy_text: error.message.clone(),
+                        error,
+                    },
+                )
+                .await
+                .provider_result;
+            }
+        };
+        let normalization = normalized.metadata().clone();
+        (
+            normalized.value,
+            Some(normalization),
+            Some(preflight.metadata().clone()),
+        )
+    } else {
+        (fallback_input, None, None)
+    };
 
     // Plugin hooks: a `tool.before` hook (script or extension) may deny the
     // call — see `hooks::fire_hook`'s combine contract.
@@ -2773,8 +2957,30 @@ async fn run_tool_call(
         let msg = hook
             .message
             .unwrap_or_else(|| "blocked by plugin hook".to_string());
-        finish_tool_row(deps, &t.id, &msg, true).await;
-        return tool_result(&t.id, &msg, true);
+        return complete_tool_call(
+            deps,
+            &t.id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name: &t.name,
+                tool_kind,
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization,
+                preflight,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    "hook_denied",
+                    "Tool call was denied by a policy hook",
+                ),
+                legacy_text: msg,
+            },
+        )
+        .await
+        .provider_result;
     }
 
     // Permission gate. Read the mode fresh so a mid-session change applies.
@@ -2803,20 +3009,51 @@ async fn run_tool_call(
             // Stopped while gated/parked: pair the tool_use with an
             // interrupted tool_result, not a user denial.
             "Interrupted by user"
-        } else if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
+        } else if perm_mode == PermMode::Plan && !matches!(tool_kind, "read") {
             "Plan mode is read-only: file edits and shell commands are disabled. \
              Propose a plan for the user to review; they can switch to Ask/Edit/Full to execute it."
         } else {
             "Denied by user"
         };
-        finish_tool_row(deps, &t.id, msg, true).await;
-        return tool_result(&t.id, msg, true);
+        let error = if cancel.is_cancelled() {
+            ToolError::new(
+                ToolErrorCategory::Cancelled,
+                "cancelled",
+                "Tool call was cancelled",
+            )
+        } else {
+            ToolError::new(
+                ToolErrorCategory::Permission,
+                "permission_denied",
+                "Tool call was denied",
+            )
+        };
+        return complete_tool_call(
+            deps,
+            &t.id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name: &t.name,
+                tool_kind,
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization,
+                preflight,
+            },
+            ToolCompletionOutcome::Error {
+                error,
+                legacy_text: msg.to_string(),
+            },
+        )
+        .await
+        .provider_result;
     }
 
     // Snapshot the worktree before a mutating tool runs, so `revert` can undo
     // it. `revert` itself must not snapshot (it would capture the change it is
     // about to undo).
-    if matches!(tool.kind(), "edit" | "execute") && t.name != "revert" {
+    if matches!(tool_kind, "edit" | "execute") && t.name != "revert" {
         if let Some(sha) = super::snapshot::take(&deps.work_dir).await {
             deps.snapshots.lock().await.push(sha);
         }
@@ -2855,44 +3092,32 @@ async fn run_tool_call(
     // Keep a copy for the `tool.after` payload below — `execute` consumes
     // `input` by value.
     let hook_input = input.clone();
-    let (tool_use_result, after_summary) = match tool.execute(&ctx, input).await {
-        Ok(mut out) => {
-            let extras = merge_display_duration(out.display.take(), elapsed_ms(started));
-            finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
-                .await;
-            let is_error = out.is_error;
-            let summary = json!({
-                "ok": !is_error,
-                "output": truncate_for_context(&out.for_model, TOOL_AFTER_OUTPUT_BYTES),
-            });
-            let result = match out.model_blocks.take() {
-                Some(mut blocks) => {
-                    blocks.push(json!({ "type": "text", "text": out.for_model }));
-                    json!({
-                        "type": "tool_result",
-                        "tool_use_id": t.id,
-                        "content": blocks,
-                        "is_error": is_error,
-                    })
-                }
-                None => tool_result(&t.id, &out.for_model, is_error),
-            };
-            (result, summary)
-        }
-        Err(e) => {
-            let msg = format!("{}: {e}", t.name);
-            let extras = merge_display_duration(None, elapsed_ms(started));
-            finish_tool_row_with_display(deps, &t.id, &msg, true, Some(extras)).await;
-            let summary = json!({
-                "ok": false,
-                "error": truncate_for_context(&msg, TOOL_AFTER_OUTPUT_BYTES),
-            });
-            (tool_result(&t.id, &msg, true), summary)
-        }
+    let execution = tool.execute(&ctx, input).await;
+    let duration_ms = elapsed_ms(started);
+    let outcome = match execution {
+        Ok(output) => ToolCompletionOutcome::Output(output),
+        Err(error) => ToolCompletionOutcome::BareError(error),
     };
+    let completed = complete_tool_call(
+        deps,
+        &t.id,
+        ToolCompletionContext {
+            version,
+            planned,
+            tool_name: &t.name,
+            tool_kind,
+            trace_id: &trace_id,
+            duration_ms,
+            normalization,
+            preflight,
+        },
+        outcome,
+    )
+    .await;
     // Observational: never gates, result ignored. Fires for both Ok and Err
     // outcomes now that the `ToolOutput` (or its error) has resolved.
-    let after_payload = json!({ "tool": t.name, "input": hook_input, "result": after_summary });
+    let after_payload =
+        json!({ "tool": t.name, "input": hook_input, "result": completed.hook_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
@@ -2906,7 +3131,7 @@ async fn run_tool_call(
         deps.session_pk.clone(),
         after_payload,
     );
-    tool_use_result
+    completed.provider_result
 }
 
 async fn reject_v2_tool_call(
@@ -2915,13 +3140,36 @@ async fn reject_v2_tool_call(
     input: &Value,
     display: &DisplayMode,
     error: ToolError,
-    kind: &str,
+    context: ToolCompletionContext<'_>,
 ) -> Value {
-    let message = serde_json::to_string(&error)
-        .unwrap_or_else(|_| format!("{}: {}", error.code, error.message));
-    insert_tool_row(deps, t, input, kind, display.subagent()).await;
-    finish_tool_row(deps, &t.id, &message, true).await;
-    tool_result(&t.id, &message, true)
+    insert_tool_row(deps, t, input, context.tool_kind, display.subagent()).await;
+    let legacy_text = format!("{}: {}", error.code, error.message);
+    complete_tool_call(
+        deps,
+        &t.id,
+        context,
+        ToolCompletionOutcome::Error { error, legacy_text },
+    )
+    .await
+    .provider_result
+}
+
+fn v2_completion_context<'a>(
+    planned: Option<&'a PlannedTool>,
+    tool_name: &'a str,
+    tool_kind: &'a str,
+    trace_id: &'a str,
+) -> ToolCompletionContext<'a> {
+    ToolCompletionContext {
+        version: NativeToolsVersion::V2,
+        planned,
+        tool_name,
+        tool_kind,
+        trace_id,
+        duration_ms: 0,
+        normalization: None,
+        preflight: None,
+    }
 }
 
 /// Handle the synthetic `load_tools` meta-call: activate the requested deferred
@@ -2940,8 +3188,7 @@ async fn handle_load_tools(
 
     let Some(activated) = deps.activated_tools.as_ref() else {
         let msg = "load_tools is not available in this session";
-        finish_tool_row(deps, &t.id, msg, true).await;
-        return tool_result(&t.id, msg, true);
+        return complete_v1_load_tools(deps, t, ToolOutput::error(msg)).await;
     };
 
     let loadable: std::collections::BTreeSet<String> = deps
@@ -2963,8 +3210,7 @@ async fn handle_load_tools(
 
     if requested.is_empty() {
         let msg = "No tool names given. Provide the exact tool names to load, taken from the load_tools description.";
-        finish_tool_row(deps, &t.id, msg, true).await;
-        return tool_result(&t.id, msg, true);
+        return complete_v1_load_tools(deps, t, ToolOutput::error(msg)).await;
     }
 
     let (mut loaded, mut unknown) = (Vec::new(), Vec::new());
@@ -3001,8 +3247,33 @@ async fn handle_load_tools(
             unknown.join(", ")
         )
     };
-    finish_tool_row(deps, &t.id, &msg, is_error).await;
-    tool_result(&t.id, &msg, is_error)
+    let output = if is_error {
+        ToolOutput::error(msg)
+    } else {
+        ToolOutput::ok(msg)
+    };
+    complete_v1_load_tools(deps, t, output).await
+}
+
+async fn complete_v1_load_tools(deps: &RunnerDeps, t: &ToolAccum, output: ToolOutput) -> Value {
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    complete_tool_call(
+        deps,
+        &t.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V1,
+            planned: None,
+            tool_name: &t.name,
+            tool_kind: "other",
+            trace_id: &trace_id,
+            duration_ms: 0,
+            normalization: None,
+            preflight: None,
+        },
+        ToolCompletionOutcome::Output(output),
+    )
+    .await
+    .provider_result
 }
 
 /// Insert the initial `tool_call` row (`{name, input}`, in_progress).
@@ -3029,12 +3300,406 @@ async fn insert_tool_row(
     .await
 }
 
-/// Patch the tool_call row with its output + terminal status, then re-emit the
-/// merged row with its ORIGINAL seq (the UI upserts by `tool_call_id`).
-async fn finish_tool_row(deps: &RunnerDeps, tool_call_id: &str, output: &str, is_error: bool) {
-    finish_tool_row_with_display(deps, tool_call_id, output, is_error, None).await;
+struct ToolCompletionContext<'a> {
+    version: NativeToolsVersion,
+    planned: Option<&'a PlannedTool>,
+    tool_name: &'a str,
+    tool_kind: &'a str,
+    trace_id: &'a str,
+    duration_ms: u64,
+    normalization: Option<ToolMetadata>,
+    preflight: Option<ToolMetadata>,
 }
 
+enum ToolCompletionOutcome {
+    Output(ToolOutput),
+    Error {
+        error: ToolError,
+        legacy_text: String,
+    },
+    BareError(anyhow::Error),
+}
+
+struct CompletedToolCall {
+    provider_result: Value,
+    hook_summary: Value,
+}
+
+async fn complete_tool_call(
+    deps: &RunnerDeps,
+    tool_call_id: &str,
+    context: ToolCompletionContext<'_>,
+    outcome: ToolCompletionOutcome,
+) -> CompletedToolCall {
+    let (legacy_text, model_blocks, display, error) = match outcome {
+        ToolCompletionOutcome::Output(output) => {
+            let error = output.is_error.then(|| {
+                output
+                    .structured_error
+                    .unwrap_or_else(|| ToolError::internal("tool_failed", "Tool execution failed"))
+            });
+            (output.for_model, output.model_blocks, output.display, error)
+        }
+        ToolCompletionOutcome::Error { error, legacy_text } => {
+            (legacy_text, None, None, Some(error))
+        }
+        ToolCompletionOutcome::BareError(source) => {
+            tracing::warn!(
+                trace_id = context.trace_id,
+                tool_family = safe_tool_family(context.tool_name, context.tool_kind),
+                "native tool handler returned an internal error"
+            );
+            let legacy_text = if context.version == NativeToolsVersion::V1 {
+                format!("{}: {source}", context.tool_name)
+            } else {
+                format!("{}: Tool execution failed", context.tool_name)
+            };
+            drop(source);
+            (
+                legacy_text,
+                None,
+                None,
+                Some(ToolError::internal(
+                    "tool_internal_error",
+                    "Tool execution failed",
+                )),
+            )
+        }
+    };
+    let is_error = error.is_some();
+    let result_limit = context
+        .planned
+        .map(|tool| usize::try_from(tool.descriptor.result_limit_bytes).unwrap_or(usize::MAX))
+        .unwrap_or(50_000);
+    let mut truncated = false;
+    let data_text = if context.version == NativeToolsVersion::V2 && !is_error {
+        let bounded = truncate_utf8_bytes(&legacy_text, result_limit);
+        truncated = bounded.len() < legacy_text.len();
+        bounded
+    } else {
+        legacy_text.clone()
+    };
+
+    let next_cursor = display
+        .as_ref()
+        .and_then(|value| value.get("next_cursor"))
+        .and_then(Value::as_str);
+    let mutation_id = display
+        .as_ref()
+        .and_then(|value| value.get("mutation_id"))
+        .and_then(Value::as_str);
+    let facade_label = context
+        .planned
+        .map(|planned| planned.canonical_name.as_str())
+        .unwrap_or(if context.version == NativeToolsVersion::V2 {
+            "unknown"
+        } else {
+            context.tool_name
+        });
+    let mut meta = ToolResultMeta::new(facade_label, context.trace_id, context.duration_ms)
+        .with_next_cursor(next_cursor)
+        .with_mutation_id(mutation_id)
+        .with_execution_metadata(context.normalization, context.preflight);
+    meta.truncated = truncated;
+
+    let model_text = if context.version == NativeToolsVersion::V2 {
+        let envelope = match error.as_ref() {
+            Some(error) => ToolResultEnvelope::failure(error.clone(), meta.clone()),
+            None => ToolResultEnvelope::success(Value::String(data_text.clone()), meta.clone()),
+        };
+        serde_json::to_string(&envelope).unwrap_or_else(|_| {
+            r#"{"ok":false,"error":{"code":"tool_internal_error","category":"internal","message":"Tool execution failed","retryable":false,"strategy":null,"field_errors":[],"candidates":[]},"meta":{"tool":"other","trace_id":"serialization","duration_ms":0,"truncated":false,"next_cursor":null,"mutation_id":null}}"#.to_string()
+        })
+    } else {
+        legacy_text.clone()
+    };
+
+    let mut display = merge_display_summary_and_duration(
+        display,
+        if is_error {
+            error
+                .as_ref()
+                .map(stable_error_message)
+                .unwrap_or_else(|| "Tool execution failed".to_string())
+        } else {
+            data_text.clone()
+        },
+        context.duration_ms,
+    );
+    if let Value::Object(fields) = &mut display {
+        if truncated {
+            fields.insert("truncated".into(), Value::Bool(true));
+        }
+    }
+    let persisted = if context.version == NativeToolsVersion::V2
+        && model_text.len() > PERSISTED_TOOL_OUTPUT_BYTES
+    {
+        let mut persisted_meta = meta.clone();
+        persisted_meta.truncated = true;
+        let envelope = match error.as_ref() {
+            Some(error) => ToolResultEnvelope::failure(error.clone(), persisted_meta),
+            None => ToolResultEnvelope::success(
+                Value::String(truncate_utf8_bytes(
+                    &data_text,
+                    PERSISTED_TOOL_OUTPUT_BYTES / 2,
+                )),
+                persisted_meta,
+            ),
+        };
+        serde_json::to_string(&envelope).unwrap_or_else(|_| {
+            r#"{"ok":false,"error":{"code":"tool_internal_error","category":"internal","message":"Tool execution failed","retryable":false,"strategy":null,"field_errors":[],"candidates":[]},"meta":{"tool":"other","trace_id":"serialization","duration_ms":0,"truncated":true,"next_cursor":null,"mutation_id":null}}"#.to_string()
+        })
+    } else if context.version == NativeToolsVersion::V1 {
+        truncate_utf8_bytes(&model_text, PERSISTED_TOOL_OUTPUT_BYTES)
+    } else {
+        model_text.clone()
+    };
+    finish_tool_row_with_display(deps, tool_call_id, &persisted, is_error, Some(display)).await;
+
+    record_native_tool_call_metrics(
+        &deps.telemetry,
+        context.tool_name,
+        context.tool_kind,
+        !is_error,
+        error.as_ref().map(|error| error.code.as_str()),
+        context.duration_ms,
+    );
+
+    let mut hook_summary = json!({
+        "ok": !is_error,
+        "output": truncate_utf8_bytes(
+            if context.version == NativeToolsVersion::V2 {
+                if let Some(error) = error.as_ref() {
+                    stable_error_message(error)
+                } else {
+                    data_text.clone()
+                }
+            } else {
+                legacy_text.clone()
+            }
+            .as_str(),
+            TOOL_AFTER_OUTPUT_BYTES,
+        ),
+    });
+    if let Some(error) = error.as_ref() {
+        hook_summary["code"] = Value::String(error.code.clone());
+        hook_summary["category"] = Value::String(error_category_label(error.category).to_string());
+    }
+
+    let provider_result = match model_blocks {
+        Some(mut blocks) => {
+            blocks.push(json!({ "type": "text", "text": model_text }));
+            json!({
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": blocks,
+                "is_error": is_error,
+            })
+        }
+        None => tool_result(tool_call_id, &model_text, is_error),
+    };
+    CompletedToolCall {
+        provider_result,
+        hook_summary,
+    }
+}
+
+fn stable_error_message(error: &ToolError) -> String {
+    if error.category == ToolErrorCategory::Internal {
+        "Tool execution failed".to_string()
+    } else {
+        truncate_utf8_bytes(&error.message, 512)
+    }
+}
+
+fn merge_display_summary_and_duration(
+    display: Option<Value>,
+    fallback_summary: String,
+    duration_ms: u64,
+) -> Value {
+    let mut fields = match display {
+        Some(Value::Object(fields)) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let summary = fields
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or(&fallback_summary);
+    fields.insert(
+        "summary".into(),
+        Value::String(truncate_utf8_bytes(summary, TOOL_DISPLAY_SUMMARY_BYTES)),
+    );
+    fields.insert("duration_ms".into(), Value::from(duration_ms));
+    Value::Object(fields)
+}
+
+pub(crate) fn record_native_tool_argument_repair(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    repair_kind: &str,
+) {
+    let repair_kind = match repair_kind {
+        "json_repair" | "lossless_integer" | "lossless_boolean" | "path_resolution" => repair_kind,
+        _ => "other",
+    };
+    telemetry.count(
+        "native.tool.argument_repair",
+        vec![("repair_kind", repair_kind.to_string())],
+    );
+}
+
+fn record_native_tool_call_metrics(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    tool_name: &str,
+    tool_kind: &str,
+    ok: bool,
+    error_code: Option<&str>,
+    duration_ms: u64,
+) {
+    let family = safe_tool_family(tool_name, tool_kind);
+    let facade = safe_tool_facade(tool_name);
+    let outcome = if ok { "success" } else { "error" };
+    let error_code = error_code.map(stable_metric_error_code).unwrap_or("none");
+    telemetry.count(
+        "native.tool.call",
+        vec![
+            ("tool_family", family.to_string()),
+            ("facade", facade.to_string()),
+            ("outcome", outcome.to_string()),
+            ("error_code", error_code.to_string()),
+        ],
+    );
+    telemetry.record(
+        "native.tool.duration_ms",
+        duration_ms as f64,
+        vec![
+            ("tool_family", family.to_string()),
+            ("outcome", outcome.to_string()),
+        ],
+    );
+}
+
+fn safe_tool_family(tool_name: &str, tool_kind: &str) -> &'static str {
+    if tool_name.starts_with("mcp__") {
+        "mcp"
+    } else if tool_name.starts_with("extension__") || tool_name.starts_with("ext__") {
+        "extension"
+    } else if !is_builtin_metric_tool(tool_name) {
+        "other"
+    } else {
+        match tool_kind {
+            "read" => "read",
+            "edit" => "edit",
+            "search" => "search",
+            "execute" => "execute",
+            "fetch" => "fetch",
+            _ => "other",
+        }
+    }
+}
+
+fn safe_tool_facade(tool_name: &str) -> &'static str {
+    if tool_name.starts_with("mcp__") {
+        "mcp"
+    } else if tool_name.starts_with("extension__") || tool_name.starts_with("ext__") {
+        "extension"
+    } else if is_builtin_metric_tool(tool_name) {
+        "builtin"
+    } else {
+        "other"
+    }
+}
+
+fn is_builtin_metric_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read"
+            | "ls"
+            | "write"
+            | "edit"
+            | "glob"
+            | "grep"
+            | "bash"
+            | "todowrite"
+            | "todoread"
+            | "webfetch"
+            | "websearch"
+            | "skill"
+            | "skill_manage"
+            | "memory"
+            | "revert"
+            | "lsp"
+            | "task"
+            | "delegate_agent"
+            | "session_search"
+            | "exitplanmode"
+            | "askuserquestion"
+            | "app_jobs"
+            | "app_projects"
+            | "clarify"
+            | LOAD_TOOLS_NAME
+    )
+}
+
+fn stable_metric_error_code(code: &str) -> &'static str {
+    match code {
+        "tool_not_found" => "tool_not_found",
+        "capability_unavailable" => "capability_unavailable",
+        "tool_not_in_plan" => "tool_not_in_plan",
+        "invalid_input" => "invalid_input",
+        "permission_denied" => "permission_denied",
+        "cancelled" => "cancelled",
+        "hook_denied" => "hook_denied",
+        "tool_internal_error" => "tool_internal_error",
+        "tool_failed" => "tool_failed",
+        _ => "other",
+    }
+}
+
+fn error_category_label(category: ToolErrorCategory) -> &'static str {
+    match category {
+        ToolErrorCategory::Caller => "caller",
+        ToolErrorCategory::Precondition => "precondition",
+        ToolErrorCategory::Conflict => "conflict",
+        ToolErrorCategory::Permission => "permission",
+        ToolErrorCategory::Transient => "transient",
+        ToolErrorCategory::Timeout => "timeout",
+        ToolErrorCategory::Cancelled => "cancelled",
+        ToolErrorCategory::Internal => "internal",
+    }
+}
+
+fn record_native_tool_plan_metric(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    version: NativeToolsVersion,
+    profile: Option<&ToolCapabilityProfile>,
+) {
+    let (interaction_mode, capability_source) = match profile {
+        Some(profile) => (
+            match profile.interaction_mode {
+                ToolInteractionMode::DirectFunctions => "direct_functions",
+                ToolInteractionMode::CodeOrchestrator => "code_orchestrator",
+                ToolInteractionMode::Hybrid => "hybrid",
+            },
+            match profile.capability_source {
+                super::capabilities::CapabilitySource::TransportDefault => "transport_default",
+                super::capabilities::CapabilitySource::ExplicitOverride => "explicit_override",
+            },
+        ),
+        None => ("legacy", "legacy"),
+    };
+    telemetry.count(
+        "native.tool.plan",
+        vec![
+            ("version", version.as_str().to_string()),
+            ("interaction_mode", interaction_mode.to_string()),
+            ("capability_source", capability_source.to_string()),
+        ],
+    );
+}
+
+/// Patch the tool_call row with its output + terminal status, then re-emit the
+/// merged row with its ORIGINAL seq (the UI upserts by `tool_call_id`).
 async fn finish_tool_row_with_display(
     deps: &RunnerDeps,
     tool_call_id: &str,
@@ -3074,20 +3739,6 @@ async fn finish_tool_row_with_display(
 /// Milliseconds elapsed since `started`, saturating into a JSON-safe u64.
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Fold the measured duration into a tool's display extras (`{"summary": …}`,
-/// `{"exit_code": …}`, …). The result is json_patch-merged into the persisted
-/// tool_call payload by [`finish_tool_row_with_display`], so `duration_ms`
-/// and the other extras survive session hydration. Non-object extras are
-/// discarded — a scalar would corrupt the payload merge.
-fn merge_display_duration(display: Option<Value>, duration_ms: u64) -> Value {
-    let mut extras = match display {
-        Some(Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    extras.insert("duration_ms".to_string(), Value::from(duration_ms));
-    Value::Object(extras)
 }
 
 /// Flush any buffered streaming text as one delta-shaped `text` row (only when
@@ -3418,6 +4069,14 @@ impl ToolAccum {
             return self.start_input.clone();
         }
         serde_json::from_str(&self.input_json).unwrap_or_else(|_| self.start_input.clone())
+    }
+
+    fn parsed_input_checked(&self) -> Result<Value, ToolError> {
+        if self.input_json.trim().is_empty() {
+            return Ok(self.start_input.clone());
+        }
+        serde_json::from_str(&self.input_json)
+            .map_err(|_| ToolError::caller("invalid_input", "Tool input is not valid JSON"))
     }
 }
 
@@ -4037,6 +4696,7 @@ mod tests {
             project_id: None,
             perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
             store,
+            telemetry: Arc::new(crate::telemetry::NoopTelemetry),
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
@@ -6248,8 +6908,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_display_duration_folds_duration_into_existing_extras() {
-        let merged = merge_display_duration(Some(json!({ "summary": "todos: 1/2 done" })), 1234);
+    fn merge_display_summary_and_duration_preserves_existing_summary() {
+        let merged = merge_display_summary_and_duration(
+            Some(json!({ "summary": "todos: 1/2 done" })),
+            "fallback".into(),
+            1234,
+        );
         assert_eq!(
             merged,
             json!({ "summary": "todos: 1/2 done", "duration_ms": 1234 })
@@ -6257,12 +6921,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_display_duration_handles_missing_or_non_object_extras() {
-        assert_eq!(merge_display_duration(None, 7), json!({ "duration_ms": 7 }));
+    fn merge_display_summary_and_duration_handles_missing_or_non_object_extras() {
+        assert_eq!(
+            merge_display_summary_and_duration(None, "done".into(), 7),
+            json!({ "summary": "done", "duration_ms": 7 })
+        );
         // A non-object display value would corrupt the json_patch — drop it.
         assert_eq!(
-            merge_display_duration(Some(json!("junk")), 7),
-            json!({ "duration_ms": 7 })
+            merge_display_summary_and_duration(Some(json!("junk")), "done".into(), 7),
+            json!({ "summary": "done", "duration_ms": 7 })
         );
     }
 
@@ -9315,5 +9982,361 @@ mod tests {
             0,
             "a cancelled worker must not write a stale completion to the rail"
         );
+    }
+
+    fn result_test_planned_tool(name: &str, limit: u64) -> tool_plan::PlannedTool {
+        let mut descriptor = ToolDescriptor::conservative(
+            name,
+            "result test",
+            json!({"type": "object", "additionalProperties": false}),
+            "read",
+        );
+        descriptor.result_limit_bytes = limit;
+        tool_plan::PlannedTool {
+            canonical_name: name.into(),
+            descriptor,
+            canonical_schema: json!({"type": "object", "additionalProperties": false}),
+            wire_schema: json!({"type": "object", "additionalProperties": false}),
+            strict: false,
+            contract_hash: "result-test-hash".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_result_truncates_utf8_data_and_preserves_cursor_images_and_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let tool = ToolAccum {
+            id: "v2-result-1".into(),
+            name: "read".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+        };
+        let input = tool.parsed_input();
+        assert!(insert_tool_row(&deps, &tool, &input, "read", None).await);
+
+        let planned = result_test_planned_tool("read", 10);
+        let output = crate::harness::native::tools::ToolOutput {
+            for_model: "éééééé".into(),
+            model_blocks: Some(vec![json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "abc"}
+            })]),
+            display: Some(json!({"exit_code": 0, "next_cursor": "cursor-2"})),
+            is_error: false,
+            structured_error: None,
+        };
+        let completed = complete_tool_call(
+            &deps,
+            &tool.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: &tool.name,
+                tool_kind: "read",
+                trace_id: "trace-v2-result",
+                duration_ms: 42,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(output),
+        )
+        .await;
+
+        let blocks = completed.provider_result["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["data"], "abc");
+        let envelope: Value = serde_json::from_str(blocks[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"], "ééééé");
+        assert_eq!(envelope["meta"]["truncated"], true);
+        assert_eq!(envelope["meta"]["next_cursor"], "cursor-2");
+        assert_eq!(envelope["meta"]["duration_ms"], 42);
+        assert!(envelope.get("error").is_none());
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some(tool.id.as_str()))
+            .unwrap();
+        assert_eq!(row.payload["exit_code"], 0);
+        assert_eq!(row.payload["next_cursor"], "cursor-2");
+        assert_eq!(row.payload["duration_ms"], 42);
+        assert!(row.payload["summary"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn v2_result_persists_large_envelopes_as_bounded_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let tool = ToolAccum {
+            id: "v2-large-result".into(),
+            name: "read".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+        };
+        assert!(insert_tool_row(&deps, &tool, &tool.parsed_input(), "read", None).await);
+        let planned = result_test_planned_tool("read", 200_000);
+        let completed = complete_tool_call(
+            &deps,
+            &tool.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: &tool.name,
+                tool_kind: "read",
+                trace_id: "trace-large",
+                duration_ms: 5,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput::ok("é".repeat(50_000))),
+        )
+        .await;
+        let provider: Value =
+            serde_json::from_str(completed.provider_result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(provider["data"].as_str().unwrap().chars().count(), 50_000);
+
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some(tool.id.as_str()))
+            .unwrap();
+        let persisted = row.payload["output"].as_str().unwrap();
+        assert!(persisted.len() < PERSISTED_TOOL_OUTPUT_BYTES);
+        let persisted: Value = serde_json::from_str(persisted).unwrap();
+        assert_eq!(persisted["ok"], true);
+        assert_eq!(persisted["meta"]["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn v2_result_keeps_v1_model_text_byte_exact_and_redacts_bare_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let telemetry_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = telemetry_lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        let plain = "legacy plain text: é";
+
+        let legacy = complete_tool_call(
+            &deps,
+            "legacy-result",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V1,
+                planned: None,
+                tool_name: "bash",
+                tool_kind: "execute",
+                trace_id: "trace-legacy",
+                duration_ms: 1,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(crate::harness::native::tools::ToolOutput::ok(plain)),
+        )
+        .await;
+        assert_eq!(legacy.provider_result["content"], plain);
+
+        let raw = "os error 267: provider source chain /secret/input.txt";
+        let error_call = ToolAccum {
+            id: "v2-error".into(),
+            name: "bash".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+        };
+        assert!(
+            insert_tool_row(
+                &deps,
+                &error_call,
+                &error_call.parsed_input(),
+                "execute",
+                None,
+            )
+            .await
+        );
+        let v2 = complete_tool_call(
+            &deps,
+            "v2-error",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&result_test_planned_tool("bash", 1_024)),
+                tool_name: "bash",
+                tool_kind: "execute",
+                trace_id: "trace-error",
+                duration_ms: 3,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::BareError(anyhow::anyhow!(raw)),
+        )
+        .await;
+        let text = v2.provider_result["content"].as_str().unwrap();
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["error"]["code"], "tool_internal_error");
+        assert_eq!(envelope["error"]["category"], "internal");
+        assert!(!text.contains(raw));
+        assert!(!text.contains("/secret/input.txt"));
+        assert_eq!(
+            v2.hook_summary,
+            json!({
+                "ok": false,
+                "code": "tool_internal_error",
+                "category": "internal",
+                "output": "Tool execution failed"
+            })
+        );
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("v2-error"))
+            .unwrap();
+        let persisted = row.payload.to_string();
+        assert!(!persisted.contains(raw));
+        assert!(!persisted.contains("/secret/input.txt"));
+        let telemetry = telemetry_lines.lock().unwrap().join("\n");
+        assert!(!telemetry.contains(raw));
+        assert!(!telemetry.contains("/secret/input.txt"));
+    }
+
+    #[tokio::test]
+    async fn v2_result_all_terminal_outcomes_use_the_same_envelope_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let planned = result_test_planned_tool("read", 1_024);
+        let outcomes = [
+            ("tool_not_found", ToolErrorCategory::Precondition),
+            ("tool_not_in_plan", ToolErrorCategory::Precondition),
+            ("invalid_input", ToolErrorCategory::Caller),
+            ("permission_denied", ToolErrorCategory::Permission),
+            ("cancelled", ToolErrorCategory::Cancelled),
+            ("hook_denied", ToolErrorCategory::Permission),
+        ];
+        for (index, (code, category)) in outcomes.into_iter().enumerate() {
+            let completed = complete_tool_call(
+                &deps,
+                &format!("outcome-{index}"),
+                ToolCompletionContext {
+                    version: NativeToolsVersion::V2,
+                    planned: Some(&planned),
+                    tool_name: "read",
+                    tool_kind: "read",
+                    trace_id: "trace-outcome",
+                    duration_ms: 0,
+                    normalization: None,
+                    preflight: None,
+                },
+                ToolCompletionOutcome::Error {
+                    error: ToolError::new(category, code, "Stable message"),
+                    legacy_text: "legacy".into(),
+                },
+            )
+            .await;
+            let envelope: Value =
+                serde_json::from_str(completed.provider_result["content"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(envelope["ok"], false, "outcome {code}");
+            assert_eq!(envelope["error"]["code"], code, "outcome {code}");
+            assert!(envelope.get("data").is_none(), "outcome {code}");
+        }
+
+        let handler = complete_tool_call(
+            &deps,
+            "outcome-handler",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-handler",
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::BareError(anyhow::anyhow!("raw provider failure")),
+        )
+        .await;
+        let handler: Value =
+            serde_json::from_str(handler.provider_result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(handler["error"]["code"], "tool_internal_error");
+
+        let success = complete_tool_call(
+            &deps,
+            "outcome-success",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-success",
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput::ok("done")),
+        )
+        .await;
+        let success: Value =
+            serde_json::from_str(success.provider_result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(success["ok"], true);
+        assert_eq!(success["data"], "done");
+        assert!(success.get("error").is_none());
+    }
+
+    #[test]
+    fn v2_result_telemetry_uses_only_fixed_low_cardinality_labels() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        let telemetry: Arc<dyn crate::telemetry::Telemetry> =
+            Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+                move |line| captured.lock().unwrap().push(line.to_string()),
+                || 0,
+            ));
+        record_native_tool_call_metrics(
+            &telemetry,
+            "mcp__secret_server__read_private_file",
+            "other",
+            false,
+            Some("dynamic_secret_error_code"),
+            123,
+        );
+        record_native_tool_argument_repair(&telemetry, "unknown_dynamic_repair");
+        record_native_tool_plan_metric(&telemetry, NativeToolsVersion::V2, Some(&direct_profile()));
+
+        let rendered = lines.lock().unwrap().join("\n");
+        assert!(rendered.contains("native.tool.call"));
+        assert!(rendered.contains("native.tool.duration_ms"));
+        assert!(rendered.contains("native.tool.argument_repair"));
+        assert!(rendered.contains("native.tool.plan"));
+        assert!(rendered.contains("\"tool_family\":\"mcp\""));
+        assert!(rendered.contains("\"facade\":\"mcp\""));
+        assert!(rendered.contains("\"error_code\":\"other\""));
+        assert!(rendered.contains("\"repair_kind\":\"other\""));
+        assert!(rendered.contains("\"version\":\"v2\""));
+        assert!(rendered.contains("\"interaction_mode\":\"direct_functions\""));
+        assert!(rendered.contains("\"capability_source\":\"transport_default\""));
+        for secret in [
+            "secret_server",
+            "read_private_file",
+            "dynamic_secret_error_code",
+            "/secret/input.txt",
+            "legacy plain text",
+            "os error 267",
+        ] {
+            assert!(!rendered.contains(secret), "telemetry leaked {secret}");
+        }
     }
 }
