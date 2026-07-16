@@ -169,6 +169,8 @@ impl DelegationRuntime {
                 session_pk: parent.session_pk,
                 parent_run_id: Some(parent.run_id),
                 retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
                 primary_agent_id: root.primary_agent_id,
                 executing_agent_id: None,
                 executing_agent_name_snapshot: request.subagent_type,
@@ -347,6 +349,8 @@ impl DelegationRuntime {
                 session_pk: previous.session_pk.clone(),
                 parent_run_id: previous.parent_run_id.clone(),
                 retry_of: Some(previous.run_id),
+                source_tool_call_id: previous.source_tool_call_id,
+                dispatch_index: previous.dispatch_index,
                 primary_agent_id: previous.primary_agent_id,
                 executing_agent_id: previous.executing_agent_id,
                 executing_agent_name_snapshot: snapshot
@@ -584,6 +588,8 @@ fn new_run(
         session_pk: session_pk.to_string(),
         parent_run_id: parent_run_id.map(str::to_string),
         retry_of: retry_of.map(str::to_string),
+        source_tool_call_id: None,
+        dispatch_index: None,
         primary_agent_id: primary_agent_id.to_string(),
         executing_agent_id: snapshot.map(|snapshot| snapshot.profile.id.clone()),
         executing_agent_name_snapshot: snapshot

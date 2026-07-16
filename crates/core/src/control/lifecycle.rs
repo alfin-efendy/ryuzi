@@ -260,6 +260,8 @@ impl ControlPlane {
             session_pk: session_pk.clone(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: identity.id.clone(),
             executing_agent_id: Some(identity.id.clone()),
             executing_agent_name_snapshot: identity.name.clone(),
