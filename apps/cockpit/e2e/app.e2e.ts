@@ -1,5 +1,21 @@
 import { expect, test } from "@playwright/test";
-import { ACCOUNT_CATALOG, ACCOUNT_CONNECTIONS, installMockIPC, mockCalls, PROVIDER_FAMILY_ROUTE_SELECTIONS } from "./mock-ipc";
+import type { AgentMention } from "../src/bindings";
+import {
+  ACCOUNT_CATALOG,
+  ACCOUNT_CONNECTIONS,
+  DELEGATE_ACTIVE_RUN,
+  DELEGATE_DONE_RUN,
+  DELEGATION_PARENT_MESSAGE,
+  DELETED_OWNER_MESSAGE,
+  DELETED_OWNER_SESSION,
+  installMockIPC,
+  LEGACY_MESSAGE,
+  LEGACY_SESSION,
+  mockCalls,
+  PROVIDER_FAMILY_ROUTE_SELECTIONS,
+  REGISTRY_WITHOUT_REVIEWER,
+  REVIEWER_CHILD_TRANSCRIPT,
+} from "./mock-ipc";
 
 test.beforeEach(async ({ page }, testInfo) => {
   const accountOverrides = testInfo.title.startsWith("accounts:")
@@ -10,11 +26,27 @@ test.beforeEach(async ({ page }, testInfo) => {
         ...(testInfo.title.includes("late quota") ? { delayed_quota: "codex-primary" } : {}),
       }
     : {};
+  const delegationOverrides = testInfo.title.startsWith("delegation:")
+    ? {
+        get_child_runs: [DELEGATE_ACTIVE_RUN, DELEGATE_DONE_RUN],
+        get_child_transcript: REVIEWER_CHILD_TRANSCRIPT,
+        list_messages: [DELEGATION_PARENT_MESSAGE],
+      }
+    : {};
+  const historyOverrides = testInfo.title.startsWith("history:")
+    ? {
+        list_agents: REGISTRY_WITHOUT_REVIEWER,
+        list_sessions: [LEGACY_SESSION, DELETED_OWNER_SESSION],
+        list_messages: [LEGACY_MESSAGE, DELETED_OWNER_MESSAGE],
+      }
+    : {};
   await installMockIPC(page, {
     ...(testInfo.title === "resolved provider and family changes are durable identity changes"
       ? { route_selections: PROVIDER_FAMILY_ROUTE_SELECTIONS }
       : {}),
     ...accountOverrides,
+    ...delegationOverrides,
+    ...historyOverrides,
   });
 });
 
@@ -271,4 +303,196 @@ test("accounts: late quota cannot repopulate an unmounted provider and reload st
   await page.reload();
   await openProvider(page, "Codex");
   await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toHaveAttribute("aria-valuenow", "20");
+});
+
+// --- Agentic journeys (Plans 3-5): agent management + start-chat, mention
+// delegation + child transcript, legacy/deleted read-only history, and the
+// Models route editor's per-target effort contract. Every substitution of a
+// stale brief string for the real UI element is called out inline.
+
+test("agents: manage a non-default agent and start a chat session for it", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Agents", { exact: true }).first().click();
+  await expect(page.getByText("Main Agent", { exact: true })).toBeVisible();
+  await expect(page.getByText("Sub Agent", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open Reviewer" }).click();
+  const tabs = page.getByTestId("agent-detail-tabs");
+  for (const label of ["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]) {
+    await expect(tabs.getByText(label, { exact: true })).toBeVisible();
+  }
+
+  // Only the action menu drives "Start chat" — no separate start button.
+  await page.getByRole("button", { name: "Actions for Reviewer" }).click();
+  await page.getByTestId("agent-actions-panel").getByRole("button", { name: "Start chat" }).click();
+  await expect(page.getByRole("heading", { name: /What should we build/ })).toBeVisible();
+
+  // Substitution: the brief's "New session primary-agent combobox contains
+  // Reviewer" doesn't exist — HomeView.tsx has no primary-agent picker at
+  // all. openAgentChat records Reviewer via nav.pendingPrimaryAgentId
+  // (store-nav.ts), consumed by choosePrimaryAgent; the only observable proof
+  // is mentions.ts's matchMentionAgents excluding the CURRENT primary from
+  // @-suggestions. With Reviewer primary, "@" now offers Ryuzi, not Reviewer.
+  // "@" alone is ambiguous with composer-context.ts's file-reference query
+  // (an empty context query is falsy, so its early-return guard doesn't
+  // fire, and mentionMenuOpen requires contextQuery === null) — a query
+  // character disambiguates, matching how a real user would type it.
+  const composer = page.getByPlaceholder("Do anything");
+  await composer.fill("@Ry");
+  await expect(page.getByRole("menu")).toContainText("Ryuzi");
+  await expect(page.getByRole("menu")).not.toContainText("Reviewer");
+
+  // Substitution: "no model/effort/permission/Orchestrate control" — none of
+  // these exist anywhere in the Home composer (models are picked per-composer
+  // via the Project/Branch pickers only; ProjectSettingsModal.tsx explicitly
+  // dropped model/effort/permission fields). Asserted directly for drift.
+  await expect(page.getByText("Orchestrate", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /model/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /effort/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /permission/i })).toHaveCount(0);
+
+  await composer.fill("kick off the review");
+  await composer.press("Enter");
+
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
+  const start = (await mockCalls(page)).find((c) => c.cmd === "start_chat_session");
+  expect(start?.args).toMatchObject({ primaryAgentId: "reviewer", turn: { text: "kick off the review" } });
+});
+
+test("delegation: mention-selected child run opens its transcript and returns to the roster", async ({ page }) => {
+  await page.goto("/");
+  const homeComposer = page.getByPlaceholder("Do anything");
+  await homeComposer.fill("investigate the flaky test");
+  await homeComposer.press("Enter");
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
+
+  // Stop the running turn so the follow-up send goes through continue_session
+  // (a running session's Enter/Send instead enqueues via ChatRequestOptions,
+  // which has no structured-mentions field — see SessionView.tsx's submit()).
+  await page.getByTitle("Stop").click();
+  await expect(page.getByTitle("Send")).toBeVisible();
+
+  // A freshly-started session's focusedSession is set directly by store.ts's
+  // start/startChat (not via the setFocused action), so hydrateTranscript
+  // never fires for it and the seeded parent message wouldn't load. Reload
+  // and reselect from the sidebar — same pattern as the existing "route
+  // switch notices" test — to force the real hydrate path.
+  await page.reload();
+  await page.getByText("Untitled session", { exact: true }).click();
+  await expect(page.getByText("Kicking off the review delegation.")).toBeVisible();
+
+  const sessionComposer = page.getByPlaceholder("Ask for follow-up changes");
+  await sessionComposer.fill("@Rev");
+  await expect(page.getByRole("menu")).toContainText("Reviewer");
+  await sessionComposer.press("Enter"); // keyboard-selects Reviewer (the only match)
+  await expect(sessionComposer).toHaveValue("@Reviewer ");
+  await page.getByTitle("Send").click();
+  await expect(page.getByTitle("Send")).toBeVisible();
+
+  // Real structured-mention shape confirmed against mentions.ts/bindings.ts's
+  // AgentMention — matches the brief's guess exactly, verified rather than
+  // assumed.
+  const expectedMention = { agentId: "reviewer", labelSnapshot: "Reviewer", startUtf16: 0, endUtf16: 9 } satisfies AgentMention;
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "continue_session")).toBe(true);
+  const delegateCall = (await mockCalls(page)).find((c) => c.cmd === "continue_session");
+  const turn = delegateCall?.args?.turn as { mentions: AgentMention[] } | undefined;
+  expect(turn?.mentions).toEqual([expectedMention]);
+  expect((await mockCalls(page)).filter((c) => c.cmd === "continue_session")).toHaveLength(1);
+
+  // Substitution: the brief's "Active/Done tabs" are section headings inside
+  // AgentRunRoster.tsx, not tabs — "Active (N)" / "Done (N)" `<h3>`s.
+  await page.getByTitle("Toggle right panel").click();
+  await page.getByTestId("right-panel-header").getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Active (1)", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Done (1)", exact: true })).toBeVisible();
+  await expect(page.getByText("Main agent", { exact: true })).toBeVisible();
+  await expect(page.getByText("Subagent", { exact: true })).toBeVisible();
+
+  await page.getByText("Reviewer", { exact: true }).click();
+  await expect(page.getByText("Reviewing the diff for regressions now.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await expect(page.getByRole("heading", { name: "Active (1)", exact: true })).toBeVisible();
+  await expect(page.getByText("Kicking off the review delegation.")).toBeVisible();
+
+  expect((await mockCalls(page)).some((c) => c.cmd === "retry_child_run")).toBe(false);
+  expect((await mockCalls(page)).some((c) => c.cmd === "cancel_child_run")).toBe(false);
+});
+
+test("history: legacy and deleted-owner sessions stay read-only", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByText("Legacy history", { exact: true }).click();
+  // Substitution: "Legacy agent" / "Deleted" labels are derived through the
+  // real access logic (lib/session-primary.ts's sessionPrimaryLabel), not
+  // fixture-only display fields — a null primaryAgentSnapshot always renders
+  // "Legacy agent" regardless of registry contents.
+  await expect(page.getByText("Legacy agent", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("This is the preserved legacy transcript.")).toBeVisible();
+  await expect(page.getByPlaceholder("Legacy sessions are read-only.")).toBeDisabled();
+  await expect(page.getByTitle("Send")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Repair agent" })).toHaveCount(0);
+  await expect(page.getByTitle("Stop")).toHaveCount(0);
+  // No per-session model/effort/permission control exists in SessionView at
+  // all (models are chosen per-composer, not stored per session) — asserted
+  // directly rather than skipped.
+  await expect(page.getByRole("combobox", { name: /model/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /effort/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /permission/i })).toHaveCount(0);
+
+  await page.getByText("Deleted owner history", { exact: true }).click();
+  // sessionPrimaryLabel renders "<name> (Deleted)" as one string when the
+  // captured owner is absent from the live registry — REGISTRY_WITHOUT_REVIEWER
+  // makes "reviewer" genuinely absent, not a fixture-only deletion flag.
+  await expect(page.getByText("Reviewer (Deleted)", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("This is the preserved reviewer transcript.")).toBeVisible();
+  await expect(
+    page.getByPlaceholder("The session’s primary agent was deleted, so this session is read-only."),
+  ).toBeDisabled();
+  await expect(page.getByTitle("Send")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Repair agent" })).toHaveCount(0);
+  await expect(page.getByTitle("Stop")).toHaveCount(0);
+
+  const calls = await mockCalls(page);
+  for (const forbidden of ["continue_session", "steer_session", "retry_child_run", "cancel_child_run"]) {
+    expect(calls.some((c) => c.cmd === forbidden)).toBe(false);
+  }
+});
+
+test("route effort: preserves an explicit override and clears it for effort-less targets", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Models", { exact: true }).first().click();
+  await page.getByRole("button", { name: "Route", exact: true }).click();
+
+  await page.getByRole("button", { name: "New route" }).click();
+  await page.getByPlaceholder("smart").fill("smart-route");
+
+  const effortCombobox = page.getByRole("combobox", { name: "Target 1 effort", exact: true });
+  await expect(effortCombobox).toBeVisible();
+  await effortCombobox.click();
+  await page.getByRole("option", { name: "High", exact: true }).click();
+  await page.getByRole("button", { name: "Save route" }).click();
+  await expect(page.getByText(/High override/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "Target 1 effort", exact: true })).toContainText("High");
+
+  const targetPicker = page.getByRole("combobox", { name: "Target 1", exact: true });
+  await targetPicker.click();
+  await expect(page.getByRole("option", { name: "model-beta", exact: true })).toBeVisible();
+  const optionTexts = await page.getByRole("option").allTextContents();
+  expect(optionTexts.length).toBeGreaterThan(0);
+  for (const text of optionTexts) {
+    expect(text).not.toMatch(/-(high|medium|xhigh|low)$/i);
+  }
+  await page.getByRole("option", { name: "model-beta", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "Target 1 effort", exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Save route" }).click();
+  await expect(page.getByText(/override/)).toHaveCount(0);
+
+  const saves = (await mockCalls(page)).filter((c) => c.cmd === "save_model_route");
+  expect(saves).toHaveLength(2);
+  const savedRoute = saves[saves.length - 1]?.args?.route as { targets: Array<{ provider: string; model: string; effort: string | null }> };
+  expect(savedRoute.targets[0]).toMatchObject({ provider: "fixture", model: "model-beta", effort: null });
 });
