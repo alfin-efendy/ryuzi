@@ -16,6 +16,24 @@ export type AgentRunPreviewModel = {
   excerpt: string | null;
 };
 
+export type AgentRunStatusPresentation = {
+  label: string;
+  tone: string;
+};
+
+const statusPresentation: Record<AgentRun["status"], AgentRunStatusPresentation> = {
+  queued: { label: "Queued", tone: "text-muted-foreground" },
+  running: { label: "Running", tone: "text-primary" },
+  completed: { label: "Completed", tone: "text-emerald-600 dark:text-emerald-400" },
+  failed: { label: "Failed", tone: "text-destructive" },
+  cancelled: { label: "Cancelled", tone: "text-muted-foreground" },
+  interrupted: { label: "Interrupted", tone: "text-amber-700 dark:text-amber-400" },
+};
+
+export function agentRunStatusPresentation(status: AgentRun["status"]): AgentRunStatusPresentation {
+  return statusPresentation[status];
+}
+
 export function dispatchSlotKey(ownerRunId: string, sourceToolCallId: string, dispatchIndex: number): string {
   return `${ownerRunId}\u0000${sourceToolCallId}\u0000${dispatchIndex}`;
 }

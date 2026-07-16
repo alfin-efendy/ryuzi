@@ -1,6 +1,6 @@
 import { ArrowLeft, Bot, Copy, RotateCw, Square, Waypoints } from "lucide-react";
 import type { AgentRun } from "@/bindings";
-import { formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
+import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
 import { messageToRow } from "@/lib/transcript";
 import { useDelegation, delegationRunKey } from "@/store-delegation";
 import { Transcript } from "@/components/transcript/Transcript";
@@ -8,24 +8,6 @@ import { Button } from "@ryuzi/ui";
 
 const activeStatuses = new Set(["queued", "running"]);
 const retryableStatuses = new Set(["failed", "cancelled", "interrupted"]);
-
-const statusTone: Record<AgentRun["status"], string> = {
-  queued: "text-muted-foreground",
-  running: "text-primary",
-  completed: "text-emerald-600 dark:text-emerald-400",
-  failed: "text-destructive",
-  cancelled: "text-muted-foreground",
-  interrupted: "text-amber-700 dark:text-amber-400",
-};
-
-const statusLabel: Record<AgentRun["status"], string> = {
-  queued: "Queued",
-  running: "Running",
-  completed: "Completed",
-  failed: "Failed",
-  cancelled: "Cancelled",
-  interrupted: "Interrupted",
-};
 
 export function AgentRunDetail({
   runnerId,
@@ -60,6 +42,7 @@ export function AgentRunDetail({
   );
   const active = activeStatuses.has(run.status);
   const duration = formatAgentRunDuration(run);
+  const status = agentRunStatusPresentation(run.status);
 
   return (
     <div className="min-h-0 flex flex-1 flex-col">
@@ -79,7 +62,7 @@ export function AgentRunDetail({
         </div>
         <div className="order-3 flex w-full flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
           <span>{kindLabel(run)}</span>
-          <span className={`font-medium ${statusTone[run.status]}`}>{statusLabel[run.status]}</span>
+          <span className={`font-medium ${status.tone}`}>{status.label}</span>
           <span>
             {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
           </span>

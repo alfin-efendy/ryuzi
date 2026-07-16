@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { AgentRun, Message } from "../bindings";
-import { linkedDispatchSlots, projectAgentRunPreview } from "./agent-runs";
+import { agentRunStatusPresentation, linkedDispatchSlots, projectAgentRunPreview } from "./agent-runs";
 
 function run(overrides: Partial<AgentRun> = {}): AgentRun {
   return {
@@ -42,6 +42,15 @@ function message(overrides: Partial<Message> = {}): Message {
     ...overrides,
   };
 }
+
+test("presents every agent-run status with its shared label and tone", () => {
+  expect(agentRunStatusPresentation("queued")).toEqual({ label: "Queued", tone: "text-muted-foreground" });
+  expect(agentRunStatusPresentation("running")).toEqual({ label: "Running", tone: "text-primary" });
+  expect(agentRunStatusPresentation("completed")).toEqual({ label: "Completed", tone: "text-emerald-600 dark:text-emerald-400" });
+  expect(agentRunStatusPresentation("failed")).toEqual({ label: "Failed", tone: "text-destructive" });
+  expect(agentRunStatusPresentation("cancelled")).toEqual({ label: "Cancelled", tone: "text-muted-foreground" });
+  expect(agentRunStatusPresentation("interrupted")).toEqual({ label: "Interrupted", tone: "text-amber-700 dark:text-amber-400" });
+});
 
 test("links dispatch slots only to the matching owner and tool call", () => {
   const runs = [

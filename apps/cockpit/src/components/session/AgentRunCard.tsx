@@ -1,7 +1,7 @@
 import { Bot, CircleAlert, Clock3, Wrench } from "lucide-react";
 import { Button } from "@ryuzi/ui";
 import type { AgentRun } from "@/bindings";
-import { formatAgentRunDuration, kindLabel, type AgentRunPreviewModel } from "@/lib/agent-runs";
+import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel, type AgentRunPreviewModel } from "@/lib/agent-runs";
 import { AgentRunPreview } from "./AgentRunPreview";
 
 export type AgentRunCardProps = {
@@ -10,24 +10,6 @@ export type AgentRunCardProps = {
   preview: AgentRunPreviewModel;
   selected: boolean;
   onSelect: () => void;
-};
-
-const statusTone: Record<AgentRun["status"], string> = {
-  queued: "text-muted-foreground",
-  running: "text-primary",
-  completed: "text-emerald-600 dark:text-emerald-400",
-  failed: "text-destructive",
-  cancelled: "text-muted-foreground",
-  interrupted: "text-amber-700 dark:text-amber-400",
-};
-
-const statusLabel: Record<AgentRun["status"], string> = {
-  queued: "Queued",
-  running: "Running",
-  completed: "Completed",
-  failed: "Failed",
-  cancelled: "Cancelled",
-  interrupted: "Interrupted",
 };
 
 function terminalFallback(run: AgentRun): string | null {
@@ -47,7 +29,7 @@ export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }
     run.resolvedModel,
     run.resolvedEffort,
   ].filter((value): value is string => Boolean(value));
-  const status = statusLabel[run.status];
+  const status = agentRunStatusPresentation(run.status);
 
   return (
     <Button
@@ -72,8 +54,8 @@ export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }
           <span className="rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground">{kindLabel(run)}</span>
           {attemptNumber > 1 && <span className="rounded border border-border px-1.5 py-px text-[10.5px] text-muted-foreground">Retry {attemptNumber}</span>}
         </span>
-        <span aria-live="polite" className={`mt-1 block text-[11px] font-medium ${statusTone[run.status]}`}>
-          {status}
+        <span aria-live="polite" className={`mt-1 block text-[11px] font-medium ${status.tone}`}>
+          {status.label}
         </span>
         <span className="mt-1 block line-clamp-2 text-[12px] leading-relaxed text-foreground">{preview.task}</span>
         <span className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
