@@ -10,7 +10,7 @@ const listSelectableModels = mock(() => Promise.resolve({ status: "ok" as const,
 const listAgents = mock(() =>
   Promise.resolve({
     status: "ok" as const,
-    data: { agents: [], defaultAgentId: "", recovery: [], subagentModel: { kind: "route" as const, route: "smart" } },
+    data: { agents: [], defaultAgentId: "", recovery: [], subagentModel: { kind: "route" as const, route: "free" } },
   }),
 );
 // refreshModelConfiguration() (fired after every successful account mutation)

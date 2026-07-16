@@ -143,7 +143,7 @@ const catalog: CatalogEntry[] = [
 const routes: ModelRouteInfo[] = [
   {
     id: "r1",
-    name: "smart",
+    name: "free",
     enabled: true,
     strategy: "fallback",
     targets: [{ provider: "openai", model: "gpt-4.1", effort: null }],
@@ -232,7 +232,7 @@ mock.module("@/bindings", () => ({
         },
       }),
     listAgents: () =>
-      Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "smart" } } }),
+      Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "free" } } }),
     listSelectableModels: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
@@ -637,7 +637,7 @@ test("Route tab lists model route aliases and their ordered targets", async () =
 
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
 
-  expect(await screen.findByText("smart")).toBeTruthy();
+  expect(await screen.findByText("free")).toBeTruthy();
   expect(screen.getByText("By order")).toBeTruthy();
   expect(screen.getByText("OpenAI / gpt-4.1")).toBeTruthy();
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
@@ -808,7 +808,7 @@ test("route form saves targets as {provider, model} scoped to the family, not th
 
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
-  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "combo" } });
+  fireEvent.change(screen.getByPlaceholderText("free"), { target: { value: "combo" } });
   fireEvent.click(screen.getByRole("button", { name: "Save route" }));
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
@@ -891,7 +891,7 @@ test("route target adapter round-trips a slash-containing model id (cloudflare-a
 
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
-  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "cf-route" } });
+  fireEvent.change(screen.getByPlaceholderText("free"), { target: { value: "cf-route" } });
 
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
   fireEvent.click(await screen.findByRole("option", { name: "@cf/meta/llama-3.1-8b-instruct" }));

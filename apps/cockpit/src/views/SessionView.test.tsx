@@ -176,7 +176,7 @@ function primary(id: string, executable = true): AgentSummaryInfo {
     name: "Renamed profile",
     description: "",
     avatarColor: "blue",
-    model: { kind: "route", route: "smart" },
+    model: { kind: "route", route: "free" },
     permissionMode: "ask",
     skillCount: 0,
     toolCount: 0,
@@ -196,7 +196,7 @@ function seed(runnerId: string, sessionOverrides: Partial<Session> = {}, agents:
     pendingApprovals: [],
   });
   useAgents.setState({
-    registry: { agents, defaultAgentId: agents[0]?.id ?? "none", recovery: [], subagentModel: { kind: "route", route: "fast" } },
+    registry: { agents, defaultAgentId: agents[0]?.id ?? "none", recovery: [], subagentModel: { kind: "route", route: "free" } },
   });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ loaded: true });

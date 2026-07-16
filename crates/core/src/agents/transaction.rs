@@ -797,7 +797,7 @@ mod tests {
     fn image(name: &str) -> RegistryDiskImage {
         RegistryDiskImage {
             index_yaml: "schema_version: 1\norder: [ryuzi]\ndefault_agent_id: ryuzi\n".into(),
-            subagents_yaml: "schema_version: 1\nmodel: { route: smart }\n".into(),
+            subagents_yaml: "schema_version: 1\nmodel: { route: free }\n".into(),
             agents: IndexMap::from([("ryuzi".into(), format!("name: {name}\n"))]),
             deleted_agent_ids: Vec::new(),
         }

@@ -340,7 +340,7 @@ mod tests {
                     color: "blue".into(),
                 },
                 model: crate::agents::types::AgentModel::Route {
-                    route: "smart".into(),
+                    route: "free".into(),
                 },
                 permissions: crate::agents::types::AgentPermissions {
                     mode: PermMode::Default,
@@ -526,7 +526,7 @@ mod tests {
                     color: "blue".into(),
                 },
                 model: crate::agents::types::AgentModel::Route {
-                    route: "smart".into(),
+                    route: "free".into(),
                 },
                 permissions: crate::agents::types::AgentPermissions {
                     mode: PermMode::Default,

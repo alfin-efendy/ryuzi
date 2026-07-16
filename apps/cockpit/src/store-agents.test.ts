@@ -28,7 +28,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "#7C5CFF",
-    model: route("smart"),
+    model: route("free"),
     permissionMode: "ask",
     skillCount: 0,
     toolCount: 0,
@@ -48,7 +48,7 @@ function registry(): AgentRegistryInfo {
     agents: [ryuziSummary(), reviewerSummary()],
     defaultAgentId: "ryuzi",
     recovery: [],
-    subagentModel: route("fast"),
+    subagentModel: route("free"),
   };
 }
 
@@ -73,7 +73,7 @@ function reviewerInput(): AgentMutationInfo {
     name: "Reviewer",
     description: "",
     avatarColor: "#7C5CFF",
-    model: route("smart"),
+    model: route("free"),
     permissionMode: "ask",
     permissionRules: [],
     skills: [],
@@ -134,7 +134,7 @@ const resetCommandMocks = () => {
   });
   updateSubagentModel.mockImplementation(async (_r, model) => ok({ ...registry(), subagentModel: model }));
   listAgentSessions.mockImplementation(async () => ok([]));
-  listSelectableModels.mockImplementation(async () => ok([selectable("smart"), selectable("fast")]));
+  listSelectableModels.mockImplementation(async () => ok([selectable("free"), selectable("free-2")]));
 };
 
 const { useAgents } = await import("./store-agents");
@@ -213,7 +213,7 @@ test("load hydrates registry and selected detail in parallel", async () => {
   expect(getAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer");
   expect(useAgents.getState().registry).toEqual(registry());
   expect(useAgents.getState().detail?.summary.id).toBe("reviewer");
-  expect(useAgents.getState().models.map((m) => m.requestValue)).toEqual(["smart", "fast"]);
+  expect(useAgents.getState().models.map((m) => m.requestValue)).toEqual(["free", "free-2"]);
   expect(useAgents.getState().loaded).toBe(true);
   expect(useAgents.getState().loading).toBe(false);
 });
@@ -456,7 +456,7 @@ test("detail reads do not suppress subagent rollback", async () => {
   updateSubagentModel.mockReturnValueOnce(failedReadResult.promise);
   useAgents.setState({ registry: registry(), detail: reviewerDetail(), loaded: true });
 
-  const firstUpdate = useAgents.getState().updateSubagentModel(route("smart"));
+  const firstUpdate = useAgents.getState().updateSubagentModel(route("free"));
   await Promise.resolve();
   getAgent.mockResolvedValueOnce(err("detail unavailable"));
   await useAgents.getState().loadDetail("reviewer");
@@ -466,7 +466,7 @@ test("detail reads do not suppress subagent rollback", async () => {
 
   const successfulReadResult = deferred<Result<AgentRegistryInfo, CmdError>>();
   updateSubagentModel.mockReturnValueOnce(successfulReadResult.promise);
-  const secondUpdate = useAgents.getState().updateSubagentModel(route("smart"));
+  const secondUpdate = useAgents.getState().updateSubagentModel(route("free"));
   await Promise.resolve();
   const detailTruth = detailOf(summary("reviewer", "Detail truth"));
   getAgent.mockResolvedValueOnce(ok(detailTruth));
@@ -497,7 +497,7 @@ test("successful registry reads survive failed default and subagent mutations wh
 
   const subagentResult = deferred<Result<AgentRegistryInfo, CmdError>>();
   updateSubagentModel.mockReturnValueOnce(subagentResult.promise);
-  const updatingSubagent = useAgents.getState().updateSubagentModel(route("smart"));
+  const updatingSubagent = useAgents.getState().updateSubagentModel(route("free"));
   await Promise.resolve();
   const subagentRegistryTruth = { ...registry(), defaultAgentId: "reviewer" };
   listAgents.mockResolvedValueOnce(ok(subagentRegistryTruth));
@@ -578,7 +578,7 @@ test("a read begun during a failed delete remains authoritative", async () => {
   const deleting = useAgents.getState().remove("reviewer");
   await Promise.resolve();
 
-  const readRegistry = { ...registry(), subagentModel: route("smart") };
+  const readRegistry = { ...registry(), subagentModel: route("free") };
   listAgents.mockResolvedValueOnce(ok(readRegistry));
   const reading = useAgents.getState().load();
   await reading;
@@ -736,11 +736,11 @@ test("failed setDefault restores the previous default", async () => {
 
 test("updateSubagentModel commits on ok and rolls back on error", async () => {
   useAgents.setState({ registry: registry(), loaded: true });
-  expect(await useAgents.getState().updateSubagentModel(route("smart"))).toBe(true);
-  expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, route("smart"));
-  expect(useAgents.getState().registry?.subagentModel).toEqual(route("smart"));
+  expect(await useAgents.getState().updateSubagentModel(route("free"))).toBe(true);
+  expect(updateSubagentModel).toHaveBeenCalledWith(LOCAL_RUNNER, route("free"));
+  expect(useAgents.getState().registry?.subagentModel).toEqual(route("free"));
 
   updateSubagentModel.mockResolvedValueOnce(err("unknown route"));
   expect(await useAgents.getState().updateSubagentModel(route("bogus"))).toBe(false);
-  expect(useAgents.getState().registry?.subagentModel).toEqual(route("smart"));
+  expect(useAgents.getState().registry?.subagentModel).toEqual(route("free"));
 });

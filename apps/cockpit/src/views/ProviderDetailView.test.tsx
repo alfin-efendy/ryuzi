@@ -47,7 +47,7 @@ test("account reconnect is redirect for browser OAuth, device for device sign-in
 test("provider_model_default_selector_clears_and_reports_varied_defaults", () => {
   const metadata: SelectableModelInfo = {
     kind: "namedRoute",
-    requestValue: "smart",
+    requestValue: "free",
     displayName: "Smart",
     preferenceKey: { family: "openai", model: "gpt-5" },
     supported: [{ value: "high", label: "High", description: "Deep reasoning" }],

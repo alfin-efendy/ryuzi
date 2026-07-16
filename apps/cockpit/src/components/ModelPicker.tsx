@@ -9,7 +9,7 @@ import { NATIVE_AGENT } from "@/constants";
 import { StatusDot } from "@/components/common/bits";
 
 type ModelPickerProps = {
-  /** Raw runtime/model id ("smart", "anthropic/claude-…") or a sentinel from `leading`. */
+  /** Raw runtime/model id ("free", "anthropic/claude-…") or a sentinel from `leading`. */
   value: string;
   onValueChange: (v: string) => void;
   /** Raw model ids; grouped by provider family via groupModelOptions. */

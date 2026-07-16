@@ -211,11 +211,10 @@ pub(crate) mod tests_support {
         }
     }
 
-    /// Like `state()`, but with the `smart` and `fast` model routes seeded
-    /// before agent persistence bootstraps, so the default Ryuzi profile
-    /// (route `smart`) and the subagent config (route `fast`) validate as
-    /// executable — required by registry mutations, which re-validate the
-    /// whole candidate registry.
+    /// Like `state()`, but with the `free` model route seeded before agent
+    /// persistence bootstraps, so the default Ryuzi profile and the subagent
+    /// config (both route `free`) validate as executable — required by
+    /// registry mutations, which re-validate the whole candidate registry.
     pub(crate) async fn state_with_agents() -> ApiState {
         state_with_agents_and_registries(crate::plugins::Registries::new()).await
     }
@@ -235,26 +234,24 @@ pub(crate) mod tests_support {
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
-        for name in ["smart", "fast"] {
-            routes::save_model_route(
-                &store,
-                ModelRouteInfo {
-                    id: String::new(),
-                    name: name.into(),
-                    enabled: true,
-                    strategy: ModelRouteStrategy::Fallback,
-                    targets: vec![ModelRouteTarget {
-                        provider: "anthropic".into(),
-                        model: "claude-opus-4-8".into(),
-                        effort: None,
-                    }],
-                    created_at: 0,
-                    updated_at: 0,
-                },
-            )
-            .await
-            .unwrap();
-        }
+        routes::save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: String::new(),
+                name: "free".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-opus-4-8".into(),
+                    effort: None,
+                }],
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
         let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
             .await
             .unwrap();

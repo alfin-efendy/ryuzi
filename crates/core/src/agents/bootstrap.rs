@@ -142,7 +142,7 @@ pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
             color: "blue".into(),
         },
         model: AgentModel::Route {
-            route: "smart".into(),
+            route: "free".into(),
         },
         permissions: AgentPermissions {
             mode: crate::PermMode::Default,
@@ -166,7 +166,7 @@ pub fn default_subagent_config() -> SubagentConfig {
     SubagentConfig {
         schema_version: AGENT_SCHEMA_VERSION,
         model: AgentModel::Route {
-            route: "fast".into(),
+            route: "free".into(),
         },
     }
 }
@@ -221,9 +221,7 @@ pub(crate) async fn ensure_default_route(store: &Store, name: &str) -> anyhow::R
 }
 
 pub(crate) async fn ensure_default_routes(store: &Store) -> anyhow::Result<()> {
-    for name in ["smart", "fast"] {
-        ensure_default_route(store, name).await?;
-    }
+    ensure_default_route(store, "free").await?;
     Ok(())
 }
 
@@ -584,26 +582,24 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let db = tempfile::NamedTempFile::new().unwrap();
             let store = Arc::new(Store::open(db.path()).await.unwrap());
-            for name in ["smart", "fast"] {
-                routes::save_model_route(
-                    &store,
-                    ModelRouteInfo {
-                        id: String::new(),
-                        name: name.into(),
-                        enabled: true,
-                        strategy: ModelRouteStrategy::Fallback,
-                        targets: vec![ModelRouteTarget {
-                            provider: "anthropic".into(),
-                            model: "claude-opus-4-8".into(),
-                            effort: None,
-                        }],
-                        created_at: 0,
-                        updated_at: 0,
-                    },
-                )
-                .await
-                .unwrap();
-            }
+            routes::save_model_route(
+                &store,
+                ModelRouteInfo {
+                    id: String::new(),
+                    name: "free".into(),
+                    enabled: true,
+                    strategy: ModelRouteStrategy::Fallback,
+                    targets: vec![ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "claude-opus-4-8".into(),
+                        effort: None,
+                    }],
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .await
+            .unwrap();
             let failpoint = BootstrapFailpoint::for_root(root.path());
             Self {
                 root,
@@ -657,7 +653,7 @@ mod tests {
             );
             fixture.write_raw(
                 "agents/subagents.yaml",
-                "schema_version: 1\nmodel: { route: fast }\n",
+                "schema_version: 1\nmodel: { route: free }\n",
             );
             fixture
         }
@@ -747,7 +743,7 @@ mod tests {
 
     fn profile_yaml(id: &str, name: &str) -> String {
         format!(
-            "schema_version: 1\nid: {id}\nname: {name}\ndescription: Test agent.\navatar: {{ color: violet }}\nmodel: {{ route: smart }}\npermissions: {{ mode: ask, rules: [] }}\nskills: {{ enabled: [] }}\ntools: {{ native: [], plugins: [], apps: [] }}\nloop: {{ max_turns: 50, max_tool_rounds: 100 }}\n"
+            "schema_version: 1\nid: {id}\nname: {name}\ndescription: Test agent.\navatar: {{ color: violet }}\nmodel: {{ route: free }}\npermissions: {{ mode: ask, rules: [] }}\nskills: {{ enabled: [] }}\ntools: {{ native: [], plugins: [], apps: [] }}\nloop: {{ max_turns: 50, max_tool_rounds: 100 }}\n"
         )
     }
 
@@ -756,7 +752,7 @@ mod tests {
         let fixture = BootstrapFixture::legacy().await;
         fixture
             .store
-            .set_setting_raw("agent_model", "smart")
+            .set_setting_raw("agent_model", "free")
             .await
             .unwrap();
         fixture
@@ -805,7 +801,7 @@ mod tests {
         let fixture = BootstrapFixture::legacy().await;
         fixture
             .store
-            .set_setting_raw("agent_model", "smart")
+            .set_setting_raw("agent_model", "free")
             .await
             .unwrap();
         fixture.insert_project_provider_and_session().await;
@@ -980,8 +976,7 @@ mod tests {
         let smart = routes.iter().find(|route| route.name == "Smart").unwrap();
         assert!(smart.enabled);
         assert_eq!(smart.targets[0].model, "custom");
-        assert!(routes::route_by_name(&routes, "smart").is_some());
-        assert!(routes::route_by_name(&routes, "fast").is_some());
+        assert!(routes::route_by_name(&routes, "free").is_some());
     }
 
     #[tokio::test]
@@ -1004,7 +999,7 @@ mod tests {
         assert_eq!(
             agent.profile.model,
             AgentModel::Route {
-                route: "smart".into()
+                route: "free".into()
             }
         );
         assert_eq!(agent.profile.permissions.mode, PermMode::Default);
@@ -1018,7 +1013,7 @@ mod tests {
         assert_eq!(
             snapshot.subagent_model,
             AgentModel::Route {
-                route: "fast".into()
+                route: "free".into()
             }
         );
         // A second startup adopts the created files.

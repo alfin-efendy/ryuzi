@@ -18,7 +18,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "violet",
-    model: route("smart"),
+    model: route("free"),
     permissionMode: "ask",
     skillCount: 0,
     toolCount: 0,
@@ -38,7 +38,7 @@ const reviewer = summary("reviewer", "Reviewer", {
 const ryuzi = summary("ryuzi", "Ryuzi");
 
 function registry(): AgentRegistryInfo {
-  return { agents: [ryuzi, reviewer], defaultAgentId: "ryuzi", recovery: [], subagentModel: route("fast") };
+  return { agents: [ryuzi, reviewer], defaultAgentId: "ryuzi", recovery: [], subagentModel: route("free") };
 }
 
 const selectable: SelectableModelInfo = {
@@ -131,7 +131,7 @@ test("Main Agent tab renders roster metadata and opens dedicated detail", () => 
   expect(screen.getByRole("button", { name: "Main Agent" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Sub Agent" })).toBeTruthy();
   expect(screen.getByText("Reviews implementation quality and regressions.")).toBeTruthy();
-  expect(screen.getAllByText("smart").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("free").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Ask").length).toBeGreaterThan(0);
   expect(screen.getByText("1 skill · 3 tools")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Open Reviewer" }));
@@ -171,7 +171,7 @@ test("create modal sends the complete initial mutation and opens the new detail"
       name: "Architect",
       description: "Designs system boundaries.",
       avatarColor: "violet",
-      model: route("fast"),
+      model: route("free"),
       permissionMode: "ask",
       permissionRules: [],
       skills: [],

@@ -298,7 +298,7 @@ const DEFAULT_AGENT = {
   name: "Ryuzi",
   description: "Default agent",
   avatarColor: "#7C3AED",
-  model: { kind: "route", route: "smart" },
+  model: { kind: "route", route: "free" },
   permissionMode: "ask",
   skillCount: 0,
   toolCount: 0,
@@ -312,7 +312,7 @@ const AGENT_REGISTRY = {
   agents: [DEFAULT_AGENT],
   defaultAgentId: DEFAULT_AGENT.id,
   recovery: [],
-  subagentModel: { kind: "route", route: "smart" },
+  subagentModel: { kind: "route", route: "free" },
 };
 
 /** Tauri command → resolved value (Result-typed commands get the raw data). */

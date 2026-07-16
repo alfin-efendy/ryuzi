@@ -2209,8 +2209,8 @@ mod tests {
         registries.harness = Arc::new(WebhookHarnessFactory {
             prompts: prompts.clone(),
         });
-        // The default Ryuzi profile's model route (`smart`) and the shared
-        // subagent route (`fast`) must resolve to an enabled, executable
+        // The default Ryuzi profile's model route and the shared subagent
+        // route (both `free`) must resolve to an enabled, executable
         // connection before agent persistence bootstraps — otherwise the
         // default primary owner is persisted but rejected as non-executable
         // by every session start this test drives.
@@ -2694,7 +2694,7 @@ mod tests {
             &state.store,
             crate::llm_router::routes::ModelRouteInfo {
                 id: "r1".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
                 targets: vec![
@@ -2716,7 +2716,7 @@ mod tests {
         .await
         .unwrap();
 
-        let target = route_model(&state.store, "smart").await.unwrap().unwrap();
+        let target = route_model(&state.store, "free").await.unwrap().unwrap();
 
         assert_eq!(target.conn.id, "c2");
         assert_eq!(target.conn.provider, "anthropic");

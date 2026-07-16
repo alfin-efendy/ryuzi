@@ -13,7 +13,7 @@ const registry: AgentRegistryInfo = {
   agents: [],
   defaultAgentId: "ryuzi",
   recovery: [],
-  subagentModel: route("fast"),
+  subagentModel: route("free"),
 };
 
 beforeEach(() => {

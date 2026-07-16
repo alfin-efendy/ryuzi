@@ -483,7 +483,7 @@ function RouteForm({
         <Input
           value={draft.name}
           onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
-          placeholder="smart"
+          placeholder="free"
           className="flex-1 font-mono"
         />
       </CardRow>

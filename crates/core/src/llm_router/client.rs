@@ -3267,7 +3267,7 @@ mod tests {
             &ctx.store,
             routes::ModelRouteInfo {
                 id: "rr-route".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::RoundRobin,
                 targets: vec![
@@ -3290,8 +3290,8 @@ mod tests {
         .unwrap();
         let routed = anthropic_messages_stream(
             &ctx,
-            json!({"model":"smart","messages":[]}),
-            utility_policy(&ctx, "smart").await.as_ref(),
+            json!({"model":"free","messages":[]}),
+            utility_policy(&ctx, "free").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3512,7 +3512,7 @@ mod tests {
             &ctx.store,
             routes::ModelRouteInfo {
                 id: "continuation".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![

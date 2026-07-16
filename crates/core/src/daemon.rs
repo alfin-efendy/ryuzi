@@ -398,10 +398,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         Arc::clone(&store),
     )
     .await?;
-    // Default durable profiles target the `smart` and `fast` routes. Create
-    // those routes only after persistence has materialized the profiles and
-    // after connections are available; a fresh daemon with none remains
-    // intentionally unconfigured.
+    // Default durable profiles target the `free` route. Create it only after
+    // persistence has materialized the profiles and after connections are
+    // available; a fresh daemon with none remains intentionally unconfigured.
     crate::agents::bootstrap::ensure_default_routes(&store).await?;
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for

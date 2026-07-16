@@ -359,7 +359,7 @@ mod tests {
             description: "Reviews implementation quality and regressions.".to_owned(),
             avatar_color: "violet".to_owned(),
             model: AgentModelInfo::Route {
-                route: "smart".to_owned(),
+                route: "free".to_owned(),
             },
             permission_mode: "ask".to_owned(),
             permission_rules: Vec::new(),

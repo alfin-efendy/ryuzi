@@ -8,7 +8,7 @@ use crate::store::Store;
 
 /// Settings-KV key holding the agent's default model (same value format the
 /// `agents` table's `model` column used, e.g. "anthropic/claude-opus-4-5"
-/// or a route alias like "smart"). Absent = router default.
+/// or a route alias like "free"). Absent = router default.
 pub const KEY_MODEL: &str = "agent_model";
 /// Settings-KV key holding the agent's permission mode:
 /// "plan" | "ask" | "edit" | "full". Absent = engine default ("ask").
@@ -96,7 +96,7 @@ mod tests {
         set(
             &store,
             &AgentSettings {
-                model: Some("smart".into()),
+                model: Some("free".into()),
                 perm_mode: Some("full".into()),
             },
         )

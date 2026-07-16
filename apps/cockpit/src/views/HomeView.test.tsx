@@ -210,7 +210,7 @@ beforeEach(() => {
           name: "Ryuzi",
           description: "",
           avatarColor: "violet",
-          model: { kind: "route", route: "smart" },
+          model: { kind: "route", route: "free" },
           permissionMode: "ask",
           skillCount: 0,
           toolCount: 0,
@@ -222,7 +222,7 @@ beforeEach(() => {
       ],
       defaultAgentId: "ryuzi",
       recovery: [],
-      subagentModel: { kind: "route", route: "fast" },
+      subagentModel: { kind: "route", route: "free" },
     },
     models: [selectable("anthropic/claude-opus-4"), selectable("anthropic/claude-sonnet-4")],
   });
@@ -510,7 +510,7 @@ test("prefers a pending primary over persisted and default choices", async () =>
       ],
       defaultAgentId: "ryuzi",
       recovery: [],
-      subagentModel: { kind: "route", route: "fast" },
+      subagentModel: { kind: "route", route: "free" },
     },
   });
   render(<HomeView />);
@@ -533,7 +533,7 @@ test("uses a persisted executable primary when no pending choice exists", async 
       ],
       defaultAgentId: "ryuzi",
       recovery: [],
-      subagentModel: { kind: "route", route: "fast" },
+      subagentModel: { kind: "route", route: "free" },
     },
   });
   render(<HomeView />);
@@ -550,7 +550,7 @@ test("disables the composer and navigates to agent repair when no executable pri
       agents: [{ ...useAgents.getState().registry!.agents[0], executable: false }],
       defaultAgentId: "ryuzi",
       recovery: [],
-      subagentModel: { kind: "route", route: "fast" },
+      subagentModel: { kind: "route", route: "free" },
     },
   });
   useNav.setState({ drafts: { "home:p1": "keep this" } });
