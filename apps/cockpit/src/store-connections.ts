@@ -78,6 +78,9 @@ type ConnectionsState = {
     redirectUri: string,
   ) => Promise<boolean>;
   addFree: (provider: string, label: string) => Promise<boolean>;
+  installedProviders: string[];
+  installProvider: (family: string) => Promise<boolean>;
+  uninstallProvider: (family: string) => Promise<boolean>;
   startKiroDevice: () => Promise<DeviceFlowInfo | null>;
   awaitKiroDevice: (label: string, flowId: string) => Promise<boolean>;
   importKiro: (label: string) => Promise<boolean>;
@@ -115,12 +118,18 @@ async function runAccountAction(
 export const useConnections = create<ConnectionsState>((set) => ({
   catalog: [],
   connections: [],
+  installedProviders: [],
   loaded: false,
 
   hydrate: async () => {
-    const [cat, conns] = await Promise.all([commands.listProviderCatalog(), commands.listConnections(LOCAL_RUNNER)]);
+    const [cat, conns, installed] = await Promise.all([
+      commands.listProviderCatalog(),
+      commands.listConnections(LOCAL_RUNNER),
+      commands.listInstalledProviders(LOCAL_RUNNER),
+    ]);
     if (cat.status === "ok") set({ catalog: cat.data });
     if (conns.status === "ok") set({ connections: conns.data });
+    if (installed.status === "ok") set({ installedProviders: installed.data });
     set({ loaded: true });
   },
   add: async (provider, label, apiKey, baseUrl) =>
@@ -148,6 +157,24 @@ export const useConnections = create<ConnectionsState>((set) => ({
   completeOauthManual: async (provider, label, verifier, state, pasted, redirectUri) =>
     apply(set, await commands.completeOauthManual(LOCAL_RUNNER, provider, label, verifier, state, pasted, redirectUri), "Connect"),
   addFree: async (provider, label) => apply(set, await commands.addFreeConnection(LOCAL_RUNNER, provider, label), "Add connection"),
+  installProvider: async (family) => {
+    const res = await commands.installProvider(LOCAL_RUNNER, family);
+    if (res.status === "error") {
+      toast.error(`Install failed: ${res.error.message}`);
+      return false;
+    }
+    set({ installedProviders: res.data });
+    return true;
+  },
+  uninstallProvider: async (family) => {
+    const res = await commands.uninstallProvider(LOCAL_RUNNER, family);
+    if (res.status === "error") {
+      toast.error(`Uninstall failed: ${res.error.message}`);
+      return false;
+    }
+    set({ installedProviders: res.data });
+    return true;
+  },
   startKiroDevice: async () => {
     const res = await commands.startKiroDeviceFlow(LOCAL_RUNNER);
     if (res.status === "ok") return res.data;

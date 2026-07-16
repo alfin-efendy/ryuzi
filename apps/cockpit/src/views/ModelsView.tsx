@@ -31,6 +31,7 @@ import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
+import { AddProviderModal } from "@/components/modals/AddProviderModal";
 
 type Tab = "providers" | "route" | "endpoint";
 
@@ -326,8 +327,12 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
 }
 
 function ProvidersTab() {
-  const { catalog, connections, loaded } = useConnections();
-  const rows = useMemo(() => buildProviderRows(catalog, connections), [catalog, connections]);
+  const { catalog, connections, installedProviders, installProvider, loaded } = useConnections();
+  const [addOpen, setAddOpen] = useState(false);
+  const rows = useMemo(
+    () => buildProviderRows(catalog, connections).filter((row) => installedProviders.includes(row.id)),
+    [catalog, connections, installedProviders],
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -339,8 +344,21 @@ function ProvidersTab() {
         </Card>
       )}
       {loaded && rows.length === 0 && (
-        <div className="py-8 text-center text-[13px] text-muted-foreground">No providers in the catalog yet.</div>
+        <div className="py-8 text-center text-[13px] text-muted-foreground">No providers installed yet.</div>
       )}
+      <div>
+        <Button variant="outline" onClick={() => setAddOpen(true)} aria-label="Add provider">
+          <Plus aria-hidden size={14} className="mr-1.5" />
+          Add provider
+        </Button>
+      </div>
+      <AddProviderModal
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        catalog={catalog}
+        installed={installedProviders}
+        onInstall={installProvider}
+      />
     </div>
   );
 }

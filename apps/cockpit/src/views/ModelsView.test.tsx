@@ -215,6 +215,7 @@ mock.module("@/bindings", () => ({
     listEndpointKeys: () => Promise.resolve({ status: "ok", data: keys }),
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
+    listInstalledProviders: () => Promise.resolve({ status: "ok", data: ["openai", "anthropic"] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
     listModelRouteTargetCapabilities: () => Promise.resolve({ status: "ok", data: routeTargetCapabilities }),
     projectRuntimeInfo: (projectId: string) =>
@@ -286,7 +287,10 @@ const { useAgents } = await import("@/store-agents");
 // fixtures) would otherwise satisfy the `loaded` guard and skip ours.
 function resetStores() {
   useEndpoint.setState({ status: null, keys: [], loaded: false });
-  useConnections.setState({ catalog: [], connections: [], loaded: false });
+  // Default the installed set to a superset of every family used across these
+  // tests so ProvidersTab (which now filters to installed families) still shows
+  // them; individual tests override `installedProviders` to assert the filter.
+  useConnections.setState({ catalog: [], connections: [], installedProviders: ["openai", "anthropic", "openrouter", "kiro"], loaded: false });
   useModelRoutes.setState({ routes: [], targetCapabilities: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
@@ -341,6 +345,33 @@ test("providers tab groups anthropic + anthropic-oauth accounts into one Anthrop
 
   fireEvent.click(anthropicRow);
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
+});
+
+test("providers tab hides catalog families absent from the installed set", async () => {
+  const xai: CatalogEntry = {
+    id: "xai",
+    name: "xAI",
+    family: "xai",
+    color: "#111111",
+    initial: "X",
+    category: "api_key",
+    format: "openai",
+    requiresBaseUrl: false,
+    models: ["grok-4"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  };
+  useConnections.setState({
+    catalog: [catalog[1]!, xai],
+    connections: [],
+    installedProviders: ["anthropic"],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  expect(await screen.findByText("Anthropic")).toBeTruthy();
+  expect(screen.queryByText("xAI")).toBeNull();
 });
 
 test("provider rows show plain account and model counts without category or active badges", async () => {
@@ -848,7 +879,7 @@ test("shows empty states for API keys, providers, and routes", async () => {
   useModelRoutes.setState({ routes: [], loaded: true });
   render(<ModelsView />);
 
-  expect(await screen.findByText("No providers in the catalog yet.")).toBeTruthy();
+  expect(await screen.findByText("No providers installed yet.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Route" }));
   expect(screen.getByText("No routes yet. Create a route alias to expose a combo-style model.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Endpoint" }));
