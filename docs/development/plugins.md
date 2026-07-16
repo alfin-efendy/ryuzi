@@ -1378,12 +1378,15 @@ one agent's own `agents/<agent-id>/knowledge/` bundle:
 - **Skill usage** — per-skill use/success counters recorded from this
   agent's own tool calls.
 - **Reviews** — retrospective/finding concepts (`ReviewFeed`).
-- **Curator** — a history of consolidated-state snapshots
-  (`ConceptArea::CuratorHistory`) with a **Restore snapshot** action
-  (`CuratorCard`, `rollback_agent_learning` RPC) that enqueues a
-  `Rollback` learning event through the same durable queue above — there is
-  no autonomous background sweep anymore; a snapshot only exists if this
-  agent (or a human) wrote one.
+- **Curator** — a forward-looking placeholder panel that would list
+  consolidated-state snapshots (`ConceptArea::CuratorHistory`) and offer a
+  **Restore snapshot** action (`CuratorCard`) enqueuing a `Rollback`
+  learning event through the same durable queue above. There is no
+  autonomous background sweep anymore, and — importantly — no in-product
+  path creates the first snapshot today: the concept-CRUD RPCs only ever
+  write `Memory` concepts, and the restore path requires an already-present
+  `curator/history/<id>.md` to restore from. So this panel stays empty until
+  a snapshot producer ships; treat it as reserved UI, not a working feature.
 - **Repair knowledge** — any OKF concept file that failed to parse/validate
   is listed with its error, editable in place (raw Markdown, validate, then
   replace) or deletable, via `delete_invalid_agent_concept`.
