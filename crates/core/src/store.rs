@@ -587,7 +587,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_40_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_41_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1082,9 +1082,12 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_40_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_41_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
-        // instead of a "duplicate column" error.
+        // instead of a "duplicate column" error. The orch_tasks block is also
+        // guarded on the table's existence because migration 39 removes it.
+        // A replay from an already-cleaned database must not try to resurrect
+        // that legacy table just to add obsolete columns.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
             let has_messages_speaker = tx
                 .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='speaker'")?
@@ -1092,40 +1095,45 @@ fn migrations() -> Migrations<'static> {
             if !has_messages_speaker {
                 tx.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", [])?;
             }
-            let has_home_session_pk = tx
-                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='home_session_pk'")?
+            let has_orch_tasks_table = tx
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='orch_tasks'")?
                 .exists([])?;
-            if !has_home_session_pk {
-                tx.execute(
-                    "ALTER TABLE orch_tasks ADD COLUMN home_session_pk TEXT",
-                    [],
-                )?;
-            }
-            let has_consecutive_failures = tx
-                .prepare(
-                    "SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='consecutive_failures'",
-                )?
-                .exists([])?;
-            if !has_consecutive_failures {
-                tx.execute(
-                    "ALTER TABLE orch_tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-            let has_gave_up = tx
-                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='gave_up'")?
-                .exists([])?;
-            if !has_gave_up {
-                tx.execute(
-                    "ALTER TABLE orch_tasks ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-            let has_steer_note = tx
-                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='steer_note'")?
-                .exists([])?;
-            if !has_steer_note {
-                tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+            if has_orch_tasks_table {
+                let has_home_session_pk = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='home_session_pk'")?
+                    .exists([])?;
+                if !has_home_session_pk {
+                    tx.execute(
+                        "ALTER TABLE orch_tasks ADD COLUMN home_session_pk TEXT",
+                        [],
+                    )?;
+                }
+                let has_consecutive_failures = tx
+                    .prepare(
+                        "SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='consecutive_failures'",
+                    )?
+                    .exists([])?;
+                if !has_consecutive_failures {
+                    tx.execute(
+                        "ALTER TABLE orch_tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+                let has_gave_up = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='gave_up'")?
+                    .exists([])?;
+                if !has_gave_up {
+                    tx.execute(
+                        "ALTER TABLE orch_tasks ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+                let has_steer_note = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='steer_note'")?
+                    .exists([])?;
+                if !has_steer_note {
+                    tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+                }
             }
             Ok(())
         }),
@@ -1137,7 +1145,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_40_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_41_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1378,6 +1386,12 @@ fn migrations() -> Migrations<'static> {
             )?;
             Ok(())
         }),
+        // 41: child agent runs share the session message ledger, but each run
+        // owns its tool-call lifecycle through agent_run_messages. The original
+        // per-session unique index prevents different runs from recording the
+        // same provider tool_call_id, so remove it after the ownership schema
+        // is in place. The scoped update query keeps writes unambiguous.
+        M::up("DROP INDEX IF EXISTS idx_messages_tool_call;"),
     ])
 }
 
@@ -5218,7 +5232,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 40);
+        assert_eq!(user_version, 41);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -5281,7 +5295,7 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 40);
+        assert_eq!(user_version, 41);
 
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
@@ -5289,7 +5303,32 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 40);
+        assert_eq!(reopened_version, 41);
+    }
+
+    #[tokio::test]
+    async fn migration_41_removes_session_wide_tool_call_uniqueness() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (user_version, has_unique_tool_call_index) = store
+            .with_conn(|c| {
+                let user_version: i64 = c.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                let has_unique_tool_call_index = c
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master \
+                         WHERE type='index' AND name='idx_messages_tool_call'",
+                    )?
+                    .exists([])?;
+                Ok((user_version, has_unique_tool_call_index))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(user_version, 41);
+        assert!(
+            !has_unique_tool_call_index,
+            "tool call IDs must be reusable by separate agent runs"
+        );
     }
 
     #[tokio::test]
@@ -5329,7 +5368,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 40);
+        assert_eq!(user_version, 41);
     }
 
     #[tokio::test]
@@ -5875,29 +5914,15 @@ mod tests {
                     .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
                     .exists([])?;
                 assert!(has_pre_check, "jobs.pre_check column");
-                // Migration 11: the orch task graph roundtrips.
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
-                     VALUES ('t1', NULL, 'p1', 'root goal', 'do it', 1)",
-                    [],
-                )?;
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
-                     VALUES ('t2', 't1', 'p1', 'child', 'step one', 2)",
-                    [],
-                )?;
-                c.execute(
-                    "INSERT INTO orch_task_deps(task_id, dep_id) VALUES ('t2', 't1')",
-                    [],
-                )?;
-                let status: String =
-                    c.query_row("SELECT status FROM orch_tasks WHERE id='t2'", [], |r| {
-                        r.get(0)
-                    })?;
-                assert_eq!(status, "todo", "default status");
-                let deps: i64 =
-                    c.query_row("SELECT count(*) FROM orch_task_deps", [], |r| r.get(0))?;
-                assert_eq!(deps, 1);
+                // Migration 11 created this graph, then migration 39 removed
+                // it as superseded orchestration state. A current store must
+                // not resurrect either legacy table.
+                for table in ["orch_tasks", "orch_task_deps"] {
+                    let exists: bool = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+                        .exists([table])?;
+                    assert!(!exists, "{table} must not survive migration 39");
+                }
                 Ok(())
             })
             .await
@@ -7200,7 +7225,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 40, "forward migration must land at v40");
+        assert_eq!(user_version, 41, "forward migration must land at v41");
     }
 
     #[tokio::test]
@@ -7808,7 +7833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_40_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_41_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -7840,12 +7865,12 @@ mod tests {
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 40
-        // defined, wind back twenty-eight.
+        // this test starts failing its assertions). With migrations through 41
+        // defined, wind back twenty-nine.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 28)
+            c.pragma_update(None, "user_version", v - 29)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -7902,13 +7927,17 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back fifteen, and reopen so 21 (and the tail
-        // migrations 22–39) replay against it. Back NINETEEN: the fully
-        // migrated tail is now v40, so rewinding to v20 is what makes
+        // migrations 22–41) replay against it. Back TWENTY-ONE: the fully
+        // migrated tail is now v41, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Replaying from v20 also crosses migration 29's `ALTER TABLE
+        // orch_tasks ADD COLUMN ...` hook, but migration 39 already dropped
+        // orch_tasks in this fully-migrated store. The hook must therefore
+        // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 20)
+            c.pragma_update(None, "user_version", v - 21)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -7971,19 +8000,14 @@ mod tests {
                 .prompt,
             "run it"
         );
-        // Native prefs copied into KV; dead settings keys deleted.
-        assert_eq!(
-            store.get_setting("agent_model").await.unwrap().as_deref(),
-            Some("openrouter/qwen3:free")
-        );
-        assert_eq!(
-            store
-                .get_setting("agent_perm_mode")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("edit")
-        );
+        // Migration 21 copies native prefs, then migration 39 removes those
+        // superseded single-agent settings in the same replay pass.
+        assert!(store.get_setting("agent_model").await.unwrap().is_none());
+        assert!(store
+            .get_setting("agent_perm_mode")
+            .await
+            .unwrap()
+            .is_none());
         for key in [
             "enabled_runtimes",
             "default_runtime",
@@ -8002,7 +8026,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
 
-        // KV-absent rule: a pre-existing agent_model must NOT be clobbered on replay.
+        // The cleanup is unconditional, so replaying the tail removes even a
+        // user-set legacy value.
         store
             .set_setting(WriteOrigin::User, "agent_model", "user-chose-this")
             .await
@@ -8010,10 +8035,9 @@ mod tests {
         store.with_conn(rewind).await.unwrap();
         drop(store);
         let store = Store::open(tmp.path()).await.unwrap();
-        assert_eq!(
-            store.get_setting("agent_model").await.unwrap().as_deref(),
-            Some("user-chose-this"),
-            "replay on an already-migrated DB must be a no-op"
+        assert!(
+            store.get_setting("agent_model").await.unwrap().is_none(),
+            "migration 39 must remove agent_model on replay"
         );
         let route_state_exists: bool = store
             .with_conn(|c| {
@@ -8046,7 +8070,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 40, "forward migration must land at v40");
+        assert_eq!(uv, 41, "forward migration must land at v41");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -8072,7 +8096,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 40, "forward migration must land at v40");
+        assert_eq!(uv, 41, "forward migration must land at v41");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
