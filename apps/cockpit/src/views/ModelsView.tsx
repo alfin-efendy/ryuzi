@@ -343,9 +343,7 @@ function ProvidersTab() {
           ))}
         </Card>
       )}
-      {loaded && rows.length === 0 && (
-        <div className="py-8 text-center text-[13px] text-muted-foreground">No providers installed yet.</div>
-      )}
+      {loaded && rows.length === 0 && <div className="py-8 text-center text-[13px] text-muted-foreground">No providers installed yet.</div>}
       <div>
         <Button variant="outline" onClick={() => setAddOpen(true)} aria-label="Add provider">
           <Plus aria-hidden size={14} className="mr-1.5" />

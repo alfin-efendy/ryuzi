@@ -290,7 +290,12 @@ function resetStores() {
   // Default the installed set to a superset of every family used across these
   // tests so ProvidersTab (which now filters to installed families) still shows
   // them; individual tests override `installedProviders` to assert the filter.
-  useConnections.setState({ catalog: [], connections: [], installedProviders: ["openai", "anthropic", "openrouter", "kiro"], loaded: false });
+  useConnections.setState({
+    catalog: [],
+    connections: [],
+    installedProviders: ["openai", "anthropic", "openrouter", "kiro"],
+    loaded: false,
+  });
   useModelRoutes.setState({ routes: [], targetCapabilities: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });

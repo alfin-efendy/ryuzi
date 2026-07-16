@@ -37,7 +37,11 @@ export function AddProviderModal({
               <div key={entry.id} className="flex items-center gap-3 border-b border-border py-2.5 last:border-b-0">
                 <Chip initial={entry.initial} color={entry.color} size={30} />
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{entry.name}</span>
-                <Button size="sm" aria-label={`Install ${entry.name}`} onClick={() => void onInstall(entry.id).then((ok) => ok && onClose())}>
+                <Button
+                  size="sm"
+                  aria-label={`Install ${entry.name}`}
+                  onClick={() => void onInstall(entry.id).then((ok) => ok && onClose())}
+                >
                   <Plus aria-hidden size={13} className="mr-1.5" />
                   Install
                 </Button>

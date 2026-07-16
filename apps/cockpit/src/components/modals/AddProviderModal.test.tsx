@@ -45,9 +45,7 @@ test("installableFamilies is empty when every head is installed", () => {
 test("clicking Install calls onInstall with the family id and closes on success", async () => {
   const onInstall = mock(async (_family: string) => true);
   const onClose = mock(() => {});
-  render(
-    <AddProviderModal open onClose={onClose} catalog={[entry("xai", "xai", { name: "xAI" })]} installed={[]} onInstall={onInstall} />,
-  );
+  render(<AddProviderModal open onClose={onClose} catalog={[entry("xai", "xai", { name: "xAI" })]} installed={[]} onInstall={onInstall} />);
 
   fireEvent.click(screen.getByRole("button", { name: "Install xAI" }));
 
@@ -56,7 +54,9 @@ test("clicking Install calls onInstall with the family id and closes on success"
 });
 
 test("renders the all-installed empty state when there is nothing to add", () => {
-  render(<AddProviderModal open onClose={() => {}} catalog={[entry("anthropic")]} installed={["anthropic"]} onInstall={async () => true} />);
+  render(
+    <AddProviderModal open onClose={() => {}} catalog={[entry("anthropic")]} installed={["anthropic"]} onInstall={async () => true} />,
+  );
   expect(screen.getByText("Every provider is already installed.")).toBeTruthy();
 });
 
