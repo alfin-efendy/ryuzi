@@ -30,7 +30,8 @@
     radial-gradient(750px 550px at 48% 55%, oklch(0.3 0.05 185 / 0.4), transparent 70%),
     oklch(0.16 0.02 170);
 }
-html[data-backdrop] {
+html[data-backdrop],
+html[data-opaque] {
   --wallpaper: transparent;
 }
 

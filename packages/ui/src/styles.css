@@ -187,6 +187,26 @@ html[data-backdrop] .acrylic-card {
   backdrop-filter: none;
 }
 
+/* Transparency toggled off (data-opaque on <html>): render fully solid
+   surfaces with no wallpaper bleed. The chrome layer shows through the
+   transparent sidebar, so it becomes the opaque --sidebar color instead of a
+   translucent tint over the (green) wallpaper; main/panel/card go opaque too.
+   Unlayered so these win over the @utility recipes. */
+html[data-opaque] .acrylic-chrome {
+  background: var(--sidebar);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+html[data-opaque] .acrylic-main {
+  background: var(--background);
+}
+html[data-opaque] .acrylic-panel {
+  background: var(--surface);
+}
+html[data-opaque] .acrylic-card {
+  background: var(--card);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
