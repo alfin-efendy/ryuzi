@@ -6224,6 +6224,8 @@ async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_wr
     cp.set_review_llm_factory_for_test(Arc::new(FixedLlmFactory(llm)));
 
     let payload = LearningPayload {
+        native_tools_version: crate::harness::native::capabilities::NativeToolsVersion::V1,
+        tool_capability_profile: None,
         review_kind: "skill".into(),
         parent_session_pk: "parent-1".into(),
         model: "test/model".into(),

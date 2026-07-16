@@ -2,11 +2,31 @@ use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeToolsVersion {
+    #[default]
     V1,
     V2,
+}
+
+impl NativeToolsVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CapabilityResolutionError> {
+        match value {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            _ => Err(CapabilityResolutionError::unavailable(
+                "native tool version must be exactly v1 or v2",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

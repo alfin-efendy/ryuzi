@@ -2428,6 +2428,22 @@ impl ControlPlane {
                 parent_session_pk: Some(payload.parent_session_pk.clone()),
             })
             .await?;
+        let stored_native_version = store
+            .get_or_insert_native_tool_session_version(
+                &review_pk,
+                payload.native_tools_version.as_str(),
+            )
+            .await?;
+        let native_tools_version = crate::harness::native::capabilities::NativeToolsVersion::parse(
+            &stored_native_version.version,
+        )?;
+        if native_tools_version == crate::harness::native::capabilities::NativeToolsVersion::V2
+            && payload.tool_capability_profile.is_none()
+        {
+            anyhow::bail!(
+                "capability_unavailable: V2 review payload has no typed capability profile"
+            );
+        }
 
         let settings = SettingsStore::new(store.clone());
         let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
@@ -2440,6 +2456,23 @@ impl ControlPlane {
             .registry
             .resolved_snapshot(&persistence.registry.default_agent_id().await)
             .await?;
+        store
+            .insert_primary_agent_run(crate::domain::NewAgentRun {
+                run_id: review_pk.clone(),
+                session_pk: review_pk.clone(),
+                parent_run_id: None,
+                retry_of: None,
+                primary_agent_id: primary_agent.profile.id.clone(),
+                executing_agent_id: Some(primary_agent.profile.id.clone()),
+                executing_agent_name_snapshot: primary_agent.profile.name.clone(),
+                agent_kind: crate::domain::AgentRunKind::Primary,
+                task: format!("{} learning review", payload.review_kind),
+                status: crate::domain::AgentRunStatus::Running,
+                resolved_model: Some(model.clone()),
+                resolved_effort: None,
+            })
+            .await?;
+        let tools = Arc::new(ToolRegistry::builtin());
         let deps = RunnerDeps {
             session_pk: review_pk.clone(),
             primary_agent,
@@ -2470,7 +2503,12 @@ impl ControlPlane {
             approvals: self.approvals.clone(),
             automation_events: None,
             llm,
-            tools: Arc::new(ToolRegistry::builtin()),
+            tools,
+            native_tools_version,
+            native_tool_runtime_surfaces:
+                crate::harness::native::capabilities::RuntimeToolSurfaces::direct_only(),
+            native_tool_override_mode: None,
+            captured_tool_capability_profile: payload.tool_capability_profile.clone(),
             agent: runner::review_agent(payload.system.clone()),
             agents: Arc::new(AgentRegistry::builtin()),
             commands: Arc::new(CommandRegistry::builtin()),
@@ -2516,6 +2554,15 @@ impl ControlPlane {
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let result = runner::drive_review(&deps, &deps.agent, &mut cm, &cancel).await;
+
+        match &result {
+            Ok(text) => {
+                let _ = self.delegation.complete(&review_pk, text).await;
+            }
+            Err(error) => {
+                let _ = self.delegation.fail(&review_pk, &error.to_string()).await;
+            }
+        }
 
         // The review session is throwaway — never resumed, hidden from every
         // picker by `kind` — so it never lingers as `running`, whether the

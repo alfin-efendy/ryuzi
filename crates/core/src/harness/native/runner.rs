@@ -3,6 +3,10 @@
 //! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
+use super::capabilities::{
+    CapabilityInputs, CapabilityResolver, NativeToolsVersion, RuntimeToolSurfaces,
+    ToolCapabilityProfile, ToolInteractionMode,
+};
 use super::commands::{CommandRegistry, ResolvedCommand};
 use super::context_manager::{
     compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
@@ -12,6 +16,8 @@ use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_IT
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
+use super::tool_contract::ToolError;
+use super::tool_plan::{self, CompiledSessionToolPlan};
 use super::tools::{
     BackgroundDispatch, MainAgentSpawner, MainDelegationResult, OutputCaps, SubagentSpawner,
     SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
@@ -81,6 +87,10 @@ pub struct NudgeState {
 /// worker collapses history instead (Task 9).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LearningPayload {
+    #[serde(default)]
+    pub native_tools_version: NativeToolsVersion,
+    #[serde(default)]
+    pub tool_capability_profile: Option<ToolCapabilityProfile>,
     pub review_kind: String, // "memory" | "skill" | "combined"
     pub parent_session_pk: String,
     pub model: String,
@@ -150,6 +160,17 @@ pub struct RunnerDeps {
     pub automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     pub llm: Arc<dyn LlmStream>,
     pub tools: Arc<ToolRegistry>,
+    /// Session-stable native tool contract version. A run-local facade is
+    /// resolved inside `drive`; child runs inherit only this version, never a
+    /// parent's compiled plan.
+    pub native_tools_version: NativeToolsVersion,
+    /// Runtime surfaces intersected with typed transport facts for a new V2
+    /// candidate. These are product capabilities, not model-name inference.
+    pub native_tool_runtime_surfaces: RuntimeToolSurfaces,
+    pub native_tool_override_mode: Option<ToolInteractionMode>,
+    /// Review forks pin the typed profile captured by the parent. Ordinary
+    /// runs leave this unset and resolve through `LlmStream` once per drive.
+    pub captured_tool_capability_profile: Option<ToolCapabilityProfile>,
     /// The selected primary agent for this session.
     pub agent: Agent,
     /// Available agents (for sub-agent spawning).
@@ -226,6 +247,89 @@ impl RunnerDeps {
 #[derive(Debug, Clone, Default)]
 struct TurnOptions {
     subtask: bool,
+}
+
+#[derive(Debug, Clone)]
+enum RunToolPlan {
+    V1,
+    CandidateV2(CompiledSessionToolPlan),
+    FrozenV2(CompiledSessionToolPlan),
+}
+
+impl RunToolPlan {
+    fn visible_definitions(&self) -> Option<&[Value]> {
+        match self {
+            Self::V1 => None,
+            Self::CandidateV2(plan) | Self::FrozenV2(plan) => Some(&plan.visible_definitions),
+        }
+    }
+
+    fn capability_profile(&self) -> Option<&ToolCapabilityProfile> {
+        match self {
+            Self::V1 => None,
+            Self::CandidateV2(plan) | Self::FrozenV2(plan) => {
+                Some(&plan.plan.body.capability_profile)
+            }
+        }
+    }
+
+    fn version(&self) -> NativeToolsVersion {
+        match self {
+            Self::V1 => NativeToolsVersion::V1,
+            Self::CandidateV2(_) | Self::FrozenV2(_) => NativeToolsVersion::V2,
+        }
+    }
+}
+
+async fn resolve_run_tool_plan(deps: &RunnerDeps, agent: &Agent) -> anyhow::Result<RunToolPlan> {
+    if let Some(plan) = tool_plan::load_plan(&deps.store, &deps.run_id).await? {
+        return Ok(RunToolPlan::FrozenV2(plan));
+    }
+    if deps.native_tools_version == NativeToolsVersion::V1 {
+        return Ok(RunToolPlan::V1);
+    }
+
+    let capability_profile = match &deps.captured_tool_capability_profile {
+        Some(profile) => profile.clone(),
+        None => {
+            let transport = deps
+                .llm
+                .transport_tool_capabilities(&deps.turn_effort_policy)
+                .await?;
+            CapabilityResolver::resolve(CapabilityInputs {
+                transport,
+                runtime: deps.native_tool_runtime_surfaces,
+                override_mode: deps.native_tool_override_mode,
+                supports_prompt_cache: deps.meta.supports_prompt_cache,
+            })?
+        }
+    };
+    let plan = tool_plan::compile_candidate(
+        &deps.tools,
+        &agent.tools,
+        capability_profile,
+        deps.review_tool_defs.as_deref(),
+    )
+    .await?;
+    Ok(RunToolPlan::CandidateV2(plan))
+}
+
+async fn verify_or_freeze_run_tool_plan(
+    deps: &RunnerDeps,
+    plan: &mut RunToolPlan,
+) -> anyhow::Result<()> {
+    match plan {
+        RunToolPlan::V1 => Ok(()),
+        RunToolPlan::CandidateV2(candidate) => {
+            tool_plan::freeze_plan(&deps.store, &deps.run_id, &*candidate).await?;
+            *plan = RunToolPlan::FrozenV2(candidate.clone());
+            Ok(())
+        }
+        RunToolPlan::FrozenV2(frozen) => {
+            tool_plan::freeze_plan(&deps.store, &deps.run_id, &*frozen).await?;
+            Ok(())
+        }
+    }
 }
 
 /// Return the resolved command's normal-turn runtime metadata. Kept separate
@@ -916,6 +1020,10 @@ async fn drive(
     display: DisplayMode,
     budget: &IterationBudget,
 ) -> anyhow::Result<String> {
+    // A facade belongs to this run/drive. Child and delegated drives call this
+    // independently with their own run_id; no compiled parent plan is cloned.
+    let mut run_tool_plan = resolve_run_tool_plan(deps, agent).await?;
+    let mut v2_plan_verified = false;
     let mut system_breakdown: Option<Vec<(&'static str, u64)>> = None;
     let system = match &agent.prompt {
         Some(p) => p.clone(),
@@ -948,8 +1056,8 @@ async fn drive(
     // the review agent's `ToolFilter` only allows a few of them: dispatch
     // (`run_tool_call`, below) enforces the real whitelist at call time, so a
     // non-whitelisted call is refused, not merely hidden from the model.
-    let tool_defs: Vec<Value> = match &deps.review_tool_defs {
-        Some(captured) => captured.clone(),
+    let tool_defs: Vec<Value> = match run_tool_plan.visible_definitions() {
+        Some(definitions) => definitions.to_vec(),
         None => current_tool_defs(deps, agent).await,
     };
     let model = deps.model.clone().unwrap_or_default();
@@ -1060,7 +1168,10 @@ async fn drive(
             } else {
                 json!(system)
             };
-            let tool_defs = current_tool_defs(deps, agent).await;
+            let tool_defs = match run_tool_plan.visible_definitions() {
+                Some(_) => tool_defs.clone(),
+                None => current_tool_defs(deps, agent).await,
+            };
             let body = json!({
                 "model": model,
                 "system": system_value,
@@ -1134,6 +1245,23 @@ async fn drive(
                 let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
                     continue;
                 };
+                let valid_response_event = matches!(
+                    &decoded,
+                    MessageStreamEvent::MessageStart(_)
+                        | MessageStreamEvent::TextDelta { .. }
+                        | MessageStreamEvent::ThinkingDelta { .. }
+                        | MessageStreamEvent::ContentBlockStart { .. }
+                );
+                if run_tool_plan.version() == NativeToolsVersion::V2
+                    && !v2_plan_verified
+                    && valid_response_event
+                {
+                    // Persistence is deliberately before processing the first
+                    // response/content event, so no V2 dispatch can occur from
+                    // a facade that failed to freeze or verify.
+                    verify_or_freeze_run_tool_plan(deps, &mut run_tool_plan).await?;
+                    v2_plan_verified = true;
+                }
                 if !ttft_logged {
                     ttft_logged = true;
                     tracing::debug!(
@@ -1279,7 +1407,7 @@ async fn drive(
                 // learning row) is what actually prevents a sub-agent or a
                 // review fork from recursively enqueueing another review.
                 if display.text() {
-                    maybe_enqueue_review(deps, &system, &tool_defs, cm).await;
+                    maybe_enqueue_review(deps, &system, &tool_defs, cm, &run_tool_plan).await;
                 }
                 return Ok(final_text); // end_turn
             }
@@ -1293,7 +1421,9 @@ async fn drive(
                     }
                     break;
                 }
-                results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
+                results.push(
+                    run_tool_call(deps, agent, t, &display, &spawn, cancel, &run_tool_plan).await,
+                );
                 // "Tool iterations since last skill_manage" (§7.2): every
                 // dispatched tool other than `skill_manage` advances the
                 // skill-nudge counter; `skill_manage` itself resets it — the
@@ -1445,6 +1575,7 @@ async fn maybe_enqueue_review(
     system: &str,
     tool_defs: &[Value],
     cm: &ContextManager,
+    run_tool_plan: &RunToolPlan,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let mem_interval =
@@ -1464,6 +1595,8 @@ async fn maybe_enqueue_review(
         _ => "skill",
     };
     let payload = LearningPayload {
+        native_tools_version: run_tool_plan.version(),
+        tool_capability_profile: run_tool_plan.capability_profile().cloned(),
         review_kind: review_kind.into(),
         parent_session_pk: deps.session_pk.clone(),
         model: deps.model.clone().unwrap_or_default(),
@@ -1703,6 +1836,10 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         automation_events: deps.automation_events.clone(),
         llm: deps.llm.clone(),
         tools: deps.tools.clone(),
+        native_tools_version: deps.native_tools_version,
+        native_tool_runtime_surfaces: deps.native_tool_runtime_surfaces,
+        native_tool_override_mode: deps.native_tool_override_mode,
+        captured_tool_capability_profile: None,
         agent: deps.agent.clone(),
         agents: deps.agents.clone(),
         commands: deps.commands.clone(),
@@ -2463,19 +2600,112 @@ async fn run_tool_call(
     display: &DisplayMode,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
+    run_tool_plan: &RunToolPlan,
 ) -> Value {
-    if t.name == LOAD_TOOLS_NAME {
-        return handle_load_tools(deps, agent, t, display).await;
-    }
     let input = t.parsed_input();
-    let Some(tool) = deps.tools.get(&t.name) else {
-        let msg = format!("unknown tool `{}`", t.name);
-        insert_tool_row(deps, t, &input, "unknown", display.subagent()).await;
-        finish_tool_row(deps, &t.id, &msg, true).await;
-        return tool_result(&t.id, &msg, true);
+    let tool = match run_tool_plan {
+        RunToolPlan::V1 => {
+            if t.name == LOAD_TOOLS_NAME {
+                return handle_load_tools(deps, agent, t, display).await;
+            }
+            let Some(tool) = deps.tools.get(&t.name) else {
+                let msg = format!("unknown tool `{}`", t.name);
+                insert_tool_row(deps, t, &input, "unknown", display.subagent()).await;
+                finish_tool_row(deps, &t.id, &msg, true).await;
+                return tool_result(&t.id, &msg, true);
+            };
+            tool
+        }
+        RunToolPlan::CandidateV2(_) => {
+            return reject_v2_tool_call(
+                deps,
+                t,
+                &input,
+                display,
+                ToolError::precondition(
+                    "capability_unavailable",
+                    "The V2 tool facade is not frozen",
+                ),
+                "unknown",
+            )
+            .await;
+        }
+        RunToolPlan::FrozenV2(plan) => {
+            let Some(planned) = plan.canonical_tools.get(&t.name) else {
+                return reject_v2_tool_call(
+                    deps,
+                    t,
+                    &input,
+                    display,
+                    ToolError::precondition(
+                        "tool_not_in_plan",
+                        format!("Tool `{}` is not part of this run's frozen facade", t.name),
+                    ),
+                    "unknown",
+                )
+                .await;
+            };
+            let unavailable =
+                |message: String| ToolError::precondition("capability_unavailable", message);
+            let available = match deps.tools.available(&t.name).await {
+                Ok(Some(available)) => available,
+                Ok(None) => {
+                    return reject_v2_tool_call(
+                        deps,
+                        t,
+                        &input,
+                        display,
+                        unavailable(format!(
+                            "Tool `{}` is missing from the current registry",
+                            t.name
+                        )),
+                        &planned.descriptor.kind,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return reject_v2_tool_call(
+                        deps,
+                        t,
+                        &input,
+                        display,
+                        unavailable(format!(
+                            "Tool `{}` is currently unavailable: {}",
+                            t.name, error.message
+                        )),
+                        &planned.descriptor.kind,
+                    )
+                    .await;
+                }
+            };
+            let current_hash = tool_plan::contract_hash_for_registered(
+                &available.registered,
+                &plan.plan.body.capability_profile,
+            );
+            if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
+                return reject_v2_tool_call(
+                    deps,
+                    t,
+                    &input,
+                    display,
+                    unavailable(format!(
+                        "Tool `{}` no longer matches its frozen contract",
+                        t.name
+                    )),
+                    &planned.descriptor.kind,
+                )
+                .await;
+            }
+            available.registered.tool.clone()
+        }
     };
     // Enforce the agent's tool allow-list.
-    if !agent.tools.allows(&t.name) {
+    // A normal V2 plan was already filtered against the run's agent policy at
+    // compile time. Review forks intentionally advertise the parent's wider
+    // captured facade, so their live whitelist remains an additional gate.
+    let enforce_live_filter =
+        matches!(run_tool_plan, RunToolPlan::V1) || deps.review_tool_defs.is_some();
+    if enforce_live_filter && !agent.tools.allows(&t.name) {
         let msg = format!(
             "tool `{}` is not permitted for the `{}` agent",
             t.name, agent.name
@@ -2650,6 +2880,21 @@ async fn run_tool_call(
         after_payload,
     );
     tool_use_result
+}
+
+async fn reject_v2_tool_call(
+    deps: &RunnerDeps,
+    t: &ToolAccum,
+    input: &Value,
+    display: &DisplayMode,
+    error: ToolError,
+    kind: &str,
+) -> Value {
+    let message = serde_json::to_string(&error)
+        .unwrap_or_else(|_| format!("{}: {}", error.code, error.message));
+    insert_tool_row(deps, t, input, kind, display.subagent()).await;
+    finish_tool_row(deps, &t.id, &message, true).await;
+    tool_result(&t.id, &message, true)
 }
 
 /// Handle the synthetic `load_tools` meta-call: activate the requested deferred
@@ -3329,6 +3574,11 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
+    use crate::harness::native::capabilities::{
+        CapabilitySource, NativeToolsVersion, RuntimeToolSurfaces, ToolCapabilityProfile,
+        ToolInteractionMode, TransportToolCapabilities, WireProtocol,
+    };
+    use crate::harness::native::tool_contract::{AvailabilityProbe, ToolDescriptor};
     use async_trait::async_trait;
     use serial_test::serial;
 
@@ -3338,6 +3588,199 @@ mod tests {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct V2RecordingLlm {
+        inner: RecordingLlm,
+        capabilities: TransportToolCapabilities,
+        capability_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl V2RecordingLlm {
+        fn new(turns: Vec<Vec<crate::llm_router::client::AnthropicEvent>>) -> Self {
+            Self {
+                inner: RecordingLlm::new(turns),
+                capabilities: TransportToolCapabilities {
+                    wire_protocol: WireProtocol::OpenAiResponses,
+                    supports_function_tools: true,
+                    supports_custom_freeform_tools: false,
+                    supports_parallel_tool_calls: true,
+                    supports_strict_function_schema: true,
+                    supports_tool_output_schema: true,
+                    schema_budget_tokens: 16_000,
+                },
+                capability_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn bodies(&self) -> Vec<Value> {
+            self.inner.bodies.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmStream for V2RecordingLlm {
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.inner.stream(request).await
+        }
+
+        async fn transport_tool_capabilities(
+            &self,
+            _policy: &TurnEffortPolicy,
+        ) -> anyhow::Result<TransportToolCapabilities> {
+            self.capability_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.capabilities)
+        }
+    }
+
+    struct FailingV2Llm {
+        capabilities: TransportToolCapabilities,
+    }
+
+    #[async_trait]
+    impl LlmStream for FailingV2Llm {
+        async fn stream(&self, _request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            anyhow::bail!("transport failed before response")
+        }
+
+        async fn transport_tool_capabilities(
+            &self,
+            _policy: &TurnEffortPolicy,
+        ) -> anyhow::Result<TransportToolCapabilities> {
+            Ok(self.capabilities)
+        }
+    }
+
+    struct ContractTool {
+        name: String,
+        description: String,
+        probe_count: std::sync::atomic::AtomicUsize,
+        unavailable_after_first_probe: bool,
+        hard_unavailable: bool,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ContractTool {
+        fn available(
+            name: &str,
+            description: &str,
+        ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    description: description.into(),
+                    probe_count: std::sync::atomic::AtomicUsize::new(0),
+                    unavailable_after_first_probe: false,
+                    hard_unavailable: false,
+                    effects: effects.clone(),
+                }),
+                effects,
+            )
+        }
+
+        fn unavailable(
+            name: &str,
+            description: &str,
+            transient_after_first: bool,
+        ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    description: description.into(),
+                    probe_count: std::sync::atomic::AtomicUsize::new(0),
+                    unavailable_after_first_probe: transient_after_first,
+                    hard_unavailable: !transient_after_first,
+                    effects: effects.clone(),
+                }),
+                effects,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for ContractTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor::conservative(
+                self.name(),
+                self.description(),
+                self.input_schema(),
+                self.kind(),
+            )
+        }
+
+        async fn probe_availability(&self) -> AvailabilityProbe {
+            let probe = self
+                .probe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hard_unavailable || (self.unavailable_after_first_probe && probe > 0) {
+                AvailabilityProbe::Unavailable {
+                    code: "dependency_down".into(),
+                    transient: self.unavailable_after_first_probe,
+                }
+            } else {
+                AvailabilityProbe::Available
+            }
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("contract-test", "contract test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    fn direct_profile() -> ToolCapabilityProfile {
+        ToolCapabilityProfile {
+            interaction_mode: ToolInteractionMode::DirectFunctions,
+            wire_protocol: WireProtocol::OpenAiResponses,
+            supports_custom_freeform_tools: false,
+            supports_parallel_tool_calls: true,
+            supports_strict_function_schema: true,
+            supports_tool_output_schema: true,
+            schema_budget_tokens: 16_000,
+            supports_prompt_cache: true,
+            capability_source: CapabilitySource::TransportDefault,
+            capability_schema_version:
+                crate::harness::native::capabilities::CAPABILITY_SCHEMA_VERSION,
+        }
+    }
+
+    fn enable_v2(deps: &mut RunnerDeps) {
+        deps.native_tools_version = NativeToolsVersion::V2;
+        deps.native_tool_runtime_surfaces = RuntimeToolSurfaces::direct_only();
+        deps.native_tool_override_mode = None;
+        deps.captured_tool_capability_profile = None;
     }
 
     #[async_trait]
@@ -3572,6 +4015,10 @@ mod tests {
             automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
+            native_tools_version: NativeToolsVersion::V1,
+            native_tool_runtime_surfaces: RuntimeToolSurfaces::direct_only(),
+            native_tool_override_mode: None,
+            captured_tool_capability_profile: None,
             agent,
             agents,
             commands: Arc::new(CommandRegistry::builtin()),
@@ -4108,6 +4555,8 @@ mod tests {
     #[test]
     fn learning_payload_round_trips_through_json() {
         let payload = LearningPayload {
+            native_tools_version: NativeToolsVersion::V1,
+            tool_capability_profile: None,
             review_kind: "combined".into(),
             parent_session_pk: "parent-1".into(),
             model: "anthropic/model-a".into(),
@@ -4157,6 +4606,8 @@ mod tests {
         let captured_messages = seed_cm.messages_for_request();
 
         let payload = LearningPayload {
+            native_tools_version: NativeToolsVersion::V1,
+            tool_capability_profile: None,
             review_kind: "memory".into(),
             parent_session_pk: "parent-1".into(),
             model: "test/model".into(),
@@ -6016,6 +6467,354 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_drive_reuses_one_facade_and_freezes_only_after_valid_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool_name = "contract_counter";
+        let (tool, effects) = ContractTool::available(tool_name, "stable contract");
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "call-1", tool_name),
+                input_json_delta(0, "{}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec![tool_name.into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
+        assert!(bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|definition| definition["name"] != LOAD_TOOLS_NAME));
+        assert_eq!(
+            llm.capability_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one drive resolves typed transport capabilities once"
+        );
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(deps
+            .store
+            .get_native_tool_plan(&deps.run_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn v2_equal_typed_profiles_ignore_opaque_model_identity() {
+        async fn facade(model: &str) -> Vec<Value> {
+            let dir = tempfile::tempdir().unwrap();
+            let (tool, _) = ContractTool::available("identity_free", "identity-free contract");
+            let llm = Arc::new(V2RecordingLlm::new(vec![final_turn("done")]));
+            let mut deps = deps_at(dir.path(), llm.clone()).await;
+            deps.model = Some(model.into());
+            let mut policy = (*deps.turn_effort_policy).clone();
+            policy.requested_model = model.into();
+            deps.turn_effort_policy = Arc::new(policy);
+            deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+            deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["identity_free".into()]);
+            enable_v2(&mut deps);
+            run_turn(
+                &deps,
+                TurnPrompt::text("go", "go"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            llm.bodies()[0]["tools"].as_array().unwrap().clone()
+        }
+
+        assert_eq!(facade("opaque-alpha").await, facade("opaque-beta").await);
+    }
+
+    #[tokio::test]
+    async fn v2_error_event_and_transport_failure_leave_candidate_unfrozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let error_llm = Arc::new(V2RecordingLlm::new(vec![vec![error_event("boom")]]));
+        let mut error_deps = deps_at(dir.path(), error_llm).await;
+        enable_v2(&mut error_deps);
+        assert!(run_turn(
+            &error_deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert!(error_deps
+            .store
+            .get_native_tool_plan(&error_deps.run_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let failing = Arc::new(FailingV2Llm {
+            capabilities: TransportToolCapabilities {
+                wire_protocol: WireProtocol::OpenAiResponses,
+                supports_function_tools: true,
+                supports_custom_freeform_tools: false,
+                supports_parallel_tool_calls: true,
+                supports_strict_function_schema: true,
+                supports_tool_output_schema: true,
+                schema_budget_tokens: 16_000,
+            },
+        });
+        let mut failing_deps = deps_at(dir.path(), failing).await;
+        enable_v2(&mut failing_deps);
+        assert!(run_turn(
+            &failing_deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert!(failing_deps
+            .store
+            .get_native_tool_plan(&failing_deps.run_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn result_text(result: &Value) -> String {
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| result.to_string())
+    }
+
+    async fn dispatch_against_plan(deps: &RunnerDeps, plan: &RunToolPlan, name: &str) -> Value {
+        run_tool_call(
+            deps,
+            &deps.agent,
+            &ToolAccum {
+                id: format!("call-{name}"),
+                name: name.into(),
+                start_input: json!({}),
+                input_json: String::new(),
+            },
+            &DisplayMode::Silent,
+            &None,
+            &CancellationToken::new(),
+            plan,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn v2_frozen_dispatch_rejects_missing_unavailable_and_changed_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "frozen_contract";
+        let (original, _) = ContractTool::available(name, "stable contract");
+        let original_registry = ToolRegistry::with_extra(vec![original]);
+        let filter = super::super::agents::ToolFilter::Only(vec![name.into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &original_registry,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let frozen = RunToolPlan::FrozenV2(compiled);
+        deps.agent.tools = filter;
+
+        deps.tools = Arc::new(ToolRegistry::builtin());
+        let missing = dispatch_against_plan(&deps, &frozen, name).await;
+        assert!(result_text(&missing).contains("capability_unavailable"));
+
+        let (unavailable, unavailable_effects) =
+            ContractTool::unavailable(name, "stable contract", false);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![unavailable]));
+        let unavailable = dispatch_against_plan(&deps, &frozen, name).await;
+        assert!(result_text(&unavailable).contains("capability_unavailable"));
+        assert_eq!(
+            unavailable_effects.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let (changed, changed_effects) = ContractTool::available(name, "changed contract");
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![changed]));
+        let changed = dispatch_against_plan(&deps, &frozen, name).await;
+        assert!(result_text(&changed).contains("capability_unavailable"));
+        assert_eq!(changed_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn v2_frozen_dispatch_rejects_expired_last_good_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "expiring_contract";
+        let (tool, effects) = ContractTool::unavailable(name, "stable contract", true);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec![name.into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let result = dispatch_against_plan(&deps, &RunToolPlan::FrozenV2(compiled), name).await;
+        assert!(result_text(&result).contains("capability_unavailable"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v2_tool_outside_frozen_plan_returns_tool_not_in_plan_without_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "outside_plan";
+        let (tool, effects) = ContractTool::available(name, "outside plan");
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::All;
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &super::super::agents::ToolFilter::Only(Vec::new()),
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let result = dispatch_against_plan(&deps, &RunToolPlan::FrozenV2(compiled), name).await;
+        assert!(result_text(&result).contains("tool_not_in_plan"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn v2_learning_payload_defaults_old_json_to_v1_and_round_trips_typed_capture() {
+        let old: LearningPayload = serde_json::from_value(json!({
+            "review_kind": "memory",
+            "parent_session_pk": "parent",
+            "model": "opaque",
+            "supports_prompt_cache": false,
+            "system": "system",
+            "tool_defs": [],
+            "messages": []
+        }))
+        .unwrap();
+        assert_eq!(old.native_tools_version, NativeToolsVersion::V1);
+        assert_eq!(old.tool_capability_profile, None);
+
+        let payload = LearningPayload {
+            native_tools_version: NativeToolsVersion::V2,
+            tool_capability_profile: Some(direct_profile()),
+            review_kind: "memory".into(),
+            parent_session_pk: "parent".into(),
+            model: "opaque".into(),
+            supports_prompt_cache: true,
+            system: "system".into(),
+            tool_defs: vec![json!({"name": "exact", "strict": true})],
+            messages: vec![],
+        };
+        let decoded: LearningPayload =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(decoded.native_tools_version, NativeToolsVersion::V2);
+        assert_eq!(decoded.tool_capability_profile, Some(direct_profile()));
+        assert_eq!(decoded.tool_defs, payload.tool_defs);
+    }
+
+    #[tokio::test]
+    async fn v2_child_run_resolves_its_own_plan_instead_of_inheriting_parent_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut parent = deps_at(dir.path(), llm).await;
+        enable_v2(&mut parent);
+        parent.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
+        let RunToolPlan::CandidateV2(parent_plan) =
+            resolve_run_tool_plan(&parent, &parent.agent).await.unwrap()
+        else {
+            panic!("new parent V2 run must compile a candidate")
+        };
+        crate::harness::native::tool_plan::freeze_plan(&parent.store, &parent.run_id, &parent_plan)
+            .await
+            .unwrap();
+
+        let mut child = parent.clone();
+        child.run_id = "opaque-child-run".into();
+        child.agent.tools = super::super::agents::ToolFilter::Only(vec!["bash".into()]);
+        let RunToolPlan::CandidateV2(child_plan) =
+            resolve_run_tool_plan(&child, &child.agent).await.unwrap()
+        else {
+            panic!("new child V2 run must compile its own candidate")
+        };
+        assert_ne!(
+            parent_plan.visible_definitions,
+            child_plan.visible_definitions
+        );
+        assert_eq!(
+            child_plan.visible_definitions[0]["name"],
+            Value::String("bash".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_review_uses_captured_profile_and_requires_exact_registry_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        enable_v2(&mut deps);
+        let profile = direct_profile();
+        let parent = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &super::super::agents::ToolFilter::Only(vec!["read".into()]),
+            profile.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        deps.agent = review_agent("captured system".into());
+        deps.review_tool_defs = Some(parent.visible_definitions.clone());
+        deps.captured_tool_capability_profile = Some(profile);
+        let RunToolPlan::CandidateV2(review) =
+            resolve_run_tool_plan(&deps, &deps.agent).await.unwrap()
+        else {
+            panic!("new V2 review run must compile a candidate")
+        };
+        assert_eq!(review.visible_definitions, parent.visible_definitions);
+        assert_eq!(
+            llm.capability_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "captured typed profiles do not re-query the current route"
+        );
+
+        let mut mismatch = deps.clone();
+        mismatch.run_id = "mismatched-review".into();
+        mismatch.review_tool_defs.as_mut().unwrap()[0]["description"] =
+            Value::String("changed after capture".into());
+        let error = resolve_run_tool_plan(&mismatch, &mismatch.agent)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("capability_unavailable"));
+    }
+
+    #[tokio::test]
     async fn load_tools_reveals_a_deferred_tool_on_the_next_turn() {
         let dir = tempfile::tempdir().unwrap();
         // Turn 1: the model calls load_tools(["webfetch"]).
@@ -6038,6 +6837,8 @@ mod tests {
         deps.activated_tools = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::BTreeSet::new(),
         )));
+        assert_eq!(deps.native_tools_version, NativeToolsVersion::V1);
+        let legacy_turn_one = current_tool_defs(&deps, &deps.agent).await;
 
         run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
             .await
@@ -6055,6 +6856,11 @@ mod tests {
         };
         let t1 = names_of(&bodies[0]);
         let t2 = names_of(&bodies[1]);
+        assert_eq!(
+            bodies[0]["tools"],
+            Value::Array(legacy_turn_one),
+            "V1 keeps the existing lazy facade byte-for-byte"
+        );
         // Turn 1: hot core + load_tools, webfetch deferred.
         assert!(t1.contains(&"load_tools".to_string()));
         assert!(t1.contains(&"read".to_string()));
