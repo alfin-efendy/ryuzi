@@ -15,7 +15,6 @@ import {
   LayoutGrid,
   ListFilter,
   Pencil,
-  Pin,
   Plus,
   Server,
   Settings,
@@ -43,16 +42,15 @@ import { useTerms } from "@/store-terms";
 import { commands } from "@/bindings";
 import {
   archivedCount,
-  chatSessions,
   isUnreadVisible,
   orderProjects,
+  orderTasks,
   projectLabel,
   sessionTitle,
-  sessionsForProject,
+  visibleTasks,
   type Ordering,
 } from "@/lib/sidebar";
 import { LOCAL_RUNNER, isSession, refOf, sessionKey, type UiSession } from "@/lib/session-key";
-import { statusMeta } from "@/lib/status";
 import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
 import { SessionRow } from "@/components/shell/SessionRow";
@@ -70,6 +68,11 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
+
+// Collapse key for the whole Projects section (mirrors TASKS_BUCKET for the
+// Tasks section). Distinct from any project id so a project named "__projects__"
+// can't collide with the section's own collapse state.
+const PROJECTS_SECTION = "__projects__";
 
 // Slim Organize/Ordering popover shared by the Tasks and Projects headers —
 // each caller supplies its own open/close state and the Ordering slice it
@@ -170,6 +173,8 @@ export function Sidebar() {
     setTaskOrdering,
     projectOrdering,
     setProjectOrdering,
+    taskOrder,
+    projectOrder,
     collapsed,
     toggleCollapsed,
   } = useUi();
@@ -245,12 +250,6 @@ export function Sidebar() {
   }, [gatewaysLoaded, hydrateGateways]);
 
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
-  // The old Projects-header menu's "Archived" toggle was removed along with
-  // the rest of that menu in this task (see OrganizeMenu above); there is no
-  // UI trigger for a global archived reveal right now, so this always reads
-  // false. Per-project archived reveal (the "N archived" link below) still
-  // works independently of this flag.
-  const [archivedGlobal] = useState(false);
   const [projectsMenuOpen, setProjectsMenuOpen] = useState(false);
   const [tasksMenuOpen, setTasksMenuOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
@@ -258,23 +257,19 @@ export function Sidebar() {
 
   const q = nav.searchQuery;
   const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
-  const projList = orderProjects(projects, projectOrdering);
-  // Chat-first sessions (no project) get their own bucket above the project
-  // tree — same query/archived/pin treatment as a project's session list,
-  // just flat (no project to nest under).
-  const qLower = q.trim().toLowerCase();
-  const chatList = chatSessions(sessions)
-    .filter((s) => !qLower || sessionTitle(s).toLowerCase().includes(qLower))
-    .filter((s) => archivedGlobal || !archived[sessionKey(s)])
-    .sort((a, b) => {
-      const pin = (pinned[sessionKey(b)] ? 1 : 0) - (pinned[sessionKey(a)] ? 1 : 0);
-      if (pin !== 0) return pin;
-      return (b.lastActive ?? 0) - (a.lastActive ?? 0);
-    });
-  // Temporary shim until Task 6 rewires the lists onto visibleTasks/orderTasks —
-  // sessionsForProject still expects a SessionFilterCtx, but the Sidebar no
-  // longer tracks status/unread filters itself.
-  const inertFilter = { statuses: {}, unreadOnly: false, readAt, focusedSession };
+  const projList = orderProjects(projects, projectOrdering, projectOrder);
+  // Top "Tasks" bucket. By Project: chat-first tasks only (project tasks nest
+  // under their project below). By Task: every task, flat. Section-level archived
+  // reveal is gone, so archived rows stay hidden here (showArchived = false);
+  // per-project reveal still lives on each project row.
+  const tasksScope = organizeBy === "task" ? "all" : "chat";
+  const taskList = orderTasks(
+    visibleTasks(sessions, tasksScope, q, false, archived),
+    pinned,
+    pinnedOrder,
+    taskOrdering,
+    taskOrder[TASKS_BUCKET] ?? [],
+  );
 
   const openSession = (s: UiSession) => {
     setFocused(refOf(s));
@@ -318,10 +313,10 @@ export function Sidebar() {
         })}
       </div>
 
-      {/* Chat sessions — chat-first sessions with no project, bucketed apart
-          from the project tree below so they never look like they belong to
-          whichever project happens to be first. */}
-      {chatList.length > 0 && (
+      {/* Tasks — the top flat bucket. By Project it holds only chat-first tasks
+          (project tasks nest under their project); By Task it holds every task,
+          flat. Rendered as guide-less SessionRows apart from the project tree. */}
+      {taskList.length > 0 && (
         <div className="box-border flex w-[260px] flex-col gap-px px-2.5">
           <div className="flex items-center gap-[2px] py-2 pl-2.5 pr-1.5">
             <div className="relative flex flex-1 items-center gap-[2px]">
@@ -365,61 +360,49 @@ export function Sidebar() {
             </div>
           </div>
           {!collapsed[TASKS_BUCKET] &&
-            chatList.map((s) => {
-              const m = statusMeta(s.status);
+            taskList.map((s) => {
               const key = sessionKey(s);
               const isActive = view.kind === "session" && isSession(s, focusedSession);
               const isPinned = !!pinned[key];
-              const rLabel = runnerLabel(s.runnerId);
-              return (
-                <div key={key} className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[key] ? "opacity-55" : ""}`}>
-                  <span
-                    className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-2 pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
-                  >
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      onClick={() => openSession(s)}
-                      className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                    >
-                      <StatusDot color={m.color} pulse={m.pulse} />
-                      <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
-                      {rLabel && (
-                        <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">
-                          {rLabel}
-                        </Badge>
-                      )}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      title={isPinned ? "Unpin" : "Pin"}
-                      className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                      onClick={() => togglePin(key)}
-                    >
-                      <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      title={archived[key] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
-                      disabled={archivingPk === s.sessionPk}
-                      className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
-                      onClick={() => (archived[key] ? setArchived(key, false) : void archiveSession(s))}
-                    >
-                      <Archive aria-hidden size={12} strokeWidth={2} />
-                    </Button>
-                  </span>
-                </div>
-              );
+              const unread = isUnreadVisible(s, readAt, focusedSession);
+              const rowProps = {
+                session: s,
+                isActive,
+                isPinned,
+                unread,
+                isArchived: !!archived[key],
+                hasTail: false,
+                showGuide: false,
+                archiveDisabled: archivingPk === s.sessionPk,
+                runnerLabel: runnerLabel(s.runnerId),
+                onOpen: () => openSession(s),
+                onTogglePin: () => togglePin(key),
+                onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
+              };
+              // Task 7 wraps pinned rows in the DnD context; until then every
+              // Tasks row is a plain (non-sortable) SessionRow.
+              return <SessionRow key={key} {...rowProps} />;
             })}
         </div>
       )}
 
       {/* Projects header */}
-      <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">
+      <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-2.5 pr-3">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className={iconBtn}
+          title={collapsed[PROJECTS_SECTION] ? "Expand Projects" : "Collapse Projects"}
+          onClick={() => toggleCollapsed(PROJECTS_SECTION)}
+        >
+          <ChevronDown
+            aria-hidden
+            size={14}
+            strokeWidth={2}
+            className={`size-[14px] transition-transform ${collapsed[PROJECTS_SECTION] ? "-rotate-90" : ""}`}
+          />
+        </Button>
         <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Projects</span>
         <span className="relative">
           <Button
@@ -455,106 +438,146 @@ export function Sidebar() {
         />
       </div>
 
-      {/* Projects tree */}
+      {/* Projects — a flat navigable list (By Task) or the nested task tree
+          (By Project). The whole section collapses via the header chevron. */}
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
-        {projList.map((p) => {
-          const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, inertFilter, pinnedOrder);
-          const archCount = archivedCount(sessions, p.projectId, archived);
-          const open = q.trim() ? sess.length > 0 : !collapsed[p.projectId];
-          return (
-            <div key={p.projectId} className="flex flex-col gap-px">
-              <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                  onClick={() => toggleCollapsed(p.projectId)}
+        {!collapsed[PROJECTS_SECTION] &&
+          (organizeBy === "task"
+            ? projList.map((p) => (
+                <div
+                  key={p.projectId}
+                  className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent"
                 >
-                  {open ? (
-                    <FolderOpen aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
-                  ) : (
-                    <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
-                  )}
-                  <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  title="Project settings"
-                  className={`${iconBtn} hidden group-hover:flex`}
-                  onClick={() => nav.setProjectSettingsFor(p.projectId)}
-                >
-                  <Settings aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  title="New task"
-                  className={`${iconBtn} hidden group-hover:flex`}
-                  onClick={() => {
-                    selectProject(p.projectId);
-                    nav.navigate({ kind: "home" });
-                    if (collapsed[p.projectId]) toggleCollapsed(p.projectId);
-                  }}
-                >
-                  <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
-                </Button>
-              </div>
-              {open && (
-                <>
-                  <DndContext
-                    sensors={sensors}
-                    collisionDetection={closestCenter}
-                    modifiers={[restrictToVerticalAxis]}
-                    onDragEnd={onPinnedDragEnd}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                    onClick={() => nav.setProjectSettingsFor(p.projectId)}
                   >
-                    <SortableContext
-                      items={sess.filter((s) => pinned[sessionKey(s)]).map((s) => sessionKey(s))}
-                      strategy={verticalListSortingStrategy}
-                    >
-                      {sess.map((s, i) => {
-                        const key = sessionKey(s);
-                        const isActive = view.kind === "session" && isSession(s, focusedSession);
-                        const isPinned = !!pinned[key];
-                        const unread = isUnreadVisible(s, readAt, focusedSession);
-                        const showArchivedLabel = archCount > 0 && !archivedGlobal;
-                        const hasTail = i < sess.length - 1 || showArchivedLabel;
-                        const rowProps = {
-                          session: s,
-                          isActive,
-                          isPinned,
-                          unread,
-                          isArchived: !!archived[key],
-                          hasTail,
-                          archiveDisabled: archivingPk === s.sessionPk,
-                          runnerLabel: runnerLabel(s.runnerId),
-                          onOpen: () => openSession(s),
-                          onTogglePin: () => togglePin(key),
-                          onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
-                        };
-                        return isPinned ? <SortableSessionRow key={key} {...rowProps} /> : <SessionRow key={key} {...rowProps} />;
-                      })}
-                    </SortableContext>
-                  </DndContext>
-                  {archCount > 0 && !archivedGlobal && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      className="h-auto min-h-6 items-stretch justify-start gap-0 rounded-sm border-0 p-0 pr-2 text-left text-[11.5px] font-normal text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent"
-                      onClick={() => setShowArchived((m) => ({ ...m, [p.projectId]: !m[p.projectId] }))}
-                    >
-                      <TreeGuide tail={false} reach={1} />
-                      <span className="self-center pl-[7px]">{showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}</span>
-                    </Button>
-                  )}
-                </>
-              )}
-            </div>
-          );
-        })}
+                    <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    title="New task"
+                    className={`${iconBtn} hidden group-hover:flex`}
+                    onClick={() => {
+                      selectProject(p.projectId);
+                      nav.navigate({ kind: "home" });
+                    }}
+                  >
+                    <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                  </Button>
+                </div>
+              ))
+            : projList.map((p) => {
+                const showArch = !!showArchived[p.projectId];
+                const sess = orderTasks(
+                  visibleTasks(sessions, { projectId: p.projectId }, q, showArch, archived),
+                  pinned,
+                  pinnedOrder,
+                  taskOrdering,
+                  taskOrder[p.projectId] ?? [],
+                );
+                const archCount = archivedCount(sessions, p.projectId, archived);
+                const open = q.trim() ? sess.length > 0 : !collapsed[p.projectId];
+                return (
+                  <div key={p.projectId} className="flex flex-col gap-px">
+                    <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                        onClick={() => toggleCollapsed(p.projectId)}
+                      >
+                        {open ? (
+                          <FolderOpen aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+                        ) : (
+                          <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+                        )}
+                        <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        title="Project settings"
+                        className={`${iconBtn} hidden group-hover:flex`}
+                        onClick={() => nav.setProjectSettingsFor(p.projectId)}
+                      >
+                        <Settings aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        title="New task"
+                        className={`${iconBtn} hidden group-hover:flex`}
+                        onClick={() => {
+                          selectProject(p.projectId);
+                          nav.navigate({ kind: "home" });
+                          if (collapsed[p.projectId]) toggleCollapsed(p.projectId);
+                        }}
+                      >
+                        <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                      </Button>
+                    </div>
+                    {open && (
+                      <>
+                        <DndContext
+                          sensors={sensors}
+                          collisionDetection={closestCenter}
+                          modifiers={[restrictToVerticalAxis]}
+                          onDragEnd={onPinnedDragEnd}
+                        >
+                          <SortableContext
+                            items={sess.filter((s) => pinned[sessionKey(s)]).map((s) => sessionKey(s))}
+                            strategy={verticalListSortingStrategy}
+                          >
+                            {sess.map((s, i) => {
+                              const key = sessionKey(s);
+                              const isActive = view.kind === "session" && isSession(s, focusedSession);
+                              const isPinned = !!pinned[key];
+                              const unread = isUnreadVisible(s, readAt, focusedSession);
+                              const showArchivedLabel = archCount > 0;
+                              const hasTail = i < sess.length - 1 || showArchivedLabel;
+                              const rowProps = {
+                                session: s,
+                                isActive,
+                                isPinned,
+                                unread,
+                                isArchived: !!archived[key],
+                                hasTail,
+                                archiveDisabled: archivingPk === s.sessionPk,
+                                runnerLabel: runnerLabel(s.runnerId),
+                                onOpen: () => openSession(s),
+                                onTogglePin: () => togglePin(key),
+                                onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
+                              };
+                              return isPinned ? <SortableSessionRow key={key} {...rowProps} /> : <SessionRow key={key} {...rowProps} />;
+                            })}
+                          </SortableContext>
+                        </DndContext>
+                        {archCount > 0 && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            className="h-auto min-h-6 items-stretch justify-start gap-0 rounded-sm border-0 p-0 pr-2 text-left text-[11.5px] font-normal text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent"
+                            onClick={() => setShowArchived((m) => ({ ...m, [p.projectId]: !m[p.projectId] }))}
+                          >
+                            <TreeGuide tail={false} reach={1} />
+                            <span className="self-center pl-[7px]">
+                              {showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}
+                            </span>
+                          </Button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              }))}
       </div>
 
       {/* Workspace / gateway switcher */}
