@@ -17,6 +17,10 @@ export type AgentDispatchGroupProps = {
 
 const idleRosterState = { status: "idle" as const, error: null };
 
+function isTerminalToolStatus(status: string | null): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
+}
+
 function knownUnavailableIndices(
   ownerRunId: string | null,
   toolCallId: string | null,
@@ -97,7 +101,7 @@ export function AgentDispatchGroup({ runnerId, sessionPk, ownerRunId, item, fall
         </div>
       );
     }
-    return fallback;
+    return isTerminalToolStatus(item.status) ? fallback : <LoadingCard />;
   }
 
   return (

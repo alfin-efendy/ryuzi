@@ -195,6 +195,20 @@ test("uses stable loading and roster-error card states before metadata exists", 
   expect(screen.getByRole("button", { name: "Retry loading agent runs" })).toBeTruthy();
 });
 
+test("keeps live ready dispatches card-shaped until their linked run arrives", () => {
+  const key = delegationSessionKey(runnerId, sessionPk);
+  useDelegation.setState({ bySession: { [key]: [] }, rosterStateBySession: { [key]: { status: "ready", error: null } } });
+
+  for (const name of ["task", "delegate_agent"]) {
+    const { unmount } = renderGroup({ item: item({ name, status: "in_progress" }) });
+
+    expect(screen.getByRole("status", { name: "Loading agent run" })).toBeTruthy();
+    expect(screen.queryByText("ordinary task chip")).toBeNull();
+
+    unmount();
+  }
+});
+
 test("retains stale cards during a roster refresh error and marks vanished slots unavailable after a successful roster", () => {
   const key = delegationSessionKey(runnerId, sessionPk);
   const stale = run({ runId: "stale", status: "completed", result: "Still visible" });
