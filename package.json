@@ -13,7 +13,8 @@
     "cockpit:build": "cd apps/cockpit && bun run tauri build",
     "e2e:cockpit": "bun run --cwd apps/cockpit e2e",
     "lint": "biome ci .",
-    "format": "biome check --write ."
+    "format": "biome check --write .",
+    "check:agentic-cleanup": "bun scripts/check-agentic-cleanup.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
