@@ -1,4 +1,3 @@
-pub mod agent_settings;
 pub mod agents;
 pub mod api;
 pub mod approval;
@@ -9,7 +8,6 @@ pub mod branches;
 pub mod connector;
 pub mod control;
 pub mod control_token;
-pub mod curator;
 pub mod daemon;
 pub mod daemon_lock;
 pub mod daemon_status;
@@ -43,6 +41,9 @@ pub mod tls;
 pub mod update;
 pub mod workspace;
 pub mod worktree;
+
+#[cfg(test)]
+mod agentic_upgrade_compat;
 
 pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};
 pub use control::{ControlPlane, ProvisionProjectRequest, ProvisionSettings};

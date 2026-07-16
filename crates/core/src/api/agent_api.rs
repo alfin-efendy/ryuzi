@@ -1042,6 +1042,13 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "update_session_runtime" => {
             let a: UpdateSessionRuntimeP = params(p)?;
             let session_pk = a.session_pk.trim().to_string();
+            // Historical (legacy / deleted-owner) sessions are read-only.
+            crate::sessions::ownership::require_executable_session_agent(
+                cp.store(),
+                &state.agents,
+                &session_pk,
+            )
+            .await?;
             let model = clean_optional(a.model);
             let effort = match a.effort {
                 Some(value) if value.trim().is_empty() => {
@@ -2303,12 +2310,19 @@ mod tests {
 
     #[tokio::test]
     async fn projectless_session_runtime_handlers_round_trip() {
-        use crate::domain::{Session, SessionKind, SessionStatus};
+        use crate::domain::{AgentIdentitySnapshot, Session, SessionKind, SessionStatus};
         let s = state().await;
+        // A live (executable-owner) chat session: runtime mutations require an
+        // executable primary agent, so seed one rather than a legacy row.
+        let owner = s.agents.default_agent_id().await;
         let chat = Session {
             session_pk: "chat-1".into(),
-            primary_agent_id: None,
-            primary_agent_snapshot: None,
+            primary_agent_id: Some(owner.clone()),
+            primary_agent_snapshot: Some(AgentIdentitySnapshot {
+                id: owner.clone(),
+                name: "Ryuzi".into(),
+                avatar_color: "violet".into(),
+            }),
             project_id: None,
             agent_session_id: None,
             worktree_path: None,
