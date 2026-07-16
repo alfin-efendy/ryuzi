@@ -1673,4 +1673,49 @@ mod tests {
         assert!(disabled.get("keyMasked").is_none());
         assert!(disabled.get("claudeCloaking").is_none());
     }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn add_connection_accepts_the_subscription_members() {
+        // The MiMo Token Plan and OpenCode Go descriptors are `ApiKey`, so they
+        // skip add_connection's non-ApiKey "coming in a later phase" refusal.
+        let s = state().await;
+
+        let list = dispatch(
+            &s,
+            "add_connection",
+            json!({
+                "provider": "mimo", "label": "MiMo (Token Plan)",
+                "api_key": "tp-test",
+                "base_url": "https://token-plan-sgp.xiaomimimo.com/v1"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|connection| connection["provider"] == "mimo"),
+            "mimo subscription connection should be added"
+        );
+
+        let list = dispatch(
+            &s,
+            "add_connection",
+            json!({
+                "provider": "opencode", "label": "OpenCode (Go)",
+                "api_key": "sk-oc-test", "base_url": null
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|connection| connection["provider"] == "opencode"),
+            "opencode subscription connection should be added"
+        );
+    }
 }

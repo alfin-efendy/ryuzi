@@ -564,6 +564,35 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_grant: None,
     },
     ProviderDescriptor {
+        id: "opencode",
+        name: "OpenCode (Go)",
+        family: "opencode-free",
+        color: "#F5A623",
+        initial: "OC",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        // OpenCode Go subscription ($5/mo); key from https://opencode.ai/auth.
+        base_url: Some("https://opencode.ai/zen/go/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[
+            "glm-5.2",
+            "kimi-k2.7-code",
+            "deepseek-v4-pro",
+            "mimo-v2.5-pro",
+        ],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        // Seed list stands; the /models route is not relied upon here.
+        has_models_endpoint: false,
+        uses_max_completion_tokens: false,
+        device_grant: None,
+    },
+    ProviderDescriptor {
         id: "mimo-free",
         name: "MiMo (free)",
         family: "mimo-free",
@@ -583,6 +612,33 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: Some("/chat"),
+        has_models_endpoint: false,
+        uses_max_completion_tokens: false,
+        device_grant: None,
+    },
+    ProviderDescriptor {
+        id: "mimo",
+        name: "MiMo (Token Plan)",
+        family: "mimo-free",
+        color: "#FF6900",
+        initial: "M",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        // Xiaomi MiMo Token Plan (key starts with `tp-`); key from
+        // https://mimo.xiaomi.com. The region-specific host
+        // (token-plan-<sgp|cn|ams>.xiaomimimo.com) is chosen in the Add Account
+        // region picker and stored as the connection's base_url_override; this
+        // static default is the sgp cluster.
+        base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &["mimo-v2.5-pro", "mimo-v2.5"],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
         has_models_endpoint: false,
         uses_max_completion_tokens: false,
         device_grant: None,
@@ -876,6 +932,24 @@ mod tests {
         assert_eq!(family_of("kiro"), Some("kiro"));
         assert_eq!(family_of("custom-openai"), Some("custom-openai"));
         assert_eq!(family_of("nope"), None);
+    }
+
+    #[test]
+    fn mimo_and_opencode_subscription_members_join_the_free_family() {
+        // Subscription members share the free tier's family head so they pool
+        // into one provider card and trigger the Free/Subscription chooser.
+        let mimo = descriptor("mimo").expect("mimo descriptor");
+        assert_eq!(mimo.family, "mimo-free");
+        assert_eq!(mimo.category, ProviderCategory::ApiKey);
+        assert!(matches!(mimo.format, ApiFormat::OpenAi));
+        assert!(matches!(mimo.auth, AuthScheme::Bearer));
+        assert_eq!(family_of("mimo"), Some("mimo-free"));
+
+        let oc = descriptor("opencode").expect("opencode descriptor");
+        assert_eq!(oc.family, "opencode-free");
+        assert_eq!(oc.category, ProviderCategory::ApiKey);
+        assert!(matches!(oc.auth, AuthScheme::Bearer));
+        assert_eq!(family_of("opencode"), Some("opencode-free"));
     }
 
     #[test]
