@@ -398,6 +398,10 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         Arc::clone(&store),
     )
     .await?;
+    // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
+    // install has runnable models (and the `free` route below has candidates)
+    // without any "Add account" step. Idempotent + respects user deletion.
+    crate::agents::bootstrap::ensure_free_providers_seeded(&store).await?;
     // Default durable profiles target the `free` route. Create it only after
     // persistence has materialized the profiles and after connections are
     // available; a fresh daemon with none remains intentionally unconfigured.

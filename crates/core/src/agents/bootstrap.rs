@@ -12,6 +12,7 @@ use anyhow::Context;
 use indexmap::IndexMap;
 
 use crate::agent_settings;
+use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 use crate::llm_router::routes::{self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget};
 use crate::paths;
 use crate::store::Store;
@@ -33,6 +34,11 @@ pub const AGENT_PERSISTENCE_MARKER: &str = "agent_persistence_schema";
 
 /// The only schema value this build understands.
 const AGENT_PERSISTENCE_SCHEMA: &str = "1";
+
+/// Settings marker: the one-time auto-seed of the MiMo/OpenCode free-tier
+/// connections has run. Kept separate from the agent-persistence marker so a
+/// user who deletes the seeded rows is not re-seeded on the next boot.
+const FREE_PROVIDERS_SEEDED_MARKER: &str = "free_providers_seeded_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapReason {
@@ -222,6 +228,45 @@ pub(crate) async fn ensure_default_route(store: &Store, name: &str) -> anyhow::R
 
 pub(crate) async fn ensure_default_routes(store: &Store) -> anyhow::Result<()> {
     ensure_default_route(store, "free").await?;
+    Ok(())
+}
+
+/// Idempotently create enabled, credential-less `free` connections for the
+/// MiMo and OpenCode free tiers so a fresh install has working models with no
+/// "Add account" click. Guarded by [`FREE_PROVIDERS_SEEDED_MARKER`] so deleting
+/// the rows is respected.
+pub(crate) async fn ensure_free_providers_seeded(store: &Store) -> anyhow::Result<()> {
+    if store
+        .get_setting_raw(FREE_PROVIDERS_SEEDED_MARKER)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    for (provider, label) in [
+        ("mimo-free", "MiMo (free)"),
+        ("opencode-free", "OpenCode (free)"),
+    ] {
+        let now = crate::paths::now_ms();
+        connections::add_connection(
+            store,
+            ConnectionRow {
+                id: crate::paths::new_id(),
+                provider: provider.into(),
+                auth_type: "free".into(),
+                label: label.into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData::default(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await?;
+    }
+    store
+        .set_setting_raw(FREE_PROVIDERS_SEEDED_MARKER, "1")
+        .await?;
     Ok(())
 }
 
@@ -1122,5 +1167,50 @@ mod tests {
                 Err(error) => error.to_string(),
             };
         assert!(error.contains("unsupported agent persistence schema"));
+    }
+
+    #[tokio::test]
+    async fn ensure_free_providers_seeded_adds_mimo_and_opencode_once() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+
+        ensure_free_providers_seeded(&store).await.unwrap();
+        let conns = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        let providers: std::collections::HashSet<_> =
+            conns.iter().map(|c| c.provider.as_str()).collect();
+        assert!(providers.contains("mimo-free"));
+        assert!(providers.contains("opencode-free"));
+        assert!(conns.iter().all(|c| c.enabled && c.auth_type == "free"));
+        let seeded = conns.len();
+
+        // Idempotent: a second call adds nothing.
+        ensure_free_providers_seeded(&store).await.unwrap();
+        let again = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        assert_eq!(again.len(), seeded);
+    }
+
+    #[tokio::test]
+    async fn ensure_free_providers_seeded_does_not_readd_after_user_deletes() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        ensure_free_providers_seeded(&store).await.unwrap();
+        let conns = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        for c in &conns {
+            crate::llm_router::connections::remove_connection(&store, &c.id)
+                .await
+                .unwrap();
+        }
+        // Marker is set, so re-seeding is a no-op even though the rows are gone.
+        ensure_free_providers_seeded(&store).await.unwrap();
+        let after = crate::llm_router::connections::list_connections(&store)
+            .await
+            .unwrap();
+        assert!(after.is_empty());
     }
 }
