@@ -1,18 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { Project, SessionStatus } from "../bindings";
-import {
-  archivedCount,
-  chatSessions,
-  dropTarget,
-  isUnreadVisible,
-  orderProjects,
-  orderTasks,
-  reorder,
-  sessionsForProject,
-  sessionTitle,
-  visibleTasks,
-  type SessionFilterCtx,
-} from "./sidebar";
+import type { Project } from "../bindings";
+import { archivedCount, dropTarget, isUnreadVisible, orderProjects, orderTasks, reorder, sessionTitle, visibleTasks } from "./sidebar";
 import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): UiSession {
@@ -51,27 +39,8 @@ const sessions = [
   sess("d", "p1", null, 40),
 ];
 
-const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
-
 describe("sidebar sessions", () => {
-  test("filters by project and sorts newest first", () => {
-    const out = sessionsForProject(sessions, "p1", "", false, {}, {}, noFilter);
-    expect(out.map((s) => s.sessionPk)).toEqual(["d", "b", "a"]);
-  });
-
-  test("pinned sessions sort first", () => {
-    const out = sessionsForProject(sessions, "p1", "", false, { [K("a")]: true }, {}, noFilter);
-    expect(out[0].sessionPk).toBe("a");
-  });
-
-  test("query matches the title case-insensitively", () => {
-    const out = sessionsForProject(sessions, "p1", "dark", false, {}, {}, noFilter);
-    expect(out.map((s) => s.sessionPk)).toEqual(["b"]);
-  });
-
-  test("archived sessions hide unless revealed", () => {
-    expect(sessionsForProject(sessions, "p1", "", false, {}, { [K("b")]: true }, noFilter).map((s) => s.sessionPk)).toEqual(["d", "a"]);
-    expect(sessionsForProject(sessions, "p1", "", true, {}, { [K("b")]: true }, noFilter).map((s) => s.sessionPk)).toEqual(["d", "b", "a"]);
+  test("archivedCount tallies archived sessions for a project", () => {
     expect(archivedCount(sessions, "p1", { [K("b")]: true, [K("c")]: true })).toBe(1);
   });
 
@@ -84,28 +53,6 @@ describe("sidebar sessions", () => {
     const projects = [{ projectId: "z", name: "zeta" } as Project, { projectId: "a", name: "alpha" } as Project];
     expect(orderProjects(projects, "updated").map((p) => p.projectId)).toEqual(["z", "a"]);
     expect(orderProjects(projects, "name").map((p) => p.projectId)).toEqual(["a", "z"]);
-  });
-
-  test("chat sessions bucket separately from project sessions", () => {
-    const sessions = [
-      { sessionPk: "c1", projectId: null, kind: "chat", runnerId: LOCAL_RUNNER },
-      { sessionPk: "p1", projectId: "proj", kind: "project", runnerId: LOCAL_RUNNER },
-    ] as any;
-    expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
-    expect(sessionsForProject(sessions, "proj", "", false, {}, {}, noFilter).map((s) => s.sessionPk)).toEqual(["p1"]);
-  });
-
-  // C2: worker/review sessions carry a real projectId (unlike chat) but must
-  // never leak into either bucket — drill-down (via the task strip) is the
-  // only way to open them.
-  test("worker and review sessions never appear in sidebar buckets", () => {
-    const sessions = [
-      { sessionPk: "w1", projectId: "p", kind: "worker" },
-      { sessionPk: "r1", projectId: null, kind: "review" },
-      { sessionPk: "c1", projectId: null, kind: "chat" },
-    ] as any;
-    expect(chatSessions(sessions).map((s) => s.sessionPk)).toEqual(["c1"]);
-    expect(sessionsForProject(sessions, "p", "", false, {}, {}, noFilter)).toEqual([]);
   });
 });
 
@@ -155,60 +102,6 @@ describe("isUnreadVisible", () => {
   });
 });
 
-// Built on `unreadSess` (not the 4-arg `sess`) so the status-carrying fixture
-// shares the same project id ("p") the filter-composition tests rely on.
-function sessS(pk: string, status: SessionStatus, lastActive: number | null): UiSession {
-  return { ...unreadSess(pk, lastActive), status };
-}
-
-describe("sessionsForProject filter", () => {
-  test("empty status filter passes all statuses", () => {
-    const rows = sessionsForProject([sessS("a", "idle", 2), sessS("b", "running", 1)], "p", "", false, {}, {}, noFilter);
-    expect(rows.map((r) => r.sessionPk)).toEqual(["a", "b"]);
-  });
-
-  test("status filter keeps only matching statuses", () => {
-    const rows = sessionsForProject(
-      [sessS("a", "idle", 2), sessS("b", "running", 1)],
-      "p",
-      "",
-      false,
-      {},
-      {},
-      { ...noFilter, statuses: { running: true } },
-    );
-    expect(rows.map((r) => r.sessionPk)).toEqual(["b"]);
-  });
-
-  test("unreadOnly gates on isUnreadVisible", () => {
-    // a: lastActive 500 > cursor 100 → unread; b: lastActive 50 <= 100 → read
-    const rows = sessionsForProject(
-      [sessS("a", "idle", 500), sessS("b", "idle", 50)],
-      "p",
-      "",
-      false,
-      {},
-      {},
-      { ...noFilter, unreadOnly: true, readAt: { [K("a")]: 100, [K("b")]: 100 } },
-    );
-    expect(rows.map((r) => r.sessionPk)).toEqual(["a"]);
-  });
-
-  test("filter composes with query and preserves pin/recency ordering", () => {
-    const rows = sessionsForProject(
-      [sessS("a", "running", 1), sessS("b", "running", 9)],
-      "p",
-      "",
-      false,
-      { [K("a")]: true },
-      {},
-      { ...noFilter, statuses: { running: true } },
-    );
-    // both running; a is pinned so it sorts first despite older lastActive
-    expect(rows.map((r) => r.sessionPk)).toEqual(["a", "b"]);
-  });
-});
-
 test("reorder moves fromId to toId's slot (forward and backward), immutably", () => {
   const a = ["1", "2", "3", "4"];
   expect(reorder(a, "1", "3")).toEqual(["2", "3", "1", "4"]);
@@ -227,68 +120,6 @@ test("dropTarget picks partition and rejects cross-partition / no-op", () => {
   expect(dropTarget("a", "b", true, true)).toBe("pinned");
   expect(dropTarget("a", "b", true, false)).toBeNull();
   expect(dropTarget("a", "a", false, false)).toBeNull();
-});
-
-test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fall after by recency", () => {
-  const mk = (pk: string, lastActive: number): UiSession => ({
-    runnerId: LOCAL_RUNNER,
-    sessionPk: pk,
-    primaryAgentId: null,
-    primaryAgentSnapshot: null,
-    projectId: "p",
-    agentSessionId: null,
-    worktreePath: null,
-    branch: null,
-    title: pk,
-    status: "idle" as const,
-    startedBy: null,
-    createdAt: 0,
-    lastActive,
-    resumeAttempts: 0,
-    branchOwned: false,
-    permMode: "default" as const,
-    kind: "project" as const,
-    speaker: null,
-    agent: null,
-    parentSessionPk: null,
-  });
-  const sessions = [mk("a", 100), mk("b", 200), mk("c", 300)];
-  const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
-  // a,b,c all pinned; pinnedOrder = [c, a] → c, a first (by order), then b (unordered → recency)
-  const out = sessionsForProject(sessions, "p", "", false, { [K("a")]: true, [K("b")]: true, [K("c")]: true }, {}, noFilter, [
-    K("c"),
-    K("a"),
-  ]);
-  expect(out.map((s) => s.sessionPk)).toEqual(["c", "a", "b"]);
-});
-
-test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-recency", () => {
-  const mk = (pk: string, lastActive: number): UiSession => ({
-    runnerId: LOCAL_RUNNER,
-    sessionPk: pk,
-    primaryAgentId: null,
-    primaryAgentSnapshot: null,
-    projectId: "p",
-    agentSessionId: null,
-    worktreePath: null,
-    branch: null,
-    title: pk,
-    status: "idle" as const,
-    startedBy: null,
-    createdAt: 0,
-    lastActive,
-    resumeAttempts: 0,
-    branchOwned: false,
-    permMode: "default" as const,
-    kind: "project" as const,
-    speaker: null,
-    agent: null,
-    parentSessionPk: null,
-  });
-  const sessions = [mk("a", 100), mk("b", 300)];
-  const noFilter: SessionFilterCtx = { statuses: {}, unreadOnly: false, readAt: {}, focusedSession: null };
-  // a pinned, b not → a first despite older lastActive (no pinnedOrder arg → default [])
-  expect(sessionsForProject(sessions, "p", "", false, { [K("a")]: true }, {}, noFilter).map((s) => s.sessionPk)).toEqual(["a", "b"]);
 });
 
 describe("orderProjects manual", () => {

@@ -144,24 +144,6 @@ test("seedReadState treats null lastActive as 0", () => {
   expect(useUi.getState().readAt[k3]).toBe(0);
 });
 
-test("markAllRead advances every session to its lastActive", () => {
-  useUi.setState({ readAt: { [k1]: 1 } });
-  useUi.getState().markAllRead([sess("s1", 400), sess("s2", 700)]);
-  expect(useUi.getState().readAt).toEqual({ [k1]: 400, [k2]: 700 });
-});
-
-test("toggleStatusFilter and toggleUnreadOnly persist", () => {
-  useUi.setState({ sessionFilter: { statuses: {}, unreadOnly: false } });
-  useUi.getState().toggleStatusFilter("running");
-  useUi.getState().toggleUnreadOnly();
-  expect(useUi.getState().sessionFilter).toEqual({ statuses: { running: true }, unreadOnly: true });
-  const saved = JSON.parse(localStorage.getItem("cockpit.ui.sessionFilter")!);
-  expect(saved).toEqual({ statuses: { running: true }, unreadOnly: true });
-  // toggling again removes the status
-  useUi.getState().toggleStatusFilter("running");
-  expect(useUi.getState().sessionFilter.statuses).toEqual({});
-});
-
 test("togglePin maintains pinnedOrder (append on pin, remove on unpin) and persists", () => {
   useUi.setState({ pinned: {}, pinnedOrder: [] });
   useUi.getState().togglePin("a");

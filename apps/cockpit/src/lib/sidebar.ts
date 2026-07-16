@@ -37,14 +37,6 @@ export function sessionTitle(s: Session): string {
   return s.title?.trim() || "Untitled session";
 }
 
-export type SessionFilterCtx = {
-  statuses: Record<string, true>;
-  unreadOnly: boolean;
-  /** Keyed by `sessKey(runnerId, pk)`. */
-  readAt: Record<string, number>;
-  focusedSession: SessionRef | null;
-};
-
 /** Given two composite keys and whether the dragged row is pinned, decide the
  *  reorder target. Returns null when the drop crosses partitions (pinned vs
  *  unpinned) or is a no-op. */
@@ -65,43 +57,6 @@ export function reorder(list: string[], fromId: string, toId: string): string[] 
   const [moved] = next.splice(from, 1);
   next.splice(to, 0, moved);
   return next;
-}
-
-// Sessions shown under one project row: query-filtered, archived hidden unless
-// revealed, status/unread filtered, pinned first, newest first within each
-// group. `kind === "project"` is required too — chat/worker/review sessions
-// carry `projectId: null` and must never leak into a project's bucket.
-export function sessionsForProject(
-  sessions: UiSession[],
-  projectId: string,
-  query: string,
-  showArchived: boolean,
-  pinned: Record<string, true>,
-  archived: Record<string, true>,
-  filter: SessionFilterCtx,
-  pinnedOrder: string[] = [],
-): UiSession[] {
-  const q = query.trim().toLowerCase();
-  const statusActive = Object.keys(filter.statuses).length > 0;
-  return sessions
-    .filter((s) => s.projectId === projectId && s.kind === "project")
-    .filter((s) => !q || sessionTitle(s).toLowerCase().includes(q))
-    .filter((s) => showArchived || !archived[sessionKey(s)])
-    .filter((s) => !statusActive || filter.statuses[s.status])
-    .filter((s) => !filter.unreadOnly || isUnreadVisible(s, filter.readAt, filter.focusedSession))
-    .sort((a, b) => {
-      const ap = pinned[sessionKey(a)] ? 1 : 0;
-      const bp = pinned[sessionKey(b)] ? 1 : 0;
-      if (ap !== bp) return bp - ap; // pinned first
-      if (ap === 1) {
-        const ai = pinnedOrder.indexOf(sessionKey(a));
-        const bi = pinnedOrder.indexOf(sessionKey(b));
-        const av = ai === -1 ? Number.POSITIVE_INFINITY : ai;
-        const bv = bi === -1 ? Number.POSITIVE_INFINITY : bi;
-        if (av !== bv) return av - bv; // by manual order; unordered → after
-      }
-      return (b.lastActive ?? 0) - (a.lastActive ?? 0); // recency within group
-    });
 }
 
 /** Pure filter for a task list — no sorting. `scope` picks the bucket:

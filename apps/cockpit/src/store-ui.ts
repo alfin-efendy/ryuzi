@@ -44,7 +44,6 @@ const KEY = {
   hideInvalidModels: "cockpit.ui.hideInvalidModels",
   notificationsEnabled: "cockpit.ui.notificationsEnabled",
   readAt: "cockpit.ui.readAt",
-  sessionFilter: "cockpit.ui.sessionFilter",
   organizeBy: "cockpit.ui.organizeBy",
   taskOrdering: "cockpit.ui.taskOrdering",
   projectOrdering: "cockpit.ui.projectOrdering",
@@ -92,17 +91,6 @@ function readNumMap(key: string): Record<string, number> {
     return raw ? (JSON.parse(raw) as Record<string, number>) : {};
   } catch {
     return {};
-  }
-}
-function readSessionFilter(key: string): { statuses: Record<string, true>; unreadOnly: boolean } {
-  if (typeof localStorage === "undefined") return { statuses: {}, unreadOnly: false };
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return { statuses: {}, unreadOnly: false };
-    const v = JSON.parse(raw) as { statuses?: Record<string, true>; unreadOnly?: boolean };
-    return { statuses: v.statuses ?? {}, unreadOnly: v.unreadOnly ?? false };
-  } catch {
-    return { statuses: {}, unreadOnly: false };
   }
 }
 function readOrdering(key: string): Ordering {
@@ -160,8 +148,6 @@ type UiState = {
   /** Per-session last-read epoch-ms cursor (unread = lastActive > cursor),
    *  keyed by `sessKey(runnerId, pk)`. */
   readAt: Record<string, number>;
-  /** Sidebar session filters: status checkboxes (empty = all) + unread-only toggle. */
-  sessionFilter: { statuses: Record<string, true>; unreadOnly: boolean };
   /** Sidebar grouping: by project, or a flat task list. */
   organizeBy: "project" | "task";
   taskOrdering: Ordering;
@@ -196,10 +182,7 @@ type UiState = {
   toggleHideInvalidModels: () => void;
   toggleNotifications: () => void;
   markRead: (key: string, ts: number) => void;
-  markAllRead: (sessions: UiSession[]) => void;
   seedReadState: (sessions: UiSession[]) => void;
-  toggleStatusFilter: (status: string) => void;
-  toggleUnreadOnly: () => void;
   setOrganizeBy: (v: "project" | "task") => void;
   setTaskOrdering: (o: Ordering) => void;
   setProjectOrdering: (o: Ordering) => void;
@@ -217,7 +200,6 @@ export const useUi = create<UiState>((set, get) => ({
   pinnedOrder: readList(KEY.pinnedOrder),
   archived: readSet(KEY.archived),
   readAt: readNumMap(KEY.readAt),
-  sessionFilter: readSessionFilter(KEY.sessionFilter),
   organizeBy: typeof localStorage !== "undefined" && localStorage.getItem(KEY.organizeBy) === "task" ? "task" : "project",
   taskOrdering: readOrdering(KEY.taskOrdering),
   projectOrdering: readOrdering(KEY.projectOrdering),
@@ -318,12 +300,6 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.readAt, JSON.stringify(readAt));
     set({ readAt });
   },
-  markAllRead: (sessions) => {
-    const readAt = { ...get().readAt };
-    for (const s of sessions) readAt[sessionKey(s)] = s.lastActive ?? 0;
-    persist(KEY.readAt, JSON.stringify(readAt));
-    set({ readAt });
-  },
   seedReadState: (sessions) => {
     const cur = get().readAt;
     let changed = false;
@@ -338,18 +314,6 @@ export const useUi = create<UiState>((set, get) => ({
     if (!changed) return; // idempotent no-op when nothing absent
     persist(KEY.readAt, JSON.stringify(readAt));
     set({ readAt });
-  },
-  toggleStatusFilter: (status) => {
-    const cur = get().sessionFilter;
-    const next = { ...cur, statuses: toggleKey(cur.statuses, status) };
-    persist(KEY.sessionFilter, JSON.stringify(next));
-    set({ sessionFilter: next });
-  },
-  toggleUnreadOnly: () => {
-    const cur = get().sessionFilter;
-    const next = { ...cur, unreadOnly: !cur.unreadOnly };
-    persist(KEY.sessionFilter, JSON.stringify(next));
-    set({ sessionFilter: next });
   },
   setOrganizeBy: (v) => {
     persist(KEY.organizeBy, v);

@@ -70,7 +70,6 @@ beforeEach(() => {
   useUi.setState({
     pinned: {},
     archived: {},
-    sessionFilter: { statuses: {}, unreadOnly: false },
     organizeBy: "project",
     collapsed: {},
     taskOrder: {},
@@ -168,7 +167,7 @@ const k1 = sessKey(LOCAL_RUNNER, "s1");
 const k2 = sessKey(LOCAL_RUNNER, "s2");
 
 test("renders an unread dot for an unread, non-focused session", () => {
-  useUi.setState({ readAt: { [k1]: 100, [k2]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100, [k2]: 100 } });
   useStore.setState({
     projects: [project],
     sessions: [sessionFixture("s1", 500), sessionFixture("s2", 50)],
@@ -181,7 +180,7 @@ test("renders an unread dot for an unread, non-focused session", () => {
 });
 
 test("does not show an unread dot for the focused session even if unseen", () => {
-  useUi.setState({ readAt: { [k1]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100 } });
   useStore.setState({
     projects: [project],
     sessions: [sessionFixture("s1", 500)],
