@@ -5716,9 +5716,7 @@ mod tests {
                 // survives to be inserted into.
                 for table in ["orch_tasks", "orch_task_deps"] {
                     let exists: bool = c
-                        .prepare(
-                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-                        )?
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
                         .exists([table])?;
                     assert!(!exists, "{table} must not survive migration 39");
                 }
@@ -7636,7 +7634,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(uv, 39, "forward migration must land at v39");
-        assert!(has_fts, "messages_fts must survive (not part of the cleanup)");
+        assert!(
+            has_fts,
+            "messages_fts must survive (not part of the cleanup)"
+        );
         assert!(
             !has_usage && !has_cstate && !has_cruns,
             "skill_usage/curator_state/curator_runs must not survive migration 39"
@@ -9131,27 +9132,115 @@ mod tests {
         drop(store);
 
         let store = Store::open(tmp.path()).await.unwrap();
-        store.with_conn(|c| {
-            let project: (String, String, Option<String>, Option<String>) = c.query_row(
-                "SELECT name,workdir,model,effort FROM projects WHERE project_id='p-keep'",
-                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-            )?;
-            assert_eq!(project, ("Keep project".into(), "/keep".into(), Some("route:smart".into()), Some("high".into())));
-            assert_eq!(c.query_row("SELECT count(*) FROM sessions WHERE session_pk='legacy-s'", [], |r| r.get::<_, i64>(0))?, 1);
-            assert_eq!(c.query_row("SELECT payload FROM messages WHERE session_pk='legacy-s'", [], |r| r.get::<_, String>(0))?, "{\"text\":\"keep transcript\"}");
-            assert_eq!(c.query_row("SELECT count(*) FROM provider_turns WHERE session_pk='legacy-s'", [], |r| r.get::<_, i64>(0))?, 1);
-            assert_eq!(c.query_row("SELECT count(*) FROM provider_connections WHERE id='provider-keep'", [], |r| r.get::<_, i64>(0))?, 1);
-            assert_eq!(c.query_row("SELECT value FROM settings WHERE key='workdir_root'", [], |r| r.get::<_, String>(0))?, "/keep-root");
-            assert_eq!(c.query_row("SELECT count(*) FROM background_events WHERE id='keep-event'", [], |r| r.get::<_, i64>(0))?, 1);
-            assert_eq!(c.query_row("SELECT count(*) FROM background_events WHERE kind IN ('learning','orch')", [], |r| r.get::<_, i64>(0))?, 0);
-            for key in ["agent_model", "agent_perm_mode", "agent.max_provider_turns", "agent.auto_continue_budget", "memory.nudge_interval"] {
-                assert_eq!(c.query_row("SELECT count(*) FROM settings WHERE key=?1", [key], |r| r.get::<_, i64>(0))?, 0, "legacy key survived: {key}");
-            }
-            for table in ["orch_tasks", "orch_task_deps", "skill_usage", "curator_state", "curator_runs"] {
-                assert_eq!(c.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |r| r.get::<_, i64>(0))?, 0, "legacy table survived: {table}");
-            }
-            Ok(())
-        }).await.unwrap();
+        store
+            .with_conn(|c| {
+                let project: (String, String, Option<String>, Option<String>) = c.query_row(
+                    "SELECT name,workdir,model,effort FROM projects WHERE project_id='p-keep'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                assert_eq!(
+                    project,
+                    (
+                        "Keep project".into(),
+                        "/keep".into(),
+                        Some("route:smart".into()),
+                        Some("high".into())
+                    )
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM sessions WHERE session_pk='legacy-s'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT payload FROM messages WHERE session_pk='legacy-s'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "{\"text\":\"keep transcript\"}"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM provider_turns WHERE session_pk='legacy-s'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM provider_connections WHERE id='provider-keep'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT value FROM settings WHERE key='workdir_root'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "/keep-root"
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM background_events WHERE id='keep-event'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT count(*) FROM background_events WHERE kind IN ('learning','orch')",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                for key in [
+                    "agent_model",
+                    "agent_perm_mode",
+                    "agent.max_provider_turns",
+                    "agent.auto_continue_budget",
+                    "memory.nudge_interval",
+                ] {
+                    assert_eq!(
+                        c.query_row("SELECT count(*) FROM settings WHERE key=?1", [key], |r| r
+                            .get::<_, i64>(
+                            0
+                        ))?,
+                        0,
+                        "legacy key survived: {key}"
+                    );
+                }
+                for table in [
+                    "orch_tasks",
+                    "orch_task_deps",
+                    "skill_usage",
+                    "curator_state",
+                    "curator_runs",
+                ] {
+                    assert_eq!(
+                        c.query_row(
+                            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                            [table],
+                            |r| r.get::<_, i64>(0)
+                        )?,
+                        0,
+                        "legacy table survived: {table}"
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -9165,18 +9254,36 @@ mod tests {
         }).await.unwrap();
         drop(store);
         let reopened = Store::open(tmp.path()).await.unwrap();
-        assert_eq!(reopened.get_setting("agentic.user.preference").await.unwrap().as_deref(), Some("keep"));
+        assert_eq!(
+            reopened
+                .get_setting("agentic.user.preference")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("keep")
+        );
     }
 
     #[tokio::test]
     async fn fresh_store_has_no_legacy_agent_tables_or_settings() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        store.with_conn(|c| {
-            for name in ["orch_tasks", "orch_task_deps", "skill_usage", "curator_state", "curator_runs"] {
-                assert!(!c.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?.exists([name])?);
-            }
-            Ok(())
-        }).await.unwrap();
+        store
+            .with_conn(|c| {
+                for name in [
+                    "orch_tasks",
+                    "orch_task_deps",
+                    "skill_usage",
+                    "curator_state",
+                    "curator_runs",
+                ] {
+                    assert!(!c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+                        .exists([name])?);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 }

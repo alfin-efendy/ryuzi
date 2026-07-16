@@ -30,8 +30,8 @@ use indexmap::IndexMap;
 
 use crate::agents::bootstrap::testing::BootstrapFailpoint;
 use crate::agents::bootstrap::{
-    initialize_agent_persistence, initialize_agent_registry, AGENT_PERSISTENCE_MARKER,
-    BootstrapReason,
+    initialize_agent_persistence, initialize_agent_registry, BootstrapReason,
+    AGENT_PERSISTENCE_MARKER,
 };
 use crate::agents::okf::{ConceptArea, KnowledgeConceptInput, KnowledgeScope};
 use crate::agents::transaction::TransactionFailpoint;
@@ -357,7 +357,11 @@ async fn background_event_present(store: &Store, id: &str) -> bool {
 /// paths.
 async fn assert_single_executable_ryuzi(registry: &crate::agents::registry::AgentRegistry) {
     let snapshot = registry.snapshot().await;
-    assert_eq!(snapshot.agents.len(), 1, "expected exactly one agent bundle");
+    assert_eq!(
+        snapshot.agents.len(),
+        1,
+        "expected exactly one agent bundle"
+    );
     assert_eq!(snapshot.agents[0].profile.name, "Ryuzi");
     assert!(
         snapshot.agents[0].executable,
@@ -426,7 +430,10 @@ async fn assert_markers_gate_only_their_own_cleanup(fixture: &Fixture, store: Ar
         );
         let agent_id = persistence.registry.default_agent_id().await;
 
-        assert!(reviewer.exists(), "reviewer agent file vanished on pass {pass}");
+        assert!(
+            reviewer.exists(),
+            "reviewer agent file vanished on pass {pass}"
+        );
         assert_eq!(
             std::fs::read(&reviewer).unwrap(),
             reviewer_bytes,
@@ -446,7 +453,11 @@ async fn assert_markers_gate_only_their_own_cleanup(fixture: &Fixture, store: Ar
         );
 
         assert_eq!(
-            store.get_setting("agentic.reviewer.pref").await.unwrap().as_deref(),
+            store
+                .get_setting("agentic.reviewer.pref")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("keep"),
             "non-legacy setting lost on pass {pass}"
         );
@@ -479,7 +490,10 @@ async fn sql_cleanup_committed_before_plan2_journal_recovery_converges() {
         "agent.auto_continue_budget",
         "memory.nudge_interval",
     ] {
-        assert!(!setting_present(&store, key).await, "legacy key {key} present");
+        assert!(
+            !setting_present(&store, key).await,
+            "legacy key {key} present"
+        );
     }
 
     // Arm the pre-journal-commit failure point. `BeforeIndexReplace` bails
@@ -507,7 +521,11 @@ async fn sql_cleanup_committed_before_plan2_journal_recovery_converges() {
         "marker must not be set after a crashed bootstrap"
     );
     assert!(
-        fixture.config_root().join("memory").join("MEMORY.md").exists(),
+        fixture
+            .config_root()
+            .join("memory")
+            .join("MEMORY.md")
+            .exists(),
         "legacy memory must be recoverable after rollback"
     );
     assert!(
@@ -601,7 +619,10 @@ async fn plan2_journal_committed_before_sql_cleanup_converges() {
         "agent.auto_continue_budget",
         "memory.nudge_interval",
     ] {
-        assert!(setting_present(&store, key).await, "legacy key {key} missing");
+        assert!(
+            setting_present(&store, key).await,
+            "legacy key {key} missing"
+        );
     }
     assert!(background_event_present(&store, "drop-learning").await);
 
@@ -618,7 +639,10 @@ async fn plan2_journal_committed_before_sql_cleanup_converges() {
         "agent.auto_continue_budget",
         "memory.nudge_interval",
     ] {
-        assert!(!setting_present(&store, key).await, "legacy key {key} survived");
+        assert!(
+            !setting_present(&store, key).await,
+            "legacy key {key} survived"
+        );
     }
     assert!(
         !background_event_present(&store, "drop-learning").await,
@@ -807,7 +831,10 @@ async fn legacy_pre_feature_database_survives_upgrade_and_resolves_read_only() {
     assert_eq!(legacy.primary_agent_id, None);
     assert_eq!(legacy.primary_agent_snapshot, None);
     assert_eq!(store.list_messages("legacy-s").await.unwrap().len(), 1);
-    assert_eq!(store.list_provider_turns("legacy-s").await.unwrap().len(), 1);
+    assert_eq!(
+        store.list_provider_turns("legacy-s").await.unwrap().len(),
+        1
+    );
 
     // The legacy session resolves as read-only against the upgraded registry.
     assert!(matches!(
@@ -875,7 +902,11 @@ async fn historical_sessions_reject_runs_and_mutations_but_stay_readable() {
             .await
             .unwrap();
         store
-            .insert_agent_run(historical_run(pk, &format!("{pk}-child"), Some(&root.run_id)))
+            .insert_agent_run(historical_run(
+                pk,
+                &format!("{pk}-child"),
+                Some(&root.run_id),
+            ))
             .await
             .unwrap();
     }
@@ -896,7 +927,10 @@ async fn historical_sessions_reject_runs_and_mutations_but_stay_readable() {
 
     for (pk, expected) in [
         ("legacy-s", "Legacy agent history is read-only."),
-        ("deleted-s", "Reviewer was deleted; this history is read-only."),
+        (
+            "deleted-s",
+            "Reviewer was deleted; this history is read-only.",
+        ),
     ] {
         let child = format!("{pk}-child");
         let blocked: Vec<(&str, serde_json::Value)> = vec![
