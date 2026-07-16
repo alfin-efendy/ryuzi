@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import type { ConnectionInfo } from "../src/bindings";
+import type { AgentRun, AgentRunRosterInfo, ConnectionInfo, CoreEvent, Message } from "../src/bindings";
 
 /**
  * Fixtures mirror the generated types in src/bindings.ts (Project, Session,
@@ -315,11 +315,15 @@ const AGENT_REGISTRY = {
   subagentModel: { kind: "route", route: "smart" },
 };
 
+const EMPTY_AGENT_RUN_ROSTER: AgentRunRosterInfo = { rootRunId: null, runs: [] };
+
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
 const FIXTURES: Record<string, unknown> = {
   list_projects: [PROJECT],
   list_sessions: [],
   list_messages: [],
+  agentRunRoster: EMPTY_AGENT_RUN_ROSTER,
+  childMessages: {} as Record<string, Message[]>,
   list_agents: AGENT_REGISTRY,
   refresh_agents: [],
   list_providers: [],
@@ -380,17 +384,6 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
       const storageKey = "ryuzi.e2e.route-state.v1";
-      type MockMessage = {
-        sessionPk: string;
-        seq: number;
-        role: string;
-        blockType: string;
-        payload: { text: string };
-        toolCallId: null;
-        status: null;
-        toolKind: null;
-        createdAt: number;
-      };
       type RouteIdentity = {
         resolvedProviderId: string;
         resolvedFamily: string;
@@ -407,7 +400,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
       };
       type DurableState = {
         sessions: (typeof SESSION)[];
-        messages: MockMessage[];
+        messages: Message[];
+        agentRunRoster: AgentRunRosterInfo;
+        childMessages: Record<string, Message[]>;
         route: RouteIdentity | null;
         routeRequests: number;
         modelRoutes: Array<{
@@ -425,12 +420,18 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         ? (JSON.parse(stored) as DurableState)
         : {
             sessions: fixtures.list_sessions as (typeof SESSION)[],
-            messages: [],
+            messages: fixtures.list_messages as Message[],
+            agentRunRoster: (fixtures.agentRunRoster as AgentRunRosterInfo | undefined) ?? EMPTY_AGENT_RUN_ROSTER,
+            childMessages: (fixtures.childMessages as Record<string, Message[]> | undefined) ?? {},
             route: null,
             routeRequests: 0,
             modelRoutes: fixtures.list_model_routes as DurableState["modelRoutes"],
           };
+      durable.agentRunRoster ??= (fixtures.agentRunRoster as AgentRunRosterInfo | undefined) ?? EMPTY_AGENT_RUN_ROSTER;
+      durable.childMessages ??= (fixtures.childMessages as Record<string, Message[]> | undefined) ?? {};
       let sessions = durable.sessions;
+      let agentRunRoster = durable.agentRunRoster;
+      let childMessages = durable.childMessages;
       let connections = fixtures.list_connections as ConnectionInfo[];
       let modelRoutes = durable.modelRoutes;
       const quotaAttempts = new Map<string, number>();
@@ -473,6 +474,8 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
 
       const persist = () => {
         durable.sessions = sessions;
+        durable.agentRunRoster = agentRunRoster;
+        durable.childMessages = childMessages;
         durable.modelRoutes = modelRoutes;
         localStorage.setItem(storageKey, JSON.stringify(durable));
       };
@@ -488,6 +491,51 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           const callback = (window as unknown as Record<string, (payload: unknown) => void>)[`_${handler}`];
           callback?.({ event: "core-event-msg", id: 0, payload: { runnerId: "local", event } });
         }
+      };
+
+      const appendChildMessage = (runId: string, message: Message) => {
+        const rows = childMessages[runId] ?? [];
+        const index = message.toolCallId
+          ? rows.findIndex((row) => row.toolCallId === message.toolCallId)
+          : rows.findIndex((row) => row.seq === message.seq);
+        const next = rows.slice();
+        if (index >= 0) next[index] = message;
+        else next.push(message);
+        childMessages = { ...childMessages, [runId]: next.sort((left, right) => left.seq - right.seq) };
+      };
+
+      type MockCoreEventInput = {
+        event: CoreEvent;
+        roster?: AgentRunRosterInfo;
+        childMessage?: { runId: string; message: Message };
+      };
+
+      w.__emitMockCoreEvent = (input: MockCoreEventInput) => {
+        if (input.roster) agentRunRoster = input.roster;
+        if (input.childMessage) appendChildMessage(input.childMessage.runId, input.childMessage.message);
+        persist();
+        emitCoreEvent(input.event as unknown as Record<string, unknown>);
+      };
+
+      const createRetryRun = (args: unknown): AgentRun => {
+        const { runId } = args as { runId: string };
+        const previous = agentRunRoster.runs.find((run) => run.runId === runId);
+        if (!previous) throw new Error(`Unknown child run: ${runId}`);
+        const retried: AgentRun = {
+          ...previous,
+          runId: `${previous.runId}-retry`,
+          retryOf: previous.runId,
+          status: "queued",
+          startedAt: null,
+          finishedAt: null,
+          toolCount: 0,
+          result: null,
+          error: null,
+        };
+        agentRunRoster = { ...agentRunRoster, runs: [...agentRunRoster.runs, retried] };
+        if (!childMessages[retried.runId]) childMessages = { ...childMessages, [retried.runId]: [] };
+        persist();
+        return retried;
       };
 
       const observeRoute = (sessionPk: string) => {
@@ -546,7 +594,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         }
 
         if (text) {
-          const message: MockMessage = {
+          const message: Message = {
             sessionPk,
             seq: durable.messages.length + 1,
             role: "system",
@@ -556,6 +604,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             status: null,
             toolKind: null,
             createdAt: Date.now(),
+            speaker: null,
           };
           durable.messages.push(message);
           persist();
@@ -598,6 +647,12 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           if (cmd === "list_sessions") return Promise.resolve(sessions);
           if (cmd === "list_connections") return Promise.resolve(connections);
           if (cmd === "list_messages") return Promise.resolve(durable.messages);
+          if (cmd === "get_child_runs") return Promise.resolve(agentRunRoster);
+          if (cmd === "get_child_transcript") {
+            const { runId } = args as { runId: string };
+            return Promise.resolve(childMessages[runId] ?? []);
+          }
+          if (cmd === "retry_child_run") return Promise.resolve(createRetryRun(args));
           if (cmd === "list_model_routes") return Promise.resolve(modelRoutes);
           if (cmd === "save_model_route") {
             const { route } = args as { route: (typeof modelRoutes)[number] };
