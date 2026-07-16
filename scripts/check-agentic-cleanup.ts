@@ -53,15 +53,10 @@ const scans = [
 //     proof creates a pre-migration fixture DB containing the old
 //     `orch_tasks` table (and friends) specifically to prove the migration
 //     drops them; it cannot do that without naming them.
-//   - skills_install.rs: a single reviewed/approved doc comment (Task 4)
-//     names the already-deleted `skill_manage` tool as the historical reason
-//     `skills_root()`'s directory constraint exists; Task 4 explicitly
-//     audited and kept this as accurate documentation.
 const allowedHistoricalReferences = new Set([
   "crates/core/src/store.rs",
   "crates/core/src/api/mod.rs",
   "crates/core/src/agentic_upgrade_compat.rs",
-  "crates/core/src/skills_install.rs",
 ]);
 
 const failures: string[] = forbiddenFiles.filter(existsSync).map((path) => `obsolete file exists: ${path}`);

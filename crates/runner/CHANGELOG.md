@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+
+### Upgrade Notes
+
+* Startup now performs a one-time agent-data cleanup (legacy agent settings, freeform memory files, Learning/curator state, orchestration DAG data) the first time this schema runs, while preserving projects, provider accounts/routes, and session/transcript history — see the "Agent data reset on first upgrade" note in the README.
+
 ## [0.6.0](https://github.com/alfin-efendy/ryuzi/compare/v0.5.0...v0.6.0) (2026-07-08)
 
 

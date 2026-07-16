@@ -1488,10 +1488,11 @@ impl ControlPlane {
     /// returns a clone for driving the first prompt.
     ///
     /// `project` is `None` for a chat (project-less) session — there is no
-    /// `Project` row to inherit `perm_mode`/`model`/`effort` from, so those
-    /// fall back to engine-wide settings: `perm_mode` from `default_perm_mode`,
-    /// `model` from the native agent's configured model (`agent_settings`), and
-    /// `effort` from `default_effort`. The harness is always native.
+    /// `Project` row to inherit `perm_mode`/`model`/`effort` from. That's
+    /// fine either way: the native harness always executes the immutable
+    /// primary-agent snapshot captured for this turn, so `perm_mode`,
+    /// `model`, and `effort` all come from that agent profile, never from
+    /// project or engine-wide settings. The harness is always native.
     async fn start_harness_session(
         self: &Arc<Self>,
         project: Option<&Project>,
@@ -1597,8 +1598,9 @@ impl ControlPlane {
         });
         let agent = session_row.and_then(|s| s.agent);
         // The curated app-control facade (spec §9.1) is only for a top-level
-        // interactive session: a worker or review-fork session never gets
-        // the `app_*` tools (mirrors the existing sub-agent blocklist, Task
+        // interactive session: a worker session (or the reserved, not yet
+        // live, `Review` kind) never gets the `app_*` tools (mirrors the
+        // existing sub-agent blocklist, Task
         // 6's `child_deps.app_control` reset, and this crate's `Harness`
         // trait boundary — `SessionCtx` is the one channel from here into
         // `NativeHarness::start_session`, which cannot reach `ControlPlane`

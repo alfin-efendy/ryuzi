@@ -415,10 +415,10 @@ impl Harness for NativeHarness {
                 // never cross the harness boundary from their parent.
                 app_control: (!ctx.isolated_target).then_some(ctx.app_control).flatten(),
                 // Primary sessions advertise lazily (hot core + load_tools);
-                // sub-agents and the review fork strip this back to `None`
-                // (eager) via `deps_for_subagent` / their own builder. Worker
-                // sessions are ALSO eager, same as a sub-agent, so their
-                // primary session gets `None` here. An isolated-target
+                // sub-agents strip this back to `None` (eager) via
+                // `deps_for_subagent`. Worker sessions are ALSO eager, same
+                // as a sub-agent, so their primary session gets `None` here.
+                // An isolated-target
                 // session (an explicit-mention or retried delegated main
                 // child) is likewise eager: it executes against a complete
                 // immutable target profile snapshot, so its tool allowlist is

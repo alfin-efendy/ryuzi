@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+
+### Features
+
+* **agents:** YAML/OKF per-agent registry (`agents/index.yaml`, `agents/subagents.yaml`, `agents/<id>.yaml`, `agents/<id>/knowledge/`) — persistent main agents with their own portable, credential-free memory/skill/review/journey knowledge, and unified `@mention`/`delegate_agent` delegation across agents, replacing the single-agent settings surface and the app orchestrator
+
+
+### Breaking Changes
+
+* **agents:** the first launch of this agent schema destructively removes the previous global agent settings, freeform memory files, Learning/curator state, and orchestration DAG data, then creates one main agent named Ryuzi; pre-upgrade sessions surface as read-only "Legacy agent" history and are never assigned to Ryuzi
+
 ## [0.2.0](https://github.com/alfin-efendy/ryuzi/compare/core-v0.1.0...core-v0.2.0) (2026-07-08)
 
 
