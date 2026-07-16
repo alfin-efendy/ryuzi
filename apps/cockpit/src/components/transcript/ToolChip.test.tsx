@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ActivityItem } from "@/lib/transcript";
+import { delegationSessionKey, useDelegation } from "@/store-delegation";
 import { TranscriptFileContext } from "./TranscriptFileContext";
 import { useUi } from "@/store-ui";
 
@@ -9,6 +10,15 @@ const { ActivityCluster } = await import("./ToolChip");
 afterEach(cleanup);
 beforeEach(() => {
   useUi.setState({ tabs: [], activeTabId: null });
+  useDelegation.setState({
+    bySession: {},
+    rootRunBySession: {},
+    rosterStateBySession: {},
+    transcriptByRun: {},
+    transcriptStateByRun: {},
+    seenRunsByDispatch: {},
+    selectedBySession: {},
+  });
 });
 
 function toolItem(key: string, status = "completed"): ActivityItem {
@@ -91,4 +101,44 @@ test("an expandable no-link card toggles open when clicking the detail text (ful
   expect(screen.queryByText("diff output here")).toBeNull();
   fireEvent.click(screen.getByText("3 files touched"));
   expect(screen.getByText("diff output here")).toBeTruthy();
+});
+
+test("routes linked task rows to agent cards while ordinary tools retain ToolChip", () => {
+  const runnerId = "local";
+  const sessionPk = "session-1";
+  useDelegation.setState({
+    bySession: {
+      [delegationSessionKey(runnerId, sessionPk)]: [
+        {
+          runId: "child-1",
+          sessionPk,
+          parentRunId: "root-1",
+          retryOf: null,
+          sourceToolCallId: "dispatch-1",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "worker",
+          executingAgentNameSnapshot: "Researcher",
+          agentKind: "subagent",
+          task: "Inspect this task",
+          status: "running",
+          startedAt: 1,
+          finishedAt: null,
+          toolCount: 0,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: null,
+          error: null,
+        },
+      ],
+    },
+    rosterStateBySession: { [delegationSessionKey(runnerId, sessionPk)]: { status: "ready", error: null } },
+  });
+  const dispatch = { ...toolItem("dispatch"), name: "task", kind: "task", toolCallId: "dispatch-1" };
+
+  render(<ActivityCluster runnerId={runnerId} sessionPk={sessionPk} ownerRunId="root-1" items={[dispatch, toolItem("ordinary")]} />);
+
+  expect(screen.getByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
+  expect(screen.getByText((content) => content.includes("src/ordinary.ts"))).toBeTruthy();
+  expect(screen.queryByText((content) => content.includes("src/dispatch.ts"))).toBeNull();
 });

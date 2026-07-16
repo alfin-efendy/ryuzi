@@ -109,6 +109,7 @@ export function AgentRunDetail({
             agentName={run.executingAgentNameSnapshot}
             agentColor="#6b7280"
             running={active}
+            ownerRunId={run.runId}
             approvalRunId={run.runId}
           />
         </div>

@@ -55,6 +55,38 @@ const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [
 const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
 const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as string[] }));
+const getChildRuns = mock(() =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: {
+      rootRunId: "root-run",
+      runs: [
+        {
+          runId: "child-run",
+          sessionPk: "s1",
+          parentRunId: "root-run",
+          retryOf: null,
+          sourceToolCallId: "dispatch-1",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "worker",
+          executingAgentNameSnapshot: "Researcher",
+          agentKind: "subagent" as const,
+          task: "Inspect hydrated dispatch",
+          status: "completed" as const,
+          startedAt: 1,
+          finishedAt: 2,
+          toolCount: 1,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: "Hydrated result",
+          error: null,
+        },
+      ],
+    },
+  }),
+);
+const getChildTranscript = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
   commands: {
@@ -73,6 +105,8 @@ mock.module("@/bindings", () => ({
     listSessions,
     listGateways,
     searchFiles,
+    getChildRuns,
+    getChildTranscript,
   },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
@@ -108,6 +142,7 @@ const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useAgents } = await import("@/store-agents");
 const { useConnections } = await import("@/store-connections");
+const { useDelegation } = await import("@/store-delegation");
 const realSend = useStore.getState().send;
 
 type Deferred<T> = {
@@ -217,6 +252,8 @@ beforeEach(() => {
   listSessions.mockClear();
   listGateways.mockClear();
   searchFiles.mockClear();
+  getChildRuns.mockClear();
+  getChildTranscript.mockClear();
 });
 
 afterEach(() => {
@@ -235,6 +272,50 @@ afterEach(() => {
   useAgents.setState({ registry: null, models: [] });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
   useNative.setState({ commandsByProject: {}, queuedBySession: {} });
+  useDelegation.setState({
+    bySession: {},
+    rootRunBySession: {},
+    rosterStateBySession: {},
+    transcriptByRun: {},
+    transcriptStateByRun: {},
+    seenRunsByDispatch: {},
+    selectedBySession: {},
+  });
+});
+
+test("hydrates the delegation roster on session mount and gives main transcript cards the durable root owner", async () => {
+  seed(LOCAL_RUNNER);
+  useStore.setState({
+    transcripts: {
+      [sessKey(LOCAL_RUNNER, "s1")]: [
+        {
+          seq: 1,
+          role: "assistant",
+          blockType: "tool_call",
+          text: "",
+          toolCallId: "dispatch-1",
+          toolStatus: "completed",
+          toolKind: "task",
+          toolName: "task",
+          toolOutput: "ordinary output",
+          createdAt: 1,
+          attachments: [],
+          toolPath: null,
+          toolInput: { prompt: "Inspect" },
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+        },
+      ],
+    },
+  });
+
+  render(<SessionView />);
+
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
+  expect(await screen.findByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
+  expect(screen.getByText("Hydrated result")).toBeTruthy();
 });
 
 test("only suggests each effective slash command from the catalog", async () => {
