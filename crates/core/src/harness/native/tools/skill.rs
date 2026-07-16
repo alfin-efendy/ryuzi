@@ -43,20 +43,10 @@ impl Tool for SkillTool {
             .ok_or_else(|| anyhow::anyhow!("skill: `name` is required"))?;
         let reg = SkillRegistry::load_with(&ctx.work_dir, &ctx.extra_skill_dirs);
         match reg.get(name) {
-            Some(skill) => {
-                // Record the view BEFORE returning: `ctx.viewed_skills` lets a
-                // same-turn `skill_manage` call tell "viewed-then-used" apart
-                // from "used blind" (the background-review guard, Task 6);
-                // `skill_usage.view_count` feeds the curator's (Task 10)
-                // usage heuristics. Best-effort — a store hiccup must not
-                // block the read the model actually asked for.
-                ctx.viewed_skills.lock().await.insert(skill.name.clone());
-                let _ = ctx.store.record_skill_view(&skill.name).await;
-                Ok(ToolOutput::ok(truncate(
-                    &format!("# Skill: {}\n\n{}", skill.name, skill.body),
-                    &ctx.caps,
-                )))
-            }
+            Some(skill) => Ok(ToolOutput::ok(truncate(
+                &format!("# Skill: {}\n\n{}", skill.name, skill.body),
+                &ctx.caps,
+            ))),
             None => Ok(ToolOutput::error(format!(
                 "skill: no skill named `{name}` (available: {})",
                 reg.names().join(", ")
@@ -87,27 +77,6 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.for_model.contains("Run make deploy."));
-    }
-
-    #[tokio::test]
-    async fn loading_a_skill_records_the_view_in_ctx_and_skill_usage() {
-        let dir = tempfile::tempdir().unwrap();
-        let sd = dir.path().join(".ryuzi/skills/deploy");
-        std::fs::create_dir_all(&sd).unwrap();
-        std::fs::write(
-            sd.join("SKILL.md"),
-            "---\nname: deploy\ndescription: How to deploy\n---\nRun make deploy.",
-        )
-        .unwrap();
-        let ctx = ctx_at(dir.path()).await;
-        let out = SkillTool
-            .execute(&ctx, json!({"name": "deploy"}))
-            .await
-            .unwrap();
-        assert!(!out.is_error);
-        assert!(ctx.viewed_skills.lock().await.contains("deploy"));
-        let usage = ctx.store.get_skill_usage("deploy").await.unwrap().unwrap();
-        assert_eq!(usage.view_count, 1);
     }
 
     #[tokio::test]

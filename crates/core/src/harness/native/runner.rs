@@ -50,46 +50,6 @@ const TEXT_FLUSH_BYTES: usize = 120;
 /// so the observational payload still gets a hard size ceiling.
 const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
 
-/// Prefix of the `💾 Self-improvement review: …` notice the review fork
-/// (Phase 4 Task 9) persists into the PARENT transcript when a learning row
-/// finishes. Shared here — not owned by the review fork — so
-/// `NativeHarness::start_session`'s best-effort nudge-state hydration
-/// (`native/mod.rs`) can find the most recent review notice and count only
-/// the user turns since it, without duplicating the literal string.
-pub const SELF_IMPROVEMENT_NOTICE_PREFIX: &str = "💾 Self-improvement review";
-
-/// Per-session nudge counters (Phase 4 §7.2), shared via `Arc` across a
-/// session's whole lifetime — including every sub-agent it spawns, since
-/// `RunnerDeps::clone()` copies the `Arc` pointer, not the state (a
-/// delegated child's tool calls still count toward `skill_iters`; only the
-/// TOP-LEVEL end_turn seam reads/resets these, gated on `DisplayMode::text()`
-/// so a sub-agent's own end_turn — or a future review fork's, once Task 9
-/// gives it a fresh `NudgeState` — never fires a nudge).
-#[derive(Default)]
-pub struct NudgeState {
-    /// User turns completed since the last memory-review nudge fired.
-    pub user_turns: std::sync::atomic::AtomicUsize,
-    /// Tool-dispatch iterations since the last `skill_manage` call.
-    pub skill_iters: std::sync::atomic::AtomicUsize,
-}
-
-/// The self-contained review-fork payload captured at finalize time. Byte-
-/// for-byte replayable prefix (§7.2 prompt-cache parity): `system` +
-/// `tool_defs` + `messages` are exactly what the parent's just-finished turn
-/// sent (plus its own committed response), so the fork rides the warm cache.
-/// `model` pins the parent's model — if `auxiliary.review.model` differs the
-/// worker collapses history instead (Task 9).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LearningPayload {
-    pub review_kind: String, // "memory" | "skill" | "combined"
-    pub parent_session_pk: String,
-    pub model: String,
-    pub supports_prompt_cache: bool,
-    pub system: String,
-    pub tool_defs: Vec<Value>,
-    pub messages: Vec<Value>,
-}
-
 /// Everything one native session needs to run turns. Built by
 /// [`super::NativeHarness::start_session`]. Cloneable so a sub-agent spawner
 /// can carry a copy.
@@ -177,18 +137,6 @@ pub struct RunnerDeps {
     /// sessions (set by the control plane). Cloned per turn like the rest of
     /// `RunnerDeps`; the underlying `Arc` is shared.
     pub app_control: Option<Arc<dyn super::tools::AppControl>>,
-    /// Nudge counters for the background learning loop (Phase 4 §7.2).
-    /// Hydrated once in `NativeHarness::start_session`; shared (same `Arc`)
-    /// with every sub-agent this session spawns.
-    pub nudge: Arc<NudgeState>,
-    /// Task 9 cache-parity override: when `Some`, `drive()` advertises THESE
-    /// tool definitions verbatim instead of filtering `tools.definitions()`
-    /// by `agent.tools` — the review fork must send the parent's exact
-    /// captured `tool_defs` for the provider cache to hit, while dispatch
-    /// (`run_tool_call`'s `agent.tools.allows` check) still enforces the
-    /// fork's real whitelist regardless of what's advertised. `None` for
-    /// every non-review turn (parent and sub-agent).
-    pub review_tool_defs: Option<Vec<Value>>,
     /// Per-session set of deferred tools the model has loaded via `load_tools`
     /// (Phase 2 lazy tools). `Some` on primary sessions (lazy advertising on);
     /// `None` for sub-agents and review forks, which keep the eager filtered
@@ -744,12 +692,11 @@ enum DisplayMode {
     /// thinking, notices, and context usage stay internal (the report arrives
     /// via the parent's `task` tool output).
     ToolsOnly { label: String },
-    /// Background review fork (Task 9): nothing but its own tool_call rows
-    /// (on the review session, never the parent) — no text/thinking/notice/
-    /// context-usage display, no auto-continue, no compaction, and —
-    /// crucially — `display.text()` gates `maybe_enqueue_review`'s nudge
-    /// trigger, so a review fork can never recursively enqueue another
-    /// review of itself.
+    /// Fully silent drive: no text/thinking/notice/context-usage display, no
+    /// auto-continue, no compaction. Retained (with its `text()`/compaction
+    /// plumbing) for a headless drive with no transcript surface; it has no
+    /// constructor since the background review fork that used it was removed.
+    #[allow(dead_code)]
     Silent,
 }
 
@@ -878,12 +825,9 @@ fn visible_tool_defs(
     advertised
 }
 
-/// The tool definitions to send this provider turn: the review fork's captured
-/// set verbatim (cache parity), else an activation-aware snapshot.
+/// The tool definitions to send this provider turn: an activation-aware
+/// snapshot filtered by `agent.tools`.
 async fn current_tool_defs(deps: &RunnerDeps, agent: &Agent) -> Vec<Value> {
-    if let Some(captured) = &deps.review_tool_defs {
-        return captured.clone();
-    }
     let activated = match &deps.activated_tools {
         Some(activated) => Some(activated.lock().await.clone()),
         None => None,
@@ -942,16 +886,8 @@ async fn drive(
         }
     };
     let system = with_delegation_catalog(system, &deps.delegation_catalog);
-    // Tools restricted to what this agent may use — UNLESS a review fork
-    // (Task 9) supplies the parent's exact captured `tool_defs` for cache
-    // parity. Advertising the full parent tool set here is safe even though
-    // the review agent's `ToolFilter` only allows a few of them: dispatch
-    // (`run_tool_call`, below) enforces the real whitelist at call time, so a
-    // non-whitelisted call is refused, not merely hidden from the model.
-    let tool_defs: Vec<Value> = match &deps.review_tool_defs {
-        Some(captured) => captured.clone(),
-        None => current_tool_defs(deps, agent).await,
-    };
+    // Tools restricted to what this agent may use, filtered by activation.
+    let tool_defs: Vec<Value> = current_tool_defs(deps, agent).await;
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
@@ -1020,10 +956,7 @@ async fn drive(
                 return Ok(final_text);
             }
             // Pre-turn (iteration 0) / mid-turn compaction check (spec §7.1).
-            // Skipped for a review fork (`DisplayMode::Silent`, Task 9): its
-            // budget is tiny (16) and its whole point is to replay the
-            // parent's captured prefix byte-for-byte — compacting it would
-            // both defeat cache parity and is never needed at this size.
+            // A fully-silent drive (`DisplayMode::Silent`) never compacts.
             if !matches!(display, DisplayMode::Silent) && cm.status().needs_compaction {
                 let trigger = if provider_turn == 0 {
                     "pre_turn"
@@ -1271,16 +1204,6 @@ async fn drive(
                     provider_turn += 1;
                     continue;
                 }
-                // Nudge trigger (Phase 4 §7.2): only the top-level, display-
-                // visible drive() ever nudges. `display.text()` is false for
-                // sub-agents (`ToolsOnly`) and will be false for Task 9's
-                // review fork (`Silent`) too — both share this `drive()` loop,
-                // so gating here (rather than trusting callers not to spawn a
-                // learning row) is what actually prevents a sub-agent or a
-                // review fork from recursively enqueueing another review.
-                if display.text() {
-                    maybe_enqueue_review(deps, &system, &tool_defs, cm).await;
-                }
                 return Ok(final_text); // end_turn
             }
 
@@ -1294,18 +1217,6 @@ async fn drive(
                     break;
                 }
                 results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
-                // "Tool iterations since last skill_manage" (§7.2): every
-                // dispatched tool other than `skill_manage` advances the
-                // skill-nudge counter; `skill_manage` itself resets it — the
-                // agent just acted on the skill signal, so the pressure that
-                // built up is spent. Shared across sub-agents (same `Arc`),
-                // mirroring `user_turns` — see `NudgeState`'s doc comment.
-                use std::sync::atomic::Ordering::Relaxed;
-                if t.name == "skill_manage" {
-                    deps.nudge.skill_iters.store(0, Relaxed);
-                } else {
-                    deps.nudge.skill_iters.fetch_add(1, Relaxed);
-                }
             }
             cm.append_tool_results(results).await?;
 
@@ -1434,180 +1345,11 @@ async fn drive(
     Ok(final_text)
 }
 
-/// The nudge trigger (Phase 4 §7.2): called only from the top-level end_turn
-/// seam (see `drive()`, gated on `display.text()`). Advances `user_turns`;
-/// when either the memory or skill threshold is crossed, captures the exact
-/// `system` / `tool_defs` / `messages_for_request()` prefix this turn just
-/// used — the cache-parity payload Task 9's review fork replays — and enqueues
-/// it in the durable learning queue for this session's executing main agent.
-async fn maybe_enqueue_review(
-    deps: &RunnerDeps,
-    system: &str,
-    tool_defs: &[Value],
-    cm: &ContextManager,
-) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mem_interval =
-        crate::settings::usize_setting(&deps.store, "memory.nudge_interval", 10).await;
-    let skill_interval =
-        crate::settings::usize_setting(&deps.store, "skills.creation_nudge_interval", 10).await;
-    let turns = deps.nudge.user_turns.fetch_add(1, Relaxed) + 1;
-    let iters = deps.nudge.skill_iters.load(Relaxed);
-    let mem_due = turns >= mem_interval;
-    let skill_due = iters >= skill_interval;
-    if !mem_due && !skill_due {
-        return;
-    }
-    let review_kind = match (mem_due, skill_due) {
-        (true, true) => "combined",
-        (true, false) => "memory",
-        _ => "skill",
-    };
-    let payload = LearningPayload {
-        review_kind: review_kind.into(),
-        parent_session_pk: deps.session_pk.clone(),
-        model: deps.model.clone().unwrap_or_default(),
-        supports_prompt_cache: deps.meta.supports_prompt_cache,
-        system: system.to_string(),
-        tool_defs: tool_defs.to_vec(),
-        messages: cm.messages_for_request(),
-    };
-    let serialized = serde_json::to_string(&payload).unwrap_or_default();
-    let review = crate::agents::learning_queue::ReviewEvent {
-        title: format!("{} review", payload.review_kind),
-        description: format!("Learning review from session {}", deps.session_pk),
-        body: serialized,
-        tags: vec![payload.review_kind.clone()],
-    };
-    if let Err(error) = deps
-        .learning_queue
-        .enqueue(
-            &deps.main_agent_id,
-            crate::agents::learning_queue::LearningEventPayload::Review(review),
-        )
-        .await
-    {
-        tracing::warn!(
-            agent_id = %deps.main_agent_id,
-            "failed to enqueue durable learning review: {error}"
-        );
-    }
-    if mem_due {
-        deps.nudge.user_turns.store(0, Relaxed);
-    }
-    if skill_due {
-        deps.nudge.skill_iters.store(0, Relaxed);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Review fork (Phase 4 Task 9): consumes a `LearningPayload` captured by
-// `maybe_enqueue_review` above and replays it as a byte-identical-prefix,
-// tool-whitelisted turn. `ControlPlane::run_review_fork` (control/
-// lifecycle.rs) owns session bookkeeping (insert/end the `kind='review'`
-// row, resolve the model, build `RunnerDeps`) and calls [`drive_review`].
-// ---------------------------------------------------------------------------
-
-/// Tools the review fork's dispatch gate allows, in addition to whatever
-/// `tool_defs` it advertises for cache parity (Task 9). Enforced by
-/// `run_tool_call`'s `agent.tools.allows` check — a call to anything else is
-/// refused with a tool_result error, never executed.
-pub const REVIEW_TOOL_WHITELIST: &[&str] = &["memory", "skill", "skill_manage"];
-
-/// Hermes-agent's memory review prompt, ported verbatim (Task 9 §3).
-pub const MEMORY_REVIEW_PROMPT: &str = "\
-Take a moment to review the conversation above for durable facts worth \
-remembering. Use the `memory` tool to add or consolidate entries. Only record \
-things that will still be true and useful next week: user preferences and \
-style (user scope), environment and conventions (global scope), or codebase \
-facts (project scope). Do not record task state, transient details, or secrets. \
-Prefer editing an existing entry over adding a near-duplicate. If nothing is \
-worth remembering, do nothing and end your turn.";
-
-/// Hermes-agent's skill review prompt, ported verbatim (Task 9 §3).
-pub const SKILL_REVIEW_PROMPT: &str = "\
-Review the conversation above for a reusable procedure worth capturing as a \
-skill. A good skill is a repeatable, generalizable workflow — not a one-off. \
-Preference ladder: (1) improve an existing skill with `skill_manage` patch/edit \
-before (2) creating a new one. Never capture user-specific secrets or a single \
-task's state (anti-capture). You MUST `skill` (view) a skill before editing it. \
-If nothing generalizes, do nothing and end your turn.";
-
-/// Appended to whichever review prompt(s) run, teaching the enforced
-/// whitelist so the model doesn't waste a turn probing for a denied tool.
-pub const REVIEW_TOOL_RESTRICTION_NOTE: &str = "\
-For this review you may ONLY use the tools `memory`, `skill`, and \
-`skill_manage`. All other tools are disabled and will return an error.";
-
-/// The final user turn appended after the replayed/digested prefix:
-/// `review_kind`'s prompt(s) plus the tool-restriction note. `"combined"`
-/// (and any other value — defensively, the safest choice) runs both.
-pub(crate) fn review_prompt_text(review_kind: &str) -> String {
-    let body = match review_kind {
-        "memory" => MEMORY_REVIEW_PROMPT.to_string(),
-        "skill" => SKILL_REVIEW_PROMPT.to_string(),
-        _ => format!("{MEMORY_REVIEW_PROMPT}\n\n{SKILL_REVIEW_PROMPT}"),
-    };
-    format!("{body}\n\n{REVIEW_TOOL_RESTRICTION_NOTE}")
-}
-
-/// The synthetic primary agent a review fork drives as — `prompt` carries the
-/// captured (or digested) RAW system string verbatim (`drive()` uses it as-is
-/// when `Some`, see the `system` binding at the top of `drive()`), and
-/// `tools` is the dispatch-time whitelist (`REVIEW_TOOL_WHITELIST`) that
-/// `run_tool_call`'s `agent.tools.allows` check enforces regardless of what
-/// `RunnerDeps::review_tool_defs` advertises.
-pub(crate) fn review_agent(system: String) -> Agent {
-    Agent {
-        name: "review".into(),
-        description: "Background self-improvement review fork".into(),
-        mode: super::agents::AgentMode::Primary,
-        prompt: Some(system),
-        tools: super::agents::ToolFilter::Only(
-            REVIEW_TOOL_WHITELIST
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        ),
-        permission_rules: Vec::new(),
-        can_delegate: false,
-        builtin: true,
-    }
-}
-
-/// Thin `drive()` wrapper fixing the review fork's shape: no sub-agent
-/// spawner, `DisplayMode::Silent` (no text/notice/context-usage display, no
-/// auto-continue, no compaction, and — via `display.text()` — no recursive
-/// nudge), and a small fixed budget. `deps`/`agent`/`cm` are caller-built
-/// (`ControlPlane::run_review_fork`) so this stays a pure driving seam,
-/// testable with a scripted `LlmStream` and no `ControlPlane` at all.
-pub(crate) async fn drive_review(
-    deps: &RunnerDeps,
-    agent: &Agent,
-    cm: &mut ContextManager,
-    cancel: &CancellationToken,
-) -> anyhow::Result<String> {
-    const REVIEW_MAX_ITERS: usize = 16;
-    drive(
-        deps,
-        agent,
-        cm,
-        cancel,
-        None,
-        DisplayMode::Silent,
-        &IterationBudget::new(REVIEW_MAX_ITERS),
-    )
-    .await
-}
-
 /// Tools delegated children may never use regardless of filters. `task` is
 /// re-armed for agents permitted to delegate; `memory` never is —
 /// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
 /// tools are blocked because the list is keyed by the parent's session_pk: a
 /// child's `todowrite` would silently clobber the user-visible plan.
-/// `skill_manage` (Phase 4 Task 6) writes filesystem skills gated by an
-/// origin × provenance guard — a primary/review-fork capability, never a
-/// sub-agent's; `skill` (read-only recall) stays available to children.
 /// App-control tools (`crate::harness::native::tools::APP_TOOLS`, Phase 6
 /// §9.1) never reach delegated children either — `ctx.app` is `None` in a
 /// sub-agent's own `ToolCtx` regardless, so this is belt-and-suspenders: it
@@ -1617,7 +1359,6 @@ const SUBAGENT_BLOCKLIST: &[&str] = &[
     "memory",
     "todowrite",
     "todoread",
-    "skill_manage",
     "app_jobs",
     "app_projects",
     "clarify",
@@ -1712,8 +1453,6 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         steer: deps.steer.clone(),
         background: deps.background.clone(),
         app_control: None,
-        nudge: deps.nudge.clone(),
-        review_tool_defs: None,
         activated_tools: None,
         write_origin: deps.write_origin,
         delegation_catalog: deps.delegation_catalog.clone(),
@@ -2593,7 +2332,6 @@ async fn run_tool_call(
         })),
         app: deps.app_control.clone(),
         write_origin: deps.write_origin,
-        viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
     // Keep a copy for the `tool.after` payload below — `execute` consumes
     // `input` by value.
@@ -3581,8 +3319,6 @@ mod tests {
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
             app_control: None,
-            nudge: Arc::new(NudgeState::default()),
-            review_tool_defs: None,
             activated_tools: None,
             write_origin: crate::domain::WriteOrigin::User,
             delegation_catalog: Vec::new(),
@@ -3978,274 +3714,6 @@ mod tests {
             .all(|metadata| metadata.observation.is_none()));
     }
 
-    /// Step 1 of Task 7's TDD brief: two end_turn turns with
-    /// `memory.nudge_interval=2` must enqueue exactly one durable learning
-    /// queue row for the main agent, carrying a cache-parity payload.
-    #[tokio::test]
-    async fn finalizer_enqueues_a_learning_row_every_nudge_interval() {
-        let dir = tempfile::tempdir().unwrap();
-        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("one"), final_turn("two")]));
-        let deps = deps_at(dir.path(), llm).await;
-        deps.store
-            .set_setting(
-                crate::domain::WriteOrigin::User,
-                "memory.nudge_interval",
-                "2",
-            )
-            .await
-            .unwrap();
-        run_turn(
-            &deps,
-            TurnPrompt::text("one", "one"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            deps.learning_queue
-                .claim_next("ryuzi", "peek")
-                .await
-                .unwrap()
-                .is_none(),
-            "below the nudge_interval threshold — no learning row yet"
-        );
-
-        run_turn(
-            &deps,
-            TurnPrompt::text("two", "two"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        let ev = deps
-            .learning_queue
-            .claim_next("ryuzi", "learner")
-            .await
-            .unwrap()
-            .expect("threshold crossed on turn 2 — a learning row must be enqueued");
-        let crate::agents::learning_queue::LearningEventPayload::Review(review) = ev.payload else {
-            panic!("nudge producer must enqueue a review payload");
-        };
-        let payload: LearningPayload = serde_json::from_str(&review.body)
-            .expect("learning payload must round-trip through JSON");
-        assert_eq!(payload.review_kind, "memory");
-        assert_eq!(payload.parent_session_pk, "s1");
-        assert!(!payload.system.is_empty(), "system prefix must be captured");
-        assert!(!payload.tool_defs.is_empty(), "tool_defs must be captured");
-        assert!(!payload.messages.is_empty(), "messages must be captured");
-
-        // Firing resets the counter: no second row is left queued.
-        assert!(deps
-            .learning_queue
-            .claim_next("ryuzi", "learner2")
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    /// No-recursion guard (global constraint): a sub-agent's own `drive()`
-    /// loop shares the parent's `NudgeState` `Arc`, but its `DisplayMode` is
-    /// `ToolsOnly`, not `Full` — `display.text()` is false, so the end_turn
-    /// seam never calls `maybe_enqueue_review`. `nudge_interval=1` means the
-    /// threshold is already crossable on the very first end_turn; if the
-    /// top-level-only guard were missing this would immediately enqueue.
-    /// (Task 9's review fork gets its own fresh `NudgeState` AND drives with
-    /// a non-`Full` `DisplayMode` too, so the same mechanism will exclude it.)
-    #[tokio::test]
-    async fn subagent_end_turn_never_nudges_even_past_threshold() {
-        let dir = tempfile::tempdir().unwrap();
-        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("subagent reply")]));
-        let deps = deps_at(dir.path(), llm).await;
-        deps.store
-            .set_setting(
-                crate::domain::WriteOrigin::User,
-                "memory.nudge_interval",
-                "1",
-            )
-            .await
-            .unwrap();
-        let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
-        let mut cm = ContextManager::load(deps.store.clone(), "subagent", cfg)
-            .await
-            .unwrap();
-        cm.append_user(json!([{"type": "text", "text": "delegated"}]))
-            .await
-            .unwrap();
-        let budget = IterationBudget::new(SUBAGENT_MAX_ITERS);
-        drive(
-            &deps,
-            &deps.agent,
-            &mut cm,
-            &CancellationToken::new(),
-            None,
-            DisplayMode::ToolsOnly {
-                label: "test".into(),
-            },
-            &budget,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            deps.nudge
-                .user_turns
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a sub-agent's own end_turn must never touch the shared nudge counter"
-        );
-        assert!(
-            deps.store
-                .claim_deliverable_background_event("peek")
-                .await
-                .unwrap()
-                .is_none(),
-            "sub-agents must never enqueue a learning row (no recursion)"
-        );
-    }
-
-    /// The cache-parity payload must survive a JSON round trip byte-for-byte
-    /// (the review fork — Task 9 — decodes exactly this shape off the rail).
-    #[test]
-    fn learning_payload_round_trips_through_json() {
-        let payload = LearningPayload {
-            review_kind: "combined".into(),
-            parent_session_pk: "parent-1".into(),
-            model: "anthropic/model-a".into(),
-            supports_prompt_cache: true,
-            system: "you are ryuzi".into(),
-            tool_defs: vec![json!({"name": "bash"})],
-            messages: vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
-        };
-        let encoded = serde_json::to_string(&payload).unwrap();
-        let decoded: LearningPayload = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.review_kind, payload.review_kind);
-        assert_eq!(decoded.parent_session_pk, payload.parent_session_pk);
-        assert_eq!(decoded.model, payload.model);
-        assert_eq!(decoded.supports_prompt_cache, payload.supports_prompt_cache);
-        assert_eq!(decoded.system, payload.system);
-        assert_eq!(decoded.tool_defs, payload.tool_defs);
-        assert_eq!(decoded.messages, payload.messages);
-    }
-
-    /// The load-bearing Task 9 invariant: the review fork's FIRST request
-    /// reproduces the captured payload's `system` (re-wrapped exactly like
-    /// the parent's own request), `tools`, and `messages` prefix byte-for-
-    /// byte — the whole point of prompt-cache parity — and a non-whitelisted
-    /// tool call (`bash`, still present in the advertised `tools` array for
-    /// cache parity) is refused at DISPATCH, not merely hidden from the
-    /// model.
-    #[tokio::test]
-    async fn review_fork_replays_byte_identical_prefix_and_denies_a_non_whitelisted_tool() {
-        let meta = crate::llm_router::model_meta::ModelMeta {
-            supports_prompt_cache: true,
-            ..crate::llm_router::model_meta::FALLBACK
-        };
-        // Build the captured prefix through the REAL ContextManager (the same
-        // mechanism `maybe_enqueue_review` uses) so `payload.messages` carries
-        // exactly the `cache_control` marker a live parent turn would have
-        // produced — no hand-authored JSON standing in for the real shape.
-        let mut seed_cm =
-            ContextManager::ephemeral("parent-1", ContextConfig::with_meta(meta.clone()));
-        seed_cm
-            .append_user(json!([{"type": "text", "text": "hi"}]))
-            .await
-            .unwrap();
-        seed_cm
-            .append_assistant(json!([{"type": "text", "text": "hello"}]))
-            .await
-            .unwrap();
-        let captured_messages = seed_cm.messages_for_request();
-
-        let payload = LearningPayload {
-            review_kind: "memory".into(),
-            parent_session_pk: "parent-1".into(),
-            model: "test/model".into(),
-            supports_prompt_cache: true,
-            system: "You are ryuzi, the parent agent.".into(),
-            tool_defs: vec![
-                json!({"name": "bash", "description": "run a shell command", "input_schema": {"type": "object"}}),
-                json!({"name": "memory", "description": "persistent memory", "input_schema": {"type": "object"}}),
-            ],
-            messages: captured_messages,
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        let llm = Arc::new(RecordingLlm::new(vec![
-            vec![
-                tool_use_start(0, "call-1", "bash"),
-                input_json_delta(0, "{\"command\":\"echo hi\"}"),
-                message_delta("tool_use"),
-                message_stop(),
-            ],
-            final_turn("Reviewed, nothing to add."),
-        ]));
-        let mut deps = deps_at(dir.path(), llm.clone()).await;
-        deps.meta = meta.clone();
-        deps.model = Some(payload.model.clone());
-        deps.review_tool_defs = Some(payload.tool_defs.clone());
-        deps.write_origin = crate::domain::WriteOrigin::BackgroundReview;
-
-        let agent = review_agent(payload.system.clone());
-        let cfg = ContextConfig::with_meta(deps.meta.clone());
-        let mut cm = ContextManager::seed_projected("review-1", cfg, payload.messages.clone());
-        cm.append_user_text(&review_prompt_text(&payload.review_kind))
-            .await
-            .unwrap();
-
-        let final_text = drive_review(&deps, &agent, &mut cm, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(final_text, "Reviewed, nothing to add.");
-
-        let bodies = llm.bodies.lock().unwrap();
-        assert_eq!(
-            bodies.len(),
-            2,
-            "a dispatch-time refusal must not skip the scripted second (final) turn"
-        );
-
-        let first = &bodies[0];
-        assert_eq!(
-            first["system"],
-            json!([{ "type": "text", "text": payload.system, "cache_control": {"type": "ephemeral"} }]),
-            "system must be re-wrapped EXACTLY like the parent's own request \
-             (the two-branch formula in `drive()`, keyed on `supports_prompt_cache`)"
-        );
-        assert_eq!(
-            first["tools"],
-            json!(payload.tool_defs),
-            "tools must be byte-identical to the captured payload, including `bash`"
-        );
-        let msgs = first["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), payload.messages.len() + 1);
-        assert_eq!(
-            &msgs[..payload.messages.len()],
-            payload.messages.as_slice(),
-            "the captured prefix must be byte-identical, unmodified by seeding or appending"
-        );
-        let review_turn = &msgs[payload.messages.len()];
-        assert_eq!(review_turn["role"], "user");
-        let review_text = review_turn["content"][0]["text"].as_str().unwrap();
-        assert!(review_text.starts_with(MEMORY_REVIEW_PROMPT));
-        assert!(review_text.contains(REVIEW_TOOL_RESTRICTION_NOTE));
-
-        // The SECOND request's trailing tool_result proves `bash` was refused
-        // at dispatch (the exact `run_tool_call` whitelist-deny wording), not
-        // silently dropped, denied by the (bypassed) permission gate, or
-        // actually executed.
-        let second = &bodies[1];
-        let msgs2 = second["messages"].as_array().unwrap();
-        let denial = msgs2.last().unwrap();
-        assert_eq!(denial["role"], "user");
-        let result_block = &denial["content"][0];
-        assert_eq!(result_block["type"], "tool_result");
-        assert_eq!(result_block["is_error"], true);
-        assert!(result_block["content"]
-            .as_str()
-            .unwrap()
-            .contains("not permitted"));
-    }
-
     /// `seed_digest` (the non-cache-parity fallback, used when the resolved
     /// review model differs from the payload's captured model) keeps only
     /// the trailing `tail` messages.
@@ -4265,95 +3733,6 @@ mod tests {
         assert_eq!(seeded.len(), 3);
         assert_eq!(seeded[0]["content"][0]["text"], "m2");
         assert_eq!(seeded[2]["content"][0]["text"], "m4");
-    }
-
-    /// Guard for `RYUZI_TEST_CONFIG_ROOT`, mirroring
-    /// `tools::skill_manage::tests::ConfigRootGuard` — redirects
-    /// `skills_install::skills_root()` into a tempdir so this module's
-    /// `skill_manage`-exercising test never touches the real
-    /// `~/.config/ryuzi/skills`. Process-global env — every test using it
-    /// must be `#[serial]`.
-    struct ReviewConfigRootGuard {
-        _dir: tempfile::TempDir,
-    }
-    impl ReviewConfigRootGuard {
-        fn new() -> (Self, std::path::PathBuf) {
-            let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("RYUZI_TEST_CONFIG_ROOT", dir.path());
-            let root = dir.path().join("skills");
-            (ReviewConfigRootGuard { _dir: dir }, root)
-        }
-    }
-    impl Drop for ReviewConfigRootGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("RYUZI_TEST_CONFIG_ROOT");
-        }
-    }
-
-    /// The load-bearing Task 6/9 handoff: a whitelisted `skill_manage create`
-    /// call inside the review fork actually writes to disk (proving the
-    /// fork's own perm_mode/whitelist let it through) AND is stamped
-    /// `created_by="agent"` — which `skill_manage`'s `execute` only does when
-    /// `ctx.write_origin.is_autonomous()`. If `run_tool_call` still hardcoded
-    /// `WriteOrigin::User` (the pre-Task-9 state), this stamp would never
-    /// appear — so this is a real regression test for the write_origin wire,
-    /// not just a smoke test that the call didn't error.
-    #[tokio::test]
-    #[serial]
-    async fn review_fork_writes_via_whitelisted_tools_carrying_background_review_write_origin() {
-        let (_guard, skills_root) = ReviewConfigRootGuard::new();
-
-        let dir = tempfile::tempdir().unwrap();
-        let create_args = json!({
-            "action": "create",
-            "name": "deploy",
-            "description": "How to deploy",
-            "body": "Run make deploy.",
-        });
-        let llm = Arc::new(RecordingLlm::new(vec![
-            vec![
-                tool_use_start(0, "call-1", "skill_manage"),
-                input_json_delta(0, &create_args.to_string()),
-                message_delta("tool_use"),
-                message_stop(),
-            ],
-            final_turn("Created a new skill."),
-        ]));
-        let mut deps = deps_at(dir.path(), llm).await;
-        deps.write_origin = crate::domain::WriteOrigin::BackgroundReview;
-
-        let agent = review_agent("You are ryuzi, reviewing.".into());
-        let cfg = ContextConfig::with_meta(deps.meta.clone());
-        let mut cm = ContextManager::seed_projected(
-            "review-1",
-            cfg,
-            vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
-        );
-        cm.append_user_text(&review_prompt_text("skill"))
-            .await
-            .unwrap();
-
-        let final_text = drive_review(&deps, &agent, &mut cm, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(final_text, "Created a new skill.");
-
-        let md = std::fs::read_to_string(skills_root.join("deploy/SKILL.md"))
-            .expect("skill_manage create must have written SKILL.md");
-        assert!(md.contains("Run make deploy."));
-
-        let usage = deps
-            .store
-            .get_skill_usage("deploy")
-            .await
-            .unwrap()
-            .expect("skill_manage create must record skill_usage");
-        assert_eq!(
-            usage.created_by.as_deref(),
-            Some("agent"),
-            "the fork's ToolCtx must carry an autonomous write_origin \
-             (BackgroundReview), not the hardcoded User of the pre-Task-9 runner"
-        );
     }
 
     #[tokio::test]
@@ -6175,27 +5554,6 @@ mod tests {
             "a sub-agent todowrite would clobber the parent session's plan"
         );
         assert!(!eff.allows("todoread"));
-    }
-
-    #[test]
-    fn subagent_blocklist_blocks_skill_manage() {
-        use super::super::agents::ToolFilter;
-        let names: Vec<String> = ["read", "bash", "skill", "skill_manage"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let eff = effective_child_filter(
-            &ToolFilter::All,
-            &ToolFilter::All,
-            &names,
-            SUBAGENT_BLOCKLIST,
-        );
-        assert!(eff.allows("read") && eff.allows("bash"));
-        // `skill` (read-only recall) stays available; `skill_manage` (a
-        // filesystem write, Phase 4 Task 6) is a primary/review-fork
-        // capability only, never a sub-agent's.
-        assert!(eff.allows("skill"));
-        assert!(!eff.allows("skill_manage"));
     }
 
     #[test]

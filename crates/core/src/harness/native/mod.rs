@@ -231,47 +231,6 @@ async fn connect_mcp_tools(
     extra
 }
 
-/// Best-effort seed for a (re)started session's [`runner::NudgeState`]:
-/// `user_turns` resumes from the count of persisted user turns since the
-/// last `💾 Self-improvement review` notice (or since the session's start, if
-/// none has fired yet), so the memory-nudge interval survives a daemon
-/// restart instead of resetting to zero on every resume. `skill_iters`
-/// always restarts at 0 — the "tool iterations since last skill_manage"
-/// counter (§7.2) is a live, in-memory-only signal a resumed session cannot
-/// reconstruct from the transcript alone. Any read failure (bare test
-/// contexts with no session row, a fresh session with no history yet) is
-/// swallowed and treated as zero — hydration is a nice-to-have, not load-
-/// bearing.
-async fn seed_nudge_state(
-    store: &crate::store::Store,
-    session_pk: &str,
-) -> Arc<runner::NudgeState> {
-    let user_turns = match store.list_messages(session_pk).await {
-        Ok(messages) => {
-            let since = messages
-                .iter()
-                .rposition(|m| {
-                    m.role == "system"
-                        && m.block_type == "notice"
-                        && m.payload["text"]
-                            .as_str()
-                            .is_some_and(|t| t.starts_with(runner::SELF_IMPROVEMENT_NOTICE_PREFIX))
-                })
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            messages[since..]
-                .iter()
-                .filter(|m| m.role == "user" && m.block_type == "text")
-                .count()
-        }
-        Err(_) => 0,
-    };
-    Arc::new(runner::NudgeState {
-        user_turns: std::sync::atomic::AtomicUsize::new(user_turns),
-        skill_iters: std::sync::atomic::AtomicUsize::new(0),
-    })
-}
-
 /// Gather every currently-provided extension tool (Track D, DT6) from the
 /// daemon-global extension host and wrap each as a native `Tool` — the
 /// extension analogue of `connect_mcp_tools`, called at the same session-
@@ -401,11 +360,6 @@ impl Harness for NativeHarness {
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
         let steer = steer::SteerBuffer::new();
-        let nudge = if ctx.isolated_target {
-            Arc::new(runner::NudgeState::default())
-        } else {
-            seed_nudge_state(&ctx.store, &ctx.session_pk).await
-        };
         // Rendered into the system prompt below so `delegate_agent` always
         // advertises the CURRENT executable catalog, excluding this
         // session's own profile (a profile can't delegate to itself).
@@ -460,8 +414,6 @@ impl Harness for NativeHarness {
                 // Explicit-target and noninteractive-session facades must
                 // never cross the harness boundary from their parent.
                 app_control: (!ctx.isolated_target).then_some(ctx.app_control).flatten(),
-                nudge,
-                review_tool_defs: None,
                 // Primary sessions advertise lazily (hot core + load_tools);
                 // sub-agents and the review fork strip this back to `None`
                 // (eager) via `deps_for_subagent` / their own builder. Worker
