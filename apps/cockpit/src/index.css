@@ -30,7 +30,8 @@
     radial-gradient(750px 550px at 48% 55%, oklch(0.3 0.05 185 / 0.4), transparent 70%),
     oklch(0.16 0.02 170);
 }
-html[data-backdrop] {
+html[data-backdrop],
+html[data-opaque] {
   --wallpaper: transparent;
 }
 
@@ -46,6 +47,20 @@ html[data-backdrop] {
   50% {
     opacity: 0.45;
     transform: scale(0.8);
+  }
+}
+
+/* Reduced-motion: neutralize the decorative infinite loops (status pulses,
+   spinners) and enter/exit animations so the compositor can idle when the OS
+   asks for less motion. Only `animation` is touched — functional transitions
+   (hover, focus, panel resize) are left alone. The !important overrides the
+   inline `animation` styles that drive relay-pulse. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
   }
 }
 
