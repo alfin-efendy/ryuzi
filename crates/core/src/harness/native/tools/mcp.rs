@@ -76,6 +76,7 @@ impl Tool for McpTool {
                     model_blocks: None,
                     display: None,
                     is_error,
+                    structured_error: None,
                 })
             }
             Err(e) => Ok(ToolOutput::error(format!("{}: {e}", self.full_name))),

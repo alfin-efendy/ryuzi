@@ -132,6 +132,7 @@ impl Tool for TodoWrite {
             // A status block so the Cockpit UI shows progress.
             display: Some(json!({ "summary": format!("todos: {done}/{total} done") })),
             is_error: false,
+            structured_error: None,
         })
     }
 }

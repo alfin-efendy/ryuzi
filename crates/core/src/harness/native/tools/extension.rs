@@ -84,6 +84,7 @@ impl Tool for ExtensionTool {
                     model_blocks: None,
                     display: None,
                     is_error,
+                    structured_error: None,
                 })
             }
             // A dead/timed-out/rejecting extension becomes a normal tool

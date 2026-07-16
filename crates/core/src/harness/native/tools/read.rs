@@ -222,6 +222,7 @@ async fn finish_read(
             })]),
             display: None,
             is_error: false,
+            structured_error: None,
         });
     }
     if meta.len() > MAX_READ_BYTES {

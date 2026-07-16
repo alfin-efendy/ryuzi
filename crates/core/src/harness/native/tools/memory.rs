@@ -155,6 +155,7 @@ impl Tool for MemoryTool {
             model_blocks: None,
             display: Some(json!({ "summary": format!("memory: {summary}") })),
             is_error: false,
+            structured_error: None,
         })
     }
 }

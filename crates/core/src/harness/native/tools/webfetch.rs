@@ -120,6 +120,7 @@ impl Tool for WebFetch {
             model_blocks: None,
             display: None,
             is_error: !status.is_success(),
+            structured_error: None,
         })
     }
 }

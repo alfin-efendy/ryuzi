@@ -9,12 +9,21 @@
 //! to the session worktree, and cap their output via [`truncate`].
 
 use crate::approval::ApprovalKey;
+use crate::harness::native::capabilities::{ToolCapabilityProfile, ToolInteractionMode};
+use crate::harness::native::tool_contract::{
+    compile_canonical_schema, compile_openai_strict_schema, explicit_open_object_schema,
+    AvailabilityProbe, NormalizedInput, PreflightMeta, ToolDescriptor, ToolError, ToolInputCtx,
+    MAX_TOOL_DESCRIPTION_BYTES, MAX_TOOL_SCHEMA_BYTES,
+};
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub mod app_jobs;
@@ -363,6 +372,7 @@ pub struct ToolOutput {
     /// the UI (e.g. a status summary). `None` for most tools.
     pub display: Option<Value>,
     pub is_error: bool,
+    pub structured_error: Option<ToolError>,
 }
 
 impl ToolOutput {
@@ -372,15 +382,28 @@ impl ToolOutput {
             model_blocks: None,
             display: None,
             is_error: false,
+            structured_error: None,
         }
     }
 
     pub fn error(text: impl Into<String>) -> Self {
+        let text = text.into();
         ToolOutput {
-            for_model: text.into(),
+            for_model: text.clone(),
             model_blocks: None,
             display: None,
             is_error: true,
+            structured_error: Some(ToolError::internal("tool_failed", text)),
+        }
+    }
+
+    pub fn from_error(error: ToolError) -> Self {
+        ToolOutput {
+            for_model: error.message.clone(),
+            model_blocks: None,
+            display: None,
+            is_error: true,
+            structured_error: Some(error),
         }
     }
 }
@@ -426,6 +449,35 @@ pub trait Tool: Send + Sync {
     fn input_schema(&self) -> Value;
     /// `tool_kind` column for the Cockpit UI: read|edit|search|execute|fetch|other.
     fn kind(&self) -> &'static str;
+    /// Serializable contract metadata. Runtime resolvers remain on [`Tool`].
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor::conservative(
+            self.name(),
+            self.description(),
+            self.input_schema(),
+            self.kind(),
+        )
+    }
+    /// Normalize arguments using only safe path-resolution inputs.
+    fn normalize_input(
+        &self,
+        _ctx: &ToolInputCtx<'_>,
+        input: Value,
+    ) -> Result<NormalizedInput, ToolError> {
+        Ok(NormalizedInput::unchanged(input))
+    }
+    /// Resolve lightweight metadata before permission and execution.
+    async fn preflight(
+        &self,
+        _ctx: &ToolInputCtx<'_>,
+        _input: &Value,
+    ) -> Result<PreflightMeta, ToolError> {
+        Ok(PreflightMeta::default())
+    }
+    /// Check whether the tool's external dependency is currently usable.
+    async fn probe_availability(&self) -> AvailabilityProbe {
+        AvailabilityProbe::Available
+    }
     /// Permission gate for a specific call.
     fn permission(&self, input: &Value) -> PermissionSpec;
     /// Execute the call.
@@ -441,16 +493,186 @@ pub trait Tool: Send + Sync {
     }
 }
 
+pub struct RegisteredTool {
+    pub tool: Arc<dyn Tool>,
+    pub descriptor: ToolDescriptor,
+    pub canonical_schema: Value,
+    pub canonical_validator: Option<Arc<jsonschema::Validator>>,
+    pub v2_schema_eligible: bool,
+    pub v2_schema_error: Option<ToolError>,
+    pub openai_strict_schema: Option<Value>,
+    pub strict_wire_eligible: bool,
+    pub strict_wire_error: Option<ToolError>,
+    pub contract_hash: String,
+}
+
+impl std::fmt::Debug for RegisteredTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredTool")
+            .field("name", &self.descriptor.canonical_name)
+            .field("v2_schema_eligible", &self.v2_schema_eligible)
+            .field("strict_wire_eligible", &self.strict_wire_eligible)
+            .field("contract_hash", &self.contract_hash)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AvailableTool {
+    pub registered: Arc<RegisteredTool>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AvailabilityCacheEntry {
+    checked_at: tokio::time::Instant,
+    probe: AvailabilityProbe,
+    last_good_at: Option<tokio::time::Instant>,
+}
+
+pub const AVAILABILITY_TTL: Duration = Duration::from_secs(30);
+pub const AVAILABILITY_LAST_GOOD_GRACE: Duration = Duration::from_secs(60);
+
+static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 /// The set of tools available to a session, keyed by name. Built-ins plus any
 /// per-session MCP tools.
 pub struct ToolRegistry {
-    tools: BTreeMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<RegisteredTool>>,
+    generation: u64,
+    availability: tokio::sync::Mutex<BTreeMap<String, AvailabilityCacheEntry>>,
 }
 
 impl ToolRegistry {
     /// All built-in tools.
     pub fn builtin() -> Self {
-        let list: Vec<Arc<dyn Tool>> = vec![
+        Self::from_complete_list(Self::builtin_list())
+    }
+
+    /// The built-ins plus a set of extra (e.g. MCP) tools.
+    pub fn with_extra(extra: Vec<Arc<dyn Tool>>) -> Self {
+        let mut list = Self::builtin_list();
+        for t in extra {
+            if let Some(index) = list.iter().position(|existing| existing.name() == t.name()) {
+                list[index] = t;
+            } else {
+                list.push(t);
+            }
+        }
+        Self::from_complete_list(list)
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .get(name)
+            .map(|registered| registered.tool.clone())
+    }
+
+    pub fn registered(&self, name: &str) -> Option<Arc<RegisteredTool>> {
+        self.tools.get(name).cloned()
+    }
+
+    /// The Anthropic `tools` array for a provider request.
+    pub fn definitions(&self) -> Vec<Value> {
+        self.tools
+            .values()
+            .map(|registered| registered.tool.definition())
+            .collect()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn v2_definition(
+        &self,
+        name: &str,
+        capabilities: &ToolCapabilityProfile,
+    ) -> Result<Value, ToolError> {
+        if capabilities.interaction_mode == ToolInteractionMode::CodeOrchestrator {
+            return Err(ToolError::precondition(
+                "direct_tool_surface_unavailable",
+                "Direct function tools are unavailable for this capability profile",
+            ));
+        }
+        let registered = self.tools.get(name).ok_or_else(|| {
+            ToolError::precondition("tool_not_found", "Tool is not present in this registry")
+        })?;
+        if !registered.v2_schema_eligible {
+            return Err(registered.v2_schema_error.clone().unwrap_or_else(|| {
+                ToolError::precondition("tool_not_v2_eligible", "Tool is not eligible for V2")
+            }));
+        }
+
+        let (schema, strict) = if capabilities.supports_strict_function_schema {
+            if !registered.strict_wire_eligible {
+                return Err(registered.strict_wire_error.clone().unwrap_or_else(|| {
+                    ToolError::precondition(
+                        "unsupported_strict_schema",
+                        "Tool is not eligible for strict schema advertisement",
+                    )
+                }));
+            }
+            (
+                registered
+                    .openai_strict_schema
+                    .clone()
+                    .expect("eligible strict schema is compiled at registry construction"),
+                true,
+            )
+        } else {
+            (registered.canonical_schema.clone(), false)
+        };
+
+        let mut definition = serde_json::json!({
+            "name": registered.descriptor.canonical_name,
+            "description": registered.descriptor.description,
+            "input_schema": schema,
+            "strict": strict,
+        });
+        if capabilities.supports_tool_output_schema {
+            if let Some(output_schema) = &registered.descriptor.output_schema {
+                definition["output_schema"] = output_schema.clone();
+            }
+        }
+        Ok(definition)
+    }
+
+    pub async fn available(&self, name: &str) -> Result<Option<AvailableTool>, ToolError> {
+        let Some(registered) = self.tools.get(name).cloned() else {
+            return Ok(None);
+        };
+        let now = tokio::time::Instant::now();
+        let mut cache = self.availability.lock().await;
+        if let Some(entry) = cache.get(name) {
+            if now.duration_since(entry.checked_at) < AVAILABILITY_TTL {
+                return availability_from_entry(registered, entry, now).map(Some);
+            }
+        }
+
+        let previous_last_good = cache.get(name).and_then(|entry| entry.last_good_at);
+        let probe = registered.tool.probe_availability().await;
+        let last_good_at = if matches!(probe, AvailabilityProbe::Available) {
+            Some(now)
+        } else {
+            previous_last_good
+        };
+        let entry = AvailabilityCacheEntry {
+            checked_at: now,
+            probe,
+            last_good_at,
+        };
+        let result = availability_from_entry(registered, &entry, now).map(Some);
+        cache.insert(name.to_string(), entry);
+        result
+    }
+
+    fn builtin_list() -> Vec<Arc<dyn Tool>> {
+        vec![
             Arc::new(read::Read),
             Arc::new(ls::Ls),
             Arc::new(write::Write),
@@ -472,44 +694,163 @@ impl ToolRegistry {
             Arc::new(session_search::SessionSearch),
             Arc::new(plan::ExitPlanMode),
             Arc::new(question::AskUserQuestion),
-            // Gated to `kind='worker'` sessions — see
-            // `runner::visible_tool_defs` (schema) and its own
-            // App-control tools over the curated `AppControl` facade (spec
-            // §9.1); `None` on `ctx.app` (sub-agents/workers/tests) errors
-            // "not available". Blocked from delegated children — see
-            // `runner::SUBAGENT_BLOCKLIST`.
             Arc::new(app_jobs::AppJobs),
             Arc::new(app_projects::AppProjects),
             Arc::new(clarify::Clarify),
-        ];
-        let mut tools = BTreeMap::new();
-        for t in list {
-            tools.insert(t.name().to_string(), t);
+        ]
+    }
+
+    fn from_complete_list(list: Vec<Arc<dyn Tool>>) -> Self {
+        let tools = list
+            .into_iter()
+            .map(|tool| {
+                let name = tool.name().to_string();
+                (name, Arc::new(compile_registered_tool(tool)))
+            })
+            .collect();
+        Self {
+            tools,
+            generation: next_registry_generation(),
+            availability: tokio::sync::Mutex::new(BTreeMap::new()),
         }
-        ToolRegistry { tools }
     }
+}
 
-    /// The built-ins plus a set of extra (e.g. MCP) tools.
-    pub fn with_extra(extra: Vec<Arc<dyn Tool>>) -> Self {
-        let mut reg = Self::builtin();
-        for t in extra {
-            reg.tools.insert(t.name().to_string(), t);
+fn next_registry_generation() -> u64 {
+    NEXT_REGISTRY_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .expect("tool registry generation exhausted")
+}
+
+fn availability_from_entry(
+    registered: Arc<RegisteredTool>,
+    entry: &AvailabilityCacheEntry,
+    now: tokio::time::Instant,
+) -> Result<AvailableTool, ToolError> {
+    match &entry.probe {
+        AvailabilityProbe::Available => Ok(AvailableTool {
+            registered,
+            stale: false,
+        }),
+        AvailabilityProbe::Unavailable { transient, .. }
+            if *transient
+                && entry.last_good_at.is_some_and(|last_good| {
+                    now.duration_since(last_good) <= AVAILABILITY_LAST_GOOD_GRACE
+                }) =>
+        {
+            Ok(AvailableTool {
+                registered,
+                stale: true,
+            })
         }
-        reg
+        AvailabilityProbe::Unavailable { code, transient } => Err(if *transient {
+            ToolError::transient(code, "Tool is temporarily unavailable")
+        } else {
+            ToolError::precondition(code, "Tool is unavailable")
+        }),
     }
+}
 
-    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
-    }
+fn compile_registered_tool(tool: Arc<dyn Tool>) -> RegisteredTool {
+    let descriptor = tool.descriptor();
+    let canonical_schema = compile_canonical_schema(descriptor.input_schema.clone());
+    let schema_bytes = serde_json::to_vec(&descriptor.input_schema)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX);
+    let size_error = if descriptor.description.len() > MAX_TOOL_DESCRIPTION_BYTES {
+        Some(contract_size_error(
+            "MAX_TOOL_DESCRIPTION_BYTES",
+            descriptor.description.len(),
+            MAX_TOOL_DESCRIPTION_BYTES,
+        ))
+    } else if schema_bytes > MAX_TOOL_SCHEMA_BYTES {
+        Some(contract_size_error(
+            "MAX_TOOL_SCHEMA_BYTES",
+            schema_bytes,
+            MAX_TOOL_SCHEMA_BYTES,
+        ))
+    } else {
+        None
+    };
 
-    /// The Anthropic `tools` array for a provider request.
-    pub fn definitions(&self) -> Vec<Value> {
-        self.tools.values().map(|t| t.definition()).collect()
-    }
+    let canonical_validator = if size_error.is_none() {
+        jsonschema::validator_for(&canonical_schema)
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
+    let invalid_error = (size_error.is_none() && canonical_validator.is_none()).then(|| {
+        ToolError::precondition("invalid_tool_schema", "Tool input schema is invalid")
+            .with_details(serde_json::json!({"reason": "schema_compilation_failed"}))
+    });
+    let open_error = (size_error.is_none()
+        && invalid_error.is_none()
+        && explicit_open_object_schema(&descriptor.input_schema))
+    .then(|| {
+        ToolError::precondition(
+            "unsupported_open_object_schema",
+            "Tool input schema contains an explicitly open object shape",
+        )
+        .with_details(serde_json::json!({"reason": "explicit_additional_properties"}))
+    });
+    let v1_only_error = descriptor
+        .v1_only
+        .then(|| ToolError::precondition("tool_not_v2_eligible", "Tool is restricted to V1"));
+    let v2_schema_error = size_error
+        .or(invalid_error)
+        .or(open_error)
+        .or(v1_only_error);
+    let v2_schema_eligible = v2_schema_error.is_none();
 
-    pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+    let strict_result = v2_schema_eligible
+        .then(|| compile_openai_strict_schema(&canonical_schema))
+        .transpose();
+    let (openai_strict_schema, strict_wire_error) = match strict_result {
+        Ok(schema) => (schema, None),
+        Err(error) => (
+            None,
+            Some(ToolError::precondition(error.code, error.message)),
+        ),
+    };
+    let strict_wire_eligible = openai_strict_schema.is_some();
+
+    let mut hasher = Sha256::new();
+    if let Ok(serialized) = serde_json::to_vec(&serde_json::json!({
+        "descriptor": &descriptor,
+        "canonical_schema": &canonical_schema,
+        "openai_strict_schema": &openai_strict_schema,
+    })) {
+        hasher.update(serialized);
     }
+    let contract_hash = format!("{:x}", hasher.finalize());
+
+    RegisteredTool {
+        tool,
+        descriptor,
+        canonical_schema,
+        canonical_validator,
+        v2_schema_eligible,
+        v2_schema_error,
+        openai_strict_schema,
+        strict_wire_eligible,
+        strict_wire_error,
+        contract_hash,
+    }
+}
+
+fn contract_size_error(limit_name: &str, actual_bytes: usize, max_bytes: usize) -> ToolError {
+    ToolError::precondition(
+        "tool_contract_too_large",
+        "Tool contract exceeds a safety limit",
+    )
+    .with_details(serde_json::json!({
+        "limit": limit_name,
+        "actual_bytes": actual_bytes,
+        "max_bytes": max_bytes,
+    }))
 }
 
 impl Default for ToolRegistry {
@@ -744,7 +1085,95 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::native::capabilities::{
+        CapabilitySource, ToolCapabilityProfile, ToolInteractionMode, WireProtocol,
+    };
+    use crate::harness::native::tool_contract::{
+        AvailabilityProbe, ToolError, ToolInputCtx, MAX_TOOL_DESCRIPTION_BYTES,
+        MAX_TOOL_SCHEMA_BYTES,
+    };
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ContractTool {
+        name: &'static str,
+        description: String,
+        schema: Value,
+        probes: AtomicUsize,
+    }
+
+    impl ContractTool {
+        fn new(name: &'static str, description: impl Into<String>, schema: Value) -> Self {
+            Self {
+                name,
+                description: description.into(),
+                schema,
+                probes: AtomicUsize::new(0),
+            }
+        }
+
+        fn transient_after_first_success(name: &'static str) -> Self {
+            Self::new(
+                name,
+                "availability test",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ContractTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn input_schema(&self) -> Value {
+            self.schema.clone()
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> PermissionSpec {
+            PermissionSpec::new(self.name, "test")
+        }
+
+        async fn execute(&self, _ctx: &ToolCtx, _input: Value) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::ok("ok"))
+        }
+
+        async fn probe_availability(&self) -> AvailabilityProbe {
+            if self.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+                AvailabilityProbe::Available
+            } else {
+                AvailabilityProbe::Unavailable {
+                    code: "temporarily_unavailable".into(),
+                    transient: true,
+                }
+            }
+        }
+    }
+
+    fn strict_capabilities() -> ToolCapabilityProfile {
+        ToolCapabilityProfile {
+            interaction_mode: ToolInteractionMode::DirectFunctions,
+            wire_protocol: WireProtocol::OpenAiResponses,
+            supports_custom_freeform_tools: false,
+            supports_parallel_tool_calls: true,
+            supports_strict_function_schema: true,
+            supports_tool_output_schema: true,
+            schema_budget_tokens: 16_000,
+            supports_prompt_cache: true,
+            capability_source: CapabilitySource::TransportDefault,
+            capability_schema_version:
+                crate::harness::native::capabilities::CAPABILITY_SCHEMA_VERSION,
+        }
+    }
 
     #[test]
     fn jail_accepts_in_tree_and_rejects_escapes() {
@@ -900,5 +1329,246 @@ mod tests {
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
+    }
+
+    #[test]
+    fn registry_generations_are_monotonic() {
+        let first = ToolRegistry::builtin().generation();
+        let second = ToolRegistry::builtin().generation();
+        assert!(second > first);
+    }
+
+    #[test]
+    fn invalid_and_open_schemas_are_excluded_from_v2_without_changing_v1() {
+        let invalid: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "invalid_contract",
+            "invalid",
+            serde_json::json!({"type": 42}),
+        ));
+        let open: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "open_contract",
+            "open",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+        ));
+        let schema_valued: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "schema_valued_contract",
+            "schema valued",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": {"type": "string"}
+            }),
+        ));
+        let untyped_open: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "untyped_open_contract",
+            "untyped open",
+            serde_json::json!({"additionalProperties": true}),
+        ));
+        let invalid_v1 = invalid.definition();
+        let open_v1 = open.definition();
+        let registry = ToolRegistry::with_extra(vec![invalid, open, schema_valued, untyped_open]);
+
+        assert_eq!(
+            registry
+                .v2_definition("invalid_contract", &strict_capabilities())
+                .unwrap_err()
+                .code,
+            "invalid_tool_schema"
+        );
+        assert_eq!(
+            registry
+                .v2_definition("open_contract", &strict_capabilities())
+                .unwrap_err()
+                .code,
+            "unsupported_open_object_schema"
+        );
+        assert_eq!(
+            registry
+                .v2_definition("untyped_open_contract", &strict_capabilities())
+                .unwrap_err()
+                .code,
+            "unsupported_open_object_schema"
+        );
+        assert_eq!(
+            registry
+                .v2_definition("schema_valued_contract", &strict_capabilities())
+                .unwrap_err()
+                .code,
+            "unsupported_open_object_schema"
+        );
+        assert_eq!(
+            registry.get("invalid_contract").unwrap().definition(),
+            invalid_v1
+        );
+        assert_eq!(registry.get("open_contract").unwrap().definition(), open_v1);
+    }
+
+    #[test]
+    fn ambiguous_optional_null_and_non_disjoint_one_of_are_not_advertised_as_strict() {
+        let ambiguous: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "ambiguous_null",
+            "ambiguous",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": ["string", "null"]}}
+            }),
+        ));
+        let one_of: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "overlapping_one_of",
+            "overlapping",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"minLength": 1}
+                        ]
+                    }
+                },
+                "required": ["value"]
+            }),
+        ));
+        let registry = ToolRegistry::with_extra(vec![ambiguous, one_of]);
+
+        assert_eq!(
+            registry
+                .v2_definition("ambiguous_null", &strict_capabilities())
+                .unwrap_err()
+                .code,
+            "ambiguous_optional_null"
+        );
+        assert_eq!(
+            registry
+                .v2_definition("overlapping_one_of", &strict_capabilities())
+                .unwrap_err()
+                .code,
+            "non_disjoint_one_of"
+        );
+    }
+
+    #[test]
+    fn oversized_contracts_report_only_bounded_size_details() {
+        let description_marker = "secret-description-marker";
+        let schema_marker = "secret-schema-marker";
+        let oversized_description: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "oversized_description",
+            format!(
+                "{description_marker}{}",
+                "x".repeat(MAX_TOOL_DESCRIPTION_BYTES + 1)
+            ),
+            serde_json::json!({"type": "object"}),
+        ));
+        let oversized_schema: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "oversized_schema",
+            "oversized schema",
+            serde_json::json!({
+                "type": "object",
+                "description": format!(
+                    "{schema_marker}{}",
+                    "x".repeat(MAX_TOOL_SCHEMA_BYTES + 1)
+                )
+            }),
+        ));
+        let registry = ToolRegistry::with_extra(vec![oversized_description, oversized_schema]);
+
+        for name in ["oversized_description", "oversized_schema"] {
+            let error = registry
+                .v2_definition(name, &strict_capabilities())
+                .unwrap_err();
+            let serialized = serde_json::to_string(&error).unwrap();
+            assert_eq!(error.code, "tool_contract_too_large");
+            assert!(!serialized.contains(description_marker));
+            assert!(!serialized.contains(schema_marker));
+            assert!(serialized.len() < 512);
+        }
+    }
+
+    #[test]
+    fn default_descriptor_and_safe_input_hooks_are_conservative() {
+        let tool = ContractTool::new(
+            "mutating_test",
+            "mutates",
+            serde_json::json!({"type": "object"}),
+        );
+        let descriptor = tool.descriptor();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ToolInputCtx {
+            work_dir: root.path(),
+            attachments_dir: None,
+            extra_skill_dirs: &[],
+        };
+        let input = serde_json::json!({"value": "unchanged"});
+        let normalized = tool.normalize_input(&ctx, input.clone()).unwrap();
+
+        assert!(!descriptor.idempotent);
+        assert!(descriptor.sequential_barrier);
+        assert_eq!(normalized.value, input);
+        assert!(!normalized.normalized);
+        assert!(normalized.metadata().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_preflight_and_probe_are_safe_no_ops() {
+        let tool = ContractTool::new(
+            "safe_defaults",
+            "safe defaults",
+            serde_json::json!({"type": "object"}),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let ctx = ToolInputCtx {
+            work_dir: root.path(),
+            attachments_dir: None,
+            extra_skill_dirs: &[],
+        };
+
+        assert_eq!(
+            tool.preflight(&ctx, &serde_json::json!({})).await.unwrap(),
+            Default::default()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_probe_uses_last_good_only_inside_grace_window() {
+        let tool = Arc::new(ContractTool::transient_after_first_success(
+            "flaky_contract",
+        ));
+        let registry = ToolRegistry::with_extra(vec![tool.clone()]);
+
+        let fresh = registry.available("flaky_contract").await.unwrap().unwrap();
+        assert!(!fresh.stale);
+        assert_eq!(tool.probes.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        let cached = registry.available("flaky_contract").await.unwrap().unwrap();
+        assert!(!cached.stale);
+        assert_eq!(tool.probes.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let stale = registry.available("flaky_contract").await.unwrap().unwrap();
+        assert!(stale.stale);
+        assert_eq!(tool.probes.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let error = registry.available("flaky_contract").await.unwrap_err();
+        assert_eq!(error.code, "temporarily_unavailable");
+        assert_eq!(tool.probes.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn tool_output_preserves_structured_errors_compatibly() {
+        let ok = ToolOutput::ok("ok");
+        assert!(ok.structured_error.is_none());
+
+        let legacy = ToolOutput::error("legacy failure");
+        assert_eq!(legacy.structured_error.unwrap().code, "tool_failed");
+
+        let error = ToolError::caller("bad_argument", "Bad argument");
+        let output = ToolOutput::from_error(error.clone());
+        assert!(output.is_error);
+        assert_eq!(output.for_model, "Bad argument");
+        assert_eq!(output.structured_error, Some(error));
     }
 }
