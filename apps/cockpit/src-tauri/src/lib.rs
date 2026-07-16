@@ -6,6 +6,7 @@ mod automation_cmd;
 mod backdrop;
 mod commands;
 mod connections_cmd;
+mod delegation_cmd;
 mod endpoint_cmd;
 pub mod engine;
 pub mod engine_daemon;
@@ -31,6 +32,7 @@ fn make_builder() -> Builder<tauri::Wry> {
         .commands(collect_commands![
             commands::list_projects,
             commands::list_sessions,
+            commands::list_agent_sessions,
             commands::list_messages,
             commands::connect_project,
             commands::clone_project,
@@ -60,13 +62,10 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::update_session_runtime,
             commands::update_session_perm_mode,
             commands::list_branches,
-            commands::orch_submit,
-            commands::orch_list_roots,
-            commands::orch_tasks,
-            commands::orch_cancel,
-            commands::orch_retry,
-            commands::orch_answer_block,
-            commands::orch_steer,
+            delegation_cmd::get_child_runs,
+            delegation_cmd::get_child_transcript,
+            delegation_cmd::cancel_child_run,
+            delegation_cmd::retry_child_run,
             agent_cmd::list_selectable_models,
             agent_cmd::list_agents,
             agent_cmd::get_agent,
@@ -373,5 +372,53 @@ mod tests {
     fn export_bindings_test() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
         export_bindings(&out);
+    }
+
+    #[test]
+    fn exported_child_run_commands_match_the_plan6_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("bindings.ts");
+        export_bindings(&out);
+        let bindings = std::fs::read_to_string(out).unwrap();
+
+        for command in [
+            "async getChildRuns(",
+            "async getChildTranscript(",
+            "async cancelChildRun(",
+            "async retryChildRun(",
+        ] {
+            assert!(
+                bindings.contains(command),
+                "missing exported command {command}"
+            );
+        }
+        let child_run_commands: Vec<_> = bindings
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix("async ")?.split_once('(')?.0;
+                (name.contains("Child") || name.contains("AgentRun")).then_some(name)
+            })
+            .collect();
+        assert_eq!(
+            child_run_commands,
+            [
+                "getChildRuns",
+                "getChildTranscript",
+                "cancelChildRun",
+                "retryChildRun",
+            ]
+        );
+
+        for draft_name in [
+            "listAgentRuns",
+            "getAgentRunTranscript",
+            "stopAgentRun",
+            "retryAgentRun",
+        ] {
+            assert!(
+                !bindings.contains(draft_name),
+                "obsolete draft command {draft_name} was exported"
+            );
+        }
     }
 }

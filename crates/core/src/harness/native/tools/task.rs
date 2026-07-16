@@ -55,14 +55,14 @@ impl Tool for Task {
     fn description(&self) -> &str {
         "Delegate self-contained subtasks to sub-agents. Single form: `prompt` \
          + `subagent_type` (e.g. `general` for multi-step work, `explore` for \
-         read-only investigation, `orchestrator` to coordinate a wide goal). \
+         read-only investigation). \
          Batch form: `tasks: [{subagent_type, prompt}]` runs independent \
          subtasks IN PARALLEL and returns every report — prefer it when \
          subtasks don't depend on each other. Sub-agents do not see this \
          conversation, so each prompt must be fully self-contained. Sub-agents \
-         cannot use `task` or `memory` themselves (unless the target agent is \
-         a delegator like `orchestrator`). Choose exactly one form per call: \
-         never send a top-level `prompt` together with `tasks`. Add \
+         cannot use `task` or `memory` themselves unless their configuration \
+         permits delegation. Choose exactly one form per call: never send a \
+         top-level `prompt` together with `tasks`. Add \
          `background: true` (single form) to dispatch without blocking — the \
          result re-enters the chat on completion."
     }

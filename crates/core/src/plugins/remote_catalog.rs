@@ -573,7 +573,7 @@ mod tests {
         // NOTE: this test relies on the real CATALOG_FEED_PUBKEY matching the test
         // key; instead, fetch_and_cache takes an injected verify via a helper.
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let http = FakeHttp {
             feed: (200, bytes),
             sig: (200, sig),
@@ -596,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_rejects_non_2xx_feed() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let http = FakeHttp {
             feed: (404, vec![]),
             sig: (200, vec![]),
@@ -622,7 +622,7 @@ mod tests {
         let mut tampered = bytes.clone();
         tampered[40] ^= 0xff;
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let http = FakeHttp {
             feed: (200, tampered),
             sig: (200, sig),
@@ -646,7 +646,7 @@ mod tests {
         let bytes = feed_json(3).into_bytes();
         let sig = sign(&bytes);
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         store.set_catalog_feed_state(9, "ok").await.unwrap();
         let http = FakeHttp {
             feed: (200, bytes),
@@ -665,18 +665,28 @@ mod tests {
 
     async fn test_cp() -> Arc<crate::control::ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-        crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(store, crate::plugins::Registries::new(), persistence)
+                .await
+        }
     }
 
     // A fresh `ControlPlane` sharing an existing `Arc<Store>` — its
     // in-memory restart flag always starts false, letting a second refresh
     // over the same populated cache assert the flag stays down.
     async fn test_cp_over(store: Arc<crate::store::Store>) -> Arc<crate::control::ControlPlane> {
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
         crate::control::ControlPlane::new_with_telemetry(
             store,
             crate::plugins::Registries::new(),
             Arc::new(crate::telemetry::NoopTelemetry),
+            persistence,
         )
         .await
     }
@@ -797,7 +807,7 @@ mod tests {
         let bytes = feed.as_bytes().to_vec();
         let sig = sign(&bytes);
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let http = FakeHttp {
             feed: (200, bytes),
             sig: (200, sig),

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { CmdError, CommandInfo, OpenTarget, Project, Result, Session } from "@/bindings";
-import { LOCAL_RUNNER, refKey } from "@/lib/session-key";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { AgentSummaryInfo, CmdError, CommandInfo, OpenTarget, Project, Result, Session } from "@/bindings";
+import { LOCAL_RUNNER, refKey, sessKey } from "@/lib/session-key";
 import { useNative } from "@/store-native";
 
 // --- @/bindings: only the commands actually reachable from the mount paths
@@ -51,6 +51,10 @@ const projectRuntimeInfo = mock(() =>
 // `commands` through this same live binding, so an absent `fetchAttachment`
 // here would break ITS attachment-preview test instead of ours.
 const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data: { dataBase64: "", contentType: null } }));
+const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Project[] }));
+const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
+const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as string[] }));
 
 mock.module("@/bindings", () => ({
   commands: {
@@ -65,9 +69,10 @@ mock.module("@/bindings", () => ({
     removeSessionMessage: async () => ({ status: "ok" as const, data: true }),
     projectRuntimeInfo,
     fetchAttachment,
-    // SessionView's orch task-strip effect (Phase 5) calls this on a chat
-    // session; stub an empty result so no strip mounts and it doesn't throw.
-    orchListRoots: async () => ({ status: "ok" as const, data: [] }),
+    listProjects,
+    listSessions,
+    listGateways,
+    searchFiles,
   },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
@@ -101,6 +106,7 @@ mock.module("@/components/session/BottomTerminalDrawer", () => ({
 const { SessionView } = await import("./SessionView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
+const { useAgents } = await import("@/store-agents");
 const { useConnections } = await import("@/store-connections");
 const realSend = useStore.getState().send;
 
@@ -139,6 +145,11 @@ function session(runnerId: string, overrides: Partial<Session> = {}): Session & 
   return {
     runnerId,
     sessionPk: "s1",
+    // Default to an executable owner: most tests exercise the normal (owned)
+    // composer/panel/queue path. Explicit legacy/deleted/nonexecutable tests
+    // override `primaryAgentId`/`primaryAgentSnapshot` themselves.
+    primaryAgentId: "primary",
+    primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" },
     projectId: "p1",
     agentSessionId: null,
     worktreePath: null,
@@ -159,37 +170,71 @@ function session(runnerId: string, overrides: Partial<Session> = {}): Session & 
   };
 }
 
-function seed(runnerId: string, status: Session["status"] = "idle") {
+function primary(id: string, executable = true): AgentSummaryInfo {
+  return {
+    id,
+    name: "Renamed profile",
+    description: "",
+    avatarColor: "blue",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  };
+}
+
+function seed(runnerId: string, sessionOverrides: Partial<Session> = {}, agents: AgentSummaryInfo[] = [primary("primary")]) {
   useStore.setState({
-    sessions: [session(runnerId, { status })],
+    sessions: [session(runnerId, sessionOverrides)],
     projects: [project()],
     focusedSession: { runnerId, pk: "s1" },
     transcripts: {},
     pendingApprovals: [],
   });
+  useAgents.setState({
+    registry: { agents, defaultAgentId: agents[0]?.id ?? "none", recovery: [], subagentModel: { kind: "route", route: "fast" } },
+  });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
   useConnections.setState({ loaded: true });
-  useNative.setState({ commandsByProject: {} });
+  useNative.setState({ commandsByProject: {}, queuedBySession: {} });
 }
 
 beforeEach(() => {
   drawerMounts.length = 0;
   listOpenTargets.mockClear();
-  sessionQueue.mockClear();
-  continueSession.mockClear();
-  continueSession.mockResolvedValue({ status: "ok", data: null });
-  enqueueSessionMessage.mockClear();
-  enqueueSessionMessage.mockResolvedValue({ status: "ok", data: { id: "q1", text: "queued" } });
-  useNative.setState({ queuedBySession: {} });
-  useStore.setState({ send: realSend });
-  useNav.setState({ drafts: {} });
+  // `mockClear()` only resets call history; a prior test's
+  // `mockRejectedValueOnce`/`mockResolvedValue` override otherwise leaks
+  // into later tests sharing this same module-level mock.
+  continueSession.mockReset();
+  continueSession.mockImplementation(() => Promise.resolve({ status: "ok" as const, data: null }));
+  enqueueSessionMessage.mockReset();
+  enqueueSessionMessage.mockImplementation(() => Promise.resolve({ status: "ok" as const, data: { id: "q1", text: "queued" } }));
+  listProjects.mockClear();
+  listSessions.mockClear();
+  listGateways.mockClear();
+  searchFiles.mockClear();
 });
 
 afterEach(() => {
   cleanup();
-  useNav.setState({ bottomOpen: false });
+  useNav.setState({ drafts: {}, bottomOpen: false, rightOpen: false });
+  useStore.setState({
+    sessions: [],
+    projects: [],
+    focusedSession: null,
+    transcripts: {},
+    pendingApprovals: [],
+    // A test that stubs `send` via `useStore.setState({ send })` otherwise
+    // leaks that mock into every later test in this shared store singleton.
+    send: realSend,
+  });
+  useAgents.setState({ registry: null, models: [] });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
-  useNative.setState({ commandsByProject: {} });
+  useNative.setState({ commandsByProject: {}, queuedBySession: {} });
 });
 
 test("only suggests each effective slash command from the catalog", async () => {
@@ -260,6 +305,204 @@ test("only suggests each effective slash command from the catalog", async () => 
   expect(screen.queryByText("Global init")).toBeNull();
 });
 
+test("normal sessions render their passed approval card only once", async () => {
+  seed(LOCAL_RUNNER);
+  useStore.setState({
+    pendingApprovals: [
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "main-run",
+        requestId: "main-approval",
+        tool: "bash",
+        summary: "run the main command",
+        kind: "tool",
+        input: { command: "printf normal-session-approval" },
+        principal: null,
+      },
+    ],
+  });
+
+  render(<SessionView />);
+
+  expect(await screen.findAllByText("printf normal-session-approval")).toHaveLength(1);
+});
+
+test("immutable primary snapshot labels the session despite profile edits", async () => {
+  seed(
+    LOCAL_RUNNER,
+    { primaryAgentId: "reviewer", primaryAgentSnapshot: { id: "reviewer", name: "Original reviewer", avatarColor: "violet" } },
+    [primary("reviewer")],
+  );
+  render(<SessionView />);
+
+  expect(await screen.findByText("Original reviewer")).toBeTruthy();
+  expect(screen.queryByText("Renamed profile")).toBeNull();
+  expect((screen.getByPlaceholderText("Ask for follow-up changes") as HTMLTextAreaElement).disabled).toBe(false);
+});
+
+test("session composer sends raw leading whitespace and its structured mention span", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "  @a review", selectionStart: 4 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("  @Ada  review");
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() =>
+    expect(continueSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "s1",
+      expect.objectContaining({
+        text: "  @Ada  review",
+        mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 2, endUtf16: 6 }],
+      }),
+    ),
+  );
+});
+
+test("session mention metadata stays with its draft when switching sessions", async () => {
+  const s2 = session(LOCAL_RUNNER, {
+    sessionPk: "s2",
+    primaryAgentId: "primary",
+    primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" },
+  });
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  useStore.setState({ sessions: [...useStore.getState().sessions, s2] });
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@a keep", selectionStart: 2 } });
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("@Ada  keep");
+
+  act(() => useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "s2" } }));
+  fireEvent.change(composer, { target: { value: "plain s2" } });
+  act(() => useStore.setState({ focusedSession: { runnerId: LOCAL_RUNNER, pk: "s1" } }));
+  expect(composer.value).toBe("@Ada  keep");
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() =>
+    expect(continueSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "s1",
+      expect.objectContaining({ mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }] }),
+    ),
+  );
+});
+
+test("session textarea Escape closes the agent mention popup", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+});
+
+test("session plain agent @ mentions open the agent menu instead of searching context", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+
+  expect(screen.getByRole("menu").textContent).toContain("Agents");
+  expect(searchFiles).not.toHaveBeenCalled();
+});
+
+test("session composer selects an agent mention from its keyboard menu", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada" },
+  ]);
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "ask @a", selectionStart: 6 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("ask @Ada ");
+});
+
+test("a deleted primary labels the header and transcript with its preserved identity", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "deleted", primaryAgentSnapshot: { id: "deleted", name: "Deleted", avatarColor: "rose" } });
+  useStore.setState({
+    transcripts: {
+      [sessKey(LOCAL_RUNNER, "s1")]: [
+        {
+          seq: 1,
+          role: "assistant",
+          blockType: "text",
+          text: "Preserved response",
+          toolCallId: null,
+          toolStatus: null,
+          toolKind: null,
+          toolName: null,
+          toolOutput: null,
+          createdAt: 1,
+          attachments: [],
+          toolPath: null,
+          toolInput: null,
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+        },
+      ],
+    },
+  });
+  render(<SessionView />);
+
+  expect(await screen.findAllByText("Deleted (Deleted)")).toHaveLength(2);
+});
+
+test("legacy sessions stay read-only without a repair destination", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: null, primaryAgentSnapshot: null });
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Legacy sessions are read-only.")) as HTMLTextAreaElement;
+  expect(composer.disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "Repair agent" })).toBeNull();
+});
+
+test("a deleted primary makes a captured session read-only without repair", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "deleted", primaryAgentSnapshot: { id: "deleted", name: "Deleted", avatarColor: "rose" } });
+  render(<SessionView />);
+
+  expect(await screen.findByText("The session’s primary agent was deleted, so this session is read-only.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Repair agent" })).toBeNull();
+});
+
+test("a nonexecutable primary offers repair navigation", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "reviewer", primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "violet" } }, [
+    primary("reviewer", false),
+  ]);
+  render(<SessionView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Repair agent" }));
+  expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "reviewer" });
+});
+
 test("local session with the bottom panel open: terminal drawer mounts and both controls are enabled", async () => {
   useNav.setState({ bottomOpen: true });
   seed(LOCAL_RUNNER);
@@ -322,7 +565,15 @@ test("running queue accepts one rapid Enter submission and clears after durable 
   const runnerId = "remote-1";
   const draftKey = refKey({ runnerId, pk: "s1" });
   const queued = deferred<{ status: "ok"; data: { id: string; text: string } }>();
-  seed(runnerId, "running");
+  seed(
+    runnerId,
+    {
+      status: "running",
+      primaryAgentId: "primary",
+      primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "blue" },
+    },
+    [primary("primary")],
+  );
   useNav.setState({ drafts: { [draftKey]: "queue this" } });
   enqueueSessionMessage.mockImplementationOnce(() => queued.promise);
 
@@ -335,6 +586,7 @@ test("running queue accepts one rapid Enter submission and clears after durable 
   expect((screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
 
   queued.resolve({ status: "ok", data: { id: "q1", text: "queue this" } });
+  await waitFor(() => expect(useNative.getState().queuedBySession[sessKey(runnerId, "s1")]).toEqual([{ id: "q1", text: "queue this" }]));
   await waitFor(() => expect(useNav.getState().drafts[draftKey]).toBeUndefined());
 });
 
@@ -382,13 +634,20 @@ test("a failed submission retains the draft and allows a retry", async () => {
 test("running queue success clears the runner-qualified draft", async () => {
   const runnerId = "remote-1";
   const draftKey = refKey({ runnerId, pk: "s1" });
-  seed(runnerId, "running");
+  seed(runnerId, { status: "running" });
   useNav.setState({ drafts: { [draftKey]: "queue this", s1: "other session" } });
 
   render(<SessionView />);
   fireEvent.keyDown(screen.getByPlaceholderText("Enter to queue"), { key: "Enter" });
 
-  await waitFor(() => expect(enqueueSessionMessage).toHaveBeenCalledWith(runnerId, "s1", "queue this", expect.anything()));
+  await waitFor(() =>
+    expect(enqueueSessionMessage).toHaveBeenCalledWith(
+      runnerId,
+      "s1",
+      "queue this",
+      expect.objectContaining({ context: expect.anything() }),
+    ),
+  );
   expect(useNav.getState().drafts[draftKey]).toBeUndefined();
   expect(useNav.getState().drafts.s1).toBe("other session");
 });
@@ -396,7 +655,7 @@ test("running queue success clears the runner-qualified draft", async () => {
 test("running queue failure leaves the runner-qualified draft", async () => {
   const runnerId = "remote-1";
   const draftKey = refKey({ runnerId, pk: "s1" });
-  seed(runnerId, "running");
+  seed(runnerId, { status: "running" });
   useNav.setState({ drafts: { [draftKey]: "keep this", s1: "other session" } });
   enqueueSessionMessage.mockResolvedValue({ status: "error", error: { message: "nope" } });
 
@@ -450,6 +709,6 @@ test("a rejected idle send keeps the draft without an unhandled rejection", asyn
   render(<SessionView />);
   fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
 
-  await waitFor(() => expect(continueSession).toHaveBeenCalledWith(runnerId, "s1", "retry this", expect.anything()));
+  await waitFor(() => expect(continueSession).toHaveBeenCalledWith(runnerId, "s1", expect.objectContaining({ text: "retry this" })));
   expect(useNav.getState().drafts[draftKey]).toBe("retry this");
 });

@@ -431,8 +431,8 @@ impl Router {
             | CoreEvent::AutomationHookRunChanged { .. }
             | CoreEvent::SessionQueueChanged { .. }
             | CoreEvent::ApprovalRequested { .. }
+            | CoreEvent::AgentRunChanged { .. }
             | CoreEvent::JobRunChanged { .. }
-            | CoreEvent::OrchTaskChanged { .. }
             // Context telemetry has no Discord rendering (yet) — the
             // compaction notice arrives as a persisted Message row instead.
             | CoreEvent::ContextUsage { .. }
@@ -650,9 +650,13 @@ mod tests {
     /// after the path is unlinked.
     async fn test_control_plane() -> (Arc<ControlPlane>, Arc<Store>) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        let cp = ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        cp.attach_test_agent_persistence().await;
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, crate::plugins::Registries::new(), persistence).await
+        };
         let store_ref = cp.store().clone();
         (cp, store_ref)
     }
@@ -1027,11 +1031,38 @@ mod tests {
         harness: Arc<dyn crate::harness::HarnessFactory>,
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(db_guard.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(db_guard.path()).await.unwrap());
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let mut regs = crate::plugins::Registries::new();
         regs.harness = harness;
-        let cp = ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
         let store_ref = cp.store().clone();
         crate::settings::SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())

@@ -1,3 +1,4 @@
+use super::lifecycle::PrimaryTurn;
 use super::*;
 use crate::domain::{
     ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, QueuedSessionPrompt,
@@ -9,6 +10,7 @@ use crate::plugins::Registries;
 use crate::settings::SettingsStore;
 use async_trait::async_trait;
 use serial_test::serial;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Redirect dirs::data_dir() into a tempdir for the duration of a test so
@@ -21,11 +23,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// global git config.
 struct StateDirGuard {
     _dir: tempfile::TempDir,
+    previous_xdg_data_home: Option<std::ffi::OsString>,
+    previous_home: Option<std::ffi::OsString>,
 }
 
 impl StateDirGuard {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
+        let previous_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let previous_home = std::env::var_os("HOME");
         std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
         std::env::set_var("HOME", dir.path());
         std::fs::write(
@@ -33,7 +39,24 @@ impl StateDirGuard {
             "[user]\n\tname = Test\n\temail = test@example.com\n",
         )
         .expect("write .gitconfig");
-        StateDirGuard { _dir: dir }
+        StateDirGuard {
+            _dir: dir,
+            previous_xdg_data_home,
+            previous_home,
+        }
+    }
+}
+
+impl Drop for StateDirGuard {
+    fn drop(&mut self) {
+        match &self.previous_xdg_data_home {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match &self.previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }
 
@@ -50,16 +73,25 @@ struct FakeSession {
     store: Arc<Store>,
     events: broadcast::Sender<CoreEvent>,
     session_pk: String,
+    run_id: String,
+    isolated_target: bool,
     block_until_cancel: bool,
+    completion_gate: Option<Arc<AtomicBool>>,
+    failure: Option<String>,
     cancelled: Arc<AtomicBool>,
     send_count: Arc<AtomicUsize>,
     ended: Arc<AtomicBool>,
+    cancels: Arc<AtomicUsize>,
     /// Every prompt text driven on this (or a sibling) fake session, in
     /// order — lets resume tests assert the exact nudge text sent.
     prompts: Arc<Mutex<Vec<String>>>,
     /// Every `steer()` call observed on this (or a sibling) fake session, in
     /// order — lets steer tests assert the live handle actually received it.
     steered: Arc<Mutex<Vec<String>>>,
+    /// Every primary-turn configuration received by a live session.
+    primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
+    /// Historic session permission updates observed by a live session.
+    perm_modes: Arc<Mutex<Vec<crate::domain::PermMode>>>,
 }
 
 #[async_trait]
@@ -72,27 +104,31 @@ impl HarnessSession for FakeSession {
         // Persist the user turn (as the ACP session does in send_prompt),
         // using the RAW display text — not the agent-decorated one — so
         // durable history mirrors what the real ACP session persists.
-        let _ = self
-            .store
-            .insert_message(NewMessage::block(
-                &self.session_pk,
-                "user",
-                "text",
-                serde_json::json!({ "text": prompt.display }),
-            ))
-            .await;
+        let user = NewMessage::block(
+            &self.session_pk,
+            "user",
+            "text",
+            serde_json::json!({ "text": prompt.display }),
+        );
+        let _ = if self.isolated_target {
+            self.store.insert_run_message(&self.run_id, user).await
+        } else {
+            self.store.insert_message(user).await
+        };
 
         // Stream an assistant text row + broadcast it (as the sink does).
-        if let Ok(seq) = self
-            .store
-            .insert_message(NewMessage::block(
-                &self.session_pk,
-                "assistant",
-                "text",
-                serde_json::json!({ "text": "working" }),
-            ))
-            .await
-        {
+        let assistant = NewMessage::block(
+            &self.session_pk,
+            "assistant",
+            "text",
+            serde_json::json!({ "text": "working" }),
+        );
+        let inserted = if self.isolated_target {
+            self.store.insert_run_message(&self.run_id, assistant).await
+        } else {
+            self.store.insert_message(assistant).await
+        };
+        if let Ok(seq) = inserted {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: self.session_pk.clone(),
                 seq,
@@ -104,6 +140,25 @@ impl HarnessSession for FakeSession {
                 tool_kind: None,
                 speaker: None,
             });
+        }
+
+        if let Some(failure) = &self.failure {
+            anyhow::bail!(failure.clone());
+        }
+
+        if self
+            .completion_gate
+            .as_ref()
+            .is_some_and(|open| !open.load(Ordering::SeqCst))
+        {
+            while !self
+                .completion_gate
+                .as_ref()
+                .is_some_and(|open| open.load(Ordering::SeqCst))
+                && !self.cancelled.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         }
 
         if self.block_until_cancel {
@@ -119,6 +174,7 @@ impl HarnessSession for FakeSession {
     }
 
     async fn cancel(&self) -> anyhow::Result<()> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
         self.cancelled.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -136,6 +192,14 @@ impl HarnessSession for FakeSession {
     fn steer(&self, text: String) {
         self.steered.lock().unwrap().push(text);
     }
+
+    fn set_perm_mode(&self, mode: crate::domain::PermMode) {
+        self.perm_modes.lock().unwrap().push(mode);
+    }
+
+    async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {
+        self.primary_turns.lock().unwrap().push(primary);
+    }
 }
 
 /// Shared counters so tests can observe the harness/session lifecycle across
@@ -148,10 +212,23 @@ struct Counters {
     sends: Arc<AtomicUsize>,
     /// Set once `end()` is called on a produced session.
     ended: Arc<AtomicBool>,
+    /// Number of cancellation calls received across produced sessions.
+    cancels: Arc<AtomicUsize>,
     /// Prompts observed by `send_prompt` across every produced session, in order.
     prompts: Arc<Mutex<Vec<String>>>,
     /// `steer()` calls observed across every produced session, in order.
     steered: Arc<Mutex<Vec<String>>>,
+    /// Every primary-turn configuration received by a live session.
+    primary_turns: Arc<Mutex<Vec<crate::harness::PrimaryTurnConfig>>>,
+    /// Historic session permission updates observed by a live session.
+    perm_modes: Arc<Mutex<Vec<crate::domain::PermMode>>>,
+    /// Every attachments read-root received by a started harness, in start
+    /// order. Explicit mention tests use this to prove their one-shot child
+    /// does not inherit the parent session root.
+    attachment_dirs: Arc<Mutex<Vec<Option<std::path::PathBuf>>>>,
+    /// Whether each started harness received an app-control facade. An
+    /// explicit-mention child must never retain its parent's facade.
+    app_facades: Arc<Mutex<Vec<bool>>>,
     /// The `SessionCtx.mcp_servers` the most recent `start_session` call was
     /// built with — lets plugin-connector tests assert on exactly what
     /// `start_harness_session` attached, without a bespoke fake per test.
@@ -164,6 +241,8 @@ struct Counters {
 
 struct FakeHarness {
     block_until_cancel: bool,
+    completion_gate: Option<(String, Arc<AtomicBool>)>,
+    fail_isolated_target: Option<String>,
     counters: Counters,
 }
 
@@ -171,24 +250,51 @@ struct FakeHarness {
 impl Harness for FakeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         self.counters.starts.fetch_add(1, Ordering::SeqCst);
+        self.counters
+            .attachment_dirs
+            .lock()
+            .unwrap()
+            .push(ctx.attachments_dir.clone());
+        self.counters
+            .app_facades
+            .lock()
+            .unwrap()
+            .push(ctx.app_control.is_some());
         *self.counters.mcp_servers.lock().unwrap() = Some(ctx.mcp_servers.clone());
         *self.counters.mcp_principals.lock().unwrap() = Some(ctx.mcp_principals.clone());
         Ok(Box::new(FakeSession {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
             session_pk: ctx.session_pk.clone(),
+            run_id: ctx.run_id.clone(),
+            isolated_target: ctx.isolated_target,
             block_until_cancel: self.block_until_cancel,
+            completion_gate: self.completion_gate.as_ref().and_then(|(name, open)| {
+                (ctx.isolated_target && ctx.primary_agent.profile.name == *name)
+                    .then(|| Arc::clone(open))
+            }),
+            failure: (ctx.isolated_target
+                && self
+                    .fail_isolated_target
+                    .as_deref()
+                    .is_some_and(|name| name == ctx.primary_agent.profile.name))
+            .then(|| format!("{} child failed", ctx.primary_agent.profile.name)),
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
+            cancels: self.counters.cancels.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
+            primary_turns: self.counters.primary_turns.clone(),
+            perm_modes: self.counters.perm_modes.clone(),
         }))
     }
 }
 
 struct FakeHarnessFactory {
     block_until_cancel: bool,
+    completion_gate: Option<(String, Arc<AtomicBool>)>,
+    fail_isolated_target: Option<String>,
     counters: Counters,
 }
 
@@ -196,6 +302,8 @@ impl HarnessFactory for FakeHarnessFactory {
     fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
         Ok(Arc::new(FakeHarness {
             block_until_cancel: self.block_until_cancel,
+            completion_gate: self.completion_gate.clone(),
+            fail_isolated_target: self.fail_isolated_target.clone(),
             counters: self.counters.clone(),
         }))
     }
@@ -280,12 +388,19 @@ impl Harness for GatedHarness {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
             session_pk: ctx.session_pk.clone(),
+            run_id: ctx.run_id.clone(),
+            isolated_target: ctx.isolated_target,
             block_until_cancel: false,
+            completion_gate: None,
+            failure: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
+            cancels: self.counters.cancels.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
+            primary_turns: self.counters.primary_turns.clone(),
+            perm_modes: self.counters.perm_modes.clone(),
         }))
     }
 }
@@ -326,12 +441,19 @@ impl Harness for LatchGatedHarness {
             store: ctx.store.clone(),
             events: ctx.events.clone(),
             session_pk: ctx.session_pk.clone(),
+            run_id: ctx.run_id.clone(),
+            isolated_target: ctx.isolated_target,
             block_until_cancel: false,
+            completion_gate: None,
+            failure: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             send_count: self.counters.sends.clone(),
             ended: self.counters.ended.clone(),
+            cancels: self.counters.cancels.clone(),
             prompts: self.counters.prompts.clone(),
             steered: self.counters.steered.clone(),
+            primary_turns: self.counters.primary_turns.clone(),
+            perm_modes: self.counters.perm_modes.clone(),
         }))
     }
 }
@@ -361,6 +483,8 @@ fn registries_with(block_until_cancel: bool, counters: Counters) -> Registries {
     let mut regs = Registries::new();
     regs.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel,
+        completion_gate: None,
+        fail_isolated_target: None,
         counters,
     });
     regs
@@ -404,6 +528,8 @@ async fn fake_control_plane_any_harness() -> (Arc<ControlPlane>, Arc<Store>, tem
     let mut regs = Registries::new();
     regs.harness = Arc::new(FakeHarnessFactory {
         block_until_cancel: false,
+        completion_gate: None,
+        fail_isolated_target: None,
         counters: counters.clone(),
     });
     let cp = test_control_plane(store, regs).await;
@@ -422,18 +548,39 @@ fn temp_db_path() -> (tempfile::NamedTempFile, std::path::PathBuf) {
     (f, path)
 }
 
-/// Attach the same YAML/OKF persistence graph production composition roots
-/// install before starting sessions. Control-plane unit tests use isolated
-/// config roots so they exercise the real session dependency without touching
-/// the operator's config directory.
-async fn attach_test_agent_persistence(cp: &Arc<ControlPlane>) {
-    cp.attach_test_agent_persistence().await;
+async fn prepare_test_agent_persistence(store: &Arc<Store>) {
+    crate::llm_router::connections::add_connection(
+        store,
+        crate::llm_router::connections::ConnectionRow {
+            id: "test-anthropic".into(),
+            provider: "anthropic".into(),
+            auth_type: "api_key".into(),
+            label: "Test Anthropic".into(),
+            priority: 0,
+            enabled: true,
+            data: crate::llm_router::connections::ConnectionData {
+                api_key: Some("test-key".into()),
+                models_override: Some(vec!["claude-opus-4-8".into()]),
+                ..Default::default()
+            },
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .await
+    .unwrap();
+    crate::agents::bootstrap::ensure_default_routes(store)
+        .await
+        .unwrap();
 }
 
 async fn test_control_plane(store: Store, registries: Registries) -> Arc<ControlPlane> {
-    let cp = ControlPlane::new(store, registries).await;
-    attach_test_agent_persistence(&cp).await;
-    cp
+    let store = Arc::new(store);
+    prepare_test_agent_persistence(&store).await;
+    let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+        .await
+        .unwrap();
+    ControlPlane::new(store, registries, persistence).await
 }
 
 async fn test_control_plane_with_telemetry(
@@ -441,9 +588,11 @@ async fn test_control_plane_with_telemetry(
     registries: Registries,
     telemetry: Arc<dyn crate::telemetry::Telemetry>,
 ) -> Arc<ControlPlane> {
-    let cp = ControlPlane::new_with_telemetry(store, registries, telemetry).await;
-    attach_test_agent_persistence(&cp).await;
-    cp
+    prepare_test_agent_persistence(&store).await;
+    let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+        .await
+        .unwrap();
+    ControlPlane::new_with_telemetry(store, registries, telemetry, persistence).await
 }
 
 async fn test_control_plane_full(
@@ -452,11 +601,1090 @@ async fn test_control_plane_full(
     telemetry: Arc<dyn crate::telemetry::Telemetry>,
     attachment_fetcher: Arc<dyn crate::attachments::AttachmentFetcher>,
 ) -> Arc<ControlPlane> {
-    let cp = ControlPlane::new_full(store, registries, telemetry, attachment_fetcher).await;
-    attach_test_agent_persistence(&cp).await;
-    cp
+    prepare_test_agent_persistence(&store).await;
+    let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+        .await
+        .unwrap();
+    ControlPlane::new_full(
+        store,
+        registries,
+        telemetry,
+        attachment_fetcher,
+        persistence,
+    )
+    .await
 }
 
+#[tokio::test]
+async fn recent_sessions_filter_by_stable_owner_and_sort_by_last_activity_with_a_clamped_limit() {
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let snapshot = crate::domain::AgentIdentitySnapshot {
+        id: "ada".into(),
+        name: "Ada".into(),
+        avatar_color: "violet".into(),
+    };
+    for (session_pk, agent_id, last_active) in [
+        ("old", "ada", 10),
+        ("new", "ada", 30),
+        ("middle", "ada", 20),
+        ("other", "bob", 40),
+    ] {
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: session_pk.into(),
+                primary_agent_id: Some(agent_id.into()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: agent_id.into(),
+                    ..snapshot.clone()
+                }),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(last_active),
+                last_active: Some(last_active),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let all = cp.list_agent_sessions("ada", 50).await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|session| session.session_pk.as_str())
+            .collect::<Vec<_>>(),
+        vec!["new", "middle", "old"],
+    );
+    assert_eq!(cp.list_agent_sessions("ada", 0).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_run_per_turn() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_counters().await;
+    let mut run_events = cp.subscribe();
+    let agent_id = cp.registry().default_agent_id().await;
+
+    let session = cp
+        .start_agent_session_with_prompt(
+            None,
+            &agent_id,
+            TurnPrompt::text("first", "first"),
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.primary_agent_id.as_deref(), Some(agent_id.as_str()));
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("session creation queues its initial primary run");
+    assert_eq!(initial_run.status, crate::domain::AgentRunStatus::Queued);
+    assert!(initial_run.started_at.is_none());
+    assert!(initial_run.finished_at.is_none());
+    assert_eq!(
+        wait_for_primary_run_statuses(&mut run_events, &session.session_pk, &initial_run.run_id)
+            .await,
+        vec!["queued", "running", "completed"],
+    );
+    let initial_run =
+        wait_for_primary_run_terminal(&store, &session.session_pk, &initial_run.run_id).await;
+    assert_eq!(initial_run.status, crate::domain::AgentRunStatus::Completed);
+    assert!(initial_run.started_at.is_some());
+    assert!(initial_run.finished_at.is_some());
+    let creation_identity = session.primary_agent_snapshot.clone().unwrap();
+    let profile = cp
+        .registry()
+        .resolved_snapshot(&agent_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: "Renamed primary".into(),
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model.clone(),
+                permissions: crate::agents::types::AgentPermissions {
+                    mode: crate::domain::PermMode::AcceptEdits,
+                    rules: vec![],
+                },
+                skills: vec!["release".into()],
+                tools: crate::agents::types::AgentTools {
+                    native: vec!["read".into()],
+                    plugins: vec![],
+                    apps: vec![],
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+
+    let run_id = cp
+        .continue_agent_session_with_prompt(
+            &session.session_pk,
+            TurnPrompt::text("second", "second"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|run| run.parent_run_id.is_none()));
+    assert!(runs
+        .iter()
+        .all(|run| run.agent_kind == crate::domain::AgentRunKind::Primary));
+    assert!(runs.iter().any(|run| run.run_id == run_id));
+    assert_eq!(
+        wait_for_primary_run_statuses(&mut run_events, &session.session_pk, &run_id).await,
+        vec!["queued", "running", "completed"],
+    );
+    let continued_run = wait_for_primary_run_terminal(&store, &session.session_pk, &run_id).await;
+    assert_eq!(
+        continued_run.status,
+        crate::domain::AgentRunStatus::Completed
+    );
+    assert!(continued_run.started_at.is_some());
+    assert!(continued_run.finished_at.is_some());
+    {
+        let primary_turns = counters.primary_turns.lock().unwrap();
+        assert_eq!(
+            primary_turns.len(),
+            1,
+            "live session must refresh its turn config"
+        );
+        assert_eq!(primary_turns[0].agent.profile.name, "Renamed primary");
+        assert_eq!(primary_turns[0].agent.profile.model, profile.model);
+        assert_eq!(
+            primary_turns[0].agent.profile.permissions.mode,
+            crate::domain::PermMode::AcceptEdits
+        );
+        assert_eq!(
+            primary_turns[0].allowed_skills,
+            Some(vec!["release".into()])
+        );
+        assert!(primary_turns[0].agent_tools.tools.allows("read"));
+        assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
+        assert_eq!(primary_turns[0].run_id, run_id);
+        assert_eq!(primary_turns[0].root_run_id, run_id);
+    }
+    assert_eq!(
+        store
+            .get_session(&session.session_pk)
+            .await
+            .unwrap()
+            .unwrap()
+            .primary_agent_snapshot,
+        Some(creation_identity),
+    );
+    assert!(
+        counters.perm_modes.lock().unwrap().is_empty(),
+        "the historic session permission must not overwrite the refreshed profile permission"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_counters().await;
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let target = cp
+        .registry()
+        .create(crate::agents::types::AgentMutationInput {
+            name: "Ada".into(),
+            description: template.description,
+            avatar: template.avatar,
+            model: template.model,
+            permissions: template.permissions,
+            skills: template.skills,
+            tools: template.tools,
+            loop_settings: template.loop_settings,
+        })
+        .await
+        .unwrap();
+    let text = "@Ada @Ada investigate";
+    let mentions = vec![
+        crate::api::types::AgentMention {
+            agent_id: target.profile.id.clone(),
+            label_snapshot: "Ada".into(),
+            start_utf16: 0,
+            end_utf16: 4,
+        },
+        crate::api::types::AgentMention {
+            agent_id: target.profile.id.clone(),
+            label_snapshot: "Ada".into(),
+            start_utf16: 5,
+            end_utf16: 9,
+        },
+    ];
+    let mut run_events = cp.subscribe();
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &mentions,
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(&counters.prompts, 2).await;
+    {
+        let attachment_dirs = counters.attachment_dirs.lock().unwrap();
+        assert!(
+            attachment_dirs[0].is_some(),
+            "the normal primary must retain its session attachment root"
+        );
+        assert_eq!(
+            attachment_dirs[1], None,
+            "the explicit-mention child must not inherit the parent attachment root"
+        );
+    }
+    {
+        let app_facades = counters.app_facades.lock().unwrap();
+        assert!(app_facades[0], "the primary retains its app-control facade");
+        assert!(
+            !app_facades[1],
+            "the explicit-mention child must not receive the parent app-control facade"
+        );
+    }
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 2, "duplicate target mentions queue one child");
+    let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
+    let child = runs.iter().find(|run| run.parent_run_id.is_some()).unwrap();
+    let statuses = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_primary_run_statuses(&mut run_events, &session.session_pk, &root.run_id),
+    )
+    .await
+    .expect("coordinator root must reach a terminal state");
+    assert_eq!(
+        statuses
+            .iter()
+            .find(|status| status.as_str() == "running")
+            .map(String::as_str),
+        Some("running"),
+        "the coordinator root becomes running before child work completes"
+    );
+    assert!(
+        cp.running.lock().unwrap().contains_key(&session.session_pk),
+        "the root harness remains registered"
+    );
+    assert_eq!(
+        cp.running.lock().unwrap().len(),
+        1,
+        "an isolated child harness must not register in ControlPlane.running"
+    );
+    let child_rows = store
+        .list_run_messages(&session.session_pk, &child.run_id)
+        .await
+        .unwrap();
+    assert_eq!(child_rows.len(), 2, "child output is run-scoped");
+    assert_eq!(child_rows[1].payload["text"], "working");
+    let synthesis = counters.prompts.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        &synthesis[..crate::mentions::COORDINATOR_SYNTHESIS_INSTRUCTION.len()],
+        crate::mentions::COORDINATOR_SYNTHESIS_INSTRUCTION
+    );
+    assert!(synthesis.contains("Agent: Ada"));
+    assert!(synthesis.contains("Result: working"));
+    let coordinator_entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(coordinator_entries.len(), 1, "one child outcome is durable");
+    assert_eq!(coordinator_entries[0].role, "system");
+    assert_eq!(coordinator_entries[0].block_type, "coordinator_outcome");
+    assert_eq!(coordinator_entries[0].payload["name"], "Ada");
+    assert_eq!(coordinator_entries[0].payload["task"], "  investigate");
+    assert_eq!(coordinator_entries[0].payload["status"], "completed");
+    assert_eq!(coordinator_entries[0].payload["result"], "working");
+    assert!(coordinator_entries[0].payload["error"].is_null());
+    assert_eq!(
+        coordinator_entries.len(),
+        1,
+        "only coordinator outcome entries belong to the root run"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mentions_keep_queue_rejection_identity_in_durable_synthesis_context() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, counters, _db_guard) = fake_control_plane_with_counters().await;
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: String| crate::agents::types::AgentMutationInput {
+        name,
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let mut targets = Vec::new();
+    for number in 1..=crate::delegation::MAX_ACTIVE_CHILD_RUNS + 1 {
+        targets.push(
+            cp.registry()
+                .create(create(format!("Target{number}")))
+                .await
+                .unwrap(),
+        );
+    }
+    let rejected = targets.last().unwrap().clone();
+    let mut text = String::new();
+    let mut mentions = Vec::new();
+    for target in &targets {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let start_utf16 = text.len() as u32;
+        text.push('@');
+        text.push_str(&target.profile.name);
+        mentions.push(crate::api::types::AgentMention {
+            agent_id: target.profile.id.clone(),
+            label_snapshot: target.profile.name.clone(),
+            start_utf16,
+            end_utf16: text.len() as u32,
+        });
+    }
+    text.push_str(" inspect the change");
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(&text, &text),
+            &mentions,
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(
+        &counters.prompts,
+        crate::delegation::MAX_ACTIVE_CHILD_RUNS + 1,
+    )
+    .await;
+    let root = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.is_none())
+        .unwrap();
+    let entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), targets.len());
+    for target in &targets {
+        assert!(entries.iter().any(|entry| {
+            entry.payload["agent_id"] == target.profile.id
+                && entry.payload["name"] == target.profile.name
+        }));
+    }
+    let rejected_entry = entries
+        .iter()
+        .find(|entry| entry.payload["agent_id"] == rejected.profile.id)
+        .expect("rejected mention must retain its resolved identity");
+    assert_eq!(rejected_entry.payload["name"], rejected.profile.name);
+    assert_eq!(rejected_entry.payload["status"], "failed");
+    assert!(rejected_entry.payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("active child run limit exceeded"));
+
+    let synthesis = counters.prompts.lock().unwrap().last().cloned().unwrap();
+    for target in &targets {
+        assert!(synthesis.contains(&format!("Agent: {}", target.profile.name)));
+    }
+    assert!(synthesis.contains("active child run limit exceeded"));
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mentions_persist_completed_outcomes_while_a_sibling_is_pending() {
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let bob_completion_open = Arc::new(AtomicBool::new(false));
+    let mut registries = Registries::new();
+    registries.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel: false,
+        completion_gate: Some(("Bob".into(), Arc::clone(&bob_completion_open))),
+        fail_isolated_target: None,
+        counters: counters.clone(),
+    });
+    let cp = test_control_plane(store, registries).await;
+    let store = cp.store().clone();
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: &str| crate::agents::types::AgentMutationInput {
+        name: name.into(),
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let ada = cp.registry().create(create("Ada")).await.unwrap();
+    let bob = cp.registry().create(create("Bob")).await.unwrap();
+    let text = "@Ada @Bob inspect the change";
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &[
+                crate::api::types::AgentMention {
+                    agent_id: ada.profile.id.clone(),
+                    label_snapshot: "Ada".into(),
+                    start_utf16: 0,
+                    end_utf16: 4,
+                },
+                crate::api::types::AgentMention {
+                    agent_id: bob.profile.id.clone(),
+                    label_snapshot: "Bob".into(),
+                    start_utf16: 5,
+                    end_utf16: 9,
+                },
+            ],
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(&counters.prompts, 2).await;
+    let root = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.is_none())
+        .unwrap();
+    let entries = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let entries = store
+                .list_run_messages(&session.session_pk, &root.run_id)
+                .await
+                .unwrap();
+            if entries.len() == 1 {
+                return entries;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Ada's terminal outcome must be durable before Bob completes");
+    assert_eq!(entries[0].payload["name"], "Ada");
+    assert_eq!(entries[0].payload["status"], "completed");
+    assert_eq!(
+        crate::mentions::coordinator_context_from_run(&store, &session.session_pk, &root.run_id)
+            .await
+            .unwrap(),
+        "Agent: Ada\nTask:   inspect the change\nStatus: completed\nResult: working\nError: "
+    );
+    let bob_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.executing_agent_id.as_deref() == Some(bob.profile.id.as_str()))
+        .unwrap();
+    assert_eq!(bob_run.status, crate::domain::AgentRunStatus::Running);
+    assert_eq!(
+        counters.prompts.lock().unwrap().len(),
+        2,
+        "synthesis must wait for every child to reach a terminal state"
+    );
+
+    bob_completion_open.store(true, Ordering::SeqCst);
+    wait_for_prompts(&counters.prompts, 3).await;
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
+async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_partial_failure_context()
+{
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let mut registries = Registries::new();
+    registries.harness = Arc::new(FakeHarnessFactory {
+        block_until_cancel: false,
+        completion_gate: None,
+        fail_isolated_target: Some("Ada".into()),
+        counters: counters.clone(),
+    });
+    let cp = test_control_plane(store, registries).await;
+    let store = cp.store().clone();
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: &str| crate::agents::types::AgentMutationInput {
+        name: name.into(),
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let ada = cp.registry().create(create("Ada")).await.unwrap();
+    let bob = cp.registry().create(create("Bob")).await.unwrap();
+    let text = "@Ada @Bob inspect the change";
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &[
+                crate::api::types::AgentMention {
+                    agent_id: ada.profile.id.clone(),
+                    label_snapshot: "Ada".into(),
+                    start_utf16: 0,
+                    end_utf16: 4,
+                },
+                crate::api::types::AgentMention {
+                    agent_id: bob.profile.id.clone(),
+                    label_snapshot: "Bob".into(),
+                    start_utf16: 5,
+                    end_utf16: 9,
+                },
+            ],
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_prompts(&counters.prompts, 3).await;
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
+    let ada_run = runs
+        .iter()
+        .find(|run| run.executing_agent_id.as_deref() == Some(ada.profile.id.as_str()))
+        .unwrap();
+    let bob_run = runs
+        .iter()
+        .find(|run| run.executing_agent_id.as_deref() == Some(bob.profile.id.as_str()))
+        .unwrap();
+    let ada_run = wait_for_primary_run_terminal(&store, &session.session_pk, &ada_run.run_id).await;
+    let bob_run = wait_for_primary_run_terminal(&store, &session.session_pk, &bob_run.run_id).await;
+    assert_eq!(ada_run.status, crate::domain::AgentRunStatus::Failed);
+    assert_eq!(bob_run.status, crate::domain::AgentRunStatus::Completed);
+
+    let synthesis = counters.prompts.lock().unwrap().last().cloned().unwrap();
+    assert!(synthesis.contains("Agent: Ada"));
+    assert!(synthesis.contains("Status: failed"));
+    assert!(synthesis.contains("Error: Ada child failed"));
+    assert!(synthesis.contains("Agent: Bob"));
+    assert!(synthesis.contains("Status: completed"));
+    let coordinator_entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(coordinator_entries.len(), 2);
+    assert!(coordinator_entries.iter().any(|message| {
+        message.payload["name"] == "Ada"
+            && message.payload["status"] == "failed"
+            && message.payload["error"] == "Ada child failed"
+    }));
+    assert!(coordinator_entries.iter().any(|message| {
+        message.payload["name"] == "Bob"
+            && message.payload["status"] == "completed"
+            && message.payload["error"].is_null()
+    }));
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
+async fn ending_explicit_mention_parent_without_a_live_harness_cancels_children_without_synthesis()
+{
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(true, counters.clone())).await;
+    let store = cp.store().clone();
+    let primary_id = cp.registry().default_agent_id().await;
+    let template = cp
+        .registry()
+        .resolved_snapshot(&primary_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    let create = |name: &str| crate::agents::types::AgentMutationInput {
+        name: name.into(),
+        description: template.description.clone(),
+        avatar: template.avatar.clone(),
+        model: template.model.clone(),
+        permissions: template.permissions.clone(),
+        skills: template.skills.clone(),
+        tools: template.tools.clone(),
+        loop_settings: template.loop_settings.clone(),
+    };
+    let ada = cp.registry().create(create("Ada")).await.unwrap();
+    let bob = cp.registry().create(create("Bob")).await.unwrap();
+    let text = "@Ada @Bob inspect the change";
+    let session = cp
+        .start_agent_session_with_turn(
+            None,
+            &primary_id,
+            TurnPrompt::text(text, text),
+            &[
+                crate::api::types::AgentMention {
+                    agent_id: ada.profile.id.clone(),
+                    label_snapshot: "Ada".into(),
+                    start_utf16: 0,
+                    end_utf16: 4,
+                },
+                crate::api::types::AgentMention {
+                    agent_id: bob.profile.id.clone(),
+                    label_snapshot: "Bob".into(),
+                    start_utf16: 5,
+                    end_utf16: 9,
+                },
+            ],
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_prompts(&counters.prompts, 2).await;
+    let runs = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap();
+    let root = runs.iter().find(|run| run.parent_run_id.is_none()).unwrap();
+    let children = runs
+        .iter()
+        .filter(|run| run.parent_run_id.as_deref() == Some(root.run_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 2);
+
+    cp.running.lock().unwrap().remove(&session.session_pk);
+    cp.end_session(&session.session_pk).await.unwrap();
+    let root = wait_for_primary_run_terminal(&store, &session.session_pk, &root.run_id).await;
+    assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
+    for child in children {
+        let child = wait_for_primary_run_terminal(&store, &session.session_pk, &child.run_id).await;
+        assert_eq!(child.status, crate::domain::AgentRunStatus::Cancelled);
+    }
+    assert_eq!(
+        counters.prompts.lock().unwrap().len(),
+        2,
+        "a stopped coordinator must not synthesize after child cancellation"
+    );
+    let coordinator_entries = store
+        .list_run_messages(&session.session_pk, &root.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator_entries.len(),
+        2,
+        "each cancelled child outcome is durable"
+    );
+    assert!(coordinator_entries.iter().all(|message| {
+        message.block_type == "coordinator_outcome"
+            && message.payload["status"] == "cancelled"
+            && message.payload["error"] == "parent run cancelled"
+    }));
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
+async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let profile = cp
+        .registry()
+        .resolved_snapshot(&agent_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: profile.name,
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: crate::agents::types::AgentTools {
+                    native: profile.tools.native,
+                    plugins: vec!["unimplemented.plugin_tool".into()],
+                    apps: Vec::new(),
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = cp
+        .start_agent_session_with_prompt(
+            None,
+            &agent_id,
+            TurnPrompt::text("reject", "reject"),
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .expect_err("native-incompatible primary must be rejected before persistence");
+    assert!(error.to_string().contains("plugin tools"));
+    assert!(store.list_sessions(None).await.unwrap().is_empty());
+    let run_count: i64 = store
+        .with_conn(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+        })
+        .await
+        .unwrap();
+    assert_eq!(run_count, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persisting() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _counters, _db_guard) = fake_control_plane_with_counters().await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let session = cp
+        .start_agent_session_with_prompt(
+            None,
+            &agent_id,
+            TurnPrompt::text("first", "first"),
+            "test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    wait_for_primary_run_terminal(&store, &session.session_pk, &initial_run.run_id).await;
+    let profile = cp
+        .registry()
+        .resolved_snapshot(&agent_id)
+        .await
+        .unwrap()
+        .profile
+        .clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: profile.name,
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: crate::agents::types::AgentTools {
+                    native: profile.tools.native,
+                    plugins: vec!["unimplemented.plugin_tool".into()],
+                    apps: Vec::new(),
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+    let messages_before_rejection = store
+        .list_messages(&session.session_pk)
+        .await
+        .unwrap()
+        .len();
+    let error = cp
+        .continue_agent_session_with_prompt(
+            &session.session_pk,
+            TurnPrompt::text("must not persist", "must not persist"),
+            &[],
+        )
+        .await
+        .expect_err("native-incompatible primary must be rejected before a continuation mutates");
+    assert!(error.to_string().contains("plugin tools"));
+    assert_eq!(
+        store
+            .list_session_agent_runs(&session.session_pk)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "rejection must happen before queuing a root run"
+    );
+    assert_eq!(
+        store
+            .list_messages(&session.session_pk)
+            .await
+            .unwrap()
+            .len(),
+        messages_before_rejection,
+        "rejection must happen before persisting the user prompt"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mutation() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let primary = cp.registry().resolved_snapshot(&agent_id).await.unwrap();
+    let now = now_ms();
+    store
+        .insert_session(Session {
+            session_pk: "resume-invalid-primary".into(),
+            primary_agent_id: Some(agent_id.clone()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: primary.profile.id.clone(),
+                name: primary.profile.name.clone(),
+                avatar_color: primary.profile.avatar.color.clone(),
+            }),
+            project_id: None,
+            agent_session_id: Some("existing-harness-session".into()),
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: SessionStatus::Interrupted,
+            perm_mode: primary.profile.permissions.mode,
+            started_by: Some("test".into()),
+            created_at: Some(now),
+            last_active: Some(now),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        })
+        .await
+        .unwrap();
+    let profile = primary.profile.clone();
+    cp.registry()
+        .update(
+            &agent_id,
+            crate::agents::types::AgentMutationInput {
+                name: profile.name,
+                description: profile.description,
+                avatar: profile.avatar,
+                model: profile.model,
+                permissions: profile.permissions,
+                skills: profile.skills,
+                tools: crate::agents::types::AgentTools {
+                    native: profile.tools.native,
+                    plugins: vec!["unimplemented.plugin_tool".into()],
+                    apps: Vec::new(),
+                },
+                loop_settings: profile.loop_settings,
+            },
+        )
+        .await
+        .unwrap();
+
+    let error = cp
+        .resume_session("resume-invalid-primary", "test")
+        .await
+        .expect_err("native-incompatible primary must be rejected before resume mutations");
+    assert!(error.to_string().contains("plugin tools"));
+    let stored = store
+        .get_session("resume-invalid-primary")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Interrupted);
+    assert_eq!(stored.resume_attempts, 0);
+    assert!(store
+        .list_session_agent_runs("resume-invalid-primary")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn agent_session_continuation_rejects_non_executable_owners_before_user_message() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
+    let now = now_ms();
+    for (session_pk, primary_agent_id, primary_agent_snapshot) in [
+        ("legacy", None, None),
+        (
+            "deleted",
+            Some("deleted"),
+            Some(crate::domain::AgentIdentitySnapshot {
+                id: "deleted".into(),
+                name: "Deleted".into(),
+                avatar_color: "gray".into(),
+            }),
+        ),
+        ("invalid", Some("ryuzi"), None),
+    ] {
+        store
+            .insert_session(crate::domain::Session {
+                session_pk: session_pk.into(),
+                primary_agent_id: primary_agent_id.map(str::to_string),
+                primary_agent_snapshot,
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: None,
+                status: SessionStatus::Idle,
+                perm_mode: crate::domain::PermMode::Default,
+                started_by: None,
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(cp
+            .continue_agent_session_with_prompt(
+                session_pk,
+                TurnPrompt::text("must not persist", "must not persist"),
+                &[],
+            )
+            .await
+            .is_err());
+        assert!(store.list_messages(session_pk).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime() {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let cp = test_control_plane(store, Registries::new()).await;
+    let agent_id = cp.registry().default_agent_id().await;
+    let snapshot = cp.registry().resolved_snapshot(&agent_id).await.unwrap();
+    cp.store()
+        .insert_session(Session {
+            session_pk: "delegation".into(),
+            primary_agent_id: Some(agent_id.clone()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: snapshot.profile.id.clone(),
+                name: snapshot.profile.name.clone(),
+                avatar_color: snapshot.profile.avatar.color.clone(),
+            }),
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: SessionStatus::Idle,
+            perm_mode: PermMode::Default,
+            started_by: None,
+            created_at: None,
+            last_active: None,
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+        })
+        .await
+        .unwrap();
+
+    let run = cp
+        .delegation()
+        .begin_primary("delegation", snapshot, "task")
+        .await
+        .unwrap();
+    assert_eq!(run.run.primary_agent_id, agent_id);
+    drop(db_guard);
+}
 /// A `HarnessFactory` whose `create()` always fails — used to exercise
 /// the cold-resume rollback path in `continue_session`.
 struct FailingHarnessFactory {
@@ -469,7 +1697,20 @@ impl HarnessFactory for FailingHarnessFactory {
     }
 }
 
-/// Build a `ControlPlane` wired to the shared-counter fake harness, plus
+async fn fake_control_plane_with_counters() -> (
+    Arc<ControlPlane>,
+    Arc<Store>,
+    Counters,
+    tempfile::NamedTempFile,
+) {
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
+    let store_ref = cp.store.clone();
+    (cp, store_ref, counters, db_guard)
+}
+
 /// a clone of its internal `Store` (for seeding/asserting session state
 /// directly), the shared prompt log (for asserting exactly what text
 /// was driven on a resumed session), and the sqlite temp-file guard the
@@ -1002,8 +2243,8 @@ async fn resolve_approval_counts_allow_and_deny() {
     let (lines, telemetry) = capturing_console_telemetry();
     let (cp, _store, _prompts, _db_guard) = fake_control_plane_with_telemetry(telemetry).await;
 
-    cp.resolve_approval_bool("req-allow", true);
-    cp.resolve_approval_bool("req-deny", false);
+    cp.resolve_approval_bool("run-allow", "req-allow", true);
+    cp.resolve_approval_bool("run-deny", "req-deny", false);
 
     let parsed = parse_telemetry_lines(&lines);
     assert!(
@@ -1023,9 +2264,13 @@ async fn resolve_approval_counts_allow_and_deny() {
 #[tokio::test]
 async fn resolve_approval_delegates_the_structured_response() {
     let (cp, _store, _prompts, _db_guard) = fake_control_plane().await;
-    let rx = cp.approvals.register("req-structured".into());
+    let rx = cp.approvals.register(crate::approval::ApprovalKey::new(
+        "run-structured",
+        "req-structured",
+    ));
 
     let resolved = cp.resolve_approval(
+        "run-structured",
         "req-structured",
         ApprovalResponse {
             decision: ApprovalDecision::AllowAlways,
@@ -1088,6 +2333,12 @@ async fn seed_session(
     store
         .insert_session(Session {
             session_pk: session_pk.to_string(),
+            primary_agent_id: Some("ryuzi".into()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: "ryuzi".into(),
+                name: "Ryuzi".into(),
+                avatar_color: "violet".into(),
+            }),
             project_id: Some(project_id.to_string()),
             agent_session_id: agent_session_id.map(|s| s.to_string()),
             worktree_path: None,
@@ -1111,6 +2362,78 @@ async fn seed_session(
         .update_resume(session_pk, status, resume_attempts)
         .await
         .unwrap();
+}
+
+async fn wait_for_primary_run_statuses(
+    rx: &mut broadcast::Receiver<CoreEvent>,
+    session_pk: &str,
+    run_id: &str,
+) -> Vec<String> {
+    let mut statuses = Vec::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Ok(CoreEvent::AgentRunChanged {
+                session_pk: event_session_pk,
+                run_id: event_run_id,
+                status,
+                ..
+            })) if event_session_pk == session_pk && event_run_id == run_id => {
+                let terminal = matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "interrupted" | "cancelled"
+                );
+                statuses.push(status);
+                if terminal {
+                    return statuses;
+                }
+            }
+            Ok(Ok(_)) => continue,
+            other => {
+                panic!("timed out waiting for primary run {run_id} lifecycle events: {other:?}")
+            }
+        }
+    }
+}
+
+/// Receive events until one matches `predicate`, skipping any interleaved
+/// `AgentRunChanged` lifecycle events a Plan4 owned turn also emits — tests
+/// written against the plain event stream only care about their own named
+/// event, not every intermediate run-status transition.
+async fn recv_event_matching(
+    rx: &mut broadcast::Receiver<CoreEvent>,
+    predicate: impl Fn(&CoreEvent) -> bool,
+) -> CoreEvent {
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for matching event")
+            .unwrap();
+        if predicate(&event) {
+            return event;
+        }
+    }
+}
+
+async fn wait_for_primary_run_terminal(
+    store: &Store,
+    session_pk: &str,
+    run_id: &str,
+) -> crate::domain::AgentRun {
+    for _ in 0..400 {
+        if let Some(run) = store
+            .list_session_agent_runs(session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+        {
+            if run.status.is_terminal() {
+                return run;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for primary run {run_id} to reach a terminal status");
 }
 
 /// Poll the shared prompt log until it has at least `n` entries (or panic
@@ -1579,11 +2902,11 @@ async fn queued_prompt_delivers_one_head_per_successful_turn() {
     releases.add_permits(1);
     wait_for_controlled_prompts(&prompts, 2).await;
     assert!(matches!(
-        events.recv().await.unwrap(),
+        recv_event_matching(&mut events, |e| matches!(e, CoreEvent::Result { .. })).await,
         CoreEvent::Result { session_pk: event_session } if event_session == session_pk
     ));
     assert!(matches!(
-        events.recv().await.unwrap(),
+        recv_event_matching(&mut events, |e| matches!(e, CoreEvent::SessionQueueChanged { .. })).await,
         CoreEvent::SessionQueueChanged { session_pk: event_session } if event_session == session_pk
     ));
     assert_eq!(
@@ -1698,12 +3021,19 @@ async fn stopped_turn_does_not_drain_queued_prompt() {
             store: store.clone(),
             events: cp.events.clone(),
             session_pk: session_pk.into(),
+            run_id: "run-".to_string() + session_pk,
+            isolated_target: false,
             block_until_cancel: true,
+            completion_gate: None,
+            failure: None,
             cancelled,
             send_count: counters.sends.clone(),
             ended: counters.ended.clone(),
+            cancels: counters.cancels.clone(),
             prompts: counters.prompts.clone(),
             steered: counters.steered.clone(),
+            primary_turns: counters.primary_turns.clone(),
+            perm_modes: counters.perm_modes.clone(),
         }),
     );
     store
@@ -1775,7 +3105,7 @@ async fn queued_prompt_delivery_restores_head_and_emits_change_when_continuation
         .await
         .is_err());
     assert!(matches!(
-        events.recv().await.unwrap(),
+        recv_event_matching(&mut events, |e| matches!(e, CoreEvent::SessionQueueChanged { .. })).await,
         CoreEvent::SessionQueueChanged { session_pk: event_session } if event_session == session_pk
     ));
     let status = store.get_session(session_pk).await.unwrap().unwrap().status;
@@ -1890,6 +3220,70 @@ async fn stop_immediately_after_start_is_registered() {
 
 #[tokio::test]
 #[serial]
+async fn project_stop_immediately_after_start_never_sends_the_prompt() {
+    let _guard = StateDirGuard::new();
+    let (_db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(false, counters.clone())).await;
+    let store = cp.store().clone();
+    let dir = tempfile::tempdir().unwrap(); // Plain folder, but still a project session.
+    let project = cp.connect_project(dir.path(), "demo").await.unwrap();
+    assert!(!project.is_git);
+
+    let mut start = Box::pin(cp.start_session(&project.project_id, "go", "test", &[]));
+    let mut pending_stop = None;
+    let session = std::future::poll_fn(|cx| -> std::task::Poll<anyhow::Result<Session>> {
+        match start.as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(session)) => {
+                // Poll the first synchronous portion of stop in the same executor
+                // turn that observes start's Ready result. The spawned startup
+                // task cannot run in between, so this is the exact return-to-stop
+                // race the registration must close.
+                let cp = Arc::clone(&cp);
+                let session_pk = session.session_pk.clone();
+                let mut stop = Box::pin(async move { cp.stop_session(&session_pk).await });
+                if let std::task::Poll::Ready(result) = stop.as_mut().poll(cx) {
+                    result.unwrap();
+                } else {
+                    pending_stop = Some(stop);
+                }
+                std::task::Poll::Ready(Ok(session))
+            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(stop) = pending_stop {
+        stop.await.unwrap();
+    }
+    let root = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("project startup creates its root run before returning");
+
+    let root = wait_for_primary_run_terminal(&store, &session.session_pk, &root.run_id).await;
+    assert_eq!(
+        counters.sends.load(Ordering::SeqCst),
+        0,
+        "an immediately stopped project startup must never drive the first prompt"
+    );
+    assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
+    let stored = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, SessionStatus::Interrupted);
+}
+
+#[tokio::test]
+#[serial]
 async fn stop_session_denies_this_sessions_parked_approvals_only() {
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();
@@ -1907,15 +3301,18 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
     wait_for_running_handle(&cp, &session.session_pk).await;
 
     // Two approvals parked for this session, one for an unrelated session.
-    let rx_a = cp
-        .approvals
-        .register_for_session(&session.session_pk, "tool-a".into());
-    let rx_b = cp
-        .approvals
-        .register_for_session(&session.session_pk, "tool-b".into());
-    let rx_other = cp
-        .approvals
-        .register_for_session("some-other-session", "tool-c".into());
+    let rx_a = cp.approvals.register_for_session(
+        &session.session_pk,
+        crate::approval::ApprovalKey::new("run-a", "tool-a"),
+    );
+    let rx_b = cp.approvals.register_for_session(
+        &session.session_pk,
+        crate::approval::ApprovalKey::new("run-b", "tool-b"),
+    );
+    let rx_other = cp.approvals.register_for_session(
+        "some-other-session",
+        crate::approval::ApprovalKey::new("run-other", "tool-c"),
+    );
 
     cp.stop_session(&session.session_pk).await.unwrap();
 
@@ -1928,7 +3325,7 @@ async fn stop_session_denies_this_sessions_parked_approvals_only() {
         "stop must deny this session's parked approval"
     );
     // The unrelated session's approval is untouched and still resolvable.
-    assert!(cp.resolve_approval_bool("tool-c", true));
+    assert!(cp.resolve_approval_bool("run-other", "tool-c", true));
     assert!(rx_other.await.unwrap().allowed());
 }
 
@@ -2144,6 +3541,8 @@ impl HarnessFactory for FailingResumeFactory {
         }
         Ok(Arc::new(FakeHarness {
             block_until_cancel: false,
+            completion_gate: None,
+            fail_isolated_target: None,
             counters: self.counters.clone(),
         }))
     }
@@ -2401,6 +3800,88 @@ async fn end_chat_session_removes_the_scratch_dir() {
 
 #[tokio::test]
 #[serial]
+async fn end_session_cancels_deferred_background_descendants_before_they_can_deliver() {
+    let _guard = StateDirGuard::new();
+    let (db_guard, db_path) = temp_db_path();
+    let store = crate::store::Store::open(&db_path).await.unwrap();
+    let counters = Counters::default();
+    let cp = test_control_plane(store, registries_with(true, counters)).await;
+    let store = cp.store().clone();
+
+    let session = cp
+        .start_chat_session(TurnPrompt::text("hi", "hi"), "test", &[])
+        .await
+        .unwrap();
+    let pk = session.session_pk.clone();
+    wait_for_running_handle(&cp, &pk).await;
+    let root = store
+        .list_session_agent_runs(&pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|run| run.parent_run_id.is_none())
+        .expect("chat startup creates a primary root");
+    assert!(
+        root.status.is_active(),
+        "the primary root must still be active"
+    );
+
+    // Model a queued background child before its detached worker is released.
+    // The worker has no rail side effect until `release`; ending the session
+    // must cancel the child's token first, so releasing it afterwards cannot
+    // enqueue a result for the dead session.
+    let child = cp
+        .delegation()
+        .queue_subagent(crate::delegation::SubagentRunRequest {
+            parent_run_id: root.run_id,
+            subagent_type: "general".into(),
+            task: "deferred background work".into(),
+            context: None,
+            background: true,
+        })
+        .await
+        .unwrap();
+    let child_run_id = child.run.run_id.clone();
+    let child_cancel = child.cancel.clone();
+    let background = cp.background().try_reserve(3, &pk).unwrap();
+    let background_cancel = background.token();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let worker_release = release.clone();
+    let worker_store = store.clone();
+    let worker_pk = pk.clone();
+    let worker = tokio::spawn(async move {
+        let _background = background;
+        worker_release.notified().await;
+        if child_cancel.is_cancelled() {
+            return;
+        }
+        worker_store
+            .enqueue_background_event(&worker_pk, "delegation", "late result")
+            .await
+            .unwrap();
+    });
+
+    cp.end_session(&pk).await.unwrap();
+
+    let child = wait_for_primary_run_terminal(&store, &pk, &child_run_id).await;
+    assert_eq!(child.status, crate::domain::AgentRunStatus::Cancelled);
+    assert!(
+        background_cancel.is_cancelled(),
+        "ending must cancel the deferred worker's background reservation"
+    );
+
+    release.notify_one();
+    worker.await.unwrap();
+    assert_eq!(
+        store.pending_background_count().await.unwrap(),
+        0,
+        "a cancelled deferred child must not enqueue a late rail event after session end"
+    );
+    drop(db_guard);
+}
+
+#[tokio::test]
+#[serial]
 async fn end_session_cancels_and_purges_orphaned_background_work() {
     let _guard = StateDirGuard::new();
     let (cp, store, _prompts, _db_guard) = fake_control_plane().await;
@@ -2469,6 +3950,12 @@ async fn resume_session_resumes_a_chat_session() {
     store
         .insert_session(Session {
             session_pk: "chat-1".to_string(),
+            primary_agent_id: Some("ryuzi".into()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: "ryuzi".into(),
+                name: "Ryuzi".into(),
+                avatar_color: "violet".into(),
+            }),
             project_id: None,
             agent_session_id: Some("agent-1".to_string()),
             worktree_path: None,
@@ -2571,9 +4058,8 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
     let project = cp.connect_project(repo_dir.path(), "demo").await.unwrap();
     // Unstaged modification to a tracked file = dirty → in-place prep refuses.
     std::fs::write(repo_dir.path().join("a.txt"), "changed").unwrap();
-    // Subscribe BEFORE starting: the orchestrator's and scheduler's session
-    // watchers finish only on a bus-terminal Result/Error for the session,
-    // so a startup failure MUST broadcast CoreEvent::Error — without it they
+    // Subscribe BEFORE starting: session watchers finish only on a
+    // bus-terminal Result/Error for the session, so a startup failure MUST
     // hang to their 2h deadline instead of reporting the real git error.
     let mut rx = cp.subscribe();
 
@@ -2629,6 +4115,18 @@ async fn git_prep_failure_emits_a_transcript_error_and_keeps_the_session() {
             .unwrap();
     }
     assert_eq!(stored.status, SessionStatus::Idle);
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("startup creates its root run");
+    assert_eq!(initial_run.status, crate::domain::AgentRunStatus::Failed);
+    assert!(initial_run
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("uncommitted changes")));
 }
 
 #[tokio::test]
@@ -2688,6 +4186,17 @@ async fn stop_during_startup_cancels_cleanly() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.status, SessionStatus::Interrupted);
+    let initial_run = store
+        .list_session_agent_runs(&session.session_pk)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("startup creates its root run");
+    assert_eq!(
+        initial_run.status,
+        crate::domain::AgentRunStatus::Interrupted
+    );
 }
 
 // Task 7.2 review fix: `startup_phases`' only pre-harness cancel checkpoint
@@ -2727,8 +4236,19 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
     // `startup_phases` directly instead of going through the normal
     // `start_session` spawn (see the comment above for why).
     let session_pk = crate::paths::new_id();
+    let primary_agent = cp
+        .registry()
+        .resolved_snapshot(&cp.registry().default_agent_id().await)
+        .await
+        .unwrap();
     let session = Session {
         session_pk: session_pk.clone(),
+        primary_agent_id: Some(primary_agent.profile.id.clone()),
+        primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+            id: primary_agent.profile.id.clone(),
+            name: primary_agent.profile.name.clone(),
+            avatar_color: primary_agent.profile.avatar.color.clone(),
+        }),
         project_id: Some(project.project_id.clone()),
         agent_session_id: None,
         worktree_path: None,
@@ -2747,6 +4267,11 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         parent_session_pk: None,
     };
     store.insert_session(session).await.unwrap();
+    let root = cp
+        .delegation()
+        .begin_primary(&session_pk, primary_agent.clone(), "go")
+        .await
+        .unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
@@ -2757,6 +4282,8 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         TurnPrompt::text("go", "go"),
         Vec::new(),
         &cancel,
+        PrimaryTurn::new(primary_agent, root.run.run_id.clone()),
+        None,
     )
     .await;
 
@@ -2771,6 +4298,8 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         msgs.is_empty(),
         "no status row should be emitted once startup was already cancelled; got: {msgs:?}"
     );
+    let root = wait_for_primary_run_terminal(&store, &session_pk, &root.run.run_id).await;
+    assert_eq!(root.status, crate::domain::AgentRunStatus::Interrupted);
 }
 
 #[tokio::test]
@@ -3125,6 +4654,15 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     // Cold-resume succeeds (the factory works) — the failure happens inside
     // the fire-and-forget `spawn_prompt` turn, so this call itself is Ok.
     cp.continue_session("s1", "hi", &[]).await.unwrap();
+    let run_id = cp
+        .store
+        .list_session_agent_runs("s1")
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("continuation queues a primary run")
+        .run_id;
 
     // The turn error must be persisted as a DURABLE transcript row
     // (role=system, block_type=error) — today it is broadcast-only and
@@ -3165,6 +4703,11 @@ async fn failed_turn_persists_a_durable_error_row_and_demotes_before_the_bus_err
     }
     let s = cp.store.get_session("s1").await.unwrap().unwrap();
     assert_eq!(s.status, SessionStatus::Idle, "must not be stuck Running");
+    let run = wait_for_primary_run_terminal(&cp.store, "s1", &run_id).await;
+    assert_eq!(run.status, crate::domain::AgentRunStatus::Failed);
+    assert!(run.started_at.is_some());
+    assert!(run.finished_at.is_some());
+    assert_eq!(run.error.as_deref(), Some("upstream quota exhausted"));
 }
 
 // ---------- Task 3: attachments wired into start/continue_session ----------
@@ -3662,7 +5205,7 @@ async fn provision_project_git_url_flow_derives_name_and_records_source() {
     std::fs::create_dir_all(&upstream_dir).unwrap();
     init_repo(&upstream_dir);
 
-    let git_url = format!("{}/.git", upstream_dir.display());
+    let git_url = format!("{}/.git", upstream_dir.display()).replace('\\', "/");
     let mut req = provision_req("fake", "ws1", "u1");
     req.git_url = Some(git_url.clone());
     // A trailing "/.git" strips to the parent dir name ("upstream-repo") via basename.
@@ -3955,10 +5498,17 @@ async fn provision_project_named_route_legacy_effort_requires_no_target_preferen
     )
     .await
     .unwrap();
+    let existing_smart = crate::llm_router::routes::list_model_routes(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|route| route.name == "smart");
     crate::llm_router::routes::save_model_route(
         &store,
         crate::llm_router::routes::ModelRouteInfo {
-            id: "smart-route".into(),
+            id: existing_smart
+                .map(|route| route.id)
+                .unwrap_or_else(|| "smart-route".into()),
             name: "smart".into(),
             enabled: true,
             strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
@@ -4621,6 +6171,8 @@ async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_wr
     cp.store()
         .insert_session(Session {
             session_pk: "parent-1".into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: None,
             agent_session_id: None,
             worktree_path: None,

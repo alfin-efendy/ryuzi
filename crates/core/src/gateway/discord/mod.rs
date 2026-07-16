@@ -553,6 +553,7 @@ mod tests {
     use crate::control::ControlPlane;
     use crate::domain::{SessionKind, SessionStatus};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
     use crate::plugins::Registries;
     use crate::settings::SettingsStore;
     use crate::store::Store;
@@ -734,8 +735,14 @@ mod tests {
 
     async fn minimal_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        ControlPlane::new(store, Registries::new()).await
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        {
+            let persistence =
+                crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+                    .await
+                    .unwrap();
+            ControlPlane::new(store, Registries::new(), persistence).await
+        }
     }
 
     // ---------- Test 1: output methods delegate to the port ----------
@@ -800,6 +807,9 @@ mod tests {
                     conversation_id: "t1".to_string(),
                 },
                 &ApprovalRequest {
+                    run_id: "run-1".to_string(),
+                    requesting_agent_id: "agent-1".to_string(),
+                    requesting_agent_name: "Agent 1".to_string(),
                     request_id: "r1".to_string(),
                     tool: "Bash".to_string(),
                     summary: "Bash: rm".to_string(),
@@ -986,17 +996,43 @@ mod tests {
         tempfile::NamedTempFile,
     ) {
         let db_guard = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(db_guard.path()).await.unwrap();
+        let store = Arc::new(Store::open(db_guard.path()).await.unwrap());
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let mut regs = Registries::new();
         regs.harness = Arc::new(OneShotHarnessFactory);
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
         let cp = ControlPlane::new_full(
-            Arc::new(store),
+            store.clone(),
             regs,
             Arc::new(NoopTelemetry),
             Arc::new(StubFetcher),
+            persistence,
         )
         .await;
-        cp.attach_test_agent_persistence().await;
         let store_ref = cp.store().clone();
         SettingsStore::new(store_ref.clone())
             .set("workdir_root", root.to_str().unwrap())

@@ -1123,6 +1123,8 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "chat-effort".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,

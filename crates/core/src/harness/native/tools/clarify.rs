@@ -8,9 +8,11 @@ use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::domain::{ApprovalDecision, ApprovalKind};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 4;
+const DEFAULT_TIMEOUT_SECS: usize = 300;
 
 pub struct Clarify;
 
@@ -97,17 +99,36 @@ impl Tool for Clarify {
             "multiSelect": false
         } ]});
 
-        let resp = interaction
-            .request(
-                &ctx.session_pk,
-                &ctx.tool_call_id,
-                "clarify",
-                "answer the agent's question",
-                ApprovalKind::Question,
-                card,
-                &ctx.cancel,
-            )
-            .await;
+        let secs = crate::settings::usize_setting(
+            &ctx.store,
+            "clarify.timeout_secs",
+            DEFAULT_TIMEOUT_SECS,
+        )
+        .await as u64;
+
+        let fut = interaction.request(
+            &ctx.session_pk,
+            &ctx.tool_call_id,
+            "clarify",
+            "answer the agent's question",
+            ApprovalKind::Question,
+            card,
+            &ctx.cancel,
+        );
+        let resp = match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                // Deregister the pending approval so a late click can't hit a
+                // stale entry and nothing leaks — never hang the turn.
+                interaction.approvals.resolve_bool(
+                    &crate::approval::ApprovalKey::new(&ctx.run_id, &ctx.tool_call_id),
+                    false,
+                );
+                return Ok(ToolOutput::ok(
+                    "No answer within the time limit; proceeding without it.",
+                ));
+            }
+        };
 
         let Some(resp) = resp else {
             return Ok(ToolOutput::error("Interrupted by user"));
@@ -165,8 +186,10 @@ mod tests {
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
         let mut clarify = tokio::spawn(async move { Clarify.execute(&ctx, q()).await.unwrap() });
 
-        let request_id = match rx.recv().await.unwrap() {
-            CoreEvent::ApprovalRequested { request_id, .. } => request_id,
+        let (run_id, request_id) = match rx.recv().await.unwrap() {
+            CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            } => (run_id, request_id),
             other => panic!("unexpected event {other:?}"),
         };
         assert!(
@@ -177,7 +200,7 @@ mod tests {
         );
 
         hub.resolve(
-            &request_id,
+            &crate::approval::ApprovalKey::new(&run_id, &request_id),
             ApprovalResponse {
                 decision: ApprovalDecision::AllowOnce,
                 scope: None,
@@ -194,9 +217,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
         let waiter = tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 hub.resolve(
-                    &request_id,
+                    &crate::approval::ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::AllowOnce,
                         scope: None,

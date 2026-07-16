@@ -28,7 +28,7 @@ export function InboxView() {
         ) : (
           <div className="space-y-3">
             {items.map((a) => (
-              <div key={a.requestId} className="space-y-1">
+              <div key={`${a.runnerId}:${a.runId}:${a.requestId}`} className="space-y-1">
                 <ApprovalCard approval={a} showSession />
                 <div className="flex justify-end">
                   <Button

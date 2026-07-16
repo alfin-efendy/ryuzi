@@ -1603,6 +1603,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn add_and_list_connection_via_rpc() {
         let s = state().await;
         let list = dispatch(
@@ -1615,10 +1616,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 1);
-        assert_eq!(list[0]["provider"], "openrouter");
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        let added = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connection| connection["provider"] == "openrouter")
+            .unwrap();
+        let id = added["id"].as_str().unwrap();
 
-        let id = list[0]["id"].as_str().unwrap();
         let renamed = dispatch(
             &s,
             "rename_connection",
@@ -1626,7 +1632,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(renamed[0]["label"], "Primary");
+        assert_eq!(
+            renamed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|connection| connection["id"] == id)
+                .unwrap()["label"],
+            "Primary"
+        );
 
         let disabled = dispatch(
             &s,
@@ -1635,8 +1649,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(disabled[0]["enabled"], false);
-        assert!(disabled[0].get("keyMasked").is_none());
-        assert!(disabled[0].get("claudeCloaking").is_none());
+        let disabled = disabled
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connection| connection["id"] == id)
+            .unwrap();
+        assert_eq!(disabled["enabled"], false);
+        assert!(disabled.get("keyMasked").is_none());
+        assert!(disabled.get("claudeCloaking").is_none());
     }
 }

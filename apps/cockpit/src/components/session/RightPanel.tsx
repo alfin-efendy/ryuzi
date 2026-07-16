@@ -11,7 +11,9 @@ import { Button, Input, Segmented } from "@ryuzi/ui";
 import { FileViewer } from "@/components/FileViewer";
 import { defaultModeForPath, previewKindForPath, type ViewMode } from "@/lib/preview";
 import { FileTreePane } from "@/components/FileTreePane";
-import { SubagentList } from "@/components/session/SubagentList";
+import { AgentRunRoster } from "@/components/session/AgentRunRoster";
+import { AgentRunDetail } from "@/components/session/AgentRunDetail";
+import { useDelegation, delegationSessionKey } from "@/store-delegation";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
 
@@ -92,6 +94,19 @@ export function RightPanel({
   const fetchDiff = useDiff((s) => s.fetch);
   const pendingReview = useDiff((s) => s.pendingReview);
   const setPendingReview = useDiff((s) => s.setPendingReview);
+  const delegationKey = delegationSessionKey(runnerId, sessionPk);
+  const selectedRunId = useDelegation((state) => state.selectedBySession[delegationKey] ?? null);
+  const runs = useDelegation((state) => state.bySession[delegationKey] ?? []);
+  const loadChildRuns = useDelegation((state) => state.load);
+  const selectedRun = runs.find((run) => run.runId === selectedRunId) ?? null;
+
+  useEffect(() => {
+    void loadChildRuns(runnerId, sessionPk);
+  }, [loadChildRuns, runnerId, sessionPk]);
+
+  useEffect(() => {
+    useDelegation.getState().select(runnerId, sessionPk, null);
+  }, [runnerId, sessionPk]);
 
   // Fetched once per session and reused both to open files from Review
   // (below) and to resolve the file viewer's session-relative reads.
@@ -468,7 +483,12 @@ export function RightPanel({
         </>
       )}
 
-      {nav.rightTab === "agents" && <SubagentList runnerId={runnerId} sessionPk={sessionPk} />}
+      {nav.rightTab === "agents" &&
+        (selectedRun ? (
+          <AgentRunDetail runnerId={runnerId} sessionPk={sessionPk} run={selectedRun} onRelatedChanges={() => nav.setRightTab("review")} />
+        ) : (
+          <AgentRunRoster runnerId={runnerId} sessionPk={sessionPk} />
+        ))}
     </div>
   );
 }

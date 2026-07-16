@@ -9,6 +9,8 @@ const base = {
   session: {
     runnerId: "local",
     sessionPk: "s1",
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p",
     agentSessionId: null,
     worktreePath: null,

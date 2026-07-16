@@ -198,13 +198,14 @@ mod tests {
         let waiter = tokio::spawn(async move {
             match rx.recv().await.unwrap() {
                 CoreEvent::ApprovalRequested {
+                    run_id,
                     request_id,
                     approval_kind,
                     ..
                 } => {
                     assert_eq!(approval_kind, ApprovalKind::Question);
                     hub.resolve(
-                        &request_id,
+                        &crate::approval::ApprovalKey::new(run_id, request_id),
                         ApprovalResponse {
                             decision: ApprovalDecision::AllowOnce,
                             scope: None,
@@ -227,8 +228,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
-                hub.resolve_bool(&request_id, false);
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
+                hub.resolve_bool(
+                    &crate::approval::ApprovalKey::new(run_id, request_id),
+                    false,
+                );
             }
         });
         let out = AskUserQuestion.execute(&ctx, valid_input()).await.unwrap();
@@ -241,9 +248,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 hub.resolve(
-                    &request_id,
+                    &crate::approval::ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::Cancel,
                         scope: None,

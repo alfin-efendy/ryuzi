@@ -16,7 +16,6 @@ const SAFE_TOOLS: &[&str] = &[
     // the prompt (like AskUserQuestion). App-control *writes* stay off this
     // list so they prompt in Default and can persist an allowAlways grant.
     "jobs.read",
-    "orch.read",
     "projects.read",
     "clarify",
 ];
@@ -237,7 +236,7 @@ mod tests {
     #[test]
     fn app_read_and_clarify_keys_auto_allow_writes_prompt() {
         // Reads + clarify auto-allow in Default AND survive Plan mode.
-        for tool in ["jobs.read", "orch.read", "projects.read", "clarify"] {
+        for tool in ["jobs.read", "projects.read", "clarify"] {
             assert_eq!(
                 decide_tool_permission(PermMode::Default, None, tool),
                 PolicyOutcome::AutoAllow,
@@ -250,7 +249,7 @@ mod tests {
             );
         }
         // Writes prompt in Default.
-        for tool in ["jobs.write", "orch.write", "projects.write"] {
+        for tool in ["jobs.write", "projects.write"] {
             assert_eq!(
                 decide_tool_permission(PermMode::Default, None, tool),
                 PolicyOutcome::Prompt,

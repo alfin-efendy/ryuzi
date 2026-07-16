@@ -8,6 +8,7 @@
 //! All file-touching tools resolve paths through [`jail`], which confines them
 //! to the session worktree, and cap their output via [`truncate`].
 
+use crate::approval::ApprovalKey;
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -17,10 +18,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub mod app_jobs;
-pub mod app_orchestrate;
 pub mod app_projects;
 pub mod bash;
 pub mod clarify;
+pub mod delegate;
 pub mod edit;
 pub mod extension;
 pub mod glob;
@@ -29,7 +30,6 @@ pub mod ls;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
-pub mod orch_block;
 pub mod plan;
 pub mod question;
 pub mod read;
@@ -102,6 +102,46 @@ pub enum BackgroundDispatch {
     Rejected { note: String },
 }
 
+pub struct MainDelegationResult {
+    pub run_id: String,
+    pub agent_id: String,
+    pub status: SubtaskStatus,
+    pub report: String,
+}
+
+impl MainDelegationResult {
+    pub fn completed(
+        run_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        report: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            agent_id: agent_id.into(),
+            status: SubtaskStatus::Completed,
+            report: report.into(),
+        }
+    }
+}
+
+/// Spawns complete main-agent profiles for `delegate_agent`. It is intentionally
+/// distinct from [`SubagentSpawner`]: main delegates retain their immutable
+/// durable profile, while `task` children are bounded ephemeral subagents.
+#[async_trait]
+pub trait MainAgentSpawner: Send + Sync {
+    /// `(id, name, description)` for executable profiles the current agent may
+    /// delegate to. The runner excludes the caller and invalid profiles.
+    async fn available(&self) -> Vec<(String, String, String)>;
+    async fn run_one(
+        &self,
+        request: crate::delegation::MainDelegationRequest,
+    ) -> MainDelegationResult;
+    async fn run_many(
+        &self,
+        requests: Vec<crate::delegation::MainDelegationRequest>,
+    ) -> Vec<MainDelegationResult>;
+}
+
 /// Spawns sub-agents for the `task` tool. Implemented by the runner; `None`
 /// inside a sub-agent's own `ToolCtx` unless that agent may delegate.
 #[async_trait]
@@ -163,20 +203,6 @@ pub struct AppJobCreate {
     pub model_override: Option<String>,
 }
 
-/// One orchestration task as seen through `app_orchestrate`.
-#[derive(Debug, Clone)]
-pub struct AppOrchSummary {
-    pub id: String,
-    pub title: String,
-    pub status: String,
-    pub agent: String,
-    /// The judge's final verdict text, present once a root reaches `done`
-    /// (`None` while in progress). Lets an agent-initiated (home-less)
-    /// orchestration retrieve its outcome via the `app_orchestrate` status
-    /// action — the rail verdict delivery is skipped when there's no home chat.
-    pub result: Option<String>,
-}
-
 /// A project as seen through `app_projects`.
 #[derive(Debug, Clone)]
 pub struct AppProjectSummary {
@@ -205,12 +231,6 @@ pub trait AppControl: Send + Sync {
     async fn set_job_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<bool>;
     async fn run_job_now(&self, id: &str) -> anyhow::Result<String>;
 
-    // --- orchestration (orch.read / orch.write) ---
-    async fn submit_orchestration(&self, project_id: &str, goal: &str) -> anyhow::Result<String>;
-    async fn list_orchestrations(&self, root: Option<&str>) -> anyhow::Result<Vec<AppOrchSummary>>;
-    async fn cancel_orchestration(&self, id: &str) -> anyhow::Result<u32>;
-    async fn retry_orchestration(&self, id: &str) -> anyhow::Result<bool>;
-
     // --- projects (projects.read / projects.write) ---
     async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>>;
     async fn create_chat_session(&self, title: Option<String>) -> anyhow::Result<String>;
@@ -219,7 +239,7 @@ pub trait AppControl: Send + Sync {
 
 /// The app-control tool names — added to the sub-agent blocklist and never
 /// advertised to delegated children (spec §9.1).
-pub const APP_TOOLS: &[&str] = &["app_jobs", "app_orchestrate", "app_projects", "clarify"];
+pub const APP_TOOLS: &[&str] = &["app_jobs", "app_projects", "clarify"];
 
 /// Channel bundle for tools whose EXECUTION is a user interaction
 /// (`exitplanmode`, `askuserquestion`): they emit their own
@@ -227,6 +247,9 @@ pub const APP_TOOLS: &[&str] = &["app_jobs", "app_orchestrate", "app_projects", 
 pub struct Interaction {
     pub approvals: Arc<crate::approval::ApprovalHub>,
     pub events: tokio::sync::broadcast::Sender<crate::domain::CoreEvent>,
+    pub run_id: String,
+    pub requesting_agent_id: String,
+    pub requesting_agent_name: String,
     /// The session's live permission mode (shared with `RunnerDeps`).
     pub perm_mode: Arc<std::sync::Mutex<crate::domain::PermMode>>,
     pub project_id: Option<String>,
@@ -246,13 +269,15 @@ impl Interaction {
         input: serde_json::Value,
         cancel: &CancellationToken,
     ) -> Option<crate::domain::ApprovalResponse> {
-        let rx = self
-            .approvals
-            .register_for_session(session_pk, request_id.to_string());
+        let key = ApprovalKey::new(&self.run_id, request_id);
+        let rx = self.approvals.register_for_session(session_pk, key.clone());
         let _ = self
             .events
             .send(crate::domain::CoreEvent::ApprovalRequested {
                 session_pk: session_pk.to_string(),
+                run_id: self.run_id.clone(),
+                requesting_agent_id: self.requesting_agent_id.clone(),
+                requesting_agent_name: self.requesting_agent_name.clone(),
                 request_id: request_id.to_string(),
                 tool: tool.to_string(),
                 summary: summary.to_string(),
@@ -266,7 +291,7 @@ impl Interaction {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                self.approvals.resolve_bool(request_id, false);
+                self.approvals.resolve_bool(&key, false);
                 None
             }
             res = rx => res.ok(),
@@ -277,6 +302,9 @@ impl Interaction {
 /// Everything a tool needs to run one call.
 pub struct ToolCtx {
     pub session_pk: String,
+    /// The durable agent run owning this call; approvals and child runs are
+    /// always scoped to this identity.
+    pub run_id: String,
     /// The session worktree — the sandbox jail root.
     pub work_dir: PathBuf,
     /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
@@ -292,6 +320,8 @@ pub struct ToolCtx {
     pub caps: OutputCaps,
     /// Sub-agent spawner for the `task` tool; `None` disables spawning.
     pub spawn: Option<Arc<dyn SubagentSpawner>>,
+    /// Complete profile spawner for `delegate_agent`; distinct from `task`.
+    pub main_agent_spawn: Option<Arc<dyn MainAgentSpawner>>,
     /// Persistent memory for the `memory` tool; `None` for sub-agents.
     pub memory: Option<Arc<crate::harness::native::memory::MemoryStore>>,
     /// Stack of worktree snapshot SHAs for the `revert` tool (most recent last).
@@ -438,19 +468,17 @@ impl ToolRegistry {
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),
+            Arc::new(delegate::DelegateAgent),
             Arc::new(session_search::SessionSearch),
             Arc::new(plan::ExitPlanMode),
             Arc::new(question::AskUserQuestion),
             // Gated to `kind='worker'` sessions — see
             // `runner::visible_tool_defs` (schema) and its own
-            // `Store::task_by_session` guard (runtime).
-            Arc::new(orch_block::OrchBlock),
             // App-control tools over the curated `AppControl` facade (spec
             // §9.1); `None` on `ctx.app` (sub-agents/workers/tests) errors
             // "not available". Blocked from delegated children — see
             // `runner::SUBAGENT_BLOCKLIST`.
             Arc::new(app_jobs::AppJobs),
-            Arc::new(app_orchestrate::AppOrchestrate),
             Arc::new(app_projects::AppProjects),
             Arc::new(clarify::Clarify),
         ];
@@ -623,6 +651,7 @@ pub(crate) mod testutil {
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
         ToolCtx {
             session_pk: "test-session".into(),
+            run_id: "test-run".into(),
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
@@ -630,6 +659,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
             spawn: None,
+            main_agent_spawn: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tool_call_id: "test-call".into(),
@@ -658,6 +688,9 @@ pub(crate) mod testutil {
         ctx.interaction = Some(Arc::new(Interaction {
             approvals: hub.clone(),
             events: tx,
+            run_id: ctx.run_id.clone(),
+            requesting_agent_id: "test-agent".into(),
+            requesting_agent_name: "Test Agent".into(),
             perm_mode: perm.clone(),
             project_id: None,
         }));
@@ -668,7 +701,6 @@ pub(crate) mod testutil {
     #[derive(Default)]
     pub struct FakeAppControl {
         pub created: std::sync::Mutex<Vec<AppJobCreate>>,
-        pub submitted: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -693,32 +725,6 @@ pub(crate) mod testutil {
         }
         async fn run_job_now(&self, _id: &str) -> anyhow::Result<String> {
             Ok("run-1".into())
-        }
-        async fn submit_orchestration(
-            &self,
-            _project_id: &str,
-            goal: &str,
-        ) -> anyhow::Result<String> {
-            self.submitted.lock().unwrap().push(goal.to_string());
-            Ok("orch-root".into())
-        }
-        async fn list_orchestrations(
-            &self,
-            _root: Option<&str>,
-        ) -> anyhow::Result<Vec<AppOrchSummary>> {
-            Ok(vec![AppOrchSummary {
-                id: "orch-root".into(),
-                title: "build it".into(),
-                status: "running".into(),
-                agent: "orchestrator".into(),
-                result: None,
-            }])
-        }
-        async fn cancel_orchestration(&self, _id: &str) -> anyhow::Result<u32> {
-            Ok(3)
-        }
-        async fn retry_orchestration(&self, _id: &str) -> anyhow::Result<bool> {
-            Ok(true)
         }
         async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>> {
             Ok(vec![AppProjectSummary {
@@ -879,19 +885,18 @@ mod tests {
             "revert",
             "lsp",
             "task",
+            "delegate_agent",
             "session_search",
             "exitplanmode",
             "askuserquestion",
-            "orch_block",
             "app_jobs",
-            "app_orchestrate",
             "app_projects",
             "clarify",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 25);
+        assert_eq!(defs.len(), 24);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

@@ -1,19 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronDown, CircleAlert, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
+import { ArrowUp, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
-import { commands, type BranchList } from "@/bindings";
+import { commands, type AgentSummaryInfo, type BranchList } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
-import { useNav } from "@/store-nav";
+import { useNav, choosePrimaryAgent, LAST_PRIMARY_AGENT_KEY } from "@/store-nav";
 import { useNative } from "@/store-native";
 import { useConnections } from "@/store-connections";
-import { HOME_SUGGESTIONS, PERM_MODES, corePermToUi, uiPermToCore, type UiPermMode } from "@/constants";
+import { HOME_SUGGESTIONS } from "@/constants";
 import { useAgents } from "@/store-agents";
+import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
+import { AgentMentionMenu } from "@/components/composer/AgentMentionMenu";
 import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
 import { composerGitOptionsForProject, normalizeBranchName } from "@/lib/composer-git";
 import { projectLabel } from "@/lib/sidebar";
-import { ComposerModelEffortMenu } from "@/components/ComposerModelEffortMenu";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -26,71 +27,60 @@ import { BranchNameModal } from "@/components/modals/BranchNameModal";
 const NO_PROJECT = "__none__";
 
 export function HomeView() {
-  const {
-    projects,
-    selectedProjectId,
-    selectProject,
-    start,
-    startChat,
-    startOrchestration,
-    projectRuntimeById,
-    loadProjectRuntime,
-    setProjectRuntime,
-  } = useStore();
+  const { projects, selectedProjectId, selectProject, start, startChat } = useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
-  const [contextRefs, setContextRefs] = useState<string[]>([]);
-  const [contextHits, setContextHits] = useState<string[]>([]);
-  const [listening, setListening] = useState(false);
-  const stopVoice = useRef<(() => void) | null>(null);
-  // Permission mode for the session about to be created. null = project default.
-  const [composerPerm, setComposerPerm] = useState<UiPermMode | null>(null);
-  // Orchestrate mode: submit the goal to the orchestrator (decomposed into
-  // tracked subtasks run by workers) instead of starting a normal turn.
-  // Requires an attached project — see the toggle's disabled state below.
-  const [orchestrate, setOrchestrate] = useState(false);
-
   // Chat is the default: no project is auto-selected. A project is attached
   // only when the user explicitly picks one (sidebar "+" or the composer's
   // project Combobox) — see selectedProjectId in the store.
   const project = projects.find((p) => p.projectId === selectedProjectId);
   const projectId = project?.projectId;
   const draftKey = `home:${projectId ?? ""}`;
-  const draft = nav.drafts[draftKey] ?? "";
-  const setDraft = useCallback(
-    (next: string | ((cur: string) => string)) => {
-      const { drafts, setDraft: write } = useNav.getState();
-      write(draftKey, typeof next === "function" ? next(drafts[draftKey] ?? "") : next);
+  const [contextRefs, setContextRefs] = useState<string[]>([]);
+  const [mentionsByDraft, setMentionsByDraft] = useState<Record<string, MentionDraft["mentions"]>>({});
+  const mentionsByDraftRef = useRef<Record<string, MentionDraft["mentions"]>>({});
+  mentionsByDraftRef.current = mentionsByDraft;
+  const mentions = mentionsByDraft[draftKey] ?? [];
+  const setMentions = useCallback(
+    (next: MentionDraft["mentions"] | ((current: MentionDraft["mentions"]) => MentionDraft["mentions"])) => {
+      const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
+      const nextMentions = typeof next === "function" ? next(currentMentions) : next;
+      mentionsByDraftRef.current = { ...mentionsByDraftRef.current, [draftKey]: nextMentions };
+      setMentionsByDraft((current) => ({ ...current, [draftKey]: nextMentions }));
     },
     [draftKey],
   );
-  const isGit = project?.isGit ?? false;
-  // Ryuzi-only: every session runs the native agent; the user picks a model.
-  const agentModels = useAgents((s) => s.models);
-  const setComposerModel = useNav((s) => s.setComposerModel);
-  const setComposerEffort = useNav((s) => s.setComposerEffort);
-  const previousProjectId = useRef(projectId);
-  const projectRuntime = projectId ? (projectRuntimeById[projectId] ?? null) : null;
-  const chatModelInfo = agentModels.find((entry) => entry.requestValue === nav.composerModel) ?? null;
-  const chatEffectiveEffort = nav.composerEffort ?? chatModelInfo?.resolvedDefault ?? null;
-  const chatRuntime = useMemo(
-    () => ({
-      projectId: "",
-      model: nav.composerModel,
-      storedEffort: nav.composerEffort,
-      effectiveEffort: chatEffectiveEffort,
-      effectiveEffortLabel: chatModelInfo?.supported.find((option) => option.value === chatEffectiveEffort)?.label ?? chatEffectiveEffort,
-      effectiveSource: nav.composerEffort
-        ? ("project" as const)
-        : chatModelInfo?.defaultSource === "provider"
-          ? ("provider" as const)
-          : ("none" as const),
-      storedEffortStatus: "valid" as const,
-      modelInfo: chatModelInfo,
-    }),
-    [chatEffectiveEffort, chatModelInfo, nav.composerEffort, nav.composerModel],
+  const [mentionCaret, setMentionCaret] = useState(0);
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
+  const [contextHits, setContextHits] = useState<string[]>([]);
+  const [listening, setListening] = useState(false);
+  const stopVoice = useRef<(() => void) | null>(null);
+
+  const draft = nav.drafts[draftKey] ?? "";
+  const updateDraft = useCallback(
+    (next: string | ((current: string) => string) | MentionDraft) => {
+      const { drafts, setDraft: write } = useNav.getState();
+      const current = drafts[draftKey] ?? "";
+      const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
+      const updated =
+        typeof next === "object"
+          ? next
+          : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
+      write(draftKey, updated.text);
+      setMentions(updated.mentions);
+    },
+    [draftKey, setMentions],
   );
+  const isGit = project?.isGit ?? false;
+  const registry = useAgents((s) => s.registry);
+  const primaryAgentId = choosePrimaryAgent(
+    registry?.agents ?? [],
+    nav.pendingPrimaryAgentId,
+    localStorage.getItem(LAST_PRIMARY_AGENT_KEY),
+    registry?.defaultAgentId ?? null,
+  );
+  const hasExecutablePrimary = primaryAgentId !== null;
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
   const connectionsLoaded = useConnections((s) => s.loaded);
@@ -102,31 +92,9 @@ export function HomeView() {
   }, [projectId, loadCommands]);
 
   useEffect(() => {
-    if (projectId) void loadProjectRuntime(projectId);
-  }, [projectId, loadProjectRuntime]);
-
-  useEffect(() => {
     if (!connectionsLoaded) void hydrateConnections();
   }, [connectionsLoaded, hydrateConnections]);
 
-  // A model picked for one project must not leak into the next one.
-  useEffect(() => {
-    if (previousProjectId.current === projectId) return;
-    previousProjectId.current = projectId;
-    setComposerModel(null);
-    setComposerEffort(null);
-  }, [projectId, setComposerEffort, setComposerModel]);
-
-  // A permission mode picked for one project's new-chat composer must not leak into the next one.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reset is edge-triggered off projectId only
-  useEffect(() => {
-    setComposerPerm(null);
-  }, [projectId]);
-  // Orchestration needs a project — detaching one turns the toggle back off
-  // instead of leaving it silently unusable.
-  useEffect(() => {
-    if (!projectId) setOrchestrate(false);
-  }, [projectId]);
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
   const setComposerBranch = nav.setComposerBranch;
@@ -155,6 +123,14 @@ export function HomeView() {
     };
   }, [projectId, isGit, setComposerBranch]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset transient composer state when the draft scope changes
+  useEffect(() => {
+    setMentionCaret(0);
+    setMentionActiveIndex(0);
+    setContextRefs([]);
+    setContextHits([]);
+  }, [draftKey]);
+
   const slashQuery = useMemo(() => {
     const trimmed = draft.trimStart();
     if (!trimmed.startsWith("/") || trimmed.includes(" ")) return null;
@@ -167,8 +143,14 @@ export function HomeView() {
       .filter((c) => c.name.toLowerCase().startsWith(slashQuery))
       .slice(0, 6);
   }, [nativeCommands, slashQuery]);
+  const mentionQuery = useMemo(() => activeAgentMentionQuery(draft, mentionCaret), [draft, mentionCaret]);
+  const mentionMatches = useMemo(
+    () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", primaryAgentId, mentions),
+    [registry?.agents, mentionQuery?.query, primaryAgentId, mentions],
+  );
   const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
   const contextQueryText = contextQuery?.query ?? null;
+  const mentionMenuOpen = mentionQuery !== null && contextQuery === null && slashQuery === null && mentionMatches.length > 0;
 
   useEffect(() => {
     if (!projectId || contextQueryText === null) {
@@ -188,9 +170,21 @@ export function HomeView() {
   }, [projectId, contextQueryText]);
 
   const pickContext = (path: string) => {
-    setDraft((cur) => replaceActiveContextToken(cur, path));
+    updateDraft((cur) => replaceActiveContextToken(cur, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
     setContextHits([]);
+  };
+
+  const pickMention = (agent: AgentSummaryInfo) => {
+    const next = insertAgentMention({ text: draft, mentions }, mentionCaret, agent);
+    updateDraft(next);
+    setMentionCaret(next.text.length);
+    setMentionActiveIndex(0);
+  };
+
+  const dismissMentionMenu = () => {
+    setMentionCaret(0);
+    setMentionActiveIndex(0);
   };
 
   const toggleVoice = () => {
@@ -201,7 +195,7 @@ export function HomeView() {
       return;
     }
     const started = startVoiceDictation({
-      onText: (text) => setDraft((cur) => (cur.trim() ? `${cur.trimEnd()} ${text}` : text)),
+      onText: (text) => updateDraft((cur) => (cur ? `${cur} ${text}` : text)),
       onEnd: () => {
         stopVoice.current = null;
         setListening(false);
@@ -217,65 +211,32 @@ export function HomeView() {
   };
 
   const send = async () => {
-    const t = draft.trim();
-    if (!t && composerFiles.attachments.length === 0) return;
-    // The toggle or a typed "/orchestrate " prefix both route to the
-    // orchestrator instead of a normal turn.
-    const orchestrateRequested = orchestrate || t.startsWith("/orchestrate ");
+    const text = draft;
+    if (!hasExecutablePrimary || (!text.trim() && composerFiles.attachments.length === 0)) return;
+    useNav.getState().consumePendingPrimaryAgentId();
     const typed = draft;
-    if (orchestrateRequested) {
-      if (!project) {
-        toast.error("Attach a project to orchestrate.");
-        return;
-      }
-      const goal = t.replace(/^\/orchestrate\s+/, "");
-      useNav.getState().clearDraft(draftKey);
-      composerFiles.clear();
-      setContextRefs([]);
-      // Orchestration posts worker bubbles, block-for-human cards, and the
-      // aggregate report into a home chat — create one (chat-first; the
-      // project attached above scopes the goal itself, not the session) so
-      // there's somewhere for those to land and for follow-up messages to
-      // steer the run (store.send's orch-steer route).
-      const chatOk = await startChat(LOCAL_RUNNER, goal, {
-        model: nav.composerModel ?? null,
-        effort: nav.composerEffort ?? null,
-        context: { branch: null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
-        attachments: composerFiles.attachments,
-        git: null,
-        permMode: composerPerm ? uiPermToCore(composerPerm) : null,
-      });
-      if (!chatOk) {
-        useNav.getState().restoreDraft(draftKey, typed);
-        return;
-      }
-      if (!(await startOrchestration(goal, true))) {
-        toast.error("Chat started, but orchestration couldn't be submitted.");
-      }
-      nav.navigate({ kind: "session" });
-      return;
-    }
-    const opts = {
-      model: project ? null : (nav.composerModel ?? null),
-      effort: project ? null : (nav.composerEffort ?? null),
+    const typedMentions = mentions;
+    const turn = {
+      text,
+      mentions,
       context: { branch: isGit ? nav.composerBranch : null, voiceTranscript: null, references: uniqueContextRefs(contextRefs) },
       attachments: composerFiles.attachments,
       git: composerGitOptionsForProject(isGit, branchList, nav.composerBranch, nav.composerUseWorktree),
-      permMode: composerPerm ? uiPermToCore(composerPerm) : null,
     };
-    useNav.getState().clearDraft(draftKey);
-    composerFiles.clear();
-    setContextRefs([]);
-    // No project attached → a chat-first session (the Home default);
-    // a picked project starts a normal project session, unchanged. Home has no
-    // runner picker yet — new sessions always start on the local engine.
-    // TODO(P3-6 deferred): add a small LOCAL/remote-runner dropdown here once
-    // `useStore().projects` is runner-scoped (today it's a single flat list
-    // sourced from the local engine only, so picking a remote runner would
-    // need its own project listing first — bigger than a composer tweak).
-    const ok = project ? await start(LOCAL_RUNNER, project.projectId, t, opts) : await startChat(LOCAL_RUNNER, t, opts);
-    if (ok) nav.navigate({ kind: "session" });
-    else useNav.getState().restoreDraft(draftKey, typed);
+    const ok = project
+      ? await start(LOCAL_RUNNER, project.projectId, primaryAgentId, turn)
+      : await startChat(LOCAL_RUNNER, primaryAgentId, turn);
+    if (ok) {
+      useNav.getState().clearDraft(draftKey);
+      composerFiles.clear();
+      setContextRefs([]);
+      setMentions([]);
+      localStorage.setItem(LAST_PRIMARY_AGENT_KEY, primaryAgentId);
+      nav.navigate({ kind: "session" });
+    } else {
+      useNav.getState().restoreDraft(draftKey, typed);
+      setMentions(typedMentions);
+    }
   };
 
   return (
@@ -289,22 +250,52 @@ export function HomeView() {
         >
           <Textarea
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              updateDraft(e.target.value);
+              setMentionCaret(e.target.selectionStart);
+              setMentionActiveIndex(0);
+            }}
+            onSelect={(e) => setMentionCaret(e.currentTarget.selectionStart)}
             onKeyDown={(e) => {
+              if (e.key === "Escape" && mentionMenuOpen) {
+                e.preventDefault();
+                dismissMentionMenu();
+                return;
+              }
+              if (mentionMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
+                const delta = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
+                e.preventDefault();
+                if (delta) setMentionActiveIndex((index) => (index + delta + mentionMatches.length) % mentionMatches.length);
+                else {
+                  const agent = mentionMatches[mentionActiveIndex];
+                  if (agent) pickMention(agent);
+                }
+                return;
+              }
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 void send();
               }
             }}
             onPaste={composerFiles.onPaste}
+            disabled={!hasExecutablePrimary}
             placeholder="Do anything"
             className="max-h-[40vh] resize-none overflow-y-auto border-none bg-transparent px-[18px] pb-1 pt-4 text-[14.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[14.5px] dark:bg-transparent"
           />
+          {mentionMenuOpen && (
+            <AgentMentionMenu
+              agents={mentionMatches}
+              activeIndex={mentionActiveIndex}
+              onActiveIndexChange={setMentionActiveIndex}
+              onPick={pickMention}
+              onClose={dismissMentionMenu}
+            />
+          )}
           {slashMatches.length > 0 && (
             <MenuPanel onClose={() => undefined} className="bottom-full left-3 z-50 mb-1.5 w-[320px]">
               <MenuSectionLabel>Commands</MenuSectionLabel>
               {slashMatches.map((cmd) => (
-                <MenuItem key={cmd.name} onClick={() => setDraft(`/${cmd.name} `)} className="font-medium">
+                <MenuItem key={cmd.name} onClick={() => updateDraft(`/${cmd.name} `)} className="font-medium">
                   <span className="font-mono text-[12px] text-muted-foreground">/{cmd.name}</span>
                   <span className="min-w-0 flex-1 truncate">{cmd.description}</span>
                 </MenuItem>
@@ -328,68 +319,34 @@ export function HomeView() {
               size="icon-sm"
               title="Attach"
               onClick={() => void composerFiles.attachFiles()}
+              disabled={!hasExecutablePrimary}
               className="rounded-full text-muted-foreground"
             >
               <Paperclip aria-hidden size={16} strokeWidth={2} />
             </Button>
-            <Combobox
-              aria-label="Permission mode"
-              options={PERM_MODES.map((m) => ({ value: m.id, label: m.label, description: m.desc }))}
-              value={composerPerm ?? corePermToUi(project?.permMode ?? "default")}
-              onValueChange={(mode) => setComposerPerm(mode as UiPermMode)}
-              trigger={
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  title="Permission mode for the new session"
-                  className="font-medium"
-                  style={{
-                    color: (composerPerm ?? corePermToUi(project?.permMode ?? "default")) === "full" ? "#E8703A" : undefined,
-                  }}
-                >
-                  <CircleAlert aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-                  {PERM_MODES.find((m) => m.id === (composerPerm ?? corePermToUi(project?.permMode ?? "default")))?.label ?? "Ask"}
-                  <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
-                </Button>
-              }
-            />
             <div className="flex-1" />
-            <ComposerModelEffortMenu
-              models={agentModels}
-              runtime={projectId ? projectRuntime : chatRuntime}
-              onChange={(model, effort) => {
-                if (projectId) void setProjectRuntime(projectId, model, effort);
-                else {
-                  setComposerModel(model);
-                  setComposerEffort(effort);
-                }
-              }}
-              disabled={agentModels.length === 0}
-            />
-            <div
-              className={`flex items-center gap-1.5 px-1 ${project ? "" : "cursor-not-allowed opacity-50"}`}
-              title={project ? "Decompose this goal into tracked subtasks run by workers" : "Attach a project to orchestrate"}
-            >
-              <span className="text-[11px] font-medium text-muted-foreground">Orchestrate</span>
-              <Switch
-                on={orchestrate}
-                onToggle={() => project && setOrchestrate((v) => !v)}
-                label="Orchestrate this goal into tracked subtasks"
-              />
-            </div>
             <Button
               variant="ghost"
               size="icon-sm"
               title="Voice"
               onClick={toggleVoice}
+              disabled={!hasExecutablePrimary}
               className={`rounded-full ${listening ? "bg-accent text-accent-foreground" : "text-muted-foreground"}`}
             >
               <Mic aria-hidden size={14} strokeWidth={2} className="size-3.5" />
             </Button>
-            <Button size="icon" title="Start session" onClick={() => void send()} className="rounded-full">
+            <Button size="icon" title="Start session" onClick={() => void send()} disabled={!hasExecutablePrimary} className="rounded-full">
               <ArrowUp aria-hidden size={15} strokeWidth={2.2} className="size-[15px]" />
             </Button>
           </div>
+          {!hasExecutablePrimary ? (
+            <div className="flex items-center justify-between gap-3 border-t border-border px-3 py-2 text-sm text-muted-foreground">
+              <span>No executable agent is available.</span>
+              <Button variant="outline" size="sm" onClick={() => nav.navigate({ kind: "agents" })}>
+                Repair agents
+              </Button>
+            </div>
+          ) : null}
           {(composerFiles.attachments.length > 0 || contextRefs.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-3 pb-2">
               {contextRefs.map((path) => (
@@ -478,7 +435,7 @@ export function HomeView() {
 
         <div className="mt-4 flex flex-wrap justify-center gap-2">
           {HOME_SUGGESTIONS.map((s) => (
-            <Button key={s} variant="outline" onClick={() => setDraft(s)} className="rounded-full px-3 text-muted-foreground">
+            <Button key={s} variant="outline" onClick={() => updateDraft(s)} className="rounded-full px-3 text-muted-foreground">
               {s}
             </Button>
           ))}

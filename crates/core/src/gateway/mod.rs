@@ -296,6 +296,9 @@ mod tests {
             conversation_id: "c1".into(),
         };
         let req = ApprovalRequest {
+            run_id: "run-1".into(),
+            requesting_agent_id: "agent-1".into(),
+            requesting_agent_name: "Agent 1".into(),
             request_id: "r1".into(),
             tool: "Bash".into(),
             summary: "ls".into(),

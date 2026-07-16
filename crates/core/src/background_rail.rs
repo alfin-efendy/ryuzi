@@ -1,7 +1,7 @@
 //! The daemon-hosted background-rail drainer (spec §6.1). Delivers completed
-//! out-of-band work (async delegation, learning forks, scheduled jobs, orch
-//! events — anything `Store::enqueue_background_event` recorded) into its
-//! target session as a NEW user turn, but only while that session is idle.
+//! out-of-band work (async delegation, learning forks, scheduled jobs —
+//! anything `Store::enqueue_background_event` recorded) into its target
+//! session as a NEW user turn, but only while that session is idle.
 //!
 //! This idle-only delivery is the rail's one load-bearing invariant: it must
 //! NEVER splice into a running turn. Hermes' role-alternation and
@@ -19,12 +19,12 @@
 //! failure, only left pending for the next attempt.
 
 use crate::control::ControlPlane;
+use crate::domain::{BackgroundKind, CoreEvent, NewMessage};
 use crate::harness::TurnPrompt;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Poll cadence for the drainer loop (mirrors `scheduler`/`orch`'s 5s cadence
-/// — see their `run_loop`s).
+/// Poll cadence for the drainer loop (mirrors the scheduler's 5s cadence).
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Deliver at most this many rows per tick, so one busy tick can't starve the
@@ -53,27 +53,18 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
                 break;
             }
         };
-        // An `unblock` answer must resume the blocked worker's orch task
-        // causally with delivery — flip it `blocked → running` here, not by a
-        // tick-time session-status poll (which false-resumes the block-turn
-        // tail and strands a fast resume). Safe for non-orch kinds: this is
-        // gated on `kind == "unblock"`, which only ever targets a worker
-        // session. Runs BEFORE the turn re-enters so the flip is settled by the
-        // time the resumed turn's terminal event reaches `watch_session`.
-        if event.kind == "unblock" {
-            crate::orch::on_unblock_delivered(cp, &event.target_session_pk).await;
-        }
-        // `continue_session_with_prompt` is the ONLY delivery path: a clean
-        // new user turn onto a session `claim_deliverable_background_event`
-        // already proved is idle. Never a mid-turn splice.
-        match cp
-            .continue_session_with_prompt(
-                &event.target_session_pk,
-                TurnPrompt::text(event.payload.clone(), event.payload.clone()),
-                &[],
-            )
-            .await
-        {
+        // Delegation outcomes retain their origin run so they become a
+        // run-scoped system result, not a synthetic primary user turn. Every
+        // other producer keeps the generic idle-only continuation behavior.
+        let delivery = if event.kind == BackgroundKind::Delegation.as_str() {
+            match event.origin_run_id.as_deref() {
+                Some(origin_run_id) => deliver_delegation_outcome(cp, &event, origin_run_id).await,
+                None => deliver_as_user_turn(cp, &event).await,
+            }
+        } else {
+            deliver_as_user_turn(cp, &event).await
+        };
+        match delivery {
             Ok(()) => {
                 let _ = store.mark_background_delivered(&event.id).await;
             }
@@ -94,10 +85,53 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
     }
 }
 
+async fn deliver_as_user_turn(
+    cp: &Arc<ControlPlane>,
+    event: &crate::domain::BackgroundEvent,
+) -> anyhow::Result<()> {
+    cp.continue_session_with_prompt(
+        &event.target_session_pk,
+        TurnPrompt::text(event.payload.clone(), event.payload.clone()),
+        &[],
+    )
+    .await
+}
+
+async fn deliver_delegation_outcome(
+    cp: &Arc<ControlPlane>,
+    event: &crate::domain::BackgroundEvent,
+    origin_run_id: &str,
+) -> anyhow::Result<()> {
+    let seq = cp
+        .store()
+        .insert_run_message(
+            origin_run_id,
+            NewMessage::block(
+                &event.target_session_pk,
+                "system",
+                "delegation_result",
+                serde_json::json!({ "text": event.payload }),
+            ),
+        )
+        .await?;
+    cp.emit(CoreEvent::Message {
+        session_pk: event.target_session_pk.clone(),
+        seq,
+        role: "system".to_string(),
+        block_type: "delegation_result".to_string(),
+        payload: serde_json::json!({ "text": event.payload }),
+        tool_call_id: None,
+        status: None,
+        tool_kind: None,
+        speaker: None,
+    });
+    Ok(())
+}
+
 /// The drainer's background loop: sleep, then drain a batch, forever.
 ///
 /// Returned as a future (not self-spawned) so hosts can run it on their own
-/// runtime, mirroring `scheduler::run_loop` / `orch::run_loop`.
+/// runtime, mirroring `scheduler::run_loop`.
 pub async fn run_loop(cp: Arc<ControlPlane>) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -106,8 +140,7 @@ pub async fn run_loop(cp: Arc<ControlPlane>) {
 }
 
 /// Spawn the drainer on the host's runtime (mirrors `scheduler::spawn_runner`
-/// / `orch::spawn_runner` — the daemon is the single always-on engine host
-/// for all of these background loops).
+/// — the daemon is the single always-on engine host for all background loops).
 pub fn spawn_runner(cp: Arc<ControlPlane>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_loop(cp))
 }
@@ -117,6 +150,7 @@ mod tests {
     use super::*;
     use crate::domain::{Message, NewMessage, PermMode, Session, SessionKind, SessionStatus};
     use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx};
+    use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
     use crate::plugins::Registries;
     use crate::store::Store;
     use async_trait::async_trait;
@@ -243,11 +277,36 @@ mod tests {
         harness: Arc<dyn HarnessFactory>,
     ) -> (Arc<ControlPlane>, tempfile::NamedTempFile) {
         let db = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(db.path()).await.unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
         let mut regs = Registries::new();
         regs.harness = harness;
-        let cp = ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = ControlPlane::new(store, regs, persistence).await;
         (cp, db)
     }
 
@@ -258,9 +317,21 @@ mod tests {
     /// rehydrated after a daemon restart.
     async fn idle_chat(cp: &Arc<ControlPlane>, pk: &str) {
         let now = crate::paths::now_ms();
+        let primary_agent = cp.registry().default_agent_id().await;
+        let primary_agent_snapshot = cp
+            .registry()
+            .resolved_snapshot(&primary_agent)
+            .await
+            .unwrap();
         cp.store()
             .insert_session(Session {
                 session_pk: pk.into(),
+                primary_agent_id: Some(primary_agent),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent_snapshot.profile.id.clone(),
+                    name: primary_agent_snapshot.profile.name.clone(),
+                    avatar_color: primary_agent_snapshot.profile.avatar.color.clone(),
+                }),
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -304,6 +375,80 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn tick_delivers_a_delegation_to_its_originating_run_without_a_user_turn() {
+        let _guard = StateDirGuard::new();
+        let (cp, _db) = control_plane_with(Arc::new(FakeHarnessFactory)).await;
+        idle_chat(&cp, "chat-1").await;
+        let snapshot = cp
+            .registry()
+            .resolved_snapshot(&cp.registry().default_agent_id().await)
+            .await
+            .unwrap();
+        let root = cp
+            .delegation()
+            .begin_primary("chat-1", snapshot, "original task")
+            .await
+            .unwrap();
+        let mut events = cp.subscribe();
+        cp.store()
+            .enqueue_background_delegation_event(
+                "chat-1",
+                &root.run.run_id,
+                "[ASYNC DELEGATION COMPLETE — child-1]\nresult: done",
+            )
+            .await
+            .unwrap();
+
+        tick(&cp).await;
+
+        assert_eq!(cp.store().pending_background_count().await.unwrap(), 0);
+        assert!(
+            cp.store()
+                .list_provider_turns("chat-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a delegation outcome must not continue the session as a synthetic user turn"
+        );
+        assert_eq!(
+            cp.store()
+                .list_session_agent_runs("chat-1")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|run| run.parent_run_id.is_none())
+                .count(),
+            1,
+            "draining a delegation must not create another primary run"
+        );
+        let outcome = cp
+            .store()
+            .list_run_messages("chat-1", &root.run.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.block_type == "delegation_result")
+            .expect("delegation outcome is attached to its originating run");
+        assert_eq!(
+            outcome.payload["text"],
+            "[ASYNC DELEGATION COMPLETE — child-1]\nresult: done"
+        );
+        assert!(
+            (0..16).filter_map(|_| events.try_recv().ok()).any(|event| matches!(
+                event,
+                crate::domain::CoreEvent::Message { block_type, payload, .. }
+                    if block_type == "delegation_result"
+                        && payload["text"] == "[ASYNC DELEGATION COMPLETE — child-1]\nresult: done"
+            )),
+            "the run-scoped outcome is emitted to live subscribers"
+        );
+
+        cp.end_session("chat-1").await.unwrap();
+        assert_eq!(cp.store().pending_background_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn tick_delivers_a_pending_row_to_an_idle_session() {
         let _guard = StateDirGuard::new();
         let (cp, _db) = control_plane_with(Arc::new(FakeHarnessFactory)).await;
@@ -336,6 +481,8 @@ mod tests {
         cp.store()
             .insert_session(Session {
                 session_pk: "busy".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,

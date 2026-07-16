@@ -21,6 +21,14 @@ async listSessions(runnerId: string | null, projectId: string | null) : Promise<
     else return { status: "error", error: e  as any };
 }
 },
+async listAgentSessions(runnerId: string | null, agentId: string, limit: number) : Promise<Result<Session[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_agent_sessions", { runnerId, agentId, limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listMessages(runnerId: string | null, sessionPk: string) : Promise<Result<Message[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_messages", { runnerId, sessionPk }) };
@@ -45,25 +53,25 @@ async cloneProject(runnerId: string | null, url: string, destParent: string) : P
     else return { status: "error", error: e  as any };
 }
 },
-async startSession(runnerId: string | null, projectId: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+async startSession(runnerId: string | null, projectId: string, primaryAgentId: string, turn: TurnInput) : Promise<Result<Session, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_session", { runnerId, projectId, prompt, options }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_session", { runnerId, projectId, primaryAgentId, turn }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async startChatSession(runnerId: string | null, prompt: string, options: ChatRequestOptions | null) : Promise<Result<Session, CmdError>> {
+async startChatSession(runnerId: string | null, primaryAgentId: string, turn: TurnInput) : Promise<Result<Session, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { runnerId, prompt, options }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_chat_session", { runnerId, primaryAgentId, turn }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async continueSession(runnerId: string | null, sessionPk: string, prompt: string, options: ChatRequestOptions | null) : Promise<Result<null, CmdError>> {
+async continueSession(runnerId: string | null, sessionPk: string, turn: TurnInput) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("continue_session", { runnerId, sessionPk, prompt, options }) };
+    return { status: "ok", data: await TAURI_INVOKE("continue_session", { runnerId, sessionPk, turn }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -109,8 +117,8 @@ async deleteToolPolicy(runnerId: string | null, projectId: string, tool: string)
     else return { status: "error", error: e  as any };
 }
 },
-async resolveApproval(runnerId: string | null, requestId: string, response: ApprovalResponse) : Promise<boolean> {
-    return await TAURI_INVOKE("resolve_approval", { runnerId, requestId, response });
+async resolveApproval(runnerId: string | null, runId: string, requestId: string, response: ApprovalResponse) : Promise<boolean> {
+    return await TAURI_INVOKE("resolve_approval", { runnerId, runId, requestId, response });
 },
 /**
  * Write pasted bytes into the attachments staging area and return the
@@ -259,57 +267,33 @@ async listBranches(runnerId: string | null, projectId: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
-async orchSubmit(projectId: string, goal: string, decompose: boolean, homeSessionPk: string | null) : Promise<Result<string, CmdError>> {
+async getChildRuns(runnerId: string | null, sessionPk: string) : Promise<Result<AgentRun[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_submit", { projectId, goal, decompose, homeSessionPk }) };
+    return { status: "ok", data: await TAURI_INVOKE("get_child_runs", { runnerId, sessionPk }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async orchListRoots() : Promise<Result<OrchTask[], CmdError>> {
+async getChildTranscript(runnerId: string | null, sessionPk: string, runId: string) : Promise<Result<Message[], CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_list_roots") };
+    return { status: "ok", data: await TAURI_INVOKE("get_child_transcript", { runnerId, sessionPk, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async orchTasks(root: string) : Promise<Result<OrchTask[], CmdError>> {
+async cancelChildRun(runnerId: string | null, sessionPk: string, runId: string) : Promise<Result<null, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_tasks", { root }) };
+    return { status: "ok", data: await TAURI_INVOKE("cancel_child_run", { runnerId, sessionPk, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async orchCancel(root: string) : Promise<Result<number, CmdError>> {
+async retryChildRun(runnerId: string | null, sessionPk: string, runId: string) : Promise<Result<AgentRun, CmdError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_cancel", { root }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async orchRetry(taskId: string) : Promise<Result<boolean, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_retry", { taskId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async orchAnswerBlock(taskId: string, answer: string) : Promise<Result<boolean, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_answer_block", { taskId, answer }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async orchSteer(sessionPk: string, text: string) : Promise<Result<string, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("orch_steer", { sessionPk, text }) };
+    return { status: "ok", data: await TAURI_INVOKE("retry_child_run", { runnerId, sessionPk, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1777,8 +1761,13 @@ transport: string; command: string | null; args: string[];
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
 export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null }
+/**
+ * An immutable identity captured when an agent becomes the primary owner of a session.
+ */
+export type AgentIdentitySnapshot = { id: string; name: string; avatarColor: string }
 export type AgentInfo = { name: string; description: string; mode: string; builtin: boolean }
 export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: InvalidKnowledgeConceptInfo[]; journey: JourneyMilestoneInfo[]; skillUsage: AgentSkillUsageInfo[]; reviews: LearningReviewInfo[]; curator: CuratorStateInfo; curatorHistory: CuratorHistorySnapshotInfo[] }
+export type AgentMention = { agentId: string; labelSnapshot: string; startUtf16: number; endUtf16: number }
 /**
  * An agent's model assignment: either a concrete provider model (with an
  * optional effort override) or a symbolic router route (`smart`, `fast`,
@@ -1799,6 +1788,9 @@ export type AgentMutationInfo = { name: string; description: string; avatarColor
  */
 export type AgentRecoveryInfo = { code: string; message: string }
 export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
+export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null }
+export type AgentRunKind = "primary" | "main-delegate" | "subagent"
+export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted"
 export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
 export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
 export type AgentValidationInfo = { field: string; message: string }
@@ -1900,8 +1892,7 @@ export type ChatRequestOptions = { model: string | null; effort: string | null; 
  */
 git: GitOptions | null;
 /**
- * Initial permission mode for the session being started (new-chat
- * picker). `None` ⇒ inherit the project default.
+ * Initial permission mode for a legacy/composer session.
  */
 permMode: PermMode | null }
 export type CmdError = { message: string }
@@ -1919,12 +1910,16 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "sessionQueueChanged"; session_pk: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "sessionQueueChanged"; session_pk: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; run_id: string; requesting_agent_id: string; requesting_agent_name: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
  */
 { kind: "notice"; session_pk: string; text: string } | { kind: "sessionEnded"; session_pk: string } |
+/**
+ * A delegation run changed after its persisted status commit.
+ */
+{ kind: "agentRunChanged"; session_pk: string; run_id: string; parent_run_id: string | null; status: string } |
 /**
  * A Hook run changed state (queued|running|success|failed|skipped).
  */
@@ -1933,11 +1928,6 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * A scheduled job run started or finished (status: running|success|failed).
  */
 { kind: "jobRunChanged"; job_id: string; run_id: string; status: string } |
-/**
- * An orchestrated task changed status (todo|ready|running|done|failed|
- * cancelled; roots also decomposing|waiting|judging).
- */
-{ kind: "orchTaskChanged"; task_id: string; root_id: string | null; status: string } |
 /**
  * Per-response context usage for a native session (drives the
  * "% context left" indicator).
@@ -2130,8 +2120,8 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
  */
 export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
- * Group-chat attribution: the agent name for a labeled worker/orchestrator
- * bubble. `None` for ordinary user/assistant rows.
+ * Legacy group-chat attribution retained so existing databases and event
+ * payloads remain readable. New message constructors leave it unset.
  */
 speaker: string | null }
 /**
@@ -2167,38 +2157,6 @@ export type ModelStatusEntry = { family: string; model: string; status: string; 
 export type ModelStatusInfo = { model: string; status: string; message: string; testedAt: number }
 export type OauthAuthorizeUrlMsg = { runnerId: string; provider: string; authorizeUrl: string }
 export type OpenTarget = { id: string; name: string }
-/**
- * One row of the orchestrated task graph.
- */
-export type OrchTask = { id: string;
-/**
- * `None` for a root (goal) task.
- */
-rootId: string | null; projectId: string; title: string; body: string;
-/**
- * Recorded from the decomposer and resolved by name against
- * `AgentRegistry` when the worker session starts (falling back to the
- * registry's default agent for an unknown/blank name).
- */
-agent: string; status: string; sessionPk: string | null; result: string | null; error: string | null; createdAt: number; finishedAt: number | null;
-/**
- * The originating chat session (root only) — where worker bubbles post
- * and the aggregate outcome re-enters over the rail. `None` for goals
- * submitted without a home chat (CLI/tests).
- */
-homeSessionPk: string | null;
-/**
- * Consecutive failed attempts for this child (circuit breaker input).
- */
-consecutiveFailures: number;
-/**
- * The breaker tripped: this child exhausted its retries and stays failed.
- */
-gaveUp: boolean;
-/**
- * Accumulated mid-run user guidance (root only), fed to the judge prompt.
- */
-steerNote: string | null }
 export type PermMode = "default" | "acceptEdits" | "bypassPermissions" | "plan"
 export type PermissionRuleInfo = { id: string; tool: string; decision: string; commandPrefix: string | null }
 export type PluginAuthInfo = {
@@ -2411,6 +2369,16 @@ export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: str
 export type SelectableModelKind = "concrete" | "namedRoute"
 export type Session = { sessionPk: string;
 /**
+ * The immutable stable ID of the agent selected when this session began.
+ * `None` with `primary_agent_snapshot == None` identifies legacy history.
+ */
+primaryAgentId: string | null;
+/**
+ * The display identity captured when the session began; never derived from
+ * the mutable registry after persistence.
+ */
+primaryAgentSnapshot: AgentIdentitySnapshot | null;
+/**
  * `None` for chat-first sessions (`kind != Project`); a project-bound
  * session always has this set.
  */
@@ -2510,6 +2478,7 @@ runsCode: boolean;
  * isn't curated" framing for a curated-but-code-running install.
  */
 curated: boolean }
+export type TurnInput = { text: string; mentions?: AgentMention[]; context: ChatContextArg | null; attachments?: string[]; git: GitOptions | null }
 /**
  * Mirror of `crate::skills_install::UpdateOutcome`. Keeps the same
  * `#[serde(tag = "kind", content = "detail")]` shape so the discriminated

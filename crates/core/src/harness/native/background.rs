@@ -1,17 +1,17 @@
 //! Shared capacity gate for async delegation (spec §6.2). Counts in-flight
 //! background delegations against the SAME `max_concurrent_runs` setting the
-//! task-batch semaphore and orch dispatcher already enforce locally — it does
-//! NOT introduce a second capacity SETTING. Also holds each in-flight
-//! delegation's cancel token keyed by the dispatching (parent) session, so
+//! task-batch semaphore already enforces locally — it does NOT introduce a
+//! second capacity SETTING. Also holds each in-flight delegation's cancel
+//! token keyed by the dispatching (parent) session, so
 //! `end_session` can interrupt orphaned work (spec §6.1).
 //!
 //! The shared `n` (`max_concurrent_runs`) is a capacity CAP, not one unified
-//! global semaphore across sync-batch + orch + background: this registry's
-//! own live counter gates only the background-worker population against `n`.
-//! Capping background workers separately (rather than sharing one semaphore
-//! object with the task-batch/orch paths) avoids a parent-holds-slot deadlock,
-//! where a parent holding a sync-batch/orch slot would deadlock awaiting its
-//! own background child for a slot from the same semaphore.
+//! global semaphore across sync-batch and background: this registry's own live
+//! counter gates only the background-worker population against `n`. Capping
+//! background workers separately (rather than sharing one semaphore object
+//! with the task-batch path) avoids a parent-holds-slot deadlock, where a
+//! parent holding a sync-batch slot would deadlock awaiting its own background
+//! child for a slot from the same semaphore.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

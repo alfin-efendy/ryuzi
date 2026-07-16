@@ -60,7 +60,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/plugins", get(list_plugins))
         .route("/plugins/{id}", get(get_plugin))
         .route("/rpc/{method}", post(rpc))
-        .route("/approvals/{request_id}", post(resolve_approval_route))
+        .route(
+            "/approvals/{run_id}/{request_id}",
+            post(resolve_approval_route),
+        )
         .route("/attachments/{*rel}", get(get_attachment))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
     let pair_limiter = PairLimiter::new();
@@ -501,15 +504,15 @@ fn rpc_unknown_method(method: &str) -> axum::response::Response {
         .into_response()
 }
 
-/// `POST /approvals/{request_id}` — resolve a pending tool-permission
+/// `POST /approvals/{run_id}/{request_id}` — resolve a pending tool-permission
 /// approval (see `ApprovalHub`) with body `{"response": ApprovalResponse}`.
 /// A missing or malformed `response` leniently denies via
 /// `ApprovalResponse::once(false)`. `resolved` is `false` if no approval with
-/// this id was pending (already resolved, unknown id, or the request timed
-/// out).
+/// this run/request pair was pending (already resolved, unknown id, or the
+/// request timed out).
 async fn resolve_approval_route(
     State(state): State<ApiState>,
-    Path(request_id): Path<String>,
+    Path((run_id, request_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let response = body
@@ -517,7 +520,7 @@ async fn resolve_approval_route(
         .cloned()
         .and_then(|v| serde_json::from_value::<crate::domain::ApprovalResponse>(v).ok())
         .unwrap_or_else(|| crate::domain::ApprovalResponse::once(false));
-    let resolved = state.cp.resolve_approval(&request_id, response);
+    let resolved = state.cp.resolve_approval(&run_id, &request_id, response);
     Json(json!({ "resolved": resolved })).into_response()
 }
 
@@ -659,8 +662,13 @@ mod tests {
 
     async fn test_cp() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-        ControlPlane::new(store, Registries::new()).await
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, Registries::new(), persistence).await
+        }
     }
 
     /// The control token every test `ApiState` uses — there is no
@@ -679,7 +687,6 @@ mod tests {
         )
         .await
         .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         std::mem::forget(config);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -739,7 +746,7 @@ mod tests {
     /// exercise.
     async fn test_cp_with_plugins() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         crate::plugins::install_builtins(&mut regs);
         regs.add_plugin(CorePlugin {
@@ -750,7 +757,12 @@ mod tests {
             extension: None,
             source: PluginSource::Builtin,
         });
-        ControlPlane::new(store, regs).await
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        }
     }
 
     #[tokio::test]

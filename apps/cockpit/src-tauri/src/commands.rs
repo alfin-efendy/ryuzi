@@ -4,19 +4,14 @@ use ryuzi_core::api::fsview_api::{content_type_for_path, MediaFile, MAX_MEDIA_RE
 use ryuzi_core::branches::BranchList;
 use ryuzi_core::domain::{ApprovalResponse, ToolPolicyRow};
 use ryuzi_core::llm_router::model_effort::{ModelPreferenceKey, ProjectRuntimeInfo};
-use ryuzi_core::{Message, OrchTask, PermMode, Project, Session};
+use ryuzi_core::{Message, PermMode, Project, Session};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
-// Cockpit's DTOs for these now live in `ryuzi_core::api::types`; only
-// `ChatRequestOptions` is referenced by name here (as a command param), but
-// specta's TS generation walks the type graph from every collected command,
-// so `ChatContextArg`/`GitOptions` are still emitted to `bindings.ts` as
-// fields of `ChatRequestOptions` without needing a local import.
-pub use ryuzi_core::api::types::ChatRequestOptions;
-pub use ryuzi_core::api::types::SessionRuntimeInfo;
+// Cockpit's DTOs for these now live in `ryuzi_core::api::types`.
+pub use ryuzi_core::api::types::{SessionRuntimeInfo, TurnInput};
 
 type R<T> = Result<T, CmdError>;
 // The old in-process `ControlPlane` state extractor is gone: every engine
@@ -25,6 +20,30 @@ type R<T> = Result<T, CmdError>;
 // resolves the runner-specific `EngineClient` via `runner_id` (default
 // `"local"`) before proxying.
 type Engine<'a> = State<'a, Arc<EngineManager>>;
+
+fn session_start_params(
+    project_id: String,
+    primary_agent_id: String,
+    turn: TurnInput,
+) -> serde_json::Value {
+    serde_json::json!({
+        "projectId": project_id,
+        "primaryAgentId": primary_agent_id,
+        "turn": turn,
+    })
+}
+
+fn chat_session_start_params(primary_agent_id: String, turn: TurnInput) -> serde_json::Value {
+    serde_json::json!({ "primaryAgentId": primary_agent_id, "turn": turn })
+}
+
+fn session_continue_params(session_pk: String, turn: TurnInput) -> serde_json::Value {
+    serde_json::json!({ "sessionPk": session_pk, "turn": turn })
+}
+
+fn agent_sessions_params(agent_id: String, limit: u32) -> serde_json::Value {
+    serde_json::json!({ "agentId": agent_id, "limit": limit })
+}
 
 #[tauri::command]
 #[specta::specta]
@@ -273,99 +292,18 @@ pub async fn list_branches(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn orch_submit(
-    engine: Engine<'_>,
-    project_id: String,
-    goal: String,
-    decompose: bool,
-    home_session_pk: Option<String>,
-) -> R<String> {
-    let client = engine.client("local")?;
-    client
-        .rpc(
-            "orch_submit",
-            serde_json::json!({
-                "project_id": project_id, "goal": goal, "decompose": decompose,
-                "home_session_pk": home_session_pk,
-            }),
-        )
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn orch_list_roots(engine: Engine<'_>) -> R<Vec<OrchTask>> {
-    let client = engine.client("local")?;
-    client.rpc("orch_list_roots", serde_json::json!({})).await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn orch_tasks(engine: Engine<'_>, root: String) -> R<Vec<OrchTask>> {
-    let client = engine.client("local")?;
-    client
-        .rpc("orch_tasks", serde_json::json!({ "root": root }))
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn orch_cancel(engine: Engine<'_>, root: String) -> R<u32> {
-    let client = engine.client("local")?;
-    client
-        .rpc("orch_cancel", serde_json::json!({ "root": root }))
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn orch_retry(engine: Engine<'_>, task_id: String) -> R<bool> {
-    let client = engine.client("local")?;
-    client
-        .rpc("orch_retry", serde_json::json!({ "task_id": task_id }))
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn orch_answer_block(engine: Engine<'_>, task_id: String, answer: String) -> R<bool> {
-    let client = engine.client("local")?;
-    client
-        .rpc(
-            "orch_answer_block",
-            serde_json::json!({ "task_id": task_id, "answer": answer }),
-        )
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn orch_steer(engine: Engine<'_>, session_pk: String, text: String) -> R<String> {
-    let client = engine.client("local")?;
-    client
-        .rpc(
-            "orch_steer",
-            serde_json::json!({ "session_pk": session_pk, "text": text }),
-        )
-        .await
-}
-
-#[tauri::command]
-#[specta::specta]
 pub async fn start_session(
     engine: Engine<'_>,
     runner_id: Option<String>,
     project_id: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: String,
+    turn: TurnInput,
 ) -> R<Session> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "start_session",
-            serde_json::json!({
-                "project_id": project_id, "prompt": prompt, "options": options,
-            }),
+            session_start_params(project_id, primary_agent_id, turn),
         )
         .await
 }
@@ -375,14 +313,14 @@ pub async fn start_session(
 pub async fn start_chat_session(
     engine: Engine<'_>,
     runner_id: Option<String>,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    primary_agent_id: String,
+    turn: TurnInput,
 ) -> R<Session> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "start_chat_session",
-            serde_json::json!({ "prompt": prompt, "options": options }),
+            chat_session_start_params(primary_agent_id, turn),
         )
         .await
 }
@@ -393,16 +331,30 @@ pub async fn continue_session(
     engine: Engine<'_>,
     runner_id: Option<String>,
     session_pk: String,
-    prompt: String,
-    options: Option<ChatRequestOptions>,
+    turn: TurnInput,
 ) -> R<()> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(
             "continue_session",
-            serde_json::json!({
-                "session_pk": session_pk, "prompt": prompt, "options": options,
-            }),
+            session_continue_params(session_pk, turn),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_agent_sessions(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    agent_id: String,
+    limit: u32,
+) -> R<Vec<Session>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "list_agent_sessions",
+            agent_sessions_params(agent_id, limit),
         )
         .await
 }
@@ -490,6 +442,7 @@ pub async fn delete_tool_policy(
 pub fn resolve_approval(
     engine: Engine<'_>,
     runner_id: Option<String>,
+    run_id: String,
     request_id: String,
     response: ApprovalResponse,
 ) -> bool {
@@ -506,7 +459,7 @@ pub fn resolve_approval(
         return false;
     };
     tokio::task::block_in_place(|| {
-        tauri::async_runtime::block_on(client.resolve_approval(&request_id, response))
+        tauri::async_runtime::block_on(client.resolve_approval(&run_id, &request_id, response))
     })
 }
 
@@ -625,4 +578,29 @@ pub fn backdrop_capability(
     state: State<'_, crate::backdrop::BackdropState>,
 ) -> crate::backdrop::BackdropCapability {
     state.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ownership_proxy_payloads_use_rpc_camel_case_keys() {
+        let turn = TurnInput::default();
+        let start = session_start_params("project".into(), "primary".into(), turn.clone());
+        let chat = chat_session_start_params("primary".into(), turn.clone());
+        let continued = session_continue_params("session".into(), turn);
+        let listed = agent_sessions_params("primary".into(), 25);
+
+        assert_eq!(start["projectId"], "project");
+        assert_eq!(start["primaryAgentId"], "primary");
+        assert!(start.get("project_id").is_none());
+        assert!(start.get("primary_agent_id").is_none());
+        assert_eq!(chat["primaryAgentId"], "primary");
+        assert!(chat.get("primary_agent_id").is_none());
+        assert_eq!(continued["sessionPk"], "session");
+        assert!(continued.get("session_pk").is_none());
+        assert_eq!(listed["agentId"], "primary");
+        assert!(listed.get("agent_id").is_none());
+    }
 }

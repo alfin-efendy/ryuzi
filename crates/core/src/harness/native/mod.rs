@@ -42,6 +42,125 @@ use tokio_util::sync::CancellationToken;
 /// The native runtime harness id — the sole in-process agent runtime.
 pub const NATIVE_ID: &str = "native";
 
+#[derive(Debug)]
+struct AdaptedPrimary {
+    agent: agents::Agent,
+    allowed_skills: Option<Vec<String>>,
+}
+
+fn tool_filter_for_profile(
+    profile: &crate::agents::types::AgentProfile,
+    available: &[String],
+) -> agents::ToolFilter {
+    if profile.tools.native.is_empty()
+        && profile.tools.plugins.is_empty()
+        && profile.tools.apps.is_empty()
+    {
+        return agents::ToolFilter::All;
+    }
+
+    let mut configured = profile
+        .tools
+        .native
+        .iter()
+        .filter(|name| {
+            available
+                .iter()
+                .any(|available_name| available_name == *name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for plugin in &profile.tools.plugins {
+        if available.iter().any(|name| name == plugin) {
+            configured.push(plugin.clone());
+            continue;
+        }
+        let (provider, tool) = plugin.split_once('.').unwrap_or((plugin, ""));
+        configured.extend(
+            available
+                .iter()
+                .filter(|name| {
+                    *name == &format!("mcp__{provider}__{tool}")
+                        || *name == &format!("ext__{provider}__{tool}")
+                })
+                .cloned(),
+        );
+    }
+    for app in &profile.tools.apps {
+        configured.extend(
+            available
+                .iter()
+                .filter(|name| name.starts_with(&format!("mcp__{app}__")))
+                .cloned(),
+        );
+    }
+    configured.sort();
+    configured.dedup();
+    if configured.is_empty() {
+        agents::ToolFilter::Only(Vec::new())
+    } else {
+        agents::ToolFilter::Only(configured)
+    }
+}
+
+fn adapt_primary_profile(
+    profile: &crate::agents::types::AgentProfile,
+) -> anyhow::Result<AdaptedPrimary> {
+    let tools = if profile.tools.native.is_empty() {
+        agents::ToolFilter::All
+    } else {
+        agents::ToolFilter::Only(profile.tools.native.clone())
+    };
+    Ok(AdaptedPrimary {
+        agent: agents::Agent {
+            name: profile.id.clone(),
+            description: profile.description.clone(),
+            mode: agents::AgentMode::Primary,
+            prompt: None,
+            tools,
+            permission_rules: profile.permissions.rules.clone(),
+            can_delegate: false,
+            builtin: false,
+        },
+        allowed_skills: (!profile.skills.is_empty()).then(|| profile.skills.clone()),
+    })
+}
+
+pub(crate) fn primary_turn_config(
+    agent: Arc<crate::agents::types::AgentSnapshot>,
+    run_id: String,
+    root_run_id: String,
+) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
+    let adapted = adapt_primary_profile(&agent.profile)?;
+    let (model, effort) = match &agent.profile.model {
+        crate::agents::types::AgentModel::Concrete { name, effort } => {
+            (Some(name.clone()), effort.clone())
+        }
+        crate::agents::types::AgentModel::Route { route } => (Some(route.clone()), None),
+    };
+    Ok(crate::harness::PrimaryTurnConfig {
+        perm_mode: agent.profile.permissions.mode,
+        agent,
+        run_id,
+        root_run_id,
+        model,
+        effort,
+        agent_tools: adapted.agent,
+        allowed_skills: adapted.allowed_skills,
+    })
+}
+
+pub(crate) fn primary_turn_config_with_tools(
+    agent: Arc<crate::agents::types::AgentSnapshot>,
+    run_id: String,
+    root_run_id: String,
+    available_tools: &[String],
+) -> anyhow::Result<crate::harness::PrimaryTurnConfig> {
+    let mut config = primary_turn_config(agent.clone(), run_id, root_run_id)?;
+    config.agent_tools.tools = tool_filter_for_profile(&agent.profile, available_tools);
+    Ok(config)
+}
+
 /// The native agent runtime as a [`Harness`]. Each session runs the agentic
 /// loop in-process via [`runner::run_turn`].
 pub struct NativeHarness {
@@ -200,7 +319,7 @@ impl Harness for NativeHarness {
         // routes/models through that capability and fall back to a compatible
         // route/model when a stale project pins a target no connection
         // actually serves anymore.
-        let model = resolve_native_model(&ctx.store, ctx.model).await;
+        let model = resolve_native_model(&ctx.store, ctx.model.clone()).await;
         let meta =
             crate::llm_router::model_meta::resolve(&ctx.store, model.as_deref().unwrap_or(""))
                 .await;
@@ -208,14 +327,9 @@ impl Harness for NativeHarness {
         // Discover agents + slash commands from the worktree (and global config).
         let agents = Arc::new(agents::AgentRegistry::load(&ctx.work_dir));
         let commands = Arc::new(commands::CommandRegistry::load(&ctx.work_dir));
-        // Agent-per-task: a worker session carries its assignee in `ctx.agent`
-        // (Phase 2 threaded the column through). Fall back to the default when
-        // unset (ordinary project/chat sessions) or unknown (stale roster).
-        let agent = ctx
-            .agent
-            .as_deref()
-            .and_then(|name| agents.get(name))
-            .unwrap_or_else(|| agents.default_agent());
+        // The durable snapshot owns this session's native persona. Legacy
+        // worktree agents remain available only for slash-command/subagent
+        // selection; they must never replace a durable primary by name.
         // Plugin hooks: observational — a `session.start` hook is notified but
         // cannot block startup (only `tool.before` gates). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
@@ -249,20 +363,24 @@ impl Harness for NativeHarness {
         // path with no special-casing.
         extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
-        let project_id = ctx.project_id.clone();
+        // The registry is complete only after MCP and extension attachment.
+        // Resolve this immutable profile against that final namespace so a
+        // constrained explicit target cannot fall back to `ToolFilter::All`.
+        let primary_turn = primary_turn_config_with_tools(
+            ctx.primary_agent.clone(),
+            ctx.run_id.clone(),
+            ctx.root_run_id.clone(),
+            &tools.names(),
+        )?;
+        let agent = primary_turn.agent_tools.clone();
         let model_name = model.as_deref().unwrap_or("");
-        let mut effort_policy = if let Some(project_id) = project_id.as_deref() {
-            crate::llm_router::model_effort::build_turn_effort_policy(
-                &ctx.store, project_id, model_name,
-            )
-            .await?
-        } else {
+        let mut effort_policy =
             crate::llm_router::model_effort::build_utility_effort_policy(&ctx.store, model_name)
-                .await?
+                .await?;
+        effort_policy.caller_override = match &primary_turn.agent.profile.model {
+            crate::agents::types::AgentModel::Concrete { effort, .. } => effort.clone(),
+            crate::agents::types::AgentModel::Route { .. } => None,
         };
-        if project_id.is_none() {
-            effort_policy.caller_override = ctx.effort;
-        }
         // Persistent memory is unconditional: a chat (project-less) session
         // still gets GLOBAL + USER memory, while a project session gets
         // global + user + project scope. `at_default(None)` sets the global
@@ -283,18 +401,40 @@ impl Harness for NativeHarness {
         // `RunnerDeps` below so `drive()` can drain what `NativeSession::steer`
         // pushes — both sides share the same `Arc<Mutex<_>>` (Task B3).
         let steer = steer::SteerBuffer::new();
-        let nudge = seed_nudge_state(&ctx.store, &ctx.session_pk).await;
+        let nudge = if ctx.isolated_target {
+            Arc::new(runner::NudgeState::default())
+        } else {
+            seed_nudge_state(&ctx.store, &ctx.session_pk).await
+        };
+        // Rendered into the system prompt below so `delegate_agent` always
+        // advertises the CURRENT executable catalog, excluding this
+        // session's own profile (a profile can't delegate to itself).
+        let delegation_catalog = ctx
+            .delegation
+            .delegate_catalog(&ctx.primary_agent.profile.id)
+            .await;
         Ok(Box::new(NativeSession {
             session_pk: ctx.session_pk.clone(),
             automation_events: ctx.automation_events.clone(),
             steer: steer.clone(),
-            deps: runner::RunnerDeps {
+            deps: Mutex::new(runner::RunnerDeps {
                 session_pk: ctx.session_pk,
+                primary_agent: ctx.primary_agent,
+                run_id: ctx.run_id.clone(),
+                root_run_id: ctx.root_run_id,
+                delegation: ctx.delegation,
+                isolated_target: ctx.isolated_target,
                 main_agent_id: ctx.main_agent_id,
                 learning_queue: ctx.learning_queue,
+                agent_knowledge: ctx.agent_knowledge,
                 kind: ctx.kind,
                 work_dir: ctx.work_dir,
-                attachments_dir: ctx.attachments_dir,
+                // Isolated explicit targets never inherit the parent session's
+                // attachment root, even if a caller constructs SessionCtx
+                // directly instead of going through the control plane.
+                attachments_dir: (!ctx.isolated_target)
+                    .then_some(ctx.attachments_dir)
+                    .flatten(),
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 extension_events: ctx.extension_events,
                 model,
@@ -312,24 +452,29 @@ impl Harness for NativeHarness {
                 agent,
                 agents,
                 commands,
+                allowed_skills: primary_turn.allowed_skills.clone(),
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 steer,
                 background: ctx.background,
-                // The control plane only populates `ctx.app_control` for a
-                // top-level interactive session (`kind` Project/Chat); worker,
-                // review, and bare test contexts pass `None` through.
-                app_control: ctx.app_control,
+                // Explicit-target and noninteractive-session facades must
+                // never cross the harness boundary from their parent.
+                app_control: (!ctx.isolated_target).then_some(ctx.app_control).flatten(),
                 nudge,
                 review_tool_defs: None,
                 // Primary sessions advertise lazily (hot core + load_tools);
                 // sub-agents and the review fork strip this back to `None`
                 // (eager) via `deps_for_subagent` / their own builder. Worker
-                // sessions are ALSO eager: a Worker's `orch_block` "block for
-                // human" primitive is its own essential primitive, and hiding
-                // it behind a `load_tools` step is fragile — so a Worker
-                // primary session gets `None` here, same as a sub-agent.
-                activated_tools: if matches!(ctx.kind, crate::domain::SessionKind::Worker) {
+                // sessions are ALSO eager, same as a sub-agent, so their
+                // primary session gets `None` here. An isolated-target
+                // session (an explicit-mention or retried delegated main
+                // child) is likewise eager: it executes against a complete
+                // immutable target profile snapshot, so its tool allowlist is
+                // exact from the first turn — lazy load_tools staging would
+                // silently overgrant beyond the target's configured filter.
+                activated_tools: if ctx.isolated_target
+                    || matches!(ctx.kind, crate::domain::SessionKind::Worker)
+                {
                     None
                 } else {
                     Some(std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -343,8 +488,8 @@ impl Harness for NativeHarness {
                 // Every autonomous agent session (Project/Chat/Worker) runs as
                 // `Agent` so the negative-space storage guard + the skill_manage
                 // guard engage; the human acts as `User` through Cockpit/TUI. A
-                // Worker is an UNATTENDED orchestration agent — it must be at
-                // least as guarded as an attended chat, never less (avoiding the
+                // Worker is an unattended agent — it must be at least as
+                // guarded as an attended chat, never less (avoiding the
                 // "unattended-with-more-power" inversion). Review never routes
                 // through here: its fork builds `RunnerDeps` directly with
                 // `BackgroundReview`, so the `Review` arm below is defensively
@@ -361,7 +506,8 @@ impl Harness for NativeHarness {
                         crate::domain::WriteOrigin::BackgroundReview
                     }
                 },
-            },
+                delegation_catalog,
+            }),
             live_cancel: Mutex::new(None),
             turn_lock: tokio::sync::Mutex::new(()),
         }))
@@ -370,7 +516,7 @@ impl Harness for NativeHarness {
 
 /// A live native session. `send_prompt` runs one full turn to completion.
 pub struct NativeSession {
-    deps: runner::RunnerDeps,
+    deps: Mutex<runner::RunnerDeps>,
     session_pk: String,
     automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     /// The in-flight turn's cancellation token, set for the duration of
@@ -394,9 +540,10 @@ impl HarnessSession for NativeSession {
         // `cancel()` trips only the CURRENT turn's token (the queued turn gets
         // a fresh one when it starts).
         let _turn = self.turn_lock.lock().await;
+        let deps = self.deps.lock().unwrap().clone();
         let cancel = CancellationToken::new();
         *self.live_cancel.lock().unwrap() = Some(cancel.clone());
-        let result = runner::run_turn(&self.deps, prompt, cancel).await;
+        let result = runner::run_turn(&deps, prompt, cancel).await;
         *self.live_cancel.lock().unwrap() = None;
         result
     }
@@ -419,9 +566,10 @@ impl HarnessSession for NativeSession {
         // fires once per real session end, never on a `stop_session`
         // interrupt (which cancels but does not `end()`). Fires to both the
         // on-disk script sink and (Track D) any subscribed extensions.
+        let deps = self.deps.lock().unwrap().clone();
         let _ = hooks::fire_hook(
-            &self.deps.work_dir,
-            self.deps.extension_events.as_ref(),
+            &deps.work_dir,
+            deps.extension_events.as_ref(),
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
@@ -435,10 +583,39 @@ impl HarnessSession for NativeSession {
         Ok(())
     }
 
+    async fn dispatch_retry_child(
+        &self,
+        child: crate::delegation::RunHandle,
+    ) -> anyhow::Result<()> {
+        let deps = self.deps.lock().unwrap().clone();
+        match child.run.agent_kind {
+            crate::domain::AgentRunKind::MainDelegate => {
+                runner::dispatch_retry_main_delegate(deps, child)
+            }
+            crate::domain::AgentRunKind::Subagent => runner::dispatch_retry_subagent(deps, child),
+            crate::domain::AgentRunKind::Primary => anyhow::bail!("only child runs can be retried"),
+        }
+    }
+
+    async fn refresh_primary_turn(&self, primary: crate::harness::PrimaryTurnConfig) {
+        // Share `turn_lock` with `send_prompt` so this can only replace the
+        // queued turn's configuration. The in-flight turn holds a cloned
+        // `RunnerDeps` snapshot until it completes.
+        let _turn = self.turn_lock.lock().await;
+        let mut deps = self.deps.lock().unwrap();
+        deps.primary_agent = primary.agent;
+        deps.run_id = primary.run_id;
+        deps.root_run_id = primary.root_run_id;
+        deps.model = primary.model;
+        deps.perm_mode = Arc::new(std::sync::Mutex::new(primary.perm_mode));
+        deps.agent = primary.agent_tools;
+        deps.allowed_skills = primary.allowed_skills;
+    }
+
     fn set_perm_mode(&self, mode: crate::domain::PermMode) {
         // Live update: the next turn's tool gate reads this fresh, so a
         // composer/project-settings permission change applies without a restart.
-        self.deps.set_perm_mode(mode);
+        self.deps.lock().unwrap().set_perm_mode(mode);
     }
 
     fn agent_session_id(&self) -> Option<String> {
@@ -545,20 +722,74 @@ mod tests {
     }
 
     async fn ctx_for(store: Arc<Store>, work_dir: std::path::PathBuf) -> SessionCtx {
+        crate::llm_router::connections::add_connection(
+            &store,
+            conn_for_resolution_tests("test-anthropic", "anthropic", "test/model"),
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        if store.get_session("sess").await.unwrap().is_none() {
+            store
+                .insert_session(crate::domain::Session {
+                    session_pk: "sess".into(),
+                    primary_agent_id: Some("ryuzi".into()),
+                    primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                        id: "ryuzi".into(),
+                        name: "Ryuzi".into(),
+                        avatar_color: "blue".into(),
+                    }),
+                    project_id: None,
+                    agent_session_id: None,
+                    worktree_path: None,
+                    branch: None,
+                    title: Some("test".into()),
+                    status: crate::domain::SessionStatus::Idle,
+                    perm_mode: PermMode::BypassPermissions,
+                    started_by: None,
+                    created_at: Some(0),
+                    last_active: Some(0),
+                    resume_attempts: 0,
+                    branch_owned: false,
+                    kind: crate::domain::SessionKind::Chat,
+                    speaker: None,
+                    agent: None,
+                    parent_session_pk: None,
+                })
+                .await
+                .unwrap();
+        }
         let (events, _rx) = broadcast::channel(64);
-        let knowledge = Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
-            work_dir.join(".agent-config"),
-        ));
-        let learning_queue = Arc::new(crate::agents::learning_queue::LearningQueue::new(
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
+        let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
-            knowledge.clone(),
-        ));
+            persistence.registry.clone(),
+            events.clone(),
+        );
+        let run = delegation
+            .begin_primary("sess", primary_agent.clone(), "test")
+            .await
+            .unwrap();
         SessionCtx {
             session_pk: "sess".into(),
+            primary_agent,
+            run_id: run.run.run_id.clone(),
+            root_run_id: run.run.run_id,
+            delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: crate::domain::SessionKind::Chat,
             agent: None,
+            isolated_target: false,
             work_dir,
             attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,
@@ -574,8 +805,8 @@ mod tests {
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
             background: super::background::BackgroundRegistry::new(),
-            agent_knowledge: knowledge,
-            learning_queue,
+            agent_knowledge: persistence.knowledge,
+            learning_queue: persistence.learning,
             store,
             app_control: None,
         }
@@ -589,6 +820,209 @@ mod tests {
         assert!(regs.gateway.get(NATIVE_ID).is_none());
     }
 
+    #[test]
+    fn durable_primary_adapter_uses_the_profile_id_and_native_tools() {
+        let profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        let adapted = adapt_primary_profile(&profile).unwrap();
+
+        assert_eq!(adapted.agent.name, "ryuzi");
+        assert!(adapted.agent.tools.allows("bash"));
+        assert_eq!(adapted.allowed_skills, None);
+    }
+
+    #[test]
+    fn durable_primary_adapter_filters_profile_tools_and_skills_without_build_fallback() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        profile.tools.native = vec!["read".into()];
+        profile.skills = vec!["release".into()];
+        let adapted = adapt_primary_profile(&profile).unwrap();
+
+        assert_eq!(adapted.agent.name, "ryuzi");
+        assert!(adapted.agent.tools.allows("read"));
+        assert!(!adapted.agent.tools.allows("bash"));
+        assert_eq!(adapted.allowed_skills, Some(vec!["release".into()]));
+    }
+
+    #[tokio::test]
+    async fn isolated_target_cannot_read_parent_attachments_or_use_parent_facade() {
+        use runner::testutil::{
+            input_json_delta, message_delta, message_stop, tool_use_start, RecordingLlm,
+        };
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        let attachment = attachments.path().join("parent-only.txt");
+        tokio::fs::write(&attachment, "parent-only attachment")
+            .await
+            .unwrap();
+        let attachment_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(attachment_db.path()).await.unwrap());
+        let mut ctx = ctx_for(store.clone(), work_dir.path().to_path_buf()).await;
+        let mut target = (*ctx.primary_agent).clone();
+        target.profile.id = "mentioned-target".into();
+        target.profile.name = "Mentioned target".into();
+        target.profile.tools.native = vec!["read".into(), "app_projects".into()];
+        target.profile.tools.plugins.clear();
+        target.profile.tools.apps.clear();
+        ctx.primary_agent = Arc::new(target);
+        ctx.main_agent_id = "mentioned-target".into();
+        ctx.isolated_target = true;
+        ctx.attachments_dir = Some(attachments.path().to_path_buf());
+        ctx.app_control = Some(Arc::new(tools::testutil::FakeAppControl::default()));
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "read-parent-attachment", "read"),
+                input_json_delta(0, &serde_json::json!({ "path": attachment }).to_string()),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "parent-facade", "app_projects"),
+                input_json_delta(0, r#"{"action":"list"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                runner::testutil::text_delta("done"),
+                message_delta("end_turn"),
+                message_stop(),
+            ],
+        ]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(OneShotFactory(llm)));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("inspect attachment", "inspect attachment"))
+            .await
+            .unwrap();
+
+        let tool_rows = store.list_messages("sess").await.unwrap();
+        let tool_row = tool_rows
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("read-parent-attachment"))
+            .expect("the mentioned child records its read attempt");
+        assert_eq!(tool_row.status.as_deref(), Some("failed"));
+        assert!(
+            !tool_row.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("parent-only attachment")),
+            "the mentioned child must not receive its parent's attachment read root"
+        );
+        let facade_row = tool_rows
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("parent-facade"))
+            .expect("the mentioned child records its parent-facade attempt");
+        assert_eq!(facade_row.status.as_deref(), Some("failed"));
+        assert!(
+            facade_row.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("not available in this context")),
+            "the mentioned child must not receive its parent's app facade"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_target_uses_complete_profile_tool_allowlist_after_registry_attach() {
+        use runner::testutil::{message_delta, message_stop, text_delta, RecordingLlm};
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let profile_db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(profile_db.path()).await.unwrap());
+        let mut ctx = ctx_for(store, work_dir.path().to_path_buf()).await;
+        let mut target = (*ctx.primary_agent).clone();
+        target.profile.id = "mentioned-target".into();
+        target.profile.name = "Mentioned target".into();
+        target.profile.tools.native.clear();
+        target.profile.tools.plugins = vec!["github.search".into()];
+        target.profile.tools.apps = vec!["slack".into()];
+        ctx.primary_agent = Arc::new(target);
+        ctx.main_agent_id = "mentioned-target".into();
+        ctx.isolated_target = true;
+        let llm = Arc::new(RecordingLlm::new(vec![vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ]]));
+        struct OneShotFactory(Arc<RecordingLlm>);
+        impl llm::LlmStreamFactory for OneShotFactory {
+            fn create(&self, _store: Arc<Store>) -> Arc<dyn llm::LlmStream> {
+                self.0.clone()
+            }
+        }
+        let harness = NativeHarness::with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
+        let session = harness.start_session(ctx).await.unwrap();
+        session
+            .send_prompt(TurnPrompt::text("inspect", "inspect"))
+            .await
+            .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        let advertised = bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            advertised.is_empty(),
+            "unattached configured tools must not overgrant native tools: {advertised:?}"
+        );
+    }
+
+    #[test]
+    fn profile_tool_filter_resolves_native_plugin_and_app_tools_without_fallback() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("target".into());
+        profile.tools.native = vec!["read".into()];
+        profile.tools.plugins = vec!["github.search".into(), "lint.check".into()];
+        profile.tools.apps = vec!["slack".into()];
+        let available = vec![
+            "read".into(),
+            "write".into(),
+            "mcp__github__search".into(),
+            "ext__lint__check".into(),
+            "mcp__slack__send".into(),
+        ];
+
+        assert_eq!(
+            tool_filter_for_profile(&profile, &available),
+            agents::ToolFilter::Only(vec![
+                "ext__lint__check".into(),
+                "mcp__github__search".into(),
+                "mcp__slack__send".into(),
+                "read".into(),
+            ])
+        );
+
+        profile.tools.native = vec!["missing-native".into()];
+        profile.tools.plugins = vec!["missing.tool".into()];
+        profile.tools.apps = vec!["missing-app".into()];
+        assert_eq!(
+            tool_filter_for_profile(&profile, &available),
+            agents::ToolFilter::Only(Vec::new()),
+            "a nonempty configuration must never broaden to every registered tool"
+        );
+    }
+
+    #[test]
+    fn durable_primary_adapter_accepts_plugin_app_and_permission_capabilities() {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        profile.tools.plugins = vec!["github.search".into()];
+        profile.tools.apps = vec!["github".into()];
+        profile.permissions.rules = vec![crate::agents::types::PermissionRule {
+            id: "deny-bash".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Deny,
+            command_prefix: None,
+        }];
+
+        let adapted = adapt_primary_profile(&profile).unwrap();
+        assert_eq!(adapted.agent.permission_rules, profile.permissions.rules);
+    }
     #[test]
     fn native_plugin_manifest_has_expected_identity() {
         let plugin = native_plugin();
@@ -968,14 +1402,11 @@ mod tests {
         let _guard = StateDirGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let work_dir = dir.path().to_path_buf();
-        let mem = memory::MemoryStore::for_agent(
-            Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
-                work_dir.join(".agent-config"),
-            )),
-            "ryuzi",
-            None,
-        )
-        .unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let ctx = ctx_for(store.clone(), work_dir).await;
+        let mem =
+            memory::MemoryStore::for_agent(ctx.agent_knowledge.clone(), "ryuzi", None).unwrap();
         mem.add(
             memory::MemoryScope::Global,
             "the deploy key lives in 1Password",
@@ -985,9 +1416,6 @@ mod tests {
         mem.add(memory::MemoryScope::User, "prefers terse answers")
             .await
             .unwrap();
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
         let llm = Arc::new(RecordingLlm::new(vec![vec![
             text_delta("ok"),
@@ -1003,10 +1431,7 @@ mod tests {
         let plugin = native_plugin_with_llm_factory(Arc::new(OneShotFactory(llm.clone())));
         let harness = plugin.harness.unwrap().create().unwrap();
         // ctx_for's SessionCtx carries project_id: None — the chat-session shape.
-        let session = harness
-            .start_session(ctx_for(store.clone(), work_dir).await)
-            .await
-            .unwrap();
+        let session = harness.start_session(ctx).await.unwrap();
         session
             .send_prompt(TurnPrompt::text("hi", "hi"))
             .await
@@ -1112,7 +1537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_turn_keeps_first_snapshot_and_next_lock_holder_refreshes() {
+    async fn concurrent_turn_keeps_primary_snapshot_despite_project_runtime_changes() {
         use crate::domain::{Project, Session, SessionStatus};
         use crate::llm_router::connections;
         use crate::llm_router::model_effort::TurnEffortPolicy;
@@ -1194,6 +1619,8 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "sess".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: Some("p".into()),
                 agent_session_id: None,
                 worktree_path: None,
@@ -1246,9 +1673,18 @@ mod tests {
         let policies = llm.policies.lock().unwrap();
         assert_eq!(policies.len(), 2);
         assert_eq!(policies[0].requested_model, "anthropic/model-a");
-        assert_eq!(policies[0].caller_override.as_deref(), Some("low"));
-        assert_eq!(policies[1].requested_model, "anthropic/model-b");
-        assert_eq!(policies[1].caller_override.as_deref(), Some("high"));
+        assert_eq!(
+            policies[0].caller_override.as_deref(),
+            Some("low"),
+            "the first turn keeps the project effort active when it started"
+        );
+        assert_eq!(policies[1].requested_model, "anthropic/model-a");
+        assert_eq!(
+            policies[1].caller_override.as_deref(),
+            Some("high"),
+            "the queued turn may intentionally read the updated project effort while retaining \
+             the immutable primary model snapshot"
+        );
     }
 
     fn conn_for_resolution_tests(

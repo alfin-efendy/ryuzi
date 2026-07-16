@@ -6,6 +6,8 @@ import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
 function sess(pk: string, lastActive: number | null): UiSession {
   const s: Session = {
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p",
     agentSessionId: null,
     worktreePath: null,

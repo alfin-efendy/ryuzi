@@ -13,6 +13,15 @@ use tokio::sync::broadcast;
 /// (Spec 3 wiring) and passed to `Harness::start_session`.
 pub struct SessionCtx {
     pub session_pk: String,
+    /// The immutable resolved primary profile driving this harness instance.
+    pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
+    /// The root primary run associated with this dispatched turn.
+    pub run_id: String,
+    /// Persisted root ancestor for delegated/retried harnesses; equal to `run_id`
+    /// for an ordinary primary turn.
+    pub root_run_id: String,
+    /// Shared lifecycle for this session's primary/delegated runs.
+    pub delegation: Arc<crate::delegation::DelegationRuntime>,
     /// Temporary Plan 2 identity seam. Plan 4 replaces default selection with
     /// the session's persisted owner while retaining this boundary.
     pub main_agent_id: String,
@@ -27,6 +36,10 @@ pub struct SessionCtx {
     /// Which agent persona/config is driving this session, if any. Mirrors
     /// `Session.agent`; unused for `Project` sessions today.
     pub agent: Option<String>,
+    /// True for explicit-mention children. They have their own harness and
+    /// provider context while their display rows are attributed to `run_id` in
+    /// the root session's Task1 message map.
+    pub isolated_target: bool,
     pub work_dir: PathBuf,
     /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
     /// — a second read root the native runtime's `read` tool tries when the
@@ -148,13 +161,44 @@ impl TurnPrompt {
     }
 }
 
-/// A live session driven by a `Harness`. Output is emitted via `SessionCtx.events`.
+/// Immutable primary agent configuration used by one pending harness turn.
+///
+/// Replacing this config is safe only before the turn starts; a harness must
+/// snapshot it when `send_prompt` begins so an in-flight turn never changes.
+#[derive(Clone)]
+pub struct PrimaryTurnConfig {
+    pub agent: Arc<crate::agents::types::AgentSnapshot>,
+    pub run_id: String,
+    /// The persisted primary root that owns the turn's background delegation rail.
+    pub root_run_id: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub perm_mode: PermMode,
+    pub agent_tools: crate::harness::native::agents::Agent,
+    pub allowed_skills: Option<Vec<String>>,
+}
+
 #[async_trait]
 pub trait HarnessSession: Send + Sync {
     async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()>;
     async fn cancel(&self) -> anyhow::Result<()>;
     async fn end(&self) -> anyhow::Result<()>;
     fn agent_session_id(&self) -> Option<String>;
+
+    /// Dispatch an already-admitted subagent retry through this harness's native
+    /// executor. Other harness implementations retain the default rejection so
+    /// the control plane can terminalize the admitted run instead of leaving it
+    /// queued.
+    async fn dispatch_retry_child(
+        &self,
+        _child: crate::delegation::RunHandle,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("the active harness does not support subagent retries")
+    }
+
+    /// Replace the primary configuration used for the next prompt. Existing
+    /// in-flight prompts retain the snapshot captured when they began.
+    async fn refresh_primary_turn(&self, _primary: PrimaryTurnConfig) {}
 
     /// Update the live permission mode for subsequent turns. Default no-op;
     /// the native session overrides this (see its `RunnerDeps`).
@@ -221,12 +265,30 @@ mod tests {
             store.clone(),
             knowledge.clone(),
         ));
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
+        let delegation = crate::delegation::DelegationRuntime::new(
+            store.clone(),
+            persistence.registry,
+            events.clone(),
+        );
         SessionCtx {
             session_pk: "s1".into(),
+            primary_agent,
+            run_id: "r1".into(),
+            root_run_id: "r1".into(),
+            delegation,
             main_agent_id: "ryuzi".into(),
             project_id: None,
             kind: SessionKind::Chat,
             agent: None,
+            isolated_target: false,
             work_dir: PathBuf::from("/tmp"),
             attachments_dir: None,
             perm_mode: PermMode::Default,

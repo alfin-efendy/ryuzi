@@ -2209,13 +2209,44 @@ mod tests {
         registries.harness = Arc::new(WebhookHarnessFactory {
             prompts: prompts.clone(),
         });
+        // The default Ryuzi profile's model route (`smart`) and the shared
+        // subagent route (`fast`) must resolve to an enabled, executable
+        // connection before agent persistence bootstraps — otherwise the
+        // default primary owner is persisted but rejected as non-executable
+        // by every session start this test drives.
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
         let cp = ControlPlane::new_with_telemetry(
             store.clone(),
             registries,
             Arc::new(crate::telemetry::NoopTelemetry),
+            persistence,
         )
         .await;
-        cp.attach_test_agent_persistence().await;
         let project_dir = tempfile::tempdir().unwrap();
         let workdir = project_dir.keep();
         store

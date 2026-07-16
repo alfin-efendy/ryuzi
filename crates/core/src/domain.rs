@@ -107,13 +107,16 @@ impl SessionKind {
 }
 
 /// A durable background-rail row (spec §6.1). Producers (async delegation,
-/// learning forks, scheduled jobs, orch events) enqueue one; the daemon
+/// learning forks, and scheduled jobs) enqueue one; the daemon
 /// drainer delivers it into `target_session_pk` as a new user turn while
 /// that session is idle. `kind` is one of [`BackgroundKind`]'s db strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackgroundEvent {
     pub id: String,
     pub target_session_pk: String,
+    /// The primary run that dispatched a delegation outcome. `None` preserves
+    /// the normal rail behavior for non-delegation producers and legacy rows.
+    pub origin_run_id: Option<String>,
     pub kind: String,
     pub payload: String,
     pub created_at: i64,
@@ -128,8 +131,6 @@ pub enum BackgroundKind {
     Delegation,
     Learning,
     Job,
-    Orch,
-    Unblock,
 }
 
 impl BackgroundKind {
@@ -138,27 +139,15 @@ impl BackgroundKind {
             BackgroundKind::Delegation => "delegation",
             BackgroundKind::Learning => "learning",
             BackgroundKind::Job => "job",
-            BackgroundKind::Orch => "orch",
-            BackgroundKind::Unblock => "unblock",
         }
     }
     pub fn from_db(s: &str) -> Self {
         match s {
             "learning" => BackgroundKind::Learning,
             "job" => BackgroundKind::Job,
-            "orch" => BackgroundKind::Orch,
-            "unblock" => BackgroundKind::Unblock,
             _ => BackgroundKind::Delegation,
         }
     }
-}
-
-/// Outcome of `Store::record_child_failure`: whether the child re-queued for
-/// another attempt, or the circuit breaker tripped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChildFailure {
-    pub requeued: bool,
-    pub gave_up: bool,
 }
 
 /// Which actor initiated a write — a general-purpose provenance marker
@@ -262,6 +251,12 @@ pub struct CuratorRun {
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub session_pk: String,
+    /// The immutable stable ID of the agent selected when this session began.
+    /// `None` with `primary_agent_snapshot == None` identifies legacy history.
+    pub primary_agent_id: Option<String>,
+    /// The display identity captured when the session began; never derived from
+    /// the mutable registry after persistence.
+    pub primary_agent_snapshot: Option<AgentIdentitySnapshot>,
     /// `None` for chat-first sessions (`kind != Project`); a project-bound
     /// session always has this set.
     pub project_id: Option<String>,
@@ -290,6 +285,133 @@ pub struct Session {
     pub agent: Option<String>,
     /// The session this one was spawned from (`Worker`/`Review` lineage).
     pub parent_session_pk: Option<String>,
+}
+
+/// An immutable identity captured when an agent becomes the primary owner of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIdentitySnapshot {
+    pub id: String,
+    pub name: String,
+    pub avatar_color: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRunKind {
+    Primary,
+    MainDelegate,
+    Subagent,
+}
+
+impl AgentRunKind {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::MainDelegate => "main-delegate",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    pub fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "main-delegate" => Ok(Self::MainDelegate),
+            "subagent" => Ok(Self::Subagent),
+            _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("invalid agent run kind `{value}`").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentRunStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl AgentRunStatus {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn from_db(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("invalid agent run status `{value}`").into(),
+            )),
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRun {
+    pub run_id: String,
+    pub session_pk: String,
+    pub parent_run_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub primary_agent_id: String,
+    pub executing_agent_id: Option<String>,
+    pub executing_agent_name_snapshot: String,
+    pub agent_kind: AgentRunKind,
+    pub task: String,
+    pub status: AgentRunStatus,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub tool_count: u32,
+    pub resolved_model: Option<String>,
+    pub resolved_effort: Option<String>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAgentRun {
+    pub run_id: String,
+    pub session_pk: String,
+    pub parent_run_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub primary_agent_id: String,
+    pub executing_agent_id: Option<String>,
+    pub executing_agent_name_snapshot: String,
+    pub agent_kind: AgentRunKind,
+    pub task: String,
+    pub status: AgentRunStatus,
+    pub resolved_model: Option<String>,
+    pub resolved_effort: Option<String>,
 }
 
 /// How a new session's git workspace is prepared (branch controls).
@@ -418,6 +540,13 @@ pub struct Principal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalRequest {
+    /// Durable run that owns this request. Resolution must supply this value
+    /// along with `request_id`, because tool-call IDs are not global.
+    pub run_id: String,
+    /// Stable id of the agent that requested approval.
+    pub requesting_agent_id: String,
+    /// Display-name snapshot of the requesting agent.
+    pub requesting_agent_name: String,
     pub request_id: String,
     pub tool: String,
     pub summary: String,
@@ -542,8 +671,8 @@ pub struct Message {
     pub status: Option<String>,
     pub tool_kind: Option<String>,
     pub created_at: i64,
-    /// Group-chat attribution: the agent name for a labeled worker/orchestrator
-    /// bubble. `None` for ordinary user/assistant rows.
+    /// Legacy group-chat attribution retained so existing databases and event
+    /// payloads remain readable. New message constructors leave it unset.
     pub speaker: Option<String>,
 }
 
@@ -557,7 +686,8 @@ pub struct NewMessage {
     pub tool_call_id: Option<String>,
     pub status: Option<String>,
     pub tool_kind: Option<String>,
-    /// Speaker label for a group-chat bubble (`None` for normal rows).
+    /// Legacy group-chat attribution retained for database and event
+    /// compatibility. New message producers always leave it unset.
     pub speaker: Option<String>,
 }
 
@@ -578,27 +708,6 @@ impl NewMessage {
             status: None,
             tool_kind: None,
             speaker: None,
-        }
-    }
-
-    /// A labeled display bubble (role `assistant`) attributed to `speaker`.
-    /// Used by the orchestrator to post worker start/status/report bubbles into
-    /// the home chat. A display row only — never a `provider_turns` entry.
-    pub fn speaker_block(
-        session_pk: &str,
-        speaker: &str,
-        block_type: &str,
-        payload: serde_json::Value,
-    ) -> Self {
-        NewMessage {
-            session_pk: session_pk.to_string(),
-            role: "assistant".to_string(),
-            block_type: block_type.to_string(),
-            payload,
-            tool_call_id: None,
-            status: None,
-            tool_kind: None,
-            speaker: Some(speaker.to_string()),
         }
     }
 }
@@ -672,7 +781,8 @@ pub enum CoreEvent {
         tool_call_id: Option<String>,
         status: Option<String>,
         tool_kind: Option<String>,
-        /// Speaker label for a group-chat bubble (`None` for normal rows).
+        /// Legacy group-chat attribution retained in message events for
+        /// database and wire compatibility.
         speaker: Option<String>,
     },
     SessionQueueChanged {
@@ -683,6 +793,11 @@ pub enum CoreEvent {
     },
     ApprovalRequested {
         session_pk: String,
+        /// Durable run that owns this approval. It is required for resolution.
+        run_id: String,
+        /// Agent profile identity and display name that originated the prompt.
+        requesting_agent_id: String,
+        requesting_agent_name: String,
         request_id: String,
         tool: String,
         summary: String,
@@ -711,6 +826,13 @@ pub enum CoreEvent {
     SessionEnded {
         session_pk: String,
     },
+    /// A delegation run changed after its persisted status commit.
+    AgentRunChanged {
+        session_pk: String,
+        run_id: String,
+        parent_run_id: Option<String>,
+        status: String,
+    },
     /// A Hook run changed state (queued|running|success|failed|skipped).
     AutomationHookRunChanged {
         hook_id: String,
@@ -721,13 +843,6 @@ pub enum CoreEvent {
     JobRunChanged {
         job_id: String,
         run_id: String,
-        status: String,
-    },
-    /// An orchestrated task changed status (todo|ready|running|done|failed|
-    /// cancelled; roots also decomposing|waiting|judging).
-    OrchTaskChanged {
-        task_id: String,
-        root_id: Option<String>,
         status: String,
     },
     /// Per-response context usage for a native session (drives the

@@ -11,7 +11,7 @@
 //! [`SessionPermOverrides`] (dropped with the session), project-scoped ones
 //! persist a `tool_policies` row via `Store::set_tool_policy`.
 
-use crate::approval::ApprovalHub;
+use crate::approval::{ApprovalHub, ApprovalKey};
 use crate::domain::{ApprovalKind, ApprovalResponse, ApprovalScope, CoreEvent, PermMode};
 use crate::harness::native::tools::PermissionSpec;
 use crate::policy::{decide_tool_permission, is_safe_tool, PolicyOutcome};
@@ -61,11 +61,19 @@ impl SessionPermOverrides {
 /// Everything one permission check needs. Borrowed from `RunnerDeps` at the
 /// dispatch site so the check itself stays a pure function of its inputs.
 pub struct PermGate<'a> {
+    /// Order (top wins): Plan hard-deny → profile rules → session overrides → project
+    /// `tool_policies` (allowAlways AND rejectAlways) → mode auto-allow → prompt.
+    /// Plan sits above every other rule so no profile/session choice can punch
+    /// through Plan's read-only guarantee.
+    pub permission_rules: &'a [crate::agents::types::PermissionRule],
     pub perm_mode: PermMode,
     pub project_id: Option<&'a str>,
     pub store: &'a Store,
     pub overrides: &'a std::sync::Mutex<SessionPermOverrides>,
     pub session_pk: &'a str,
+    pub run_id: &'a str,
+    pub requesting_agent_id: &'a str,
+    pub requesting_agent_name: &'a str,
     pub tool_call_id: &'a str,
     pub approvals: &'a ApprovalHub,
     pub events: &'a broadcast::Sender<CoreEvent>,
@@ -87,6 +95,29 @@ fn key_to_policy_tool(key: &str) -> &str {
     }
 }
 
+fn profile_rule_decision(
+    rules: &[crate::agents::types::PermissionRule],
+    tool: &str,
+    input: &serde_json::Value,
+) -> Option<PermDecision> {
+    use crate::agents::types::PermissionDecision;
+
+    rules.iter().find_map(|rule| {
+        (rule.tool == tool
+            && rule.command_prefix.as_ref().is_none_or(|prefix| {
+                input
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|command| command.starts_with(prefix))
+            }))
+        .then_some(match rule.decision {
+            PermissionDecision::Allow => PermDecision::Allow,
+            PermissionDecision::Deny => PermDecision::Deny,
+            PermissionDecision::Ask => return None,
+        })
+    })
+}
+
 /// Decide whether a native tool call may proceed.
 ///
 /// Order (top wins): Plan hard-deny → session overrides → project
@@ -101,6 +132,9 @@ pub async fn evaluate(
     let tool = key_to_policy_tool(&spec.key);
     if gate.perm_mode == PermMode::Plan && !is_safe_tool(tool) {
         return PermDecision::Deny;
+    }
+    if let Some(decision) = profile_rule_decision(gate.permission_rules, &spec.key, input) {
+        return decision;
     }
     match gate.overrides.lock().unwrap().decision_for(tool) {
         Some(true) => return PermDecision::Allow,
@@ -118,11 +152,15 @@ pub async fn evaluate(
     }
     // Prompt: register a pending approval (scoped to the session so a
     // session-wide stop can deny it), surface it, and await the reply.
+    let approval_key = ApprovalKey::new(gate.run_id, gate.tool_call_id);
     let rx = gate
         .approvals
-        .register_for_session(gate.session_pk, gate.tool_call_id.to_string());
+        .register_for_session(gate.session_pk, approval_key.clone());
     let _ = gate.events.send(CoreEvent::ApprovalRequested {
         session_pk: gate.session_pk.to_string(),
+        run_id: gate.run_id.to_string(),
+        requesting_agent_id: gate.requesting_agent_id.to_string(),
+        requesting_agent_name: gate.requesting_agent_name.to_string(),
         request_id: gate.tool_call_id.to_string(),
         tool: spec.key.clone(),
         summary: spec.summary.clone(),
@@ -135,7 +173,7 @@ pub async fn evaluate(
         // Turn stopped while parked: deny, and deregister the abandoned
         // prompt so a later resolve() can't hit a stale entry.
         _ = gate.cancel.cancelled() => {
-            gate.approvals.resolve_bool(gate.tool_call_id, false);
+            gate.approvals.resolve_bool(&approval_key, false);
             PermDecision::Deny
         }
         res = rx => match res {
@@ -186,6 +224,7 @@ async fn persist_rule(gate: &PermGate<'_>, tool: &str, decision: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalKey;
     use crate::domain::{ApprovalDecision, ApprovalResponse, ApprovalScope, WriteOrigin};
     use crate::store::Store;
     use std::sync::Arc;
@@ -218,17 +257,61 @@ mod tests {
 
         fn gate(&self, perm_mode: PermMode, project_id: Option<&'static str>) -> PermGate<'_> {
             PermGate {
+                permission_rules: &[],
                 perm_mode,
                 project_id,
                 store: &self.store,
                 overrides: &self.overrides,
                 session_pk: "s",
+                run_id: "run-1",
+                requesting_agent_id: "agent-1",
+                requesting_agent_name: "Agent One",
                 tool_call_id: "call-1",
                 approvals: &self.approvals,
                 events: &self.events,
                 cancel: &self.cancel,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn profile_rules_allow_matching_tool_and_command_prefix() {
+        let f = Fixture::new().await;
+        let rules = [crate::agents::types::PermissionRule {
+            id: "cargo-test".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Allow,
+            command_prefix: Some("cargo test".into()),
+        }];
+        let gate = PermGate {
+            permission_rules: &rules,
+            ..f.gate(PermMode::Default, None)
+        };
+        let d = evaluate(
+            &spec("bash"),
+            &serde_json::json!({"command": "cargo test -p ryuzi-core"}),
+            &gate,
+        )
+        .await;
+        assert_eq!(d, PermDecision::Allow);
+        assert!(!f.approvals.has_pending());
+    }
+
+    #[tokio::test]
+    async fn profile_rule_ask_falls_through_to_the_normal_gate() {
+        let f = Fixture::new().await;
+        let rules = [crate::agents::types::PermissionRule {
+            id: "ask-bash".into(),
+            tool: "bash".into(),
+            decision: crate::agents::types::PermissionDecision::Ask,
+            command_prefix: None,
+        }];
+        let gate = PermGate {
+            permission_rules: &rules,
+            ..f.gate(PermMode::BypassPermissions, None)
+        };
+        let d = evaluate(&spec("bash"), &serde_json::json!({}), &gate).await;
+        assert_eq!(d, PermDecision::Allow);
     }
 
     #[tokio::test]
@@ -311,9 +394,12 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         let waiter = tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 approvals.resolve(
-                    &request_id,
+                    &ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::AllowAlways,
                         scope: Some(ApprovalScope::Project),
@@ -346,9 +432,12 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 approvals.resolve(
-                    &request_id,
+                    &ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::AllowAlways,
                         scope: Some(ApprovalScope::Session),
@@ -373,9 +462,12 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         let waiter = tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 approvals.resolve(
-                    &request_id,
+                    &ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::RejectAlways,
                         scope: Some(ApprovalScope::Project),
@@ -408,9 +500,12 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 approvals.resolve(
-                    &request_id,
+                    &ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::RejectAlways,
                         scope: Some(ApprovalScope::Session),
@@ -438,9 +533,12 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 approvals.resolve(
-                    &request_id,
+                    &ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::AllowAlways,
                         scope: None,
@@ -474,8 +572,11 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
-                approvals.resolve_bool(&request_id, false);
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
+                approvals.resolve_bool(&ApprovalKey::new(run_id, request_id), false);
             }
         });
         let d = evaluate(
@@ -508,9 +609,12 @@ mod tests {
         let approvals = f.approvals.clone();
         let mut rx = f.events.subscribe();
         tokio::spawn(async move {
-            if let Ok(CoreEvent::ApprovalRequested { request_id, .. }) = rx.recv().await {
+            if let Ok(CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            }) = rx.recv().await
+            {
                 approvals.resolve(
-                    &request_id,
+                    &ApprovalKey::new(run_id, request_id),
                     ApprovalResponse {
                         decision: ApprovalDecision::AllowAlways,
                         scope: Some(ApprovalScope::Project),
@@ -560,7 +664,7 @@ mod tests {
                 } => {
                     assert_eq!(approval_kind, ApprovalKind::Tool);
                     assert_eq!(input["command"], "rm -rf ./x");
-                    approvals.resolve_bool("call-1", true);
+                    approvals.resolve_bool(&ApprovalKey::new("run-1", "call-1"), true);
                 }
                 other => panic!("unexpected event {other:?}"),
             }
@@ -591,12 +695,13 @@ mod tests {
         let waiter = tokio::spawn(async move {
             match rx.recv().await.unwrap() {
                 CoreEvent::ApprovalRequested {
+                    run_id,
                     request_id,
                     principal,
                     ..
                 } => {
                     assert_eq!(principal, Some(expected));
-                    approvals.resolve_bool(&request_id, true);
+                    approvals.resolve_bool(&ApprovalKey::new(run_id, request_id), true);
                 }
                 other => panic!("unexpected event {other:?}"),
             }
@@ -620,12 +725,13 @@ mod tests {
         let waiter = tokio::spawn(async move {
             match rx.recv().await.unwrap() {
                 CoreEvent::ApprovalRequested {
+                    run_id,
                     request_id,
                     principal,
                     ..
                 } => {
                     assert_eq!(principal, None);
-                    approvals.resolve_bool(&request_id, true);
+                    approvals.resolve_bool(&ApprovalKey::new(run_id, request_id), true);
                 }
                 other => panic!("unexpected event {other:?}"),
             }

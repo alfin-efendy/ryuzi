@@ -95,6 +95,8 @@ test("notificationsEnabled defaults on and toggles + persists", () => {
 function sess(pk: string, lastActive: number | null): UiSession {
   const s: Session = {
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p",
     agentSessionId: null,
     worktreePath: null,

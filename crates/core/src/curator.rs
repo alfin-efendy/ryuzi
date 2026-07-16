@@ -172,7 +172,7 @@ pub async fn tick(store: &Arc<Store>) {
 /// The curator's background loop: sleep, then check-and-maybe-sweep,
 /// forever. Returned as a future (not self-spawned) so hosts can run it on
 /// their own runtime, mirroring `learning::run_loop` / `background_rail::
-/// run_loop` / `scheduler::run_loop` / `orch::run_loop`.
+/// run_loop` / `scheduler::run_loop`.
 pub async fn run_loop(store: Arc<Store>) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;

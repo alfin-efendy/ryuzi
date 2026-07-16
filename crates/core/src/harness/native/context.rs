@@ -64,8 +64,9 @@ pub(crate) fn build_sections(
     work_dir: &Path,
     extra_skill_dirs: &[std::path::PathBuf],
     memory: Option<&str>,
+    allowed_skills: Option<&[String]>,
 ) -> Vec<Section> {
-    let mut sections: Vec<Section> = vec![
+    let mut sections = vec![
         Section {
             label: "base_prompt",
             body: BASE_PROMPT.to_string(),
@@ -148,9 +149,7 @@ pub(crate) fn build_sections(
     }
 
     // Available skills (names + descriptions only; bodies load via the tool).
-    if let Some(guidance) =
-        super::skills::SkillRegistry::load_with(work_dir, extra_skill_dirs).guidance()
-    {
+    if let Some(guidance) = skill_guidance(work_dir, extra_skill_dirs, allowed_skills) {
         sections.push(Section {
             label: "skills",
             body: guidance,
@@ -161,13 +160,10 @@ pub(crate) fn build_sections(
 }
 
 /// Join section bodies into the final `system` string (blank line between).
-/// `pub(crate)`, not `pub`: `Section` itself is crate-internal, and every
-/// current/expected caller (`assemble_system` and later same-crate refactors)
-/// lives inside `ryuzi-core`.
 pub(crate) fn join_sections(sections: &[Section]) -> String {
     sections
         .iter()
-        .map(|s| s.body.as_str())
+        .map(|section| section.body.as_str())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -176,28 +172,60 @@ pub(crate) fn join_sections(sections: &[Section]) -> String {
 /// same-label sections summed and first-seen order preserved. Diagnostic only.
 pub(crate) fn breakdown_of(sections: &[Section]) -> Vec<(&'static str, u64)> {
     let mut out: Vec<(&'static str, u64)> = Vec::new();
-    for s in sections {
-        let tokens = (s.body.len() / 4) as u64;
-        if let Some(entry) = out.iter_mut().find(|(l, _)| *l == s.label) {
+    for section in sections {
+        let tokens = (section.body.len() / 4) as u64;
+        if let Some(entry) = out.iter_mut().find(|(label, _)| *label == section.label) {
             entry.1 += tokens;
         } else {
-            out.push((s.label, tokens));
+            out.push((section.label, tokens));
         }
     }
     out
 }
 
-/// Assemble the system prompt for a session rooted at `work_dir`. Signature is
-/// preserved for existing callers (including the review-fork path); it now
-/// delegates to `build_sections` + `join_sections`.
+/// Assemble the system prompt for callers that only need the final string.
 pub fn assemble_system(
     work_dir: &Path,
     extra_skill_dirs: &[std::path::PathBuf],
     memory: Option<&str>,
+    allowed_skills: Option<&[String]>,
 ) -> String {
-    join_sections(&build_sections(work_dir, extra_skill_dirs, memory))
+    join_sections(&build_sections(
+        work_dir,
+        extra_skill_dirs,
+        memory,
+        allowed_skills,
+    ))
 }
 
+fn skill_guidance(
+    work_dir: &Path,
+    extra_skill_dirs: &[std::path::PathBuf],
+    allowed_skills: Option<&[String]>,
+) -> Option<String> {
+    let guidance = super::skills::SkillRegistry::load_with(work_dir, extra_skill_dirs)
+        .all()
+        .into_iter()
+        .filter(|skill| {
+            allowed_skills
+                .map(|allowed| allowed.iter().any(|name| name == &skill.name))
+                .unwrap_or(true)
+        })
+        .map(|skill| {
+            let description: String = skill.description.chars().take(60).collect();
+            format!("- {}: {description}", skill.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!guidance.is_empty()).then(|| {
+        format!(
+            "Available skills. You MUST scan this list at the start of every \
+             task and load a skill's full instructions with the `skill` tool \
+             BEFORE doing work it covers. Author new skills with \
+             `skill_manage` (keep descriptions ≤60 chars).\n{guidance}"
+        )
+    })
+}
 fn push_if_present(
     sections: &mut Vec<Section>,
     seen: &mut std::collections::HashSet<String>,
@@ -222,9 +250,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limits_skill_guidance_to_durable_primary_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["release", "unrelated"] {
+            let skill = dir.path().join(".ryuzi/skills").join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} work\n---\nbody"),
+            )
+            .unwrap();
+        }
+
+        let sys = assemble_system(dir.path(), &[], None, Some(&["release".into()]));
+        assert!(sys.contains("- release: release work"), "{sys}");
+        assert!(!sys.contains("- unrelated: unrelated work"), "{sys}");
+    }
+    #[test]
     fn includes_base_prompt_and_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let sys = assemble_system(dir.path(), &[], None);
+        let sys = assemble_system(dir.path(), &[], None, None);
         assert!(sys.contains("You are an autonomous software engineering agent"));
         assert!(sys.contains("Working directory"));
         assert!(sys.contains(&dir.path().display().to_string()));
@@ -252,7 +297,7 @@ mod tests {
     #[test]
     fn assembled_system_teaches_the_verbatim_steer_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let sys = assemble_system(dir.path(), &[], None);
+        let sys = assemble_system(dir.path(), &[], None, None);
         assert!(sys.contains(STEER_MARKER_OPEN));
         assert!(sys.contains(STEER_MARKER_CLOSE));
         assert!(sys.contains("ONLY that marker pair"));
@@ -261,7 +306,7 @@ mod tests {
     #[test]
     fn assembled_system_teaches_session_search_discovery_then_read() {
         let dir = tempfile::tempdir().unwrap();
-        let sys = assemble_system(dir.path(), &[], None);
+        let sys = assemble_system(dir.path(), &[], None, None);
         assert!(sys.contains(super::super::tools::session_search::SESSION_SEARCH_GUIDANCE));
         assert!(sys.contains("action=discovery"));
         assert!(sys.contains("action=read"));
@@ -271,7 +316,7 @@ mod tests {
     fn includes_project_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "Follow the house style.").unwrap();
-        let sys = assemble_system(dir.path(), &[], None);
+        let sys = assemble_system(dir.path(), &[], None, None);
         assert!(sys.contains("Follow the house style."));
         assert!(sys.contains("Instructions from"));
     }
@@ -283,11 +328,12 @@ mod tests {
             dir.path(),
             &[],
             Some("# Persistent memory (global) [1% full — 11/6000 chars]\nglobal fact"),
+            None,
         );
         assert!(sys.contains("# Persistent memory (global)"));
         assert!(sys.contains("global fact"));
         // Empty snapshots add nothing.
-        let sys = assemble_system(dir.path(), &[], Some("   "));
+        let sys = assemble_system(dir.path(), &[], Some("   "), None);
         assert!(!sys.contains("Persistent memory"));
     }
 
@@ -298,15 +344,16 @@ mod tests {
             dir.path(),
             &[],
             Some("# Persistent memory (global) [1% full — 11/6000 chars]\nglobal fact"),
+            None,
         );
         assert!(sys.contains(super::super::memory::MEMORY_GUIDANCE));
         let mem_pos = sys.find("# Persistent memory").unwrap();
         let guidance_pos = sys.find(super::super::memory::MEMORY_GUIDANCE).unwrap();
         assert!(mem_pos < guidance_pos, "guidance must follow the snapshot");
         // No snapshot -> no guidance either (nothing to explain).
-        let sys = assemble_system(dir.path(), &[], None);
+        let sys = assemble_system(dir.path(), &[], None, None);
         assert!(!sys.contains(super::super::memory::MEMORY_GUIDANCE));
-        let sys = assemble_system(dir.path(), &[], Some("   "));
+        let sys = assemble_system(dir.path(), &[], Some("   "), None);
         assert!(!sys.contains(super::super::memory::MEMORY_GUIDANCE));
     }
 
@@ -318,7 +365,7 @@ mod tests {
         // CLAUDE.md with byte-identical content (the symlink/copy case).
         std::fs::write(dir.join("CLAUDE.md"), "# Rules\n\nBe precise.").unwrap();
 
-        let sections = build_sections(&dir, &[], None);
+        let sections = build_sections(&dir, &[], None, None);
         let bodies: Vec<&str> = sections.iter().map(|s| s.body.as_str()).collect();
         let hits = bodies.iter().filter(|b| b.contains("Be precise.")).count();
         assert_eq!(
@@ -336,7 +383,7 @@ mod tests {
         std::fs::write(dir.join("AGENTS.md"), "# A\n\nAlpha rule.").unwrap();
         std::fs::write(dir.join("CLAUDE.md"), "# C\n\nBravo rule.").unwrap();
 
-        let sections = build_sections(&dir, &[], None);
+        let sections = build_sections(&dir, &[], None, None);
         let joined = join_sections(&sections);
         assert!(
             joined.contains("Alpha rule."),
@@ -357,7 +404,7 @@ mod tests {
         std::fs::write(dir.join("AGENTS.md"), "Same body").unwrap();
         std::fs::write(dir.join("CLAUDE.md"), "\n  Same body  \n").unwrap(); // trims equal
 
-        let sections = build_sections(&dir, &[], None);
+        let sections = build_sections(&dir, &[], None, None);
         let hits = sections
             .iter()
             .filter(|s| s.body.contains("Same body"))
@@ -373,7 +420,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ryuzi-ctx-bd-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
 
-        let sections = build_sections(&dir, &[], None);
+        let sections = build_sections(&dir, &[], None, None);
         let bd = breakdown_of(&sections);
 
         // Every label present in sections appears once in the breakdown.

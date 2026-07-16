@@ -116,20 +116,19 @@ mod tests {
     /// reaching for a Registries mutator that doesn't exist post-construction).
     async fn state_with_plugins(plugins: Vec<crate::plugins::CorePlugin>) -> ApiState {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
         for plugin in plugins {
             regs.add_plugin(plugin);
         }
-        let cp = crate::control::ControlPlane::new(store, regs).await;
         let config = tempfile::tempdir().unwrap();
         let persistence = crate::agents::bootstrap::initialize_agent_persistence(
             config.path().to_path_buf(),
-            cp.store().clone(),
+            Arc::clone(&store),
         )
         .await
         .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
+        let cp = crate::control::ControlPlane::new(store, regs, persistence.clone()).await;
         std::mem::forget(config);
         std::mem::forget(tmp);
         ApiState {

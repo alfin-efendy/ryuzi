@@ -7,8 +7,9 @@ export function activeContextQuery(draft: string): ContextQuery | null {
   const match = /(^|\s)@(\S*)$/.exec(draft);
   if (!match) return null;
   const start = match.index + match[1].length;
-  if (start > 0 && /\w/.test(draft[start - 1] ?? "")) return null;
-  return { start, query: match[2] };
+  const query = match[2];
+  if (query && !query.includes("/") && !query.includes(".")) return null;
+  return { start, query };
 }
 
 export function replaceActiveContextToken(draft: string, path: string): string {

@@ -8,9 +8,7 @@
 
 use crate::control::ControlPlane;
 use crate::domain::WriteOrigin;
-use crate::harness::native::tools::{
-    AppControl, AppJobCreate, AppJobSummary, AppOrchSummary, AppProjectSummary,
-};
+use crate::harness::native::tools::{AppControl, AppJobCreate, AppJobSummary, AppProjectSummary};
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
 
@@ -138,45 +136,6 @@ impl AppControl for AppControlImpl {
         Ok(run_id)
     }
 
-    async fn submit_orchestration(&self, project_id: &str, goal: &str) -> anyhow::Result<String> {
-        let cp = self.cp()?;
-        // Always decomposed; app-control orchestration isn't bound to a home
-        // chat (`home_session_pk: None`) — the facade has no session binding
-        // to thread through (see `audit`'s doc comment).
-        let root = crate::orch::submit(&cp, project_id, goal, true, None).await?;
-        self.audit("app_orchestrate", "submit").await;
-        Ok(root)
-    }
-
-    async fn list_orchestrations(&self, root: Option<&str>) -> anyhow::Result<Vec<AppOrchSummary>> {
-        let cp = self.cp()?;
-        let rows = crate::orch::list_tasks(cp.store(), root).await?;
-        Ok(rows
-            .into_iter()
-            .map(|t| AppOrchSummary {
-                id: t.id,
-                title: t.title,
-                status: t.status,
-                agent: t.agent,
-                result: t.result,
-            })
-            .collect())
-    }
-
-    async fn cancel_orchestration(&self, id: &str) -> anyhow::Result<u32> {
-        let cp = self.cp()?;
-        let n = crate::orch::cancel_tree(cp.store(), id).await?;
-        self.audit("app_orchestrate", "cancel").await;
-        Ok(n)
-    }
-
-    async fn retry_orchestration(&self, id: &str) -> anyhow::Result<bool> {
-        let cp = self.cp()?;
-        let ok = crate::orch::retry_task(cp.store(), id).await?;
-        self.audit("app_orchestrate", "retry").await;
-        Ok(ok)
-    }
-
     async fn list_projects(&self) -> anyhow::Result<Vec<AppProjectSummary>> {
         let cp = self.cp()?;
         Ok(cp
@@ -192,9 +151,9 @@ impl AppControl for AppControlImpl {
 
     async fn create_chat_session(&self, title: Option<String>) -> anyhow::Result<String> {
         let cp = self.cp()?;
-        // No empty-session primitive exists yet (same gap C3 hit for
-        // orchestration entry): `start_chat_session` requires a `TurnPrompt`
-        // and immediately drives one real chat-agent turn in the background.
+        // No empty-session primitive exists yet: `start_chat_session` requires
+        // a `TurnPrompt` and immediately drives one real chat-agent turn in
+        // the background.
         // Pragmatic choice: use the title (or a generic placeholder) as that
         // turn's prompt, so "create a chat" reads as "start a chat with this
         // opener" rather than blocking the whole facade on a new primitive.
@@ -221,17 +180,23 @@ mod tests {
     /// A `ControlPlane` over a fresh temp-file store, wired with the real
     /// (native) harness factory — unused by this test since `create_job`
     /// never starts a session, but keeping `Registries::default()` mirrors
-    /// `crate::orch::tests`' own `ControlPlane::new(store, regs)` pattern
-    /// rather than reaching into `crate::control::tests`'s private harness
-    /// fakes, which aren't visible from a sibling module.
+    /// `ControlPlane::new(store, regs)` pattern rather than reaching into
+    /// `crate::control::tests`'s private harness fakes, which aren't visible
+    /// from a sibling module.
     async fn test_control_plane() -> Arc<ControlPlane> {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         // Keep the backing file alive for the process; the test's OS temp
-        // dir is cleaned up on process exit either way (same shortcut
-        // `crate::orch::tests`' own harness-plumbing helper uses).
+        // dir is cleaned up on process exit either way.
         std::mem::forget(tmp);
-        ControlPlane::new(store, crate::plugins::Registries::new()).await
+        {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(
+                std::sync::Arc::clone(&store),
+            )
+            .await
+            .unwrap();
+            ControlPlane::new(store, crate::plugins::Registries::new(), persistence).await
+        }
     }
 
     #[tokio::test]
@@ -265,7 +230,6 @@ mod tests {
         let app = cp.build_app_control();
         app.list_jobs().await.unwrap();
         app.list_projects().await.unwrap();
-        app.list_orchestrations(None).await.unwrap();
         assert!(cp.store().list_audit(10).await.unwrap().is_empty());
     }
 

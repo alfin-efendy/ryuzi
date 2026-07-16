@@ -1,6 +1,7 @@
 use crate::domain::{
-    CuratorRun, Message, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn,
-    QueuedSessionPrompt, Session, SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
+    AgentIdentitySnapshot, AgentRun, AgentRunKind, AgentRunStatus, CuratorRun, Message,
+    NewAgentRun, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, QueuedSessionPrompt,
+    Session, SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -586,7 +587,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_37_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_38_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -913,6 +914,17 @@ fn migrations() -> Migrations<'static> {
             if !has_override {
                 tx.execute("ALTER TABLE jobs ADD COLUMN model_override TEXT", [])?;
             }
+            let has_origin_run_id = tx
+                .prepare("SELECT 1 FROM pragma_table_info('background_events') WHERE name='origin_run_id'")?
+                .exists([])?;
+            if !has_origin_run_id {
+                tx.execute("ALTER TABLE background_events ADD COLUMN origin_run_id TEXT", [])?;
+            }
+            tx.execute(
+                "CREATE INDEX IF NOT EXISTS idx_background_events_origin \
+                 ON background_events(origin_run_id, delivered_at)",
+                [],
+            )?;
             Ok(())
         }),
         // Migration 28 — Remote catalog cache (origin/main #113).
@@ -1070,7 +1082,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_37_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_38_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1125,7 +1137,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_37_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_38_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1252,6 +1264,56 @@ fn migrations() -> Migrations<'static> {
             CREATE INDEX IF NOT EXISTS idx_session_prompt_queue_pending \
                 ON session_prompt_queue(session_pk, status, position);",
         ),
+        // 38: session ownership and agent run history. This is deliberately
+        // appended after main's v35 queue, v36 automation history, and v37
+        // compatibility repair so both released main v37 databases and legacy
+        // Plan4 v35 databases converge without losing either feature set.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_primary_agent_id = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='primary_agent_id'")?
+                .exists([])?;
+            if !has_primary_agent_id {
+                tx.execute("ALTER TABLE sessions ADD COLUMN primary_agent_id TEXT", [])?;
+            }
+            let has_primary_agent_snapshot = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='primary_agent_snapshot'")?
+                .exists([])?;
+            if !has_primary_agent_snapshot {
+                tx.execute("ALTER TABLE sessions ADD COLUMN primary_agent_snapshot TEXT", [])?;
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_runs (\
+                   run_id TEXT PRIMARY KEY,\
+                   session_pk TEXT NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,\
+                   parent_run_id TEXT REFERENCES agent_runs(run_id),\
+                   retry_of TEXT REFERENCES agent_runs(run_id),\
+                   primary_agent_id TEXT NOT NULL,\
+                   executing_agent_id TEXT,\
+                   executing_agent_name_snapshot TEXT NOT NULL,\
+                   agent_kind TEXT NOT NULL CHECK(agent_kind IN ('primary','main-delegate','subagent')),\
+                   task TEXT NOT NULL,\
+                   status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled','interrupted')),\
+                   started_at INTEGER,\
+                   finished_at INTEGER,\
+                   tool_count INTEGER NOT NULL DEFAULT 0 CHECK(tool_count >= 0),\
+                   resolved_model TEXT,\
+                   resolved_effort TEXT,\
+                   result TEXT,\
+                   error TEXT\
+                 );\
+                 CREATE INDEX IF NOT EXISTS agent_runs_parent_idx ON agent_runs(session_pk,parent_run_id,started_at);\
+                 CREATE INDEX IF NOT EXISTS agent_runs_status_idx ON agent_runs(session_pk,status);\
+                 CREATE TABLE IF NOT EXISTS agent_run_messages (\
+                   session_pk TEXT NOT NULL,\
+                   message_seq INTEGER NOT NULL,\
+                   run_id TEXT NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,\
+                   PRIMARY KEY(session_pk,message_seq),\
+                   FOREIGN KEY(session_pk,message_seq) REFERENCES messages(session_pk,seq) ON DELETE CASCADE\
+                 );\
+                 CREATE INDEX IF NOT EXISTS agent_run_messages_run_idx ON agent_run_messages(run_id,message_seq);",
+            )?;
+            Ok(())
+        }),
     ])
 }
 
@@ -1916,15 +1978,21 @@ impl Store {
     }
 
     pub async fn insert_session(&self, s: Session) -> anyhow::Result<()> {
+        let primary_agent_snapshot = s
+            .primary_agent_snapshot
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk,primary_agent_id,primary_agent_snapshot) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
                     s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
-                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk,
+                    s.primary_agent_id, primary_agent_snapshot
                 ],
             )
         })
@@ -1940,16 +2008,22 @@ impl Store {
     ) -> anyhow::Result<()> {
         let updated_at = now_ms();
         let session_pk = s.session_pk.clone();
+        let primary_agent_snapshot = s
+            .primary_agent_snapshot
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.with_conn(move |c| {
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk,primary_agent_id,primary_agent_snapshot) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![
                     s.session_pk, s.project_id, s.agent_session_id, s.worktree_path,
                     s.branch, s.title, s.status.as_str(), s.created_at, s.last_active,
                     s.started_by, s.resume_attempts, s.branch_owned, s.perm_mode.as_str(),
-                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk
+                    s.kind.as_str(), s.speaker, s.agent, s.parent_session_pk,
+                    s.primary_agent_id, primary_agent_snapshot
                 ],
             )?;
             tx.execute(
@@ -2015,6 +2089,19 @@ impl Store {
             c.execute(
                 "UPDATE sessions SET title=?2 WHERE session_pk=?1",
                 params![pk, title],
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Clear a session title so the next completed turn generates one.
+    pub async fn clear_session_title(&self, pk: &str) -> anyhow::Result<()> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET title=NULL WHERE session_pk=?1",
+                params![pk],
             )
         })
         .await?;
@@ -2095,6 +2182,26 @@ impl Store {
                     .collect::<rusqlite::Result<Vec<_>>>();
                 rows
             }
+        })
+        .await
+    }
+
+    pub async fn list_recent_sessions_for_agent(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<Session>> {
+        let agent_id = agent_id.to_string();
+        let limit = limit.clamp(1, 50);
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLS} FROM sessions WHERE primary_agent_id=?1 \
+                 ORDER BY last_active DESC, created_at DESC, session_pk DESC LIMIT ?2"
+            ))?;
+            let rows = stmt
+                .query_map(params![agent_id, limit], row_to_session)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
         .await
     }
@@ -2549,8 +2656,7 @@ impl Store {
     /// worker/review sessions (internal delegation noise) and any hit whose
     /// lineage root is in `exclude_lineage` (the caller's own conversation),
     /// dedup remaining hits by lineage root (one hit per past conversation),
-    /// and rank interactive-origin sessions above scheduler/orch-started
-    /// ones.
+    /// and rank interactive-origin sessions above scheduled ones.
     ///
     /// `query` is always passed as a bound parameter — never interpolated
     /// into the SQL — so it cannot inject outer-SQL syntax. It IS still
@@ -2576,7 +2682,7 @@ impl Store {
                  JOIN messages m ON m.session_pk = f.session_pk AND m.seq = f.seq \
                  WHERE messages_fts MATCH ?1 \
                    AND s.kind NOT IN ('worker','review') \
-                 ORDER BY (s.started_by IN ('scheduler','orch')) ASC, \
+                 ORDER BY (s.started_by = 'scheduler') ASC, \
                           m.created_at DESC \
                  LIMIT ?2",
             )?;
@@ -3427,26 +3533,58 @@ impl Store {
         .await
     }
 
-    /// Enqueue a durable background-rail row (spec §6.1). Returns the new id.
+    /// Enqueue a durable background-rail row with no originating run. This
+    /// preserves the generic new-user-turn delivery semantics for jobs and
+    /// legacy producers.
     pub async fn enqueue_background_event(
         &self,
         target_session_pk: &str,
         kind: &str,
         payload: &str,
     ) -> anyhow::Result<String> {
+        self.enqueue_background_event_for_run(target_session_pk, None, kind, payload)
+            .await
+    }
+
+    /// Enqueue a durable background delegation outcome bound to the primary
+    /// run that dispatched it. The rail drainer attaches this to that run
+    /// instead of opening a new primary user turn.
+    pub async fn enqueue_background_delegation_event(
+        &self,
+        target_session_pk: &str,
+        origin_run_id: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
+        self.enqueue_background_event_for_run(
+            target_session_pk,
+            Some(origin_run_id),
+            crate::domain::BackgroundKind::Delegation.as_str(),
+            payload,
+        )
+        .await
+    }
+
+    async fn enqueue_background_event_for_run(
+        &self,
+        target_session_pk: &str,
+        origin_run_id: Option<&str>,
+        kind: &str,
+        payload: &str,
+    ) -> anyhow::Result<String> {
         let id = crate::paths::new_id();
-        let (id2, target, kind, payload, now) = (
+        let (id2, target, origin, kind, payload, now) = (
             id.clone(),
             target_session_pk.to_string(),
+            origin_run_id.map(str::to_string),
             kind.to_string(),
             payload.to_string(),
             crate::paths::now_ms(),
         );
         self.with_conn(move |c| {
             c.execute(
-                "INSERT INTO background_events(id, target_session_pk, kind, payload, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id2, target, kind, payload, now],
+                "INSERT INTO background_events(id, target_session_pk, origin_run_id, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id2, target, origin, kind, payload, now],
             )
             .map(|_| ())
         })
@@ -3491,18 +3629,19 @@ impl Store {
                 params![id, claimer],
             )?;
             let row = tx.query_row(
-                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                "SELECT id, target_session_pk, origin_run_id, kind, payload, created_at, claimed_by, delivered_at \
                  FROM background_events WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(crate::domain::BackgroundEvent {
                         id: r.get(0)?,
                         target_session_pk: r.get(1)?,
-                        kind: r.get(2)?,
-                        payload: r.get(3)?,
-                        created_at: r.get(4)?,
-                        claimed_by: r.get(5)?,
-                        delivered_at: r.get(6)?,
+                        origin_run_id: r.get(2)?,
+                        kind: r.get(3)?,
+                        payload: r.get(4)?,
+                        created_at: r.get(5)?,
+                        claimed_by: r.get(6)?,
+                        delivered_at: r.get(7)?,
                     })
                 },
             )?;
@@ -3545,18 +3684,19 @@ impl Store {
                 params![id, claimer],
             )?;
             let row = tx.query_row(
-                "SELECT id, target_session_pk, kind, payload, created_at, claimed_by, delivered_at \
+                "SELECT id, target_session_pk, origin_run_id, kind, payload, created_at, claimed_by, delivered_at \
                  FROM background_events WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(crate::domain::BackgroundEvent {
                         id: r.get(0)?,
                         target_session_pk: r.get(1)?,
-                        kind: r.get(2)?,
-                        payload: r.get(3)?,
-                        created_at: r.get(4)?,
-                        claimed_by: r.get(5)?,
-                        delivered_at: r.get(6)?,
+                        origin_run_id: r.get(2)?,
+                        kind: r.get(3)?,
+                        payload: r.get(4)?,
+                        created_at: r.get(5)?,
+                        claimed_by: r.get(6)?,
+                        delivered_at: r.get(7)?,
                     })
                 },
             )?;
@@ -4370,51 +4510,6 @@ impl Store {
         .await
     }
 
-    /// Record a worker child's failure and decide retry vs. give-up. Increments
-    /// `consecutive_failures`; if it stays `<= max_retries` the child re-queues
-    /// (`todo`, cleared outcome) for another attempt; otherwise the breaker
-    /// trips (`gave_up=1`, `failed`). Only affects a `running` child.
-    pub async fn record_child_failure(
-        &self,
-        id: &str,
-        max_retries: i64,
-    ) -> anyhow::Result<crate::domain::ChildFailure> {
-        let id = id.to_string();
-        let now = crate::paths::now_ms();
-        self.with_conn(move |c| {
-            let tx = c.transaction()?;
-            let n: i64 = tx
-                .query_row(
-                    "SELECT consecutive_failures FROM orch_tasks WHERE id=?1 AND status='running'",
-                    params![id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?
-                + 1;
-            let gave_up = n > max_retries;
-            if gave_up {
-                tx.execute(
-                    "UPDATE orch_tasks SET status='failed', gave_up=1, \
-                     consecutive_failures=?2, finished_at=?3 WHERE id=?1",
-                    params![id, n, now],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE orch_tasks SET status='todo', consecutive_failures=?2, \
-                     session_pk=NULL, error=NULL, result=NULL, finished_at=NULL WHERE id=?1",
-                    params![id, n],
-                )?;
-            }
-            tx.commit()?;
-            Ok(crate::domain::ChildFailure {
-                requeued: !gave_up,
-                gave_up,
-            })
-        })
-        .await
-    }
-
     /// Replace the entire cached remote catalog with `rows` in one
     /// transaction. Called after a signed feed fetch verifies successfully;
     /// an empty slice clears the cache.
@@ -4439,29 +4534,6 @@ impl Store {
                 )?;
             }
             tx.commit()
-        })
-        .await
-    }
-
-    /// The orch task whose worker (or judge) session is `session_pk`, if any.
-    /// The `orch_block` tool's runtime guard (Task E6, spec §8): a session
-    /// with no matching row here is not an orchestrated worker turn, so the
-    /// tool refuses regardless of what the schema-level gate advertised.
-    pub async fn task_by_session(
-        &self,
-        session_pk: &str,
-    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
-        let session_pk = session_pk.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!(
-                    "SELECT {} FROM orch_tasks WHERE session_pk=?1",
-                    crate::orch::ORCH_COLS
-                ),
-                params![session_pk],
-                crate::orch::task_from,
-            )
-            .optional()
         })
         .await
     }
@@ -4517,44 +4589,6 @@ impl Store {
                 },
             )
             .optional()
-        })
-        .await
-    }
-
-    /// A non-terminal root bound to `home_session_pk` (the live orchestration a
-    /// typed steer targets), if any.
-    pub async fn live_root_for_home(
-        &self,
-        home_session_pk: &str,
-    ) -> anyhow::Result<Option<crate::orch::OrchTask>> {
-        let home = home_session_pk.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!(
-                    "SELECT {} FROM orch_tasks WHERE root_id IS NULL AND home_session_pk=?1 \
-                     AND status IN ('decomposing','waiting','judging') ORDER BY created_at DESC LIMIT 1",
-                    crate::orch::ORCH_COLS
-                ),
-                params![home],
-                crate::orch::task_from,
-            )
-            .optional()
-        })
-        .await
-    }
-
-    /// Append a mid-run user directive to a root's steer note (newline-joined).
-    pub async fn append_steer_note(&self, root_id: &str, text: &str) -> anyhow::Result<()> {
-        let (root_id, text) = (root_id.to_string(), text.to_string());
-        self.with_conn(move |c| {
-            c.execute(
-                "UPDATE orch_tasks SET steer_note = \
-                   CASE WHEN steer_note IS NULL OR steer_note='' THEN ?2 \
-                        ELSE steer_note || char(10) || ?2 END \
-                 WHERE id=?1 AND root_id IS NULL",
-                params![root_id, text],
-            )
-            .map(|_| ())
         })
         .await
     }
@@ -4676,6 +4710,247 @@ impl Store {
         .await
     }
 
+    pub async fn insert_primary_agent_run(&self, run: NewAgentRun) -> anyhow::Result<AgentRun> {
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            validate_agent_run(&tx, &run, true)?;
+            let stored = insert_agent_run_row(&tx, run)?;
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+    }
+
+    pub async fn insert_agent_run(&self, run: NewAgentRun) -> anyhow::Result<AgentRun> {
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            validate_agent_run(&tx, &run, false)?;
+            let stored = insert_agent_run_row(&tx, run)?;
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+    }
+
+    pub async fn insert_owned_session_with_primary_run(
+        &self,
+        mut session: Session,
+        identity: AgentIdentitySnapshot,
+        run: NewAgentRun,
+    ) -> anyhow::Result<AgentRun> {
+        if session.session_pk != run.session_pk
+            || run.agent_kind != AgentRunKind::Primary
+            || run.parent_run_id.is_some()
+            || run.retry_of.is_some()
+            || run.primary_agent_id != identity.id
+            || run.executing_agent_id.as_deref() != Some(identity.id.as_str())
+        {
+            anyhow::bail!("owned session and primary run do not form a valid root");
+        }
+        session.primary_agent_id = Some(identity.id.clone());
+        session.primary_agent_snapshot = Some(identity);
+        let primary_agent_snapshot = session
+            .primary_agent_snapshot
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO sessions(session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk,primary_agent_id,primary_agent_snapshot) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                params![
+                    session.session_pk, session.project_id, session.agent_session_id,
+                    session.worktree_path, session.branch, session.title, session.status.as_str(),
+                    session.created_at, session.last_active, session.started_by,
+                    session.resume_attempts, session.branch_owned, session.perm_mode.as_str(),
+                    session.kind.as_str(), session.speaker, session.agent, session.parent_session_pk,
+                    session.primary_agent_id, primary_agent_snapshot
+                ],
+            )?;
+            validate_agent_run(&tx, &run, true)?;
+            let stored = insert_agent_run_row(&tx, run)?;
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+    }
+
+    pub async fn get_agent_run(&self, run_id: &str) -> anyhow::Result<Option<AgentRun>> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE run_id=?1",
+                params![run_id],
+                row_to_agent_run,
+            ).optional()
+        }).await
+    }
+
+    pub async fn list_session_agent_runs(&self, session_pk: &str) -> anyhow::Result<Vec<AgentRun>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare("SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE session_pk=?1 ORDER BY rowid")?;
+            let rows = stmt
+                .query_map(params![session_pk], row_to_agent_run)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }).await
+    }
+
+    pub async fn root_agent_run_id(&self, run_id: &str) -> anyhow::Result<Option<String>> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "WITH RECURSIVE ancestors(run_id, parent_run_id) AS (SELECT run_id, parent_run_id FROM agent_runs WHERE run_id=?1 UNION ALL SELECT parent.run_id, parent.parent_run_id FROM agent_runs parent JOIN ancestors child ON child.parent_run_id=parent.run_id) SELECT run_id FROM ancestors WHERE parent_run_id IS NULL LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_descendant_agent_runs(
+        &self,
+        root_run_id: &str,
+    ) -> anyhow::Result<Vec<AgentRun>> {
+        let root_run_id = root_run_id.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare("WITH RECURSIVE descendants AS (SELECT * FROM agent_runs WHERE parent_run_id=?1 UNION ALL SELECT child.* FROM agent_runs child JOIN descendants parent ON child.parent_run_id=parent.run_id) SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM descendants ORDER BY started_at, run_id")?;
+            let rows = stmt
+                .query_map(params![root_run_id], row_to_agent_run)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }).await
+    }
+
+    pub async fn transition_agent_run(
+        &self,
+        run_id: &str,
+        allowed_from: &[AgentRunStatus],
+        to: AgentRunStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let run_id = run_id.to_string();
+        let allowed_from = allowed_from
+            .iter()
+            .map(|status| status.as_db().to_string())
+            .collect::<Vec<_>>();
+        let result = result.map(str::to_string);
+        let error = error.map(str::to_string);
+        let at = now_ms();
+        self.with_conn(move |c| {
+            let mut conditions = String::from("status IN (");
+            conditions.push_str(&std::iter::repeat_n("?", allowed_from.len()).collect::<Vec<_>>().join(","));
+            conditions.push_str(") AND status NOT IN ('completed','failed','cancelled','interrupted')");
+            let mut params = vec![
+                rusqlite::types::Value::Text(to.as_db().to_string()),
+                rusqlite::types::Value::Integer(at),
+                rusqlite::types::Value::Integer(to.is_terminal().into()),
+                result.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text),
+                error.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text),
+                rusqlite::types::Value::Text(run_id),
+            ];
+            params.extend(allowed_from.into_iter().map(rusqlite::types::Value::Text));
+            c.execute(
+                &format!(
+                    "UPDATE agent_runs SET status=?1, started_at=CASE WHEN ?1='running' AND started_at IS NULL THEN ?2 ELSE started_at END, finished_at=CASE WHEN ?3=1 AND finished_at IS NULL THEN ?2 ELSE finished_at END, result=?4, error=?5 WHERE run_id=?6 AND {conditions}"
+                ),
+                rusqlite::params_from_iter(params),
+            )
+            .map(|updated| updated == 1)
+        })
+        .await
+    }
+
+    pub async fn increment_agent_run_tool_count(&self, run_id: &str) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            if c.execute(
+                "UPDATE agent_runs SET tool_count=tool_count+1 WHERE run_id=?1",
+                params![run_id],
+            )? == 0
+            {
+                return Err(to_sql_json_error("unknown agent run"));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn interrupt_incomplete_agent_runs(
+        &self,
+        reason: &str,
+    ) -> anyhow::Result<Vec<AgentRun>> {
+        let reason = reason.to_string();
+        let at = now_ms();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let mut stmt = tx.prepare(
+                "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE status IN ('queued','running') ORDER BY rowid",
+            )?;
+            let mut runs = stmt
+                .query_map([], row_to_agent_run)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            tx.execute(
+                "UPDATE agent_runs SET status='interrupted', finished_at=?1, error=?2 WHERE status IN ('queued','running')",
+                params![at, reason.clone()],
+            )?;
+            for run in &mut runs {
+                run.status = AgentRunStatus::Interrupted;
+                run.finished_at = Some(at);
+                run.error = Some(reason.clone());
+            }
+            tx.commit()?;
+            Ok(runs)
+        })
+        .await
+    }
+
+    pub async fn insert_run_message(
+        &self,
+        run_id: &str,
+        message: NewMessage,
+    ) -> anyhow::Result<i64> {
+        let run_id = run_id.to_string();
+        let payload = serde_json::to_string(&message.payload)?;
+        let created = now_ms();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let session_pk: String = tx.query_row("SELECT session_pk FROM agent_runs WHERE run_id=?1", params![run_id], |r| r.get(0))?;
+            if session_pk != message.session_pk {
+                return Err(to_sql_json_error("run and message sessions differ"));
+            }
+            let seq = tx.query_row(
+                "INSERT INTO messages(session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker) SELECT ?1,COALESCE(MAX(seq),0)+1,?2,?3,?4,?5,?6,?7,?8,?9 FROM messages WHERE session_pk=?1 RETURNING seq",
+                params![message.session_pk, message.role, message.block_type, payload, message.tool_call_id, message.status, message.tool_kind, created, message.speaker],
+                |r| r.get::<_, i64>(0),
+            )?;
+            tx.execute("INSERT INTO agent_run_messages(session_pk,message_seq,run_id) VALUES (?1,?2,?3)", params![session_pk, seq, run_id])?;
+            tx.commit()?;
+            Ok(seq)
+        }).await
+    }
+
+    pub async fn list_run_messages(
+        &self,
+        session_pk: &str,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<Message>> {
+        let session_pk = session_pk.to_string();
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare("SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker FROM messages m JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq WHERE rm.session_pk=?1 AND rm.run_id=?2 ORDER BY m.seq")?;
+            let rows = stmt
+                .query_map(params![session_pk, run_id], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }).await
+    }
+
     /// Atomically consume a pairing code: deletes it iff it exists and has
     /// not expired, returning whether it was consumed. A code can only ever
     /// be consumed once (the row is gone after the first success).
@@ -4693,14 +4968,127 @@ impl Store {
     }
 }
 
+fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
+    let tool_count: i64 = r.get(12)?;
+    Ok(AgentRun {
+        run_id: r.get(0)?,
+        session_pk: r.get(1)?,
+        parent_run_id: r.get(2)?,
+        retry_of: r.get(3)?,
+        primary_agent_id: r.get(4)?,
+        executing_agent_id: r.get(5)?,
+        executing_agent_name_snapshot: r.get(6)?,
+        agent_kind: AgentRunKind::from_db(&r.get::<_, String>(7)?)?,
+        task: r.get(8)?,
+        status: AgentRunStatus::from_db(&r.get::<_, String>(9)?)?,
+        started_at: r.get(10)?,
+        finished_at: r.get(11)?,
+        tool_count: u32::try_from(tool_count).map_err(to_sql_json_error)?,
+        resolved_model: r.get(13)?,
+        resolved_effort: r.get(14)?,
+        result: r.get(15)?,
+        error: r.get(16)?,
+    })
+}
+
+fn insert_agent_run_row(
+    tx: &rusqlite::Transaction<'_>,
+    run: NewAgentRun,
+) -> rusqlite::Result<AgentRun> {
+    tx.execute(
+        "INSERT INTO agent_runs(run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,resolved_model,resolved_effort) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![run.run_id, run.session_pk, run.parent_run_id, run.retry_of, run.primary_agent_id, run.executing_agent_id, run.executing_agent_name_snapshot, run.agent_kind.as_db(), run.task, run.status.as_db(), run.resolved_model, run.resolved_effort],
+    )?;
+    tx.query_row(
+        "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE run_id=?1",
+        params![run.run_id],
+        row_to_agent_run,
+    )
+}
+
+fn validate_agent_run(
+    tx: &rusqlite::Transaction<'_>,
+    run: &NewAgentRun,
+    root: bool,
+) -> rusqlite::Result<()> {
+    if root {
+        if run.agent_kind != AgentRunKind::Primary
+            || run.parent_run_id.is_some()
+            || run.retry_of.is_some()
+        {
+            return Err(to_sql_json_error(
+                "a primary agent run must be a parentless, non-retry root",
+            ));
+        }
+        return Ok(());
+    }
+    if run.agent_kind == AgentRunKind::Primary || run.parent_run_id.is_none() {
+        return Err(to_sql_json_error(
+            "only a root primary run may be parentless",
+        ));
+    }
+    let parent = tx.query_row(
+        "SELECT session_pk,primary_agent_id FROM agent_runs WHERE run_id=?1",
+        params![run.parent_run_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    if parent.0 != run.session_pk || parent.1 != run.primary_agent_id {
+        return Err(to_sql_json_error(
+            "agent run parent belongs to another root",
+        ));
+    }
+    if let Some(retry_of) = &run.retry_of {
+        let retry = tx.query_row(
+            "SELECT session_pk,parent_run_id,primary_agent_id FROM agent_runs WHERE run_id=?1",
+            params![retry_of],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if retry.0 != run.session_pk
+            || retry.1 != run.parent_run_id
+            || retry.2 != run.primary_agent_id
+        {
+            return Err(to_sql_json_error("agent run retry belongs to another tree"));
+        }
+    }
+    Ok(())
+}
+
+fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
+    let payload: String = r.get(4)?;
+    Ok(Message {
+        session_pk: r.get(0)?,
+        seq: r.get(1)?,
+        role: r.get(2)?,
+        block_type: r.get(3)?,
+        payload: serde_json::from_str(&payload).map_err(|error| from_sql_json_error(4, error))?,
+        tool_call_id: r.get(5)?,
+        status: r.get(6)?,
+        tool_kind: r.get(7)?,
+        created_at: r.get(8)?,
+        speaker: r.get(9)?,
+    })
+}
+
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk,primary_agent_id,primary_agent_snapshot";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
+    let snapshot: Option<String> = r.get(18)?;
+    let primary_agent_snapshot = snapshot
+        .map(|raw| serde_json::from_str(&raw).map_err(to_sql_json_error))
+        .transpose()?;
     let status: String = r.get(6)?;
     let kind: String = r.get(13)?;
     Ok(Session {
         session_pk: r.get(0)?,
+        primary_agent_id: r.get(17)?,
+        primary_agent_snapshot,
         project_id: r.get(1)?,
         agent_session_id: r.get(2)?,
         worktree_path: r.get(3)?,
@@ -4810,6 +5198,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_38_adds_ownership_schema_to_main_v37_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE sessions (session_pk TEXT PRIMARY KEY);
+                 CREATE TABLE messages (
+                    session_pk TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    PRIMARY KEY(session_pk, seq)
+                 );
+                 CREATE TABLE session_prompt_queue (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_pk TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','claimed')) DEFAULT 'pending',
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(session_pk, position)
+                 );
+                 CREATE INDEX idx_session_prompt_queue_pending
+                    ON session_prompt_queue(session_pk, status, position);
+                 INSERT INTO session_prompt_queue(id, session_pk, position, payload, created_at)
+                    VALUES ('queued', 'main-v37', 1, '{\"text\":\"preserve queue\"}', 1);
+                 CREATE TABLE automation_hooks (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    trigger_kind TEXT NOT NULL,
+                    action_kind TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    inbound_path TEXT UNIQUE,
+                    config_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO automation_hooks(id, name, trigger_kind, action_kind, config_json, created_at, updated_at)
+                    VALUES ('hook', 'Preserve hook', 'schedule', 'session', '{}', 1, 1);
+                 CREATE TABLE automation_hook_runs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    hook_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    session_pk TEXT,
+                    error TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_http_status INTEGER,
+                    queued_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    finished_at INTEGER
+                 );
+                 INSERT INTO automation_hook_runs(id, hook_id, status, envelope_json, snapshot_json, queued_at)
+                    VALUES ('run', 'hook', 'completed', '{}', '{}', 1);
+                 CREATE INDEX idx_automation_hook_runs_hook
+                    ON automation_hook_runs(hook_id, queued_at DESC);
+                 CREATE TABLE automation_hook_attempts (
+                    run_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER,
+                    http_status INTEGER,
+                    error TEXT,
+                    PRIMARY KEY(run_id, ordinal),
+                    FOREIGN KEY(run_id) REFERENCES automation_hook_runs(id)
+                 );
+                 INSERT INTO automation_hook_attempts(run_id, ordinal, started_at)
+                    VALUES ('run', 1, 1);
+                 CREATE TABLE session_automation_origins (
+                    session_pk TEXT PRIMARY KEY NOT NULL,
+                    kind TEXT NOT NULL,
+                    hook_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    depth INTEGER NOT NULL
+                 );
+                 INSERT INTO session_automation_origins(session_pk, kind, hook_id, run_id, depth)
+                    VALUES ('main-v37', 'hook', 'hook', 'run', 0);
+                 PRAGMA user_version=37;",
+            )
+            .unwrap();
+        }
+
+        type PreservedRowCounts = (i64, i64, i64, i64, i64);
+        type Migration38Snapshot = (i64, Vec<String>, Vec<String>, PreservedRowCounts);
+
+        let upgraded = Store::open(tmp.path()).await.unwrap();
+        let (user_version, ownership_columns, agent_run_tables, preserved_rows): Migration38Snapshot = upgraded
+            .with_conn(|c| {
+                let ownership_columns = c
+                    .prepare("SELECT name FROM pragma_table_info('sessions') WHERE name LIKE 'primary_agent_%' ORDER BY name")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let agent_run_tables = c
+                    .prepare(
+                        "SELECT name FROM sqlite_master \n                         WHERE type='table' AND name IN ('agent_runs', 'agent_run_messages') \n                         ORDER BY name",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((
+                    c.query_row("PRAGMA user_version", [], |row| row.get(0))?,
+                    ownership_columns,
+                    agent_run_tables,
+                    (
+                        c.query_row("SELECT COUNT(*) FROM session_prompt_queue", [], |row| row.get(0))?,
+                        c.query_row("SELECT COUNT(*) FROM automation_hooks", [], |row| row.get(0))?,
+                        c.query_row("SELECT COUNT(*) FROM automation_hook_runs", [], |row| row.get(0))?,
+                        c.query_row("SELECT COUNT(*) FROM automation_hook_attempts", [], |row| row.get(0))?,
+                        c.query_row("SELECT COUNT(*) FROM session_automation_origins", [], |row| row.get(0))?,
+                    ),
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(user_version, 38);
+        assert_eq!(
+            ownership_columns,
+            ["primary_agent_id", "primary_agent_snapshot"]
+        );
+        assert_eq!(agent_run_tables, ["agent_run_messages", "agent_runs"]);
+        assert_eq!(preserved_rows, (1, 1, 1, 1, 1));
+    }
+
+    #[tokio::test]
     async fn migration_37_repairs_feature_branch_v36_missing_session_prompt_queue() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -4846,7 +5358,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 37);
+        assert_eq!(user_version, 38);
     }
 
     #[tokio::test]
@@ -4963,6 +5475,8 @@ mod tests {
     fn sample_session() -> Session {
         Session {
             session_pk: "s1".into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: Some("p1".into()),
             agent_session_id: None,
             worktree_path: Some("/tmp/wt".into()),
@@ -5419,58 +5933,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A store with one `waiting` root and one `running` child (`ot-child`) —
-    /// just enough orch-task graph for the circuit-breaker test below. Raw
-    /// SQL rather than `orch::insert_root`/`insert_children`: those mint
-    /// random ids, and this test needs a stable id to fail repeatedly.
-    async fn orch_test_store() -> Store {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        std::mem::forget(tmp);
-        store
-            .with_conn(|c| {
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
-                     VALUES ('ot-root', NULL, 'p1', 'goal', 'do it', '', 'waiting', 1)",
-                    [],
-                )?;
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, agent, status, created_at) \
-                     VALUES ('ot-child', 'ot-root', 'p1', 'child', 'do child', '', 'running', 2)",
-                    [],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        store
-    }
-
-    #[tokio::test]
-    async fn record_child_failure_requeues_then_trips_the_breaker() {
-        let store = orch_test_store().await;
-        let child = "ot-child";
-        // First two failures re-queue for retry.
-        let a = store.record_child_failure(child, 2).await.unwrap();
-        assert!(a.requeued && !a.gave_up);
-        // Re-mark running to model the retry attempt, then fail again.
-        crate::orch::set_status(&store, child, "todo", "running")
-            .await
-            .unwrap();
-        let b = store.record_child_failure(child, 2).await.unwrap();
-        assert!(b.requeued && !b.gave_up);
-        crate::orch::set_status(&store, child, "todo", "running")
-            .await
-            .unwrap();
-        // Third failure trips the breaker.
-        let c = store.record_child_failure(child, 2).await.unwrap();
-        assert!(!c.requeued && c.gave_up);
-        let t = crate::orch::get_task(&store, child).await.unwrap().unwrap();
-        assert_eq!(t.status, "failed");
-        assert!(t.gave_up);
-        assert_eq!(t.consecutive_failures, 3);
-    }
-
     #[tokio::test]
     async fn migration_adds_sessions_branch_owned_defaulting_to_owned() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -5644,6 +6106,8 @@ mod tests {
         store
             .insert_session(crate::domain::Session {
                 session_pk: "chat-1".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -5988,42 +6452,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project_id, "p2");
         assert_eq!(rows[0].decision, "rejectAlways");
-    }
-
-    #[tokio::test]
-    async fn record_audit_writes_rows_read_back_newest_first() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store
-            .record_audit(
-                WriteOrigin::Agent,
-                Some("sess-1"),
-                "app_jobs",
-                "create",
-                "allow",
-            )
-            .await
-            .unwrap();
-        store
-            .record_audit(
-                WriteOrigin::Agent,
-                Some("sess-1"),
-                "app_orchestrate",
-                "submit",
-                "allow",
-            )
-            .await
-            .unwrap();
-        let rows = store.list_audit(10).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        // Newest first.
-        assert_eq!(rows[0].tool, "app_orchestrate");
-        assert_eq!(rows[0].action, "submit");
-        assert_eq!(rows[0].origin, "agent");
-        assert_eq!(rows[0].session_pk.as_deref(), Some("sess-1"));
-        assert_eq!(rows[1].tool, "app_jobs");
-        // Limit is honored.
-        assert_eq!(store.list_audit(1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -6631,34 +7059,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 37, "forward migration must land at v37");
-    }
-
-    #[tokio::test]
-    async fn migration_29_adds_speaker_and_orch_group_chat_columns() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        // A speaker-labeled display row round-trips.
-        store
-            .insert_message(crate::domain::NewMessage::speaker_block(
-                "s1",
-                "build",
-                "text",
-                serde_json::json!({ "text": "worker report" }),
-            ))
-            .await
-            .unwrap();
-        let rows = store.list_messages("s1").await.unwrap();
-        assert_eq!(rows[0].speaker.as_deref(), Some("build"));
-        // A root task records its home chat + starts un-broken.
-        let root = crate::orch::insert_root(&store, "p1", "goal", "waiting", Some("home-1"))
-            .await
-            .unwrap();
-        let t = crate::orch::get_task(&store, &root).await.unwrap().unwrap();
-        assert_eq!(t.home_session_pk.as_deref(), Some("home-1"));
-        assert_eq!(t.consecutive_failures, 0);
-        assert!(!t.gave_up);
-        assert_eq!(t.steer_note, None);
+        assert_eq!(user_version, 38, "forward migration must land at v38");
     }
 
     #[tokio::test]
@@ -6677,6 +7078,303 @@ mod tests {
             .unwrap();
         assert!(cols.iter().any(|c| c == "session_pk"), "cols: {cols:?}");
         assert!(cols.iter().any(|c| c == "origin"), "cols: {cols:?}");
+    }
+
+    #[tokio::test]
+    async fn insert_primary_agent_run_rejects_non_primary_and_non_root_shapes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        let valid_root = NewAgentRun {
+            run_id: "root".into(),
+            session_pk: "s1".into(),
+            parent_run_id: None,
+            retry_of: None,
+            primary_agent_id: "ada".into(),
+            executing_agent_id: Some("ada".into()),
+            executing_agent_name_snapshot: "Ada".into(),
+            agent_kind: AgentRunKind::Primary,
+            task: "root".into(),
+            status: AgentRunStatus::Queued,
+            resolved_model: None,
+            resolved_effort: None,
+        };
+        for (run_id, agent_kind, parent_run_id, retry_of) in [
+            ("delegate", AgentRunKind::MainDelegate, None, None),
+            ("parented", AgentRunKind::Primary, Some("root".into()), None),
+            ("retry", AgentRunKind::Primary, None, Some("root".into())),
+        ] {
+            let mut invalid = valid_root.clone();
+            invalid.run_id = run_id.into();
+            invalid.agent_kind = agent_kind;
+            invalid.parent_run_id = parent_run_id;
+            invalid.retry_of = retry_of;
+            assert!(
+                store.insert_primary_agent_run(invalid).await.is_err(),
+                "{run_id} must not be accepted as a primary root"
+            );
+        }
+        assert!(store.insert_primary_agent_run(valid_root).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn agentic_session_migration_preserves_legacy_history_and_run_tree() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.insert_project(sample_project()).await.unwrap();
+            store.insert_session(sample_session()).await.unwrap();
+            store
+                .with_conn(|c| c.pragma_update(None, "user_version", 34))
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let legacy = store.get_session("s1").await.unwrap().unwrap();
+        assert_eq!(legacy.primary_agent_id, None);
+        assert_eq!(legacy.primary_agent_snapshot, None);
+
+        let identity = AgentIdentitySnapshot {
+            id: "ada".into(),
+            name: "Ada at creation".into(),
+            avatar_color: "violet".into(),
+        };
+        let mut owned = sample_session();
+        owned.session_pk = "owned".into();
+        let root = NewAgentRun {
+            run_id: "root".into(),
+            session_pk: "owned".into(),
+            parent_run_id: None,
+            retry_of: None,
+            primary_agent_id: "ada".into(),
+            executing_agent_id: Some("ada".into()),
+            executing_agent_name_snapshot: "Ada".into(),
+            agent_kind: AgentRunKind::Primary,
+            task: "ship it".into(),
+            status: AgentRunStatus::Queued,
+            resolved_model: Some("anthropic/claude-opus-4-8".into()),
+            resolved_effort: Some("high".into()),
+        };
+        store
+            .insert_owned_session_with_primary_run(owned, identity.clone(), root)
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let owned = store.get_session("owned").await.unwrap().unwrap();
+        assert_eq!(owned.primary_agent_id.as_deref(), Some("ada"));
+        assert_eq!(owned.primary_agent_snapshot, Some(identity));
+        assert_eq!(
+            store
+                .get_agent_run("root")
+                .await
+                .unwrap()
+                .unwrap()
+                .executing_agent_name_snapshot,
+            "Ada"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_primary_agent_snapshot_errors_on_read() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE sessions SET primary_agent_id='ada', primary_agent_snapshot='{not json' WHERE session_pk='s1'",
+                    [],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        assert!(store.get_session("s1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn agentic_session_migration_upgrades_a_fresh_v34_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE sessions (
+                    session_pk TEXT PRIMARY KEY,
+                    project_id TEXT,
+                    agent_session_id TEXT,
+                    worktree_path TEXT,
+                    branch TEXT,
+                    title TEXT,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    created_at INTEGER,
+                    last_active INTEGER,
+                    started_by TEXT,
+                    resume_attempts INTEGER NOT NULL DEFAULT 0,
+                    branch_owned INTEGER NOT NULL DEFAULT 1,
+                    perm_mode TEXT NOT NULL DEFAULT 'default',
+                    kind TEXT NOT NULL DEFAULT 'project',
+                    speaker TEXT,
+                    agent TEXT,
+                    parent_session_pk TEXT
+                 );
+                 CREATE TABLE messages (
+                    session_pk TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    block_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    tool_call_id TEXT,
+                    status TEXT,
+                    tool_kind TEXT,
+                    created_at INTEGER NOT NULL,
+                    speaker TEXT,
+                    PRIMARY KEY (session_pk, seq)
+                 );
+                 INSERT INTO sessions (session_pk) VALUES ('legacy');
+                 PRAGMA user_version = 34;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let legacy = store.get_session("legacy").await.unwrap().unwrap();
+        assert_eq!(legacy.primary_agent_id, None);
+        assert_eq!(legacy.primary_agent_snapshot, None);
+        let has_agent_runs: bool = store
+            .with_conn(|c| {
+                c.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'")?
+                    .exists([])
+            })
+            .await
+            .unwrap();
+        assert!(has_agent_runs);
+    }
+
+    #[tokio::test]
+    async fn agent_runs_validate_tree_transition_and_message_ownership() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_project(sample_project()).await.unwrap();
+        let identity = AgentIdentitySnapshot {
+            id: "ada".into(),
+            name: "Ada".into(),
+            avatar_color: "violet".into(),
+        };
+        let root = NewAgentRun {
+            run_id: "root".into(),
+            session_pk: "owned".into(),
+            parent_run_id: None,
+            retry_of: None,
+            primary_agent_id: "ada".into(),
+            executing_agent_id: Some("ada".into()),
+            executing_agent_name_snapshot: "Ada".into(),
+            agent_kind: AgentRunKind::Primary,
+            task: "ship it".into(),
+            status: AgentRunStatus::Queued,
+            resolved_model: None,
+            resolved_effort: None,
+        };
+        let mut session = sample_session();
+        session.session_pk = "owned".into();
+        store
+            .insert_owned_session_with_primary_run(session, identity, root)
+            .await
+            .unwrap();
+
+        let child = NewAgentRun {
+            run_id: "child".into(),
+            session_pk: "owned".into(),
+            parent_run_id: Some("root".into()),
+            retry_of: None,
+            primary_agent_id: "ada".into(),
+            executing_agent_id: Some("delegate".into()),
+            executing_agent_name_snapshot: "Delegate".into(),
+            agent_kind: AgentRunKind::MainDelegate,
+            task: "delegate it".into(),
+            status: AgentRunStatus::Queued,
+            resolved_model: None,
+            resolved_effort: None,
+        };
+        store.insert_agent_run(child).await.unwrap();
+        assert_eq!(
+            store
+                .list_descendant_agent_runs("root")
+                .await
+                .unwrap()
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child"]
+        );
+        assert!(store
+            .transition_agent_run(
+                "child",
+                &[AgentRunStatus::Queued],
+                AgentRunStatus::Running,
+                None,
+                None,
+            )
+            .await
+            .unwrap());
+        assert!(store
+            .transition_agent_run(
+                "child",
+                &[AgentRunStatus::Running],
+                AgentRunStatus::Completed,
+                Some("done"),
+                None,
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .transition_agent_run(
+                "child",
+                &[AgentRunStatus::Completed],
+                AgentRunStatus::Running,
+                None,
+                None,
+            )
+            .await
+            .unwrap());
+        let child = store.get_agent_run("child").await.unwrap().unwrap();
+        assert!(child.started_at.is_some());
+        assert!(child.finished_at.is_some());
+        assert_eq!(child.result.as_deref(), Some("done"));
+
+        let seq = store
+            .insert_run_message(
+                "child",
+                NewMessage::block(
+                    "owned",
+                    "assistant",
+                    "text",
+                    serde_json::json!({"text": "done"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(
+            store.list_run_messages("owned", "child").await.unwrap()[0].payload["text"],
+            "done"
+        );
+        assert!(store
+            .insert_run_message(
+                "child",
+                NewMessage::block(
+                    "wrong",
+                    "assistant",
+                    "text",
+                    serde_json::json!({"text": "wrong"})
+                ),
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -6848,7 +7546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_37_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_38_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -6869,21 +7567,22 @@ mod tests {
         // 29 messages.speaker + orch_tasks home/breaker/steer columns;
         // 30 audit.session_pk + audit.origin;
         // 31 plugin_catalog_cache + catalog_feed_state;
-        // 34 agent_learning_state + agent_learning_queue; 35 session_prompt_queue;
-        // 36 automation hooks/runs/attempts; 37 session_automation_origins and
-        // a compatibility queue repair all use convergent, existence-guarded DDL,
-        // so every migration through the latest version re-runs safely on the
-        // next open.
+        // 34 agent_learning_state + agent_learning_queue — CREATE TABLE
+        // IF NOT EXISTS; 35 session_prompt_queue; 36 automation hooks/runs/
+        // attempts; 37 session_automation_origins plus compatibility queue
+        // repair; 38 session ownership and agent runs — all convergent,
+        // existence-guarded, or CREATE TABLE IF NOT EXISTS)
+        // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 37
-        // defined, wind back twenty-five.
+        // this test starts failing its assertions). With migrations through 38
+        // defined, wind back twenty-six.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 25)
+            c.pragma_update(None, "user_version", v - 26)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -6938,12 +7637,15 @@ mod tests {
 
     #[tokio::test]
     async fn migration_21_drops_the_runtime_concept() {
-        // Set user_version to the exact predecessor so migration 21 (and the
-        // later migrations) replay against it without depending on the number
-        // of migrations currently at the tail.
+        // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
+        // wind user_version back fifteen, and reopen so 21 (and the tail
+        // migrations 22–38) replay against it. Back EIGHTEEN: the fully
+        // migrated tail is now v38, so rewinding to v20 is what makes
+        // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
-            c.pragma_update(None, "user_version", 20)
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            c.pragma_update(None, "user_version", v - 18)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -7081,7 +7783,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 37, "forward migration must land at v37");
+        assert_eq!(uv, 38, "forward migration must land at v38");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -7107,7 +7809,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 37, "forward migration must land at v37");
+        assert_eq!(uv, 38, "forward migration must land at v38");
         assert!(has_fts && has_usage && has_cstate && has_cruns);
     }
 
@@ -7165,6 +7867,8 @@ mod tests {
     ) -> crate::domain::Session {
         crate::domain::Session {
             session_pk: pk.into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: None,
             agent_session_id: None,
             worktree_path: None,
@@ -7755,6 +8459,8 @@ mod tests {
         // An IDLE target and a RUNNING target.
         let mk = |pk: &str, status: crate::domain::SessionStatus| crate::domain::Session {
             session_pk: pk.into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
             project_id: None,
             agent_session_id: None,
             worktree_path: None,
@@ -7835,6 +8541,8 @@ mod tests {
         store
             .insert_session(crate::domain::Session {
                 session_pk: "idle-1".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -8444,6 +9152,8 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -8514,6 +9224,8 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,

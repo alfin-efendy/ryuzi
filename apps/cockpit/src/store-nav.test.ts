@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHistory, type View } from "./store-nav";
+import { goBackHistory, goForwardHistory, navigateHistory, useNav, type NavHistory, type View, choosePrimaryAgent } from "./store-nav";
+import type { AgentSummaryInfo } from "./bindings";
 
 const home: View = { kind: "home" };
 const models: View = { kind: "models" };
@@ -85,12 +86,12 @@ test("readClampedPanelSize parses, defaults, and clamps a persisted size to the 
   expect(readClampedPanelSize("2000", 900, BOTTOM_HEIGHT)).toBe(540); // 60% of 900
 });
 
-test("composer nav keeps durable chat-only model and effort state", () => {
+test("composer nav omits obsolete chat-only model and effort state", () => {
   const nav = useNav.getState() as unknown as Record<string, unknown>;
-  expect(nav.composerModel).toBeNull();
-  expect(typeof nav.setComposerModel).toBe("function");
-  expect(nav.composerEffort).toBeNull();
-  expect(typeof nav.setComposerEffort).toBe("function");
+  expect(nav.composerModel).toBeUndefined();
+  expect(nav.setComposerModel).toBeUndefined();
+  expect(nav.composerEffort).toBeUndefined();
+  expect(nav.setComposerEffort).toBeUndefined();
 });
 
 test("composer git controls default to worktree ON, no branch until the list loads", () => {
@@ -179,6 +180,29 @@ test("openAgentChat records the primary agent and opens New session", () => {
   expect(useNav.getState().history.back).toEqual([{ kind: "agents" }]);
 });
 
+test("choosePrimaryAgent prefers requested, then stored, default, then first executable", () => {
+  const agent = (id: string, executable = true): AgentSummaryInfo => ({
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  });
+  const agents = [agent("invalid", false), agent("first"), agent("default"), agent("stored"), agent("requested")];
+
+  expect(choosePrimaryAgent(agents, "requested", "stored", "default")).toBe("requested");
+  expect(choosePrimaryAgent(agents, "missing", "stored", "default")).toBe("stored");
+  expect(choosePrimaryAgent(agents, "missing", "missing", "default")).toBe("default");
+  expect(choosePrimaryAgent(agents, "missing", "missing", "missing")).toBe("first");
+  expect(choosePrimaryAgent([agent("invalid", false)], null, null, null)).toBeNull();
+});
 test("consumePendingPrimaryAgentId is a one-shot handoff", () => {
   useNav.setState({ pendingPrimaryAgentId: "reviewer" });
   expect(useNav.getState().consumePendingPrimaryAgentId()).toBe("reviewer");

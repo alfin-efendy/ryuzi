@@ -10,6 +10,7 @@ import type {
   CmdError,
   Result,
   SelectableModelInfo,
+  Session,
 } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -114,6 +115,7 @@ const deleteAgent = spyOn(commands, "deleteAgent");
 const setDefaultAgent = spyOn(commands, "setDefaultAgent");
 const updateSubagentModel = spyOn(commands, "updateSubagentModel");
 const listSelectableModels = spyOn(commands, "listSelectableModels");
+const listAgentSessions = spyOn(commands, "listAgentSessions");
 
 const resetCommandMocks = () => {
   listAgents.mockImplementation(async () => ok(registry()));
@@ -131,6 +133,7 @@ const resetCommandMocks = () => {
     });
   });
   updateSubagentModel.mockImplementation(async (_r, model) => ok({ ...registry(), subagentModel: model }));
+  listAgentSessions.mockImplementation(async () => ok([]));
   listSelectableModels.mockImplementation(async () => ok([selectable("smart"), selectable("fast")]));
 };
 
@@ -147,6 +150,7 @@ const allMocks = [
   setDefaultAgent,
   updateSubagentModel,
   listSelectableModels,
+  listAgentSessions,
 ];
 
 beforeEach(() => {
@@ -156,6 +160,7 @@ beforeEach(() => {
     registry: null,
     detail: null,
     models: [],
+    recentSessionsByAgent: {},
     loaded: false,
     loading: false,
     saving: false,
@@ -168,6 +173,38 @@ afterAll(() => {
 });
 
 // ---------- load / loadDetail ----------
+
+test("loadRecentSessions calls the generated command and stores sessions under their owner", async () => {
+  const sessions: Session[] = [
+    {
+      sessionPk: "s1",
+      primaryAgentId: "reviewer",
+      primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "violet" },
+      projectId: "p1",
+      agentSessionId: null,
+      worktreePath: null,
+      branch: null,
+      title: "Review",
+      status: "idle",
+      permMode: "default",
+      startedBy: "cockpit",
+      createdAt: 1,
+      lastActive: 2,
+      resumeAttempts: 0,
+      branchOwned: false,
+      kind: "project",
+      speaker: null,
+      agent: null,
+      parentSessionPk: null,
+    },
+  ];
+  listAgentSessions.mockResolvedValueOnce(ok(sessions));
+
+  await useAgents.getState().loadRecentSessions("reviewer");
+
+  expect(listAgentSessions).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", 10);
+  expect(useAgents.getState().recentSessionsByAgent).toEqual({ reviewer: sessions });
+});
 
 test("load hydrates registry and selected detail in parallel", async () => {
   await useAgents.getState().load("reviewer");

@@ -7,6 +7,7 @@ import {
   type AgentMutationInfo,
   type AgentRegistryInfo,
   type SelectableModelInfo,
+  type Session,
 } from "./bindings";
 import { LOCAL_RUNNER } from "./lib/session-key";
 import { useLearning } from "./store-learning";
@@ -25,7 +26,9 @@ type AgentsState = {
   loaded: boolean;
   loading: boolean;
   saving: boolean;
-
+  /** Sessions owned by each stable agent ID, capped by the backend query. */
+  recentSessionsByAgent: Record<string, Session[]>;
+  loadRecentSessions: (agentId: string) => Promise<void>;
   load: (agentId?: string) => Promise<void>;
   loadDetail: (agentId: string) => Promise<void>;
   create: (input: AgentMutationInfo) => Promise<AgentDetailInfo | null>;
@@ -175,6 +178,17 @@ export const useAgents = create<AgentsState>((set, get) => {
     loaded: false,
     loading: false,
     saving: false,
+    recentSessionsByAgent: {},
+
+    loadRecentSessions: async (agentId) => {
+      try {
+        const result = await commands.listAgentSessions(LOCAL_RUNNER, agentId, 10);
+        if (result.status === "ok") set((state) => ({ recentSessionsByAgent: { ...state.recentSessionsByAgent, [agentId]: result.data } }));
+        else toast.error(`Couldn't load recent sessions: ${result.error.message}`);
+      } catch (error) {
+        toast.error(`Couldn't load recent sessions: ${errorMessage(error)}`);
+      }
+    },
 
     load: async (agentId) => {
       const generation = ++loadGeneration;

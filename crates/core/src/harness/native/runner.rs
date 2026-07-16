@@ -13,11 +13,12 @@ use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
 use super::tools::{
-    BackgroundDispatch, OutputCaps, SubagentSpawner, SubtaskResult, SubtaskSpec, SubtaskStatus,
-    ToolCtx, ToolRegistry,
+    BackgroundDispatch, MainAgentSpawner, MainDelegationResult, OutputCaps, SubagentSpawner,
+    SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
 };
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
+use crate::delegation::{RunHandle, SubagentRunRequest};
 use crate::domain::{CoreEvent, NewMessage, PermMode, SessionKind};
 use crate::harness::TurnPrompt;
 use crate::llm_router::client::MessageStreamEvent;
@@ -95,13 +96,25 @@ pub struct LearningPayload {
 #[derive(Clone)]
 pub struct RunnerDeps {
     pub session_pk: String,
+    /// Immutable primary identity and root run for this dispatched turn.
+    pub primary_agent: Arc<crate::agents::types::AgentSnapshot>,
+    pub run_id: String,
+    /// The persisted primary root that owns all descendant rail outcomes.
+    /// This remains stable while `run_id` changes for delegated main profiles
+    /// and ephemeral sub-agent loops.
+    pub root_run_id: String,
+    pub delegation: Arc<crate::delegation::DelegationRuntime>,
+    /// A child harness must not replay the root transcript or append provider
+    /// turns to it; its result is conveyed only through its run-scoped rows.
+    pub isolated_target: bool,
     /// Main agent whose isolated knowledge bundle owns this session's memory.
     pub main_agent_id: String,
     /// Durable learning queue shared with the daemon worker.
     pub learning_queue: Arc<crate::agents::learning_queue::LearningQueue>,
+    /// Per-agent knowledge bundles used to construct isolated target memory.
+    pub agent_knowledge: Arc<crate::agents::knowledge::AgentKnowledgeStore>,
     /// The session's kind (`Project`, `Chat`, `Worker`, `Review`), mirroring
     /// `SessionCtx::kind`. Consulted by `visible_tool_defs` to schema-gate
-    /// `orch_block` (Task E6, spec §8) to `Worker` sessions only.
     pub kind: SessionKind,
     pub work_dir: PathBuf,
     /// Session attachments folder (second read root for the `read` tool).
@@ -143,6 +156,10 @@ pub struct RunnerDeps {
     pub agents: Arc<AgentRegistry>,
     /// Available slash commands.
     pub commands: Arc<CommandRegistry>,
+    /// Names of skills the durable primary profile permits. `None` leaves the
+    /// native runtime's normal unrestricted discovery in place. Subagents reset
+    /// this to `None` so their established unrestricted behavior remains.
+    pub allowed_skills: Option<Vec<String>>,
     /// Persistent memory (None in contexts without a session row, e.g. bare
     /// tests, and always None inside sub-agents).
     pub memory: Option<Arc<super::memory::MemoryStore>>,
@@ -184,6 +201,9 @@ pub struct RunnerDeps {
     /// `User` for ordinary interactive sessions; the background review fork
     /// (Task 9) sets `BackgroundReview` so Task 6's skill-write guard applies.
     pub write_origin: crate::domain::WriteOrigin,
+    /// Profiles the runner can delegate to, rendered into the system prompt so
+    /// `delegate_agent` has a current, executable target catalog.
+    pub delegation_catalog: Vec<(String, String, String)>,
 }
 
 impl RunnerDeps {
@@ -346,58 +366,67 @@ pub async fn run_turn(
 
     // 2. Load history + context state and append the user turn.
     let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
-    let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
+    let mut cm = if deps.isolated_target {
+        ContextManager::ephemeral(&deps.session_pk, cfg)
+    } else {
+        ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?
+    };
     // Seed the indicator immediately on resume, before any model call —
     // prefer the persisted last-known status (server truth) over the
     // reload estimate (spec §6.1/§10).
-    match deps.store.get_session_context(&deps.session_pk).await {
-        Ok(Some(saved)) => {
-            // Seed BEFORE reading status: an overflowed prior turn persisted
-            // the full-window total via `mark_full`, but this fresh
-            // `ContextManager` only knows the (possibly much smaller) reload
-            // estimate, which would otherwise let `needs_compaction` miss the
-            // overflow and loop forever (spec §12).
-            if let Some(saved_active) = saved["active_tokens"].as_u64() {
-                cm.seed_active_tokens(saved_active);
+    if !deps.isolated_target {
+        match deps.store.get_session_context(&deps.session_pk).await {
+            Ok(Some(saved)) => {
+                // Seed BEFORE reading status: an overflowed prior turn persisted
+                // the full-window total via `mark_full`, but this fresh
+                // `ContextManager` only knows the (possibly much smaller) reload
+                // estimate, which would otherwise let `needs_compaction` miss the
+                // overflow and loop forever (spec §12).
+                if let Some(saved_active) = saved["active_tokens"].as_u64() {
+                    cm.seed_active_tokens(saved_active);
+                }
+                let st = cm.status();
+                let _ = deps.events.send(CoreEvent::ContextUsage {
+                    session_pk: deps.session_pk.clone(),
+                    active_tokens: saved["active_tokens"].as_u64().unwrap_or(st.active_tokens),
+                    context_window: st.context_window,
+                    usable_window: saved["usable_window"].as_u64().unwrap_or(st.usable_window),
+                    percent_left: saved["percent_left"]
+                        .as_u64()
+                        .unwrap_or(st.percent_left as u64) as u8,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 0,
+                });
+                // Re-emit the accumulated session cost from what's already
+                // persisted — no accumulation here, just pricing the saved tally
+                // at current rates (spec: resume must not double-count).
+                let tally = super::cost::Tally::from_payload(&saved);
+                if !tally.is_empty() {
+                    emit_session_cost(deps, &tally).await;
+                }
             }
-            let st = cm.status();
-            let _ = deps.events.send(CoreEvent::ContextUsage {
-                session_pk: deps.session_pk.clone(),
-                active_tokens: saved["active_tokens"].as_u64().unwrap_or(st.active_tokens),
-                context_window: st.context_window,
-                usable_window: saved["usable_window"].as_u64().unwrap_or(st.usable_window),
-                percent_left: saved["percent_left"]
-                    .as_u64()
-                    .unwrap_or(st.percent_left as u64) as u8,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                output_tokens: 0,
-            });
-            // Re-emit the accumulated session cost from what's already
-            // persisted — no accumulation here, just pricing the saved tally
-            // at current rates (spec: resume must not double-count).
-            let tally = super::cost::Tally::from_payload(&saved);
-            if !tally.is_empty() {
-                emit_session_cost(deps, &tally).await;
-            }
+            // No persisted tally yet (fresh session) or a read error — either
+            // way this is a display re-emit, never an accumulation: `cm` hasn't
+            // committed any response yet, so `cm.last_*` would be all-zero at
+            // best and stale at worst. `emit_context_usage` would otherwise
+            // persist a spurious zero-token model entry (and a `total_usd=0`
+            // `SessionCost`) on every brand-new session.
+            _ => emit_context_display(deps, &cm, true).await,
         }
-        // No persisted tally yet (fresh session) or a read error — either
-        // way this is a display re-emit, never an accumulation: `cm` hasn't
-        // committed any response yet, so `cm.last_*` would be all-zero at
-        // best and stale at worst. `emit_context_usage` would otherwise
-        // persist a spurious zero-token model entry (and a `total_usd=0`
-        // `SessionCost`) on every brand-new session.
-        _ => emit_context_display(deps, &cm, true).await,
     }
     cm.append_user(user_content_blocks(&prompt.blocks, &agent_text))
         .await?;
 
-    // 3. Drive the loop with a spawner available for the `task` tool.
-    let spawn: Arc<dyn SubagentSpawner> = Arc::new(RunnerSpawner {
+    // 3. Drive the loop. Isolated complete-profile children retain `task`
+    // execution when it is advertised, but their RunnerSpawner still strips
+    // attachments, app control, and persistent memory in deps_for_subagent.
+    let spawn = Some(Arc::new(RunnerSpawner {
         deps: deps.clone(),
         cancel: cancel.clone(),
         depth: 0,
-    });
+        parent_run_id: deps.run_id.clone(),
+    }) as Arc<dyn SubagentSpawner>);
     // Seed the parent turn-cap from the `agent.max_provider_turns` setting,
     // defaulting to Phase 2's raised ceiling (PARENT_MAX_ITERS). This is what
     // makes the setting meaningful under the IterationBudget model: drive()'s
@@ -411,14 +440,16 @@ pub async fn run_turn(
         &agent,
         &mut cm,
         &cancel,
-        Some(spawn),
+        spawn,
         DisplayMode::Full,
         &budget,
     )
     .await?;
 
     // 4. Best-effort: give a fresh session a generated title.
-    maybe_generate_title(deps, &prompt.display).await;
+    if !deps.isolated_target {
+        maybe_generate_title(deps, &prompt.display).await;
+    }
     Ok(())
 }
 
@@ -516,19 +547,18 @@ fn merge_agent_prompt_suffix(expanded: String, prompt: &TurnPrompt) -> String {
     }
 }
 
-/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the command
-/// model override when present, otherwise the freshest project/session model.
-/// A command override wins only for this turn; it never changes persisted
-/// project or session settings. Falls back to the session-start model when no
-/// project row is reachable (bare tests, ephemeral contexts) or when nothing
-/// resolves at all (empty store / no routable connection), so those contexts
-/// behave exactly as before. When the chosen model fails routing and a
-/// substitute is resolved, a status row announces the substitution — no silent
-/// swap.
+/// Build this turn's `RunnerDeps`: a clone of `deps` carrying the freshest
+/// resolution of the project's pinned model. Falls back to the session-start
+/// model when no project row is reachable (bare tests, ephemeral contexts) or
+/// when nothing resolves at all (empty store / no routable connection), so
+/// those contexts behave exactly as before. When the pinned model fails
+/// routing and a substitute is resolved, a status row announces the
+/// substitution — no silent swap.
 async fn refresh_turn_configuration(
     deps: &RunnerDeps,
     command_model: Option<String>,
 ) -> RunnerDeps {
+    let scheduler_override = scheduler_model_override(deps).await;
     let project_pin = project_pinned_model(deps).await;
     let session_pin = if project_pin.is_none() {
         chat_session_pinned_model(&deps.store, &deps.session_pk).await
@@ -540,10 +570,10 @@ async fn refresh_turn_configuration(
         .is_some_and(|model| !model.trim().is_empty());
     let pinned = command_model
         .filter(|model| !model.trim().is_empty())
-        .or_else(|| match project_pin.clone() {
-            Some(pinned) => pinned,
-            None => session_pin.clone().or_else(|| deps.model.clone()),
-        });
+        .or(scheduler_override.clone())
+        .or_else(|| deps.model.clone())
+        .or_else(|| project_pin.clone().flatten())
+        .or(session_pin.clone());
     let resolved = super::resolve_native_model(&deps.store, pinned.clone()).await;
     if let (Some(pinned), Some(resolved)) = (pinned.as_deref(), resolved.as_deref()) {
         if !pinned.trim().is_empty() && pinned != resolved {
@@ -567,7 +597,14 @@ async fn refresh_turn_configuration(
         turn.model = resolved;
     }
     let model = turn.model.as_deref().unwrap_or("");
-    if has_command_model || project_pin.is_some() || session_pin.is_some() {
+    let primary_model = agent_model_name(&turn.primary_agent.profile.model);
+    if has_command_model
+        || scheduler_override.is_some()
+        || project_pin.is_some()
+        || session_pin.is_some()
+        || turn.model != deps.model
+        || primary_model.as_deref() == Some(model)
+    {
         turn.meta = crate::llm_router::model_meta::resolve(&turn.store, model).await;
     }
     let policy = if let Some(project_id) = turn.project_id.as_deref() {
@@ -581,7 +618,16 @@ async fn refresh_turn_configuration(
         )
         .await
     };
-    if let Ok(policy) = policy {
+    if let Ok(mut policy) = policy {
+        policy.caller_override = if turn.agent.mode.is_subagent() {
+            turn.turn_effort_policy.caller_override.clone()
+        } else {
+            policy
+                .caller_override
+                .clone()
+                .or_else(|| turn.turn_effort_policy.caller_override.clone())
+                .or_else(|| agent_effort(&turn.primary_agent.profile.model))
+        };
         turn.turn_effort_policy = Arc::new(policy);
     }
     turn
@@ -591,6 +637,24 @@ async fn refresh_turn_configuration(
 /// inner Option is the pin itself, which may legitimately be unset. `None`
 /// when there is no session/project row to read, or the session has no
 /// bound project (chat-first sessions).
+async fn scheduler_model_override(deps: &RunnerDeps) -> Option<String> {
+    let session = deps
+        .store
+        .get_session(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()?;
+    if session.started_by.as_deref() != Some("scheduler") {
+        return None;
+    }
+    deps.store
+        .get_session_runtime_settings(&deps.session_pk)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|runtime| runtime.model)
+}
+
 async fn project_pinned_model(deps: &RunnerDeps) -> Option<Option<String>> {
     let session = deps
         .store
@@ -618,6 +682,20 @@ async fn chat_session_pinned_model(store: &Store, session_pk: &str) -> Option<St
         .ok()
         .flatten()
         .and_then(|runtime| runtime.model)
+}
+
+fn agent_model_name(model: &crate::agents::types::AgentModel) -> Option<String> {
+    match model {
+        crate::agents::types::AgentModel::Concrete { name, .. } => Some(name.clone()),
+        crate::agents::types::AgentModel::Route { route } => Some(route.clone()),
+    }
+}
+
+fn agent_effort(model: &crate::agents::types::AgentModel) -> Option<String> {
+    match model {
+        crate::agents::types::AgentModel::Concrete { effort, .. } => effort.clone(),
+        crate::agents::types::AgentModel::Route { .. } => None,
+    }
 }
 
 /// If this session has no title yet, generate a terse one from the first
@@ -724,12 +802,15 @@ fn is_hot(name: &str) -> bool {
 /// deferred index (name + one-line summary) so the model knows what it can load.
 fn load_tools_definition(deferred_index: &[(String, String)]) -> Value {
     let mut description = String::from(
-        "Load additional tools into this session by name so you can call them. \
-         Only the tools listed below can be loaded; call this with the exact \
-         names you need, then use them on your next step.\n\nAvailable to load:",
+        "Load additional tools into this session by name so you can call them.          Only the tools listed below can be loaded; call this with the exact          names you need, then use them on your next step.
+
+Available to load:",
     );
     for (name, summary) in deferred_index {
-        description.push_str(&format!("\n- {name}: {summary}"));
+        description.push_str(&format!(
+            "
+- {name}: {summary}"
+        ));
     }
     json!({
         "name": LOAD_TOOLS_NAME,
@@ -748,83 +829,78 @@ fn load_tools_definition(deferred_index: &[(String, String)]) -> Value {
     })
 }
 
-/// Tool definitions advertised to the model this turn: the registry's tools
-/// filtered by the agent's allow-list, with `orch_block` additionally hidden
-/// from every session kind but `Worker` (Task E6, spec §8) — the SCHEMA-level
-/// half of the gate. This is advisory, not the safety boundary: dispatch
-/// (`run_tool_call`'s `agent.tools.allows` check) still enforces the agent's
-/// real whitelist regardless of what's advertised, and `orch_block`'s own
-/// `Store::task_by_session` lookup is the authoritative RUNTIME guard — a
-/// non-worker session has no orch task row for its `session_pk` even if it
-/// somehow called the tool anyway.
-///
-/// `activated = None` (sub-agents, review forks, tests): the full set filtered
-/// by the agent allow-list and the `orch_block`/`Worker` gate — unchanged
-/// behavior. `activated = Some(set)`: only the hot core plus deferred tools the
-/// model has already loaded, plus a synthetic `load_tools` carrying the index of
-/// what remains deferred. Dispatch (`run_tool_call`) still enforces the real
-/// whitelist, so a tool that is merely hidden here is refused, not executed, if
-/// the model somehow calls it.
+/// Tool definitions advertised to the model this turn. `activated = None`
+/// preserves eager filtered advertisement for subagents/review workers; a
+/// primary session advertises the hot core plus loaded deferred tools.
 fn visible_tool_defs(
     tools: &ToolRegistry,
     agent: &Agent,
-    kind: SessionKind,
     activated: Option<&std::collections::BTreeSet<String>>,
 ) -> Vec<Value> {
-    let allowed = |name: &str| {
-        agent.tools.allows(name) && (name != "orch_block" || kind == SessionKind::Worker)
-    };
+    let allowed = |name: &str| agent.tools.allows(name);
 
     let Some(activated) = activated else {
         return tools
             .definitions()
             .into_iter()
-            .filter(|d| {
-                d.get("name")
-                    .and_then(|n| n.as_str())
+            .filter(|definition| {
+                definition
+                    .get("name")
+                    .and_then(|name| name.as_str())
                     .map(&allowed)
                     .unwrap_or(false)
             })
             .collect();
     };
 
-    let mut out: Vec<Value> = Vec::new();
-    let mut deferred_index: Vec<(String, String)> = Vec::new();
-    for def in tools.definitions() {
-        let Some(name) = def.get("name").and_then(|n| n.as_str()) else {
+    let mut advertised = Vec::new();
+    let mut deferred_index = Vec::new();
+    for definition in tools.definitions() {
+        let Some(name) = definition.get("name").and_then(|name| name.as_str()) else {
             continue;
         };
         if !allowed(name) {
             continue;
         }
         if is_hot(name) || activated.contains(name) {
-            out.push(def);
+            advertised.push(definition);
         } else {
-            let summary = def
+            let summary = definition
                 .get("description")
-                .and_then(|d| d.as_str())
-                .and_then(|d| d.lines().next())
+                .and_then(|description| description.as_str())
+                .and_then(|description| description.lines().next())
                 .unwrap_or("")
                 .to_string();
             deferred_index.push((name.to_string(), summary));
         }
     }
-    out.push(load_tools_definition(&deferred_index));
-    out
+    advertised.push(load_tools_definition(&deferred_index));
+    advertised
 }
 
 /// The tool definitions to send this provider turn: the review fork's captured
-/// set verbatim (cache parity), else the activation-aware set from a snapshot of
-/// `deps.activated_tools`.
+/// set verbatim (cache parity), else an activation-aware snapshot.
 async fn current_tool_defs(deps: &RunnerDeps, agent: &Agent) -> Vec<Value> {
     if let Some(captured) = &deps.review_tool_defs {
         return captured.clone();
     }
     let activated = match &deps.activated_tools {
-        Some(m) => Some(m.lock().await.clone()),
+        Some(activated) => Some(activated.lock().await.clone()),
         None => None,
     };
-    visible_tool_defs(&deps.tools, agent, deps.kind, activated.as_ref())
+    visible_tool_defs(&deps.tools, agent, activated.as_ref())
+}
+
+fn with_delegation_catalog(system: String, catalog: &[(String, String, String)]) -> String {
+    if catalog.is_empty() {
+        return system;
+    }
+    let entries = catalog
+        .iter()
+        .map(|(id, name, description)| format!("- `{id}` ({name}): {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{system}\n\nAvailable complete agent profiles for `delegate_agent`:\n{entries}")
 }
 
 /// The agentic provider-turn loop. Shared by the top-level turn and sub-agents.
@@ -849,8 +925,12 @@ async fn drive(
                 None => None,
             };
             let t0 = std::time::Instant::now();
-            let sections =
-                context::build_sections(&deps.work_dir, &deps.extra_skill_dirs, memory.as_deref());
+            let sections = context::build_sections(
+                &deps.work_dir,
+                &deps.extra_skill_dirs,
+                memory.as_deref(),
+                deps.allowed_skills.as_deref(),
+            );
             system_breakdown = Some(context::breakdown_of(&sections));
             let text = context::join_sections(&sections);
             tracing::debug!(
@@ -861,10 +941,17 @@ async fn drive(
             text
         }
     };
-    // Baseline snapshot of what this turn starts with (used by set_baseline +
-    // the Phase-1 breakdown). Recomputed each provider turn below so a mid-turn
-    // `load_tools` takes effect on the next iteration.
-    let tool_defs: Vec<Value> = current_tool_defs(deps, agent).await;
+    let system = with_delegation_catalog(system, &deps.delegation_catalog);
+    // Tools restricted to what this agent may use — UNLESS a review fork
+    // (Task 9) supplies the parent's exact captured `tool_defs` for cache
+    // parity. Advertising the full parent tool set here is safe even though
+    // the review agent's `ToolFilter` only allows a few of them: dispatch
+    // (`run_tool_call`, below) enforces the real whitelist at call time, so a
+    // non-whitelisted call is refused, not merely hidden from the model.
+    let tool_defs: Vec<Value> = match &deps.review_tool_defs {
+        Some(captured) => captured.clone(),
+        None => current_tool_defs(deps, agent).await,
+    };
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
@@ -1482,6 +1569,7 @@ pub(crate) fn review_agent(system: String) -> Agent {
                 .map(|s| s.to_string())
                 .collect(),
         ),
+        permission_rules: Vec::new(),
         can_delegate: false,
         builtin: true,
     }
@@ -1513,7 +1601,7 @@ pub(crate) async fn drive_review(
 }
 
 /// Tools delegated children may never use regardless of filters. `task` is
-/// re-armed for delegator agents (the orchestrator role); `memory` never is —
+/// re-armed for agents permitted to delegate; `memory` never is —
 /// sub-agents run memoryless, mirroring hermes-agent's `skip_memory`. The todo
 /// tools are blocked because the list is keyed by the parent's session_pk: a
 /// child's `todowrite` would silently clobber the user-visible plan.
@@ -1531,7 +1619,6 @@ const SUBAGENT_BLOCKLIST: &[&str] = &[
     "todoread",
     "skill_manage",
     "app_jobs",
-    "app_orchestrate",
     "app_projects",
     "clarify",
 ];
@@ -1570,21 +1657,67 @@ fn effective_child_filter(
     )
 }
 
-/// The `max_spawn_depth` setting (default 2: a delegating sub-agent like the
-/// builtin `orchestrator` can itself delegate one level; its children cannot).
+/// The `max_spawn_depth` setting controls how many delegation hops a child may make.
 async fn max_spawn_depth(store: &Store) -> u8 {
     crate::settings::usize_setting(store, "max_spawn_depth", 2).await as u8
 }
 
-/// Clone `deps` for a spawned sub-agent, stripping the capabilities that are
-/// top-level-session only: persistent memory (sub-agents run memoryless) and
-/// the app-control facade (spec §9.1).
-fn deps_for_subagent(deps: &RunnerDeps) -> RunnerDeps {
-    let mut child = deps.clone();
-    child.memory = None;
-    child.app_control = None;
-    child.activated_tools = None;
-    child
+/// Build one memoryless task child's dependencies from the current shared
+/// subagent configuration. The parent contributes only session-scoped services
+/// and isolation boundaries; its model, metadata, and effort policy never
+/// select the child model.
+async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
+    let shared_model = deps.delegation.registry_snapshot().await.subagent_model;
+    let model = super::resolve_native_model(&deps.store, agent_model_name(&shared_model)).await;
+    let model_name = model.as_deref().unwrap_or("");
+    let mut effort_policy =
+        crate::llm_router::model_effort::build_utility_effort_policy(&deps.store, model_name)
+            .await?;
+    effort_policy.caller_override = agent_effort(&shared_model);
+    let meta = crate::llm_router::model_meta::resolve(&deps.store, model_name).await;
+
+    Ok(RunnerDeps {
+        session_pk: deps.session_pk.clone(),
+        primary_agent: deps.primary_agent.clone(),
+        run_id: deps.run_id.clone(),
+        root_run_id: deps.root_run_id.clone(),
+        delegation: deps.delegation.clone(),
+        isolated_target: deps.isolated_target,
+        main_agent_id: deps.main_agent_id.clone(),
+        learning_queue: deps.learning_queue.clone(),
+        agent_knowledge: deps.agent_knowledge.clone(),
+        kind: deps.kind,
+        work_dir: deps.work_dir.clone(),
+        attachments_dir: None,
+        extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        extension_events: deps.extension_events.clone(),
+        model,
+        turn_effort_policy: Arc::new(effort_policy),
+        meta,
+        perm_mode: deps.perm_mode.clone(),
+        project_id: deps.project_id.clone(),
+        perm_overrides: deps.perm_overrides.clone(),
+        store: deps.store.clone(),
+        events: deps.events.clone(),
+        approvals: deps.approvals.clone(),
+        automation_events: deps.automation_events.clone(),
+        llm: deps.llm.clone(),
+        tools: deps.tools.clone(),
+        agent: deps.agent.clone(),
+        agents: deps.agents.clone(),
+        commands: deps.commands.clone(),
+        allowed_skills: None,
+        memory: None,
+        snapshots: deps.snapshots.clone(),
+        steer: deps.steer.clone(),
+        background: deps.background.clone(),
+        app_control: None,
+        nudge: deps.nudge.clone(),
+        review_tool_defs: None,
+        activated_tools: None,
+        write_origin: deps.write_origin,
+        delegation_catalog: deps.delegation_catalog.clone(),
+    })
 }
 
 /// A [`SubagentSpawner`] backed by the runner: runs sub-agents in ephemeral
@@ -1594,6 +1727,312 @@ struct RunnerSpawner {
     deps: RunnerDeps,
     cancel: CancellationToken,
     depth: u8,
+    /// The durable run that owns children spawned through this particular
+    /// `task` capability. Root turns use the primary run; each child spawner
+    /// replaces this with its own child run before it can recurse.
+    parent_run_id: String,
+}
+
+/// Add the fixed delegation capabilities that only a delegated complete-profile
+/// child receives. Its configured profile filter remains authoritative for every
+/// other tool; the registry check keeps the advertised capabilities dispatchable.
+fn effective_delegated_main_child_filter(
+    filter: super::agents::ToolFilter,
+    names: &[String],
+) -> super::agents::ToolFilter {
+    match filter {
+        super::agents::ToolFilter::All => super::agents::ToolFilter::All,
+        super::agents::ToolFilter::Only(mut allowed) => {
+            // Isolated main profiles advertise `task` when the delegation
+            // contract requires it, and their terminal turn receives the
+            // constrained RunnerSpawner above.
+            for delegation_tool in ["task", "delegate_agent"] {
+                if names.iter().any(|name| name == delegation_tool)
+                    && !allowed.iter().any(|name| name == delegation_tool)
+                {
+                    allowed.push(delegation_tool.to_string());
+                }
+            }
+            allowed.sort();
+            super::agents::ToolFilter::Only(allowed)
+        }
+    }
+}
+
+/// Runs complete durable main profiles in isolated child harnesses. The child
+/// receives its own immutable profile through `RunHandle.agent_snapshot`; it
+/// never receives parent attachments or persistent parent memory.
+struct RunnerMainAgentSpawner {
+    deps: RunnerDeps,
+}
+
+impl RunnerMainAgentSpawner {
+    async fn run_child(
+        &self,
+        request: crate::delegation::MainDelegationRequest,
+    ) -> MainDelegationResult {
+        let background = request.background;
+        let context = request.context.clone();
+        let root_run_id = self.deps.root_run_id.clone();
+        let child_run = match self.deps.delegation.queue_main(request).await {
+            Ok(child) => child,
+            Err(error) => {
+                return MainDelegationResult {
+                    run_id: String::new(),
+                    agent_id: String::new(),
+                    status: SubtaskStatus::Error,
+                    report: error.to_string(),
+                };
+            }
+        };
+        let run_id = child_run.run.run_id.clone();
+        let agent_id = child_run.run.executing_agent_id.clone().unwrap_or_default();
+        if background {
+            let cap =
+                crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await;
+            let Some(reservation) = self.deps.background.try_reserve(cap, &self.deps.session_pk)
+            else {
+                let _ = self
+                    .deps
+                    .delegation
+                    .cancel_child(&self.deps.session_pk, &run_id)
+                    .await;
+                return MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Error,
+                    report: format!(
+                        "Async delegation capacity reached ({cap} running). Run this task synchronously."
+                    ),
+                };
+            };
+            let worker = Self {
+                deps: self.deps.clone(),
+            };
+            let goal = child_run.run.task.clone();
+            let child_run_id = child_run.run.run_id.clone();
+            let session_pk = self.deps.session_pk.clone();
+            tokio::spawn(async move {
+                let reservation_cancel = reservation.token();
+                let execution = worker.execute_child(child_run, context);
+                tokio::pin!(execution);
+                let result = tokio::select! {
+                    _ = reservation_cancel.cancelled() => {
+                        // The terminal transition awaits SQLite; release the
+                        // capacity guard first so ending a session never holds
+                        // a slot hostage on that I/O.
+                        drop(reservation);
+                        let _ = worker
+                            .deps
+                            .delegation
+                            .cancel_child(&session_pk, &child_run_id)
+                            .await;
+                        return;
+                    }
+                    result = &mut execution => result,
+                };
+                if reservation_cancel.is_cancelled() {
+                    return;
+                }
+                worker
+                    .deliver_background_result(&root_run_id, &goal, &result)
+                    .await;
+            });
+            return MainDelegationResult::completed(
+                run_id,
+                agent_id,
+                "background delegation dispatched".to_string(),
+            );
+        }
+        self.execute_child(child_run, context).await
+    }
+
+    async fn execute_child(
+        &self,
+        child: RunHandle,
+        context: Option<String>,
+    ) -> MainDelegationResult {
+        let run_id = child.run.run_id.clone();
+        let agent_id = child.run.executing_agent_id.clone().unwrap_or_default();
+        let result = async {
+            self.deps.delegation.mark_running(&run_id).await?;
+            let snapshot = child
+                .agent_snapshot
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("delegated agent snapshot is unavailable"))?;
+            let mut child_deps = self.deps.clone();
+            child_deps.run_id = run_id.clone();
+            let primary_turn = super::primary_turn_config_with_tools(
+                snapshot.clone(),
+                run_id.clone(),
+                child_deps.root_run_id.clone(),
+                &child_deps.tools.names(),
+            )?;
+            child_deps.primary_agent = primary_turn.agent;
+            child_deps.main_agent_id = snapshot.profile.id.clone();
+            child_deps.isolated_target = true;
+            child_deps.attachments_dir = None;
+            child_deps.memory = Some(Arc::new(super::memory::MemoryStore::for_agent(
+                child_deps.agent_knowledge.clone(),
+                &snapshot.profile.id,
+                child_deps.project_id.as_deref(),
+            )?));
+            // A delegated target may advertise its configured app tool but
+            // never receives the parent's app-control facade to execute it.
+            child_deps.app_control = None;
+            child_deps.perm_overrides = Arc::new(std::sync::Mutex::new(Default::default()));
+            child_deps.perm_mode = Arc::new(std::sync::Mutex::new(primary_turn.perm_mode));
+            child_deps.model = primary_turn.model;
+            child_deps.meta = crate::llm_router::model_meta::resolve(
+                &child_deps.store,
+                child_deps.model.as_deref().unwrap_or(""),
+            )
+            .await;
+            let mut effort_policy = crate::llm_router::model_effort::build_utility_effort_policy(
+                &child_deps.store,
+                child_deps.model.as_deref().unwrap_or(""),
+            )
+            .await?;
+            effort_policy.caller_override = primary_turn.effort;
+            child_deps.turn_effort_policy = Arc::new(effort_policy);
+            child_deps.allowed_skills = primary_turn.allowed_skills;
+            child_deps.agent = primary_turn.agent_tools;
+            child_deps.agent.tools = effective_delegated_main_child_filter(
+                child_deps.agent.tools,
+                &child_deps.tools.names(),
+            );
+            // The child's own catalog excludes ITS profile (not the
+            // parent's) — a delegated agent must never be offered a
+            // `delegate_agent` route back to the profile it's currently
+            // executing as.
+            child_deps.delegation_catalog = self
+                .deps
+                .delegation
+                .delegate_catalog(&snapshot.profile.id)
+                .await;
+            let mut cm = ContextManager::ephemeral(
+                &child_deps.session_pk,
+                ContextConfig::with_meta(child_deps.meta.clone()),
+            );
+            let task = child.run.task.clone();
+            let mut prompt = vec![json!({ "type": "text", "text": task })];
+            if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+                prompt.push(json!({ "type": "text", "text": context }));
+            }
+            cm.append_user(Value::Array(prompt)).await?;
+            let turns = snapshot.profile.loop_settings.max_turns.max(1) as usize;
+            let text = drive(
+                &child_deps,
+                &child_deps.agent.clone(),
+                &mut cm,
+                &child.cancel,
+                Some(Arc::new(RunnerSpawner {
+                    deps: child_deps.clone(),
+                    cancel: child.cancel.clone(),
+                    depth: 0,
+                    parent_run_id: run_id.clone(),
+                })),
+                DisplayMode::ToolsOnly {
+                    label: snapshot.profile.name.clone(),
+                },
+                &IterationBudget::new(turns),
+            )
+            .await?;
+            self.deps.delegation.complete(&run_id, &text).await?;
+            Ok::<_, anyhow::Error>(text)
+        }
+        .await;
+        match result {
+            Ok(report) if child.cancel.is_cancelled() => {
+                let _ = self
+                    .deps
+                    .delegation
+                    .interrupt(&run_id, "delegated agent interrupted")
+                    .await;
+                MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Interrupted,
+                    report,
+                }
+            }
+            Ok(report) => MainDelegationResult::completed(run_id, agent_id, report),
+            Err(error) if child.cancel.is_cancelled() => {
+                let _ = self
+                    .deps
+                    .delegation
+                    .interrupt(&run_id, "delegated agent interrupted")
+                    .await;
+                MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Interrupted,
+                    report: error.to_string(),
+                }
+            }
+            Err(error) => {
+                let _ = self.deps.delegation.fail(&run_id, &error.to_string()).await;
+                MainDelegationResult {
+                    run_id,
+                    agent_id,
+                    status: SubtaskStatus::Error,
+                    report: error.to_string(),
+                }
+            }
+        }
+    }
+
+    async fn deliver_background_result(
+        &self,
+        originating_run_id: &str,
+        goal: &str,
+        result: &MainDelegationResult,
+    ) {
+        let block = delegation::format_delegation_block(&delegation::DelegationResult {
+            id: result.run_id.clone(),
+            goal: goal.to_string(),
+            agent_type: result.agent_id.clone(),
+            model: self.deps.model.clone().unwrap_or_default(),
+            status: result.status.as_str().to_string(),
+            summary: result.report.clone(),
+            error: (result.status == SubtaskStatus::Error).then(|| result.report.clone()),
+        });
+        if let Err(error) = self
+            .deps
+            .store
+            .enqueue_background_delegation_event(&self.deps.session_pk, originating_run_id, &block)
+            .await
+        {
+            tracing::warn!(
+                "native: failed to enqueue background main delegation {}: {error}",
+                result.run_id,
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl MainAgentSpawner for RunnerMainAgentSpawner {
+    async fn available(&self) -> Vec<(String, String, String)> {
+        self.deps
+            .delegation
+            .delegate_catalog(&self.deps.primary_agent.profile.id)
+            .await
+    }
+
+    async fn run_one(
+        &self,
+        request: crate::delegation::MainDelegationRequest,
+    ) -> MainDelegationResult {
+        self.run_child(request).await
+    }
+
+    async fn run_many(
+        &self,
+        requests: Vec<crate::delegation::MainDelegationRequest>,
+    ) -> Vec<MainDelegationResult> {
+        futures::future::join_all(requests.into_iter().map(|request| self.run_child(request))).await
+    }
 }
 
 impl RunnerSpawner {
@@ -1626,7 +2065,97 @@ impl RunnerSpawner {
         &self,
         index: usize,
         spec: SubtaskSpec,
+        _cancel: CancellationToken,
+    ) -> SubtaskResult {
+        let result = |status, report| SubtaskResult {
+            index,
+            agent_type: spec.agent_type.clone(),
+            status,
+            report,
+        };
+        let child_run = match self
+            .deps
+            .delegation
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: self.parent_run_id.clone(),
+                subagent_type: spec.agent_type.clone(),
+                task: spec.prompt.clone(),
+                context: None,
+                background: false,
+            })
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => return result(SubtaskStatus::Error, error.to_string()),
+        };
+        self.run_queued_child(index, spec, child_run.cancel.clone(), child_run)
+            .await
+    }
+
+    /// Execute a child after its durable run has been admitted. The same path
+    /// powers synchronous single/batch calls and detached background work.
+    async fn run_queued_child(
+        &self,
+        index: usize,
+        spec: SubtaskSpec,
+        _cancel: CancellationToken,
+        child_run: RunHandle,
+    ) -> SubtaskResult {
+        let run_id = child_run.run.run_id.clone();
+        let result = |status, report| SubtaskResult {
+            index,
+            agent_type: spec.agent_type.clone(),
+            status,
+            report,
+        };
+        if let Err(error) = self.deps.delegation.mark_running(&run_id).await {
+            return result(SubtaskStatus::Error, error.to_string());
+        }
+        let child_cancel = child_run.cancel.clone();
+        let execution = async {
+            self.run_subagent_loop(index, &spec, child_cancel, &run_id)
+                .await
+        }
+        .await;
+        match execution {
+            SubtaskResult {
+                status: SubtaskStatus::Completed,
+                report,
+                ..
+            } => match self.deps.delegation.complete(&run_id, &report).await {
+                Ok(()) => result(SubtaskStatus::Completed, report),
+                Err(error) => result(SubtaskStatus::Error, error.to_string()),
+            },
+            SubtaskResult {
+                status: SubtaskStatus::Interrupted,
+                report,
+                ..
+            } => {
+                let _ = self
+                    .deps
+                    .delegation
+                    .interrupt(&run_id, "subagent interrupted")
+                    .await;
+                result(SubtaskStatus::Interrupted, report)
+            }
+            SubtaskResult {
+                status: SubtaskStatus::Error,
+                report,
+                ..
+            } => {
+                let _ = self.deps.delegation.fail(&run_id, &report).await;
+                result(SubtaskStatus::Error, report)
+            }
+        }
+    }
+
+    /// Run one bounded, memoryless `task` child after durable admission.
+    async fn run_subagent_loop(
+        &self,
+        index: usize,
+        spec: &SubtaskSpec,
         cancel: CancellationToken,
+        run_id: &str,
     ) -> SubtaskResult {
         let result = |status, report| SubtaskResult {
             index,
@@ -1656,7 +2185,7 @@ impl RunnerSpawner {
             &self.deps.tools.names(),
             SUBAGENT_BLOCKLIST,
         );
-        // Orchestrator role: a delegating child gets the `task` tool re-armed
+        // Delegating children get the `task` tool re-armed.
         // and a spawner one hop deeper, while the spawn-depth budget allows.
         let child_depth = self.depth.saturating_add(1);
         let max_depth = max_spawn_depth(&self.deps.store).await;
@@ -1680,7 +2209,8 @@ impl RunnerSpawner {
                     context::assemble_system(
                         &self.deps.work_dir,
                         &self.deps.extra_skill_dirs,
-                        None
+                        None,
+                        None,
                     )
                 ),
             });
@@ -1691,13 +2221,18 @@ impl RunnerSpawner {
         // Reset it here so the `ctx.app == None for sub-agents` invariant holds
         // unconditionally at the facade layer, not merely because the SUBAGENT
         // name-blocklist (Task 8) hides the tools — defense in depth.
-        let mut child_deps = deps_for_subagent(&self.deps);
+        let mut child_deps = match deps_for_subagent(&self.deps).await {
+            Ok(deps) => deps,
+            Err(error) => return result(SubtaskStatus::Error, error.to_string()),
+        };
+        child_deps.run_id = run_id.to_string();
         child_deps.agent = child.clone();
         let child_spawn: Option<Arc<dyn SubagentSpawner>> = if delegates {
             Some(Arc::new(RunnerSpawner {
                 deps: child_deps.clone(),
                 cancel: cancel.clone(),
                 depth: child_depth,
+                parent_run_id: run_id.to_string(),
             }))
         } else {
             None
@@ -1731,9 +2266,52 @@ impl RunnerSpawner {
                 result(SubtaskStatus::Interrupted, cap_report(&text))
             }
             Ok(text) => result(SubtaskStatus::Completed, cap_report(&text)),
-            Err(e) => result(SubtaskStatus::Error, e.to_string()),
+            Err(error) => result(SubtaskStatus::Error, error.to_string()),
         }
     }
+}
+
+/// Dispatch an admitted main-delegate retry through the same profile-isolated
+/// runner as a normal `delegate_agent` execution. The pre-existing session
+/// harness supplies the current project/worktree/MCP tool registry; the child
+/// snapshot supplies the effective target profile.
+pub(crate) fn dispatch_retry_main_delegate(
+    deps: RunnerDeps,
+    child: RunHandle,
+) -> anyhow::Result<()> {
+    if child.run.agent_kind != crate::domain::AgentRunKind::MainDelegate {
+        anyhow::bail!("only main-delegate retries can use the main-delegate executor");
+    }
+    let worker = RunnerMainAgentSpawner { deps };
+    tokio::spawn(async move {
+        let _ = worker.execute_child(child, None).await;
+    });
+    Ok(())
+}
+
+/// Dispatch an admitted subagent retry through the existing queued-child
+/// executor. The caller supplies a freshly started session harness so the
+/// retry inherits the current session configuration while retaining the
+/// persisted subagent type and task.
+pub(crate) fn dispatch_retry_subagent(deps: RunnerDeps, child: RunHandle) -> anyhow::Result<()> {
+    if child.run.agent_kind != crate::domain::AgentRunKind::Subagent {
+        anyhow::bail!("only subagent retries can use the subagent executor");
+    }
+    let spec = SubtaskSpec {
+        agent_type: child.run.executing_agent_name_snapshot.clone(),
+        prompt: child.run.task.clone(),
+    };
+    let cancel = child.cancel.clone();
+    let spawner = RunnerSpawner {
+        parent_run_id: child.run.parent_run_id.clone().unwrap_or_default(),
+        deps,
+        cancel: cancel.clone(),
+        depth: 0,
+    };
+    tokio::spawn(async move {
+        let _ = spawner.run_queued_child(0, spec, cancel, child).await;
+    });
+    Ok(())
 }
 
 #[async_trait]
@@ -1797,15 +2375,36 @@ impl SubagentSpawner for RunnerSpawner {
                 ),
             };
         };
-        let id = crate::paths::new_id();
+        let child_run = match self
+            .deps
+            .delegation
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: self.parent_run_id.clone(),
+                subagent_type: spec.agent_type.clone(),
+                task: spec.prompt.clone(),
+                context: None,
+                background: true,
+            })
+            .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return BackgroundDispatch::Rejected {
+                    note: format!("background delegation could not be queued: {error}"),
+                };
+            }
+        };
+        let id = child_run.run.run_id.clone();
         let deps = self.deps.clone();
+        let child_cancel = child_run.cancel.clone();
         let this_spawner = RunnerSpawner {
             deps: deps.clone(),
-            cancel: reservation.token(),
+            cancel: child_cancel.clone(),
             depth: 0,
+            parent_run_id: child_run.run.run_id.clone(),
         };
         let (deleg_id, goal) = (id.clone(), spec.prompt.clone());
-        let parent_pk = deps.session_pk.clone();
+        let (parent_pk, root_run_id) = (deps.session_pk.clone(), self.deps.root_run_id.clone());
         // Read the parent's persisted headroom on the CALLER's task (a quick
         // DB read) before detaching — the spawned worker only needs the
         // resulting number, not a live store round-trip mid-flight.
@@ -1815,13 +2414,19 @@ impl SubagentSpawner for RunnerSpawner {
             // slot taken; its Drop (on completion, panic, or cancellation)
             // frees the slot and deregisters the cancel token.
             let _reservation = reservation;
-            let cancel = _reservation.token();
-            let child = this_spawner.run_child(0, spec, cancel.clone()).await;
+            let reservation_cancel = _reservation.token();
+            let child = this_spawner
+                .run_queued_child(0, spec, child_cancel.clone(), child_run)
+                .await;
             // A cancelled worker (its parent ended, or was interrupted via
             // `interrupt_for_session`) must not write a stale completion to
             // the rail — the session that would receive it may already be
             // gone, or a fresh one may have taken its session_pk.
-            if cancel.is_cancelled() {
+            if reservation_cancel.is_cancelled() || child_cancel.is_cancelled() {
+                let _ = deps
+                    .delegation
+                    .interrupt(&deleg_id, "background subagent interrupted")
+                    .await;
                 return;
             }
             let cap_chars = summary_budget::budget_cap_chars(headroom, 1);
@@ -1837,11 +2442,12 @@ impl SubagentSpawner for RunnerSpawner {
                 summary: budgeted.text,
                 error: (child.status == SubtaskStatus::Error).then(|| child.report.clone()),
             });
-            // Durable re-entry (survives a daemon restart). The drainer
-            // delivers it as a new user turn once the parent is idle.
+            // Durable re-entry (survives a daemon restart), scoped to the
+            // primary run that dispatched this child so the rail records a
+            // delegation result instead of opening a synthetic user turn.
             let _ = deps
                 .store
-                .enqueue_background_event(&parent_pk, "delegation", &block)
+                .enqueue_background_delegation_event(&parent_pk, &root_run_id, &block)
                 .await;
         });
         BackgroundDispatch::Dispatched { id }
@@ -1878,7 +2484,18 @@ async fn run_tool_call(
         finish_tool_row(deps, &t.id, &msg, true).await;
         return tool_result(&t.id, &msg, true);
     }
-    insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
+    if insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await {
+        if let Err(error) = deps
+            .store
+            .increment_agent_run_tool_count(&deps.run_id)
+            .await
+        {
+            tracing::warn!(
+                "native: increment_agent_run_tool_count({}) failed: {error}",
+                deps.run_id
+            );
+        }
+    }
 
     // Plugin hooks: a `tool.before` hook (script or extension) may deny the
     // call — see `hooks::fire_hook`'s combine contract.
@@ -1907,11 +2524,15 @@ async fn run_tool_call(
     let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
     let gate = super::permission::PermGate {
+        permission_rules: &agent.permission_rules,
         perm_mode,
         project_id: deps.project_id.as_deref(),
         store: &deps.store,
         overrides: &deps.perm_overrides,
         session_pk: &deps.session_pk,
+        run_id: &deps.run_id,
+        requesting_agent_id: &deps.primary_agent.profile.id,
+        requesting_agent_name: &agent.name,
         tool_call_id: &t.id,
         approvals: &deps.approvals,
         events: &deps.events,
@@ -1949,6 +2570,7 @@ async fn run_tool_call(
     let started = std::time::Instant::now();
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
+        run_id: deps.run_id.clone(),
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
@@ -1956,12 +2578,16 @@ async fn run_tool_call(
         cancel: cancel.clone(),
         caps: OutputCaps::default(),
         spawn: spawn.clone(),
+        main_agent_spawn: Some(Arc::new(RunnerMainAgentSpawner { deps: deps.clone() })),
         memory: deps.memory.clone(),
         snapshots: deps.snapshots.clone(),
         tool_call_id: t.id.clone(),
         interaction: Some(Arc::new(super::tools::Interaction {
             approvals: deps.approvals.clone(),
             events: deps.events.clone(),
+            run_id: deps.run_id.clone(),
+            requesting_agent_id: deps.primary_agent.profile.id.clone(),
+            requesting_agent_name: agent.name.clone(),
             perm_mode: deps.perm_mode.clone(),
             project_id: deps.project_id.clone(),
         })),
@@ -2050,11 +2676,7 @@ async fn handle_load_tools(
         .tools
         .names()
         .into_iter()
-        .filter(|n| {
-            agent.tools.allows(n)
-                && !is_hot(n)
-                && (n != "orch_block" || deps.kind == SessionKind::Worker)
-        })
+        .filter(|n| agent.tools.allows(n) && !is_hot(n))
         .collect();
 
     let requested: Vec<String> = input
@@ -2118,7 +2740,7 @@ async fn insert_tool_row(
     input: &Value,
     kind: &str,
     subagent: Option<&str>,
-) {
+) -> bool {
     let mut payload = json!({ "name": t.name, "input": input });
     if let Some(label) = subagent {
         payload["subagent"] = json!(label);
@@ -2132,7 +2754,7 @@ async fn insert_tool_row(
         Some("in_progress".to_string()),
         Some(kind.to_string()),
     )
-    .await;
+    .await
 }
 
 /// Patch the tool_call row with its output + terminal status, then re-emit the
@@ -2226,7 +2848,7 @@ async fn emit_row(
     tool_call_id: Option<String>,
     status: Option<String>,
     tool_kind: Option<String>,
-) {
+) -> bool {
     let msg = NewMessage {
         session_pk: deps.session_pk.clone(),
         role: role.to_string(),
@@ -2237,7 +2859,7 @@ async fn emit_row(
         tool_kind: tool_kind.clone(),
         speaker: None,
     };
-    match deps.store.insert_message(msg).await {
+    match deps.store.insert_run_message(&deps.run_id, msg).await {
         Ok(seq) => {
             let _ = deps.events.send(CoreEvent::Message {
                 session_pk: deps.session_pk.clone(),
@@ -2250,8 +2872,12 @@ async fn emit_row(
                 tool_kind,
                 speaker: None,
             });
+            true
         }
-        Err(e) => tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}"),
+        Err(e) => {
+            tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}");
+            false
+        }
     }
 }
 
@@ -2703,90 +3329,107 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
+    use async_trait::async_trait;
     use serial_test::serial;
 
-    #[tokio::test]
-    async fn chat_turn_model_reads_the_durable_session_runtime() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+    struct StaticMcpCaller;
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store
-            .insert_session(Session {
-                session_pk: "chat-model".into(),
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-        store
-            .update_session_runtime_settings(
-                "chat-model",
-                Some("openai/gpt-5.5".into()),
-                Some("high".into()),
-            )
-            .await
-            .unwrap();
+    struct BlockingTool {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
-        assert_eq!(
-            chat_session_pinned_model(&store, "chat-model").await,
-            Some("openai/gpt-5.5".into())
-        );
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn description(&self) -> &str {
+            "Blocks until the test releases it."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("blocking", "block test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::ok("released"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::mcp_client::McpCaller for StaticMcpCaller {
+        async fn call(
+            &self,
+            _tool: &str,
+            _arguments: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"content": []}))
+        }
     }
 
     #[tokio::test]
-    async fn chat_turn_model_change_refreshes_model_metadata() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
+    async fn primary_agent_model_drives_turn_configuration() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentPermissions, AgentProfile, AgentSnapshot,
+            AgentTools,
+        };
         use testutil::RecordingLlm;
 
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(RecordingLlm::new(vec![]));
-        let deps = deps_at(dir.path(), llm).await;
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.primary_agent = Arc::new(AgentSnapshot {
+            profile: AgentProfile {
+                schema_version: 1,
+                id: "primary".into(),
+                name: "Primary".into(),
+                description: String::new(),
+                avatar: AgentAvatar {
+                    color: "blue".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/model-b".into(),
+                    effort: Some("high".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::Default,
+                    rules: vec![],
+                },
+                skills: vec![],
+                tools: AgentTools {
+                    native: vec![],
+                    plugins: vec![],
+                    apps: vec![],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            },
+            executable: true,
+            validation: vec![],
+        });
+        deps.model = Some("anthropic/model-b".into());
         add_anthropic_conn(&deps.store, &["model-b"]).await;
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-        deps.store
-            .update_session_runtime_settings(
-                "s1",
-                Some("anthropic/model-b".into()),
-                Some("high".into()),
-            )
-            .await
-            .unwrap();
         deps.store
             .set_setting_raw(
                 "models.meta.anthropic/model-b",
@@ -2798,6 +3441,10 @@ mod tests {
         let refreshed = refresh_turn_configuration(&deps, None).await;
         assert_eq!(refreshed.model.as_deref(), Some("anthropic/model-b"));
         assert_eq!(refreshed.meta.context_window, 222_222);
+        assert_eq!(
+            refreshed.turn_effort_policy.caller_override.as_deref(),
+            Some("high")
+        );
     }
     use crate::store::Store;
 
@@ -2846,6 +3493,26 @@ mod tests {
         llm: Arc<dyn LlmStream>,
         store: Arc<Store>,
     ) -> RunnerDeps {
+        deps_with_store_and_registry(dir, llm, store).await.0
+    }
+
+    async fn deps_with_executable_profile_registry(
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmStream>,
+        store: Arc<Store>,
+    ) -> (RunnerDeps, Arc<crate::agents::registry::AgentRegistry>) {
+        add_anthropic_conn_with_efforts(&store, &["parent-model", "target-model"]).await;
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        deps_with_store_and_registry(dir, llm, store).await
+    }
+
+    async fn deps_with_store_and_registry(
+        dir: &std::path::Path,
+        llm: Arc<dyn LlmStream>,
+        store: Arc<Store>,
+    ) -> (RunnerDeps, Arc<crate::agents::registry::AgentRegistry>) {
         let (events, _rx) = broadcast::channel(256);
         let agents = Arc::new(AgentRegistry::builtin());
         let agent = agents.default_agent();
@@ -2856,10 +3523,31 @@ mod tests {
             store.clone(),
             knowledge,
         ));
-        RunnerDeps {
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+            .await
+            .unwrap();
+        let primary_agent = persistence
+            .registry
+            .resolved_snapshot("ryuzi")
+            .await
+            .unwrap();
+        let registry = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let delegation = crate::delegation::DelegationRuntime::new(
+            store.clone(),
+            registry.clone(),
+            events.clone(),
+        );
+        let mut deps = RunnerDeps {
             session_pk: "s1".into(),
+            primary_agent,
+            run_id: "r1".into(),
+            root_run_id: "r1".into(),
+            delegation,
+            isolated_target: false,
             main_agent_id: "ryuzi".into(),
             learning_queue,
+            agent_knowledge,
             kind: SessionKind::Chat,
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
@@ -2887,6 +3575,7 @@ mod tests {
             agent,
             agents,
             commands: Arc::new(CommandRegistry::builtin()),
+            allowed_skills: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             steer: SteerBuffer::new(),
@@ -2896,7 +3585,58 @@ mod tests {
             review_tool_defs: None,
             activated_tools: None,
             write_origin: crate::domain::WriteOrigin::User,
-        }
+            delegation_catalog: Vec::new(),
+        };
+        seed_owned_session_with_root(&mut deps, "test root").await;
+        (deps, registry)
+    }
+
+    async fn seed_owned_session_with_root(deps: &mut RunnerDeps, task: &str) {
+        use crate::domain::{AgentIdentitySnapshot, Session, SessionStatus};
+
+        deps.store
+            .insert_session(Session {
+                session_pk: deps.session_pk.clone(),
+                primary_agent_id: Some(deps.primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(AgentIdentitySnapshot {
+                    id: deps.primary_agent.profile.id.clone(),
+                    name: deps.primary_agent.profile.name.clone(),
+                    avatar_color: deps.primary_agent.profile.avatar.color.clone(),
+                }),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("test root".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::BypassPermissions,
+                started_by: None,
+                created_at: None,
+                last_active: None,
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+            })
+            .await
+            .unwrap();
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), task)
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id.clone();
+        deps.root_run_id = root.run.run_id;
+        deps.agent = crate::harness::native::primary_turn_config_with_tools(
+            deps.primary_agent.clone(),
+            deps.run_id.clone(),
+            deps.root_run_id.clone(),
+            &deps.tools.names(),
+        )
+        .unwrap()
+        .agent_tools;
     }
 
     /// Feature C1a: a real tool call (the bash tool, actually executed —
@@ -3243,8 +3983,6 @@ mod tests {
     /// queue row for the main agent, carrying a cache-parity payload.
     #[tokio::test]
     async fn finalizer_enqueues_a_learning_row_every_nudge_interval() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
-
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("one"), final_turn("two")]));
         let deps = deps_at(dir.path(), llm).await;
@@ -3256,33 +3994,6 @@ mod tests {
             )
             .await
             .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                // Pre-titled: an untitled session would make `run_turn`'s
-                // trailing `maybe_generate_title` call consume a THIRD
-                // scripted LLM turn (this test scripts exactly two, one per
-                // `run_turn` call).
-                title: Some("titled".into()),
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-
         run_turn(
             &deps,
             TurnPrompt::text("one", "one"),
@@ -3342,8 +4053,6 @@ mod tests {
     /// a non-`Full` `DisplayMode` too, so the same mechanism will exclude it.)
     #[tokio::test]
     async fn subagent_end_turn_never_nudges_even_past_threshold() {
-        use crate::domain::{PermMode, Session, SessionKind, SessionStatus};
-
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(ScriptedLlm::new(vec![final_turn("subagent reply")]));
         let deps = deps_at(dir.path(), llm).await;
@@ -3355,29 +4064,6 @@ mod tests {
             )
             .await
             .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                project_id: None,
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Chat,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
-
         let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
         let mut cm = ContextManager::load(deps.store.clone(), "subagent", cfg)
             .await
@@ -3708,7 +4394,7 @@ mod tests {
     /// per-turn snapshot has rows to read while title generation stays off
     /// (an untitled session row would consume an extra scripted LLM turn).
     async fn seed_pinned_project(store: &Store, model: Option<&str>) {
-        use crate::domain::{Project, Session, SessionKind, SessionStatus};
+        use crate::domain::Project;
         store
             .insert_project(Project {
                 project_id: "p".into(),
@@ -3723,28 +4409,55 @@ mod tests {
             })
             .await
             .unwrap();
-        store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                project_id: Some("p".into()),
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: Some("titled".into()),
-                status: SessionStatus::Running,
-                perm_mode: PermMode::BypassPermissions,
-                started_by: None,
-                created_at: Some(0),
-                last_active: Some(0),
-                resume_attempts: 0,
-                branch_owned: true,
-                kind: SessionKind::Project,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
+        store.set_session_project("s1", "p").await.unwrap();
+        store.set_session_title("s1", "titled").await.unwrap();
+    }
+
+    async fn add_anthropic_conn_with_efforts(store: &Store, models: &[&str]) {
+        use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
+        use crate::llm_router::model_effort::{DiscoveredModelMeta, ReasoningEffortOption};
+
+        let effort = |value: &str| ReasoningEffortOption {
+            value: value.into(),
+            label: value.into(),
+            description: None,
+        };
+        connections::add_connection(
+            store,
+            ConnectionRow {
+                id: "claude".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "claude".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    api_key: Some("sk-test".into()),
+                    models_override: Some(models.iter().map(|model| (*model).into()).collect()),
+                    model_meta_overrides: Some(
+                        models
+                            .iter()
+                            .map(|model| {
+                                (
+                                    (*model).into(),
+                                    DiscoveredModelMeta {
+                                        effort_options: Some(vec![effort("low"), effort("high")]),
+                                        default_effort_advertised: true,
+                                        default_effort: Some("low".into()),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// An enabled anthropic API-key connection serving exactly `models`, so
@@ -3774,15 +4487,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_turn_picks_up_a_mid_chat_model_change() {
+    async fn durable_primary_model_wins_over_a_project_pin() {
         use testutil::RecordingLlm;
+
         let dir = tempfile::tempdir().unwrap();
-        let turn1 = vec![text_delta("one"), message_delta("end_turn"), message_stop()];
-        let turn2 = vec![text_delta("two"), message_delta("end_turn"), message_stop()];
-        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
         let mut deps = deps_at(dir.path(), llm.clone()).await;
-        // Simulate what start_session froze into RunnerDeps at session start.
-        deps.model = Some("anthropic/model-a".into());
+        deps.model = Some("anthropic/model-b".into());
         add_anthropic_conn(&deps.store, &["model-a", "model-b"]).await;
         seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
 
@@ -3794,45 +4506,44 @@ mod tests {
         .await
         .unwrap();
 
-        // The user repins the model mid-chat (exactly what the composer's
-        // model picker writes via update_project).
+        assert_eq!(llm.bodies.lock().unwrap()[0]["model"], "anthropic/model-b");
+    }
+
+    #[tokio::test]
+    async fn scheduler_model_override_wins_over_project_and_primary_models() {
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(RecordingLlm::new(vec![turn]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.model = Some("anthropic/model-b".into());
+        add_anthropic_conn(&deps.store, &["model-a", "model-b", "model-c"]).await;
+        seed_pinned_project(&deps.store, Some("anthropic/model-a")).await;
         deps.store
-            .update_project(
-                "p",
-                Some("anthropic/model-b".into()),
-                PermMode::BypassPermissions,
-            )
+            .with_conn(|connection| {
+                connection.execute(
+                    "UPDATE sessions SET started_by = 'scheduler' WHERE session_pk = 's1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        deps.store
+            .update_session_runtime_settings("s1", Some("anthropic/model-c".into()), None)
             .await
             .unwrap();
 
         run_turn(
             &deps,
-            TurnPrompt::text("two", "two"),
+            TurnPrompt::text("one", "one"),
             CancellationToken::new(),
         )
         .await
         .unwrap();
 
-        {
-            let bodies = llm.bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 2);
-            assert_eq!(bodies[0]["model"], "anthropic/model-a");
-            assert_eq!(
-                bodies[1]["model"], "anthropic/model-b",
-                "the next turn must re-read the project's pinned model"
-            );
-        }
-
-        // Negative invariant: both pins (model-a, then model-b) are routable
-        // via the connection seeded above, so neither turn should have
-        // announced a substitution.
-        let msgs = deps.store.list_messages("s1").await.unwrap();
-        assert!(
-            !msgs.iter().any(|m| m.payload["summary"]
-                .as_str()
-                .is_some_and(|s| s.contains("is not routable"))),
-            "a routable pin must never emit a not-routable status row"
-        );
+        assert_eq!(llm.bodies.lock().unwrap()[0]["model"], "anthropic/model-c");
     }
 
     #[tokio::test]
@@ -3968,7 +4679,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_model_overrides_the_project_model_for_one_turn() {
-        use crate::domain::{PermMode, Project, Session, SessionKind, SessionStatus};
+        use crate::domain::{PermMode, Project};
         use testutil::RecordingLlm;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3997,28 +4708,6 @@ mod tests {
             })
             .await
             .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                project_id: Some("p".into()),
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Idle,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: None,
-                last_active: None,
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Project,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
 
         run_turn(
             &deps,
@@ -4030,7 +4719,13 @@ mod tests {
 
         let body = llm.bodies.lock().unwrap().pop().unwrap();
         assert_eq!(body["model"], "anthropic/model-b");
-        assert!(!body.to_string().contains("subtask"));
+        // The command's `subtask: true` frontmatter controls only the turn's
+        // runtime iteration budget (see `turn_options`/`max_provider_turns`);
+        // it must never appear as a message/system-prompt field. The
+        // available `task` tool's own description legitimately contains the
+        // substring "subtasks", so assert on the user message content
+        // specifically rather than the whole serialized body.
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Ship now");
     }
     #[tokio::test]
     async fn refresh_turn_configuration_reloads_model_effort_preferences_defaults_and_meta() {
@@ -4126,6 +4821,10 @@ mod tests {
             .clear_model_effort_preference(&key_a)
             .await
             .unwrap();
+        // The durable primary model wins over the project pin; update it before
+        // the next turn so this test continues to exercise model-specific
+        // effort and metadata refresh without relying on project precedence.
+        deps.model = Some("anthropic/model-b".into());
         let key_b = ModelPreferenceKey {
             family: "anthropic".into(),
             model: "model-b".into(),
@@ -4192,7 +4891,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
         let llm = Arc::new(RecordingLlm::new(vec![turn]));
-        let deps = deps_at(dir.path(), llm.clone()).await;
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.model = None;
         add_anthropic_conn(&deps.store, &["model-a"]).await;
         // A route the default-model fallback resolves to (mirrors
         // native/mod.rs::native_model_resolution_falls_back_from_an_unresolvable_model).
@@ -5159,29 +5859,24 @@ mod tests {
         assert!(!eff.allows("memory"));
     }
 
-    /// Task E6 schema gate: `orch_block` is hidden from every session kind
-    /// but `Worker`, even for an agent (`build`) whose own `ToolFilter` is
-    /// `All`. The tool's own `Store::task_by_session` lookup (exercised in
-    /// `tools::orch_block`'s tests) is the runtime backstop this pairs with.
     #[test]
-    fn visible_tool_defs_hides_orch_block_outside_worker_sessions() {
-        let tools = ToolRegistry::builtin();
-        let agent = AgentRegistry::builtin().default_agent();
-        assert_eq!(agent.tools, super::super::agents::ToolFilter::All);
-        let names = |defs: &[Value]| -> Vec<String> {
-            defs.iter()
-                .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                .collect()
-        };
-        for kind in [SessionKind::Chat, SessionKind::Project, SessionKind::Review] {
-            let defs = visible_tool_defs(&tools, &agent, kind, None);
-            assert!(
-                !names(&defs).contains(&"orch_block".to_string()),
-                "{kind:?} must not see orch_block"
-            );
-        }
-        let worker_defs = visible_tool_defs(&tools, &agent, SessionKind::Worker, None);
-        assert!(names(&worker_defs).contains(&"orch_block".to_string()));
+    fn delegated_main_child_filter_adds_only_delegation_tools() {
+        use super::super::agents::ToolFilter;
+
+        let names = ["read", "bash", "task", "delegate_agent", "write"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let filter = effective_delegated_main_child_filter(
+            ToolFilter::Only(vec!["read".to_string()]),
+            &names,
+        );
+
+        assert!(filter.allows("read"));
+        assert!(filter.allows("task"));
+        assert!(filter.allows("delegate_agent"));
+        assert!(!filter.allows("bash"));
+        assert!(!filter.allows("write"));
     }
 
     #[test]
@@ -5216,8 +5911,8 @@ mod tests {
     fn visible_tool_defs_none_is_the_full_filtered_set() {
         let tools = ToolRegistry::builtin();
         let agent = AgentRegistry::builtin().default_agent(); // tools: ToolFilter::All
-        let eager = visible_tool_defs(&tools, &agent, SessionKind::Chat, None);
-        // Full set (25) minus orch_block (hidden outside Worker) = 24, and no load_tools.
+        let eager = visible_tool_defs(&tools, &agent, None);
+        // Full filtered set, no load_tools.
         let names: Vec<String> = eager
             .iter()
             .filter_map(|d| d["name"].as_str().map(String::from))
@@ -5235,7 +5930,7 @@ mod tests {
         let tools = ToolRegistry::builtin();
         let agent = AgentRegistry::builtin().default_agent();
         let empty = std::collections::BTreeSet::new();
-        let lazy = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&empty));
+        let lazy = visible_tool_defs(&tools, &agent, Some(&empty));
         let names: Vec<String> = lazy
             .iter()
             .filter_map(|d| d["name"].as_str().map(String::from))
@@ -5268,7 +5963,7 @@ mod tests {
         let agent = AgentRegistry::builtin().default_agent();
         let mut set = std::collections::BTreeSet::new();
         set.insert("webfetch".to_string());
-        let lazy = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&set));
+        let lazy = visible_tool_defs(&tools, &agent, Some(&set));
         let names: Vec<String> = lazy
             .iter()
             .filter_map(|d| d["name"].as_str().map(String::from))
@@ -5284,7 +5979,7 @@ mod tests {
             .unwrap()
             .contains("\n- webfetch:"));
         // Deterministic order across calls.
-        let again = visible_tool_defs(&tools, &agent, SessionKind::Chat, Some(&set));
+        let again = visible_tool_defs(&tools, &agent, Some(&set));
         assert_eq!(lazy, again);
     }
 
@@ -5318,31 +6013,6 @@ mod tests {
             .collect();
         assert!(enames.contains(&"webfetch".to_string()));
         assert!(!enames.contains(&LOAD_TOOLS_NAME.to_string()));
-    }
-
-    /// A Worker-kind primary session is eager (`activated_tools: None`), not
-    /// lazy — its own `orch_block` "block for human" primitive must never sit
-    /// behind a `load_tools` step. Mirrors `worker_defs` in
-    /// `visible_tool_defs_hides_orch_block_outside_worker_sessions` above, but
-    /// asserts the `None` (eager) path directly: `orch_block` advertised, no
-    /// synthetic `load_tools`.
-    #[test]
-    fn visible_tool_defs_worker_sessions_are_eager() {
-        let tools = ToolRegistry::builtin();
-        let agent = AgentRegistry::builtin().default_agent();
-        let defs = visible_tool_defs(&tools, &agent, SessionKind::Worker, None);
-        let names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["name"].as_str().map(String::from))
-            .collect();
-        assert!(
-            names.contains(&"orch_block".to_string()),
-            "Worker sessions must see their own block-for-human primitive"
-        );
-        assert!(
-            !names.iter().any(|n| n == LOAD_TOOLS_NAME),
-            "Worker sessions are eager: no synthetic load_tools"
-        );
     }
 
     #[tokio::test]
@@ -5570,6 +6240,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         let results = spawner
             .run_many(vec![
@@ -5606,6 +6277,7 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(turns));
         let deps = deps_at(dir.path(), llm).await;
         let spawner = RunnerSpawner {
+            parent_run_id: deps.run_id.clone(),
             deps,
             cancel: CancellationToken::new(),
             depth: 0,
@@ -5636,6 +6308,7 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::new(vec![child]));
         let deps = deps_at(dir.path(), llm).await;
         let spawner = RunnerSpawner {
+            parent_run_id: deps.run_id.clone(),
             deps,
             cancel: CancellationToken::new(),
             depth: 0,
@@ -5668,6 +6341,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let spawner = RunnerSpawner {
+            parent_run_id: deps.run_id.clone(),
             deps,
             cancel,
             depth: 0,
@@ -5691,159 +6365,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestrator_child_delegates_at_default_depth() {
-        use testutil::RecordingLlm;
-        let dir = tempfile::tempdir().unwrap();
-        // parent → task(orchestrator) → orchestrator → task(explore) →
-        // explore reports → orchestrator synthesizes → parent closes.
-        let parent = vec![
-            tool_use_start(0, "c1", "task"),
-            input_json_delta(
-                0,
-                "{\"subagent_type\":\"orchestrator\",\"prompt\":\"coordinate this\"}",
-            ),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        let orch_1 = vec![
-            tool_use_start(0, "c2", "task"),
-            input_json_delta(
-                0,
-                "{\"subagent_type\":\"explore\",\"prompt\":\"look around\"}",
-            ),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        let explore = vec![
-            text_delta("explored ok"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let orch_2 = vec![
-            text_delta("coordinated: explored ok"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let parent_end = vec![
-            text_delta("done"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let llm = Arc::new(RecordingLlm::new(vec![
-            parent, orch_1, explore, orch_2, parent_end,
-        ]));
-        // max_spawn_depth unset: the default (2) must let the builtin
-        // orchestrator delegate out of the box.
-        let deps = deps_at(dir.path(), llm.clone()).await;
-
-        run_turn(
-            &deps,
-            TurnPrompt::text("go wide", "go wide"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        {
-            let bodies = llm.bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 5, "orchestrator's delegation really ran");
-            // The orchestrator child carries the capability block + task tool.
-            let orch_sys = bodies[1]["system"].as_str().unwrap();
-            assert!(orch_sys.contains("spawn depth 1 of 2"), "{orch_sys}");
-            let orch_tools: Vec<&str> = bodies[1]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|t| t["name"].as_str())
-                .collect();
-            assert!(orch_tools.contains(&"task"));
-            assert!(!orch_tools.contains(&"memory"), "memory stays blocked");
-            // Guard dropped before the awaits below (clippy: await_holding_lock).
-        }
-        // The grandchild explore ran and fed the orchestrator's synthesis.
-        let task_row_out = deps
-            .store
-            .list_messages("s1")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|m| m.block_type == "tool_call" && m.payload["name"] == "task")
-            .expect("task row")
-            .payload["output"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(task_row_out.contains("coordinated: explored ok"));
-    }
-
-    #[tokio::test]
-    async fn orchestrator_child_cannot_delegate_when_depth_is_flat() {
-        use testutil::RecordingLlm;
-        let dir = tempfile::tempdir().unwrap();
-        let parent = vec![
-            tool_use_start(0, "c1", "task"),
-            input_json_delta(
-                0,
-                "{\"subagent_type\":\"orchestrator\",\"prompt\":\"coordinate\"}",
-            ),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        // The orchestrator tries to delegate anyway; the tool must refuse.
-        let orch_try = vec![
-            tool_use_start(0, "c2", "task"),
-            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"x\"}"),
-            message_delta("tool_use"),
-            message_stop(),
-        ];
-        let orch_give_up = vec![
-            text_delta("did it alone"),
-            message_delta("end_turn"),
-            message_stop(),
-        ];
-        let parent_end = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
-        let llm = Arc::new(RecordingLlm::new(vec![
-            parent,
-            orch_try,
-            orch_give_up,
-            parent_end,
-        ]));
-        let deps = deps_at(dir.path(), llm.clone()).await;
-        // Explicit flat delegation: the orchestrator child may not re-spawn.
-        deps.store
-            .set_setting(crate::domain::WriteOrigin::User, "max_spawn_depth", "1")
-            .await
-            .unwrap();
-
-        run_turn(
-            &deps,
-            TurnPrompt::text("go", "go"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        let bodies = llm.bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 4, "no grandchild stream was opened");
-        // `task` was filtered out of the child's toolset entirely, so the
-        // allow-list gate refuses the attempt.
-        let orch_tools: Vec<&str> = bodies[1]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert!(!orch_tools.contains(&"task"));
-        let msgs = serde_json::to_string(&bodies[2]["messages"]).unwrap();
-        assert!(msgs.contains("not permitted"), "{msgs}");
-        // And its system prompt has no capability block.
-        assert!(!bodies[1]["system"]
-            .as_str()
-            .unwrap()
-            .contains("spawn depth"));
-    }
-
-    #[tokio::test]
     async fn subagent_deps_never_inherit_parent_memory() {
         use crate::agents::knowledge::AgentKnowledgeStore;
         use crate::harness::native::memory::MemoryStore;
@@ -5858,9 +6379,64 @@ mod tests {
             )
             .unwrap(),
         ));
-        let child = deps_for_subagent(&parent);
+        let child = deps_for_subagent(&parent).await.unwrap();
         assert!(child.memory.is_none());
+        assert!(child.attachments_dir.is_none());
+        assert_eq!(child.work_dir, parent.work_dir);
+        assert_eq!(child.project_id, parent.project_id);
         assert!(child.app_control.is_none());
+    }
+
+    #[tokio::test]
+    async fn subagent_cannot_read_parent_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_attachments = tempfile::tempdir().unwrap();
+        let attachment_dir = parent_attachments.path().to_path_buf();
+        let attachment = attachment_dir.join("private.txt");
+        tokio::fs::write(&attachment, "parent-only attachment")
+            .await
+            .unwrap();
+        let child_turn = vec![
+            tool_use_start(0, "read-parent-attachment", "read"),
+            input_json_delta(
+                0,
+                &format!(
+                    r#"{{"path":{}}}"#,
+                    serde_json::to_string(&attachment).unwrap()
+                ),
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_turn, final_turn("done")]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.attachments_dir = Some(attachment_dir);
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+
+        let result = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "try to read the parent attachment".into(),
+            }])
+            .await;
+
+        assert_eq!(result[0].status, SubtaskStatus::Completed);
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let read = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("read-parent-attachment"))
+            .expect("the attempted child read is recorded");
+        assert!(
+            !read.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("parent-only attachment")),
+            "the parent attachment content must never reach the subagent"
+        );
     }
 
     #[tokio::test]
@@ -5927,7 +6503,6 @@ mod tests {
 
     #[tokio::test]
     async fn generates_a_title_for_a_fresh_session() {
-        use crate::domain::{Project, Session, SessionKind, SessionStatus};
         let dir = tempfile::tempdir().unwrap();
         // Turn 0: the actual reply. Turn 1: the title generation.
         let main = vec![
@@ -5943,43 +6518,10 @@ mod tests {
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![main, title]));
         let deps = deps_at(dir.path(), llm).await;
-        // A session row must exist (and be untitled) for title generation.
-        deps.store
-            .insert_project(Project {
-                project_id: "p".into(),
-                name: "p".into(),
-                workdir: dir.path().to_string_lossy().into(),
-                source: None,
-                model: None,
-                effort: None,
-                perm_mode: PermMode::Default,
-                created_at: Some(0),
-                is_git: false,
-            })
-            .await
-            .unwrap();
-        deps.store
-            .insert_session(Session {
-                session_pk: "s1".into(),
-                project_id: Some("p".into()),
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Running,
-                perm_mode: PermMode::Default,
-                started_by: None,
-                created_at: Some(0),
-                last_active: Some(0),
-                resume_attempts: 0,
-                branch_owned: true,
-                kind: SessionKind::Project,
-                speaker: None,
-                agent: None,
-                parent_session_pk: None,
-            })
-            .await
-            .unwrap();
+        // Override the default fixture title so this test still exercises
+        // title generation without replacing its durable session/root run.
+        deps.store.clear_session_title("s1").await.unwrap();
+        deps.store.set_session_project("s1", "p").await.unwrap();
 
         run_turn(
             &deps,
@@ -6433,14 +6975,19 @@ mod tests {
         }
     }
 
-    /// Insert an IDLE session row for `session_pk` — the rail's
-    /// `claim_deliverable_background_event` only claims rows whose target
-    /// session is idle (spec §6.1's idle-only invariant).
+    /// Ensure `session_pk` has a durable session row for tests that exercise
+    /// background delivery. `deps_with_store_and_registry` already creates the
+    /// matching owned root run used by run-scoped transcript emission.
     async fn seed_idle_session(store: &Store, session_pk: &str) {
+        if store.get_session(session_pk).await.unwrap().is_some() {
+            return;
+        }
         use crate::domain::{Session, SessionKind, SessionStatus};
         store
             .insert_session(Session {
                 session_pk: session_pk.to_string(),
+                primary_agent_id: None,
+                primary_agent_snapshot: None,
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -6460,6 +7007,18 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    async fn wait_for_background_release(
+        background: &crate::harness::native::background::BackgroundRegistry,
+    ) {
+        for _ in 0..200 {
+            if background.active() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("background reservation was not released within the poll window");
     }
 
     /// Poll the rail (bounded) until the detached worker for `session_pk`
@@ -6492,6 +7051,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         // Fill the one slot with a manual reservation.
         let _held = deps.background.try_reserve(1, &deps.session_pk).unwrap();
@@ -6524,6 +7084,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 1,
+            parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
             .run_background(SubtaskSpec {
@@ -6542,7 +7103,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn run_background_dispatch_writes_a_rail_row_on_completion() {
+    async fn nested_main_background_task_delivers_to_the_root_run() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = StateDirGuard::new();
         let child_turn = vec![
@@ -6551,10 +7112,60 @@ mod tests {
             message_stop(),
         ];
         let llm = Arc::new(ScriptedLlm::new(vec![child_turn]));
-        let mut deps = deps_at(dir.path(), llm).await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let target = registry
+            .create(crate::agents::types::AgentMutationInput {
+                name: "Delegate".into(),
+                description: "delegate".into(),
+                avatar: crate::agents::types::AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: crate::agents::types::AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: crate::agents::types::AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: crate::agents::types::AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: crate::agents::types::AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
         deps.model = Some("anthropic/model-a".into());
         // The parent session row must exist + be idle for the rail JOIN later.
         seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "audit auth")
+            .await
+            .unwrap();
+        let root_run_id = root.run.run_id.clone();
+        let parent = deps
+            .delegation
+            .queue_main(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id.clone(),
+                target_agent_id: target.profile.id,
+                task: "delegate audit".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        deps.run_id = parent.run.run_id.clone();
+        deps.root_run_id = root_run_id.clone();
         // Generous headroom so the short child report is not spilled.
         deps.store
             .upsert_session_context(
@@ -6567,6 +7178,7 @@ mod tests {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: parent.run.run_id,
         };
         let out = spawner
             .run_background(SubtaskSpec {
@@ -6579,7 +7191,12 @@ mod tests {
             _ => panic!("expected dispatch"),
         };
         let row = wait_for_rail_row(&deps.store, &deps.session_pk).await;
-        assert_eq!(row.kind, "delegation");
+        assert_eq!(row.kind, crate::domain::BackgroundKind::Delegation.as_str());
+        assert_eq!(
+            row.origin_run_id.as_deref(),
+            Some(root_run_id.as_str()),
+            "a main delegate's background task must deliver to the root primary run"
+        );
         assert!(row
             .payload
             .contains(&format!("[ASYNC DELEGATION COMPLETE — {id}]")));
@@ -6587,16 +7204,1179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_background_cancelled_worker_writes_nothing_to_the_rail() {
+    async fn background_main_delegate_reserves_a_cancellable_worker_and_never_enqueues_after_end() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
         let dir = tempfile::tempdir().unwrap();
-        // No scripted turns: the cancelled worker must never reach the model.
         let llm = Arc::new(ScriptedLlm::new(vec![]));
-        let deps = deps_at(dir.path(), llm).await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (deps, registry) = deps_with_executable_profile_registry(dir.path(), llm, store).await;
         seed_idle_session(&deps.store, &deps.session_pk).await;
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Background target".into(),
+                description: "background target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let root_run_id = deps.run_id.clone();
+
+        let dispatched = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id,
+                target_agent_id: target.profile.id,
+                task: "wait for cancellation".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+        assert_eq!(
+            deps.background.active(),
+            1,
+            "main delegates reserve background capacity"
+        );
+
+        deps.background.interrupt_for_session(&deps.session_pk);
+        wait_for_background_release(&deps.background).await;
+        assert_eq!(
+            deps.background.active(),
+            0,
+            "cancellation releases the main delegate reservation"
+        );
+        assert_eq!(
+            deps.store.pending_background_count().await.unwrap(),
+            0,
+            "a cancelled main delegate cannot enqueue a stale rail row"
+        );
+        let child = deps
+            .delegation
+            .await_terminal(&dispatched.run_id)
+            .await
+            .expect("the cancelled worker records its terminal run");
+        assert_eq!(
+            child.status,
+            crate::domain::AgentRunStatus::Cancelled,
+            "cancelling the detached worker must mark its child run cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_main_delegate_enqueues_and_delivers_on_the_delegation_rail() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("background main result")]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (deps, registry) = deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Background target".into(),
+                description: "background target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let root_run_id = deps.run_id.clone();
+
+        let dispatched = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root_run_id.clone(),
+                target_agent_id: target.profile.id,
+                task: "finish in the background".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+
+        for _ in 0..200 {
+            if deps
+                .store
+                .get_agent_run(&dispatched.run_id)
+                .await
+                .unwrap()
+                .is_some_and(|run| run.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let child = deps
+            .store
+            .get_agent_run(&dispatched.run_id)
+            .await
+            .unwrap()
+            .expect("background main delegate is durable");
+        assert_eq!(child.status, crate::domain::AgentRunStatus::Completed);
+        assert_eq!(child.result.as_deref(), Some("background main result"));
+        assert!(
+            deps.store
+                .list_run_messages(&deps.session_pk, &root_run_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.block_type != "delegation_result"),
+            "main background results must not bypass the rail with a run message"
+        );
+
+        let claimed = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        assert_eq!(
+            claimed.kind,
+            crate::domain::BackgroundKind::Delegation.as_str()
+        );
+        assert!(claimed.payload.contains(&dispatched.run_id));
+        assert!(claimed.payload.contains("background main result"));
+        assert_eq!(claimed.claimed_by.as_deref(), Some("test-poll"));
+        deps.store
+            .mark_background_delivered(&claimed.id)
+            .await
+            .unwrap();
+        assert!(
+            deps.store
+                .claim_deliverable_background_event("after-delivery")
+                .await
+                .unwrap()
+                .is_none(),
+            "a delivered main delegation rail row is not claimed again"
+        );
+        assert!(
+            deps.store
+                .list_provider_turns(&deps.session_pk)
+                .await
+                .unwrap()
+                .is_empty(),
+            "enqueueing does not create a new primary turn; the generic rail owns delivery"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn continued_second_turn_background_main_and_task_rails_use_second_root() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            final_turn("background main result"),
+            final_turn("background task result"),
+        ]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let first_root = deps.root_run_id.clone();
+        let second = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "second turn")
+            .await
+            .unwrap();
+        let second_root = second.run.run_id;
+        deps.run_id = second_root.clone();
+        deps.root_run_id = second_root.clone();
+
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Background target".into(),
+                description: "background target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+
+        let main = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: second_root.clone(),
+                target_agent_id: target.profile.id,
+                task: "delegate in the background".into(),
+                context: None,
+                background: true,
+            })
+            .await;
+        assert_eq!(main.status, SubtaskStatus::Completed);
+        let task = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: second_root.clone(),
+        }
+        .run_background(SubtaskSpec {
+            agent_type: "general".into(),
+            prompt: "task in the background".into(),
+        })
+        .await;
+        assert!(matches!(task, BackgroundDispatch::Dispatched { .. }));
+
+        let first_rail = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        let second_rail = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        for rail in [first_rail, second_rail] {
+            assert_eq!(rail.origin_run_id.as_deref(), Some(second_root.as_str()));
+            assert_ne!(rail.origin_run_id.as_deref(), Some(first_root.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_mention_nested_retry_background_rail_uses_outer_root_without_user_turn() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        let _guard = StateDirGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn(
+            "background retry result",
+        )]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm, store).await;
+        let outer_root = deps.root_run_id.clone();
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Mentioned target".into(),
+                description: "mentioned target".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let explicit_child = deps
+            .delegation
+            .queue_main(crate::delegation::MainDelegationRequest {
+                parent_run_id: outer_root.clone(),
+                target_agent_id: target.profile.id,
+                task: "explicit mention".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        let nested_child = deps
+            .delegation
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: explicit_child.run.run_id.clone(),
+                subagent_type: "general".into(),
+                task: "nested task".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        deps.delegation
+            .fail(&explicit_child.run.run_id, "failed mention")
+            .await
+            .unwrap();
+        deps.delegation
+            .fail(&nested_child.run.run_id, "failed nested task")
+            .await
+            .unwrap();
+        let main_retry = deps
+            .delegation
+            .retry_child_handle(&deps.session_pk, &explicit_child.run.run_id)
+            .await
+            .unwrap();
+        let nested_retry = deps
+            .delegation
+            .retry_child_handle(&deps.session_pk, &nested_child.run.run_id)
+            .await
+            .unwrap();
+        for retry in [&main_retry, &nested_retry] {
+            assert_eq!(
+                deps.store
+                    .root_agent_run_id(&retry.run.run_id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(outer_root.as_str())
+            );
+        }
+
+        deps.run_id = nested_retry.run.run_id.clone();
+        deps.root_run_id = deps
+            .store
+            .root_agent_run_id(&nested_retry.run.run_id)
+            .await
+            .unwrap()
+            .expect("nested retry has an outer primary root");
+        let dispatched = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: nested_retry.run.run_id,
+        }
+        .run_background(SubtaskSpec {
+            agent_type: "general".into(),
+            prompt: "retry in the background".into(),
+        })
+        .await;
+        assert!(matches!(dispatched, BackgroundDispatch::Dispatched { .. }));
+
+        let rail = wait_for_rail_row(&deps.store, &deps.session_pk).await;
+        assert_eq!(rail.origin_run_id.as_deref(), Some(outer_root.as_str()));
+        assert!(
+            deps.store
+                .list_messages(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.role != "user"),
+            "background delivery must stay on the rail instead of creating a user turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_main_child_uses_the_target_profile_without_parent_leaks() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            PermissionDecision, PermissionRule,
+        };
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "target-app-call", "app_projects"),
+                input_json_delta(0, r#"{"action":"list"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "target-app-call", "app_projects"),
+                input_json_delta(0, r#"{"action":"list"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "target-mcp-call", "mcp__slack__send"),
+                input_json_delta(0, r#"{}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            vec![
+                tool_use_start(0, "profile-rule-call", "read"),
+                input_json_delta(0, r#"{"path":"ignored-by-profile-rule"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("target done"),
+        ]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm.clone(), store).await;
+        let parent = registry
+            .create(AgentMutationInput {
+                name: "Parent".into(),
+                description: "Parent-only profile".into(),
+                avatar: AgentAvatar {
+                    color: "orange".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/parent-model".into(),
+                    effort: Some("low".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: vec![PermissionRule {
+                        id: "parent-rule".into(),
+                        tool: "write".into(),
+                        decision: PermissionDecision::Allow,
+                        command_prefix: None,
+                    }],
+                },
+                skills: vec!["parent-skill".into()],
+                tools: AgentTools {
+                    native: vec!["write".into()],
+                    plugins: vec![],
+                    apps: vec![],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 9,
+                    max_tool_rounds: 9,
+                },
+            })
+            .await
+            .unwrap();
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Target".into(),
+                description: "Target-only profile".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: Some("high".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: vec![PermissionRule {
+                        id: "target-rule".into(),
+                        tool: "read".into(),
+                        decision: PermissionDecision::Deny,
+                        command_prefix: None,
+                    }],
+                },
+                skills: vec!["target-skill".into()],
+                tools: AgentTools {
+                    native: vec!["read".into(), "bash".into(), "app_projects".into()],
+                    plugins: vec!["github.search".into(), "lint.check".into()],
+                    apps: vec!["slack".into()],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 4,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        deps.primary_agent = Arc::new(parent);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "github",
+                "search",
+                "GitHub search",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "slack",
+                "send",
+                "Slack send",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+        ]));
+        deps.app_control = Some(Arc::new(
+            crate::harness::native::tools::testutil::FakeAppControl::default(),
+        ));
+        deps.attachments_dir = Some(dir.path().join("parent-attachments"));
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                deps.agent_knowledge.clone(),
+                "parent",
+                None,
+            )
+            .unwrap(),
+        ));
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        deps.store
+            .set_setting_raw(
+                "models.meta.anthropic/target-model",
+                r#"{"context_window":222222,"max_output_tokens":3333}"#,
+            )
+            .await
+            .unwrap();
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "parent")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id.clone();
+        let parent_attachments = deps.attachments_dir.clone();
+        let parent_memory = deps.memory.as_ref().unwrap().knowledge_root().to_path_buf();
+        let target_memory = crate::harness::native::memory::MemoryStore::for_agent(
+            deps.agent_knowledge.clone(),
+            &target.profile.id,
+            None,
+        )
+        .unwrap();
+        target_memory
+            .add(
+                crate::harness::native::memory::MemoryScope::Global,
+                "target memory only",
+            )
+            .await
+            .unwrap();
+
+        let result = RunnerMainAgentSpawner { deps: deps.clone() }
+            .run_child(crate::delegation::MainDelegationRequest {
+                parent_run_id: root.run.run_id,
+                target_agent_id: target.profile.id.clone(),
+                task: "inspect the target profile".into(),
+                context: Some("only inspect authentication files".into()),
+                background: false,
+            })
+            .await;
+
+        assert_eq!(result.status, SubtaskStatus::Completed);
+        let child = deps
+            .store
+            .get_agent_run(&result.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.executing_agent_id.as_deref(),
+            Some(target.profile.id.as_str())
+        );
+        assert_eq!(
+            child.resolved_model.as_deref(),
+            Some("anthropic/target-model")
+        );
+        assert_eq!(
+            child.tool_count, 3,
+            "only target-owned, schema-admitted tool calls are counted; the facade-gated app attempt is rejected before admission"
+        );
+        let bodies = llm.bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            5,
+            "the target loop executes its configured turns"
+        );
+        let body = &bodies[0];
+        assert_eq!(body["model"], "anthropic/target-model");
+        assert_eq!(
+            body["max_tokens"], 3_333,
+            "the target model metadata controls its output context"
+        );
+        assert_eq!(
+            llm.policies.lock().unwrap()[0].caller_override.as_deref(),
+            Some("high")
+        );
+        let tool_rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let target_app_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("target-app-call"))
+            .expect("target app facade call is recorded");
+        assert_eq!(
+            target_app_call.status.as_deref(),
+            Some("failed"),
+            "the target's app tool is advertised but cannot reach the parent's facade"
+        );
+        assert!(
+            target_app_call.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("not available in this context")),
+            "the target must not execute against the parent's app facade"
+        );
+        let target_mcp_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("target-mcp-call"))
+            .expect("target app MCP call is recorded");
+        assert_eq!(target_mcp_call.status.as_deref(), Some("completed"));
+        let profile_rule_call = tool_rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("profile-rule-call"))
+            .expect("target profile-rule call is recorded");
+        assert_eq!(profile_rule_call.status.as_deref(), Some("failed"));
+        assert_eq!(
+            profile_rule_call.payload["output"], "Denied by user",
+            "the target profile's deny rule applies even to a plan-safe read"
+        );
+        assert!(
+            tool_rows.iter().all(|row| !matches!(
+                row.tool_call_id.as_deref(),
+                Some("plan-mode-call" | "task-call" | "delegate-agent-call")
+            )),
+            "parent-only bash and delegation calls must not leak into the target loop"
+        );
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "inspect the target profile");
+        assert_eq!(content[1]["text"], "only inspect authentication files");
+        let system = body["system"].as_str().unwrap();
+        assert!(system.contains("target memory only"));
+        assert!(!system.contains("parent-skill"));
+        let advertised = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(advertised.contains(&"read"));
+        assert!(advertised.contains(&"bash"));
+        assert!(advertised.contains(&"task"));
+        assert!(advertised.contains(&"delegate_agent"));
+        assert!(advertised.contains(&"mcp__github__search"));
+        assert!(advertised.contains(&"mcp__slack__send"));
+        assert!(advertised.contains(&"app_projects"));
+        assert!(!advertised.contains(&"write"));
+        assert!(!advertised.contains(&"ext__lint__check"));
+        assert_eq!(
+            parent_attachments,
+            Some(dir.path().join("parent-attachments"))
+        );
+        assert_eq!(
+            deps.memory.as_ref().unwrap().knowledge_root(),
+            parent_memory
+        );
+        assert_ne!(target_memory.knowledge_root(), parent_memory.as_path());
+    }
+
+    #[tokio::test]
+    async fn main_delegate_retry_uses_the_target_profile_runner() {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("target retry complete")]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm.clone(), store).await;
+        let target = registry
+            .create(AgentMutationInput {
+                name: "Restricted target".into(),
+                description: "target profile".into(),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: Some("high".into()),
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: vec!["read".into()],
+                    plugins: vec!["github.search".into()],
+                    apps: vec!["slack".into()],
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap();
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "github",
+                "search",
+                "GitHub search",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+            Arc::new(crate::harness::native::tools::mcp::McpTool::new(
+                "slack",
+                "send",
+                "Slack send",
+                serde_json::json!({"type": "object"}),
+                Arc::new(StaticMcpCaller),
+                None,
+            )),
+        ]));
+        let failed = deps
+            .delegation
+            .queue_main(crate::delegation::MainDelegationRequest {
+                parent_run_id: deps.run_id.clone(),
+                target_agent_id: target.profile.id.clone(),
+                task: "retry only this target task".into(),
+                context: None,
+                background: false,
+            })
+            .await
+            .unwrap();
+        deps.delegation
+            .fail(&failed.run.run_id, "failed")
+            .await
+            .unwrap();
+        let retry = deps
+            .delegation
+            .retry_child_handle(&deps.session_pk, &failed.run.run_id)
+            .await
+            .unwrap();
+
+        let retry_id = retry.run.run_id.clone();
+        dispatch_retry_main_delegate(deps.clone(), retry).unwrap();
+        let terminal = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            deps.delegation.await_terminal(&retry_id),
+        )
+        .await
+        .expect("retry target must finish")
+        .unwrap();
+
+        assert_eq!(terminal.status, crate::domain::AgentRunStatus::Completed);
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/target-model");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "retry only this target task"
+        );
+        let advertised = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(advertised.contains(&"read"));
+        assert!(advertised.contains(&"task"));
+        assert!(advertised.contains(&"delegate_agent"));
+        assert!(advertised.contains(&"mcp__github__search"));
+        assert!(advertised.contains(&"mcp__slack__send"));
+        assert!(!advertised.contains(&"bash"));
+        assert!(!advertised.contains(&"write"));
+    }
+
+    #[tokio::test]
+    async fn tool_counts_include_main_subagent_and_retry_but_not_denied_or_unknown_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_allowed = vec![
+            tool_use_start(0, "main-allowed", "bash"),
+            input_json_delta(0, r#"{"command":"echo main"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let main_denied = vec![
+            tool_use_start(0, "main-denied", "write"),
+            input_json_delta(0, r#"{"path":"denied.txt","content":"no"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let main_unknown = vec![
+            tool_use_start(0, "main-unknown", "unknown"),
+            input_json_delta(0, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let child_allowed = vec![
+            tool_use_start(0, "child-allowed", "bash"),
+            input_json_delta(0, r#"{"command":"echo child"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let retry_allowed = vec![
+            tool_use_start(0, "retry-allowed", "bash"),
+            input_json_delta(0, r#"{"command":"echo retry"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            main_allowed,
+            main_denied,
+            main_unknown,
+            final_turn("main done"),
+            child_allowed,
+            vec![error_event("child failed")],
+            retry_allowed,
+            final_turn("retry done"),
+        ]));
+        let deps = deps_at(dir.path(), llm).await;
+        let mut restricted = deps.agent.clone();
+        restricted.tools = crate::harness::native::agents::ToolFilter::Only(vec!["bash".into()]);
+        let budget = IterationBudget::new(4);
+        let mut cm = ContextManager::ephemeral(
+            &deps.session_pk,
+            ContextConfig::with_meta(deps.meta.clone()),
+        );
+        cm.append_user(json!([{ "type": "text", "text": "count tools" }]))
+            .await
+            .unwrap();
+        drive(
+            &deps,
+            &restricted,
+            &mut cm,
+            &CancellationToken::new(),
+            None,
+            DisplayMode::Full,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            1,
+            "the primary run counts only its allowed known call"
+        );
+
         let spawner = RunnerSpawner {
             deps: deps.clone(),
             cancel: CancellationToken::new(),
             depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+        let child = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "run the child tool".into(),
+            }])
+            .await;
+        assert_eq!(child[0].status, SubtaskStatus::Error);
+        let first_child = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(first_child.tool_count, 1);
+
+        let retry = deps
+            .delegation
+            .retry_child(&deps.session_pk, &first_child.run_id)
+            .await
+            .unwrap();
+        let retry_handle = crate::delegation::RunHandle {
+            run: retry.clone(),
+            agent_snapshot: None,
+            cancel: CancellationToken::new(),
+        };
+        let retry_spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+        let retry_result = retry_spawner
+            .run_queued_child(
+                0,
+                SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "retry the child tool".into(),
+                },
+                retry_handle.cancel.clone(),
+                retry_handle,
+            )
+            .await;
+        assert_eq!(retry_result.status, SubtaskStatus::Completed);
+        assert_eq!(
+            deps.store
+                .get_agent_run(&retry.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            1,
+            "the retry owns a new single allowed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_subagent_stops_follow_on_tools_and_preserves_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocking_turn = vec![
+            tool_use_start(0, "blocking-call", "blocking"),
+            input_json_delta(0, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let next_tool_turn = vec![
+            tool_use_start(0, "must-not-run", "bash"),
+            input_json_delta(0, r#"{"command":"echo side-effect"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![blocking_turn, next_tool_turn]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(BlockingTool {
+            started: started.clone(),
+            release: release.clone(),
+            effects: effects.clone(),
+        })]));
+        let root = deps.run_id.clone();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: root,
+        };
+        let worker = tokio::spawn(async move {
+            spawner
+                .run_many(vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "block until cancelled".into(),
+                }])
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("the child entered its blocking tool");
+        let child = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .expect("the child is durably queued before it runs");
+        assert_eq!(child.status, crate::domain::AgentRunStatus::Running);
+        deps.delegation
+            .cancel_child(&deps.session_pk, &child.run_id)
+            .await
+            .unwrap();
+        release.notify_one();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("cancelling a child must settle its worker")
+            .unwrap();
+
+        assert_eq!(results[0].status, SubtaskStatus::Interrupted);
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            deps.store
+                .get_agent_run(&child.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::domain::AgentRunStatus::Cancelled,
+            "the worker must not overwrite the runtime cancellation"
+        );
+        assert!(
+            deps.store
+                .list_messages(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.tool_call_id.as_deref() != Some("must-not-run")),
+            "the cancellation token stops the loop before a subsequent tool side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_main_target_executes_advertised_task_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_task = vec![
+            tool_use_start(0, "delegate-work", "task"),
+            input_json_delta(0, r#"{"subagent_type":"general","prompt":"inspect"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(testutil::RecordingLlm::new(vec![
+            parent_task,
+            final_turn("subagent complete"),
+            final_turn("parent complete"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.isolated_target = true;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate", "delegate"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(llm.bodies.lock().unwrap().len(), 3);
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, crate::domain::AgentRunStatus::Completed);
+        assert_eq!(children[0].result.as_deref(), Some("subagent complete"));
+    }
+
+    #[tokio::test]
+    async fn subagent_uses_current_shared_model_effort_and_audits_it() {
+        use crate::agents::types::AgentModel;
+        use testutil::RecordingLlm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![final_turn("subagent complete")]));
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) =
+            deps_with_executable_profile_registry(dir.path(), llm.clone(), store).await;
+        deps.model = Some("anthropic/parent-model".into());
+        registry
+            .set_subagent_model(AgentModel::Concrete {
+                name: "anthropic/target-model".into(),
+                effort: Some("high".into()),
+            })
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+
+        let result = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "inspect".into(),
+            }])
+            .await;
+
+        assert_eq!(result[0].status, SubtaskStatus::Completed);
+        let body = llm.bodies.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "anthropic/target-model");
+        let policy = llm.policies.lock().unwrap().pop().unwrap();
+        assert_eq!(policy.caller_override.as_deref(), Some("high"));
+        let child = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            child.resolved_model.as_deref(),
+            Some("anthropic/target-model")
+        );
+        assert_eq!(child.resolved_effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn task_children_are_durable_runs_with_tool_counts_and_terminal_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_turn = vec![
+            tool_use_start(0, "child-call", "bash"),
+            input_json_delta(0, "{\"command\":\"echo child\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![child_turn, final_turn("child done")]));
+        let deps = deps_at(dir.path(), llm).await;
+        // `deps_at` already owns a root run for run-scoped transcript rows.
+        let root = deps.run_id.clone();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
+        };
+        let results = spawner
+            .run_many(vec![SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "inspect the workspace".into(),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, SubtaskStatus::Completed);
+        assert_eq!(results[0].report, "child done");
+        let children = deps.store.list_descendant_agent_runs(&root).await.unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, crate::domain::AgentRunStatus::Completed);
+        assert_eq!(children[0].tool_count, 1);
+        assert_eq!(
+            deps.store
+                .list_run_messages(&deps.session_pk, &children[0].run_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the child tool call must be attached to its durable run"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_background_cancelled_worker_writes_nothing_to_the_rail() {
+        let dir = tempfile::tempdir().unwrap();
+        // No scripted turns: the cancelled worker must never reach the model.
+        let llm = Arc::new(ScriptedLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        seed_idle_session(&deps.store, &deps.session_pk).await;
+        let root = deps
+            .delegation
+            .begin_primary(&deps.session_pk, deps.primary_agent.clone(), "audit auth")
+            .await
+            .unwrap();
+        deps.run_id = root.run.run_id;
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
             .run_background(SubtaskSpec {

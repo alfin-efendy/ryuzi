@@ -102,8 +102,16 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         label: "Max sub-agent spawn depth",
         field_type: FieldType::Int,
         default: Some("2"),
-        help: "How deep sub-agents may spawn further sub-agents (2 lets a \
-               delegating agent like `orchestrator` fan out; 1 = flat)",
+        help: "How deep sub-agents may spawn further sub-agents (2 permits a child \
+               agent to fan out; 1 = flat)",
+        ..BASE
+    },
+    ConfigField {
+        key: "approval_timeout_ms",
+        label: "Approval timeout (ms)",
+        field_type: FieldType::Int,
+        default: Some("300000"),
+        help: "How long to wait for a tool approval",
         ..BASE
     },
     ConfigField {
@@ -234,15 +242,16 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_28_keys_and_correct_flags() {
+    fn schema_has_29_keys_and_correct_flags() {
         let fields = all_fields();
-        assert_eq!(fields.len(), 28); // 25 global + 3 discord
+        assert_eq!(fields.len(), 29); // 26 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
-        // list order: 25 globals first, then 3 discord fields
+        // list order: 26 globals first, then 3 discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
+        assert!(keys.contains(&"approval_timeout_ms"));
         assert_eq!(
-            &keys[25..],
+            &keys[26..],
             &["discord.token", "discord.app_id", "discord.guild_id"]
         );
         // the only required global is workdir_root; all 3 discord fields required; token is the only secret

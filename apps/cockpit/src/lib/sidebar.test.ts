@@ -16,6 +16,8 @@ function sess(pk: string, projectId: string, title: string | null, lastActive = 
   return {
     runnerId: LOCAL_RUNNER,
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId,
     agentSessionId: null,
     worktreePath: null,
@@ -110,6 +112,8 @@ function unreadSess(pk: string, lastActive: number | null): UiSession {
   return {
     runnerId: LOCAL_RUNNER,
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p",
     agentSessionId: null,
     worktreePath: null,
@@ -219,6 +223,8 @@ test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fa
   const mk = (pk: string, lastActive: number): UiSession => ({
     runnerId: LOCAL_RUNNER,
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p",
     agentSessionId: null,
     worktreePath: null,
@@ -250,6 +256,8 @@ test("sessionsForProject with empty pinnedOrder keeps legacy pinned-first-then-r
   const mk = (pk: string, lastActive: number): UiSession => ({
     runnerId: LOCAL_RUNNER,
     sessionPk: pk,
+    primaryAgentId: null,
+    primaryAgentSnapshot: null,
     projectId: "p",
     agentSessionId: null,
     worktreePath: null,

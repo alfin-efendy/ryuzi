@@ -8,13 +8,13 @@ pub mod apps_api;
 pub mod audit;
 pub mod automation_api;
 pub mod connections_api;
+pub mod delegation_api;
 pub mod endpoint_api;
 pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
 pub mod learning_api;
 pub mod native_api;
-pub mod orch_api;
 pub mod plugins_api;
 pub mod remote_catalog_api;
 pub mod scheduler_api;
@@ -82,8 +82,17 @@ impl From<crate::agents::registry::AgentRegistryError> for ApiError {
     }
 }
 
+impl From<crate::mentions::MentionError> for ApiError {
+    fn from(e: crate::mentions::MentionError) -> Self {
+        ApiError::bad_request(e.to_string())
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(mention) = e.downcast_ref::<crate::mentions::MentionError>() {
+            return ApiError::from(mention.clone());
+        }
         ApiError {
             status: 500,
             message: e.to_string(),
@@ -118,6 +127,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if apps_api::HANDLES.contains(&m) => apps_api::dispatch(state, m, p).await,
         m if native_api::HANDLES.contains(&m) => native_api::dispatch(state, m, p).await,
         m if agent_api::HANDLES.contains(&m) => agent_api::dispatch(state, m, p).await,
+        m if delegation_api::HANDLES.contains(&m) => delegation_api::dispatch(state, m, p).await,
         m if session_io_api::HANDLES.contains(&m) => session_io_api::dispatch(state, m, p).await,
         m if fsview_api::HANDLES.contains(&m) => fsview_api::dispatch(state, m, p).await,
         m if skills_api::HANDLES.contains(&m) => skills_api::dispatch(state, m, p).await,
@@ -125,7 +135,6 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
         m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
-        m if orch_api::HANDLES.contains(&m) => orch_api::dispatch(state, m, p).await,
         m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await
@@ -147,22 +156,48 @@ pub(crate) mod tests_support {
     use async_trait::async_trait;
     use std::sync::Arc;
 
+    async fn prepare_test_agent_persistence(store: &Arc<crate::store::Store>) {
+        crate::llm_router::connections::add_connection(
+            store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(store)
+            .await
+            .unwrap();
+    }
+
     /// A fresh in-memory-backed `ApiState` with a real bearer token ("t").
     /// Leaks the backing tempfile's guard for test simplicity — acceptable
     /// since each test process exits shortly after.
     pub(crate) async fn state() -> ApiState {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            cp.store().clone(),
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = crate::control::ControlPlane::new(
+            store,
+            crate::plugins::Registries::new(),
+            persistence.clone(),
         )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
-        std::mem::forget(config);
+        .await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -182,11 +217,24 @@ pub(crate) mod tests_support {
     /// executable — required by registry mutations, which re-validate the
     /// whole candidate registry.
     pub(crate) async fn state_with_agents() -> ApiState {
+        state_with_agents_and_registries(crate::plugins::Registries::new()).await
+    }
+
+    pub(crate) async fn state_with_native_llm(
+        llm_factory: Arc<dyn crate::harness::native::llm::LlmStreamFactory>,
+    ) -> ApiState {
+        let mut registries = crate::plugins::Registries::new();
+        registries.harness =
+            Arc::new(crate::harness::native::NativeHarnessFactory::with_llm_factory(llm_factory));
+        state_with_agents_and_registries(registries).await
+    }
+
+    async fn state_with_agents_and_registries(registries: crate::plugins::Registries) -> ApiState {
         use crate::llm_router::routes::{
             self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget,
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         for name in ["smart", "fast"] {
             routes::save_model_route(
                 &store,
@@ -207,16 +255,10 @@ pub(crate) mod tests_support {
             .await
             .unwrap();
         }
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            cp.store().clone(),
-        )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
-        std::mem::forget(config);
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = crate::control::ControlPlane::new(store, registries, persistence.clone()).await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -230,16 +272,18 @@ pub(crate) mod tests_support {
         }
     }
 
-    /// Like `state()`, but with one connected project (`"p1"`) already in the
-    /// store — for command families (orch, scheduler, ...) whose calls need a
-    /// real `project_id` to validate against.
+    /// Like `state_with_agents()`, but with one connected project (`"p1"`)
+    /// already in the store — for command families whose calls need a real
+    /// `project_id` to validate against.
     pub(crate) async fn state_with_project() -> ApiState {
-        let s = state().await;
-        s.cp.store()
+        let state = state_with_agents().await;
+        state
+            .cp
+            .store()
             .insert_project(crate::domain::Project {
                 project_id: "p1".into(),
-                name: "demo".into(),
-                workdir: "/tmp/demo".into(),
+                name: "project".into(),
+                workdir: std::env::temp_dir().display().to_string(),
                 source: None,
                 model: None,
                 effort: None,
@@ -249,7 +293,7 @@ pub(crate) mod tests_support {
             })
             .await
             .unwrap();
-        s
+        state
     }
 
     /// A no-op `HarnessSession` — the RPC tests that use
@@ -303,19 +347,14 @@ pub(crate) mod tests_support {
         std::mem::forget(dir);
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(tmp.path()).await.unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let mut registries = crate::plugins::Registries::new();
         registries.harness = Arc::new(FakeHarnessFactory);
-        let cp = crate::control::ControlPlane::new(store, registries).await;
-        let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            cp.store().clone(),
-        )
-        .await
-        .unwrap();
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
-        std::mem::forget(config);
+        let persistence = crate::agents::bootstrap::AgentPersistence::temporary(Arc::clone(&store))
+            .await
+            .unwrap();
+        let cp = crate::control::ControlPlane::new(store, registries, persistence.clone()).await;
         std::mem::forget(tmp);
         ApiState {
             router_server: Arc::new(crate::llm_router::server::RouterServer::new(
@@ -412,6 +451,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_surface_has_no_legacy_orchestration_methods() {
+        let port = serve(state().await, opts(0)).await.unwrap();
+        let client = reqwest::Client::new();
+        for method in [
+            "orch_submit",
+            "orch_list_roots",
+            "orch_tasks",
+            "orch_cancel",
+            "orch_retry",
+            "orch_answer_block",
+            "orch_steer",
+        ] {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/rpc/{method}"))
+                .bearer_auth("t")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{method}"
+            );
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(
+                body["error"],
+                format!("unknown method: {method}"),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_method_is_404_with_error_envelope() {
         let port = serve(state().await, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
@@ -444,10 +517,10 @@ mod tests {
     #[tokio::test]
     async fn approvals_endpoint_resolves_a_registered_approval() {
         let s = state().await;
-        let rx = s.cp.approvals_for_test_register("req-9");
+        let rx = s.cp.approvals_for_test_register("run-9", "req-9");
         let port = serve(s, opts(0)).await.unwrap();
         let r = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{port}/approvals/req-9"))
+            .post(format!("http://127.0.0.1:{port}/approvals/run-9/req-9"))
             .bearer_auth("t")
             .json(
                 &json!({ "response": { "decision": "allowOnce", "scope": null, "payload": null } }),

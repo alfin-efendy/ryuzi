@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type {
   BranchList,
   CatalogEntry,
-  ChatRequestOptions,
+  ChatContextArg,
   CmdError,
   CommandInfo,
   ConnectionInfo,
@@ -37,11 +37,18 @@ const projectRuntimeInfo = mock(() => Promise.resolve({ status: "ok" as const, d
 // so the permission-picker test can drive the real store's start() and
 // inspect what startSession actually received.
 const startSession = mock(
-  (_runnerId: string, _projectId: string, _prompt: string, _options: ChatRequestOptions | null): Promise<Result<Session, CmdError>> =>
+  (
+    _runnerId: string,
+    _projectId: string,
+    _primaryAgentId: string,
+    _turn: { text: string; context: ChatContextArg | null },
+  ): Promise<Result<Session, CmdError>> =>
     Promise.resolve({
       status: "ok",
       data: {
         sessionPk: "s1",
+        primaryAgentId: null,
+        primaryAgentSnapshot: null,
         projectId: "p1",
         agentSessionId: null,
         worktreePath: null,
@@ -61,6 +68,38 @@ const startSession = mock(
       },
     }),
 );
+const startChatSession = mock(
+  (
+    _runnerId: string,
+    _primaryAgentId: string,
+    _turn: { text: string; context: ChatContextArg | null },
+  ): Promise<Result<Session, CmdError>> =>
+    Promise.resolve({
+      status: "ok",
+      data: {
+        sessionPk: "chat-1",
+        primaryAgentId: "ryuzi",
+        primaryAgentSnapshot: { id: "ryuzi", name: "Ryuzi", avatarColor: "violet" },
+        projectId: null,
+        agentSessionId: null,
+        worktreePath: null,
+        branch: null,
+        title: "chat",
+        status: "running",
+        permMode: "default",
+        startedBy: "cockpit",
+        createdAt: 1,
+        lastActive: 1,
+        resumeAttempts: 0,
+        branchOwned: false,
+        kind: "chat",
+        speaker: null,
+        agent: null,
+        parentSessionPk: null,
+      },
+    }),
+);
+
 const listProjects = mock((): Promise<Result<Project[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const listSessions = mock((): Promise<Result<Session[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 // refresh() (fire-and-forget after a successful start()) always fans out to
@@ -68,7 +107,17 @@ const listSessions = mock((): Promise<Result<Session[], CmdError>> => Promise.re
 const listGateways = mock((): Promise<Result<never[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { listBranches, nativeCommands, searchFiles, projectRuntimeInfo, startSession, listProjects, listSessions, listGateways },
+  commands: {
+    listBranches,
+    nativeCommands,
+    searchFiles,
+    projectRuntimeInfo,
+    startChatSession,
+    startSession,
+    listProjects,
+    listSessions,
+    listGateways,
+  },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // useComposerAttachments registers a Tauri drag-drop listener on mount.
@@ -80,8 +129,9 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
+const defaultHydrateConnections = useConnections.getState().hydrate;
 const { useAgents } = await import("@/store-agents");
-const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
+const { useModelStatuses } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
 const { useNative } = await import("@/store-native");
 
@@ -146,8 +196,34 @@ const anthropicConnection: ConnectionInfo = {
 beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1", projectRuntimeById: { p1: runtimeInfo } });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
-  useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
+  useConnections.setState({
+    catalog: catalogEntries,
+    connections: [anthropicConnection],
+    loaded: true,
+    hydrate: defaultHydrateConnections,
+  });
   useAgents.setState({
+    registry: {
+      agents: [
+        {
+          id: "ryuzi",
+          name: "Ryuzi",
+          description: "",
+          avatarColor: "violet",
+          model: { kind: "route", route: "smart" },
+          permissionMode: "ask",
+          skillCount: 0,
+          toolCount: 0,
+          knowledgeCount: 0,
+          executable: true,
+          validation: [],
+          isDefault: true,
+        },
+      ],
+      defaultAgentId: "ryuzi",
+      recovery: [],
+      subagentModel: { kind: "route", route: "fast" },
+    },
     models: [selectable("anthropic/claude-opus-4"), selectable("anthropic/claude-sonnet-4")],
   });
   useModelStatuses.setState({ byKey: {} });
@@ -156,7 +232,9 @@ beforeEach(() => {
   useNav.setState({ composerBranch: null });
   listBranches.mockClear();
   nativeCommands.mockClear();
+  searchFiles.mockClear();
   startSession.mockClear();
+  startChatSession.mockClear();
   listProjects.mockClear();
   listSessions.mockClear();
   listGateways.mockClear();
@@ -168,7 +246,7 @@ afterEach(() => {
   cleanup();
   useStore.setState({ projects: [], selectedProjectId: null, projectRuntimeById: {} });
   useConnections.setState({ catalog: [], connections: [], loaded: false });
-  useAgents.setState({ models: [] });
+  useAgents.setState({ registry: null, models: [] });
   useModelStatuses.setState({ byKey: {} });
   useUi.setState({ hideInvalidModels: false });
   useNative.setState({ commandsByProject: {} });
@@ -181,6 +259,15 @@ test("git project: branch pill shows and branches are fetched", async () => {
   // aria-label="Branch"; the visible branch name lives in its text content.
   await waitFor(() => expect(screen.getByRole("combobox", { name: "Branch" }).textContent).toContain("main"));
   expect(listBranches).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
+});
+
+test("hydrates provider connections when they have not loaded", async () => {
+  const hydrate = mock(async () => {});
+  useConnections.setState({ loaded: false, hydrate });
+
+  render(<HomeView />);
+
+  await waitFor(() => expect(hydrate).toHaveBeenCalledTimes(1));
 });
 
 test("non-git project: no branch pill, no worktree toggle, no list_branches call", async () => {
@@ -278,66 +365,230 @@ test("composer text is read from the persisted draft map (key home:{projectId})"
   });
 });
 
-test("composer model chip opens the structured model and effort menu", async () => {
-  render(<HomeView />);
-  const chip = screen.getByRole("button", { name: "Model and effort" });
-  expect(chip.textContent).toContain("Default model");
-  expect(chip.textContent).not.toContain("Ryuzi");
-  fireEvent.click(chip);
-  expect(await screen.findByText("claude-opus-4")).toBeTruthy();
-});
-
-test("chat-first composer keeps model and effort in durable nav state", async () => {
-  useStore.setState({ selectedProjectId: null, projectRuntimeById: {} });
+test("sends raw leading whitespace and its structured mention span", async () => {
   useAgents.setState({
-    models: [
-      {
-        ...selectable("anthropic/claude-opus-4"),
-        supported: [
-          { value: "medium", label: "Medium", description: null },
-          { value: "high", label: "High", description: null },
-        ],
-        resolvedDefault: "medium",
-        defaultSource: "provider",
-      },
-    ],
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        {
+          ...useAgents.getState().registry!.agents[0],
+          id: "ada",
+          name: "Ada",
+          description: "Accessibility reviewer",
+          isDefault: false,
+        },
+      ],
+    },
   });
-  useNav.setState({ composerModel: null, composerEffort: null });
   render(<HomeView />);
+  await waitFor(() => expect(useNav.getState().composerBranch).toBe("main"));
 
-  const trigger = screen.getByRole("button", { name: "Model and effort" });
-  fireEvent.click(trigger);
-  fireEvent.click(await screen.findByText("claude-opus-4"));
-  fireEvent.click(await screen.findByText("High"));
-  expect(useNav.getState()).toMatchObject({ composerModel: "anthropic/claude-opus-4", composerEffort: "high" });
+  const composer = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "  @a review", selectionStart: 4 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("  @Ada  review");
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() =>
+    expect(startSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "p1",
+      "ryuzi",
+      expect.objectContaining({
+        text: "  @Ada  review",
+        mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 2, endUtf16: 6 }],
+      }),
+    ),
+  );
 });
 
-test("structured composer model list comes from native metadata", async () => {
-  useModelStatuses.setState({ byKey: { [statusKey("anthropic", "claude-sonnet-4")]: "invalid" } });
-  useUi.setState({ hideInvalidModels: true });
+test("keeps structured mentions with their home draft when projects switch", async () => {
+  useStore.setState({ projects: [project(), project({ projectId: "p2", name: "other" })] });
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        { ...useAgents.getState().registry!.agents[0], id: "ada", name: "Ada", description: "Accessibility reviewer", isDefault: false },
+      ],
+    },
+  });
   render(<HomeView />);
-  fireEvent.click(screen.getByRole("button", { name: "Model and effort" }));
-  expect(await screen.findByText("claude-opus-4")).toBeTruthy();
-  expect(screen.getByText("claude-sonnet-4")).toBeTruthy();
+
+  const composer = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@a keep", selectionStart: 2 } });
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("@Ada  keep");
+
+  act(() => useStore.setState({ selectedProjectId: "p2" }));
+  fireEvent.change(composer, { target: { value: "plain p2" } });
+  act(() => useStore.setState({ selectedProjectId: "p1" }));
+  expect(composer.value).toBe("@Ada  keep");
+
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() =>
+    expect(startSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "p1",
+      "ryuzi",
+      expect.objectContaining({ mentions: [{ agentId: "ada", labelSnapshot: "Ada", startUtf16: 0, endUtf16: 4 }] }),
+    ),
+  );
 });
 
-test("permission picker seeds the new session's mode", async () => {
+test("textarea Escape closes the agent mention popup", () => {
+  useStore.setState({ selectedProjectId: null });
+  localStorage.removeItem("cockpit.lastPrimaryAgentId");
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        { ...useAgents.getState().registry!.agents[0], id: "ada", name: "Ada", description: "Accessibility reviewer", isDefault: false },
+      ],
+    },
+  });
   render(<HomeView />);
 
-  // Default label reflects the project's own default mode ("ask").
-  const trigger = screen.getByRole("combobox", { name: "Permission mode" });
-  expect(trigger.textContent).toContain("Ask");
+  const composer = screen.getByPlaceholderText("Do anything");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+  fireEvent.keyDown(composer, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+});
 
-  fireEvent.click(trigger);
-  fireEvent.click(await screen.findByRole("option", { name: /Full/ }));
-  // The trigger label updates to reflect the picked mode.
-  await waitFor(() => expect(trigger.textContent).toContain("Full"));
+test("plain agent @ mentions open the agent menu instead of searching context", () => {
+  useAgents.setState({
+    registry: {
+      ...useAgents.getState().registry!,
+      agents: [
+        ...useAgents.getState().registry!.agents,
+        { ...useAgents.getState().registry!.agents[0], id: "ada", name: "Ada", description: "Accessibility reviewer", isDefault: false },
+      ],
+    },
+  });
+  render(<HomeView />);
+
+  const composer = screen.getByPlaceholderText("Do anything");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+
+  expect(screen.getByRole("menu").textContent).toContain("Agents");
+  expect(searchFiles).not.toHaveBeenCalled();
+});
+
+test("selects the default primary and forwards a complete first project TurnInput", async () => {
+  render(<HomeView />);
+  await waitFor(() => expect(useNav.getState().composerBranch).toBe("main"));
 
   const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
   fireEvent.change(box, { target: { value: "ship it" } });
   fireEvent.keyDown(box, { key: "Enter" });
 
-  await waitFor(() => expect(startSession).toHaveBeenCalled());
-  const [, , , options] = startSession.mock.calls[0];
-  expect(options?.permMode).toBe("bypassPermissions");
+  await waitFor(() =>
+    expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "ryuzi", {
+      text: "ship it",
+      mentions: [],
+      context: { branch: "main", voiceTranscript: null, references: [] },
+      attachments: [],
+      git: { useWorktree: true, createBranch: true, branchName: null, baseBranch: null },
+    }),
+  );
+  expect(localStorage.getItem("cockpit.lastPrimaryAgentId")).toBe("ryuzi");
+});
+
+test("prefers a pending primary over persisted and default choices", async () => {
+  useNav.setState({ pendingPrimaryAgentId: "reviewer" });
+  localStorage.setItem("cockpit.lastPrimaryAgentId", "stored");
+  useAgents.setState({
+    registry: {
+      agents: [
+        { ...useAgents.getState().registry!.agents[0], id: "ryuzi", isDefault: true },
+        { ...useAgents.getState().registry!.agents[0], id: "stored", isDefault: false },
+        { ...useAgents.getState().registry!.agents[0], id: "reviewer", isDefault: false },
+      ],
+      defaultAgentId: "ryuzi",
+      recovery: [],
+      subagentModel: { kind: "route", route: "fast" },
+    },
+  });
+  render(<HomeView />);
+  await waitFor(() => expect(useNav.getState().composerBranch).toBe("main"));
+  fireEvent.change(screen.getByPlaceholderText("Do anything"), { target: { value: "assigned" } });
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+
+  await waitFor(() => expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "reviewer", expect.anything()));
+  expect(useNav.getState().pendingPrimaryAgentId).toBeNull();
+  expect(localStorage.getItem("cockpit.lastPrimaryAgentId")).toBe("reviewer");
+});
+
+test("uses a persisted executable primary when no pending choice exists", async () => {
+  localStorage.setItem("cockpit.lastPrimaryAgentId", "stored");
+  useAgents.setState({
+    registry: {
+      agents: [
+        { ...useAgents.getState().registry!.agents[0], id: "ryuzi", isDefault: true },
+        { ...useAgents.getState().registry!.agents[0], id: "stored", isDefault: false },
+      ],
+      defaultAgentId: "ryuzi",
+      recovery: [],
+      subagentModel: { kind: "route", route: "fast" },
+    },
+  });
+  render(<HomeView />);
+  await waitFor(() => expect(useNav.getState().composerBranch).toBe("main"));
+  fireEvent.change(screen.getByPlaceholderText("Do anything"), { target: { value: "resume" } });
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+
+  await waitFor(() => expect(startSession).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "stored", expect.anything()));
+});
+
+test("disables the composer and navigates to agent repair when no executable primary exists", () => {
+  useAgents.setState({
+    registry: {
+      agents: [{ ...useAgents.getState().registry!.agents[0], executable: false }],
+      defaultAgentId: "ryuzi",
+      recovery: [],
+      subagentModel: { kind: "route", route: "fast" },
+    },
+  });
+  useNav.setState({ drafts: { "home:p1": "keep this" } });
+  render(<HomeView />);
+
+  const box = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  expect(box.disabled).toBe(true);
+  expect(box.value).toBe("keep this");
+  expect(screen.getByRole("button", { name: "Start session" }).hasAttribute("disabled")).toBe(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "Repair agents" }));
+  expect(useNav.getState().view()).toEqual({ kind: "agents" });
+  expect(startSession).not.toHaveBeenCalled();
+});
+
+test("starts a chat without a project using the selected primary", async () => {
+  useStore.setState({ selectedProjectId: null });
+  render(<HomeView />);
+  fireEvent.change(screen.getByPlaceholderText("Do anything"), { target: { value: "chat" } });
+  fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+
+  await waitFor(() =>
+    expect(startChatSession).toHaveBeenCalledWith(LOCAL_RUNNER, "ryuzi", {
+      text: "chat",
+      mentions: [],
+      context: { branch: null, voiceTranscript: null, references: [] },
+      attachments: [],
+      git: null,
+    }),
+  );
+});
+
+test("preserves project, branch, context, voice, and attachment controls while model controls stay removed", () => {
+  render(<HomeView />);
+  expect(screen.getByRole("combobox", { name: "Project" })).toBeTruthy();
+  expect(screen.getByRole("combobox", { name: "Branch" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Attach" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Voice" })).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "Permission mode" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Model and effort" })).toBeNull();
 });

@@ -8,6 +8,7 @@ import type {
   CmdError,
   Result,
   SelectableModelInfo,
+  Session,
 } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -31,9 +32,19 @@ const deleteAgent = mock(
   }),
 );
 
-mock.module("@/bindings", () => ({ commands: { deleteAgent, duplicateAgent, getAgent, listApps, updateAgent }, events: {} }));
+const listAgentSessions = mock(async (_runner: string | null, _agentId: string, _limit: number) => ({
+  status: "ok" as const,
+  data: [] as Session[],
+}));
+const listMessages = mock(async (_runner: string | null, _sessionPk: string) => ({ status: "ok" as const, data: [] }));
+
+mock.module("@/bindings", () => ({
+  commands: { deleteAgent, duplicateAgent, getAgent, listAgentSessions, listApps, listMessages, updateAgent },
+  events: {},
+}));
 
 const { AgentDetailView } = await import("./AgentDetailView");
+const { useStore } = await import("@/store");
 const { useAgents } = await import("@/store-agents");
 const { useApps } = await import("@/store-apps");
 const { useLearning } = await import("@/store-learning");
@@ -72,6 +83,30 @@ const miniInfo: SelectableModelInfo = {
   resolvedDefault: "low",
 };
 
+function recentSession(overrides: Partial<Session> = {}): Session {
+  return {
+    sessionPk: "s1",
+    primaryAgentId: "reviewer",
+    primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "violet" },
+    projectId: "p1",
+    agentSessionId: null,
+    worktreePath: null,
+    branch: "feature/agent-sessions",
+    title: "Preserve immutable ownership",
+    status: "idle",
+    permMode: "default",
+    startedBy: "cockpit",
+    createdAt: 1,
+    lastActive: 2,
+    resumeAttempts: 0,
+    branchOwned: false,
+    kind: "project",
+    speaker: null,
+    agent: null,
+    parentSessionPk: null,
+    ...overrides,
+  };
+}
 function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
   return {
     summary: {
@@ -118,11 +153,21 @@ const learningSnapshot: AgentLearningInfo = {
 };
 
 function seed(value = detail()) {
-  useAgents.setState({ registry, detail: value, models: [routeInfo, opusInfo, miniInfo], loaded: true, loading: false, saving: false });
+  useAgents.setState({
+    registry,
+    detail: value,
+    models: [routeInfo, opusInfo, miniInfo],
+    loaded: true,
+    loading: false,
+    saving: false,
+    recentSessionsByAgent: {},
+  });
   useNav.setState({ history: { back: [], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
 }
 
 beforeEach(() => {
+  listAgentSessions.mockClear();
+  listAgentSessions.mockResolvedValue({ status: "ok", data: [] });
   deleteAgent.mockClear();
   duplicateAgent.mockClear();
   listApps.mockClear();
@@ -315,6 +360,18 @@ test("model transitions preserve supported effort, clear unsupported effort, and
       maxToolRounds: 100,
     }),
   );
+});
+
+test("Overview loads owned sessions and opens a selected session", async () => {
+  listAgentSessions.mockResolvedValue({ status: "ok", data: [recentSession()] });
+  render(<AgentDetailView agentId="reviewer" />);
+
+  expect(await screen.findByRole("button", { name: /Preserve immutable ownership/ })).toBeTruthy();
+  expect(listAgentSessions).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", 10);
+
+  fireEvent.click(screen.getByRole("button", { name: /Preserve immutable ownership/ }));
+  expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
+  expect(useNav.getState().history.current).toEqual({ kind: "session" });
 });
 
 test("changing agent resets the local tab to Overview", async () => {

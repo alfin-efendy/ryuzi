@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -102,11 +103,8 @@ pub struct Daemon {
     /// the same anchor and double-fire or skip jobs. Tracked so `stop()`
     /// can abort it, same as `router_handle`/`fanout_handle`.
     scheduler_handle: JoinHandle<()>,
-    /// The orch dispatcher's background loop (`orch::spawn_runner`), tracked
-    /// for the same reason as `scheduler_handle`.
-    orch_handle: JoinHandle<()>,
     /// The background-rail drainer's loop (`background_rail::spawn_runner`),
-    /// tracked for the same reason as `scheduler_handle`/`orch_handle` — the
+    /// tracked for the same reason as `scheduler_handle` — the
     /// daemon is the single always-on engine host for it too.
     rail_handle: JoinHandle<()>,
     /// The durable per-agent learning queue worker (`learning::spawn_runner`),
@@ -136,7 +134,7 @@ impl Daemon {
     ///
     /// Partial-failure rollback: if gateway N fails to start, every gateway
     /// 0..N-1 that DID start is stopped (best-effort — errors swallowed,
-    /// same as `stop()`), the router/fan-out/scheduler/orch/rail/learning/
+    /// same as `stop()`), the router/fan-out/scheduler/rail/learning/
     /// curator handles are aborted, and the daemon is marked stopped (reusing the same
     /// idempotency flag `stop()` checks) before the error is returned.
     /// Marking it stopped here means a caller's own best-effort `stop()` on
@@ -163,9 +161,16 @@ impl Daemon {
         }
         for (idx, gw) in self.gateways.iter().enumerate() {
             if let Err(e) = gw.start().await {
-                self.fail_boot_and_rollback().await;
-                for started in &self.gateways[..idx] {
-                    let _ = started.stop().await;
+                if !self.stopped.swap(true, Ordering::SeqCst) {
+                    for started in &self.gateways[..idx] {
+                        let _ = started.stop().await;
+                    }
+                    self.router_handle.abort();
+                    self.fanout_handle.abort();
+                    self.scheduler_handle.abort();
+                    self.rail_handle.abort();
+                    self.learning_handle.abort();
+                    self.curator_handle.abort();
                 }
                 self.abort_gateway_status_listeners();
                 return Err(e);
@@ -219,7 +224,6 @@ impl Daemon {
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
-        self.orch_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.curator_handle.abort();
@@ -263,7 +267,7 @@ impl Daemon {
     /// failing gateway can't block the rest of the shutdown),
     /// abort the router and approval fan-out broadcast-consumer loops (which
     /// also aborts any in-flight per-approval races the fan-out spawned —
-    /// see `spawn_approval_fanout`), abort the scheduler, orch, rail,
+    /// see `spawn_approval_fanout`), abort the scheduler, rail,
     /// learning, and curator loops, stop the endpoint server, then flush
     /// telemetry. A second call is a no-op.
     pub async fn stop(&self) {
@@ -288,7 +292,6 @@ impl Daemon {
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
-        self.orch_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.curator_handle.abort();
@@ -314,7 +317,6 @@ impl Drop for Daemon {
         self.router_handle.abort();
         self.fanout_handle.abort();
         self.scheduler_handle.abort();
-        self.orch_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.curator_handle.abort();
@@ -374,8 +376,7 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// → a second, inbound-only `Router` handed to every gateway via
 /// `Gateway::set_router` (Task 6 — see `router.rs`'s module doc for why two
 /// instances) → the approval fan-out spawned on another `cp.subscribe()`
-/// → the cron scheduler (`scheduler::spawn_runner`), orch dispatcher
-/// (`orch::spawn_runner`), background-rail drainer
+/// → the cron scheduler (`scheduler::spawn_runner`), background-rail drainer
 /// (`background_rail::spawn_runner`), learning worker
 /// (`learning::spawn_runner`), and curator (`curator::spawn_runner`, Task
 /// 10 — store-only, spawned off `store` directly rather than `cp` since it
@@ -397,6 +398,11 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         Arc::clone(&store),
     )
     .await?;
+    // Default durable profiles target the `smart` and `fast` routes. Create
+    // those routes only after persistence has materialized the profiles and
+    // after connections are available; a fresh daemon with none remains
+    // intentionally unconfigured.
+    crate::agents::bootstrap::ensure_default_routes(&store).await?;
     // One-time (idempotent) upgrade of any legacy plaintext secrets to
     // encrypted-at-rest; see `llm_router::secrets::init_and_sweep`'s doc for
     // the atomicity/idempotency/degraded-state contract.
@@ -436,10 +442,14 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         registries.harness = factory;
     }
 
-    let cp =
-        ControlPlane::new_with_telemetry(Arc::clone(&store), registries, Arc::clone(&telemetry))
-            .await;
-    cp.attach_agent_persistence(persistence.handles())?;
+    let cp = ControlPlane::new_with_telemetry(
+        Arc::clone(&store),
+        registries,
+        Arc::clone(&telemetry),
+        persistence.clone(),
+    )
+    .await;
+    cp.delegation().recover_after_restart().await?;
     let settings = SettingsStore::new(Arc::clone(&store));
 
     let factories: HashMap<String, Arc<dyn GatewayFactory>> =
@@ -483,11 +493,9 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let fanout_handle =
         spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), gateways.clone());
 
-    // The daemon is the single always-on engine host: cron scheduler and
-    // orch dispatcher live HERE (moved out of Cockpit). The scheduler's
+    // The daemon is the single always-on engine host for cron scheduling. The scheduler's
     // job_last_fired anchor is single-host-only — never spawn a second one.
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
-    let orch_handle = crate::orch::spawn_runner(Arc::clone(&cp));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let curator_handle = crate::curator::spawn_runner(Arc::clone(&store));
@@ -512,7 +520,6 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         router_handle,
         fanout_handle,
         scheduler_handle,
-        orch_handle,
         rail_handle,
         learning_handle,
         curator_handle,
@@ -619,6 +626,9 @@ fn spawn_approval_fanout(
             match rx.recv().await {
                 Ok(CoreEvent::ApprovalRequested {
                     session_pk,
+                    run_id,
+                    requesting_agent_id,
+                    requesting_agent_name,
                     request_id,
                     tool,
                     summary,
@@ -638,6 +648,9 @@ fn spawn_approval_fanout(
                             &store,
                             &gateways,
                             &session_pk,
+                            &run_id,
+                            &requesting_agent_id,
+                            &requesting_agent_name,
                             &request_id,
                             &tool,
                             &summary,
@@ -673,12 +686,23 @@ pub(crate) async fn handle_approval(
     store: &Arc<Store>,
     gateways: &[Arc<dyn Gateway>],
     session_pk: &str,
+    run_id: &str,
+    requesting_agent_id: &str,
+    requesting_agent_name: &str,
     request_id: &str,
     tool: &str,
     summary: &str,
     principal: Option<Principal>,
 ) {
     let settings = SettingsStore::new(Arc::clone(store));
+
+    let timeout_ms: u64 = settings
+        .get("approval_timeout_ms")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
 
     let approver_role_ids = policy::parse_role_ids(
         settings
@@ -711,16 +735,21 @@ pub(crate) async fn handle_approval(
         .collect();
 
     if known_surfaces.is_empty() {
+        // No gateway surface can answer this — leave it pending for Cockpit
+        // rather than auto-denying it.
         return;
     }
 
     let req = ApprovalRequest {
+        run_id: run_id.to_string(),
+        requesting_agent_id: requesting_agent_id.to_string(),
+        requesting_agent_name: requesting_agent_name.to_string(),
         request_id: request_id.to_string(),
         tool: tool.to_string(),
         summary: summary.to_string(),
         approver_role_ids,
         started_by,
-        timeout_ms: None,
+        timeout_ms: Some(timeout_ms),
         principal,
     };
 
@@ -749,14 +778,26 @@ pub(crate) async fn handle_approval(
         }
     };
 
-    if let Some(decision) = race.await {
-        cp.resolve_approval_bool(
-            request_id,
-            matches!(
-                decision,
-                ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
-            ),
-        );
+    // A genuine `approval_timeout_ms` elapse auto-rejects (there is no
+    // reasonable default decision otherwise). But every gateway simply
+    // erroring — with time still remaining — must NOT be treated the same as
+    // a timeout: it must leave the request pending for another surface or
+    // Cockpit, exactly like the fully-surfaceless case above.
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), race).await {
+        Ok(Some(decision)) => {
+            cp.resolve_approval_bool(
+                run_id,
+                request_id,
+                matches!(
+                    decision,
+                    ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+                ),
+            );
+        }
+        Ok(None) => {}
+        Err(_) => {
+            cp.resolve_approval_bool(run_id, request_id, false);
+        }
     }
 }
 
@@ -872,25 +913,58 @@ mod tests {
         store: Arc<Store>,
     ) -> crate::agents::bootstrap::AgentPersistence {
         let config = tempfile::tempdir().unwrap();
-        let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-            config.path().to_path_buf(),
-            store,
-        )
-        .await
-        .unwrap();
+        let persistence = test_agent_persistence_at(store, config.path().to_path_buf()).await;
         std::mem::forget(config);
         persistence
     }
 
+    async fn test_agent_persistence_at(
+        store: Arc<Store>,
+        config_root: PathBuf,
+    ) -> crate::agents::bootstrap::AgentPersistence {
+        crate::agents::bootstrap::initialize_agent_persistence(config_root.clone(), store.clone())
+            .await
+            .unwrap();
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        crate::agents::bootstrap::initialize_agent_persistence(config_root, store)
+            .await
+            .unwrap()
+    }
+
     async fn prompt_recovery_test_daemon(store: Arc<Store>) -> Daemon {
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
         let cp = ControlPlane::new_with_telemetry(
             store.clone(),
             Registries::new(),
             Arc::new(NoopTelemetry),
+            persistence,
         )
         .await;
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let router_in = Arc::new(Router::new(Arc::clone(&cp), vec![]));
         Daemon {
             cp,
@@ -898,9 +972,9 @@ mod tests {
             gateways: vec![],
             router_in,
             router_server: Arc::new(RouterServer::new(store)),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
@@ -909,7 +983,6 @@ mod tests {
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -940,10 +1013,15 @@ mod tests {
         telemetry: Arc<dyn Telemetry>,
     ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
         let (guard, path) = temp_db_path();
-        let store = Store::open(&path).await.unwrap();
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), Registries::new(), telemetry).await;
-        let store = cp.store().clone();
+        let store = Arc::new(Store::open(&path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            Registries::new(),
+            telemetry,
+            persistence,
+        )
+        .await;
         (cp, store, guard)
     }
 
@@ -974,6 +1052,12 @@ mod tests {
         store
             .insert_session(Session {
                 session_pk: session_pk.to_string(),
+                primary_agent_id: Some("ryuzi".into()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: "ryuzi".into(),
+                    name: "Ryuzi".into(),
+                    avatar_color: "blue".into(),
+                }),
                 project_id: Some(project_id.to_string()),
                 agent_session_id: None,
                 worktree_path: None,
@@ -1643,13 +1727,16 @@ mod tests {
         let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
-        let approval = cp.approvals_for_test_register("req-cockpit-only");
+        let approval = cp.approvals_for_test_register("run-cockpit-only", "req-cockpit-only");
 
         handle_approval(
             &cp,
             &store,
             &[],
             "s1",
+            "run-cockpit-only",
+            "agent-cockpit-only",
+            "Agent Cockpit Only",
             "req-cockpit-only",
             "Bash",
             "ls",
@@ -1664,7 +1751,7 @@ mod tests {
                 .is_err(),
             "a Cockpit-only approval must remain pending without a gateway surface"
         );
-        assert!(cp.resolve_approval_bool("req-cockpit-only", true));
+        assert!(cp.resolve_approval_bool("run-cockpit-only", "req-cockpit-only", true));
         assert!(approval.await.unwrap().allowed());
     }
 
@@ -1672,10 +1759,13 @@ mod tests {
     async fn approval_fanout_keeps_question_requests_pending_until_cockpit_resolves() {
         let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         let _fanout = spawn_approval_fanout(Arc::clone(&cp), Arc::clone(&store), vec![]);
-        let approval = cp.approvals_for_test_register("req-question");
+        let approval = cp.approvals_for_test_register("run-question", "req-question");
 
         cp.emit(CoreEvent::ApprovalRequested {
             session_pk: "s1".into(),
+            run_id: "run-question".into(),
+            requesting_agent_id: "agent-question".into(),
+            requesting_agent_name: "Agent Question".into(),
             request_id: "req-question".into(),
             tool: "clarify".into(),
             summary: "Choose one".into(),
@@ -1691,7 +1781,7 @@ mod tests {
                 .is_err(),
             "a Question approval must not be auto-cancelled by the fan-out"
         );
-        assert!(cp.resolve_approval_bool("req-question", true));
+        assert!(cp.resolve_approval_bool("run-question", "req-question", true));
         assert!(approval.await.unwrap().allowed());
     }
 
@@ -1720,6 +1810,9 @@ mod tests {
             &store,
             &gateways,
             "s1",
+            "run-1",
+            "agent-1",
+            "Agent 1",
             "req-1",
             "Bash",
             "ls -la",
@@ -1745,7 +1838,11 @@ mod tests {
             captured.approver_role_ids,
             vec!["role-a".to_string(), "role-b".to_string()]
         );
-        assert_eq!(captured.timeout_ms, None);
+        assert_eq!(
+            captured.timeout_ms,
+            Some(300_000),
+            "handle_approval must forward the resolved approval_timeout_ms default to the gateway"
+        );
         assert_eq!(captured.tool, "Bash");
         assert_eq!(captured.summary, "ls -la");
         assert_eq!(
@@ -1766,9 +1863,13 @@ mod tests {
 
         let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(150));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
-        let approval = cp.approvals_for_test_register("req-2");
+        let approval = cp.approvals_for_test_register("run-2", "req-2");
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-2", "Bash", "sleep", None).await;
+        handle_approval(
+            &cp, &store, &gateways, "s1", "run-2", "agent-2", "Agent 2", "req-2", "Bash", "sleep",
+            None,
+        )
+        .await;
 
         assert!(approval.await.unwrap().allowed());
         let parsed = parse_telemetry_lines(&lines);
@@ -1790,9 +1891,13 @@ mod tests {
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
-        let approval = cp.approvals_for_test_register("req-3");
+        let approval = cp.approvals_for_test_register("run-3", "req-3");
 
-        handle_approval(&cp, &store, &gateways, "s1", "req-3", "Bash", "ls", None).await;
+        handle_approval(
+            &cp, &store, &gateways, "s1", "run-3", "agent-3", "Agent 3", "req-3", "Bash", "ls",
+            None,
+        )
+        .await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1805,7 +1910,7 @@ mod tests {
                 .is_err(),
             "no gateway surfaces must leave the Cockpit approval pending"
         );
-        assert!(cp.resolve_approval_bool("req-3", false));
+        assert!(cp.resolve_approval_bool("run-3", "req-3", false));
     }
 
     // ---------- fan-out error tolerance (MUST-FIX 1) ----------
@@ -1830,6 +1935,9 @@ mod tests {
             &store,
             &gateways,
             "s1",
+            "run-race-1",
+            "agent-race",
+            "Agent Race",
             "req-race-1",
             "Bash",
             "ls",
@@ -1861,14 +1969,17 @@ mod tests {
 
         let discord = FakeGateway::new("discord", GwBehavior::ErrImmediately);
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(discord)];
-        let mut approval = cp.approvals_for_test_register("req-unavailable-discord");
+        let mut approval = cp.approvals_for_test_register("run-race-2", "req-race-2");
 
         handle_approval(
             &cp,
             &store,
             &gateways,
             "s1",
-            "req-unavailable-discord",
+            "run-race-2",
+            "agent-race",
+            "Agent Race",
+            "req-race-2",
             "Bash",
             "ls",
             None,
@@ -1882,7 +1993,7 @@ mod tests {
             "an unavailable Discord surface must leave the approval pending for Cockpit"
         );
         assert!(
-            cp.resolve_approval_bool("req-unavailable-discord", true),
+            cp.resolve_approval_bool("run-race-2", "req-race-2", true),
             "Cockpit must be able to resolve an approval after Discord is unavailable"
         );
         assert!(
@@ -1896,14 +2007,15 @@ mod tests {
     #[tokio::test]
     async fn daemon_start_rolls_back_started_gateways_and_aborts_handles_on_later_failure() {
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
         let cp = ControlPlane::new_with_telemetry(
-            Arc::new(store),
+            store.clone(),
             Registries::new(),
             Arc::new(NoopTelemetry),
+            persistence.clone(),
         )
         .await;
-        let store = cp.store().clone();
 
         let gw_a = FakeGateway::new("gw-a", GwBehavior::Allow);
         let stops_a = gw_a.stops.clone();
@@ -1911,7 +2023,7 @@ mod tests {
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw_a), Arc::new(gw_b)];
 
         // Long-running "loops" standing in for the real router/fan-out/
-        // scheduler/orch/rail/learning tasks, so this test can assert that a
+        // scheduler/rail/learning tasks, so this test can assert that a
         // failed `start()` aborts them too.
         let router_handle = tokio::spawn(async {
             loop {
@@ -1924,11 +2036,6 @@ mod tests {
             }
         });
         let scheduler_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        });
-        let orch_handle = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -1949,8 +2056,6 @@ mod tests {
             }
         });
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
@@ -1969,7 +2074,6 @@ mod tests {
             router_handle,
             fanout_handle,
             scheduler_handle,
-            orch_handle,
             rail_handle,
             learning_handle,
             curator_handle,
@@ -1999,10 +2103,6 @@ mod tests {
         assert!(
             daemon.scheduler_handle.is_finished(),
             "start()'s rollback must abort the scheduler loop"
-        );
-        assert!(
-            daemon.orch_handle.is_finished(),
-            "start()'s rollback must abort the orch loop"
         );
         assert!(
             daemon.rail_handle.is_finished(),
@@ -2039,6 +2139,9 @@ mod tests {
     #[async_trait]
     impl HarnessSession for PermFakeSession {
         async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            let run_id = "perm-primary-run".to_string();
+            let requesting_agent_id = "ryuzi".to_string();
+            let requesting_agent_name = "Ryuzi".to_string();
             let _ = self
                 .store
                 .insert_message(NewMessage::block(
@@ -2052,6 +2155,9 @@ mod tests {
             let request_id = "perm-req-1".to_string();
             let _ = self.events.send(CoreEvent::ApprovalRequested {
                 session_pk: self.session_pk.clone(),
+                run_id: run_id.clone(),
+                requesting_agent_id,
+                requesting_agent_name,
                 request_id: request_id.clone(),
                 tool: "Bash".into(),
                 summary: "ls -la".into(),
@@ -2059,7 +2165,9 @@ mod tests {
                 input: serde_json::json!({}),
                 principal: None,
             });
-            let rx = self.approvals.register(request_id);
+            let rx = self
+                .approvals
+                .register(crate::approval::ApprovalKey::new(run_id, request_id));
             let allow = rx.await.map(|r| r.allowed()).unwrap_or(false);
             if allow {
                 let _ = self
@@ -2109,13 +2217,17 @@ mod tests {
     async fn approval_fanout_allows_a_blocked_turn_to_complete_end_to_end() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
         let mut regs = Registries::new();
         regs.harness = Arc::new(PermFakeHarnessFactory);
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        cp.attach_test_agent_persistence().await;
-        let store = cp.store().clone();
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
 
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -2136,6 +2248,9 @@ mod tests {
             match recv {
                 Ok(Ok(CoreEvent::ApprovalRequested {
                     session_pk,
+                    run_id,
+                    requesting_agent_id,
+                    requesting_agent_name,
                     request_id,
                     tool,
                     summary,
@@ -2152,6 +2267,9 @@ mod tests {
                         &store,
                         &gateways,
                         &session_pk,
+                        &run_id,
+                        &requesting_agent_id,
+                        &requesting_agent_name,
                         &request_id,
                         &tool,
                         &summary,
@@ -2197,12 +2315,19 @@ mod tests {
     #[async_trait]
     impl HarnessSession for PlanFakeSession {
         async fn send_prompt(&self, _prompt: TurnPrompt) -> anyhow::Result<()> {
+            let run_id = "plan-primary-run".to_string();
+            let requesting_agent_id = "ryuzi".to_string();
+            let requesting_agent_name = "Ryuzi".to_string();
             let request_id = "plan-req-1".to_string();
-            let rx = self
-                .approvals
-                .register_for_session(&self.session_pk, request_id.clone());
+            let rx = self.approvals.register_for_session(
+                &self.session_pk,
+                crate::approval::ApprovalKey::new(run_id.clone(), request_id.clone()),
+            );
             let _ = self.events.send(CoreEvent::ApprovalRequested {
                 session_pk: self.session_pk.clone(),
+                run_id,
+                requesting_agent_id,
+                requesting_agent_name,
                 request_id: request_id.clone(),
                 tool: "exitplanmode".into(),
                 summary: "review the proposed plan".into(),
@@ -2260,13 +2385,24 @@ mod tests {
     async fn approval_fanout_keeps_plan_kind_requests_pending_until_cockpit_resolves() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        // Keep the test fast: the fan-out's own timeout — not any gateway or
+        // `handle_approval` call — must be what resolves this.
+        SettingsStore::new(store.clone())
+            .set("approval_timeout_ms", "50")
+            .await
+            .unwrap();
+
         let mut regs = Registries::new();
         regs.harness = Arc::new(PlanFakeHarnessFactory);
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        cp.attach_test_agent_persistence().await;
-        let store = cp.store().clone();
+        let persistence = test_agent_persistence(store.clone()).await;
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
 
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -2279,9 +2415,11 @@ mod tests {
             .await
             .unwrap();
 
-        let request_id = loop {
+        let (run_id, request_id) = loop {
             match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(CoreEvent::ApprovalRequested { request_id, .. })) => break request_id,
+                Ok(Ok(CoreEvent::ApprovalRequested {
+                    run_id, request_id, ..
+                })) => break (run_id, request_id),
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => panic!("approval event receiver failed: {error}"),
                 Err(_) => panic!("the Plan approval was not requested"),
@@ -2297,7 +2435,7 @@ mod tests {
             "the fan-out must not auto-cancel a Plan approval"
         );
 
-        assert!(cp.resolve_approval_bool(&request_id, true));
+        assert!(cp.resolve_approval_bool(&run_id, &request_id, true));
         for _ in 0..10 {
             let msgs = store.list_messages(&session.session_pk).await.unwrap();
             if msgs
@@ -2441,13 +2579,30 @@ mod tests {
             sent: sent.clone(),
             release: release.clone(),
         });
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
+        let store = Arc::new(store);
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
         let store = cp.store().clone();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
         let now = crate::paths::now_ms();
         store
             .insert_session(Session {
                 session_pk: "idle-queued".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
                 project_id: None,
                 agent_session_id: Some("interrupted-agent".into()),
                 worktree_path: None,
@@ -2483,17 +2638,15 @@ mod tests {
                 .unwrap();
         }
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
             store: store.clone(),
             gateways: vec![],
             router_server: Arc::new(RouterServer::new(store.clone())),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
@@ -2502,7 +2655,6 @@ mod tests {
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -2629,12 +2781,25 @@ mod tests {
         regs.harness = Arc::new(ResumeFakeHarnessFactory {
             prompts: prompts.clone(),
         });
-        let cp = ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry)).await;
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp =
+            ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry), persistence)
+                .await;
         let store = cp.store().clone();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
         let now = crate::paths::now_ms();
         store
             .insert_session(Session {
                 session_pk: "inbound-session".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -2659,8 +2824,6 @@ mod tests {
             .await
             .unwrap();
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let router_in = Arc::new(Router::new_boot_gated(Arc::clone(&cp), vec![]));
         let daemon = Arc::new(Daemon {
             cp,
@@ -2668,9 +2831,9 @@ mod tests {
             gateways: vec![],
             router_in: Arc::clone(&router_in),
             router_server: Arc::new(RouterServer::new(store.clone())),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
@@ -2679,7 +2842,6 @@ mod tests {
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -2741,12 +2903,25 @@ mod tests {
         regs.harness = Arc::new(ResumeFakeHarnessFactory {
             prompts: prompts.clone(),
         });
-        let cp = ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry)).await;
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp =
+            ControlPlane::new_with_telemetry(store, regs, Arc::new(NoopTelemetry), persistence)
+                .await;
         let store = cp.store().clone();
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
         let now = crate::paths::now_ms();
         store
             .insert_session(Session {
                 session_pk: "inbound-session".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
                 project_id: None,
                 agent_session_id: None,
                 worktree_path: None,
@@ -2775,8 +2950,6 @@ mod tests {
         let starts = gateway.starts.clone();
         let stops = gateway.stops.clone();
         let gateway: Arc<dyn Gateway> = Arc::new(gateway);
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let router_in = Arc::new(Router::new_boot_gated(
             Arc::clone(&cp),
             vec![Arc::clone(&gateway)],
@@ -2787,9 +2960,9 @@ mod tests {
             gateways: vec![gateway],
             router_in: Arc::clone(&router_in),
             router_server: Arc::new(RouterServer::new(store.clone())),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
@@ -2798,7 +2971,6 @@ mod tests {
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -2857,9 +3029,17 @@ mod tests {
     async fn daemon_start_serializes_concurrent_boot_failure() {
         let (_db_guard, db_path) = temp_db_path();
         let store = Arc::new(Store::open(&db_path).await.unwrap());
-        let cp =
-            ControlPlane::new_with_telemetry(store, Registries::new(), Arc::new(NoopTelemetry))
-                .await;
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp = ControlPlane::new_with_telemetry(
+            store,
+            Registries::new(),
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
         let store = cp.store().clone();
         let (start_entered, release_start) = (
             Arc::new(tokio::sync::Notify::new()),
@@ -2873,8 +3053,6 @@ mod tests {
         let starts = Arc::clone(&gateway.starts);
         let stops = Arc::clone(&gateway.stops);
         let gateway: Arc<dyn Gateway> = Arc::new(gateway);
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let router_in = Arc::new(Router::new_boot_gated(
             Arc::clone(&cp),
             vec![Arc::clone(&gateway)],
@@ -2885,9 +3063,9 @@ mod tests {
             gateways: vec![gateway],
             router_in: Arc::clone(&router_in),
             router_server: Arc::new(RouterServer::new(store.clone())),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
             stopped: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
@@ -2896,7 +3074,6 @@ mod tests {
             router_handle: tokio::spawn(async {}),
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -2969,20 +3146,35 @@ mod tests {
     #[tokio::test]
     async fn daemon_start_fires_reconcile_and_resumes_running_sessions() {
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let mut regs = Registries::new();
         regs.harness = Arc::new(ResumeFakeHarnessFactory {
             prompts: prompts.clone(),
         });
-        let cp =
-            ControlPlane::new_with_telemetry(Arc::new(store), regs, Arc::new(NoopTelemetry)).await;
-        let store = cp.store().clone();
+        let persistence = test_agent_persistence(store.clone()).await;
+        let agents = persistence.registry.clone();
+        let agent_knowledge = persistence.knowledge.clone();
+        let learning_queue = persistence.learning.clone();
+        let cp = ControlPlane::new_with_telemetry(
+            store.clone(),
+            regs,
+            Arc::new(NoopTelemetry),
+            persistence,
+        )
+        .await;
         seed_project(&store, "p1").await;
+        let primary_agent = agents.resolved_snapshot("ryuzi").await.unwrap();
         let now = crate::paths::now_ms();
         store
             .insert_session(Session {
                 session_pk: "s1".into(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
                 project_id: Some("p1".into()),
                 agent_session_id: Some("acp-123".into()),
                 worktree_path: None,
@@ -3020,17 +3212,15 @@ mod tests {
         let router_handle =
             tokio::spawn(Router::new(Arc::clone(&cp), vec![Arc::clone(&gw)]).run(cp.subscribe()));
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             router_in: Arc::new(Router::new(Arc::clone(&cp), vec![Arc::clone(&gw)])),
             cp,
             store: store.clone(),
             gateways: vec![gw],
             router_server: Arc::new(RouterServer::new(store.clone())),
-            agents: persistence.registry,
-            agent_knowledge: persistence.knowledge,
-            learning_queue: persistence.learning,
+            agents,
+            agent_knowledge,
+            learning_queue,
             telemetry: Arc::new(NoopTelemetry),
             gateway_status_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
@@ -3040,7 +3230,6 @@ mod tests {
             router_handle,
             fanout_handle: tokio::spawn(async {}),
             scheduler_handle: tokio::spawn(async {}),
-            orch_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             curator_handle: tokio::spawn(async {}),
@@ -3081,21 +3270,22 @@ mod tests {
     #[tokio::test]
     async fn daemon_stop_is_idempotent_and_stops_each_gateway_once() {
         let (_db_guard, db_path) = temp_db_path();
-        let store = Store::open(&db_path).await.unwrap();
+        let store = Arc::new(Store::open(&db_path).await.unwrap());
+        let persistence = test_agent_persistence(store.clone()).await;
         let cp = ControlPlane::new_with_telemetry(
-            Arc::new(store),
+            store.clone(),
             Registries::new(),
             Arc::new(NoopTelemetry),
+            persistence.clone(),
         )
         .await;
-        let store = cp.store().clone();
 
         let gw = FakeGateway::new("discord", GwBehavior::Allow);
         let stops = gw.stops.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
         // Long-running "loops" standing in for the real router/fan-out/
-        // scheduler/orch/rail/learning tasks, so this test can assert
+        // scheduler/rail/learning tasks, so this test can assert
         // `stop()` actually aborts them.
         let router_handle = tokio::spawn(async {
             loop {
@@ -3108,11 +3298,6 @@ mod tests {
             }
         });
         let scheduler_handle = tokio::spawn(async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-        });
-        let orch_handle = tokio::spawn(async {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
@@ -3133,8 +3318,6 @@ mod tests {
             }
         });
 
-        let persistence = test_agent_persistence(store.clone()).await;
-        cp.attach_agent_persistence(persistence.handles()).unwrap();
         let daemon = Daemon {
             router_in: Arc::new(Router::new(Arc::clone(&cp), vec![])),
             cp,
@@ -3153,7 +3336,6 @@ mod tests {
             router_handle,
             fanout_handle,
             scheduler_handle,
-            orch_handle,
             rail_handle,
             learning_handle,
             curator_handle,
@@ -3167,8 +3349,8 @@ mod tests {
             1,
             "a second stop() must not re-invoke gateway.stop()"
         );
-        // Give the abort a moment to actually land, then assert all seven
-        // tracked loops are gone — stop() must not leave them running.
+        // Give the abort a moment to actually land, then assert all tracked
+        // loops are gone — stop() must not leave them running.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             daemon.router_handle.is_finished(),
@@ -3181,10 +3363,6 @@ mod tests {
         assert!(
             daemon.scheduler_handle.is_finished(),
             "stop() must abort the scheduler loop"
-        );
-        assert!(
-            daemon.orch_handle.is_finished(),
-            "stop() must abort the orch loop"
         );
         assert!(
             daemon.rail_handle.is_finished(),
@@ -3326,6 +3504,12 @@ mod tests {
     async fn build_daemon_real_fanout_lets_a_blocked_turn_complete_end_to_end() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
+        let config_root = tempfile::tempdir().unwrap();
+        test_agent_persistence_at(
+            Arc::new(Store::open(&db_path).await.unwrap()),
+            config_root.path().to_path_buf(),
+        )
+        .await;
         {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
@@ -3340,7 +3524,7 @@ mod tests {
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            config_root: tempfile::tempdir().unwrap().keep(),
+            config_root: config_root.path().to_path_buf(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -3405,10 +3589,16 @@ mod tests {
     async fn daemon_stop_aborts_fanout_so_a_later_approval_is_never_resolved() {
         let _guard = StateDirGuard::new();
         let (_db_guard, db_path) = temp_db_path();
+        let config_root = tempfile::tempdir().unwrap();
+        test_agent_persistence_at(
+            Arc::new(Store::open(&db_path).await.unwrap()),
+            config_root.path().to_path_buf(),
+        )
+        .await;
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path: db_path.clone(),
-            config_root: tempfile::tempdir().unwrap().keep(),
+            config_root: config_root.path().to_path_buf(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
@@ -3467,7 +3657,7 @@ mod tests {
         );
     }
 
-    // ---------- (j) daemon hosts scheduler + orch + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
+    // ---------- (j) daemon hosts scheduler + rail + learning + curator loops (Tasks 10, 9, 8, 10) ----------
 
     #[tokio::test]
     async fn daemon_uses_injected_config_root_not_database_parent() {
@@ -3484,7 +3674,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let persistence = daemon.cp.agent_persistence().unwrap();
+        let persistence = daemon.cp.agent_persistence();
         assert!(Arc::ptr_eq(&daemon.agents, &persistence.registry));
         assert!(Arc::ptr_eq(&daemon.agent_knowledge, &persistence.knowledge));
         assert!(Arc::ptr_eq(&daemon.learning_queue, &persistence.learning));
@@ -3521,7 +3711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_hosts_and_stop_aborts_scheduler_orch_rail_learning_and_curator_loops() {
+    async fn daemon_hosts_and_stop_aborts_scheduler_rail_learning_and_curator_loops() {
         let (_guard, db_path) = temp_db_path();
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
@@ -3537,7 +3727,6 @@ mod tests {
             !daemon.scheduler_handle.is_finished(),
             "scheduler loop must be live"
         );
-        assert!(!daemon.orch_handle.is_finished(), "orch loop must be live");
         assert!(!daemon.rail_handle.is_finished(), "rail loop must be live");
         assert!(
             !daemon.learning_handle.is_finished(),
@@ -3553,10 +3742,6 @@ mod tests {
         assert!(
             daemon.scheduler_handle.is_finished(),
             "stop() must abort the scheduler loop"
-        );
-        assert!(
-            daemon.orch_handle.is_finished(),
-            "stop() must abort the orch loop"
         );
         assert!(
             daemon.rail_handle.is_finished(),

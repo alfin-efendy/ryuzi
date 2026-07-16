@@ -71,6 +71,8 @@ pub struct Agent {
     /// Custom system prompt; `None` uses the runtime's assembled prompt.
     pub prompt: Option<String>,
     pub tools: ToolFilter,
+    /// Profile-level rules evaluated before session and project overrides.
+    pub permission_rules: Vec<crate::agents::types::PermissionRule>,
     /// Whether this agent, when spawned as a sub-agent, may itself delegate
     /// via the `task` tool (subject to the `max_spawn_depth` setting).
     /// Frontmatter key: `delegate: true`.
@@ -81,17 +83,6 @@ pub struct Agent {
 
 const READ_ONLY_TOOLS: &[&str] = &["read", "ls", "glob", "grep", "webfetch", "todoread"];
 
-const ORCHESTRATOR_PROMPT: &str = "\
-You are an orchestrator sub-agent. Break the given goal into 2-6 \
-self-contained subtasks and run them with the `task` tool — use the batch \
-form (`tasks: [...]`) for independent subtasks so they run in parallel, and \
-sequential single calls when one subtask feeds the next. Choose exactly one \
-form per `task` call: never include a top-level `prompt` alongside `tasks`. \
-Sub-agents cannot \
-see your conversation, so every prompt must carry all needed context. Do small \
-connective work yourself instead of delegating it. Finish with one \
-synthesized report of what was done, found, or failed.";
-
 fn builtin_agents() -> Vec<Agent> {
     vec![
         Agent {
@@ -100,6 +91,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Primary,
             prompt: None,
             tools: ToolFilter::All,
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -115,6 +107,7 @@ fn builtin_agents() -> Vec<Agent> {
                     .into(),
             ),
             tools: ToolFilter::Only(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect()),
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -124,6 +117,7 @@ fn builtin_agents() -> Vec<Agent> {
             mode: AgentMode::Subagent,
             prompt: None,
             tools: ToolFilter::All,
+            permission_rules: Vec::new(),
             can_delegate: false,
             builtin: true,
         },
@@ -142,17 +136,8 @@ fn builtin_agents() -> Vec<Agent> {
                     .map(|s| s.to_string())
                     .collect(),
             ),
+            permission_rules: Vec::new(),
             can_delegate: false,
-            builtin: true,
-        },
-        Agent {
-            name: "orchestrator".into(),
-            description: "Coordinator sub-agent: decomposes a wide goal and runs task batches."
-                .into(),
-            mode: AgentMode::Subagent,
-            prompt: Some(ORCHESTRATOR_PROMPT.into()),
-            tools: ToolFilter::All,
-            can_delegate: true,
             builtin: true,
         },
     ]
@@ -275,6 +260,7 @@ fn parse_agent_markdown(name: &str, text: &str) -> Agent {
         mode,
         prompt: (!prompt.is_empty()).then(|| prompt.to_string()),
         tools,
+        permission_rules: Vec::new(),
         can_delegate,
         builtin: false,
     }
@@ -356,22 +342,6 @@ mod tests {
         assert!(a.can_delegate);
         let a = parse_agent_markdown("lead2", "---\ndelegate: nope\n---\nx");
         assert!(!a.can_delegate);
-    }
-
-    #[test]
-    fn orchestrator_builtin_is_a_delegating_subagent() {
-        let reg = AgentRegistry::builtin();
-        let orch = reg.get("orchestrator").unwrap();
-        assert!(orch.mode.is_subagent());
-        assert!(!orch.mode.is_primary());
-        assert!(orch.can_delegate);
-        assert!(orch.tools.allows("task") && orch.tools.allows("bash"));
-        assert!(orch.prompt.as_deref().unwrap().contains("batch form"));
-        assert!(orch.prompt.as_deref().unwrap().contains("exactly one form"));
-        // No other builtin delegates.
-        for name in ["build", "plan", "general", "explore"] {
-            assert!(!reg.get(name).unwrap().can_delegate, "{name}");
-        }
     }
 
     #[test]

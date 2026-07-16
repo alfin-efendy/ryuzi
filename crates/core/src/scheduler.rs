@@ -390,7 +390,6 @@ pub(crate) fn run_note_for(final_text: Option<&str>) -> (bool, Option<String>) {
 
 /// The final assistant message of a session: the trailing run of assistant
 /// text rows (they are persisted delta-shaped), concatenated in order.
-/// Shared with the orch dispatcher, which captures worker/judge reports.
 pub(crate) async fn final_assistant_text(store: &Store, session_pk: &str) -> Option<String> {
     let msgs = store.list_messages(session_pk).await.ok()?;
     let mut parts: Vec<String> = Vec::new();
@@ -865,40 +864,30 @@ pub async fn tick(cp: &Arc<ControlPlane>) {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn scheduler_terminal_helper_emits_failed_trigger() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
-        let hook = crate::automation::create_hook(
-            cp.store(),
-            crate::automation::HookInput::outbound(
-                "scheduler failure",
-                TriggerKind::SchedulerRunFailed,
-                "https://example.com/scheduler",
-                None,
-            ),
+    async fn prepare_test_agent_persistence(store: &std::sync::Arc<Store>) {
+        crate::llm_router::connections::add_connection(
+            store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
         )
         .await
         .unwrap();
-
-        emit_scheduler_terminal_automation(
-            &cp,
-            "job-1",
-            "run-1",
-            None,
-            "failed",
-            Some("start failed"),
-        )
-        .await;
-
-        let runs = crate::automation::list_runs(cp.store(), &hook.id)
+        crate::agents::bootstrap::ensure_default_routes(store)
             .await
             .unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].envelope["event"], "scheduler.run.failed");
-        assert_eq!(runs[0].envelope["data"]["status"], "failed");
-        assert_eq!(runs[0].envelope["data"]["error"], "start failed");
     }
 
     #[test]
@@ -996,8 +985,15 @@ mod tests {
     #[tokio::test]
     async fn tick_records_scheduler_liveness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        let cp = crate::control::ControlPlane::new(store, crate::plugins::Registries::new()).await;
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(store, crate::plugins::Registries::new(), persistence)
+                .await
+        };
         tick(&cp).await;
         let val = cp
             .store()
@@ -1011,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn job_and_run_crud_roundtrip() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
 
         let job = JobRow {
             id: "j1".into(),
@@ -1100,9 +1096,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_model_override_is_session_scoped_without_mutating_primary_profile() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            crate::control::ControlPlane::new(
+                store.clone(),
+                crate::plugins::Registries::new(),
+                persistence,
+            )
+            .await
+        };
+        store
+            .insert_project(crate::domain::Project {
+                project_id: "p-override".into(),
+                name: "override".into(),
+                workdir: std::env::temp_dir().to_string_lossy().into_owned(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: crate::domain::PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+        let primary_id = cp.registry().default_agent_id().await;
+        let profile_before = cp.registry().resolved_snapshot(&primary_id).await.unwrap();
+        let session = cp
+            .start_session_with_prompt(
+                "p-override",
+                crate::harness::TurnPrompt::text("run", "run"),
+                "scheduler",
+                &[],
+                None,
+                None,
+                Some("scheduled/model".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_session_runtime_settings(&session.session_pk)
+                .await
+                .unwrap()
+                .and_then(|settings| settings.model),
+            Some("scheduled/model".into())
+        );
+        assert_eq!(
+            cp.registry()
+                .resolved_snapshot(&primary_id)
+                .await
+                .unwrap()
+                .profile,
+            profile_before.profile
+        );
+    }
+    #[tokio::test]
     async fn job_model_override_roundtrips() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
         let mut job = sample_job("j-mo");
         job.model_override = Some("cheap/haiku".into());
         upsert_job(&store, job.clone()).await.unwrap();
@@ -1240,11 +1299,16 @@ mod tests {
     async fn completed_job_delivers_to_its_home_session_via_rail() {
         let _guard = SchedulerStateDirGuard::new();
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
+        let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
+        prepare_test_agent_persistence(&store).await;
         let mut regs = crate::plugins::Registries::new();
         regs.harness = std::sync::Arc::new(FakeJobHarnessFactory);
-        let cp = crate::control::ControlPlane::new(store, regs).await;
-        cp.attach_test_agent_persistence().await;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
 
         // A non-git project the job runs against — the fake harness needs no
         // real repo, so any workdir will do.

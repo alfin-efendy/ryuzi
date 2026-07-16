@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { CmdError, Result } from "@/bindings";
+import type { AgentRun, CmdError, Message, Result } from "@/bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
+const getChildRuns = mock(
+  (_runnerId: string | null, _sessionPk: string): Promise<Result<AgentRun[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
+);
+const getChildTranscript = mock(
+  (_runnerId: string | null, _sessionPk: string, _runId: string): Promise<Result<Message[], CmdError>> =>
+    Promise.resolve({ status: "ok", data: [] }),
+);
 const gitDiff = mock(
   (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }),
 );
@@ -12,7 +19,7 @@ const sessionWorkdir = mock(
 );
 
 mock.module("@/bindings", () => ({
-  commands: { gitDiff, sessionWorkdir },
+  commands: { gitDiff, sessionWorkdir, getChildRuns, getChildTranscript },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // The File tab pulls in CodeMirror and file IPC — irrelevant to the Review-tab
@@ -34,11 +41,38 @@ const FRESH_DIFF = [
   "+const fresh = true;",
 ].join("\n");
 
+function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
+  return {
+    runId: "child-1",
+    sessionPk: "s1",
+    parentRunId: null,
+    retryOf: null,
+    primaryAgentId: "primary",
+    executingAgentId: "worker",
+    executingAgentNameSnapshot: "Researcher",
+    agentKind: "subagent",
+    task: "Inspect the live transcript",
+    status: "completed",
+    startedAt: 1_000,
+    finishedAt: 2_000,
+    toolCount: 1,
+    resolvedModel: "model-a",
+    resolvedEffort: null,
+    result: "Child findings",
+    error: null,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   useNav.setState({ rightOpen: true, rightTab: "review", rightMaximized: false });
   useDiff.setState({ bySession: {}, pendingReview: null });
   useUi.setState({ tabs: [], activeTabId: null });
   gitDiff.mockClear();
+  getChildRuns.mockClear();
+  getChildRuns.mockImplementation((_runnerId, _sessionPk) => Promise.resolve({ status: "ok", data: [] }));
+  getChildTranscript.mockClear();
+  getChildTranscript.mockImplementation((_runnerId, _sessionPk, _runId) => Promise.resolve({ status: "ok", data: [] }));
   gitDiff.mockImplementation(() => Promise.resolve({ status: "ok", data: "" }));
 });
 
@@ -304,6 +338,73 @@ test("Review error keeps Refresh available and retries", async () => {
 
   await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(2));
   await waitFor(() => expect(screen.queryByText("diff failed")).toBeNull());
+});
+
+test("switching runners, sessions, and full detail resets the selected child run", async () => {
+  getChildRuns.mockImplementation((runnerId: string | null, sessionPk: string) =>
+    Promise.resolve({ status: "ok", data: [childRun({ runId: `${runnerId}-${sessionPk}`, sessionPk })] }),
+  );
+  getChildTranscript.mockImplementation((_runnerId: string | null, _sessionPk: string, runId: string) =>
+    Promise.resolve({
+      status: "ok",
+      data: [
+        {
+          seq: 1,
+          sessionPk: "session-a",
+          role: "assistant",
+          blockType: "text",
+          payload: { text: `Live transcript for ${runId}` },
+          toolCallId: null,
+          status: null,
+          toolKind: null,
+          createdAt: 1,
+          speaker: null,
+        },
+      ],
+    }),
+  );
+  useNav.setState({ rightTab: "agents" });
+  const view = render(<RightPanel runnerId="runner-a" sessionPk="session-a" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledWith("runner-a", "session-a"));
+  fireEvent.click(screen.getByRole("button", { name: /Researcher/i }));
+  await waitFor(() => expect(screen.getByText("Live transcript for runner-a-session-a")).toBeTruthy());
+
+  view.rerender(<RightPanel runnerId="runner-a" sessionPk="session-b" branch="main" running={false} isGit />);
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledWith("runner-a", "session-b"));
+  await waitFor(() => expect(screen.getByRole("button", { name: /Researcher/i })).toBeTruthy());
+  expect(screen.queryByText("Live transcript for runner-a-session-a")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: /Researcher/i }));
+  await waitFor(() => expect(screen.getByText("Live transcript for runner-a-session-b")).toBeTruthy());
+  view.rerender(<RightPanel runnerId="runner-b" sessionPk="session-b" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledWith("runner-b", "session-b"));
+  await waitFor(() => expect(screen.getByRole("button", { name: /Researcher/i })).toBeTruthy());
+  expect(screen.queryByText("Live transcript for runner-a-session-b")).toBeNull();
+});
+
+test("agent-run events refresh the visible child transcript", async () => {
+  getChildRuns.mockResolvedValue({ status: "ok", data: [childRun()] });
+  getChildTranscript.mockResolvedValue({ status: "ok", data: [] });
+  useNav.setState({ rightTab: "agents" });
+  render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
+  fireEvent.click(screen.getByRole("button", { name: /Researcher/i }));
+  await waitFor(() => expect(getChildTranscript).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "child-1"));
+
+  await act(async () => {
+    const { useStore } = await import("@/store");
+    useStore
+      .getState()
+      .applyCoreEvent(
+        { kind: "agentRunChanged", session_pk: "s1", run_id: "child-1", parent_run_id: null, status: "completed" },
+        LOCAL_RUNNER,
+      );
+  });
+
+  await waitFor(() => expect(getChildTranscript).toHaveBeenCalledTimes(2));
 });
 
 test("many file tabs do not move the expand action out of the fixed header", () => {

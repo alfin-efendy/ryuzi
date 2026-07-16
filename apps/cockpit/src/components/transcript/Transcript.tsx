@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AudioLines, ChevronDown, Paperclip } from "lucide-react";
 import { commands } from "@/bindings";
+import { useStore } from "@/store";
 import { buildTranscript, closeDanglingFence, type Row, type RowAttachment } from "@/lib/transcript";
 import { mediaKindForContentType } from "@/lib/attachments";
 import { distanceFromBottom, isStuck, pinningInterrupted, showScrollFab } from "@/lib/scroll";
@@ -11,8 +12,7 @@ import { ActivityCluster } from "./ToolChip";
 import { TurnSummary } from "./TurnSummary";
 import { FileChangeCards } from "./FileChangeCards";
 import { TurnActions } from "./TurnActions";
-import { SpeakerBubble } from "./SpeakerBubble";
-import { BlockCard } from "./BlockCard";
+import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { Button, Modal, ModalBody, ModalFooter, ModalHeader } from "@ryuzi/ui";
 
 /** Renders one saved attachment. Unlike the pre-P4-3 `convertFileSrc(a.path)`
@@ -169,6 +169,7 @@ export function Transcript({
   agentColor,
   running,
   children,
+  approvalRunId,
 }: {
   runnerId: string;
   sessionPk: string;
@@ -177,6 +178,7 @@ export function Transcript({
   agentColor: string;
   running: boolean;
   children?: ReactNode;
+  approvalRunId?: string;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -194,6 +196,19 @@ export function Transcript({
   const [lightbox, setLightbox] = useState<string | null>(null);
 
   const groups = useMemo(() => buildTranscript(rows, running), [rows, running]);
+  const pendingApprovals = useStore((state) => state.pendingApprovals);
+  const approvals = useMemo(
+    () =>
+      pendingApprovals.filter(
+        (approval) =>
+          approvalRunId !== undefined &&
+          approval.runnerId === runnerId &&
+          approval.sessionPk === sessionPk &&
+          approval.runId === approvalRunId,
+      ),
+    [approvalRunId, pendingApprovals, runnerId, sessionPk],
+  );
+  const approvalKey = approvalRunId === undefined ? "session" : `run:${approvalRunId}`;
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -250,7 +265,7 @@ export function Transcript({
 
   return (
     <>
-      <div className="relative flex min-h-0 flex-1 flex-col">
+      <div key={approvalKey} className="relative flex min-h-0 flex-1 flex-col">
         <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           <div ref={contentRef} className="mx-auto flex w-full max-w-3xl flex-col gap-3.5">
             {groups.map((g, i) => {
@@ -277,12 +292,6 @@ export function Transcript({
                   return <ErrorRow key={g.key} text={g.text} />;
                 case "notice":
                   return <NoticeRow key={g.key} text={g.text} />;
-                case "speaker":
-                  return g.blockType === "orch_block" && g.taskId ? (
-                    <BlockCard key={g.key} taskId={g.taskId} question={g.markdown} speaker={g.speaker} />
-                  ) : (
-                    <SpeakerBubble key={g.key} speaker={g.speaker} markdown={g.markdown} />
-                  );
                 case "summary":
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">
@@ -295,6 +304,11 @@ export function Transcript({
               }
             })}
             {running && <WorkingPulse color={agentColor} />}
+            {approvals.map((approval, index) => (
+              <div key={`${approval.runnerId}:${approval.runId}:${approval.requestId}`} className="px-4 pb-2">
+                <ApprovalCard approval={approval} hotkey={index === approvals.length - 1} />
+              </div>
+            ))}
             {children}
           </div>
         </div>

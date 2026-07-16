@@ -23,7 +23,6 @@ const realTodoPanel = { ...(await import("@/components/session/TodoPanel")) };
 const realQueuedMessages = { ...(await import("@/components/session/QueuedMessages")) };
 const realSessionCostPanel = { ...(await import("@/components/session/SessionCostPanel")) };
 const realOpenInMenu = { ...(await import("@/components/session/OpenInMenu")) };
-const realComposerModelEffortMenu = { ...(await import("@/components/ComposerModelEffortMenu")) };
 const realUseComposerAttachments = { ...(await import("@/components/composer/useComposerAttachments")) };
 const realAttachmentChips = { ...(await import("@/components/composer/AttachmentChips")) };
 const realVoice = { ...(await import("@/lib/voice")) };
@@ -32,16 +31,8 @@ mock.module("@/bindings", () => ({
   commands: {
     sessionWorkdir: async () => ({ status: "ok" as const, data: "/work/demo" }),
     searchFiles: async () => ({ status: "ok" as const, data: [] }),
-    sessionRuntimeInfo: async () => ({ status: "ok" as const, data: null }),
     listProviderCatalog: async () => [],
     listConnections: async () => [],
-    // SessionView's orch task-strip effect fires this on mount; an empty
-    // result means no strip mounts (see SessionView.test.tsx's stub note).
-    orchListRoots: async () => ({ status: "ok" as const, data: [] }),
-    sessionTodos: async () => ({
-      status: "ok" as const,
-      data: [{ content: "Place the TODO List in the transcript", status: "in_progress" }],
-    }),
     // Not reached from any mount path here (Transcript is mocked away below),
     // but `mock.module` replaces "@/bindings" process-wide: the real
     // Transcript other test files render (e.g. ModalShells.test.tsx) resolves
@@ -84,7 +75,6 @@ mock.module("@/components/session/TodoPanel", () => ({
 mock.module("@/components/session/QueuedMessages", () => ({ QueuedMessages: () => null }));
 mock.module("@/components/session/SessionCostPanel", () => ({ SessionCostPanel: () => null }));
 mock.module("@/components/session/OpenInMenu", () => ({ OpenInMenu: () => null }));
-mock.module("@/components/ComposerModelEffortMenu", () => ({ ComposerModelEffortMenu: () => null }));
 
 const { SessionView } = await import("./SessionView");
 const { useNav } = await import("@/store-nav");
@@ -98,6 +88,8 @@ beforeEach(() => {
       {
         runnerId: LOCAL_RUNNER,
         sessionPk: "s1",
+        primaryAgentId: null,
+        primaryAgentSnapshot: null,
         projectId: null,
         agentSessionId: null,
         worktreePath: null,
@@ -140,7 +132,6 @@ afterAll(() => {
   mock.module("@/components/session/QueuedMessages", () => realQueuedMessages);
   mock.module("@/components/session/SessionCostPanel", () => realSessionCostPanel);
   mock.module("@/components/session/OpenInMenu", () => realOpenInMenu);
-  mock.module("@/components/ComposerModelEffortMenu", () => realComposerModelEffortMenu);
 });
 
 test("panel controls live at workspace scope and expose pressed state", async () => {

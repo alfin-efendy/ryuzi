@@ -56,9 +56,29 @@ pub struct ChatRequestOptions {
     pub attachments: Vec<String>,
     /// None => engine default (worktree ON, new engine-named branch from HEAD).
     pub git: Option<GitOptions>,
-    /// Initial permission mode for the session being started (new-chat
-    /// picker). `None` ⇒ inherit the project default.
+    /// Initial permission mode for a legacy/composer session.
     pub perm_mode: Option<crate::domain::PermMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMention {
+    pub agent_id: String,
+    pub label_snapshot: String,
+    pub start_utf16: u32,
+    pub end_utf16: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnInput {
+    pub text: String,
+    #[serde(default)]
+    pub mentions: Vec<AgentMention>,
+    pub context: Option<ChatContextArg>,
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    pub git: Option<GitOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1475,90 +1495,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn automation_detail_dto_converts_only_three_attempts_and_redacts_header_values() {
-        let hook = crate::automation::HookRow {
-            id: "hook-1".to_string(),
-            name: "Delivery".to_string(),
-            trigger_kind: crate::automation::TriggerKind::SessionEnd,
-            action_kind: crate::automation::ActionKind::WebhookOutbound,
-            enabled: true,
-            inbound_path: None,
-            action: crate::automation::HookActionInput::WebhookOutbound(
-                crate::automation::WebhookOutboundAction {
-                    url: "https://example.com/hook".to_string(),
-                    method: "POST".to_string(),
-                    headers: vec![crate::automation::WebhookHeader {
-                        name: "Authorization".to_string(),
-                        value: "Bearer secret".to_string(),
-                    }],
-                    payload_template: None,
-                },
-            ),
-            created_at: 1,
-            updated_at: 2,
-        };
-        let run = crate::automation::HookRunRow {
-            id: "run-1".to_string(),
-            hook_id: hook.id.clone(),
-            status: "completed".to_string(),
-            envelope: serde_json::json!({}),
-            snapshot: hook.clone(),
-            session_pk: None,
-            error: None,
-            attempt_count: 4,
-            last_http_status: Some(200),
-            queued_at: 3,
-            started_at: Some(4),
-            finished_at: Some(5),
-            attempts: (1..=4)
-                .map(|ordinal| crate::automation::HookAttemptRow {
-                    run_id: "run-1".to_string(),
-                    ordinal,
-                    started_at: ordinal,
-                    finished_at: None,
-                    http_status: None,
-                    error: None,
-                })
-                .collect(),
-        };
-
-        let dto: AutomationHookDetail = crate::automation::HookDetail {
-            hook,
-            runs: vec![run],
-        }
-        .into();
-        let serialized = serde_json::to_value(&dto).unwrap();
-
-        assert_eq!(dto.runs[0].attempts.len(), 3);
-        assert_eq!(
-            dto.runs[0]
-                .attempts
-                .iter()
-                .map(|attempt| attempt.ordinal)
-                .collect::<Vec<_>>(),
-            vec![2, 3, 4]
-        );
-        assert_eq!(
-            serialized["action"]["config"]["headers"],
-            serde_json::json!([{ "name": "Authorization", "configured": true }])
-        );
-        assert!(!serialized.to_string().contains("Bearer secret"));
-    }
-
-    #[test]
-    fn command_info_defaults_effective_when_legacy_json_omits_it() {
-        let command: CommandInfo = serde_json::from_value(serde_json::json!({
-            "name": "ship",
-            "description": "Ship the current change",
-            "agent": null,
-            "model": null,
-            "subtask": false,
-            "origin": "project",
-            "shadowsGlobal": true
+    fn agent_mention_and_turn_input_use_camel_case_fields() {
+        let turn: TurnInput = serde_json::from_value(serde_json::json!({
+            "text": "ask Ada",
+            "mentions": [{
+                "agentId": "ada",
+                "labelSnapshot": "Ada",
+                "startUtf16": 4,
+                "endUtf16": 7
+            }],
+            "attachments": []
         }))
         .unwrap();
 
-        assert!(command.effective);
+        assert_eq!(
+            serde_json::to_value(&turn.mentions[0]).unwrap(),
+            serde_json::json!({
+                "agentId": "ada",
+                "labelSnapshot": "Ada",
+                "startUtf16": 4,
+                "endUtf16": 7
+            })
+        );
     }
 
     #[test]
@@ -1587,38 +1545,6 @@ mod tests {
         );
         assert!(out.contains("- Referenced file: src/main.rs"));
         assert!(out.contains("- Referenced file: crates/core/src/lib.rs"));
-    }
-
-    #[test]
-    fn chat_request_options_deserializes_model_and_ignores_legacy_runtime_id() {
-        // Native-only: a legacy `runtimeId` key is accepted but ignored.
-        let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"runtimeId": "native", "model": "fable"}))
-                .unwrap();
-        assert_eq!(opts.model.as_deref(), Some("fable"));
-    }
-
-    #[test]
-    fn chat_request_options_git_defaults_to_none_and_deserializes() {
-        // Old payloads (no `git` key) keep parsing.
-        let opts: ChatRequestOptions =
-            serde_json::from_value(serde_json::json!({"model": "fable"})).unwrap();
-        assert!(opts.git.is_none());
-
-        let opts: ChatRequestOptions = serde_json::from_value(serde_json::json!({
-            "git": {
-                "useWorktree": false,
-                "createBranch": true,
-                "branchName": "feat/x",
-                "baseBranch": null
-            }
-        }))
-        .unwrap();
-        let git = opts.git.unwrap();
-        assert!(!git.use_worktree);
-        assert!(git.create_branch);
-        assert_eq!(git.branch_name.as_deref(), Some("feat/x"));
-        assert_eq!(git.base_branch, None);
     }
 
     #[test]

@@ -4,6 +4,8 @@ import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
+import type { AgentSummaryInfo, TurnInput } from "./bindings";
+import { LAST_PRIMARY_AGENT_KEY, choosePrimaryAgent } from "./store-nav";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const k1 = sessKey(LOCAL_RUNNER, "s1");
@@ -30,7 +32,6 @@ function reset() {
     loaded: {},
     contextUsage: {},
     projectRuntimeById: {},
-    sessionRuntimeById: {},
     sessionCost: {},
   });
 }
@@ -665,48 +666,67 @@ test("hydrateTranscript keeps live rows that arrived during the fetch (and never
   expect(st.lastSeq[k1]).toBe(3);
 });
 
-test("resolveApproval retains a pending approval when the backend does not resolve it", async () => {
+test("approval.requested retains its run scope and only clears the matching request", () => {
   reset();
-  useStore.getState().applyCoreEvent(
-    {
-      kind: "approvalRequested",
-      session_pk: "s1",
-      request_id: "r1",
-      tool: "Bash",
-      summary: "Bash: rm",
-      approval_kind: "tool",
-      input: {},
-    },
-    LOCAL_RUNNER,
-  );
-  const resolveApproval = spyOn(commands, "resolveApproval").mockResolvedValue(false);
-
-  await useStore.getState().resolveApproval(LOCAL_RUNNER, "r1", { decision: "allowOnce", scope: null, payload: null });
-
-  expect(useStore.getState().pendingApprovals).toHaveLength(1);
-  resolveApproval.mockRestore();
+  const s = useStore.getState();
+  for (const run_id of ["run-1", "run-2"]) {
+    s.applyCoreEvent(
+      {
+        kind: "approvalRequested",
+        session_pk: "s1",
+        run_id,
+        requesting_agent_id: "agent-1",
+        requesting_agent_name: "Agent One",
+        request_id: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        approval_kind: "tool",
+        input: {},
+      },
+      LOCAL_RUNNER,
+    );
+  }
+  expect(useStore.getState().pendingApprovals.map((approval) => approval.runId)).toEqual(["run-1", "run-2"]);
+  useStore.getState().clearApproval("run-1", "r1");
+  expect(useStore.getState().pendingApprovals.map((approval) => approval.runId)).toEqual(["run-2"]);
 });
 
-test("resolveApproval clears a pending approval when the backend resolves it", async () => {
+test("resolveApproval calls the run-scoped command and clears that request only", async () => {
   reset();
-  useStore.getState().applyCoreEvent(
-    {
-      kind: "approvalRequested",
-      session_pk: "s1",
-      request_id: "r1",
-      tool: "Bash",
-      summary: "Bash: rm",
-      approval_kind: "tool",
-      input: {},
-    },
-    LOCAL_RUNNER,
-  );
-  const resolveApproval = spyOn(commands, "resolveApproval").mockResolvedValue(true);
+  useStore.setState({
+    pendingApprovals: [
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "run-1",
+        requestId: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        kind: "tool",
+        input: {},
+        principal: null,
+      },
+      {
+        runnerId: LOCAL_RUNNER,
+        sessionPk: "s1",
+        runId: "run-2",
+        requestId: "r1",
+        tool: "Bash",
+        summary: "Bash: rm",
+        kind: "tool",
+        input: {},
+        principal: null,
+      },
+    ],
+  });
+  const response = { decision: "allowOnce" as const, scope: null, payload: null };
+  const resolve = spyOn(commands, "resolveApproval").mockResolvedValue(true);
 
-  await useStore.getState().resolveApproval(LOCAL_RUNNER, "r1", { decision: "allowOnce", scope: null, payload: null });
+  await useStore.getState().resolveApproval(LOCAL_RUNNER, "run-1", "r1", response);
 
-  expect(useStore.getState().pendingApprovals).toHaveLength(0);
-  resolveApproval.mockRestore();
+  expect(resolve).toHaveBeenCalledWith(LOCAL_RUNNER, "run-1", "r1", response);
+  expect(useStore.getState().pendingApprovals.map((approval) => approval.runId)).toEqual(["run-2"]);
+  resolve.mockRestore();
 });
 
 test("pending approvals from different sessions both count", () => {
@@ -716,6 +736,9 @@ test("pending approvals from different sessions both count", () => {
     {
       kind: "approvalRequested",
       session_pk: "s1",
+      run_id: "run-1",
+      requesting_agent_id: "agent-1",
+      requesting_agent_name: "Agent One",
       request_id: "r1",
       tool: "Bash",
       summary: "x",
@@ -728,6 +751,9 @@ test("pending approvals from different sessions both count", () => {
     {
       kind: "approvalRequested",
       session_pk: "s2",
+      run_id: "run-2",
+      requesting_agent_id: "agent-2",
+      requesting_agent_name: "Agent Two",
       request_id: "r2",
       tool: "Write",
       summary: "y",
@@ -742,6 +768,8 @@ test("pending approvals from different sessions both count", () => {
 const runningSession = (pk: string) => ({
   runnerId: LOCAL_RUNNER,
   sessionPk: pk,
+  primaryAgentId: null,
+  primaryAgentSnapshot: null,
   projectId: "p1",
   agentSessionId: null,
   worktreePath: null,
@@ -893,12 +921,36 @@ test("error event appends no transient row — the durable error row arrives via
   listSessions.mockRestore();
 });
 
+test("choosePrimaryAgent integrates pending, persisted, default, then executable fallback", () => {
+  const agent = (id: string, executable = true): AgentSummaryInfo => ({
+    id,
+    name: id,
+    description: "",
+    avatarColor: "violet",
+    model: { kind: "route", route: "smart" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable,
+    validation: [],
+    isDefault: false,
+  });
+  localStorage.setItem(LAST_PRIMARY_AGENT_KEY, "stored");
+  const agents = [agent("broken", false), agent("fallback"), agent("default"), agent("stored"), agent("requested")];
+  expect(choosePrimaryAgent(agents, "requested", localStorage.getItem(LAST_PRIMARY_AGENT_KEY), "default")).toBe("requested");
+  expect(choosePrimaryAgent(agents, null, localStorage.getItem(LAST_PRIMARY_AGENT_KEY), "default")).toBe("stored");
+  localStorage.removeItem(LAST_PRIMARY_AGENT_KEY);
+});
+
 test("start forwards chat options so composer model, context, and attachments reach IPC", async () => {
   reset();
   const start = spyOn(commands, "startSession").mockResolvedValue({
     status: "ok",
     data: {
       sessionPk: "s1",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
@@ -924,19 +976,18 @@ test("start forwards chat options so composer model, context, and attachments re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  await useStore.getState().start(LOCAL_RUNNER, "p1", "/review", {
-    model: "fable",
-    context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
-    attachments: ["C:\\tmp\\notes.txt"],
-  });
-
-  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "/review", {
-    model: "fable",
-    effort: null,
+  await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", {
+    text: "/review",
     context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
     attachments: ["C:\\tmp\\notes.txt"],
     git: null,
-    permMode: null,
+  });
+
+  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "primary", {
+    text: "/review",
+    context: { branch: "feature/auth", voiceTranscript: null, references: ["src/main.rs"] },
+    attachments: ["C:\\tmp\\notes.txt"],
+    git: null,
   });
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
 
@@ -951,6 +1002,8 @@ test("start forwards composer git options to IPC", async () => {
     status: "ok",
     data: {
       sessionPk: "s2",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
@@ -974,17 +1027,18 @@ test("start forwards composer git options to IPC", async () => {
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  await useStore.getState().start(LOCAL_RUNNER, "p1", "go", {
-    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
-  });
-
-  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "go", {
-    model: null,
-    effort: null,
+  await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", {
+    text: "go",
     context: null,
     attachments: [],
     git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
-    permMode: null,
+  });
+
+  expect(start).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "primary", {
+    text: "go",
+    context: null,
+    attachments: [],
+    git: { useWorktree: false, createBranch: true, branchName: "feat/login", baseBranch: null },
   });
 
   start.mockRestore();
@@ -998,6 +1052,8 @@ test("start resolves and focuses the session without waiting for refresh", async
     status: "ok",
     data: {
       sessionPk: "s3",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: "p1",
       agentSessionId: null,
       worktreePath: null,
@@ -1020,7 +1076,7 @@ test("start resolves and focuses the session without waiting for refresh", async
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "go", null);
+  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", { text: "go", context: null, attachments: [], git: null });
 
   expect(ok).toBe(true);
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s3" });
@@ -1038,7 +1094,7 @@ test("start returns false and does not focus on backend error", async () => {
     status: "error",
     error: { message: "boom" },
   });
-  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "go", null);
+  const ok = await useStore.getState().start(LOCAL_RUNNER, "p1", "primary", { text: "go", context: null, attachments: [], git: null });
   expect(ok).toBe(false);
   expect(useStore.getState().focusedSession).toBeNull();
   start.mockRestore();
@@ -1050,6 +1106,8 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
     status: "ok",
     data: {
       sessionPk: "c1",
+      primaryAgentId: null,
+      primaryAgentSnapshot: null,
       projectId: null,
       agentSessionId: null,
       worktreePath: null,
@@ -1072,16 +1130,9 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   const listProjects = spyOn(commands, "listProjects").mockReturnValue(new Promise(() => {}));
   const listSessions = spyOn(commands, "listSessions").mockReturnValue(new Promise(() => {}));
 
-  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", { model: "fable", effort: "high" });
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "primary", { text: "hey", context: null, attachments: [], git: null });
 
-  expect(startChat).toHaveBeenCalledWith(LOCAL_RUNNER, "hey", {
-    model: "fable",
-    effort: "high",
-    permMode: null,
-    context: null,
-    attachments: [],
-    git: null,
-  });
+  expect(startChat).toHaveBeenCalledWith(LOCAL_RUNNER, "primary", { text: "hey", context: null, attachments: [], git: null });
   expect(ok).toBe(true);
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "c1" });
   expect(useStore.getState().sessions.map((s) => s.sessionPk)).toContain("c1");
@@ -1091,46 +1142,13 @@ test("startChat calls start_chat_session (no projectId) and seeds/focuses the re
   listSessions.mockRestore();
 });
 
-test("projectless session runtime loads and updates independently", async () => {
-  reset();
-  const initial = {
-    sessionPk: "c1",
-    model: "fixture/model-alpha",
-    storedEffort: "medium",
-    effectiveEffort: "medium",
-    effectiveEffortLabel: "Medium",
-    effectiveSource: "session" as const,
-    storedEffortStatus: "valid" as const,
-    modelInfo: null,
-  };
-  const runtimeCommands = commands as typeof commands & {
-    sessionRuntimeInfo: typeof commands.projectRuntimeInfo;
-    updateSessionRuntime: typeof commands.updateProjectRuntime;
-  };
-  const sessionInfo = mock(async () => ({ status: "ok" as const, data: initial }));
-  const update = mock(async () => ({
-    status: "ok" as const,
-    data: { ...initial, model: "fixture/model-beta", storedEffort: "ultra" },
-  }));
-  Object.assign(runtimeCommands, { sessionRuntimeInfo: sessionInfo, updateSessionRuntime: update });
-
-  await useStore.getState().loadSessionRuntime(LOCAL_RUNNER, "c1");
-  expect(useStore.getState().sessionRuntimeById.c1).toEqual(initial);
-  await useStore.getState().setSessionRuntime(LOCAL_RUNNER, "c1", "fixture/model-beta", "ultra");
-  expect(update).toHaveBeenCalledWith(LOCAL_RUNNER, "c1", "fixture/model-beta", "ultra");
-  expect(useStore.getState().sessionRuntimeById.c1).toMatchObject({ model: "fixture/model-beta", storedEffort: "ultra" });
-
-  delete (runtimeCommands as Partial<typeof runtimeCommands>).sessionRuntimeInfo;
-  delete (runtimeCommands as Partial<typeof runtimeCommands>).updateSessionRuntime;
-});
-
 test("startChat returns false and does not focus on backend error", async () => {
   reset();
   const startChat = spyOn(commands, "startChatSession").mockResolvedValue({
     status: "error",
     error: { message: "boom" },
   });
-  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "hey", null);
+  const ok = await useStore.getState().startChat(LOCAL_RUNNER, "primary", { text: "hey", context: null, attachments: [], git: null });
   expect(ok).toBe(false);
   expect(useStore.getState().focusedSession).toBeNull();
   startChat.mockRestore();
@@ -1230,6 +1248,23 @@ test("a completed todowrite tool_call triggers a todo refetch for its session", 
   useNative.setState({ loadTodos: original });
 });
 
+test("send preserves /orchestrate text as an ordinary turn input", async () => {
+  reset();
+  const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
+  const listProjects = spyOn(commands, "listProjects").mockResolvedValue({ status: "ok", data: [] });
+  const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
+  const listGateways = mockGateways();
+  const turn: TurnInput = { text: "/orchestrate audit", context: null, attachments: [], git: null };
+
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", turn)).resolves.toBe(true);
+  expect(cont).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", turn);
+
+  cont.mockRestore();
+  listProjects.mockRestore();
+  listSessions.mockRestore();
+  listGateways.mockRestore();
+});
+
 test("send resolves true on success and false on backend error (drives composer draft restore)", async () => {
   reset();
   const cont = spyOn(commands, "continueSession").mockResolvedValue({ status: "ok", data: null });
@@ -1237,10 +1272,12 @@ test("send resolves true on success and false on backend error (drives composer 
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(true);
 
   cont.mockResolvedValue({ status: "error", error: { message: "quota exhausted" } });
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hi", null)).resolves.toBe(false);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hi", context: null, attachments: [], git: null })).resolves.toBe(
+    false,
+  );
 
   cont.mockRestore();
   listProjects.mockRestore();
@@ -1257,7 +1294,9 @@ test("send steers a RUNNING session instead of starting a new turn via continue"
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "hold on", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "hold on", context: null, attachments: [], git: null })).resolves.toBe(
+    true,
+  );
   expect(steer).toHaveBeenCalledWith(LOCAL_RUNNER, "s1", "hold on");
   expect(cont).not.toHaveBeenCalled();
 
@@ -1277,7 +1316,7 @@ test("send falls back to continue for a session that is not running", async () =
   const listSessions = spyOn(commands, "listSessions").mockResolvedValue({ status: "ok", data: [] });
   const listGateways = mockGateways();
 
-  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", "go", null)).resolves.toBe(true);
+  await expect(useStore.getState().send(LOCAL_RUNNER, "s1", { text: "go", context: null, attachments: [], git: null })).resolves.toBe(true);
   expect(cont).toHaveBeenCalled();
   expect(steer).not.toHaveBeenCalled();
 
@@ -1296,6 +1335,8 @@ test("setFocused marks the previously-focused session read up to its lastActive"
       {
         runnerId: LOCAL_RUNNER,
         sessionPk: "s1",
+        primaryAgentId: null,
+        primaryAgentSnapshot: null,
         projectId: "p",
         agentSessionId: null,
         worktreePath: null,
