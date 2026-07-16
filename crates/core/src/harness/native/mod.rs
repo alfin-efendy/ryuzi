@@ -31,6 +31,7 @@ pub mod snapshot;
 pub mod steer;
 pub mod summary_budget;
 pub mod tool_contract;
+pub mod tool_plan;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
