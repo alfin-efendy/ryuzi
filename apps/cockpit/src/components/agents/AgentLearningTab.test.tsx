@@ -36,7 +36,6 @@ const validateRaw = mock(async (): Promise<KnowledgeConceptInfo | null> => parse
 const replaceRaw = mock(async () => true);
 const deleteInvalid = mock(async () => true);
 const rollback = mock(async () => true);
-const setSkillPinned = mock(async () => {});
 
 const { useLearning } = await import("@/store-learning");
 const { useStore } = await import("@/store");
@@ -60,7 +59,7 @@ function seedLearning(snapshot: AgentLearningInfo) {
 }
 
 beforeEach(() => {
-  for (const fn of [load, createConcept, updateConcept, deleteConcept, validateRaw, replaceRaw, deleteInvalid, rollback, setSkillPinned])
+  for (const fn of [load, createConcept, updateConcept, deleteConcept, validateRaw, replaceRaw, deleteInvalid, rollback])
     fn.mockClear();
   useStore.setState({ projects: [] });
   seedLearning(reviewerLearning);
