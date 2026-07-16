@@ -3,6 +3,7 @@ import type { Project, SessionStatus } from "../bindings";
 import {
   archivedCount,
   chatSessions,
+  dropTarget,
   isUnreadVisible,
   orderProjects,
   orderTasks,
@@ -219,6 +220,13 @@ test("reorder no-ops on missing id or equal ids", () => {
   expect(reorder(["1", "2"], "x", "1")).toEqual(["1", "2"]);
   expect(reorder(["1", "2"], "1", "x")).toEqual(["1", "2"]);
   expect(reorder(["1", "2"], "1", "1")).toEqual(["1", "2"]);
+});
+
+test("dropTarget picks partition and rejects cross-partition / no-op", () => {
+  expect(dropTarget("a", "b", false, false)).toBe("manual");
+  expect(dropTarget("a", "b", true, true)).toBe("pinned");
+  expect(dropTarget("a", "b", true, false)).toBeNull();
+  expect(dropTarget("a", "a", false, false)).toBeNull();
 });
 
 test("sessionsForProject orders pinned by pinnedOrder index; unordered pinned fall after by recency", () => {

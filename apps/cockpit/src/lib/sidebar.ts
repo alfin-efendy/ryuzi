@@ -45,6 +45,15 @@ export type SessionFilterCtx = {
   focusedSession: SessionRef | null;
 };
 
+/** Given two composite keys and whether the dragged row is pinned, decide the
+ *  reorder target. Returns null when the drop crosses partitions (pinned vs
+ *  unpinned) or is a no-op. */
+export function dropTarget(activeId: string, overId: string, isActivePinned: boolean, isOverPinned: boolean): "pinned" | "manual" | null {
+  if (activeId === overId) return null;
+  if (isActivePinned !== isOverPinned) return null;
+  return isActivePinned ? "pinned" : "manual";
+}
+
 /** Move `fromId` to occupy `toId`'s position (immutably). No-op if either id is
  *  absent or they are equal. */
 export function reorder(list: string[], fromId: string, toId: string): string[] {
