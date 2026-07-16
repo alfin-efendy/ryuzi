@@ -7870,8 +7870,8 @@ mod tests {
             Some("anthropic/target-model")
         );
         assert_eq!(
-            child.tool_count, 3,
-            "only target-owned, schema-admitted tool calls are counted; the facade-gated app attempt is rejected before admission"
+            child.tool_count, 4,
+            "all known, target-authorized tool calls are counted, including the recorded app facade failure"
         );
         let bodies = llm.bodies.lock().unwrap().clone();
         assert_eq!(
