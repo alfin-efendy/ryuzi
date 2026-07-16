@@ -3,11 +3,14 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! {
+    static CANONICAL_COMPILATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 256 * 1024;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 16 * 1024;
-pub const MAX_NORMALIZATION_METADATA_ENTRIES: usize = 16;
-pub const MAX_NORMALIZATION_METADATA_KEY_BYTES: usize = 64;
-pub const MAX_NORMALIZATION_METADATA_VALUE_BYTES: usize = 256;
+pub const MAX_TOOL_METADATA_ENTRIES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,11 +168,152 @@ pub struct ToolInputCtx<'a> {
     pub extra_skill_dirs: &'a [PathBuf],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMetadataToken {
+    Workspace,
+    Attachments,
+    SkillDirectory,
+    RelativePath,
+    AbsolutePath,
+    LosslessInteger,
+    LosslessBoolean,
+    Native,
+}
+
+impl ToolMetadataToken {
+    pub fn parse(value: &str) -> Result<Self, ToolError> {
+        match value {
+            "workspace" => Ok(Self::Workspace),
+            "attachments" => Ok(Self::Attachments),
+            "skill_directory" => Ok(Self::SkillDirectory),
+            "relative_path" => Ok(Self::RelativePath),
+            "absolute_path" => Ok(Self::AbsolutePath),
+            "lossless_integer" => Ok(Self::LosslessInteger),
+            "lossless_boolean" => Ok(Self::LosslessBoolean),
+            "native" => Ok(Self::Native),
+            _ => Err(ToolError::caller(
+                "invalid_tool_metadata_token",
+                "Tool metadata token is not in the stable redaction-safe vocabulary",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ToolMetadataEntry {
+    WorkspaceResolution(ToolMetadataToken),
+    AttachmentResolution(ToolMetadataToken),
+    SkillResolution(ToolMetadataToken),
+    Coercion(ToolMetadataToken),
+    ResourceCount(u64),
+    CandidateCount(u64),
+    MatchCount(u64),
+    CacheHit(bool),
+    Truncated(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ToolMetadataKey {
+    WorkspaceResolution,
+    AttachmentResolution,
+    SkillResolution,
+    Coercion,
+    ResourceCount,
+    CandidateCount,
+    MatchCount,
+    CacheHit,
+    Truncated,
+}
+
+impl ToolMetadataEntry {
+    fn key(&self) -> ToolMetadataKey {
+        match self {
+            Self::WorkspaceResolution(_) => ToolMetadataKey::WorkspaceResolution,
+            Self::AttachmentResolution(_) => ToolMetadataKey::AttachmentResolution,
+            Self::SkillResolution(_) => ToolMetadataKey::SkillResolution,
+            Self::Coercion(_) => ToolMetadataKey::Coercion,
+            Self::ResourceCount(_) => ToolMetadataKey::ResourceCount,
+            Self::CandidateCount(_) => ToolMetadataKey::CandidateCount,
+            Self::MatchCount(_) => ToolMetadataKey::MatchCount,
+            Self::CacheHit(_) => ToolMetadataKey::CacheHit,
+            Self::Truncated(_) => ToolMetadataKey::Truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolMetadata {
+    entries: BTreeMap<ToolMetadataKey, ToolMetadataEntry>,
+}
+
+impl ToolMetadata {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = &ToolMetadataEntry> {
+        self.entries.values()
+    }
+
+    pub fn insert(&mut self, entry: ToolMetadataEntry) -> Result<(), ToolError> {
+        let key = entry.key();
+        if self.entries.contains_key(&key) {
+            return Err(ToolError::caller(
+                "duplicate_tool_metadata",
+                "Tool metadata contains a duplicate fact",
+            ));
+        }
+        if self.entries.len() >= MAX_TOOL_METADATA_ENTRIES {
+            return Err(ToolError::caller(
+                "tool_metadata_limit",
+                "Tool metadata exceeds the bounded fact limit",
+            ));
+        }
+        self.entries.insert(key, entry);
+        Ok(())
+    }
+}
+
+impl Serialize for ToolMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.entries.len()))?;
+        for entry in self.entries.values() {
+            sequence.serialize_element(entry)?;
+        }
+        sequence.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let entries = Vec::<ToolMetadataEntry>::deserialize(deserializer)?;
+        let mut metadata = Self::default();
+        for entry in entries {
+            metadata.insert(entry).map_err(serde::de::Error::custom)?;
+        }
+        Ok(metadata)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedInput {
     pub value: Value,
     pub normalized: bool,
-    metadata: BTreeMap<String, String>,
+    metadata: ToolMetadata,
 }
 
 impl NormalizedInput {
@@ -177,7 +321,7 @@ impl NormalizedInput {
         Self {
             value,
             normalized: false,
-            metadata: BTreeMap::new(),
+            metadata: ToolMetadata::default(),
         }
     }
 
@@ -185,42 +329,35 @@ impl NormalizedInput {
         Self {
             value,
             normalized: true,
-            metadata: BTreeMap::new(),
+            metadata: ToolMetadata::default(),
         }
     }
 
-    pub fn metadata(&self) -> &BTreeMap<String, String> {
+    pub fn metadata(&self) -> &ToolMetadata {
         &self.metadata
     }
 
-    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        if self.metadata.len() >= MAX_NORMALIZATION_METADATA_ENTRIES {
-            return self;
-        }
-        let mut key = key.into();
-        let mut value = value.into();
-        truncate_utf8(&mut key, MAX_NORMALIZATION_METADATA_KEY_BYTES);
-        truncate_utf8(&mut value, MAX_NORMALIZATION_METADATA_VALUE_BYTES);
-        self.metadata.insert(key, value);
-        self
+    pub fn with_metadata(mut self, entry: ToolMetadataEntry) -> Result<Self, ToolError> {
+        self.metadata.insert(entry)?;
+        Ok(self)
     }
-}
-
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightMeta {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "ToolMetadata::is_empty")]
+    metadata: ToolMetadata,
+}
+
+impl PreflightMeta {
+    pub fn metadata(&self) -> &ToolMetadata {
+        &self.metadata
+    }
+
+    pub fn with_metadata(mut self, entry: ToolMetadataEntry) -> Result<Self, ToolError> {
+        self.metadata.insert(entry)?;
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,8 +390,15 @@ impl std::fmt::Display for SchemaCompileError {
 impl std::error::Error for SchemaCompileError {}
 
 pub fn compile_canonical_schema(mut schema: Value) -> Value {
+    #[cfg(test)]
+    CANONICAL_COMPILATION_COUNT.with(|count| count.set(count.get() + 1));
     close_object_shapes(&mut schema);
     schema
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_compilation_count() -> usize {
+    CANONICAL_COMPILATION_COUNT.with(std::cell::Cell::get)
 }
 
 fn close_object_shapes(value: &mut Value) {
@@ -269,12 +413,96 @@ fn close_object_shapes(value: &mut Value) {
             if object_shape && !object.contains_key("additionalProperties") {
                 object.insert("additionalProperties".into(), Value::Bool(false));
             }
-            for value in object.values_mut() {
-                close_object_shapes(value);
-            }
+            visit_schema_children_mut(object, close_object_shapes);
         }
         _ => {}
     }
+}
+
+fn visit_schema_children_mut(object: &mut Map<String, Value>, mut visit: impl FnMut(&mut Value)) {
+    const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ];
+    const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+    const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    ];
+
+    for keyword in SINGLE_SCHEMA_KEYWORDS {
+        if let Some(schema) = object.get_mut(*keyword) {
+            visit(schema);
+        }
+    }
+    for keyword in SCHEMA_ARRAY_KEYWORDS {
+        if let Some(Value::Array(schemas)) = object.get_mut(*keyword) {
+            for schema in schemas {
+                visit(schema);
+            }
+        }
+    }
+    for keyword in SCHEMA_MAP_KEYWORDS {
+        if let Some(Value::Object(schemas)) = object.get_mut(*keyword) {
+            for schema in schemas.values_mut() {
+                visit(schema);
+            }
+        }
+    }
+}
+
+fn visit_schema_children(
+    object: &Map<String, Value>,
+    mut visit: impl FnMut(&Value) -> bool,
+) -> bool {
+    const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ];
+    const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+    const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    ];
+
+    SINGLE_SCHEMA_KEYWORDS
+        .iter()
+        .filter_map(|keyword| object.get(*keyword))
+        .any(&mut visit)
+        || SCHEMA_ARRAY_KEYWORDS
+            .iter()
+            .filter_map(|keyword| object.get(*keyword).and_then(Value::as_array))
+            .flatten()
+            .any(&mut visit)
+        || SCHEMA_MAP_KEYWORDS
+            .iter()
+            .filter_map(|keyword| object.get(*keyword).and_then(Value::as_object))
+            .flat_map(Map::values)
+            .any(visit)
 }
 
 fn type_includes(value: &Option<&Value>, expected: &str) -> bool {
@@ -287,17 +515,41 @@ fn type_includes(value: &Option<&Value>, expected: &str) -> bool {
 
 pub fn compile_openai_strict_schema(canonical: &Value) -> Result<Value, SchemaCompileError> {
     let mut wire = compile_canonical_schema(canonical.clone());
-    if !wire
+    if wire
         .as_object()
-        .is_some_and(|root| root.get("type").and_then(Value::as_str) == Some("object"))
+        .is_none_or(|root| root.get("type").and_then(Value::as_str) != Some("object"))
     {
         return Err(SchemaCompileError::new(
             "strict_root_not_object",
             "Strict tool schemas require an object root",
         ));
     }
+    rewrite_schema_consts(&mut wire)?;
     compile_strict_node(&mut wire)?;
     Ok(wire)
+}
+
+fn rewrite_schema_consts(value: &mut Value) -> Result<(), SchemaCompileError> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(constant) = object.remove("const") {
+        if object.contains_key("enum") {
+            return Err(SchemaCompileError::new(
+                "unsupported_strict_schema",
+                "Tool schema uses a construct unsupported by strict mode",
+            ));
+        }
+        object.insert("enum".into(), Value::Array(vec![constant]));
+    }
+
+    let mut result = Ok(());
+    visit_schema_children_mut(object, |schema| {
+        if result.is_ok() {
+            result = rewrite_schema_consts(schema);
+        }
+    });
+    result
 }
 
 fn compile_strict_node(value: &mut Value) -> Result<(), SchemaCompileError> {
@@ -502,13 +754,25 @@ fn one_of_is_provably_disjoint(branches: &[Value]) -> bool {
     })
 }
 
-fn singleton_schema_value(schema: &Value) -> Option<Value> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProvenDiscriminator {
+    String(String),
+    Boolean(bool),
+    Null,
+}
+
+fn singleton_schema_value(schema: &Value) -> Option<ProvenDiscriminator> {
     let object = schema.as_object()?;
-    if let Some(value) = object.get("const") {
-        return Some(value.clone());
-    }
     let values = object.get("enum")?.as_array()?;
-    (values.len() == 1).then(|| values[0].clone())
+    if values.len() != 1 {
+        return None;
+    }
+    match &values[0] {
+        Value::String(value) => Some(ProvenDiscriminator::String(value.clone())),
+        Value::Bool(value) => Some(ProvenDiscriminator::Boolean(*value)),
+        Value::Null => Some(ProvenDiscriminator::Null),
+        _ => None,
+    }
 }
 
 fn reject_unsupported_keywords(object: &Map<String, Value>) -> Result<(), SchemaCompileError> {
@@ -517,7 +781,6 @@ fn reject_unsupported_keywords(object: &Map<String, Value>) -> Result<(), Schema
         "$ref",
         "additionalProperties",
         "anyOf",
-        "const",
         "description",
         "enum",
         "exclusiveMaximum",
@@ -553,7 +816,7 @@ pub(crate) fn explicit_open_object_schema(schema: &Value) -> bool {
                 && object
                     .get("additionalProperties")
                     .is_some_and(|value| value != &Value::Bool(false));
-            explicitly_open || object.values().any(explicit_open_object_schema)
+            explicitly_open || visit_schema_children(object, explicit_open_object_schema)
         }
         _ => false,
     }
@@ -562,8 +825,10 @@ pub(crate) fn explicit_open_object_schema(schema: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_canonical_schema, compile_openai_strict_schema, FacadePriority, ResourceScopeHint,
-        ToolDescriptor, ToolEffect, ToolErrorCategory,
+        compile_canonical_schema, compile_openai_strict_schema, explicit_open_object_schema,
+        FacadePriority, NormalizedInput, PreflightMeta, ResourceScopeHint, ToolDescriptor,
+        ToolEffect, ToolErrorCategory, ToolMetadata, ToolMetadataEntry, ToolMetadataToken,
+        MAX_TOOL_METADATA_ENTRIES,
     };
     use serde_json::json;
 
@@ -635,6 +900,67 @@ mod tests {
         }));
 
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn canonical_schema_traverses_only_schema_valued_keyword_positions() {
+        let schema = compile_canonical_schema(json!({
+            "type": "object",
+            "properties": {
+                "required": {"type": "string"},
+                "additionalProperties": {"type": "boolean"},
+                "nested": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "object"}},
+                        {"$ref": "#/$defs/payload"}
+                    ]
+                }
+            },
+            "$defs": {
+                "payload": {"type": "object", "properties": {"id": {"type": "string"}}}
+            },
+            "const": {"required": []},
+            "enum": [{"required": []}],
+            "default": {"required": []},
+            "examples": [{"additionalProperties": true}]
+        }));
+
+        assert!(schema["properties"].get("additionalProperties").is_some());
+        assert!(schema["properties"].get("properties").is_none());
+        assert_eq!(schema["const"], json!({"required": []}));
+        assert_eq!(schema["enum"], json!([{"required": []}]));
+        assert_eq!(schema["default"], json!({"required": []}));
+        assert_eq!(schema["examples"], json!([{"additionalProperties": true}]));
+        assert_eq!(
+            schema["properties"]["nested"]["anyOf"][0]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(schema["$defs"]["payload"]["additionalProperties"], false);
+        assert!(!explicit_open_object_schema(&schema));
+    }
+
+    #[test]
+    fn open_schema_detection_checks_only_genuine_schema_positions() {
+        let instance_data_only = json!({
+            "type": "object",
+            "properties": {
+                "additionalProperties": {"type": "boolean"}
+            },
+            "const": {"additionalProperties": true},
+            "enum": [{"additionalProperties": true}]
+        });
+        let genuinely_open = json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": true}
+                }
+            }
+        });
+
+        assert!(!explicit_open_object_schema(&instance_data_only));
+        assert!(explicit_open_object_schema(&genuinely_open));
     }
 
     #[test]
@@ -729,6 +1055,79 @@ mod tests {
     }
 
     #[test]
+    fn strict_schema_rewrites_schema_node_consts_to_singleton_enums() {
+        fn assert_no_const(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Array(values) => values.iter().for_each(assert_no_const),
+                serde_json::Value::Object(object) => {
+                    assert!(!object.contains_key("const"), "wire schema contains const");
+                    object.values().for_each(assert_no_const);
+                }
+                _ => {}
+            }
+        }
+
+        let wire = compile_openai_strict_schema(&json!({
+            "type": "object",
+            "properties": {
+                "mode": {"const": "safe"},
+                "operation": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {"action": {"const": "read"}},
+                            "required": ["action"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"action": {"const": "write"}},
+                            "required": ["action"]
+                        }
+                    ]
+                }
+            },
+            "required": ["mode", "operation"],
+            "$defs": {"tag": {"const": true}}
+        }))
+        .unwrap();
+
+        assert_no_const(&wire);
+        assert_eq!(wire["properties"]["mode"]["enum"], json!(["safe"]));
+        assert_eq!(wire["$defs"]["tag"]["enum"], json!([true]));
+        assert_eq!(
+            wire["properties"]["operation"]["anyOf"][0]["properties"]["action"]["enum"],
+            json!(["read"])
+        );
+    }
+
+    #[test]
+    fn strict_schema_does_not_prove_numeric_singletons_disjoint() {
+        let error = compile_openai_strict_schema(&json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {"action": {"enum": [1]}},
+                            "required": ["action"]
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"action": {"enum": [1.0]}},
+                            "required": ["action"]
+                        }
+                    ]
+                }
+            },
+            "required": ["operation"]
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.code, "non_disjoint_one_of");
+    }
+
+    #[test]
     fn descriptor_and_error_categories_have_stable_serialization() {
         let descriptor = ToolDescriptor {
             canonical_name: "read".into(),
@@ -776,6 +1175,81 @@ mod tests {
                 "cancelled",
                 "internal"
             ])
+        );
+    }
+
+    #[test]
+    fn tool_metadata_is_typed_bounded_and_rejects_duplicates() {
+        let mut metadata = ToolMetadata::default();
+        let entries = [
+            ToolMetadataEntry::WorkspaceResolution(ToolMetadataToken::Workspace),
+            ToolMetadataEntry::AttachmentResolution(ToolMetadataToken::Attachments),
+            ToolMetadataEntry::SkillResolution(ToolMetadataToken::SkillDirectory),
+            ToolMetadataEntry::Coercion(ToolMetadataToken::LosslessInteger),
+            ToolMetadataEntry::ResourceCount(1),
+            ToolMetadataEntry::CandidateCount(2),
+            ToolMetadataEntry::MatchCount(3),
+            ToolMetadataEntry::CacheHit(true),
+        ];
+        assert_eq!(entries.len(), MAX_TOOL_METADATA_ENTRIES);
+        for entry in entries {
+            metadata.insert(entry).unwrap();
+        }
+
+        let limit = metadata
+            .insert(ToolMetadataEntry::Truncated(false))
+            .unwrap_err();
+        assert_eq!(limit.code, "tool_metadata_limit");
+
+        let mut duplicate = ToolMetadata::default();
+        duplicate.insert(ToolMetadataEntry::CacheHit(true)).unwrap();
+        let duplicate = duplicate
+            .insert(ToolMetadataEntry::CacheHit(false))
+            .unwrap_err();
+        assert_eq!(duplicate.code, "duplicate_tool_metadata");
+
+        let duplicate_serialized = json!([
+            {"kind": "cache_hit", "value": true},
+            {"kind": "cache_hit", "value": false}
+        ]);
+        assert!(serde_json::from_value::<ToolMetadata>(duplicate_serialized).is_err());
+    }
+
+    #[test]
+    fn metadata_tokens_accept_only_stable_redaction_safe_vocabulary() {
+        assert_eq!(
+            ToolMetadataToken::parse("workspace").unwrap(),
+            ToolMetadataToken::Workspace
+        );
+        for rejected in [
+            "wørkspace",
+            "../../secret.txt",
+            "api_key",
+            "bearer-token",
+            "raw argument text",
+        ] {
+            let error = ToolMetadataToken::parse(rejected).unwrap_err();
+            assert_eq!(error.code, "invalid_tool_metadata_token");
+            assert!(!error.message.contains(rejected));
+        }
+    }
+
+    #[test]
+    fn normalization_and_preflight_share_private_checked_metadata() {
+        let normalized = NormalizedInput::changed(json!({"path": "safe"}))
+            .with_metadata(ToolMetadataEntry::WorkspaceResolution(
+                ToolMetadataToken::RelativePath,
+            ))
+            .unwrap();
+        let preflight = PreflightMeta::default()
+            .with_metadata(ToolMetadataEntry::ResourceCount(1))
+            .unwrap();
+
+        assert_eq!(normalized.metadata().len(), 1);
+        assert_eq!(preflight.metadata().len(), 1);
+        assert_eq!(
+            serde_json::to_value(preflight).unwrap(),
+            json!({"metadata": [{"kind": "resource_count", "value": 1}]})
         );
     }
 }

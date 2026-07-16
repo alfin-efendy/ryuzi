@@ -17,6 +17,7 @@ use crate::harness::native::tool_contract::{
 };
 use crate::store::Store;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -540,7 +541,7 @@ static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<RegisteredTool>>,
     generation: u64,
-    availability: tokio::sync::Mutex<BTreeMap<String, AvailabilityCacheEntry>>,
+    availability: BTreeMap<String, Arc<tokio::sync::Mutex<Option<AvailabilityCacheEntry>>>>,
 }
 
 impl ToolRegistry {
@@ -552,13 +553,7 @@ impl ToolRegistry {
     /// The built-ins plus a set of extra (e.g. MCP) tools.
     pub fn with_extra(extra: Vec<Arc<dyn Tool>>) -> Self {
         let mut list = Self::builtin_list();
-        for t in extra {
-            if let Some(index) = list.iter().position(|existing| existing.name() == t.name()) {
-                list[index] = t;
-            } else {
-                list.push(t);
-            }
-        }
+        list.extend(extra);
         Self::from_complete_list(list)
     }
 
@@ -608,25 +603,18 @@ impl ToolRegistry {
             }));
         }
 
-        let (schema, strict) = if capabilities.supports_strict_function_schema {
-            if !registered.strict_wire_eligible {
-                return Err(registered.strict_wire_error.clone().unwrap_or_else(|| {
-                    ToolError::precondition(
-                        "unsupported_strict_schema",
-                        "Tool is not eligible for strict schema advertisement",
-                    )
-                }));
-            }
-            (
-                registered
-                    .openai_strict_schema
-                    .clone()
-                    .expect("eligible strict schema is compiled at registry construction"),
-                true,
-            )
-        } else {
-            (registered.canonical_schema.clone(), false)
-        };
+        let (schema, strict) =
+            if capabilities.supports_strict_function_schema && registered.strict_wire_eligible {
+                (
+                    registered
+                        .openai_strict_schema
+                        .clone()
+                        .expect("eligible strict schema is compiled at registry construction"),
+                    true,
+                )
+            } else {
+                (registered.canonical_schema.clone(), false)
+            };
 
         let mut definition = serde_json::json!({
             "name": registered.descriptor.canonical_name,
@@ -646,28 +634,33 @@ impl ToolRegistry {
         let Some(registered) = self.tools.get(name).cloned() else {
             return Ok(None);
         };
-        let now = tokio::time::Instant::now();
-        let mut cache = self.availability.lock().await;
-        if let Some(entry) = cache.get(name) {
-            if now.duration_since(entry.checked_at) < AVAILABILITY_TTL {
-                return availability_from_entry(registered, entry, now).map(Some);
+        let cache = self
+            .availability
+            .get(name)
+            .expect("availability entries are built from the immutable tool snapshot");
+        let mut cache = cache.lock().await;
+        let evaluation_time = tokio::time::Instant::now();
+        if let Some(entry) = cache.as_ref() {
+            if evaluation_time.duration_since(entry.checked_at) < AVAILABILITY_TTL {
+                return availability_from_entry(registered, entry, evaluation_time).map(Some);
             }
         }
 
-        let previous_last_good = cache.get(name).and_then(|entry| entry.last_good_at);
+        let previous_last_good = cache.as_ref().and_then(|entry| entry.last_good_at);
         let probe = registered.tool.probe_availability().await;
+        let completed_at = tokio::time::Instant::now();
         let last_good_at = if matches!(probe, AvailabilityProbe::Available) {
-            Some(now)
+            Some(completed_at)
         } else {
             previous_last_good
         };
         let entry = AvailabilityCacheEntry {
-            checked_at: now,
+            checked_at: completed_at,
             probe,
             last_good_at,
         };
-        let result = availability_from_entry(registered, &entry, now).map(Some);
-        cache.insert(name.to_string(), entry);
+        let result = availability_from_entry(registered, &entry, completed_at).map(Some);
+        *cache = Some(entry);
         result
     }
 
@@ -701,17 +694,19 @@ impl ToolRegistry {
     }
 
     fn from_complete_list(list: Vec<Arc<dyn Tool>>) -> Self {
-        let tools = list
-            .into_iter()
-            .map(|tool| {
-                let name = tool.name().to_string();
-                (name, Arc::new(compile_registered_tool(tool)))
-            })
+        let mut tools = BTreeMap::new();
+        for tool in list {
+            let registered = Arc::new(compile_registered_tool(tool));
+            tools.insert(registered.descriptor.canonical_name.clone(), registered);
+        }
+        let availability = tools
+            .keys()
+            .map(|name| (name.clone(), Arc::new(tokio::sync::Mutex::new(None))))
             .collect();
         Self {
             tools,
             generation: next_registry_generation(),
-            availability: tokio::sync::Mutex::new(BTreeMap::new()),
+            availability,
         }
     }
 }
@@ -755,14 +750,13 @@ fn availability_from_entry(
 
 fn compile_registered_tool(tool: Arc<dyn Tool>) -> RegisteredTool {
     let descriptor = tool.descriptor();
-    let canonical_schema = compile_canonical_schema(descriptor.input_schema.clone());
-    let schema_bytes = serde_json::to_vec(&descriptor.input_schema)
-        .map(|serialized| serialized.len())
-        .unwrap_or(usize::MAX);
-    let size_error = if descriptor.description.len() > MAX_TOOL_DESCRIPTION_BYTES {
+    let description_bytes = descriptor.description.len();
+    let serialized_input_schema = serde_json::to_vec(&descriptor.input_schema).unwrap_or_default();
+    let schema_bytes = serialized_input_schema.len();
+    let size_error = if description_bytes > MAX_TOOL_DESCRIPTION_BYTES {
         Some(contract_size_error(
             "MAX_TOOL_DESCRIPTION_BYTES",
-            descriptor.description.len(),
+            description_bytes,
             MAX_TOOL_DESCRIPTION_BYTES,
         ))
     } else if schema_bytes > MAX_TOOL_SCHEMA_BYTES {
@@ -773,6 +767,12 @@ fn compile_registered_tool(tool: Arc<dyn Tool>) -> RegisteredTool {
         ))
     } else {
         None
+    };
+
+    let canonical_schema = if size_error.is_none() {
+        compile_canonical_schema(descriptor.input_schema.clone())
+    } else {
+        Value::Null
     };
 
     let canonical_validator = if size_error.is_none() {
@@ -817,15 +817,12 @@ fn compile_registered_tool(tool: Arc<dyn Tool>) -> RegisteredTool {
     };
     let strict_wire_eligible = openai_strict_schema.is_some();
 
-    let mut hasher = Sha256::new();
-    if let Ok(serialized) = serde_json::to_vec(&serde_json::json!({
-        "descriptor": &descriptor,
-        "canonical_schema": &canonical_schema,
-        "openai_strict_schema": &openai_strict_schema,
-    })) {
-        hasher.update(serialized);
-    }
-    let contract_hash = format!("{:x}", hasher.finalize());
+    let contract_hash = contract_hash(
+        &descriptor,
+        &serialized_input_schema,
+        &canonical_schema,
+        &openai_strict_schema,
+    );
 
     RegisteredTool {
         tool,
@@ -839,6 +836,55 @@ fn compile_registered_tool(tool: Arc<dyn Tool>) -> RegisteredTool {
         strict_wire_error,
         contract_hash,
     }
+}
+
+fn contract_hash(
+    descriptor: &ToolDescriptor,
+    serialized_input_schema: &[u8],
+    canonical_schema: &Value,
+    openai_strict_schema: &Option<Value>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ryuzi-tool-contract-v2\0");
+    hash_part(&mut hasher, &descriptor.canonical_name);
+    hash_part(&mut hasher, &descriptor.description);
+    hasher.update((serialized_input_schema.len() as u64).to_le_bytes());
+    hasher.update(serialized_input_schema);
+    hash_part(&mut hasher, &descriptor.output_schema);
+    hash_part(&mut hasher, &descriptor.kind);
+    hash_part(&mut hasher, &descriptor.effect);
+    hash_part(&mut hasher, &descriptor.idempotent);
+    hash_part(&mut hasher, &descriptor.interactive);
+    hash_part(&mut hasher, &descriptor.sequential_barrier);
+    hash_part(&mut hasher, &descriptor.resource_scope);
+    hash_part(&mut hasher, &descriptor.result_limit_bytes);
+    hash_part(&mut hasher, &descriptor.facade_priority);
+    hash_part(&mut hasher, &descriptor.policy_aliases);
+    hash_part(&mut hasher, &descriptor.v2_only);
+    hash_part(&mut hasher, &descriptor.v1_only);
+    hash_part(&mut hasher, &descriptor.allow_lossless_coercions);
+    hash_part(&mut hasher, canonical_schema);
+    hash_part(&mut hasher, openai_strict_schema);
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_part(hasher: &mut Sha256, value: &impl Serialize) {
+    struct HashWriter<'a>(&'a mut Sha256);
+
+    impl std::io::Write for HashWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter(hasher);
+    serde_json::to_writer(&mut writer, value).expect("tool contract fields are serializable");
+    writer.0.update(b"\0");
 }
 
 fn contract_size_error(limit_name: &str, actual_bytes: usize, max_bytes: usize) -> ToolError {
@@ -1089,8 +1135,8 @@ mod tests {
         CapabilitySource, ToolCapabilityProfile, ToolInteractionMode, WireProtocol,
     };
     use crate::harness::native::tool_contract::{
-        AvailabilityProbe, ToolError, ToolInputCtx, MAX_TOOL_DESCRIPTION_BYTES,
-        MAX_TOOL_SCHEMA_BYTES,
+        canonical_compilation_count, AvailabilityProbe, ToolError, ToolInputCtx,
+        MAX_TOOL_DESCRIPTION_BYTES, MAX_TOOL_SCHEMA_BYTES,
     };
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1099,7 +1145,48 @@ mod tests {
         name: &'static str,
         description: String,
         schema: Value,
+        canonical_name: Option<&'static str>,
+        first_probe_delay: Duration,
+        probe_failure_transient: bool,
         probes: AtomicUsize,
+    }
+
+    struct BlockingProbeTool {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingProbeTool {
+        fn name(&self) -> &str {
+            "blocking_probe"
+        }
+
+        fn description(&self) -> &str {
+            "blocking availability probe"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> PermissionSpec {
+            PermissionSpec::new(self.name(), "test")
+        }
+
+        async fn execute(&self, _ctx: &ToolCtx, _input: Value) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::ok("ok"))
+        }
+
+        async fn probe_availability(&self) -> AvailabilityProbe {
+            self.started.notify_one();
+            self.release.notified().await;
+            AvailabilityProbe::Available
+        }
     }
 
     impl ContractTool {
@@ -1108,8 +1195,26 @@ mod tests {
                 name,
                 description: description.into(),
                 schema,
+                canonical_name: None,
+                first_probe_delay: Duration::ZERO,
+                probe_failure_transient: true,
                 probes: AtomicUsize::new(0),
             }
+        }
+
+        fn with_canonical_name(mut self, canonical_name: &'static str) -> Self {
+            self.canonical_name = Some(canonical_name);
+            self
+        }
+
+        fn with_first_probe_delay(mut self, delay: Duration) -> Self {
+            self.first_probe_delay = delay;
+            self
+        }
+
+        fn with_hard_failure(mut self) -> Self {
+            self.probe_failure_transient = false;
+            self
         }
 
         fn transient_after_first_success(name: &'static str) -> Self {
@@ -1139,6 +1244,19 @@ mod tests {
             "other"
         }
 
+        fn descriptor(&self) -> ToolDescriptor {
+            let mut descriptor = ToolDescriptor::conservative(
+                self.name(),
+                self.description(),
+                self.input_schema(),
+                self.kind(),
+            );
+            if let Some(canonical_name) = self.canonical_name {
+                descriptor.canonical_name = canonical_name.into();
+            }
+            descriptor
+        }
+
         fn permission(&self, _input: &Value) -> PermissionSpec {
             PermissionSpec::new(self.name, "test")
         }
@@ -1148,12 +1266,16 @@ mod tests {
         }
 
         async fn probe_availability(&self) -> AvailabilityProbe {
-            if self.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+            let probe_index = self.probes.fetch_add(1, Ordering::SeqCst);
+            if probe_index == 0 && !self.first_probe_delay.is_zero() {
+                tokio::time::advance(self.first_probe_delay).await;
+            }
+            if probe_index == 0 {
                 AvailabilityProbe::Available
             } else {
                 AvailabilityProbe::Unavailable {
                     code: "temporarily_unavailable".into(),
-                    transient: true,
+                    transient: self.probe_failure_transient,
                 }
             }
         }
@@ -1406,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_optional_null_and_non_disjoint_one_of_are_not_advertised_as_strict() {
+    fn strict_ineligible_v2_tools_fall_back_to_closed_canonical_schema() {
         let ambiguous: Arc<dyn Tool> = Arc::new(ContractTool::new(
             "ambiguous_null",
             "ambiguous",
@@ -1433,20 +1555,32 @@ mod tests {
         ));
         let registry = ToolRegistry::with_extra(vec![ambiguous, one_of]);
 
-        assert_eq!(
-            registry
-                .v2_definition("ambiguous_null", &strict_capabilities())
-                .unwrap_err()
-                .code,
-            "ambiguous_optional_null"
-        );
-        assert_eq!(
-            registry
-                .v2_definition("overlapping_one_of", &strict_capabilities())
-                .unwrap_err()
-                .code,
-            "non_disjoint_one_of"
-        );
+        for name in ["ambiguous_null", "overlapping_one_of"] {
+            let registered = registry.registered(name).unwrap();
+            assert!(registered.v2_schema_eligible);
+            assert!(!registered.strict_wire_eligible);
+
+            let definition = registry
+                .v2_definition(name, &strict_capabilities())
+                .unwrap();
+            assert_eq!(definition["name"], name);
+            assert_eq!(definition["strict"], false);
+            assert_eq!(definition["input_schema"], registered.canonical_schema);
+            assert_eq!(definition["input_schema"]["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn strict_capable_profiles_can_advertise_builtin_strict_ineligible_tools() {
+        let registry = ToolRegistry::builtin();
+
+        for name in ["task", "delegate_agent"] {
+            let definition = registry
+                .v2_definition(name, &strict_capabilities())
+                .unwrap();
+            assert_eq!(definition["strict"], false);
+            assert_eq!(definition["input_schema"]["additionalProperties"], false);
+        }
     }
 
     #[test]
@@ -1484,6 +1618,101 @@ mod tests {
             assert!(!serialized.contains(schema_marker));
             assert!(serialized.len() < 512);
         }
+    }
+
+    #[test]
+    fn oversized_schema_skips_recursive_contract_compilers() {
+        let oversized: Arc<dyn Tool> = Arc::new(ContractTool::new(
+            "oversized_compile_guard",
+            "oversized schema",
+            serde_json::json!({
+                "type": "object",
+                "description": "x".repeat(MAX_TOOL_SCHEMA_BYTES + 1)
+            }),
+        ));
+        let before = canonical_compilation_count();
+
+        let registered = compile_registered_tool(oversized);
+
+        assert_eq!(canonical_compilation_count(), before);
+        assert_eq!(registered.canonical_schema, Value::Null);
+        assert_eq!(
+            registered.v2_schema_error.unwrap().code,
+            "tool_contract_too_large"
+        );
+        assert_eq!(registered.contract_hash.len(), 64);
+    }
+
+    #[test]
+    fn contract_hash_is_stable_and_covers_descriptor_changes() {
+        let first = compile_registered_tool(Arc::new(ContractTool::new(
+            "stable_hash",
+            "same description",
+            serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+        )));
+        let second = compile_registered_tool(Arc::new(ContractTool::new(
+            "stable_hash",
+            "same description",
+            serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+        )));
+        let changed = compile_registered_tool(Arc::new(ContractTool::new(
+            "stable_hash",
+            "changed description",
+            serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+        )));
+
+        assert_eq!(first.contract_hash, second.contract_hash);
+        assert_ne!(first.contract_hash, changed.contract_hash);
+    }
+
+    #[tokio::test]
+    async fn descriptor_canonical_name_controls_snapshot_dedup_lookup_and_cache() {
+        let first = Arc::new(
+            ContractTool::new(
+                "first_alias",
+                "first",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_canonical_name("canonical_contract"),
+        );
+        let second = Arc::new(
+            ContractTool::new(
+                "second_alias",
+                "second",
+                serde_json::json!({"type": "object"}),
+            )
+            .with_canonical_name("canonical_contract"),
+        );
+        let registry = ToolRegistry::with_extra(vec![first.clone(), second.clone()]);
+
+        assert!(registry.get("first_alias").is_none());
+        assert!(registry.get("second_alias").is_none());
+        assert_eq!(
+            registry.get("canonical_contract").unwrap().name(),
+            "second_alias"
+        );
+        assert_eq!(
+            registry
+                .registered("canonical_contract")
+                .unwrap()
+                .descriptor
+                .description,
+            "second"
+        );
+        assert_eq!(
+            registry
+                .v2_definition("canonical_contract", &strict_capabilities())
+                .unwrap()["name"],
+            "canonical_contract"
+        );
+        assert!(registry
+            .available("canonical_contract")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(first.probes.load(Ordering::SeqCst), 0);
+        assert_eq!(second.probes.load(Ordering::SeqCst), 1);
+        assert!(registry.available("second_alias").await.unwrap().is_none());
     }
 
     #[test]
@@ -1555,6 +1784,98 @@ mod tests {
         let error = registry.available("flaky_contract").await.unwrap_err();
         assert_eq!(error.code, "temporarily_unavailable");
         assert_eq!(tool.probes.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn availability_ttl_and_last_good_start_after_slow_probe_completion() {
+        let tool = Arc::new(
+            ContractTool::transient_after_first_success("slow_flaky_contract")
+                .with_first_probe_delay(Duration::from_secs(40)),
+        );
+        let registry = ToolRegistry::with_extra(vec![tool.clone()]);
+
+        let first = registry
+            .available("slow_flaky_contract")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!first.stale);
+
+        let immediate = registry
+            .available("slow_flaky_contract")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!immediate.stale);
+        assert_eq!(tool.probes.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let stale = registry
+            .available("slow_flaky_contract")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale.stale);
+        assert_eq!(tool.probes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_availability_failure_never_uses_last_good_grace() {
+        let tool = Arc::new(
+            ContractTool::transient_after_first_success("hard_failure_contract")
+                .with_hard_failure(),
+        );
+        let registry = ToolRegistry::with_extra(vec![tool]);
+
+        registry
+            .available("hard_failure_contract")
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        let error = registry
+            .available("hard_failure_contract")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.category,
+            crate::harness::native::tool_contract::ToolErrorCategory::Precondition
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_probe_does_not_serialize_unrelated_canonical_keys() {
+        let blocking = Arc::new(BlockingProbeTool {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let independent = Arc::new(ContractTool::new(
+            "independent_probe",
+            "independent",
+            serde_json::json!({"type": "object"}),
+        ));
+        let registry = Arc::new(ToolRegistry::with_extra(vec![
+            blocking.clone(),
+            independent,
+        ]));
+        let blocking_lookup = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.available("blocking_probe").await })
+        };
+        blocking.started.notified().await;
+
+        let independent_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.available("independent_probe"),
+        )
+        .await
+        .expect("unrelated canonical key should not wait for blocking probe")
+        .unwrap();
+        assert!(independent_result.is_some());
+
+        blocking.release.notify_one();
+        assert!(blocking_lookup.await.unwrap().unwrap().is_some());
     }
 
     #[test]
