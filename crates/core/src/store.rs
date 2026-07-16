@@ -2656,6 +2656,31 @@ impl Store {
         .await
     }
 
+    /// List transcript rows that belong to the primary session view. The full
+    /// durable ledger remains available through [`Self::list_messages`] for
+    /// exports, search, and other run-aware consumers.
+    pub async fn list_primary_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,\
+                        m.status,m.tool_kind,m.created_at,m.speaker \
+                 FROM messages m \
+                 LEFT JOIN agent_run_messages rm \
+                   ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq \
+                 LEFT JOIN agent_runs ar ON ar.run_id=rm.run_id \
+                 WHERE m.session_pk=?1 \
+                   AND (rm.run_id IS NULL OR ar.parent_run_id IS NULL) \
+                 ORDER BY m.seq",
+            )?;
+            let rows = stmt
+                .query_map(params![session_pk], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Resolve `pk`'s lineage root: walk `parent_session_pk` up to the
     /// session with no parent. Used to exclude the CALLING session's own
     /// lineage from `session_search` recall — a session should never
@@ -3453,13 +3478,15 @@ impl Store {
     /// so the original `{name, input}` survives an `{output: …}` update),
     /// optionally flip status, and return the row's seq, the merged payload,
     /// and its persisted tool_kind — the caller re-emits all three.
-    pub async fn update_tool_call(
+    pub async fn update_run_tool_call(
         &self,
+        run_id: &str,
         session_pk: &str,
         tool_call_id: &str,
         status: Option<&str>,
         patch: &serde_json::Value,
     ) -> anyhow::Result<(i64, serde_json::Value, Option<String>)> {
+        let run_id = run_id.to_string();
         let session_pk = session_pk.to_string();
         let tool_call_id = tool_call_id.to_string();
         let status = status.map(|s| s.to_string());
@@ -3467,9 +3494,17 @@ impl Store {
         let (seq, payload, tool_kind) = self
             .with_conn(move |c| {
                 c.query_row(
-                    "UPDATE messages SET payload=json_patch(payload, ?3), status=COALESCE(?4, status) \
-                     WHERE session_pk=?1 AND tool_call_id=?2 RETURNING seq, payload, tool_kind",
-                    params![session_pk, tool_call_id, patch, status],
+                    "UPDATE messages \
+                     SET payload=json_patch(payload, ?4), status=COALESCE(?5, status) \
+                     WHERE session_pk=?2 AND tool_call_id=?3 \
+                       AND EXISTS ( \
+                           SELECT 1 FROM agent_run_messages rm \
+                           WHERE rm.session_pk=messages.session_pk \
+                             AND rm.message_seq=messages.seq \
+                             AND rm.run_id=?1 \
+                       ) \
+                     RETURNING seq,payload,tool_kind",
+                    params![run_id, session_pk, tool_call_id, patch, status],
                     |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
@@ -6437,27 +6472,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_messages_exclude_child_owned_rows() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_agent_run(agent_run_input(
+                "child",
+                Some("root"),
+                None,
+                AgentRunKind::Subagent,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+
+        store
+            .insert_message(NewMessage::block(
+                "s1",
+                "user",
+                "text",
+                serde_json::json!({"text": "unowned"}),
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_run_message(
+                "root",
+                NewMessage::block(
+                    "s1",
+                    "assistant",
+                    "text",
+                    serde_json::json!({"text": "root owned"}),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .insert_run_message(
+                "child",
+                NewMessage::block(
+                    "s1",
+                    "assistant",
+                    "text",
+                    serde_json::json!({"text": "child owned"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let primary = store.list_primary_messages("s1").await.unwrap();
+        assert_eq!(
+            primary
+                .iter()
+                .map(|message| message.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["unowned", "root owned"]
+        );
+        assert_eq!(store.list_messages("s1").await.unwrap().len(), 3);
+        let child = store.list_run_messages("s1", "child").await.unwrap();
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].payload["text"], "child owned");
+    }
+
+    #[tokio::test]
+    async fn update_run_tool_call_does_not_cross_run_tool_call_id_collisions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_agent_run(agent_run_input(
+                "child",
+                Some("root"),
+                None,
+                AgentRunKind::Subagent,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+
+        let tool_row = |output: &str| NewMessage {
+            session_pk: "s1".into(),
+            role: "assistant".into(),
+            block_type: "tool_call".into(),
+            payload: serde_json::json!({"name": "Bash", "output": output}),
+            tool_call_id: Some("shared-id".into()),
+            status: Some("in_progress".into()),
+            tool_kind: Some("execute".into()),
+            speaker: None,
+        };
+        let root_seq = store
+            .insert_run_message("root", tool_row("root"))
+            .await
+            .unwrap();
+        let child_seq = store
+            .insert_run_message("child", tool_row("child"))
+            .await
+            .unwrap();
+
+        let (seq, payload, kind) = store
+            .update_run_tool_call(
+                "child",
+                "s1",
+                "shared-id",
+                Some("completed"),
+                &serde_json::json!({"output": "child updated"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seq, child_seq);
+        assert_eq!(payload["output"], "child updated");
+        assert_eq!(kind.as_deref(), Some("execute"));
+        let root = store.list_run_messages("s1", "root").await.unwrap();
+        assert_eq!(root[0].seq, root_seq);
+        assert_eq!(root[0].payload["output"], "root");
+        assert_eq!(root[0].status.as_deref(), Some("in_progress"));
+        let child = store.list_run_messages("s1", "child").await.unwrap();
+        assert_eq!(child[0].seq, child_seq);
+        assert_eq!(child[0].payload["output"], "child updated");
+        assert_eq!(child[0].status.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
     async fn tool_call_update_merges_output_and_returns_kind() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
 
         store
-            .insert_message(NewMessage {
-                session_pk: "s1".into(),
-                role: "assistant".into(),
-                block_type: "tool_call".into(),
-                payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
-                tool_call_id: Some("tc-1".into()),
-                status: Some("pending".into()),
-                tool_kind: Some("execute".into()),
-                speaker: None,
-            })
+            .insert_run_message(
+                "root",
+                NewMessage {
+                    session_pk: "s1".into(),
+                    role: "assistant".into(),
+                    block_type: "tool_call".into(),
+                    payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
+                    tool_call_id: Some("tc-1".into()),
+                    status: Some("pending".into()),
+                    tool_kind: Some("execute".into()),
+                    speaker: None,
+                },
+            )
             .await
             .unwrap();
 
         // The caller now sends ONLY the update patch; the store merges it.
         let (seq, merged, kind) = store
-            .update_tool_call(
+            .update_run_tool_call(
+                "root",
                 "s1",
                 "tc-1",
                 Some("completed"),
@@ -6465,7 +6658,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(seq, 1, "update_tool_call must return the row's real seq");
+        assert_eq!(
+            seq, 1,
+            "update_run_tool_call must return the row's real seq"
+        );
         assert_eq!(
             merged["name"], "Bash",
             "merge must preserve the original name"
@@ -6489,7 +6685,7 @@ mod tests {
 
         // An empty patch (ToolCallDone with no raw_output) must leave payload intact.
         let (_, merged2, _) = store
-            .update_tool_call("s1", "tc-1", None, &serde_json::json!({}))
+            .update_run_tool_call("root", "s1", "tc-1", None, &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(merged2["name"], "Bash");
@@ -6501,7 +6697,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let res = store
-            .update_tool_call(
+            .update_run_tool_call(
+                "root",
                 "s1",
                 "missing-tc",
                 Some("completed"),

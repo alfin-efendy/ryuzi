@@ -399,6 +399,14 @@ pub struct AgentRun {
     pub error: Option<String>,
 }
 
+/// The session's primary run, if it has one, plus its sorted child runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunRosterInfo {
+    pub root_run_id: Option<String>,
+    pub runs: Vec<AgentRun>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct NewAgentRun {
@@ -787,6 +795,19 @@ pub enum CoreEvent {
         tool_kind: Option<String>,
         /// Legacy group-chat attribution retained in message events for
         /// database and wire compatibility.
+        speaker: Option<String>,
+    },
+    /// A durable transcript row owned by a non-primary agent run.
+    AgentRunMessage {
+        session_pk: String,
+        run_id: String,
+        seq: i64,
+        role: String,
+        block_type: String,
+        payload: serde_json::Value,
+        tool_call_id: Option<String>,
+        status: Option<String>,
+        tool_kind: Option<String>,
         speaker: Option<String>,
     },
     SessionQueueChanged {

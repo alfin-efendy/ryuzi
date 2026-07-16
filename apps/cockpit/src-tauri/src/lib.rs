@@ -420,5 +420,17 @@ mod tests {
                 "obsolete draft command {draft_name} was exported"
             );
         }
+
+        for contract in [
+            "export type AgentRunRosterInfo = { rootRunId: string | null; runs: AgentRun[] }",
+            "sourceToolCallId: string | null",
+            "dispatchIndex: number | null",
+            "{ kind: \"agentRunMessage\"; session_pk: string; run_id: string;",
+        ] {
+            assert!(
+                bindings.contains(contract),
+                "missing generated binding contract {contract}"
+            );
+        }
     }
 }

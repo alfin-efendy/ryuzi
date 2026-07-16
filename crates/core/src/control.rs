@@ -966,7 +966,7 @@ impl ControlPlane {
     }
 
     pub async fn list_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
-        self.store.list_messages(session_pk).await
+        self.store.list_primary_messages(session_pk).await
     }
 
     /// Retrieve the persisted tool policy for `(project_id, tool)`, if any.

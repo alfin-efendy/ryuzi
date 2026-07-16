@@ -2799,23 +2799,31 @@ async fn finish_tool_row_with_display(
     }
     match deps
         .store
-        .update_tool_call(&deps.session_pk, tool_call_id, Some(status), &patch)
+        .update_run_tool_call(
+            &deps.run_id,
+            &deps.session_pk,
+            tool_call_id,
+            Some(status),
+            &patch,
+        )
         .await
     {
         Ok((seq, payload, tool_kind)) => {
-            let _ = deps.events.send(CoreEvent::Message {
-                session_pk: deps.session_pk.clone(),
-                seq,
-                role: "assistant".into(),
-                block_type: "tool_call".into(),
-                payload,
-                tool_call_id: Some(tool_call_id.to_string()),
-                status: Some(status.to_string()),
-                tool_kind,
-                speaker: None,
-            });
+            let _ = deps.events.send(run_message_event(
+                deps,
+                MessageEventFields {
+                    seq,
+                    role: "assistant".into(),
+                    block_type: "tool_call".into(),
+                    payload,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    status: Some(status.to_string()),
+                    tool_kind,
+                    speaker: None,
+                },
+            ));
         }
-        Err(e) => tracing::warn!("native: update_tool_call({tool_call_id}) failed: {e}"),
+        Err(e) => tracing::warn!("native: update_run_tool_call({tool_call_id}) failed: {e}"),
     }
 }
 
@@ -2859,7 +2867,49 @@ async fn flush_text(deps: &RunnerDeps, buf: &mut String, emit_display: bool) {
     }
 }
 
-/// Persist a message row and broadcast the matching `CoreEvent::Message`.
+struct MessageEventFields {
+    seq: i64,
+    role: String,
+    block_type: String,
+    payload: Value,
+    tool_call_id: Option<String>,
+    status: Option<String>,
+    tool_kind: Option<String>,
+    speaker: Option<String>,
+}
+
+/// Build a live event from already-persisted row data, keeping root and child
+/// transcript delivery disjoint for both inserts and terminal tool updates.
+fn run_message_event(deps: &RunnerDeps, message: MessageEventFields) -> CoreEvent {
+    if deps.run_id == deps.root_run_id {
+        CoreEvent::Message {
+            session_pk: deps.session_pk.clone(),
+            seq: message.seq,
+            role: message.role,
+            block_type: message.block_type,
+            payload: message.payload,
+            tool_call_id: message.tool_call_id,
+            status: message.status,
+            tool_kind: message.tool_kind,
+            speaker: message.speaker,
+        }
+    } else {
+        CoreEvent::AgentRunMessage {
+            session_pk: deps.session_pk.clone(),
+            run_id: deps.run_id.clone(),
+            seq: message.seq,
+            role: message.role,
+            block_type: message.block_type,
+            payload: message.payload,
+            tool_call_id: message.tool_call_id,
+            status: message.status,
+            tool_kind: message.tool_kind,
+            speaker: message.speaker,
+        }
+    }
+}
+
+/// Persist a message row and broadcast the matching root or child event.
 async fn emit_row(
     deps: &RunnerDeps,
     role: &str,
@@ -2881,17 +2931,19 @@ async fn emit_row(
     };
     match deps.store.insert_run_message(&deps.run_id, msg).await {
         Ok(seq) => {
-            let _ = deps.events.send(CoreEvent::Message {
-                session_pk: deps.session_pk.clone(),
-                seq,
-                role: role.to_string(),
-                block_type: block_type.to_string(),
-                payload,
-                tool_call_id,
-                status,
-                tool_kind,
-                speaker: None,
-            });
+            let _ = deps.events.send(run_message_event(
+                deps,
+                MessageEventFields {
+                    seq,
+                    role: role.to_string(),
+                    block_type: block_type.to_string(),
+                    payload,
+                    tool_call_id,
+                    status,
+                    tool_kind,
+                    speaker: None,
+                },
+            ));
             true
         }
         Err(e) => {
@@ -3701,6 +3753,105 @@ mod tests {
         )
         .unwrap()
         .agent_tools;
+    }
+
+    async fn child_deps_for_event_test(deps: &RunnerDeps) -> RunnerDeps {
+        use crate::domain::{AgentRunKind, AgentRunStatus, NewAgentRun};
+
+        let run_id = format!("{}-child", deps.run_id);
+        deps.store
+            .insert_agent_run(NewAgentRun {
+                run_id: run_id.clone(),
+                session_pk: deps.session_pk.clone(),
+                parent_run_id: Some(deps.run_id.clone()),
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: deps.primary_agent.profile.id.clone(),
+                executing_agent_id: Some(deps.primary_agent.profile.id.clone()),
+                executing_agent_name_snapshot: deps.primary_agent.profile.name.clone(),
+                agent_kind: AgentRunKind::Subagent,
+                task: "event ownership".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+        let mut child = deps.clone();
+        child.run_id = run_id;
+        child
+    }
+
+    #[tokio::test]
+    async fn child_rows_emit_agent_run_message_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        let child = child_deps_for_event_test(&deps).await;
+        let mut events = child.events.subscribe();
+
+        assert!(
+            emit_row(
+                &child,
+                "assistant",
+                "tool_call",
+                json!({ "name": "Bash", "input": { "command": "echo child" } }),
+                Some("child-tool".into()),
+                Some("in_progress".into()),
+                Some("execute".into()),
+            )
+            .await
+        );
+        finish_tool_row(&child, "child-tool", "child done", false).await;
+
+        let broadcast = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(broadcast.len(), 2);
+        assert!(broadcast.iter().all(|event| matches!(
+            event,
+            CoreEvent::AgentRunMessage { run_id, tool_call_id, .. }
+                if run_id == &child.run_id && tool_call_id.as_deref() == Some("child-tool")
+        )));
+        assert!(
+            !broadcast
+                .iter()
+                .any(|event| matches!(event, CoreEvent::Message { .. })),
+            "child-owned rows must never reach the primary message event"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_rows_emit_message_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        let mut events = deps.events.subscribe();
+
+        assert!(
+            emit_row(
+                &deps,
+                "assistant",
+                "tool_call",
+                json!({ "name": "Bash", "input": { "command": "echo root" } }),
+                Some("root-tool".into()),
+                Some("in_progress".into()),
+                Some("execute".into()),
+            )
+            .await
+        );
+        finish_tool_row(&deps, "root-tool", "root done", false).await;
+
+        let broadcast = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(broadcast.len(), 2);
+        assert!(broadcast.iter().all(|event| matches!(
+            event,
+            CoreEvent::Message { tool_call_id, .. }
+                if tool_call_id.as_deref() == Some("root-tool")
+        )));
+        assert!(
+            !broadcast
+                .iter()
+                .any(|event| matches!(event, CoreEvent::AgentRunMessage { .. })),
+            "root-owned rows must never reach the child run event"
+        );
     }
 
     async fn create_main_delegate_target(

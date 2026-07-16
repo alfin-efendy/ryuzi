@@ -432,6 +432,9 @@ impl Router {
             | CoreEvent::SessionQueueChanged { .. }
             | CoreEvent::ApprovalRequested { .. }
             | CoreEvent::AgentRunChanged { .. }
+            // Child transcript rows are delivered only to the Cockpit's
+            // run-scoped rail; Discord renders the primary transcript.
+            | CoreEvent::AgentRunMessage { .. }
             | CoreEvent::JobRunChanged { .. }
             // Context telemetry has no Discord rendering (yet) — the
             // compaction notice arrives as a persisted Message row instead.
