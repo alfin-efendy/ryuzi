@@ -6328,6 +6328,83 @@ fn direct_review_profile() -> crate::harness::native::capabilities::ToolCapabili
 }
 
 #[tokio::test]
+async fn v2_review_projects_dangling_tool_results_as_structured_envelopes() {
+    use crate::harness::native::llm::{LlmStream, LlmStreamFactory};
+    use crate::harness::native::runner::testutil::{
+        message_delta, message_stop, text_delta, ScriptedLlm,
+    };
+    use crate::llm_router::provenance::{LlmRequest, RoutedStream};
+
+    struct CapturingReviewLlm {
+        inner: ScriptedLlm,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl LlmStream for CapturingReviewLlm {
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.bodies.lock().unwrap().push(request.body.clone());
+            self.inner.stream(request).await
+        }
+    }
+
+    struct FixedLlmFactory(Arc<dyn LlmStream>);
+
+    impl LlmStreamFactory for FixedLlmFactory {
+        fn create(&self, _store: Arc<Store>) -> Arc<dyn LlmStream> {
+            self.0.clone()
+        }
+    }
+
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let cp = test_control_plane(store, registries(false)).await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let llm: Arc<dyn LlmStream> = Arc::new(CapturingReviewLlm {
+        inner: ScriptedLlm::new(vec![vec![
+            text_delta("review complete"),
+            message_delta("end_turn"),
+            message_stop(),
+        ]]),
+        bodies: bodies.clone(),
+    });
+    cp.set_review_llm_factory_for_test(Arc::new(FixedLlmFactory(llm)));
+
+    let profile = direct_review_profile();
+    let read_definition = crate::harness::native::tools::ToolRegistry::builtin()
+        .v2_definition("read", &profile)
+        .unwrap();
+    let mut payload = v2_review_payload(Some(profile));
+    payload.tool_defs = vec![read_definition];
+    payload.messages = vec![serde_json::json!({
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "dangling-review-call",
+            "name": "read",
+            "input": {}
+        }]
+    })];
+
+    cp.run_review_fork(&serde_json::to_string(&payload).unwrap())
+        .await
+        .unwrap();
+
+    let captured = bodies.lock().unwrap();
+    let messages = captured[0]["messages"].as_array().unwrap();
+    let repair = messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .find(|block| block["tool_use_id"] == "dangling-review-call")
+        .expect("review request must repair the captured dangling tool call");
+    let envelope: serde_json::Value =
+        serde_json::from_str(repair["content"].as_str().unwrap()).unwrap();
+    assert_eq!(envelope["error"]["code"], "cancelled");
+    assert_eq!(envelope["error"]["category"], "cancelled");
+    assert_eq!(envelope["meta"]["tool"], "read");
+}
+
+#[tokio::test]
 async fn v2_review_missing_profile_fails_before_creating_durable_review_state() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let store = crate::store::Store::open(db.path()).await.unwrap();

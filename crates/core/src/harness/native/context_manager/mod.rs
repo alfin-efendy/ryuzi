@@ -9,7 +9,9 @@ pub mod truncation;
 pub use accounting::estimate_tokens;
 pub use truncation::truncate_for_context;
 
+use super::capabilities::NativeToolsVersion;
 use super::ledger::Ledger;
+use super::tool_contract::truncate_utf8_bytes;
 use crate::llm_router::model_meta::ModelMeta;
 use crate::store::Store;
 use accounting::TokenState;
@@ -21,6 +23,7 @@ pub struct ContextConfig {
     pub auto_compact_percent: u64,
     pub tool_output_max_bytes: usize,
     pub compact_prompt: Option<String>,
+    pub native_tools_version: NativeToolsVersion,
 }
 
 impl ContextConfig {
@@ -31,7 +34,13 @@ impl ContextConfig {
             auto_compact_percent: 90,
             tool_output_max_bytes: 10_000,
             compact_prompt: None,
+            native_tools_version: NativeToolsVersion::V1,
         }
+    }
+
+    pub fn with_native_tools_version(mut self, version: NativeToolsVersion) -> Self {
+        self.native_tools_version = version;
+        self
     }
 
     pub async fn load(store: &Store, meta: ModelMeta) -> ContextConfig {
@@ -50,6 +59,7 @@ impl ContextConfig {
             auto_compact_percent: percent.clamp(50, 95),
             tool_output_max_bytes: budget,
             compact_prompt: prompt,
+            native_tools_version: NativeToolsVersion::V1,
         }
     }
 }
@@ -170,10 +180,15 @@ impl ContextManager {
     /// stores the truncated form — exactly what the model sees.
     pub async fn append_tool_results(&mut self, results: Vec<Value>) -> anyhow::Result<()> {
         let budget = self.cfg.tool_output_max_bytes;
+        let version = self.cfg.native_tools_version;
         let truncated: Vec<Value> = results
             .into_iter()
             .map(|mut r| {
-                if let Some(s) = r.get("content").and_then(|c| c.as_str()) {
+                if version == NativeToolsVersion::V2 {
+                    if let Some(content) = r.get_mut("content") {
+                        structurally_bound_v2_result_content(content, budget);
+                    }
+                } else if let Some(s) = r.get("content").and_then(Value::as_str) {
                     if s.len() > budget {
                         r["content"] = Value::String(truncate_for_context(s, budget));
                     }
@@ -191,7 +206,9 @@ impl ContextManager {
     /// block when the model supports caching. The sanitize runs first so the
     /// cache breakpoint lands on the actual last block of the sent body.
     pub fn messages_for_request(&self) -> Vec<Value> {
-        let mut msgs = self.ledger.messages_for_request();
+        let mut msgs = self
+            .ledger
+            .messages_for_request_for_version(self.cfg.native_tools_version);
         if self.cfg.meta.supports_prompt_cache {
             if let Some(last) = msgs.last_mut() {
                 if let Some(blocks) = last["content"].as_array_mut() {
@@ -301,6 +318,77 @@ impl ContextManager {
     }
 }
 
+fn structurally_bound_v2_result_content(content: &mut Value, budget: usize) {
+    match content {
+        Value::String(text) => {
+            *text = structurally_bound_v2_envelope(text, budget);
+        }
+        Value::Array(blocks) => {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                let Some(text) = block
+                    .get_mut("text")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                block["text"] = Value::String(structurally_bound_v2_envelope(&text, budget));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn structurally_bound_v2_envelope(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let Ok(mut envelope) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    if envelope.get("ok").and_then(Value::as_bool) != Some(true)
+        || !envelope.get("meta").is_some_and(Value::is_object)
+    {
+        return serde_json::to_string(&envelope).unwrap_or_else(|_| text.to_string());
+    }
+    let Some(data) = envelope
+        .get("data")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return serde_json::to_string(&envelope).unwrap_or_else(|_| text.to_string());
+    };
+    envelope["meta"]["truncated"] = Value::Bool(true);
+    envelope["data"] = Value::String(String::new());
+    let mut best = serde_json::to_string(&envelope).unwrap_or_else(|_| text.to_string());
+    if best.len() > budget {
+        return best;
+    }
+
+    let mut boundaries = data
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(data.len());
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        envelope["data"] = Value::String(truncate_utf8_bytes(&data, boundaries[mid]));
+        let candidate = serde_json::to_string(&envelope).unwrap_or_else(|_| best.clone());
+        if candidate.len() <= budget {
+            best = candidate;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    best
+}
+
 /// Classify provider error text as context-window overflow. Applied to both
 /// pre-stream anyhow errors and mid-stream Error events (spec §12).
 pub fn is_context_overflow(msg: &str) -> bool {
@@ -345,6 +433,14 @@ mod tests {
             st.percent_left
         );
         assert!(!st.needs_compaction);
+    }
+
+    #[test]
+    fn context_config_defaults_to_legacy_native_tool_ingestion() {
+        assert_eq!(
+            ContextConfig::with_meta(meta()).native_tools_version,
+            crate::harness::native::capabilities::NativeToolsVersion::V1
+        );
     }
 
     #[tokio::test]

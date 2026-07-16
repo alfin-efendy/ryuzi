@@ -2557,7 +2557,8 @@ impl ControlPlane {
                 delegation_catalog: Vec::new(),
             };
 
-            let cfg = ContextConfig::with_meta(deps.meta.clone());
+            let cfg = ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(deps.native_tools_version);
             let mut cm = if cache_parity {
                 ContextManager::seed_projected(&review_pk, cfg, payload.messages.clone())
             } else {

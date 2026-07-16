@@ -14,9 +14,6 @@ pub const MAX_TOOL_METADATA_ENTRIES: usize = 8;
 pub const MAX_TOOL_ERROR_FIELD_ERRORS: usize = 8;
 pub const MAX_TOOL_ERROR_CANDIDATES: usize = 8;
 const MAX_TOOL_ERROR_MESSAGE_BYTES: usize = 512;
-const MAX_TOOL_ERROR_DETAIL_STRING_BYTES: usize = 256;
-const MAX_TOOL_ERROR_DETAIL_ENTRIES: usize = 8;
-const MAX_TOOL_ERROR_DETAIL_DEPTH: usize = 3;
 const MAX_TOOL_RESULT_LABEL_BYTES: usize = 128;
 const MAX_TOOL_RESULT_CURSOR_BYTES: usize = 256;
 const MAX_TOOL_METADATA_TOKEN_BYTES: usize = 32;
@@ -131,7 +128,7 @@ pub enum ToolErrorStrategy {
     ContactSupport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolFieldError {
     pub field: String,
     pub code: String,
@@ -145,27 +142,58 @@ impl ToolFieldError {
         message: impl Into<String>,
     ) -> Self {
         Self {
-            field: truncate_utf8_bytes(&field.into(), MAX_TOOL_RESULT_LABEL_BYTES),
+            field: stable_field_name(&field.into()),
             code: stable_error_code(&code.into()),
-            message: truncate_utf8_bytes(&message.into(), MAX_TOOL_ERROR_MESSAGE_BYTES),
+            message: stable_field_error_message(&message.into()),
         }
+    }
+
+    fn sanitized(&self) -> Self {
+        Self::new(&self.field, &self.code, &self.message)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+impl Serialize for ToolFieldError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let safe = self.sanitized();
+        json!({
+            "field": safe.field,
+            "code": safe.code,
+            "message": safe.message,
+        })
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolFieldError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawToolFieldError {
+            field: String,
+            code: String,
+            message: String,
+        }
+
+        let raw = RawToolFieldError::deserialize(deserializer)?;
+        Ok(Self::new(raw.field, raw.code, raw.message))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     pub category: ToolErrorCategory,
     pub code: String,
     pub message: String,
-    #[serde(default)]
     pub retryable: bool,
-    #[serde(default)]
     pub strategy: Option<ToolErrorStrategy>,
-    #[serde(default)]
     pub field_errors: Box<Vec<ToolFieldError>>,
-    #[serde(default)]
     pub candidates: Box<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Box<Value>>,
 }
 
@@ -175,10 +203,12 @@ impl ToolError {
         code: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
+        let code = stable_error_code(&code.into());
+        let _untrusted_message = message.into();
         Self {
             category,
-            code: stable_error_code(&code.into()),
-            message: truncate_utf8_bytes(&message.into(), MAX_TOOL_ERROR_MESSAGE_BYTES),
+            message: public_error_message(category, &code),
+            code,
             retryable: matches!(
                 category,
                 ToolErrorCategory::Transient | ToolErrorCategory::Timeout
@@ -207,7 +237,7 @@ impl ToolError {
     }
 
     pub fn with_details(mut self, details: Value) -> Self {
-        self.details = Some(Box::new(details));
+        self.details = typed_error_details(&details).map(Box::new);
         self
     }
 
@@ -218,19 +248,21 @@ impl ToolError {
 
     pub fn with_field_error(mut self, error: ToolFieldError) -> Self {
         if self.field_errors.len() < MAX_TOOL_ERROR_FIELD_ERRORS {
-            self.field_errors.push(error);
+            self.field_errors.push(error.sanitized());
         }
         self
     }
 
     pub fn with_candidate(mut self, candidate: impl Into<String>) -> Self {
         if self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES {
-            self.candidates.push(truncate_utf8_bytes(
-                &candidate.into(),
-                MAX_TOOL_RESULT_LABEL_BYTES,
-            ));
+            self.candidates
+                .push(stable_error_candidate(&candidate.into()));
         }
         self
+    }
+
+    pub fn public_message(&self) -> String {
+        public_error_message(self.category, &stable_error_code(&self.code))
     }
 }
 
@@ -239,20 +271,16 @@ impl Serialize for ToolError {
     where
         S: serde::Serializer,
     {
-        let message = if self.category == ToolErrorCategory::Internal {
-            "Tool execution failed".to_string()
-        } else {
-            truncate_utf8_bytes(&self.message, MAX_TOOL_ERROR_MESSAGE_BYTES)
-        };
+        let message = self.public_message();
         let field_errors = self
             .field_errors
             .iter()
             .take(MAX_TOOL_ERROR_FIELD_ERRORS)
             .map(|error| {
                 json!({
-                    "field": truncate_utf8_bytes(&error.field, MAX_TOOL_RESULT_LABEL_BYTES),
+                    "field": stable_field_name(&error.field),
                     "code": stable_error_code(&error.code),
-                    "message": truncate_utf8_bytes(&error.message, MAX_TOOL_ERROR_MESSAGE_BYTES),
+                    "message": stable_field_error_message(&error.message),
                 })
             })
             .collect::<Vec<_>>();
@@ -260,7 +288,7 @@ impl Serialize for ToolError {
             .candidates
             .iter()
             .take(MAX_TOOL_ERROR_CANDIDATES)
-            .map(|candidate| truncate_utf8_bytes(candidate, MAX_TOOL_RESULT_LABEL_BYTES))
+            .map(|candidate| stable_error_candidate(candidate))
             .collect::<Vec<_>>();
         let mut stable = json!({
             "code": stable_error_code(&self.code),
@@ -271,10 +299,57 @@ impl Serialize for ToolError {
             "field_errors": field_errors,
             "candidates": candidates,
         });
-        if let Some(details) = self.details.as_ref() {
-            stable["details"] = bounded_detail(details, 0);
+        if let Some(details) = self
+            .details
+            .as_ref()
+            .and_then(|value| typed_error_details(value))
+        {
+            stable["details"] = details;
         }
         stable.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawToolError {
+            category: ToolErrorCategory,
+            code: String,
+            #[serde(default)]
+            message: String,
+            #[serde(default, rename = "retryable")]
+            _retryable: bool,
+            #[serde(default)]
+            strategy: Option<ToolErrorStrategy>,
+            #[serde(default)]
+            field_errors: Vec<ToolFieldError>,
+            #[serde(default)]
+            candidates: Vec<String>,
+            #[serde(default)]
+            details: Option<Value>,
+        }
+
+        let raw = RawToolError::deserialize(deserializer)?;
+        let mut error = ToolError::new(raw.category, raw.code, raw.message);
+        error.strategy = raw.strategy;
+        for field_error in raw
+            .field_errors
+            .into_iter()
+            .take(MAX_TOOL_ERROR_FIELD_ERRORS)
+        {
+            error = error.with_field_error(field_error);
+        }
+        for candidate in raw.candidates.into_iter().take(MAX_TOOL_ERROR_CANDIDATES) {
+            error = error.with_candidate(candidate);
+        }
+        if let Some(details) = raw.details {
+            error = error.with_details(details);
+        }
+        Ok(error)
     }
 }
 
@@ -291,51 +366,99 @@ fn stable_error_code(code: &str) -> String {
     }
 }
 
-fn bounded_detail(value: &Value, depth: usize) -> Value {
-    if depth >= MAX_TOOL_ERROR_DETAIL_DEPTH {
-        return Value::Null;
-    }
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
-        Value::String(text) => Value::String(stable_detail_text(text)),
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .take(MAX_TOOL_ERROR_DETAIL_ENTRIES)
-                .map(|value| bounded_detail(value, depth + 1))
-                .collect(),
-        ),
-        Value::Object(object) => {
-            let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_by_key(|(key, _)| *key);
-            Value::Object(
-                entries
-                    .into_iter()
-                    .take(MAX_TOOL_ERROR_DETAIL_ENTRIES)
-                    .map(|(key, value)| {
-                        (
-                            truncate_utf8_bytes(key, MAX_TOOL_RESULT_LABEL_BYTES),
-                            bounded_detail(value, depth + 1),
-                        )
-                    })
-                    .collect(),
-            )
-        }
+fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
+    let message = match code {
+        "invalid_input" => "Tool input is invalid",
+        "bad_argument" => "Bad argument",
+        "invalid_tool_metadata_token" => INVALID_TOOL_METADATA_TOKEN,
+        "duplicate_tool_metadata" => "Tool metadata contains a duplicate fact",
+        "tool_metadata_limit" => "Tool metadata exceeds the bounded fact limit",
+        "direct_tool_surface_unavailable" => "Direct function tools are unavailable",
+        "tool_not_found" => "Tool was not found",
+        "tool_not_v2_eligible" => "Tool is not eligible for V2",
+        "invalid_tool_schema" => "Tool input schema is invalid",
+        "unsupported_open_object_schema" => "Tool input schema is not supported",
+        "tool_contract_too_large" => "Tool contract exceeds a safety limit",
+        "path_kind_mismatch" => "Path kind does not match the tool contract",
+        "tool_not_in_plan" => "Tool is not part of this run's frozen facade",
+        "capability_unavailable" => "Tool is currently unavailable",
+        "permission_denied" => "Tool call was denied",
+        "hook_denied" => "Tool call was denied by a policy hook",
+        "cancelled" => "Tool call was cancelled",
+        "tool_failed" | "tool_internal_error" => "Tool execution failed",
+        _ => match category {
+            ToolErrorCategory::Caller => "Tool input is invalid",
+            ToolErrorCategory::Precondition => "Tool precondition was not met",
+            ToolErrorCategory::Conflict => "Tool call conflicts with current state",
+            ToolErrorCategory::Permission => "Tool call was denied",
+            ToolErrorCategory::Transient => "Tool is temporarily unavailable",
+            ToolErrorCategory::Timeout => "Tool call timed out",
+            ToolErrorCategory::Cancelled => "Tool call was cancelled",
+            ToolErrorCategory::Internal => "Tool execution failed",
+        },
+    };
+    truncate_utf8_bytes(message, MAX_TOOL_ERROR_MESSAGE_BYTES)
+}
+
+fn stable_field_name(field: &str) -> String {
+    match field {
+        "arguments" | "command" | "content" | "cursor" | "id" | "input" | "name" | "path"
+        | "prompt" | "query" | "url" | "value" => field.to_string(),
+        _ => "field".to_string(),
     }
 }
 
-fn stable_detail_text(text: &str) -> String {
-    let bounded = truncate_utf8_bytes(text, MAX_TOOL_ERROR_DETAIL_STRING_BYTES);
-    let stable_token = bounded.len() <= 64
-        && !bounded.is_empty()
-        && bounded.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
-        });
-    if stable_token {
-        bounded
-    } else {
-        "[redacted]".to_string()
+fn stable_field_error_message(_message: &str) -> String {
+    "Invalid field value".to_string()
+}
+
+fn stable_error_candidate(candidate: &str) -> String {
+    match candidate {
+        "attachments" | "contact_support" | "directory" | "file" | "missing" | "other"
+        | "request_permission" | "retry" | "revise_input" | "skill_directory" | "wait"
+        | "workspace" => candidate.to_string(),
+        _ => "other".to_string(),
     }
+}
+
+fn typed_error_details(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if let Some(reason) = object.get("reason").and_then(Value::as_str) {
+        let reason = match reason {
+            "explicit_additional_properties" | "schema_compilation_failed" => reason,
+            _ => return None,
+        };
+        return Some(json!({"reason": reason}));
+    }
+    if let (Some(limit), Some(actual_bytes), Some(max_bytes)) = (
+        object.get("limit").and_then(Value::as_str),
+        object.get("actual_bytes").and_then(Value::as_u64),
+        object.get("max_bytes").and_then(Value::as_u64),
+    ) {
+        let limit = match limit {
+            "MAX_TOOL_DESCRIPTION_BYTES" | "MAX_TOOL_SCHEMA_BYTES" => limit,
+            _ => return None,
+        };
+        return Some(json!({
+            "limit": limit,
+            "actual_bytes": actual_bytes,
+            "max_bytes": max_bytes,
+        }));
+    }
+    if let (Some(expected_directory), Some(actual_kind)) = (
+        object.get("expected_directory").and_then(Value::as_bool),
+        object.get("actual_kind").and_then(Value::as_str),
+    ) {
+        let actual_kind = match actual_kind {
+            "directory" | "file" | "missing" | "other" | "symlink" => actual_kind,
+            _ => return None,
+        };
+        return Some(json!({
+            "expected_directory": expected_directory,
+            "actual_kind": actual_kind,
+        }));
+    }
+    None
 }
 
 pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
@@ -450,7 +573,12 @@ impl Serialize for ToolResultEnvelope {
 
 impl std::fmt::Display for ToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
+        write!(
+            f,
+            "{}: {}",
+            stable_error_code(&self.code),
+            self.public_message()
+        )
     }
 }
 
@@ -1406,6 +1534,7 @@ mod tests {
         ToolEffect, ToolError, ToolErrorCategory, ToolErrorStrategy, ToolFieldError, ToolMetadata,
         ToolMetadataEntry, ToolMetadataToken, ToolResultEnvelope, ToolResultMeta,
         MAX_TOOL_ERROR_CANDIDATES, MAX_TOOL_ERROR_FIELD_ERRORS, MAX_TOOL_METADATA_ENTRIES,
+        MAX_TOOL_SCHEMA_BYTES,
     };
     use serde_json::json;
 
@@ -2046,6 +2175,112 @@ mod tests {
         assert!(
             text.len() < 4_096,
             "bounded error exceeded safe envelope size"
+        );
+    }
+
+    #[test]
+    fn tool_error_serialization_redacts_every_untrusted_text_surface() {
+        let top_secret = "os error 267: provider source /private/top bearer-secret";
+        let field_secret = "source chain /private/field token-secret";
+        let candidate_secret = "lowercasecredentialtoken123456789";
+        let detail_secret = "lowercasecredentialdetail123456789";
+        let error = ToolError {
+            category: ToolErrorCategory::Precondition,
+            code: "capability_unavailable".into(),
+            message: top_secret.into(),
+            retryable: false,
+            strategy: None,
+            field_errors: Box::new(vec![ToolFieldError {
+                field: "command".into(),
+                code: "invalid".into(),
+                message: field_secret.into(),
+            }]),
+            candidates: Box::new(vec![candidate_secret.into()]),
+            details: Some(Box::new(json!({"reason": detail_secret}))),
+        };
+
+        let displayed = error.to_string();
+        let serialized = serde_json::to_value(error).unwrap();
+        let rendered = serialized.to_string();
+        for secret in [top_secret, field_secret, candidate_secret, detail_secret] {
+            assert!(
+                !rendered.contains(secret),
+                "serialized ToolError leaked {secret}"
+            );
+            assert!(
+                !displayed.contains(secret),
+                "displayed ToolError leaked {secret}"
+            );
+        }
+        assert_eq!(serialized["code"], "capability_unavailable");
+        assert_eq!(serialized["category"], "precondition");
+    }
+
+    #[test]
+    fn tool_error_deserialization_enforces_bounds_and_sanitization() {
+        let raw = "os error 267 provider source bearercredentialtoken";
+        let decoded: ToolError = serde_json::from_value(json!({
+            "category": "transient",
+            "code": "dependency_down",
+            "message": raw,
+            "retryable": false,
+            "strategy": "retry",
+            "field_errors": (0..32).map(|index| json!({
+                "field": format!("field-{index}"),
+                "code": "invalid",
+                "message": raw,
+            })).collect::<Vec<_>>(),
+            "candidates": (0..32).map(|_| "lowercasecredentialtoken123456789").collect::<Vec<_>>(),
+            "details": {"reason": "lowercasecredentialdetail123456789"},
+        }))
+        .unwrap();
+
+        assert_eq!(decoded.field_errors.len(), MAX_TOOL_ERROR_FIELD_ERRORS);
+        assert_eq!(decoded.candidates.len(), MAX_TOOL_ERROR_CANDIDATES);
+        assert!(
+            decoded.retryable,
+            "retryability is derived from the typed category"
+        );
+        let rendered = serde_json::to_string(&decoded).unwrap();
+        assert!(!rendered.contains(raw));
+        assert!(!rendered.contains("lowercasecredentialtoken123456789"));
+        assert!(!rendered.contains("lowercasecredentialdetail123456789"));
+    }
+
+    #[test]
+    fn tool_error_preserves_allowlisted_typed_details() {
+        let limit = ToolError::precondition(
+            "tool_contract_too_large",
+            "Tool contract exceeds a safety limit",
+        )
+        .with_details(json!({
+            "limit": "MAX_TOOL_SCHEMA_BYTES",
+            "actual_bytes": 300_000,
+            "max_bytes": MAX_TOOL_SCHEMA_BYTES,
+        }));
+        let reason = ToolError::precondition("invalid_tool_schema", "Tool input schema is invalid")
+            .with_details(json!({"reason": "schema_compilation_failed"}));
+        let path_kind = ToolError::precondition(
+            "path_kind_mismatch",
+            "Path kind does not match the tool contract",
+        )
+        .with_details(json!({"expected_directory": true, "actual_kind": "file"}));
+
+        assert_eq!(
+            serde_json::to_value(limit).unwrap()["details"],
+            json!({
+                "limit": "MAX_TOOL_SCHEMA_BYTES",
+                "actual_bytes": 300_000,
+                "max_bytes": MAX_TOOL_SCHEMA_BYTES,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(reason).unwrap()["details"],
+            json!({"reason": "schema_compilation_failed"})
+        );
+        assert_eq!(
+            serde_json::to_value(path_kind).unwrap()["details"],
+            json!({"expected_directory": true, "actual_kind": "file"})
         );
     }
 }

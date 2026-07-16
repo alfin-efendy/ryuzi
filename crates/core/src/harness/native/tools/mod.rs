@@ -400,7 +400,7 @@ impl ToolOutput {
 
     pub fn from_error(error: ToolError) -> Self {
         ToolOutput {
-            for_model: error.message.clone(),
+            for_model: error.public_message(),
             model_blocks: None,
             display: None,
             is_error: true,

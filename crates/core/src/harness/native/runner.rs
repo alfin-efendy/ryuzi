@@ -518,7 +518,9 @@ pub async fn run_turn(
     }
 
     // 2. Load history + context state and append the user turn.
-    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone())
+        .await
+        .with_native_tools_version(deps.native_tools_version);
     let mut cm = if deps.isolated_target {
         ContextManager::ephemeral(&deps.session_pk, cfg)
     } else {
@@ -609,7 +611,9 @@ pub async fn run_turn(
 /// Manual /compact: persist the user's row, compact the session history, and
 /// record a notice row. No model turn runs.
 async fn run_manual_compact(deps: &RunnerDeps) -> anyhow::Result<()> {
-    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone())
+        .await
+        .with_native_tools_version(deps.native_tools_version);
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Same resume-seed as `run_turn` (spec §12): honor a persisted
     // post-overflow total so a manual /compact right after an overflow
@@ -1459,8 +1463,22 @@ async fn drive(
             let mut results: Vec<Value> = Vec::new();
             for (i, t) in tool_calls.iter().enumerate() {
                 if cancel.is_cancelled() {
-                    for rest in &tool_calls[i..] {
-                        results.push(tool_result(&rest.id, "Interrupted by user", true));
+                    if run_tool_plan.version() == NativeToolsVersion::V2 {
+                        for rest in &tool_calls[i..] {
+                            results.push(
+                                complete_queued_v2_cancellation(
+                                    deps,
+                                    rest,
+                                    &display,
+                                    &run_tool_plan,
+                                )
+                                .await,
+                            );
+                        }
+                    } else {
+                        for rest in &tool_calls[i..] {
+                            results.push(tool_result(&rest.id, "Interrupted by user", true));
+                        }
                     }
                     break;
                 }
@@ -2093,7 +2111,8 @@ impl RunnerMainAgentSpawner {
                 .await;
             let mut cm = ContextManager::ephemeral(
                 &child_deps.session_pk,
-                ContextConfig::with_meta(child_deps.meta.clone()),
+                ContextConfig::with_meta(child_deps.meta.clone())
+                    .with_native_tools_version(child_deps.native_tools_version),
             );
             let task = child.run.task.clone();
             let mut prompt = vec![json!({ "type": "text", "text": task })];
@@ -2420,7 +2439,8 @@ impl RunnerSpawner {
         };
         let mut cm = ContextManager::ephemeral(
             &self.deps.session_pk,
-            ContextConfig::with_meta(self.deps.meta.clone()),
+            ContextConfig::with_meta(self.deps.meta.clone())
+                .with_native_tools_version(self.deps.native_tools_version),
         );
         if let Err(e) = cm
             .append_user(json!([{ "type": "text", "text": spec.prompt }]))
@@ -3094,9 +3114,16 @@ async fn run_tool_call(
     let hook_input = input.clone();
     let execution = tool.execute(&ctx, input).await;
     let duration_ms = elapsed_ms(started);
-    let outcome = match execution {
-        Ok(output) => ToolCompletionOutcome::Output(output),
-        Err(error) => ToolCompletionOutcome::BareError(error),
+    let outcome = if version == NativeToolsVersion::V2 && cancel.is_cancelled() {
+        ToolCompletionOutcome::Error {
+            error: cancelled_tool_error(),
+            legacy_text: "Interrupted by user".to_string(),
+        }
+    } else {
+        match execution {
+            Ok(output) => ToolCompletionOutcome::Output(output),
+            Err(error) => ToolCompletionOutcome::BareError(error),
+        }
     };
     let completed = complete_tool_call(
         deps,
@@ -3116,8 +3143,75 @@ async fn run_tool_call(
     .await;
     // Observational: never gates, result ignored. Fires for both Ok and Err
     // outcomes now that the `ToolOutput` (or its error) has resolved.
-    let after_payload =
-        json!({ "tool": t.name, "input": hook_input, "result": completed.hook_summary });
+    fire_tool_after_observation(deps, &t.name, hook_input, completed.hook_summary).await;
+    completed.provider_result
+}
+
+async fn complete_queued_v2_cancellation(
+    deps: &RunnerDeps,
+    t: &ToolAccum,
+    display: &DisplayMode,
+    run_tool_plan: &RunToolPlan,
+) -> Value {
+    let planned = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) => plan.canonical_tools.get(&t.name),
+        RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => None,
+    };
+    let tool_kind = planned
+        .map(|planned| planned.descriptor.kind.as_str())
+        .unwrap_or("other");
+    let input = t.parsed_input();
+    if insert_tool_row(deps, t, &input, tool_kind, display.subagent()).await {
+        if let Err(error) = deps
+            .store
+            .increment_agent_run_tool_count(&deps.run_id)
+            .await
+        {
+            tracing::warn!(
+                "native: increment_agent_run_tool_count({}) failed: {error}",
+                deps.run_id
+            );
+        }
+    }
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let completed = complete_tool_call(
+        deps,
+        &t.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V2,
+            planned,
+            tool_name: &t.name,
+            tool_kind,
+            trace_id: &trace_id,
+            duration_ms: 0,
+            normalization: None,
+            preflight: None,
+        },
+        ToolCompletionOutcome::Error {
+            error: cancelled_tool_error(),
+            legacy_text: "Interrupted by user".to_string(),
+        },
+    )
+    .await;
+    fire_tool_after_observation(deps, &t.name, input, completed.hook_summary).await;
+    completed.provider_result
+}
+
+fn cancelled_tool_error() -> ToolError {
+    ToolError::new(
+        ToolErrorCategory::Cancelled,
+        "cancelled",
+        "Tool call was cancelled",
+    )
+}
+
+async fn fire_tool_after_observation(
+    deps: &RunnerDeps,
+    tool_name: &str,
+    input: Value,
+    hook_summary: Value,
+) {
+    let after_payload = json!({ "tool": tool_name, "input": input, "result": hook_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
@@ -3131,7 +3225,6 @@ async fn run_tool_call(
         deps.session_pk.clone(),
         after_payload,
     );
-    completed.provider_result
 }
 
 async fn reject_v2_tool_call(
@@ -3431,24 +3524,13 @@ async fn complete_tool_call(
             fields.insert("truncated".into(), Value::Bool(true));
         }
     }
-    let persisted = if context.version == NativeToolsVersion::V2
-        && model_text.len() > PERSISTED_TOOL_OUTPUT_BYTES
-    {
-        let mut persisted_meta = meta.clone();
-        persisted_meta.truncated = true;
-        let envelope = match error.as_ref() {
-            Some(error) => ToolResultEnvelope::failure(error.clone(), persisted_meta),
-            None => ToolResultEnvelope::success(
-                Value::String(truncate_utf8_bytes(
-                    &data_text,
-                    PERSISTED_TOOL_OUTPUT_BYTES / 2,
-                )),
-                persisted_meta,
-            ),
-        };
-        serde_json::to_string(&envelope).unwrap_or_else(|_| {
-            r#"{"ok":false,"error":{"code":"tool_internal_error","category":"internal","message":"Tool execution failed","retryable":false,"strategy":null,"field_errors":[],"candidates":[]},"meta":{"tool":"other","trace_id":"serialization","duration_ms":0,"truncated":true,"next_cursor":null,"mutation_id":null}}"#.to_string()
-        })
+    let persisted = if context.version == NativeToolsVersion::V2 {
+        serialize_persisted_v2_envelope(
+            error.as_ref(),
+            &data_text,
+            &meta,
+            PERSISTED_TOOL_OUTPUT_BYTES,
+        )
     } else if context.version == NativeToolsVersion::V1 {
         truncate_utf8_bytes(&model_text, PERSISTED_TOOL_OUTPUT_BYTES)
     } else {
@@ -3504,12 +3586,80 @@ async fn complete_tool_call(
     }
 }
 
-fn stable_error_message(error: &ToolError) -> String {
-    if error.category == ToolErrorCategory::Internal {
-        "Tool execution failed".to_string()
-    } else {
-        truncate_utf8_bytes(&error.message, 512)
+fn serialize_persisted_v2_envelope(
+    error: Option<&ToolError>,
+    data_text: &str,
+    meta: &ToolResultMeta,
+    max_bytes: usize,
+) -> String {
+    let envelope = match error {
+        Some(error) => ToolResultEnvelope::failure(error.clone(), meta.clone()),
+        None => ToolResultEnvelope::success(Value::String(data_text.to_string()), meta.clone()),
+    };
+    let serialized = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| persisted_v2_serialization_fallback(true));
+    if serialized.len() < max_bytes {
+        return serialized;
     }
+
+    let mut bounded_meta = meta.clone();
+    bounded_meta.truncated = true;
+    if let Some(error) = error {
+        let mut compact_error = ToolError::new(error.category, &error.code, error.public_message());
+        if let Some(strategy) = error.strategy {
+            compact_error = compact_error.with_strategy(strategy);
+        }
+        let compact =
+            serde_json::to_string(&ToolResultEnvelope::failure(compact_error, bounded_meta))
+                .unwrap_or_else(|_| persisted_v2_serialization_fallback(true));
+        if compact.len() < max_bytes {
+            return compact;
+        }
+        return persisted_v2_serialization_fallback(true);
+    }
+
+    let envelope = ToolResultEnvelope::success(Value::String(String::new()), bounded_meta.clone());
+    let mut best = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| persisted_v2_serialization_fallback(true));
+    if best.len() >= max_bytes {
+        return persisted_v2_serialization_fallback(true);
+    }
+    let mut boundaries = data_text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(data_text.len());
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let envelope = ToolResultEnvelope::success(
+            Value::String(truncate_utf8_bytes(data_text, boundaries[mid])),
+            bounded_meta.clone(),
+        );
+        let candidate = serde_json::to_string(&envelope).unwrap_or_else(|_| best.clone());
+        if candidate.len() < max_bytes {
+            best = candidate;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    best
+}
+
+fn persisted_v2_serialization_fallback(truncated: bool) -> String {
+    let mut meta = ToolResultMeta::new("other", "serialization", 0);
+    meta.truncated = truncated;
+    serde_json::to_string(&ToolResultEnvelope::failure(
+        ToolError::internal("tool_internal_error", "Tool execution failed"),
+        meta,
+    ))
+    .expect("static V2 persistence fallback is serializable")
+}
+
+fn stable_error_message(error: &ToolError) -> String {
+    error.public_message()
 }
 
 fn merge_display_summary_and_duration(
@@ -4264,7 +4414,9 @@ mod tests {
         CapabilitySource, NativeToolsVersion, RuntimeToolSurfaces, ToolCapabilityProfile,
         ToolInteractionMode, TransportToolCapabilities, WireProtocol,
     };
-    use crate::harness::native::tool_contract::{AvailabilityProbe, ToolDescriptor};
+    use crate::harness::native::tool_contract::{
+        AvailabilityProbe, ToolDescriptor, ToolFieldError, MAX_TOOL_ERROR_FIELD_ERRORS,
+    };
     use async_trait::async_trait;
     use serial_test::serial;
 
@@ -4273,6 +4425,11 @@ mod tests {
     struct BlockingTool {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct CancellationAwareTool {
+        started: Arc<tokio::sync::Notify>,
         effects: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -4501,6 +4658,43 @@ mod tests {
             self.effects
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(crate::harness::native::tools::ToolOutput::ok("released"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for CancellationAwareTool {
+        fn name(&self) -> &str {
+            "cancel_aware"
+        }
+
+        fn description(&self) -> &str {
+            "Waits for cancellation and returns a legacy handler error."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": false})
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("cancel-aware", "cancel test")
+        }
+
+        async fn execute(
+            &self,
+            ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.started.notify_one();
+            ctx.cancel.cancelled().await;
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::error(
+                "os error 267: provider cancellation bearer-secret",
+            ))
         }
     }
 
@@ -4831,6 +5025,11 @@ mod tests {
         reason: &'static str,
     }
 
+    #[derive(Default)]
+    struct RecordingExtensionEvents {
+        calls: std::sync::Mutex<Vec<(crate::harness::native::hooks::HookEvent, serde_json::Value)>>,
+    }
+
     struct BlockingAutomationSink {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: std::sync::Arc<tokio::sync::Semaphore>,
@@ -4868,6 +5067,18 @@ mod tests {
             } else {
                 crate::harness::native::hooks::HookResult::allow()
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::plugins::extension::ExtensionEvents for RecordingExtensionEvents {
+        async fn dispatch(
+            &self,
+            event: crate::harness::native::hooks::HookEvent,
+            payload: &Value,
+        ) -> crate::harness::native::hooks::HookResult {
+            self.calls.lock().unwrap().push((event, payload.clone()));
+            crate::harness::native::hooks::HookResult::allow()
         }
     }
 
@@ -8262,8 +8473,55 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "tu-dangling");
         assert_eq!(messages[2]["content"][0]["is_error"], true);
+        assert_eq!(messages[2]["content"][0]["content"], "interrupted");
         assert_eq!(messages[2]["content"][1]["type"], "text");
         assert_eq!(messages[2]["content"][1]["text"], "next");
+    }
+
+    #[tokio::test]
+    async fn v2_request_body_repairs_a_dangling_tool_use_with_a_cancelled_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(V2RecordingLlm::new(vec![turn]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        enable_v2(&mut deps);
+        {
+            let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
+            ledger
+                .append_user(json!([{"type": "text", "text": "earlier"}]))
+                .await
+                .unwrap();
+            ledger
+                .append_assistant(json!([
+                    {"type": "tool_use", "id": "tu-v2-dangling", "name": "read", "input": {}}
+                ]))
+                .await
+                .unwrap();
+        }
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies();
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        let repair = &messages[2]["content"][0];
+        assert_eq!(repair["type"], "tool_result");
+        assert_eq!(repair["tool_use_id"], "tu-v2-dangling");
+        assert_eq!(repair["is_error"], true);
+        let envelope: Value = serde_json::from_str(repair["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "cancelled");
+        assert_eq!(envelope["error"]["category"], "cancelled");
+        assert_eq!(envelope["meta"]["tool"], "read");
+        assert_eq!(envelope["meta"]["truncated"], false);
+        assert!(envelope["meta"]["trace_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
     }
 
     #[tokio::test]
@@ -9811,6 +10069,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_cancellation_during_a_handler_completes_it_and_queued_siblings_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let first_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (never_run, sibling_effects) =
+            ContractTool::available("never_run", "must stay queued after cancellation");
+        let tool_turn = vec![
+            tool_use_start(0, "cancel-running", "cancel_aware"),
+            input_json_delta(0, "{}"),
+            tool_use_start(1, "cancel-queued", "never_run"),
+            input_json_delta(1, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(V2RecordingLlm::new(vec![tool_turn]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.agent.tools = crate::harness::native::agents::ToolFilter::All;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            Arc::new(CancellationAwareTool {
+                started: started.clone(),
+                effects: first_effects.clone(),
+            }),
+            never_run,
+        ]));
+        let telemetry_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_telemetry = telemetry_lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured_telemetry.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        let extension_events = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(extension_events.clone());
+        let cancel = CancellationToken::new();
+        let running = {
+            let deps = deps.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_turn(
+                    &deps,
+                    TurnPrompt::text("cancel both", "cancel both"),
+                    cancel,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("the real handler must start");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), running)
+            .await
+            .expect("the cancelled V2 turn must settle")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            first_effects.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the in-flight handler observes cancellation exactly once"
+        );
+        assert_eq!(
+            sibling_effects.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued sibling must never execute"
+        );
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let results = turns.last().unwrap().payload.as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for (index, expected_id) in ["cancel-running", "cancel-queued"].into_iter().enumerate() {
+            assert_eq!(results[index]["tool_use_id"], expected_id);
+            let envelope: Value =
+                serde_json::from_str(results[index]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], "cancelled");
+            assert_eq!(envelope["error"]["category"], "cancelled");
+            assert!(!results[index].to_string().contains("bearer-secret"));
+        }
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        for expected_id in ["cancel-running", "cancel-queued"] {
+            let row = rows
+                .iter()
+                .find(|row| row.tool_call_id.as_deref() == Some(expected_id))
+                .expect("every cancelled V2 call owns a completed row");
+            let envelope: Value = serde_json::from_str(row.payload["output"].as_str().unwrap())
+                .expect("persisted cancellation stays structured");
+            assert_eq!(envelope["error"]["code"], "cancelled");
+        }
+        let after_calls = extension_events
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolAfter)
+            .map(|(_, payload)| payload.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(after_calls.len(), 2);
+        assert!(after_calls.iter().all(|payload| {
+            payload["result"]["ok"] == false && payload["result"]["code"] == "cancelled"
+        }));
+        let telemetry = telemetry_lines.lock().unwrap().join("\n");
+        assert_eq!(telemetry.matches("native.tool.call").count(), 2);
+        assert!(!telemetry.contains("bearer-secret"));
+    }
+
+    #[tokio::test]
     async fn isolated_main_target_executes_advertised_task_subagents() {
         let dir = tempfile::tempdir().unwrap();
         let parent_task = vec![
@@ -10069,6 +10439,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_text_completion_stays_a_valid_envelope_through_context_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let planned = result_test_planned_tool("read", 50_000);
+        let completed = complete_tool_call(
+            &deps,
+            "context-text",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-context-text",
+                duration_ms: 7,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput {
+                for_model: "é".repeat(10_000),
+                model_blocks: None,
+                display: Some(json!({"next_cursor": "cursor-after-ingestion"})),
+                is_error: false,
+                structured_error: None,
+            }),
+        )
+        .await;
+        let cfg = ContextConfig {
+            tool_output_max_bytes: 1_024,
+            ..ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(NativeToolsVersion::V2)
+        };
+        let mut cm = ContextManager::ephemeral("context-text", cfg);
+
+        cm.append_tool_results(vec![completed.provider_result])
+            .await
+            .unwrap();
+
+        let messages = cm.messages_for_request();
+        let text = messages[0]["content"][0]["content"].as_str().unwrap();
+        assert!(text.len() <= 1_024, "V2 ingestion exceeded its text budget");
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["meta"]["truncated"], true);
+        assert_eq!(envelope["meta"]["next_cursor"], "cursor-after-ingestion");
+        assert!(envelope["data"]
+            .as_str()
+            .unwrap()
+            .is_char_boundary(envelope["data"].as_str().unwrap().len()));
+    }
+
+    #[tokio::test]
+    async fn v2_image_completion_preserves_images_and_bounds_its_envelope_at_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let planned = result_test_planned_tool("read", 50_000);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAEC"}
+        });
+        let completed = complete_tool_call(
+            &deps,
+            "context-image",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-context-image",
+                duration_ms: 9,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput {
+                for_model: "x".repeat(10_000),
+                model_blocks: Some(vec![image.clone()]),
+                display: Some(json!({"next_cursor": "image-cursor"})),
+                is_error: false,
+                structured_error: None,
+            }),
+        )
+        .await;
+        let cfg = ContextConfig {
+            tool_output_max_bytes: 1_024,
+            ..ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(NativeToolsVersion::V2)
+        };
+        let mut cm = ContextManager::ephemeral("context-image", cfg);
+
+        cm.append_tool_results(vec![completed.provider_result])
+            .await
+            .unwrap();
+
+        let messages = cm.messages_for_request();
+        let blocks = messages[0]["content"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0], image);
+        let text = blocks[1]["text"].as_str().unwrap();
+        assert!(text.len() <= 1_024, "V2 ingestion exceeded its text budget");
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["meta"]["truncated"], true);
+        assert_eq!(envelope["meta"]["next_cursor"], "image-cursor");
+    }
+
+    #[tokio::test]
     async fn v2_result_persists_large_envelopes_as_bounded_valid_json() {
         let dir = tempfile::tempdir().unwrap();
         let llm = Arc::new(RecordingLlm::new(vec![]));
@@ -10114,6 +10590,102 @@ mod tests {
         let persisted: Value = serde_json::from_str(persisted).unwrap();
         assert_eq!(persisted["ok"], true);
         assert_eq!(persisted["meta"]["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn v2_result_persists_maximal_failures_below_the_structural_byte_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let tool = ToolAccum {
+            id: "v2-maximal-error".into(),
+            name: "read".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+        };
+        assert!(insert_tool_row(&deps, &tool, &tool.parsed_input(), "read", None).await);
+        let mut error =
+            ToolError::precondition("capability_unavailable", "Tool is currently unavailable")
+                .with_details(json!({
+                    "limit": "MAX_TOOL_SCHEMA_BYTES",
+                    "actual_bytes": 300_000,
+                    "max_bytes": 262_144,
+                }));
+        for index in 0..MAX_TOOL_ERROR_FIELD_ERRORS {
+            error = error
+                .with_field_error(ToolFieldError::new(
+                    format!("field-{index}"),
+                    "invalid",
+                    "invalid value".repeat(128),
+                ))
+                .with_candidate(format!("candidate-{index}"));
+        }
+        let planned = result_test_planned_tool("read", 200_000);
+        complete_tool_call(
+            &deps,
+            &tool.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: &tool.name,
+                tool_kind: "read",
+                trace_id: "trace-maximal-error",
+                duration_ms: 5,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error,
+                legacy_text: "legacy unavailable".into(),
+            },
+        )
+        .await;
+
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some(tool.id.as_str()))
+            .unwrap();
+        let persisted = row.payload["output"].as_str().unwrap();
+        assert!(persisted.len() < PERSISTED_TOOL_OUTPUT_BYTES);
+        let envelope: Value = serde_json::from_str(persisted).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "capability_unavailable");
+    }
+
+    #[test]
+    fn v2_result_structurally_compacts_failure_envelopes_under_a_small_ceiling() {
+        let mut error =
+            ToolError::precondition("capability_unavailable", "Tool is currently unavailable")
+                .with_details(json!({
+                    "limit": "MAX_TOOL_SCHEMA_BYTES",
+                    "actual_bytes": 300_000,
+                    "max_bytes": 262_144,
+                }));
+        for index in 0..MAX_TOOL_ERROR_FIELD_ERRORS {
+            error = error
+                .with_field_error(ToolFieldError::new(
+                    format!("field-{index}"),
+                    "invalid",
+                    "invalid value",
+                ))
+                .with_candidate("retry");
+        }
+        let serialized = serialize_persisted_v2_envelope(
+            Some(&error),
+            "",
+            &ToolResultMeta::new("read", "trace-small-cap", 1),
+            512,
+        );
+
+        assert!(serialized.len() < 512);
+        let envelope: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "capability_unavailable");
+        assert_eq!(envelope["meta"]["truncated"], true);
     }
 
     #[tokio::test]
