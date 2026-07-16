@@ -32,6 +32,7 @@ const { RightPanel } = await import("./RightPanel");
 const { useNav } = await import("@/store-nav");
 const { useDiff } = await import("@/store-diff");
 const { useUi } = await import("@/store-ui");
+const { useDelegation, delegationSessionKey } = await import("@/store-delegation");
 
 const APP_DIFF = ["diff --git a/src/app.ts b/src/app.ts", "--- a/src/app.ts", "+++ b/src/app.ts", "@@ -1 +1 @@", "-old", "+new"].join("\n");
 const FRESH_DIFF = [
@@ -71,6 +72,15 @@ beforeEach(() => {
   useNav.setState({ rightOpen: true, rightTab: "review", rightMaximized: false });
   useDiff.setState({ bySession: {}, pendingReview: null });
   useUi.setState({ tabs: [], activeTabId: null });
+  useDelegation.setState({
+    bySession: {},
+    rootRunBySession: {},
+    rosterStateBySession: {},
+    transcriptByRun: {},
+    transcriptStateByRun: {},
+    seenRunsByDispatch: {},
+    selectedBySession: {},
+  });
   gitDiff.mockClear();
   getChildRuns.mockClear();
   getChildRuns.mockImplementation((_runnerId, _sessionPk) => Promise.resolve({ status: "ok", data: { rootRunId: null, runs: [] } }));
@@ -341,6 +351,33 @@ test("Review error keeps Refresh available and retries", async () => {
 
   await waitFor(() => expect(gitDiff).toHaveBeenCalledTimes(2));
   await waitFor(() => expect(screen.queryByText("diff failed")).toBeNull());
+});
+
+test("panel mount preserves an external selection but a scope change clears its own stale selection", async () => {
+  const firstKey = delegationSessionKey("runner-a", "session-a");
+  const secondKey = delegationSessionKey("runner-b", "session-b");
+  const first = childRun({ runId: "first-run", sessionPk: "session-a", task: "Selected from chat" });
+  const second = childRun({ runId: "second-run", sessionPk: "session-b", task: "Stale selection in next scope" });
+  getChildRuns.mockImplementation((runnerId, sessionPk) =>
+    Promise.resolve({
+      status: "ok",
+      data: { rootRunId: null, runs: runnerId === "runner-a" && sessionPk === "session-a" ? [first] : [second] },
+    }),
+  );
+  useDelegation.setState({
+    bySession: { [firstKey]: [first], [secondKey]: [second] },
+    selectedBySession: { [firstKey]: first.runId, [secondKey]: second.runId },
+  });
+  useNav.setState({ rightTab: "agents" });
+
+  const panel = render(<RightPanel runnerId="runner-a" sessionPk="session-a" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(useDelegation.getState().selectedBySession[firstKey]).toBe(first.runId));
+  expect(screen.getByText("Selected from chat")).toBeTruthy();
+
+  panel.rerender(<RightPanel runnerId="runner-b" sessionPk="session-b" branch="main" running={false} isGit />);
+  await waitFor(() => expect(useDelegation.getState().selectedBySession[secondKey]).toBeNull());
+  expect(screen.getByRole("button", { name: /Researcher/i })).toBeTruthy();
 });
 
 test("switching runners, sessions, and full detail resets the selected child run", async () => {

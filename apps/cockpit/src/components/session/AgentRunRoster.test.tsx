@@ -81,3 +81,19 @@ test("selecting a roster card navigates to its full detail", () => {
 
   expect(useDelegation.getState().selectedBySession[delegationSessionKey("local", "s1")]).toBe("run-1");
 });
+
+test("keeps every retry attempt selectable in Done", () => {
+  const first = run({ runId: "first", task: "Original investigation", status: "failed", error: "timed out" });
+  const retry = run({ runId: "retry", retryOf: first.runId, task: "Retried investigation", status: "completed", result: "completed" });
+  const key = delegationSessionKey("local", "s1");
+  useDelegation.setState({ bySession: { [key]: [first, retry] } });
+
+  render(<AgentRunRoster runnerId="local" sessionPk="s1" />);
+
+  expect(screen.getByText("Done (2)")).toBeTruthy();
+  expect(screen.getByText("Retry 2")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /Original investigation/i }));
+  expect(useDelegation.getState().selectedBySession[key]).toBe("first");
+  fireEvent.click(screen.getByRole("button", { name: /Retried investigation/i }));
+  expect(useDelegation.getState().selectedBySession[key]).toBe("retry");
+});

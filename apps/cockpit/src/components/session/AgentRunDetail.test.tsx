@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { AgentRun, Message } from "@/bindings";
 
 const cancelChildRun = mock(() => Promise.resolve({ status: "ok", data: null }));
@@ -79,6 +79,95 @@ test("labels a main delegate as Main agent", () => {
 
   expect(screen.getByText("Main agent")).toBeTruthy();
   expect(screen.queryByText("Subagent")).toBeNull();
+});
+
+test("keeps detail metadata and result available when retrying a failed transcript load", async () => {
+  const key = delegationRunKey("local", "s1", "run-1");
+  useDelegation.setState({
+    transcriptStateByRun: { [key]: { status: "error", error: "Transcript service unavailable" } },
+  });
+
+  render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
+
+  expect(screen.getByText("Inspect logs")).toBeTruthy();
+  expect(screen.getByText("Final findings")).toBeTruthy();
+  expect(screen.getByText("Transcript service unavailable")).toBeTruthy();
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Retry transcript" }));
+    await Promise.resolve();
+  });
+  expect(getChildTranscript).toHaveBeenCalledWith("local", "s1", "run-1");
+});
+
+test("places the run identity and valid action in the detail header", () => {
+  const active = render(
+    <AgentRunDetail
+      runnerId="local"
+      sessionPk="s1"
+      run={run({ status: "running", result: null, error: null })}
+      onRelatedChanges={() => {}}
+    />,
+  );
+  const header = active.container.querySelector("header");
+  expect(header).toBeTruthy();
+  const headerContent = within(header!);
+
+  expect(headerContent.getByRole("button", { name: "Back to Agents" })).toBeTruthy();
+  expect(headerContent.getByRole("img", { name: "Agent avatar for Researcher" })).toBeTruthy();
+  for (const label of ["Researcher", "Subagent", "Running", "2 tools", "2s", "model-a", "high"]) {
+    expect(headerContent.getByText(label)).toBeTruthy();
+  }
+  expect(headerContent.getByRole("button", { name: "Stop" })).toBeTruthy();
+  expect(headerContent.queryByRole("button", { name: "Retry" })).toBeNull();
+  active.unmount();
+
+  const failed = render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
+  expect(
+    failed.container.querySelector("header") && within(failed.container.querySelector("header")!).getByRole("button", { name: "Retry" }),
+  ).toBeTruthy();
+  expect(within(failed.container.querySelector("header")!).queryByRole("button", { name: "Stop" })).toBeNull();
+});
+
+test("renders a grandchild dispatch card inside the child transcript", () => {
+  const parent = run();
+  const grandchild = run({
+    runId: "grandchild-1",
+    parentRunId: parent.runId,
+    sourceToolCallId: "nested-task",
+    dispatchIndex: 0,
+    executingAgentNameSnapshot: "Grandchild",
+    task: "Inspect nested work",
+    status: "completed",
+    result: "Nested findings",
+    error: null,
+  });
+  const sessionKey = delegationSessionKey("local", "s1");
+  useDelegation.setState({
+    bySession: { [sessionKey]: [parent, grandchild] },
+    rosterStateBySession: { [sessionKey]: { status: "ready", error: null } },
+    transcriptByRun: {
+      [delegationRunKey("local", "s1", parent.runId)]: [
+        {
+          seq: 1,
+          sessionPk: "s1",
+          role: "assistant",
+          blockType: "tool_call",
+          payload: { name: "task", input: { prompt: "Inspect nested work" } },
+          toolCallId: "nested-task",
+          status: "completed",
+          toolKind: "task",
+          createdAt: 1,
+          speaker: null,
+        },
+      ],
+    },
+  });
+
+  render(<AgentRunDetail runnerId="local" sessionPk="s1" run={parent} onRelatedChanges={() => {}} />);
+
+  expect(screen.getByRole("button", { name: "Open Grandchild agent run" })).toBeTruthy();
+  expect(screen.getByText("Inspect nested work")).toBeTruthy();
+  expect(screen.queryByText("ordinary task chip")).toBeNull();
 });
 
 test("renders and resolves only approvals for the exact runner, session, and run", () => {
