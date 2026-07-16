@@ -80,9 +80,10 @@ fn list_shows_redaction_defaults_and_unset() {
     assert!(!text.contains("supersecret"));
     assert!(text.contains("default_effort = medium (default)"));
     assert!(text.contains("default_perm_mode = default (default)"));
+    assert!(text.contains("approval_timeout_ms = 300000 (default)"));
     assert!(text.contains("workdir_root = (unset)"));
     assert!(text.contains("enabled_gateways = discord")); // seeded, persisted (no "(default)")
-    assert_eq!(out.len(), 28); // one line per schema key, catalog order (25 global + 3 discord)
+    assert_eq!(out.len(), 29); // one line per schema key, catalog order (26 global + 3 discord)
     assert_eq!(out[0].split(" = ").next(), Some("workdir_root"));
 }
 
