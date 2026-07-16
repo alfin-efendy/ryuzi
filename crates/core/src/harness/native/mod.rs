@@ -10,6 +10,7 @@
 
 pub mod agents;
 pub mod background;
+pub mod capabilities;
 pub mod commands;
 pub mod context;
 pub mod context_manager;

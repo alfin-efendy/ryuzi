@@ -1,6 +1,8 @@
 //! Lightweight model capability inference for routing.
 use serde_json::Value;
 
+use crate::harness::native::capabilities::TransportToolCapabilities;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModelCapabilities {
     pub vision: bool,
@@ -15,6 +17,51 @@ pub struct RequiredCapabilities {
     pub pdf: bool,
     pub audio: bool,
     pub image_generation: bool,
+}
+
+/// Tool-wire features frozen into a request. Unlike multimodal preferences,
+/// these are hard requirements: an incompatible retry target must not receive
+/// the request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolTransportRequirements {
+    pub function_tools: bool,
+    pub custom_freeform_tools: bool,
+    pub strict_function_schema: bool,
+    pub tool_output_schema: bool,
+}
+
+impl ToolTransportRequirements {
+    pub fn satisfied_by(self, capabilities: TransportToolCapabilities) -> bool {
+        (!self.function_tools || capabilities.supports_function_tools)
+            && (!self.custom_freeform_tools || capabilities.supports_custom_freeform_tools)
+            && (!self.strict_function_schema || capabilities.supports_strict_function_schema)
+            && (!self.tool_output_schema || capabilities.supports_tool_output_schema)
+    }
+}
+
+pub fn tool_transport_requirements_from_body(body: &Value) -> ToolTransportRequirements {
+    let mut requirements = ToolTransportRequirements::default();
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return requirements;
+    };
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(Value::as_str);
+        let function = tool.get("function").unwrap_or(tool);
+        let custom = matches!(tool_type, Some("custom" | "custom_tool" | "freeform"));
+        requirements.custom_freeform_tools |= custom;
+        requirements.function_tools |= !custom;
+        requirements.strict_function_schema |= function
+            .get("strict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        requirements.tool_output_schema |= tool.get("output_schema").is_some()
+            || function.get("output_schema").is_some()
+            || tool
+                .get("custom")
+                .and_then(|custom| custom.get("output_schema"))
+                .is_some();
+    }
+    requirements
 }
 
 impl RequiredCapabilities {
@@ -157,5 +204,23 @@ mod tests {
         assert!(model_capabilities("gpt-4o").vision);
         assert!(model_capabilities("claude-sonnet-4-5").pdf);
         assert!(!model_capabilities("text-only").vision);
+    }
+
+    #[test]
+    fn extracts_hard_tool_transport_requirements_from_frozen_definitions() {
+        let requirements = tool_transport_requirements_from_body(&json!({
+            "tools": [
+                {"type": "function", "function": {"name": "lookup", "strict": true}},
+                {"type": "custom", "custom": {
+                    "name": "shell",
+                    "output_schema": {"type": "string"}
+                }}
+            ]
+        }));
+
+        assert!(requirements.function_tools);
+        assert!(requirements.custom_freeform_tools);
+        assert!(requirements.strict_function_schema);
+        assert!(requirements.tool_output_schema);
     }
 }

@@ -2,6 +2,8 @@
 //! Ported from 9router (MIT, (c) 2024-2026 decolua and contributors) —
 //! concept and provider list from open-sse/providers/registry/.
 
+use crate::harness::native::capabilities::{TransportToolCapabilities, WireProtocol};
+
 /// Wire format the provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFormat {
@@ -28,6 +30,48 @@ pub enum ProviderCategory {
     Free,
 }
 
+/// Typed facts about the provider adapter's tool wire contract. These facts
+/// belong to the adapter, never to a requested model identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderToolTransport {
+    capabilities: TransportToolCapabilities,
+}
+
+impl ProviderToolTransport {
+    pub const ANTHROPIC_FUNCTIONS: Self = Self {
+        capabilities: TransportToolCapabilities::function_only(WireProtocol::AnthropicMessages),
+    };
+    pub const OPENAI_FUNCTIONS: Self = Self {
+        capabilities: TransportToolCapabilities::function_only(WireProtocol::OpenAiChat),
+    };
+    pub const OPENAI_STRICT_CHAT: Self = Self {
+        capabilities: TransportToolCapabilities {
+            wire_protocol: WireProtocol::OpenAiChat,
+            supports_function_tools: true,
+            supports_custom_freeform_tools: false,
+            supports_parallel_tool_calls: true,
+            supports_strict_function_schema: true,
+            supports_tool_output_schema: false,
+            schema_budget_tokens: 16_000,
+        },
+    };
+    pub const OPENAI_STRICT_RESPONSES: Self = Self {
+        capabilities: TransportToolCapabilities {
+            wire_protocol: WireProtocol::OpenAiResponses,
+            supports_function_tools: true,
+            supports_custom_freeform_tools: true,
+            supports_parallel_tool_calls: true,
+            supports_strict_function_schema: true,
+            supports_tool_output_schema: true,
+            schema_budget_tokens: 16_000,
+        },
+    };
+
+    pub const fn capabilities(self) -> TransportToolCapabilities {
+        self.capabilities
+    }
+}
+
 pub struct ProviderDescriptor {
     pub id: &'static str,
     pub name: &'static str,
@@ -41,6 +85,7 @@ pub struct ProviderDescriptor {
     pub initial: &'static str,
     pub category: ProviderCategory,
     pub format: ApiFormat,
+    pub tool_transport: ProviderToolTransport,
     /// Chat base. OpenAi format usually ends with `/v1` (path
     /// `/chat/completions` is appended); a vendor host without a version
     /// segment (e.g. `github-copilot` → `https://api.githubcopilot.com`) is
@@ -200,6 +245,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "A",
         category: ApiKey,
         format: ApiFormat::Anthropic,
+        tool_transport: ProviderToolTransport::ANTHROPIC_FUNCTIONS,
         base_url: Some("https://api.anthropic.com/v1"),
         auth: AuthScheme::XApiKey,
         models: &["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
@@ -222,6 +268,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "O",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_STRICT_CHAT,
         base_url: Some("https://api.openai.com/v1"),
         auth: AuthScheme::Bearer,
         models: &["gpt-5.2", "gpt-5.2-codex", "o5-mini"],
@@ -244,6 +291,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "R",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://openrouter.ai/api/v1"),
         auth: AuthScheme::Bearer,
         models: &[],
@@ -266,6 +314,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "G",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://api.groq.com/openai/v1"),
         auth: AuthScheme::Bearer,
         models: &[],
@@ -288,6 +337,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "D",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://api.deepseek.com/v1"),
         auth: AuthScheme::Bearer,
         models: &["deepseek-chat", "deepseek-reasoner"],
@@ -310,6 +360,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "M",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://api.mistral.ai/v1"),
         auth: AuthScheme::Bearer,
         models: &[],
@@ -332,6 +383,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "X",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://api.x.ai/v1"),
         auth: AuthScheme::Bearer,
         models: &[],
@@ -354,6 +406,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "G",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         auth: AuthScheme::Bearer,
         models: &["gemini-3.0-pro", "gemini-3.0-flash"],
@@ -376,6 +429,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "L",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("http://127.0.0.1:11434/v1"),
         auth: AuthScheme::None,
         models: &[],
@@ -398,6 +452,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "C",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: None,
         auth: AuthScheme::Bearer,
         models: &[],
@@ -420,6 +475,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "C",
         category: ApiKey,
         format: ApiFormat::Anthropic,
+        tool_transport: ProviderToolTransport::ANTHROPIC_FUNCTIONS,
         base_url: None,
         auth: AuthScheme::XApiKey,
         models: &[],
@@ -444,6 +500,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "A",
         category: OAuth,
         format: ApiFormat::Anthropic,
+        tool_transport: ProviderToolTransport::ANTHROPIC_FUNCTIONS,
         base_url: Some("https://api.anthropic.com/v1"),
         auth: AuthScheme::Bearer,
         models: &[
@@ -482,6 +539,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "O",
         category: OAuth,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_STRICT_RESPONSES,
         base_url: Some("https://api.openai.com/v1"),
         auth: AuthScheme::Bearer,
         models: &["gpt-5.2-codex", "gpt-5.2", "o5-mini"],
@@ -514,6 +572,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "K",
         category: Free,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::ANTHROPIC_FUNCTIONS,
         base_url: None,
         auth: AuthScheme::Bearer,
         models: &[
@@ -549,6 +608,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "OC",
         category: Free,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://opencode.ai/zen/v1"),
         auth: AuthScheme::None,
         models: &[],
@@ -571,6 +631,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "M",
         category: Free,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://api.xiaomimimo.com/api/free-ai/openai"),
         auth: AuthScheme::None,
         // No /models endpoint on this host (9router discovers via models.dev)
@@ -595,6 +656,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "N",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://integrate.api.nvidia.com/v1"),
         auth: AuthScheme::Bearer,
         models: &[],
@@ -617,6 +679,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "H",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://router.huggingface.co/v1"),
         auth: AuthScheme::Bearer,
         models: &[],
@@ -639,6 +702,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "CF",
         category: ApiKey,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         // User pastes https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
         base_url: None,
         auth: AuthScheme::Bearer,
@@ -668,6 +732,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "Q",
         category: OAuth,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://portal.qwen.ai/v1"),
         auth: AuthScheme::Bearer,
         models: &[
@@ -695,6 +760,7 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         initial: "GH",
         category: OAuth,
         format: ApiFormat::OpenAi,
+        tool_transport: ProviderToolTransport::OPENAI_FUNCTIONS,
         base_url: Some("https://api.githubcopilot.com"),
         auth: AuthScheme::Bearer,
         models: &[

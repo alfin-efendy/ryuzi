@@ -28,6 +28,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::harness::native::capabilities::{CapabilityResolutionError, TransportToolCapabilities};
+
 /// Everything the upstream path needs, decoupled from axum. Cheap to clone
 /// (an `Arc<Store>`, a `reqwest::Client` which is internally reference
 /// counted, and a small `Option<String>`).
@@ -137,6 +139,127 @@ pub async fn route_models_for_anthropic_messages(
     )
 }
 
+/// Read the adapter-level tool envelope for every target the current routing
+/// rules may try before content is delivered. This is deliberately a peek:
+/// it never advances model-route or provider-account round-robin cursors.
+pub async fn route_tool_capabilities(
+    store: &Store,
+    requested: &str,
+) -> anyhow::Result<TransportToolCapabilities> {
+    let targets = peek_route_tool_targets(store, requested).await?;
+    TransportToolCapabilities::intersection(
+        targets
+            .into_iter()
+            .map(|target| target.desc.tool_transport.capabilities()),
+    )
+    .map_err(anyhow::Error::from)
+}
+
+async fn peek_route_tool_targets(
+    store: &Store,
+    requested: &str,
+) -> anyhow::Result<Vec<RouteTarget>> {
+    let enabled = connections::list_connections(store)
+        .await?
+        .into_iter()
+        .filter(|connection| connection.enabled)
+        .collect::<Vec<_>>();
+    let route_list = routes::list_model_routes(store).await?;
+    let mut out = Vec::new();
+
+    if let Some(route) = routes::route_by_name(&route_list, requested) {
+        for target in &route.targets {
+            append_peeked_route_target(&enabled, target, &mut out);
+        }
+    } else if let Some((family, model)) = requested.split_once('/') {
+        for connection in &enabled {
+            let Some(desc) = registry::descriptor(&connection.provider) else {
+                continue;
+            };
+            if desc.family != family
+                || !anthropic_messages_target_allowed(connection, desc)
+                || !connection_has_required_credentials(desc, connection)
+            {
+                continue;
+            }
+            let Some(upstream_model) =
+                resolved_requested_model(connection, desc, requested, model, true)
+            else {
+                continue;
+            };
+            out.push(RouteTarget {
+                conn: connection.clone(),
+                desc,
+                upstream_model,
+                route_target_key: None,
+            });
+        }
+        if let Some(route) = route_list.iter().find(|route| {
+            route.enabled
+                && route
+                    .targets
+                    .iter()
+                    .any(|target| target.provider == family && target.model == model)
+        }) {
+            for target in &route.targets {
+                append_peeked_route_target(&enabled, target, &mut out);
+            }
+        }
+    } else {
+        for connection in &enabled {
+            let Some(desc) = registry::descriptor(&connection.provider) else {
+                continue;
+            };
+            if anthropic_messages_target_allowed(connection, desc)
+                && connection_has_required_credentials(desc, connection)
+                && connection_serves_model(desc, connection, requested, false)
+            {
+                out.push(RouteTarget {
+                    conn: connection.clone(),
+                    desc,
+                    upstream_model: requested.to_string(),
+                    route_target_key: None,
+                });
+            }
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|target| seen.insert((target.conn.id.clone(), target.upstream_model.clone())));
+    if out.is_empty() {
+        return Err(CapabilityResolutionError {
+            code: "capability_unavailable",
+            message: format!("no eligible transport targets for route '{requested}'"),
+        }
+        .into());
+    }
+    Ok(out)
+}
+
+fn append_peeked_route_target(
+    enabled: &[connections::ConnectionRow],
+    target: &routes::ModelRouteTarget,
+    out: &mut Vec<RouteTarget>,
+) {
+    for connection in enabled {
+        let Some(desc) = registry::descriptor(&connection.provider) else {
+            continue;
+        };
+        if desc.family == target.provider
+            && anthropic_messages_target_allowed(connection, desc)
+            && connection_has_required_credentials(desc, connection)
+            && connection_serves_model(desc, connection, &target.model, false)
+        {
+            out.push(RouteTarget {
+                conn: connection.clone(),
+                desc,
+                upstream_model: target.model.clone(),
+                route_target_key: None,
+            });
+        }
+    }
+}
+
 async fn route_models_for_body_matching(
     store: &Store,
     requested: &str,
@@ -165,6 +288,9 @@ async fn route_models_for_body_matching_with_cache(
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
     let required = body
         .map(capabilities::required_capabilities_from_body)
+        .unwrap_or_default();
+    let tool_requirements = body
+        .map(capabilities::tool_transport_requirements_from_body)
         .unwrap_or_default();
     let route_list = routes::list_model_routes(store).await?;
     if let Some(route) = routes::route_by_name(&route_list, requested) {
@@ -207,7 +333,10 @@ async fn route_models_for_body_matching_with_cache(
                 out.push(annotated);
             }
         }
-        return Ok(normalize_single_reason(out));
+        return Ok(filter_tool_compatible(
+            normalize_single_reason(out),
+            tool_requirements,
+        ));
     }
     if let Some((prov, model)) = requested.split_once('/') {
         let candidates: Vec<_> = enabled
@@ -246,7 +375,10 @@ async fn route_models_for_body_matching_with_cache(
                 });
             }
         }
-        return Ok(normalize_single_reason(out));
+        return Ok(filter_tool_compatible(
+            normalize_single_reason(out),
+            tool_requirements,
+        ));
     }
     // Bare model: first (highest-priority) connection listing it.
     let mut provider_order = Vec::<String>::new();
@@ -295,7 +427,22 @@ async fn route_models_for_body_matching_with_cache(
             }
         }
     }
-    Ok(normalize_single_reason(out))
+    Ok(filter_tool_compatible(
+        normalize_single_reason(out),
+        tool_requirements,
+    ))
+}
+
+fn filter_tool_compatible(
+    targets: Vec<AnnotatedRouteTarget>,
+    requirements: capabilities::ToolTransportRequirements,
+) -> Vec<AnnotatedRouteTarget> {
+    targets
+        .into_iter()
+        .filter(|target| {
+            requirements.satisfied_by(target.target.desc.tool_transport.capabilities())
+        })
+        .collect()
 }
 
 fn combine_order_reason(
@@ -398,6 +545,7 @@ async fn route_continuation_targets(
     requested: &str,
     attempted: &std::collections::HashSet<(String, String)>,
     provider_order_cache: &mut ProviderOrderCache,
+    tool_requirements: capabilities::ToolTransportRequirements,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let Some((family, model)) = requested.split_once('/') else {
         return Ok(Vec::new());
@@ -437,7 +585,7 @@ async fn route_continuation_targets(
             out.push(annotated);
         }
     }
-    Ok(out)
+    Ok(filter_tool_compatible(out, tool_requirements))
 }
 
 fn route_target_has_candidate(
@@ -1854,15 +2002,19 @@ pub async fn anthropic_messages_stream(
     effort_policy: &model_effort::TurnEffortPolicy,
 ) -> anyhow::Result<RoutedStream> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
+    let tool_requirements = capabilities::tool_transport_requirements_from_body(&body);
     let mut provider_order_cache = ProviderOrderCache::new();
-    let targets = route_models_for_body_matching_with_cache(
-        &ctx.store,
-        &requested,
-        None,
-        anthropic_messages_target_allowed,
-        &mut provider_order_cache,
-    )
-    .await?;
+    let targets = filter_tool_compatible(
+        route_models_for_body_matching_with_cache(
+            &ctx.store,
+            &requested,
+            None,
+            anthropic_messages_target_allowed,
+            &mut provider_order_cache,
+        )
+        .await?,
+        tool_requirements,
+    );
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
@@ -1885,6 +2037,7 @@ pub async fn anthropic_messages_stream(
                     &requested,
                     &attempted,
                     &mut provider_order_cache,
+                    tool_requirements,
                 )
                 .await?,
             );
@@ -2120,15 +2273,19 @@ pub async fn anthropic_messages_stream(
 /// Non-streaming sibling: returns the full Anthropic message `Value`.
 pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Result<Value> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
+    let tool_requirements = capabilities::tool_transport_requirements_from_body(&body);
     let mut provider_order_cache = ProviderOrderCache::new();
-    let targets = route_models_for_body_matching_with_cache(
-        &ctx.store,
-        &requested,
-        None,
-        anthropic_messages_target_allowed,
-        &mut provider_order_cache,
+    let targets = filter_tool_compatible(
+        route_models_for_body_matching_with_cache(
+            &ctx.store,
+            &requested,
+            None,
+            anthropic_messages_target_allowed,
+            &mut provider_order_cache,
+        )
+        .await?,
+        tool_requirements,
     )
-    .await?
     .into_iter()
     .map(|annotated| annotated.target)
     .collect::<Vec<_>>();
@@ -2155,6 +2312,7 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                     &requested,
                     &attempted,
                     &mut provider_order_cache,
+                    tool_requirements,
                 )
                 .await?
                 .into_iter()
@@ -4942,6 +5100,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(named[0].route_target_key.as_ref().unwrap().target_index, 0);
+    }
+
+    #[tokio::test]
+    async fn route_tool_capabilities_are_adapter_facts_not_model_name_inference() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "openai",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["opaque-alpha".into(), "opaque-beta".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let alpha = route_tool_capabilities(&ctx.store, "openai/opaque-alpha")
+            .await
+            .unwrap();
+        let beta = route_tool_capabilities(&ctx.store, "openai/opaque-beta")
+            .await
+            .unwrap();
+
+        assert_eq!(alpha, beta);
+        assert_eq!(
+            alpha.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+        assert!(alpha.supports_strict_function_schema);
+    }
+
+    #[tokio::test]
+    async fn route_tool_capabilities_report_a_typed_error_for_an_empty_target_set() {
+        let ctx = test_ctx().await;
+
+        let error = route_tool_capabilities(&ctx.store, "opaque-missing")
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<CapabilityResolutionError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn route_tool_capabilities_intersect_fallbacks_without_advancing_order() {
+        let ctx = test_ctx().await;
+        for (id, provider, model) in [
+            ("openai-1", "openai", "opaque-primary"),
+            ("openai-2", "openai", "opaque-primary"),
+            ("custom", "custom-openai", "opaque-fallback"),
+        ] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    provider,
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        base_url_override: (provider == "custom-openai")
+                            .then(|| "http://127.0.0.1:9/v1".into()),
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        routes::save_provider_account_route(
+            &ctx.store,
+            "openai",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "mixed-route".into(),
+                name: "mixed".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "opaque-primary".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "custom-openai".into(),
+                        model: "opaque-fallback".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "mixed").await.unwrap();
+        assert!(!capabilities.supports_strict_function_schema);
+        assert_eq!(
+            capabilities.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+
+        let routed = route_models_for_anthropic_messages(&ctx.store, "mixed")
+            .await
+            .unwrap();
+        assert_eq!(routed[0].conn.id, "openai-1");
+        assert_eq!(routed[0].route_target_key.as_ref().unwrap().target_index, 0);
+    }
+
+    #[tokio::test]
+    async fn strict_tool_requirements_hard_filter_incompatible_route_targets() {
+        let ctx = test_ctx().await;
+        for (id, provider, model) in [
+            ("custom", "custom-openai", "opaque-custom"),
+            ("official", "openai", "opaque-official"),
+        ] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    provider,
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        base_url_override: (provider == "custom-openai")
+                            .then(|| "http://127.0.0.1:9/v1".into()),
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "strict-route".into(),
+                name: "strict".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "custom-openai".into(),
+                        model: "opaque-custom".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "opaque-official".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let frozen_request = json!({
+            "model": "strict",
+            "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "strict": true,
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
+
+        let targets = route_models_for_body(&ctx.store, "strict", Some(&frozen_request))
+            .await
+            .unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].conn.id, "official");
     }
 
     #[tokio::test]
