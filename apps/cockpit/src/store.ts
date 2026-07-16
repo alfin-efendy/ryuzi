@@ -265,6 +265,7 @@ export const useStore = create<State>((set, get) => ({
           // extra state to keep here.
           return {};
         case "agentRunChanged":
+        case "agentRunMessage":
           useDelegation.getState().applyCoreEvent(e, runnerId);
           return {};
         default:

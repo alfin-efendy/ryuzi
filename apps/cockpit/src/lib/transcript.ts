@@ -55,6 +55,7 @@ export type ActivityItem =
   | {
       type: "tool";
       key: string;
+      toolCallId: string | null;
       name: string;
       kind: string | null;
       status: string | null;
@@ -92,6 +93,16 @@ function isInProgress(item: ActivityItem): boolean {
   return item.type === "tool" && (item.status === "pending" || item.status === "in_progress");
 }
 
+/** Native delegation calls remain visible at all times so their child-run
+ * cards are never hidden inside a generic work fold. */
+export function isAgentDispatchTool(name: string): boolean {
+  return name === "task" || name === "delegate_agent";
+}
+
+function isAgentDispatch(item: ActivityItem): boolean {
+  return item.type === "tool" && isAgentDispatchTool(item.name);
+}
+
 /** Split a cluster into folded groups and standalone items.
  *
  *  `liveTail=true` (the cluster is the transcript tail while the agent runs):
@@ -110,7 +121,7 @@ export function partitionActivity(items: ActivityItem[], liveTail: boolean): Act
     fold = [];
   };
   items.forEach((item, index) => {
-    if ((liveTail && index >= tailStart) || isInProgress(item)) {
+    if ((liveTail && index >= tailStart) || isInProgress(item) || isAgentDispatch(item)) {
       flush();
       fragments.push({ kind: "item", item });
     } else {
@@ -263,6 +274,7 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
           ? {
               type: "tool",
               key,
+              toolCallId: row.toolCallId,
               name: row.toolName ?? "Tool",
               kind: row.toolKind,
               status: row.toolStatus,
@@ -290,6 +302,30 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
   // Whitespace-only chunks stay inside runs (they are paragraph separators),
   // but a run that never got visible content is dropped entirely.
   return groups.filter((g) => (g.type !== "agent" && g.type !== "thought") || g.markdown.trim().length > 0);
+}
+
+/** Makes each native dispatch an activity boundary without changing the
+ * ordering of ordinary tool/status activity around it. */
+function splitDispatchActivity(groups: Group[]): Group[] {
+  return groups.flatMap((group) => {
+    if (group.type !== "activity") return [group];
+    const split: Group[] = [];
+    let ordinary: ActivityItem[] = [];
+    const flush = () => {
+      if (ordinary.length > 0) split.push({ type: "activity", key: ordinary[0]!.key, items: ordinary });
+      ordinary = [];
+    };
+    for (const item of group.items) {
+      if (isAgentDispatch(item)) {
+        flush();
+        split.push({ type: "activity", key: item.key, items: [item] });
+      } else {
+        ordinary.push(item);
+      }
+    }
+    flush();
+    return split;
+  });
 }
 
 /** Last-row minus user-row timestamps; null when either is missing. */
@@ -408,7 +444,7 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
   turns.forEach((turnRows, t) => {
     // Absolute row offset keeps transient (seq 0) fallback keys globally unique
     // even though each turn slice is grouped independently.
-    const groups = groupRows(turnRows, rowOffset);
+    const groups = splitDispatchActivity(groupRows(turnRows, rowOffset));
     rowOffset += turnRows.length;
     const live = running && t === turns.length - 1;
     if (live) {
@@ -417,24 +453,32 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
     }
     const agentGroups = groups.filter((g) => g.type === "agent");
     const lastAgent = agentGroups[agentGroups.length - 1];
-    const collapsible = groups.filter((g) => g.type === "activity" || g.type === "thought");
+    let collapsible: Group[] = [];
+    const flushCollapsible = () => {
+      if (collapsible.length === 0) return;
+      const first = collapsible[0]!;
+      out.push({
+        type: "summary",
+        key: `sum-${first.key}`,
+        groups: collapsible,
+        durationMs: turnDurationMs(turnRows),
+        editCards: editCardsForGroups(collapsible),
+      });
+      collapsible = [];
+    };
     for (const g of groups) {
-      if (g.type === "activity" || g.type === "thought") {
-        if (g === collapsible[0]) {
-          out.push({
-            type: "summary",
-            key: `sum-${g.key}`,
-            groups: collapsible,
-            durationMs: turnDurationMs(turnRows),
-            editCards: editCardsForGroups(collapsible),
-          });
-        }
-      } else if (g === lastAgent && g.type === "agent") {
+      if (g.type === "thought" || (g.type === "activity" && !g.items.some(isAgentDispatch))) {
+        collapsible.push(g);
+        continue;
+      }
+      flushCollapsible();
+      if (g === lastAgent && g.type === "agent") {
         out.push({ ...g, turnEnd: true });
       } else {
         out.push(g);
       }
     }
+    flushCollapsible();
   });
   return out;
 }

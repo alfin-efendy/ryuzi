@@ -9,12 +9,14 @@ import { useDelegation, delegationSessionKey } from "@/store-delegation";
 
 const { AgentRunRoster } = await import("./AgentRunRoster");
 
-function run(overrides: Partial<AgentRun> = {}): AgentRun {
+function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Partial<AgentRun> = {}): AgentRun {
   return {
     runId: "run-1",
     sessionPk: "s1",
     parentRunId: null,
     retryOf: null,
+    sourceToolCallId,
+    dispatchIndex,
     primaryAgentId: "lead",
     executingAgentId: "worker",
     executingAgentNameSnapshot: "Researcher",

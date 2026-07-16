@@ -15,6 +15,7 @@ function toolItem(key: string, status = "completed"): ActivityItem {
   return {
     type: "tool",
     key,
+    toolCallId: null,
     name: "read",
     kind: "read",
     status,
