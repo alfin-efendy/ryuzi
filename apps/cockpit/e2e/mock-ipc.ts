@@ -601,6 +601,33 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
       const storageKey = "ryuzi.e2e.route-state.v1";
+      // Command names Plan 6 (agentic cleanup) permanently deleted from the
+      // Tauri invoke surface — the single-agent settings/memory/Learning/
+      // curator/orch commands, and the `learning_cmd` trio. If the UI ever
+      // calls one of these again (a regression `check-agentic-cleanup.ts`
+      // can't catch, since it only scans source text, not runtime
+      // invocations), the unmocked-command fallback below throws instead of
+      // silently resolving — so an accidental call fails the test
+      // immediately rather than degrading quietly.
+      const removedCommands = new Set([
+        "search_sessions",
+        "list_skill_usage",
+        "set_skill_pinned",
+        "get_agent_settings",
+        "set_agent_settings",
+        "read_memory",
+        "write_memory",
+        "learning_graph",
+        "curator_status",
+        "curator_rollback",
+        "orch_submit",
+        "orch_list_roots",
+        "orch_tasks",
+        "orch_cancel",
+        "orch_retry",
+        "orch_answer_block",
+        "orch_steer",
+      ]);
       type MockMessage = {
         sessionPk: string;
         seq: number;
@@ -936,6 +963,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             return Promise.resolve(connections);
           }
           if (cmd in fixtures) return Promise.resolve(fixtures[cmd]);
+          if (removedCommands.has(cmd)) {
+            throw new Error(`[mock-ipc] removed command invoked by UI: ${cmd} — this should never be called`);
+          }
           console.warn("[mock-ipc] unmocked command:", cmd);
           if (cmd.startsWith("list_") || cmd.startsWith("refresh_") || cmd.startsWith("probe_")) {
             return Promise.resolve([]);
