@@ -267,7 +267,7 @@ async listBranches(runnerId: string | null, projectId: string) : Promise<Result<
     else return { status: "error", error: e  as any };
 }
 },
-async getChildRuns(runnerId: string | null, sessionPk: string) : Promise<Result<AgentRun[], CmdError>> {
+async getChildRuns(runnerId: string | null, sessionPk: string) : Promise<Result<AgentRunRosterInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_child_runs", { runnerId, sessionPk }) };
 } catch (e) {
@@ -1788,8 +1788,12 @@ export type AgentMutationInfo = { name: string; description: string; avatarColor
  */
 export type AgentRecoveryInfo = { code: string; message: string }
 export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
-export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null }
+export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null }
 export type AgentRunKind = "primary" | "main-delegate" | "subagent"
+/**
+ * The session's primary run, if it has one, plus its sorted child runs.
+ */
+export type AgentRunRosterInfo = { rootRunId: string | null; runs: AgentRun[] }
 export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted"
 export type AgentSkillUsageInfo = { skillId: string; uses: number; successes: number; conceptId: string }
 export type AgentSummaryInfo = { id: string; name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; skillCount: number; toolCount: number; knowledgeCount: number; executable: boolean; validation: AgentValidationInfo[]; isDefault: boolean }
@@ -1910,7 +1914,11 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "sessionQueueChanged"; session_pk: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; run_id: string; requesting_agent_id: string; requesting_agent_name: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
+/**
+ * A durable transcript row owned by a non-primary agent run.
+ */
+{ kind: "agentRunMessage"; session_pk: string; run_id: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } | { kind: "sessionQueueChanged"; session_pk: string } | { kind: "result"; session_pk: string } | { kind: "approvalRequested"; session_pk: string; run_id: string; requesting_agent_id: string; requesting_agent_name: string; request_id: string; tool: string; summary: string; approval_kind: ApprovalKind; input: JsonValue; principal?: Principal | null } | { kind: "error"; session_pk: string; message: string } |
 /**
  * Out-of-band announcement (e.g. "update available") rendered to every
  * surface of a session.
