@@ -4,6 +4,7 @@ import {
   Archive,
   Bot,
   Workflow,
+  ChevronDown,
   ChevronRight,
   ChevronsUpDown,
   Folder,
@@ -35,7 +36,7 @@ import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, us
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useStore } from "@/store";
-import { useUi } from "@/store-ui";
+import { TASKS_BUCKET, useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
 import { useTerms } from "@/store-terms";
@@ -169,6 +170,8 @@ export function Sidebar() {
     setTaskOrdering,
     projectOrdering,
     setProjectOrdering,
+    collapsed,
+    toggleCollapsed,
   } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: UiSession; reason: string } | null>(null);
   const archiveCancelRef = useRef<HTMLButtonElement>(null);
@@ -241,7 +244,6 @@ export function Sidebar() {
     if (!gatewaysLoaded) void hydrateGateways();
   }, [gatewaysLoaded, hydrateGateways]);
 
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
   // The old Projects-header menu's "Archived" toggle was removed along with
   // the rest of that menu in this task (see OrganizeMenu above); there is no
@@ -323,6 +325,21 @@ export function Sidebar() {
         <div className="box-border flex w-[260px] flex-col gap-px px-2.5">
           <div className="flex items-center gap-[2px] py-2 pl-2.5 pr-1.5">
             <div className="relative flex flex-1 items-center gap-[2px]">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className={iconBtn}
+                title={collapsed[TASKS_BUCKET] ? "Expand Tasks" : "Collapse Tasks"}
+                onClick={() => toggleCollapsed(TASKS_BUCKET)}
+              >
+                <ChevronDown
+                  aria-hidden
+                  size={14}
+                  strokeWidth={2}
+                  className={`size-[14px] transition-transform ${collapsed[TASKS_BUCKET] ? "-rotate-90" : ""}`}
+                />
+              </Button>
               <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Tasks</span>
               <span className="relative">
                 <Button
@@ -347,56 +364,57 @@ export function Sidebar() {
               />
             </div>
           </div>
-          {chatList.map((s) => {
-            const m = statusMeta(s.status);
-            const key = sessionKey(s);
-            const isActive = view.kind === "session" && isSession(s, focusedSession);
-            const isPinned = !!pinned[key];
-            const rLabel = runnerLabel(s.runnerId);
-            return (
-              <div key={key} className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[key] ? "opacity-55" : ""}`}>
-                <span
-                  className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-2 pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
-                >
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    onClick={() => openSession(s)}
-                    className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+          {!collapsed[TASKS_BUCKET] &&
+            chatList.map((s) => {
+              const m = statusMeta(s.status);
+              const key = sessionKey(s);
+              const isActive = view.kind === "session" && isSession(s, focusedSession);
+              const isPinned = !!pinned[key];
+              const rLabel = runnerLabel(s.runnerId);
+              return (
+                <div key={key} className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[key] ? "opacity-55" : ""}`}>
+                  <span
+                    className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-2 pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
                   >
-                    <StatusDot color={m.color} pulse={m.pulse} />
-                    <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
-                    {rLabel && (
-                      <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">
-                        {rLabel}
-                      </Badge>
-                    )}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    title={isPinned ? "Unpin" : "Pin"}
-                    className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                    onClick={() => togglePin(key)}
-                  >
-                    <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    title={archived[key] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
-                    disabled={archivingPk === s.sessionPk}
-                    className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
-                    onClick={() => (archived[key] ? setArchived(key, false) : void archiveSession(s))}
-                  >
-                    <Archive aria-hidden size={12} strokeWidth={2} />
-                  </Button>
-                </span>
-              </div>
-            );
-          })}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => openSession(s)}
+                      className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                    >
+                      <StatusDot color={m.color} pulse={m.pulse} />
+                      <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
+                      {rLabel && (
+                        <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">
+                          {rLabel}
+                        </Badge>
+                      )}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      title={isPinned ? "Unpin" : "Pin"}
+                      className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
+                      onClick={() => togglePin(key)}
+                    >
+                      <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      title={archived[key] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
+                      disabled={archivingPk === s.sessionPk}
+                      className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
+                      onClick={() => (archived[key] ? setArchived(key, false) : void archiveSession(s))}
+                    >
+                      <Archive aria-hidden size={12} strokeWidth={2} />
+                    </Button>
+                  </span>
+                </div>
+              );
+            })}
         </div>
       )}
 
@@ -443,7 +461,7 @@ export function Sidebar() {
           const showArch = archivedGlobal || !!showArchived[p.projectId];
           const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, inertFilter, pinnedOrder);
           const archCount = archivedCount(sessions, p.projectId, archived);
-          const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
+          const open = q.trim() ? sess.length > 0 : !collapsed[p.projectId];
           return (
             <div key={p.projectId} className="flex flex-col gap-px">
               <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
@@ -451,7 +469,7 @@ export function Sidebar() {
                   type="button"
                   variant="ghost"
                   className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                  onClick={() => setExpanded((e) => ({ ...e, [p.projectId]: !open }))}
+                  onClick={() => toggleCollapsed(p.projectId)}
                 >
                   {open ? (
                     <FolderOpen aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
@@ -479,7 +497,7 @@ export function Sidebar() {
                   onClick={() => {
                     selectProject(p.projectId);
                     nav.navigate({ kind: "home" });
-                    setExpanded((e) => ({ ...e, [p.projectId]: true }));
+                    if (collapsed[p.projectId]) toggleCollapsed(p.projectId);
                   }}
                 >
                   <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />

@@ -207,3 +207,17 @@ test("Organize menu switches By Project / By Task and offers Manual Order; no St
   expect(screen.queryByText("Collapse all")).toBeNull();
   expect(screen.queryByText("Mark all as read")).toBeNull();
 });
+
+test("collapsing the Tasks section hides its rows", () => {
+  useStore.setState({
+    projects: [project],
+    sessions: [{ ...session, projectId: null, kind: "chat", title: "chatty" }],
+    pendingApprovals: [],
+    focusedSession: null,
+  });
+  useUi.setState({ collapsed: {} });
+  render(<Sidebar />);
+  expect(screen.getByText("chatty")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /collapse tasks/i }));
+  expect(screen.queryByText("chatty")).toBeNull();
+});
