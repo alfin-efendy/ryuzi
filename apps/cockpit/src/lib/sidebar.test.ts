@@ -337,4 +337,21 @@ describe("orderTasks", () => {
   test("pinned float to top by pinnedOrder, ahead of the ordering", () => {
     expect(orderTasks(rows, { [K("a")]: true }, [K("a")], "updated", []).map((s) => s.sessionPk)).toEqual(["a", "b", "c"]);
   });
+  // Regression: two-plus ids simultaneously absent from `taskOrder` all map to
+  // Number.POSITIVE_INFINITY; `Infinity - Infinity` is NaN, and a NaN comparator
+  // return is treated as "equal" — so a naive `d !== 0` short-circuit skipped the
+  // recency fall-through and left the original order intact. Fresh manual order
+  // (`taskOrder = []`) must still sort by recency, newest first.
+  test("manual with empty taskOrder falls through to recency (no NaN short-circuit)", () => {
+    expect(orderTasks(rows, {}, [], "manual", []).map((s) => s.sessionPk)).toEqual(["b", "c", "a"]);
+  });
+  // Regression: same NaN trap in the pinned tie-break branch. Two-plus pinned
+  // rows with an empty `pinnedOrder` must sort by recency within the pinned group.
+  test("pinned with empty pinnedOrder falls through to recency within the group", () => {
+    expect(orderTasks(rows, { [K("a")]: true, [K("b")]: true, [K("c")]: true }, [], "updated", []).map((s) => s.sessionPk)).toEqual([
+      "b",
+      "c",
+      "a",
+    ]);
+  });
 });

@@ -20,7 +20,16 @@ export function projectLabel(p: Pick<Project, "name">): string {
 
 export function orderProjects(projects: Project[], ordering: Ordering, order: string[] = []): Project[] {
   if (ordering === "name") return [...projects].sort((a, b) => a.name.localeCompare(b.name));
-  if (ordering === "manual") return [...projects].sort((a, b) => orderIndex(order, a.projectId) - orderIndex(order, b.projectId));
+  if (ordering === "manual") {
+    return [...projects].sort((a, b) => {
+      const ia = orderIndex(order, a.projectId);
+      const ib = orderIndex(order, b.projectId);
+      // Compare indices before subtracting: two absent ids are both +Infinity, and
+      // `Infinity - Infinity` is NaN (treated as "equal" by sort, but unsafe). The
+      // `!==` guard keeps them stable in their original order instead.
+      return ia === ib ? 0 : ia - ib;
+    });
+  }
   return projects; // "updated" — store order (as-fetched)
 }
 
@@ -128,14 +137,20 @@ export function orderTasks(
     const bp = pinned[kb] ? 1 : 0;
     if (ap !== bp) return bp - ap; // pinned first
     if (ap === 1) {
-      const d = orderIndex(pinnedOrder, ka) - orderIndex(pinnedOrder, kb);
-      if (d !== 0) return d;
+      // Compare indices before subtracting so two unordered pins (both +Infinity)
+      // fall through to recency instead of returning `Infinity - Infinity` = NaN.
+      const ia = orderIndex(pinnedOrder, ka);
+      const ib = orderIndex(pinnedOrder, kb);
+      if (ia !== ib) return ia - ib;
       return (b.lastActive ?? 0) - (a.lastActive ?? 0);
     }
     if (ordering === "name") return sessionTitle(a).localeCompare(sessionTitle(b));
     if (ordering === "manual") {
-      const d = orderIndex(taskOrder, ka) - orderIndex(taskOrder, kb);
-      if (d !== 0) return d;
+      // Same NaN trap: two ids absent from `taskOrder` are both +Infinity, so only
+      // return the delta when the indices differ; otherwise fall through to recency.
+      const ia = orderIndex(taskOrder, ka);
+      const ib = orderIndex(taskOrder, kb);
+      if (ia !== ib) return ia - ib;
     }
     return (b.lastActive ?? 0) - (a.lastActive ?? 0); // "updated" & manual fallback
   });
