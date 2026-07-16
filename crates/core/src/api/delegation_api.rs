@@ -68,6 +68,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "cancel_child_run" => {
             let a: RunP = params(p)?;
+            // Historical (legacy / deleted-owner) sessions are read-only:
+            // reject before touching the child run.
+            crate::sessions::ownership::require_executable_session_agent(
+                state.cp.store(),
+                &state.agents,
+                &a.session_pk,
+            )
+            .await?;
             require_child_run(state, &a.session_pk, &a.run_id).await?;
             state
                 .cp
@@ -79,6 +87,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "retry_child_run" => {
             let a: RunP = params(p)?;
+            // Historical (legacy / deleted-owner) sessions are read-only:
+            // reject before any run lookup or retry dispatch.
+            crate::sessions::ownership::require_executable_session_agent(
+                state.cp.store(),
+                &state.agents,
+                &a.session_pk,
+            )
+            .await?;
             let previous = require_child_run(state, &a.session_pk, &a.run_id).await?;
             if let Some(agent_id) = previous.executing_agent_id.as_deref() {
                 let snapshot = state
@@ -152,10 +168,16 @@ mod tests {
     use std::time::Duration;
 
     fn session(session_pk: &str) -> Session {
+        // Child-run controls require an executable primary agent; every
+        // fixture registry here bootstraps the built-in `ryuzi` owner.
         Session {
             session_pk: session_pk.into(),
-            primary_agent_id: None,
-            primary_agent_snapshot: None,
+            primary_agent_id: Some("ryuzi".into()),
+            primary_agent_snapshot: Some(crate::domain::AgentIdentitySnapshot {
+                id: "ryuzi".into(),
+                name: "Ryuzi".into(),
+                avatar_color: "violet".into(),
+            }),
             project_id: None,
             agent_session_id: None,
             worktree_path: None,

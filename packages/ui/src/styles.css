@@ -148,26 +148,63 @@ html.dark[data-backdrop] {
   background: var(--surface-acrylic);
 }
 
-/* Acrylic surface recipes: one full-window glass layer behind a transparent
-   title bar + sidebar, a floating main content card, and flat panel tints
-   inside it (the glass layer already blurs). */
+/* Acrylic surface recipes. The design is ONE full-window glass layer
+   (acrylic-chrome) behind a transparent title bar + sidebar; the floating main
+   content card and the panel/card tints inside it are flat translucent washes
+   that read as glass because the single chrome blur shows through them.
+   Only acrylic-chrome carries a backdrop-filter, and it blurs only the *static*
+   wallpaper gradient, so WebView2 caches the result and it costs ~0 while idle.
+   Stacking blur on the moving inner surfaces (main over the transcript, the
+   composer/todo card over scrolling content) forced a full-window re-blur every
+   stream/scroll frame — the reason those are now flat tints. See the
+   html[data-backdrop] override below for the OS-backdrop case. */
 @utility acrylic-chrome {
   background: color-mix(in oklab, var(--sidebar) 55%, transparent);
-  -webkit-backdrop-filter: blur(32px) saturate(160%);
-  backdrop-filter: blur(32px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px);
+  backdrop-filter: blur(24px);
 }
 @utility acrylic-main {
   background: color-mix(in oklab, var(--background) 62%, transparent);
-  -webkit-backdrop-filter: blur(40px) saturate(150%);
-  backdrop-filter: blur(40px) saturate(150%);
 }
 @utility acrylic-panel {
   background: color-mix(in oklab, var(--surface) 55%, transparent);
 }
 @utility acrylic-card {
-  background: color-mix(in oklab, var(--card) 82%, transparent);
-  -webkit-backdrop-filter: blur(24px);
-  backdrop-filter: blur(24px);
+  background: color-mix(in oklab, var(--card) 90%, transparent);
+}
+
+/* When the OS paints the window backdrop (Mica on Windows 11, vibrancy on
+   macOS) it already frosts the surface. A CSS backdrop-filter on top is
+   invisible over that frost yet still forces WebView2 to run a full-window GPU
+   blur pass every frame the backdrop or content changes — the dominant cause of
+   high msedgewebview2.exe GPU. Drop the CSS blur entirely and let the OS do the
+   glass. Unlayered so it wins over the @utility blur above; kept across all
+   three recipes so re-adding blur to an inner surface can't silently regress. */
+html[data-backdrop] .acrylic-chrome,
+html[data-backdrop] .acrylic-main,
+html[data-backdrop] .acrylic-card {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* Transparency toggled off (data-opaque on <html>): render fully solid
+   surfaces with no wallpaper bleed. The chrome layer shows through the
+   transparent sidebar, so it becomes the opaque --sidebar color instead of a
+   translucent tint over the (green) wallpaper; main/panel/card go opaque too.
+   Unlayered so these win over the @utility recipes. */
+html[data-opaque] .acrylic-chrome {
+  background: var(--sidebar);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+html[data-opaque] .acrylic-main {
+  background: var(--background);
+}
+html[data-opaque] .acrylic-panel {
+  background: var(--surface);
+}
+html[data-opaque] .acrylic-card {
+  background: var(--card);
 }
 
 @layer base {

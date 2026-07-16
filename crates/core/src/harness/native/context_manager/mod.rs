@@ -94,9 +94,10 @@ impl ContextManager {
     }
 
     /// Seed a fresh, ephemeral `ContextManager` whose ledger starts pre-
-    /// loaded with `messages` verbatim (Task 9's review-fork cache-parity
-    /// replay) — `messages_for_request()` returns exactly `messages` as its
-    /// leading prefix; a later `append_*` call adds AFTER it without
+    /// loaded with `messages` verbatim — a byte-identical replay of an
+    /// already-captured prompt prefix, for cache-parity continuation of a
+    /// prior turn — `messages_for_request()` returns exactly `messages` as
+    /// its leading prefix; a later `append_*` call adds AFTER it without
     /// retroactively touching a block already inside `messages`.
     pub fn seed_projected(
         session_pk: &str,
@@ -113,10 +114,10 @@ impl ContextManager {
     }
 
     /// Seed a fresh `ContextManager` from only the last `tail` messages of a
-    /// captured payload — used when the review fork's resolved model differs
-    /// from the payload's captured model (Task 9): a different model may
-    /// tokenize/cache differently, so byte-identical cache-parity replay is
-    /// impossible, and a digest is all the fork needs to have SOME context.
+    /// captured payload — used when a replay's resolved model differs from
+    /// the payload's captured model: a different model may tokenize/cache
+    /// differently, so byte-identical cache-parity replay is impossible, and
+    /// a digest is all the replay needs to have SOME context.
     pub fn seed_digest(
         session_pk: &str,
         cfg: ContextConfig,

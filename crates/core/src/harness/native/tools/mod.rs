@@ -36,7 +36,6 @@ pub mod read;
 pub mod revert;
 pub mod session_search;
 pub mod skill;
-pub mod skill_manage;
 pub mod task;
 pub mod todo;
 pub mod webfetch;
@@ -356,14 +355,9 @@ pub struct ToolCtx {
     /// `User` for interactive turns; the background review fork
     /// (`WriteOrigin::BackgroundReview`) and sub-agent turns
     /// (`WriteOrigin::Agent`) set it explicitly at their own `ToolCtx` build
-    /// sites. Consulted by `skill_manage` and the app-control negative-space
-    /// guard (Phase 6) to gate autonomous writes more strictly than
-    /// human-driven ones.
+    /// sites. Consulted by the app-control negative-space guard (Phase 6) to
+    /// gate autonomous writes more strictly than human-driven ones.
     pub write_origin: crate::domain::WriteOrigin,
-    /// Skill names viewed so far this tool-call turn — the `skill` tool
-    /// records into this set so a same-turn `skill_manage` USE can tell
-    /// "viewed-then-used" apart from "used blind", without a DB round trip.
-    pub viewed_skills: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The result of a tool call.
@@ -479,7 +473,6 @@ impl ToolRegistry {
             Arc::new(webfetch::WebFetch),
             Arc::new(websearch::WebSearch),
             Arc::new(skill::SkillTool),
-            Arc::new(skill_manage::SkillManage),
             Arc::new(memory::MemoryTool),
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
@@ -682,7 +675,6 @@ pub(crate) mod testutil {
             interaction: None,
             app: None,
             write_origin: crate::domain::WriteOrigin::User,
-            viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -896,7 +888,6 @@ mod tests {
             "webfetch",
             "websearch",
             "skill",
-            "skill_manage",
             "memory",
             "revert",
             "lsp",
@@ -912,7 +903,7 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 24);
+        assert_eq!(defs.len(), 23);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

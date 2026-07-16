@@ -222,6 +222,25 @@ every surface talks to — there is no per-surface embedded engine anymore.
 
 ---
 
+## Agent registry upgrade
+
+The engine bootstraps a persistent YAML/OKF agent registry
+(`crates/core/src/agents/`) under the Ryuzi config directory the first time a
+build with this schema runs against an existing database.
+
+> **Agent data reset on first upgrade:** The first launch of this agent schema permanently removes the previous global agent settings, freeform memory files, Learning/curator state, and orchestration DAG data, then creates one main agent named **Ryuzi**. Projects, provider accounts/routes, and historical sessions/transcripts are preserved. Pre-upgrade sessions appear as read-only **Legacy agent** history and are not assigned to Ryuzi.
+
+The cleanup is journaled and idempotent (`crates/core/src/agents/bootstrap.rs`):
+once the `agent_persistence_schema` setting is stamped, later launches never
+repeat it, and a crash between the SQL and filesystem halves of the cleanup
+converges to the same end state on retry (see
+`crates/core/src/agentic_upgrade_compat.rs` for the crash-order proof). There
+is no routine way to re-run it from a running install; an explicit
+agent-data reset is destructive by design, on par with the first-upgrade
+cleanup above, not a day-to-day operation.
+
+---
+
 ## Chat sessions
 
 Sessions no longer require a project. A session's `kind` is `project`,
@@ -287,7 +306,7 @@ find its way back into that chat, even across a daemon restart.
 
 ## Auxiliary model settings
 
-Three secondary (non-primary-turn) LLM calls each read their own optional
+Two secondary (non-primary-turn) LLM calls each read their own optional
 model override from a raw settings key, so you can route them to a cheaper
 or faster model than the session's main model:
 
@@ -295,7 +314,6 @@ or faster model than the session's main model:
 | --- | --- | --- |
 | `auxiliary.title.model` | Session-title generation | The session's model |
 | `auxiliary.compaction.model` | Context-compaction summarization | The session's model |
-| `auxiliary.decompose.model` | Orchestrator goal-decompose | The configured default model |
 
 Each key is unset by default (fallback applies). They are plain key-value
 settings with no dedicated UI yet — set them out-of-band via the `set_setting`
@@ -304,82 +322,60 @@ directly in the `settings` table.
 
 ---
 
-## Group-chat orchestration
+## Agent delegation
 
-A goal can fan out into a tree of tracked subtasks, each run by its own
-worker session, with progress and outcomes reported back into the
-originating chat as labeled bubbles (`crates/core/src/orch.rs`).
+There is no toggle-driven app orchestrator anymore. Every turn executes as
+one **main agent**'s immutable profile snapshot (model, permissions, tools,
+skills) captured when the run starts
+(`crates/core/src/agents/`, `AgentSnapshot`); delegating work to another
+agent — or to a disposable helper — is always an explicit act inside that
+turn, never a background decompose/judge tree.
 
-- **Starting a run.** Toggle "Orchestrate" on the Home composer (only
-  enabled once a project is attached — orchestration always needs a project
-  to scope the goal to) or type `/orchestrate <goal>`; both route to
-  `orch_submit` instead of a normal chat turn
-  (`apps/cockpit/src/views/HomeView.tsx`). With `decompose: true` (the
-  toggle's default) an LLM plans the subtasks in the background while the
-  root sits in `decomposing`; `auxiliary.decompose.model` (above) can route
-  that planning call to a cheaper model than the session's own.
-- **Worker sessions, hidden from the sidebar.** Each subtask runs as its own
-  `kind='worker'` session bound to the root's project. Worker (and `review`)
-  sessions never appear in a sidebar bucket — `sessionsForProject` and
-  `chatSessions` (`apps/cockpit/src/lib/sidebar.ts`) only ever surface
-  `kind === "project"` or `kind === "chat"` rows. The only way to reach a
-  worker is the task strip's chip
-  (`apps/cockpit/src/components/session/TaskStrip.tsx`), a pinned row of
-  per-subtask pills above the home chat's transcript while a root is live.
-  Clicking a chip drills into that worker's full `SessionView` (every tool
-  call it made); the strip clears once the root settles.
-- **Speaker bubbles.** A worker's start and its final report post into the
-  home chat as speaker-labeled bubbles (`messages.speaker`, migration #29);
-  distinct workers render with distinct agent-colored labels
-  (`apps/cockpit/src/lib/agent-color.ts`). Once every child is done, the
-  root's judge session posts its verdict as an `"orchestrator"` bubble AND
-  re-enters the home chat as a new turn over the background rail
-  (`kind='orch'`, wrapped in an `[ORCHESTRATION COMPLETE — …]` marker) —
-  delivery is idle-only, like every other rail row, never mid-turn.
-- **Steering.** Typing an ordinary message into a home chat while its
-  orchestration is live does not start a normal turn: `orch_steer`
-  (`crates/core/src/orch.rs::note_steer`) intercepts it first. `cancel` or
-  `/cancel` (case-insensitive) cancels the whole tree; anything else is
-  appended to the root's `steer_note` column as accumulating guidance the
-  judge reads on its next pass. `orch_steer` reports back `noOrchestration`
-  when no live root is bound to that session, so ordinary chats fall
-  through to a normal turn unaffected.
-- **Block-for-human.** A worker can call the native `orch_block` tool
-  (visible only inside worker sessions) to pause on a blocking question.
-  The task's status flips to `blocked` and Cockpit renders a `BlockCard` in
-  the home chat; the human's answer goes back through
-  `ControlPlane::answer_orch_block` (Tauri command `orchAnswerBlock`),
-  enqueued on the background rail as a `kind='unblock'` row and delivered as
-  a clean new user turn once the worker session is idle again — never a
-  mid-turn splice.
-- **Retry + circuit breaker.** A worker run that fails is requeued (`todo`)
-  for another attempt rather than failing the root immediately.
-  `MAX_TASK_RETRIES` (`crates/core/src/orch.rs`, currently `2`) caps
-  consecutive failures per child — it is a Rust constant, not a runtime
-  setting. Once a child exceeds it the breaker trips (`gave_up=1`,
-  `status='failed'`) and, once every child under a root has given up, the
-  root itself fails — delivered into the home chat through the same
-  `deliver_outcome` path a successful verdict uses.
-- **Concurrency cap.** Orchestrator fan-out shares the same
-  `max_concurrent_runs` setting (default `3`) described under Background
-  rail & async delegation above — the same knob also caps sync task batches
-  and background `task` delegations, so a busy daemon can't be
-  over-subscribed by any one of the three callers.
-
-**Known v1 limitation — the Home double turn.** Orchestrating from a fresh
-Home submission (Orchestrate toggle) creates the home chat by posting the
-goal as its first user message, which — like starting any new chat — runs
-one ordinary chat-agent turn on that same goal, *in parallel* with the
-worker bubbles the orchestration itself produces
-(`apps/cockpit/src/views/HomeView.tsx`'s `send()` calls `startChat(goal,
-…)` and then `startOrchestration(goal, true)`). This is harmless: the home
-chat's agent turn runs in its own scratch directory (see Chat sessions
-above), never the real project worktree, and does not affect the
-orchestration's actual work. A planned fast-follow — an "empty-home-chat"
-primitive that creates the home chat with the goal as a display-only
-opening message and no chat-agent turn — will remove the redundant turn.
-Seeing duplicate agent activity on a fresh orchestrated Home submission is
-expected v1 behavior, not a bug.
+- **`@AgentName` mentions.** Typing `@<agent name>` in the composer
+  delegates a task to that agent's own profile — model, permissions, tools,
+  and skills all switch to the target's — resolved by
+  `crate::mentions::resolve_mentions` (`crates/core/src/mentions.rs`). A
+  mention cannot target the session's own primary agent, a
+  stale/renamed label, an unknown id, or a non-executable (quarantined)
+  profile; each of those is a typed `MentionError` surfaced back to the
+  caller instead of silently doing the wrong thing. Every delegated agent's
+  result is folded back into one answer via `COORDINATOR_SYNTHESIS_INSTRUCTION`,
+  attributed by agent name.
+- **`delegate_agent` tool.** The model itself can delegate mid-turn to a
+  complete agent profile via the native `delegate_agent` tool
+  (`crates/core/src/harness/native/tools/delegate.rs`), the same mechanism
+  an explicit `@mention` uses under the hood — this is the "unified
+  delegation" path, whether the human or the agent initiates it.
+- **Runtime-only, memoryless subagents.** The native `task` tool still
+  spawns same-turn helper children, but they never get a persisted agent
+  profile or OKF memory of their own (`deps_for_subagent`,
+  `crates/core/src/harness/native/runner.rs`): they share the fleet-wide
+  `agents/subagents.yaml` model/effort configuration and vanish with the
+  turn, unlike a delegated main agent.
+- **Per-agent OKF.** Every main agent's memory, skill usage, review notes,
+  and journey milestones live as Markdown concepts under its own
+  `agents/<agent-id>/knowledge/` bundle — the On-disk Knowledge Format, see
+  `crates/core/src/agents/okf.rs` — never a store shared across agents.
+- **Durable Learning delivery queue.** Memory writes, skill-usage
+  observations, and review/journey notes are appended to
+  `agent_learning_queue` (`crates/core/src/agents/learning_queue.rs`) and
+  drained strictly in per-agent sequence order into that agent's OKF bundle
+  by a daemon-hosted worker (`crates/core/src/learning.rs`, polling every
+  5s) — idempotent by event id, so a crash between apply and acknowledge
+  can never duplicate knowledge. A stuck event blocks only its own agent;
+  every other agent's queue keeps draining.
+- **Child-run provenance.** Every delegated run (mention or subagent) is its
+  own `agent_runs` row: `parent_run_id`, `primary_agent_id`,
+  `executing_agent_id`/`executing_agent_name_snapshot`, `agent_kind`
+  (`main`/`subagent`), and `resolved_model`/`resolved_effort` — queryable
+  via the `get_child_runs`/`get_child_transcript` RPCs
+  (`crates/core/src/api/delegation_api.rs`).
+- **Right-panel Active/Done navigation.** Cockpit's session right panel
+  lists every child run split into **Active** and **Done** sections
+  (`apps/cockpit/src/components/session/AgentRunRoster.tsx`); selecting one
+  opens its own transcript (`AgentRunDetail.tsx`) — replacing the old
+  worker task strip with durable, queryable child runs instead of an
+  in-memory orchestration tree.
 
 ---
 

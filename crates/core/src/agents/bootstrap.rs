@@ -11,7 +11,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use indexmap::IndexMap;
 
-use crate::agent_settings;
 use crate::llm_router::routes::{self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget};
 use crate::paths;
 use crate::store::Store;
@@ -33,6 +32,13 @@ pub const AGENT_PERSISTENCE_MARKER: &str = "agent_persistence_schema";
 
 /// The only schema value this build understands.
 const AGENT_PERSISTENCE_SCHEMA: &str = "1";
+
+/// Legacy settings-KV keys that once held the single native agent's default
+/// model / permission mode. The runtime that read them is gone; only
+/// [`legacy_agent_data_exists`] still probes these rows to decide whether a
+/// first-upgrade cleanup is due (migration 39 deletes them).
+const LEGACY_AGENT_MODEL_KEY: &str = "agent_model";
+const LEGACY_AGENT_PERM_MODE_KEY: &str = "agent_perm_mode";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapReason {
@@ -274,12 +280,9 @@ pub async fn reset_agent_registry(
 }
 
 async fn legacy_agent_data_exists(config_root: &Path, store: &Store) -> anyhow::Result<bool> {
-    if store
-        .get_setting(agent_settings::KEY_MODEL)
-        .await?
-        .is_some()
+    if store.get_setting(LEGACY_AGENT_MODEL_KEY).await?.is_some()
         || store
-            .get_setting(agent_settings::KEY_PERM_MODE)
+            .get_setting(LEGACY_AGENT_PERM_MODE_KEY)
             .await?
             .is_some()
     {

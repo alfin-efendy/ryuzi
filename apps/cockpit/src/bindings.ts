@@ -1538,30 +1538,6 @@ async pluginsRestartRequired(runnerId: string | null) : Promise<Result<boolean, 
     else return { status: "error", error: e  as any };
 }
 },
-async searchSessions(query: string) : Promise<Result<FtsHit[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("search_sessions", { query }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async listSkillUsage() : Promise<Result<SkillUsage[], CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("list_skill_usage") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async setSkillPinned(name: string, pinned: boolean) : Promise<Result<null, CmdError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("set_skill_pinned", { name, pinned }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async listAudit(limit: number) : Promise<Result<AuditRow[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_audit", { limit }) };
@@ -2044,13 +2020,6 @@ restartCount: number;
  * `restart-exhausted: ...` marker), never extension-supplied raw text.
  */
 lastError: string | null; confirmedEvents: string[]; toolCount: number }
-/**
- * One `messages_fts` match, joined against its owning session — the unit
- * the `session_search` native tool's DISCOVERY action returns, and (Task
- * 11) the `search_sessions` RPC method's response for the Cockpit Learning
- * panel.
- */
-export type FtsHit = { sessionPk: string; seq: number; snippet: string; title: string | null; kind: string; createdAt: number }
 export type GatewayEventInfo = { at: number; level: string; text: string }
 export type GatewayInfo = { id: string; name: string; badge: string;
 /**
@@ -2433,13 +2402,6 @@ export type SessionStatus = "idle" | "running" | "interrupted" | "ended"
  * for `Completed` — exactly one is ever `Some`.
  */
 export type SkillInstallBegin = { completed: boolean; trust: TrustPromptDto | null; plugin: InstalledSkillPack | null }
-/**
- * Per-skill telemetry (Phase 4 §4/§7): use/view/patch counters and
- * lifecycle state, read by the `skill_manage` native tool (Task 6) and the
- * curator (Task 10) to decide when a skill should transition between
- * `active`, `stale`, and `archived`.
- */
-export type SkillUsage = { name: string; createdBy: string | null; useCount: number; viewCount: number; patchCount: number; lastUsedAt: number | null; lastViewedAt: number | null; lastPatchedAt: number | null; state: string; pinned: boolean; archivedAt: number | null; createdAt: number | null }
 export type StoredEffortStatus = "valid" | "unsupported" | "unknownMetadata"
 export type TermExitMsg = { id: string }
 export type TermOutputMsg = { id: string;

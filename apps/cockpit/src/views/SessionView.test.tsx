@@ -532,6 +532,16 @@ test("immutable primary snapshot labels the session despite profile edits", asyn
   expect((screen.getByPlaceholderText("Ask for follow-up changes") as HTMLTextAreaElement).disabled).toBe(false);
 });
 
+test("session composer has no orchestration, model/effort, or permission-mode controls", async () => {
+  seed(LOCAL_RUNNER);
+  render(<SessionView />);
+
+  await screen.findByPlaceholderText("Ask for follow-up changes");
+  expect(screen.queryByRole("button", { name: /Orchestrate/i })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Model and effort" })).toBeNull();
+  expect(screen.queryByRole("combobox", { name: /permission/i })).toBeNull();
+});
+
 test("session composer sends raw leading whitespace and its structured mention span", async () => {
   seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
     primary("primary"),
