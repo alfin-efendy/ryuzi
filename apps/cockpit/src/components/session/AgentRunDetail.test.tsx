@@ -40,7 +40,18 @@ beforeEach(() => {
     bySession: { [delegationSessionKey("local", "s1")]: [run()] },
     transcriptByRun: {
       [delegationRunKey("local", "s1", "run-1")]: [
-        { seq: 1, sessionPk: "s1", role: "assistant", blockType: "text", payload: { text: "The complete child transcript" }, toolCallId: null, status: null, toolKind: null, createdAt: 1, speaker: null },
+        {
+          seq: 1,
+          sessionPk: "s1",
+          role: "assistant",
+          blockType: "text",
+          payload: { text: "The complete child transcript" },
+          toolCallId: null,
+          status: null,
+          toolKind: null,
+          createdAt: 1,
+          speaker: null,
+        },
       ] as Message[],
     },
     selectedBySession: { [delegationSessionKey("local", "s1")]: "run-1" },
@@ -144,7 +155,14 @@ test("back clears selection and copy writes the final result", () => {
 });
 
 test("active runs expose Stop while failed runs expose Retry", () => {
-  const active = render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run({ status: "running", result: null, error: null })} onRelatedChanges={() => {}} />);
+  const active = render(
+    <AgentRunDetail
+      runnerId="local"
+      sessionPk="s1"
+      run={run({ status: "running", result: null, error: null })}
+      onRelatedChanges={() => {}}
+    />,
+  );
   expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
   active.unmount();
 

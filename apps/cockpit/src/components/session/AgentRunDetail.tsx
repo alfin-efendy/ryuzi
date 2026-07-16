@@ -69,16 +69,28 @@ export function AgentRunDetail({
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
             <span className="capitalize">{run.status}</span>
             <span>{run.agentKind === "subagent" ? "Subagent" : "Main agent"}</span>
-            <span>{run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}</span>
+            <span>
+              {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
+            </span>
             <span>{duration(run)}</span>
-            {run.resolvedModel && <span>{run.resolvedModel}{run.resolvedEffort ? ` · ${run.resolvedEffort}` : ""}</span>}
+            {run.resolvedModel && (
+              <span>
+                {run.resolvedModel}
+                {run.resolvedEffort ? ` · ${run.resolvedEffort}` : ""}
+              </span>
+            )}
           </div>
           {run.error && <p className="mb-0 mt-2 text-[12px] text-destructive">{run.error}</p>}
           {run.result && (
             <div className="mt-3 rounded-md border border-border bg-muted/30 p-2.5">
               <div className="mb-1 flex items-center justify-between gap-2 text-[11px] font-medium text-muted-foreground">
                 Final result
-                <Button variant="ghost" size="xs" aria-label="Copy result" onClick={() => void navigator.clipboard.writeText(run.result ?? "")}>
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  aria-label="Copy result"
+                  onClick={() => void navigator.clipboard.writeText(run.result ?? "")}
+                >
                   <Copy aria-hidden size={12} /> Copy
                 </Button>
               </div>
@@ -90,7 +102,15 @@ export function AgentRunDetail({
           </Button>
         </div>
         <div className="min-h-[240px]">
-          <Transcript runnerId={runnerId} sessionPk={sessionPk} rows={rows} agentName={run.executingAgentNameSnapshot} agentColor="#6b7280" running={active} approvalRunId={run.runId} />
+          <Transcript
+            runnerId={runnerId}
+            sessionPk={sessionPk}
+            rows={rows}
+            agentName={run.executingAgentNameSnapshot}
+            agentColor="#6b7280"
+            running={active}
+            approvalRunId={run.runId}
+          />
         </div>
       </div>
     </div>

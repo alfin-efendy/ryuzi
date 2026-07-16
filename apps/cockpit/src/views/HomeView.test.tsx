@@ -129,8 +129,9 @@ const { HomeView } = await import("./HomeView");
 const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
+const defaultHydrateConnections = useConnections.getState().hydrate;
 const { useAgents } = await import("@/store-agents");
-const { useModelStatuses, statusKey } = await import("@/store-model-statuses");
+const { useModelStatuses } = await import("@/store-model-statuses");
 const { useUi } = await import("@/store-ui");
 const { useNative } = await import("@/store-native");
 
@@ -195,7 +196,12 @@ const anthropicConnection: ConnectionInfo = {
 beforeEach(() => {
   useStore.setState({ projects: [project()], selectedProjectId: "p1", projectRuntimeById: { p1: runtimeInfo } });
   // loaded: true keeps the mount effect from hydrating connections over IPC.
-  useConnections.setState({ catalog: catalogEntries, connections: [anthropicConnection], loaded: true });
+  useConnections.setState({
+    catalog: catalogEntries,
+    connections: [anthropicConnection],
+    loaded: true,
+    hydrate: defaultHydrateConnections,
+  });
   useAgents.setState({
     registry: {
       agents: [
@@ -253,6 +259,15 @@ test("git project: branch pill shows and branches are fetched", async () => {
   // aria-label="Branch"; the visible branch name lives in its text content.
   await waitFor(() => expect(screen.getByRole("combobox", { name: "Branch" }).textContent).toContain("main"));
   expect(listBranches).toHaveBeenCalledWith(LOCAL_RUNNER, "p1");
+});
+
+test("hydrates provider connections when they have not loaded", async () => {
+  const hydrate = mock(async () => {});
+  useConnections.setState({ loaded: false, hydrate });
+
+  render(<HomeView />);
+
+  await waitFor(() => expect(hydrate).toHaveBeenCalledTimes(1));
 });
 
 test("non-git project: no branch pill, no worktree toggle, no list_branches call", async () => {

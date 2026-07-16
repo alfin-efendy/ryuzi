@@ -32,10 +32,16 @@ const deleteAgent = mock(
   }),
 );
 
-const listAgentSessions = mock(async (_runner: string | null, _agentId: string, _limit: number) => ({ status: "ok" as const, data: [] as Session[] }));
+const listAgentSessions = mock(async (_runner: string | null, _agentId: string, _limit: number) => ({
+  status: "ok" as const,
+  data: [] as Session[],
+}));
 const listMessages = mock(async (_runner: string | null, _sessionPk: string) => ({ status: "ok" as const, data: [] }));
 
-mock.module("@/bindings", () => ({ commands: { deleteAgent, duplicateAgent, getAgent, listAgentSessions, listApps, listMessages, updateAgent }, events: {} }));
+mock.module("@/bindings", () => ({
+  commands: { deleteAgent, duplicateAgent, getAgent, listAgentSessions, listApps, listMessages, updateAgent },
+  events: {},
+}));
 
 const { AgentDetailView } = await import("./AgentDetailView");
 const { useStore } = await import("@/store");

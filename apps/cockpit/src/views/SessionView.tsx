@@ -30,15 +30,7 @@ import { AttachmentChips } from "@/components/composer/AttachmentChips";
 import { HISTORY_IDLE, historyEntries, shouldNavigateHistory, stepHistory, type HistoryState } from "@/components/composer/inputHistory";
 
 export function SessionView() {
-  const {
-    sessions,
-    transcripts,
-    focusedSession,
-    send,
-    stop,
-    pendingApprovals,
-    projects,
-  } = useStore();
+  const { sessions, transcripts, focusedSession, send, stop, pendingApprovals, projects } = useStore();
   const enqueueQueueMessage = useNative((s) => s.enqueueQueueMessage);
   const nav = useNav();
   // Draft text lives in the persisted useNav drafts map keyed by session, so
@@ -73,7 +65,10 @@ export function SessionView() {
       const { drafts, setDraft: write } = useNav.getState();
       const current = drafts[draftKey] ?? "";
       const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
-      const updated = typeof next === "object" ? next : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
+      const updated =
+        typeof next === "object"
+          ? next
+          : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
       write(draftKey, updated.text);
       setMentions(updated.mentions);
     },
@@ -151,8 +146,9 @@ export function SessionView() {
         updateDraft(historyRef.current.pending);
       }
     };
-  }, [draftKey, updateDraft]);
+  }, [updateDraft]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset transient composer state when the focused session changes
   useEffect(() => {
     setMentionCaret(0);
     setMentionActiveIndex(0);
@@ -207,7 +203,7 @@ export function SessionView() {
   const meta = statusMeta(session.status);
   const running = session.status === "running";
   const pendingForSession = pendingApprovals.filter((a) => a.runnerId === runnerId && a.sessionPk === session.sessionPk);
-  const currentPrimary = session.primaryAgentId ? registry?.agents.find((agent) => agent.id === session.primaryAgentId) ?? null : null;
+  const currentPrimary = session.primaryAgentId ? (registry?.agents.find((agent) => agent.id === session.primaryAgentId) ?? null) : null;
   const composeReadOnly = sessionIsReadOnly(session.primaryAgentSnapshot) || currentPrimary === null || !currentPrimary.executable;
   const composeReadOnlyReason = sessionIsReadOnly(session.primaryAgentSnapshot)
     ? "Legacy sessions are read-only."
@@ -406,6 +402,7 @@ export function SessionView() {
 
           {/* Transcript, with the TODO List overlaying it */}
           <div className="relative flex min-h-0 flex-1 flex-col">
+            <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
               <Transcript
                 runnerId={runnerId}

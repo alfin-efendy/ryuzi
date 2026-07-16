@@ -20,10 +20,7 @@ export function AgentMentionMenu({
   };
 
   return (
-    <MenuPanel
-      onClose={onClose ?? (() => undefined)}
-      className="bottom-full left-3 z-50 mb-1.5 w-[320px]"
-    >
+    <MenuPanel onClose={onClose ?? (() => undefined)} className="bottom-full left-3 z-50 mb-1.5 w-[320px]">
       <div
         role="menu"
         onKeyDown={(event) => {

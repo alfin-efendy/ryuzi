@@ -51,7 +51,9 @@ test("keeps child runs isolated when two runners share a session pk", async () =
 test("store core-event bridge refetches child metadata for its scoped run", async () => {
   const getChildRuns = spyOn(commands, "getChildRuns").mockResolvedValue({ status: "ok", data: [run()] });
 
-  useStore.getState().applyCoreEvent({ kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: null, status: "running" }, local);
+  useStore
+    .getState()
+    .applyCoreEvent({ kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: null, status: "running" }, local);
   await Promise.resolve();
 
   expect(getChildRuns).toHaveBeenCalledWith(local, sessionPk);
@@ -63,7 +65,9 @@ test("agent-run event reloads only its runner/session metadata and selected tran
   const getChildTranscript = spyOn(commands, "getChildTranscript").mockResolvedValue({ status: "ok", data: [] });
   useDelegation.getState().select(local, sessionPk, "run-1");
 
-  useDelegation.getState().applyCoreEvent({ kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: null, status: "completed" }, local);
+  useDelegation
+    .getState()
+    .applyCoreEvent({ kind: "agentRunChanged", session_pk: sessionPk, run_id: "run-1", parent_run_id: null, status: "completed" }, local);
   await Promise.resolve();
   await Promise.resolve();
 
@@ -82,7 +86,10 @@ test("retry appends the returned attempt and selects it", async () => {
 
   await useDelegation.getState().retry(local, sessionPk, "run-1");
 
-  expect(useDelegation.getState().bySession[delegationSessionKey(local, sessionPk)]?.map((entry) => entry.runId)).toEqual(["run-1", "run-2"]);
+  expect(useDelegation.getState().bySession[delegationSessionKey(local, sessionPk)]?.map((entry) => entry.runId)).toEqual([
+    "run-1",
+    "run-2",
+  ]);
   expect(useDelegation.getState().selectedBySession[delegationSessionKey(local, sessionPk)]).toBe("run-2");
   retryChildRun.mockRestore();
   getChildTranscript.mockRestore();

@@ -27,13 +27,7 @@ import { BranchNameModal } from "@/components/modals/BranchNameModal";
 const NO_PROJECT = "__none__";
 
 export function HomeView() {
-  const {
-    projects,
-    selectedProjectId,
-    selectProject,
-    start,
-    startChat,
-  } = useStore();
+  const { projects, selectedProjectId, selectProject, start, startChat } = useStore();
   const nav = useNav();
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const composerFiles = useComposerAttachments();
@@ -69,7 +63,10 @@ export function HomeView() {
       const { drafts, setDraft: write } = useNav.getState();
       const current = drafts[draftKey] ?? "";
       const currentMentions = mentionsByDraftRef.current[draftKey] ?? [];
-      const updated = typeof next === "object" ? next : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
+      const updated =
+        typeof next === "object"
+          ? next
+          : updateMentionDraft({ text: current, mentions: currentMentions }, typeof next === "function" ? next(current) : next);
       write(draftKey, updated.text);
       setMentions(updated.mentions);
     },
@@ -93,6 +90,10 @@ export function HomeView() {
     // Slash commands are project metadata on the local engine.
     if (projectId) void loadCommands(LOCAL_RUNNER, projectId);
   }, [projectId, loadCommands]);
+
+  useEffect(() => {
+    if (!connectionsLoaded) void hydrateConnections();
+  }, [connectionsLoaded, hydrateConnections]);
 
   const [branchList, setBranchList] = useState<BranchList | null>(null);
   const [branchModalOpen, setBranchModalOpen] = useState(false);
@@ -122,6 +123,7 @@ export function HomeView() {
     };
   }, [projectId, isGit, setComposerBranch]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset transient composer state when the draft scope changes
   useEffect(() => {
     setMentionCaret(0);
     setMentionActiveIndex(0);

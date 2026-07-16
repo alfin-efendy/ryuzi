@@ -212,9 +212,7 @@ beforeEach(() => {
   continueSession.mockReset();
   continueSession.mockImplementation(() => Promise.resolve({ status: "ok" as const, data: null }));
   enqueueSessionMessage.mockReset();
-  enqueueSessionMessage.mockImplementation(() =>
-    Promise.resolve({ status: "ok" as const, data: { id: "q1", text: "queued" } }),
-  );
+  enqueueSessionMessage.mockImplementation(() => Promise.resolve({ status: "ok" as const, data: { id: "q1", text: "queued" } }));
   listProjects.mockClear();
   listSessions.mockClear();
   listGateways.mockClear();
@@ -711,8 +709,6 @@ test("a rejected idle send keeps the draft without an unhandled rejection", asyn
   render(<SessionView />);
   fireEvent.keyDown(screen.getByPlaceholderText("Ask for follow-up changes"), { key: "Enter" });
 
-  await waitFor(() =>
-    expect(continueSession).toHaveBeenCalledWith(runnerId, "s1", expect.objectContaining({ text: "retry this" })),
-  );
+  await waitFor(() => expect(continueSession).toHaveBeenCalledWith(runnerId, "s1", expect.objectContaining({ text: "retry this" })));
   expect(useNav.getState().drafts[draftKey]).toBe("retry this");
 });

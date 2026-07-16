@@ -28,10 +28,20 @@ function RunCard({ run, onSelect }: { run: AgentRun; onSelect: () => void }) {
         <span className="mt-0.5 block truncate text-[12px] text-muted-foreground">{run.task}</span>
         <span className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
           <span className="capitalize">{run.status}</span>
-          <span>{run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}</span>
-          <span className="inline-flex items-center gap-1"><Clock3 aria-hidden size={10} />{duration(run)}</span>
+          <span>
+            {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Clock3 aria-hidden size={10} />
+            {duration(run)}
+          </span>
         </span>
-        {run.error && <span className="mt-1 flex items-center gap-1 text-[11px] text-destructive"><CircleAlert aria-hidden size={11} />{run.error}</span>}
+        {run.error && (
+          <span className="mt-1 flex items-center gap-1 text-[11px] text-destructive">
+            <CircleAlert aria-hidden size={11} />
+            {run.error}
+          </span>
+        )}
       </span>
     </Button>
   );
@@ -50,11 +60,19 @@ export function AgentRunRoster({ runnerId, sessionPk }: { runnerId: string; sess
     <div className="min-h-0 flex-1 overflow-y-auto p-2">
       <section>
         <h3 className="px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Active ({active.length})</h3>
-        <div className="flex flex-col gap-0.5">{active.map((run) => <RunCard key={run.runId} run={run} onSelect={() => select(runnerId, sessionPk, run.runId)} />)}</div>
+        <div className="flex flex-col gap-0.5">
+          {active.map((run) => (
+            <RunCard key={run.runId} run={run} onSelect={() => select(runnerId, sessionPk, run.runId)} />
+          ))}
+        </div>
       </section>
       <section className="mt-3">
         <h3 className="px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Done ({done.length})</h3>
-        <div className="flex flex-col gap-0.5">{done.map((run) => <RunCard key={run.runId} run={run} onSelect={() => select(runnerId, sessionPk, run.runId)} />)}</div>
+        <div className="flex flex-col gap-0.5">
+          {done.map((run) => (
+            <RunCard key={run.runId} run={run} onSelect={() => select(runnerId, sessionPk, run.runId)} />
+          ))}
+        </div>
       </section>
     </div>
   );

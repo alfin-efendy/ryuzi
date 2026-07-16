@@ -863,23 +863,25 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
         .unwrap();
 
     wait_for_prompts(&counters.prompts, 2).await;
-    let attachment_dirs = counters.attachment_dirs.lock().unwrap();
-    assert!(
-        attachment_dirs[0].is_some(),
-        "the normal primary must retain its session attachment root"
-    );
-    assert_eq!(
-        attachment_dirs[1], None,
-        "the explicit-mention child must not inherit the parent attachment root"
-    );
-    drop(attachment_dirs);
-    let app_facades = counters.app_facades.lock().unwrap();
-    assert!(app_facades[0], "the primary retains its app-control facade");
-    assert!(
-        !app_facades[1],
-        "the explicit-mention child must not receive the parent app-control facade"
-    );
-    drop(app_facades);
+    {
+        let attachment_dirs = counters.attachment_dirs.lock().unwrap();
+        assert!(
+            attachment_dirs[0].is_some(),
+            "the normal primary must retain its session attachment root"
+        );
+        assert_eq!(
+            attachment_dirs[1], None,
+            "the explicit-mention child must not inherit the parent attachment root"
+        );
+    }
+    {
+        let app_facades = counters.app_facades.lock().unwrap();
+        assert!(app_facades[0], "the primary retains its app-control facade");
+        assert!(
+            !app_facades[1],
+            "the explicit-mention child must not receive the parent app-control facade"
+        );
+    }
     let runs = store
         .list_session_agent_runs(&session.session_pk)
         .await

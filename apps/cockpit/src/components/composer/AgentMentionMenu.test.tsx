@@ -5,8 +5,34 @@ import type { AgentSummaryInfo } from "@/bindings";
 import { AgentMentionMenu } from "./AgentMentionMenu";
 
 const agents: AgentSummaryInfo[] = [
-  { id: "ada", name: "Ada", description: "", avatarColor: "blue", model: { kind: "route", route: "fast" }, permissionMode: "ask", skillCount: 0, toolCount: 0, knowledgeCount: 0, executable: true, validation: [], isDefault: false },
-  { id: "lin", name: "Lin", description: "", avatarColor: "green", model: { kind: "route", route: "fast" }, permissionMode: "ask", skillCount: 0, toolCount: 0, knowledgeCount: 0, executable: true, validation: [], isDefault: false },
+  {
+    id: "ada",
+    name: "Ada",
+    description: "",
+    avatarColor: "blue",
+    model: { kind: "route", route: "fast" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable: true,
+    validation: [],
+    isDefault: false,
+  },
+  {
+    id: "lin",
+    name: "Lin",
+    description: "",
+    avatarColor: "green",
+    model: { kind: "route", route: "fast" },
+    permissionMode: "ask",
+    skillCount: 0,
+    toolCount: 0,
+    knowledgeCount: 0,
+    executable: true,
+    validation: [],
+    isDefault: false,
+  },
 ];
 
 describe("AgentMentionMenu", () => {
@@ -14,7 +40,14 @@ describe("AgentMentionMenu", () => {
     const picked: string[] = [];
     function Menu() {
       const [activeIndex, setActiveIndex] = useState(0);
-      return <AgentMentionMenu agents={agents} activeIndex={activeIndex} onActiveIndexChange={setActiveIndex} onPick={(agent) => picked.push(agent.id)} />;
+      return (
+        <AgentMentionMenu
+          agents={agents}
+          activeIndex={activeIndex}
+          onActiveIndexChange={setActiveIndex}
+          onPick={(agent) => picked.push(agent.id)}
+        />
+      );
     }
     render(<Menu />);
 

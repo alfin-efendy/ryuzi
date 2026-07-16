@@ -7,7 +7,8 @@ const getChildRuns = mock(
   (_runnerId: string | null, _sessionPk: string): Promise<Result<AgentRun[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
 );
 const getChildTranscript = mock(
-  (_runnerId: string | null, _sessionPk: string, _runId: string): Promise<Result<Message[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
+  (_runnerId: string | null, _sessionPk: string, _runId: string): Promise<Result<Message[], CmdError>> =>
+    Promise.resolve({ status: "ok", data: [] }),
 );
 const gitDiff = mock(
   (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> => Promise.resolve({ status: "ok", data: "" }),
@@ -343,7 +344,7 @@ test("switching runners, sessions, and full detail resets the selected child run
   getChildRuns.mockImplementation((runnerId: string | null, sessionPk: string) =>
     Promise.resolve({ status: "ok", data: [childRun({ runId: `${runnerId}-${sessionPk}`, sessionPk })] }),
   );
-  getChildTranscript.mockImplementation((_runnerId: string | null, sessionPk: string, runId: string) =>
+  getChildTranscript.mockImplementation((_runnerId: string | null, _sessionPk: string, runId: string) =>
     Promise.resolve({
       status: "ok",
       data: [
@@ -395,15 +396,16 @@ test("agent-run events refresh the visible child transcript", async () => {
 
   await act(async () => {
     const { useStore } = await import("@/store");
-    useStore.getState().applyCoreEvent(
-      { kind: "agentRunChanged", session_pk: "s1", run_id: "child-1", parent_run_id: null, status: "completed" },
-      LOCAL_RUNNER,
-    );
+    useStore
+      .getState()
+      .applyCoreEvent(
+        { kind: "agentRunChanged", session_pk: "s1", run_id: "child-1", parent_run_id: null, status: "completed" },
+        LOCAL_RUNNER,
+      );
   });
 
   await waitFor(() => expect(getChildTranscript).toHaveBeenCalledTimes(2));
 });
-
 
 test("many file tabs do not move the expand action out of the fixed header", () => {
   useNav.setState({ rightTab: "file" });

@@ -1,12 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentMention } from "@/bindings";
-import {
-  activeAgentMentionQuery,
-  insertAgentMention,
-  matchMentionAgents,
-  updateMentionDraft,
-  type MentionDraft,
-} from "./mentions";
+import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "./mentions";
 
 const ada = { id: "ada", name: "Ada", description: "Accessibility review", executable: true };
 const lin = { id: "lin", name: "Lin", description: "Systems planner", executable: true };

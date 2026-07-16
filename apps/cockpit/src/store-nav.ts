@@ -55,8 +55,6 @@ export function choosePrimaryAgent(
   return [requestedId, lastId, defaultId].find(valid) ?? agents.find((agent) => agent.executable)?.id ?? null;
 }
 
-
-
 function readBool(key: string, fallback: boolean): boolean {
   if (typeof localStorage === "undefined") return fallback;
   const v = localStorage.getItem(key);

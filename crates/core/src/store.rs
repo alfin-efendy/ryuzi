@@ -5280,9 +5280,11 @@ mod tests {
             .unwrap();
         }
 
+        type PreservedRowCounts = (i64, i64, i64, i64, i64);
+        type Migration38Snapshot = (i64, Vec<String>, Vec<String>, PreservedRowCounts);
+
         let upgraded = Store::open(tmp.path()).await.unwrap();
-        let (user_version, ownership_columns, agent_run_tables, preserved_rows):
-            (i64, Vec<String>, Vec<String>, (i64, i64, i64, i64, i64)) = upgraded
+        let (user_version, ownership_columns, agent_run_tables, preserved_rows): Migration38Snapshot = upgraded
             .with_conn(|c| {
                 let ownership_columns = c
                     .prepare("SELECT name FROM pragma_table_info('sessions') WHERE name LIKE 'primary_agent_%' ORDER BY name")?
