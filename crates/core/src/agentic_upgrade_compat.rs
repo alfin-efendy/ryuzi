@@ -923,6 +923,14 @@ async fn historical_sessions_reject_runs_and_mutations_but_stay_readable() {
                 "cancel_child_run",
                 json!({ "session_pk": pk, "run_id": child }),
             ),
+            (
+                "enqueue_session_message",
+                json!({ "session_pk": pk, "prompt": "queued turn", "options": null }),
+            ),
+            (
+                "remove_session_message",
+                json!({ "session_pk": pk, "id": format!("{pk}-queue-item") }),
+            ),
         ];
         for (method, params) in blocked {
             let error = dispatch(&state, method, params).await.unwrap_err();
