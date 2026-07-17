@@ -1573,6 +1573,32 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // 47: versioned component plugin releases (Task 3). Tracks every
+        // fetched build of a WASM component plugin — one row per
+        // (plugin_id, version) — so activation/rollback/revocation can be
+        // audited independently of the single "current install" row in
+        // `plugin_installs`. The partial unique index enforces at most one
+        // active version per plugin id directly in the schema; the
+        // `active`/`revoked` write paths additionally enforce the invariant
+        // in application code (see `set_active_component_release` and
+        // `mark_component_release_revoked`) so a partial-index-less SQLite
+        // build would still behave correctly.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS component_plugin_releases (\
+                plugin_id TEXT NOT NULL,\
+                version TEXT NOT NULL,\
+                source_url TEXT NOT NULL,\
+                sha256 TEXT NOT NULL,\
+                signing_key_id TEXT NOT NULL,\
+                installed_at INTEGER NOT NULL,\
+                active INTEGER NOT NULL DEFAULT 0,\
+                revoked INTEGER NOT NULL DEFAULT 0,\
+                revocation_reason TEXT,\
+                PRIMARY KEY (plugin_id, version)\
+            );\
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_component_plugin_releases_active \
+                ON component_plugin_releases(plugin_id) WHERE active=1;",
+        ),
     ])
 }
 
@@ -1768,6 +1794,23 @@ fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
     })
 }
 
+fn map_component_release_row(r: &Row) -> rusqlite::Result<ComponentPluginReleaseRecord> {
+    Ok(ComponentPluginReleaseRecord {
+        plugin_id: r.get(0)?,
+        version: r.get(1)?,
+        source_url: r.get(2)?,
+        sha256: r.get(3)?,
+        signing_key_id: r.get(4)?,
+        installed_at: r.get(5)?,
+        active: r.get::<_, i64>(6)? != 0,
+        revoked: r.get::<_, i64>(7)? != 0,
+        revocation_reason: r.get(8)?,
+    })
+}
+
+const COMPONENT_RELEASE_COLS: &str = "plugin_id, version, source_url, sha256, signing_key_id, \
+    installed_at, active, revoked, revocation_reason";
+
 fn map_device_row(r: &Row) -> rusqlite::Result<Device> {
     Ok(Device {
         id: r.get(0)?,
@@ -1919,6 +1962,28 @@ pub struct PluginAttachStatus {
     pub last_attach_at: i64,
     pub outcome: String,
     pub reason: Option<String>,
+}
+
+/// One row of `component_plugin_releases`: a single fetched build of a WASM
+/// component plugin, keyed by `(plugin_id, version)`. Distinct from the
+/// single "current install" row in `plugin_installs` — this table is an
+/// append-mostly ledger of every version ever fetched for a plugin, so
+/// activation, rollback, and revocation can all be audited independently.
+/// `active` is true for at most one version per `plugin_id` (enforced by a
+/// partial unique index and by `set_active_component_release`). `revoked` +
+/// `revocation_reason` mark a version as no longer safe to activate; a
+/// revoked version is automatically deactivated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentPluginReleaseRecord {
+    pub plugin_id: String,
+    pub version: String,
+    pub source_url: String,
+    pub sha256: String,
+    pub signing_key_id: String,
+    pub installed_at: i64,
+    pub active: bool,
+    pub revoked: bool,
+    pub revocation_reason: Option<String>,
 }
 
 /// One row of `plugin_catalog_cache`: an entry from the last verified signed
@@ -4628,6 +4693,171 @@ impl Store {
                 .query_map([], map_plugin_attach_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Insert a new component plugin release row, or refresh an existing
+    /// one's metadata (`source_url`, `sha256`, `signing_key_id`) in place.
+    /// `installed_at`, `active`, `revoked`, and `revocation_reason` are never
+    /// clobbered by a refresh — those are durable lifecycle state owned by
+    /// `set_active_component_release` and `mark_component_release_revoked`,
+    /// not by whatever the caller happens to pass in a metadata re-verify.
+    pub async fn upsert_component_release(
+        &self,
+        rec: &ComponentPluginReleaseRecord,
+    ) -> anyhow::Result<()> {
+        let rec = rec.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO component_plugin_releases({COMPONENT_RELEASE_COLS}) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                     ON CONFLICT(plugin_id, version) DO UPDATE SET \
+                       source_url=excluded.source_url, sha256=excluded.sha256, \
+                       signing_key_id=excluded.signing_key_id"
+                ),
+                params![
+                    rec.plugin_id,
+                    rec.version,
+                    rec.source_url,
+                    rec.sha256,
+                    rec.signing_key_id,
+                    rec.installed_at,
+                    rec.active as i64,
+                    rec.revoked as i64,
+                    rec.revocation_reason,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// All releases fetched for `plugin_id`, oldest first. Ordered by
+    /// `installed_at ASC, version ASC` — installation order is the primary
+    /// key so history reads chronologically; `version` is the tiebreaker for
+    /// rows that share an `installed_at` timestamp (e.g. backfilled or
+    /// second-granularity clocks), keeping the order fully deterministic.
+    /// This is lexicographic on `version`, not semver-aware.
+    pub async fn list_component_releases(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Vec<ComponentPluginReleaseRecord>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {COMPONENT_RELEASE_COLS} FROM component_plugin_releases \
+                 WHERE plugin_id=?1 ORDER BY installed_at ASC, version ASC"
+            ))?;
+            let rows = stmt
+                .query_map(params![plugin_id], map_component_release_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// The currently active release for `plugin_id`, if any. At most one row
+    /// can be active per plugin (enforced by the partial unique index on
+    /// `component_plugin_releases(plugin_id) WHERE active=1` plus
+    /// `set_active_component_release`'s transaction).
+    pub async fn active_component_release(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<ComponentPluginReleaseRecord>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {COMPONENT_RELEASE_COLS} FROM component_plugin_releases \
+                     WHERE plugin_id=?1 AND active=1"
+                ),
+                params![plugin_id],
+                map_component_release_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Activate `(plugin_id, version)`, deactivating whatever was previously
+    /// active for that plugin. Validates the target row exists and is not
+    /// revoked *before* touching any state, and runs entirely inside one
+    /// transaction: a rejected activation (missing or revoked target) leaves
+    /// the prior active version untouched, and a mid-transaction failure
+    /// rolls back rather than leaving two (or zero) active rows.
+    pub async fn set_active_component_release(
+        &self,
+        plugin_id: &str,
+        version: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let version = version.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let revoked: Option<i64> = tx
+                .query_row(
+                    "SELECT revoked FROM component_plugin_releases \
+                     WHERE plugin_id=?1 AND version=?2",
+                    params![plugin_id, version],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match revoked {
+                None => {
+                    return Err(to_sql_json_error(format!(
+                        "no component release {plugin_id}@{version} to activate"
+                    )));
+                }
+                Some(revoked) if revoked != 0 => {
+                    return Err(to_sql_json_error(format!(
+                        "component release {plugin_id}@{version} is revoked and cannot be activated"
+                    )));
+                }
+                Some(_) => {}
+            }
+            tx.execute(
+                "UPDATE component_plugin_releases SET active=0 \
+                 WHERE plugin_id=?1 AND active=1",
+                params![plugin_id],
+            )?;
+            tx.execute(
+                "UPDATE component_plugin_releases SET active=1 \
+                 WHERE plugin_id=?1 AND version=?2",
+                params![plugin_id, version],
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+
+    /// Revoke `(plugin_id, version)`: records `reason`, clears `active` if
+    /// this was the active version, and leaves other versions untouched.
+    /// Idempotent — revoking an already-revoked version updates the
+    /// recorded reason and succeeds again rather than erroring.
+    pub async fn mark_component_release_revoked(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let version = version.to_string();
+        let reason = reason.to_string();
+        self.with_conn(move |c| {
+            let changed = c.execute(
+                "UPDATE component_plugin_releases \
+                 SET revoked=1, revocation_reason=?3, active=0 \
+                 WHERE plugin_id=?1 AND version=?2",
+                params![plugin_id, version, reason],
+            )?;
+            if changed == 0 {
+                return Err(to_sql_json_error(format!(
+                    "no component release {plugin_id}@{version} to revoke"
+                )));
+            }
+            Ok(())
         })
         .await
     }
@@ -10207,6 +10437,232 @@ mod tests {
 
         store.delete_plugin_install("acme").await.unwrap();
         assert!(store.get_plugin_install("acme").await.unwrap().is_none());
+    }
+
+    fn component_release(
+        plugin_id: &str,
+        version: &str,
+        installed_at: i64,
+    ) -> ComponentPluginReleaseRecord {
+        ComponentPluginReleaseRecord {
+            plugin_id: plugin_id.into(),
+            version: version.into(),
+            source_url: format!("https://example.test/{plugin_id}/{version}.wasm"),
+            sha256: format!("sha256-{plugin_id}-{version}"),
+            signing_key_id: "key-1".into(),
+            installed_at,
+            active: false,
+            revoked: false,
+            revocation_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_42_creates_component_plugin_releases_table() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let count: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT count(*) FROM component_plugin_releases", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn component_release_versions_coexist_with_deterministic_order() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.1", 2000))
+            .await
+            .unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert_eq!(releases.len(), 2);
+        // Ordering is by installed_at ascending (not semver): the 0.1.0 row
+        // was installed first even though it was upserted second above.
+        assert_eq!(releases[0].version, "0.1.0");
+        assert_eq!(releases[1].version, "0.1.1");
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn component_release_activation_is_exclusive() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.1", 2000))
+            .await
+            .unwrap();
+
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+        assert!(active.active);
+
+        store
+            .set_active_component_release("github", "0.1.1")
+            .await
+            .unwrap();
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.1");
+
+        let releases = store.list_component_releases("github").await.unwrap();
+        let old = releases
+            .iter()
+            .find(|r| r.version == "0.1.0")
+            .expect("0.1.0 must still exist");
+        assert!(
+            !old.active,
+            "activating 0.1.1 must clear 0.1.0's active flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn component_release_set_active_rejects_absent_or_revoked_and_preserves_existing_active()
+    {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.2.0", 2000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        // Absent version: rejected, active state untouched.
+        assert!(store
+            .set_active_component_release("github", "9.9.9")
+            .await
+            .is_err());
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+
+        // Revoked version: rejected, active state untouched.
+        store
+            .mark_component_release_revoked("github", "0.2.0", "supply chain concern")
+            .await
+            .unwrap();
+        assert!(store
+            .set_active_component_release("github", "0.2.0")
+            .await
+            .is_err());
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn component_release_revoke_active_clears_active_and_is_idempotent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        store
+            .mark_component_release_revoked("github", "0.1.0", "hash mismatch")
+            .await
+            .unwrap();
+        let releases = store.list_component_releases("github").await.unwrap();
+        let rev = &releases[0];
+        assert!(rev.revoked);
+        assert!(!rev.active);
+        assert_eq!(rev.revocation_reason.as_deref(), Some("hash mismatch"));
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Idempotent: revoking again does not error and keeps the reason.
+        store
+            .mark_component_release_revoked("github", "0.1.0", "hash mismatch (re-checked)")
+            .await
+            .unwrap();
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert!(releases[0].revoked);
+        assert_eq!(
+            releases[0].revocation_reason.as_deref(),
+            Some("hash mismatch (re-checked)")
+        );
+    }
+
+    #[tokio::test]
+    async fn component_release_upsert_preserves_active_and_revoked_state_on_metadata_refresh() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        // Refresh metadata (e.g. re-verified source_url/sha256) via upsert.
+        // The record passed in claims active=false, but that must not
+        // clobber the durable active flag set above.
+        let mut refreshed = component_release("github", "0.1.0", 1000);
+        refreshed.source_url = "https://example.test/github/0.1.0-mirror.wasm".into();
+        store.upsert_component_release(&refreshed).await.unwrap();
+
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+        assert_eq!(
+            active.source_url,
+            "https://example.test/github/0.1.0-mirror.wasm"
+        );
     }
 
     #[tokio::test]
