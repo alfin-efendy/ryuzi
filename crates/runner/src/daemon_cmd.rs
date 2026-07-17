@@ -601,6 +601,14 @@ pub(crate) fn spawn_detached(
     use std::fs::File;
     use std::process::{Command, Stdio};
 
+    // Fresh install: `log_path`'s parent is the state dir, which nothing has
+    // created yet — the daemon's own `Store::open` would, but it cannot run
+    // until this spawn succeeds. `File::create` does not create parent
+    // directories, so without this the first `ryuzi start` on a clean machine
+    // fails with NotFound instead of starting the daemon.
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let stdout = File::options().append(true).create(true).open(log_path)?;
     let stderr = File::options().append(true).create(true).open(log_path)?;
     let mut command = Command::new(&cmd[0]);
@@ -891,6 +899,28 @@ mod tests {
     fn control_port_default_is_4483() {
         // Documented default; EngineClient and docs reference it.
         assert_eq!(super::DEFAULT_CONTROL_PORT, 4483);
+    }
+
+    // ---------- spawn_detached ----------
+
+    /// Fresh install: the state dir holding `daemon.log` does not exist yet.
+    /// The log is opened before the child is spawned, so the directory must be
+    /// created first or `ryuzi start` dies with NotFound on a clean machine.
+    /// The command is deliberately bogus — the spawn is expected to fail; what
+    /// matters is that the log (and its dir) exist by the time it is reached.
+    #[test]
+    fn spawn_detached_creates_a_missing_log_dir_before_spawning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("ryuzi");
+        let log = fresh.join("daemon.log");
+        assert!(!fresh.exists(), "precondition: state dir must be missing");
+
+        let _ = spawn_detached(&["ryuzi-no-such-binary".to_string()], &[], &log);
+
+        assert!(
+            log.exists(),
+            "daemon.log and its parent dir must be created"
+        );
     }
 
     // ---------- is_canary ----------

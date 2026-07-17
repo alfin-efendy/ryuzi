@@ -5,15 +5,20 @@
 use std::sync::Arc;
 
 use crate::llm_router::routes::{self, ModelRouteInfo, ModelRouteStrategy, ModelRouteTarget};
-use crate::llm_router::{connections, probe, registry};
+use crate::llm_router::{connections, models, probe, registry};
 use crate::store::Store;
 
 /// The families whose free-tier models seed the `free` route.
 const FREE_FAMILIES: &[&str] = &["mimo-free", "opencode-free"];
 
-/// Probe every model on the enabled MiMo/OpenCode free connections and, when at
-/// least one passes, overwrite the `free` route's targets with the passing set.
-/// Returns the number of passing targets written (0 = route left untouched).
+/// Refresh each enabled MiMo/OpenCode free connection's live model catalog,
+/// probe every model on it, and — when at least one passes — overwrite the
+/// `free` route's targets with the passing set. Returns the number of passing
+/// targets written (0 = route left untouched).
+///
+/// The refresh is what makes the route usable out of the box: a free provider
+/// may seed no models at all and publish its catalog only from a live endpoint,
+/// in which case there is nothing to probe until it has been fetched.
 pub(crate) async fn rebuild_free_route(
     store: &Arc<Store>,
     http: &reqwest::Client,
@@ -28,8 +33,40 @@ pub(crate) async fn rebuild_free_route(
         if !FREE_FAMILIES.contains(&desc.family) {
             continue;
         }
-        for model in connections::effective_models(desc, conn) {
-            let outcome = probe::probe_model(http, store, desc, conn, &model).await;
+        let mut conn = conn.clone();
+        // Discover the live catalog before probing. `opencode-free` seeds no
+        // models at all (`models: &[]`) and publishes them from its own
+        // endpoint, so without this there is nothing to probe and none of its
+        // models can ever reach the route. The refresh persists what it finds,
+        // so the Models view sees the same catalog. Non-fatal: a provider with
+        // no endpoint (`mimo-free`) keeps its seeded list, and a failure here
+        // (offline, 404) still leaves that list to probe.
+        if desc.has_models_endpoint {
+            if let Err(e) = models::refresh_connection_models(store, http, &mut conn).await {
+                tracing::warn!(
+                    provider = %conn.provider,
+                    error = %e,
+                    "free route: live model refresh failed; probing the seeded list"
+                );
+            }
+        }
+        for model in connections::effective_models(desc, &conn) {
+            let outcome = probe::probe_model(http, store, desc, &conn, &model).await;
+            // Persist the verdict exactly as the Models view's "Test All" does
+            // (`connections_api::test_connection_model`), so a fresh install
+            // shows every free model's status without a manual pass. Same
+            // best-effort contract: `upsert_model_status` drops "unknown", so a
+            // rate limit or outage never clobbers a stored valid/invalid, and a
+            // store hiccup must not derail the rebuild.
+            let _ = store
+                .upsert_model_status(crate::store::ModelStatusRow {
+                    family: desc.family.to_string(),
+                    model: model.clone(),
+                    status: outcome.status.as_str().to_string(),
+                    message: outcome.message.clone(),
+                    tested_at: crate::paths::now_ms(),
+                })
+                .await;
             if outcome.ok {
                 let key = (desc.family.to_string(), model.clone());
                 if seen.insert(key) {
@@ -110,6 +147,84 @@ mod tests {
         let written = rebuild_free_route(&store, &http).await.unwrap();
         assert_eq!(written, 0);
         assert!(routes::list_model_routes(&store).await.unwrap().is_empty());
+    }
+
+    /// `opencode-free` ships an EMPTY static model list (`models: &[]`) and
+    /// discovers its catalog live (`has_models_endpoint: true`). Without a
+    /// refresh first, `effective_models` returns nothing, so not one of its
+    /// models is ever probed and none can reach the `free` route — a fresh
+    /// install ends up routing to `mimo-auto` alone while every OpenCode free
+    /// model sits unused and untested.
+    #[tokio::test]
+    async fn rebuild_refreshes_live_models_before_probing_so_opencode_free_can_route() {
+        use axum::{routing::get, routing::post, Json, Router};
+        use serde_json::json;
+
+        let app = Router::new()
+            .route(
+                "/models",
+                get(|| async { Json(json!({"data": [{"id": "free-a"}, {"id": "free-b"}]})) }),
+            )
+            .route(
+                "/chat/completions",
+                post(|| async {
+                    Json(json!({
+                        "id": "c1",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        connections::add_connection(
+            &store,
+            ConnectionRow {
+                id: crate::paths::new_id(),
+                provider: "opencode-free".into(),
+                auth_type: "free".into(),
+                label: "OpenCode (free)".into(),
+                priority: 0,
+                enabled: true,
+                data: ConnectionData {
+                    base_url_override: Some(format!("http://127.0.0.1:{port}")),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let written = rebuild_free_route(&store, &http).await.unwrap();
+
+        assert_eq!(
+            written, 2,
+            "both live-discovered models should pass the probe"
+        );
+        let routes = routes::list_model_routes(&store).await.unwrap();
+        let free = routes
+            .iter()
+            .find(|r| r.name == "free")
+            .expect("free route");
+        let models: Vec<&str> = free.targets.iter().map(|t| t.model.as_str()).collect();
+        assert_eq!(models, ["free-a", "free-b"]);
+        assert!(free.targets.iter().all(|t| t.provider == "opencode-free"));
+
+        // Every verdict is persisted exactly as the Models view's "Test All"
+        // would, so a fresh install shows each free model's status without the
+        // user running a manual pass first.
+        let statuses = store.list_model_statuses("opencode-free").await.unwrap();
+        let tested: Vec<(&str, &str)> = statuses
+            .iter()
+            .map(|s| (s.model.as_str(), s.status.as_str()))
+            .collect();
+        assert_eq!(tested, [("free-a", "valid"), ("free-b", "valid")]);
     }
 
     #[tokio::test]
