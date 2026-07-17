@@ -391,6 +391,7 @@ test("switching runners, sessions, and full detail resets the selected child run
         {
           seq: 1,
           sessionPk: "session-a",
+          runId: null,
           role: "assistant",
           blockType: "text",
           payload: { text: `Live transcript for ${runId}` },

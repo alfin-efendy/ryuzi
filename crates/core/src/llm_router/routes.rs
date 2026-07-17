@@ -2,6 +2,7 @@
 //! an ordered list of provider connection/model targets.
 use crate::llm_router::model_capabilities;
 use crate::llm_router::model_effort::{ModelPreferenceKey, ReasoningEffortOption};
+use crate::llm_router::model_meta;
 use crate::llm_router::{connections, registry};
 use crate::store::Store;
 use rusqlite::OptionalExtension;
@@ -40,6 +41,7 @@ pub struct ModelRouteTarget {
 pub struct ModelRouteTargetCapability {
     pub provider: String,
     pub model: String,
+    pub context_window: u64,
     pub supported: Vec<ReasoningEffortOption>,
     pub provider_default: Option<String>,
 }
@@ -211,9 +213,11 @@ pub async fn list_model_route_target_capabilities(
             },
         )
         .await?;
+        let context_window = model_meta::resolve(store, &model).await.context_window;
         capabilities.push(ModelRouteTargetCapability {
             provider,
             model,
+            context_window,
             supported: resolved.supported,
             provider_default: resolved.provider_default,
         });
