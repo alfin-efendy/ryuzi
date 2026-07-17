@@ -4,8 +4,8 @@
 use super::{ControlPlane, WorkerBinding, RESUME_NUDGE};
 use crate::connector::ConnectorCtx;
 use crate::domain::{
-    AgentRunKind, AttachmentRef, CoreEvent, NewAgentRun, NewMessage, PermMode, Project,
-    QueuedSessionPrompt, Session, SessionGitOptions, SessionKind, SessionStatus, WriteOrigin,
+    AgentRunKind, AttachmentRef, CoreEvent, NewAgentRun, PermMode, Project, QueuedSessionPrompt,
+    Session, SessionGitOptions, SessionKind, SessionStatus,
 };
 use crate::harness::{HarnessSession, PrimaryTurnConfig, SessionCtx, TurnPrompt};
 use crate::mentions::{
@@ -13,7 +13,7 @@ use crate::mentions::{
     COORDINATOR_SYNTHESIS_INSTRUCTION,
 };
 use crate::paths::{new_id, now_ms, worktree_path_for};
-use crate::sessions::ownership::{resolve_session_agent_access, SessionAgentAccess};
+use crate::sessions::ownership::require_executable_session_agent;
 use crate::settings::SettingsStore;
 use crate::worktree;
 use std::path::Path;
@@ -260,6 +260,8 @@ impl ControlPlane {
             session_pk: session_pk.clone(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: identity.id.clone(),
             executing_agent_id: Some(identity.id.clone()),
             executing_agent_name_snapshot: identity.name.clone(),
@@ -347,15 +349,8 @@ impl ControlPlane {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         let resolved_mentions = if mentions.is_empty() {
@@ -396,15 +391,8 @@ impl ControlPlane {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         let run = self
@@ -736,15 +724,8 @@ impl ControlPlane {
         if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         let run = self
@@ -936,6 +917,7 @@ impl ControlPlane {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: session_pk.to_string(),
                 seq,
+                run_id: None,
                 role: "system".to_string(),
                 block_type: "status".to_string(),
                 payload,
@@ -956,6 +938,7 @@ impl ControlPlane {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: session_pk.to_string(),
                 seq,
+                run_id: None,
                 role: "system".to_string(),
                 block_type: "error".to_string(),
                 payload,
@@ -1232,15 +1215,8 @@ impl ControlPlane {
             },
             None => None,
         };
-        let agent_id = match resolve_session_agent_access(&self.store, &self.registry, session_pk)
-            .await?
-        {
-            SessionAgentAccess::Executable { agent_id } => agent_id,
-            SessionAgentAccess::LegacyReadOnly => anyhow::bail!("legacy sessions are read-only"),
-            SessionAgentAccess::DeletedReadOnly { .. } => {
-                anyhow::bail!("the session's primary agent was deleted")
-            }
-        };
+        let agent_id =
+            require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
         validate_executable_primary(&self.registries, &primary_agent)?;
         if session.agent_session_id.is_none() {
@@ -1516,10 +1492,11 @@ impl ControlPlane {
     /// returns a clone for driving the first prompt.
     ///
     /// `project` is `None` for a chat (project-less) session — there is no
-    /// `Project` row to inherit `perm_mode`/`model`/`effort` from, so those
-    /// fall back to engine-wide settings: `perm_mode` from `default_perm_mode`,
-    /// `model` from the native agent's configured model (`agent_settings`), and
-    /// `effort` from `default_effort`. The harness is always native.
+    /// `Project` row to inherit `perm_mode`/`model`/`effort` from. That's
+    /// fine either way: the native harness always executes the immutable
+    /// primary-agent snapshot captured for this turn, so `perm_mode`,
+    /// `model`, and `effort` all come from that agent profile, never from
+    /// project or engine-wide settings. The harness is always native.
     async fn start_harness_session(
         self: &Arc<Self>,
         project: Option<&Project>,
@@ -1625,8 +1602,9 @@ impl ControlPlane {
         });
         let agent = session_row.and_then(|s| s.agent);
         // The curated app-control facade (spec §9.1) is only for a top-level
-        // interactive session: a worker or review-fork session never gets
-        // the `app_*` tools (mirrors the existing sub-agent blocklist, Task
+        // interactive session: a worker session (or the reserved, not yet
+        // live, `Review` kind) never gets the `app_*` tools (mirrors the
+        // existing sub-agent blocklist, Task
         // 6's `child_deps.app_control` reset, and this crate's `Harness`
         // trait boundary — `SessionCtx` is the one channel from here into
         // `NativeHarness::start_session`, which cannot reach `ControlPlane`
@@ -1838,6 +1816,7 @@ impl ControlPlane {
                                 task,
                                 context: None,
                                 background: false,
+                                dispatch: None,
                             })
                             .await;
                         (agent_id, agent_name, queued)
@@ -2171,6 +2150,9 @@ impl ControlPlane {
     }
 
     pub async fn stop_session(&self, session_pk: &str) -> anyhow::Result<()> {
+        // Historical (legacy / deleted-owner) sessions are read-only: reject
+        // before any state transition, through the one centralized guard.
+        require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         // A session still in background startup has no live handle yet —
         // cancel its startup task; it checks the token between phases.
         if let Some(token) = self.starting.lock().unwrap().get(session_pk) {
@@ -2216,6 +2198,9 @@ impl ControlPlane {
     /// teardown), after which the worktree is cleaned up and the session
     /// marked `Ended`.
     pub async fn end_session(&self, session_pk: &str) -> anyhow::Result<()> {
+        // Historical (legacy / deleted-owner) sessions are read-only: reject
+        // before any teardown or store mutation, through the one central guard.
+        require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         // Abort any in-flight background startup and WAIT for it to unwind
         // before tearing down: the teardown below must read the FINAL
         // workspace columns (git prep backfills them at its checkpoint), or
@@ -2339,230 +2324,6 @@ impl ControlPlane {
             &format!("session {short} ended"),
         )
         .await;
-        Ok(())
-    }
-
-    /// Drive one review-fork replay from a durable learning-queue payload
-    /// captured `LearningPayload`, spin up a `kind='review'`,
-    /// `parent_session_pk`-linked session — a real, isolatable session, but
-    /// hidden from every picker (which filters on `kind`) — and replay the
-    /// parent's exact captured `system`/`tool_defs`/`messages` prefix
-    /// byte-for-byte when the resolved review model matches the payload's
-    /// captured model (prompt-cache parity), or a tail digest otherwise. The
-    /// fork advertises the parent's full `tool_defs` but is restricted to
-    /// `runner::REVIEW_TOOL_WHITELIST` at DISPATCH time
-    /// (`agent.tools.allows`, enforced inside `runner::drive`), carries
-    /// `WriteOrigin::BackgroundReview` into every `ToolCtx` it builds (so
-    /// Task 6's skill-write guard applies), and runs with a fresh
-    /// `NudgeState` under `DisplayMode::Silent` so it can never recursively
-    /// enqueue its own review. On completion, persists a `💾
-    /// Self-improvement review: …` notice into the PARENT transcript and
-    /// broadcasts it so a live Cockpit view picks it up immediately.
-    ///
-    /// Called by `learning::tick` once per claimed row; a successful return
-    /// marks the row delivered, an error releases the claim so a later tick
-    /// retries it.
-    pub async fn run_review_fork(&self, payload: &str) -> anyhow::Result<()> {
-        use crate::harness::native::agents::AgentRegistry;
-        use crate::harness::native::commands::CommandRegistry;
-        use crate::harness::native::context_manager::{ContextConfig, ContextManager};
-        use crate::harness::native::runner::{self, LearningPayload, NudgeState, RunnerDeps};
-        use crate::harness::native::steer::SteerBuffer;
-        use crate::harness::native::tools::ToolRegistry;
-
-        let payload: LearningPayload = serde_json::from_str(payload)?;
-        let store = self.store.clone();
-
-        // Resolve the review model: `auxiliary.review.model` if configured,
-        // else the parent's captured model. Only an EXACT match with the
-        // captured model can safely replay the captured prefix — a
-        // different model may tokenize/route/cache differently, so cache
-        // parity is impossible and a tail digest stands in instead.
-        let model = crate::harness::native::llm::aux_model(&store, "review", &payload.model).await;
-        let cache_parity = model == payload.model;
-
-        let mut meta = crate::llm_router::model_meta::resolve(&store, &model).await;
-        if cache_parity {
-            // Pin the EXACT flag the payload was captured with — `drive()`'s
-            // system-wrapping formula branches on this, and it must
-            // reproduce whatever the parent's turn actually did, regardless
-            // of any model-metadata drift since capture time.
-            meta.supports_prompt_cache = payload.supports_prompt_cache;
-        }
-
-        let parent = store.get_session(&payload.parent_session_pk).await?;
-        let project_id = parent.as_ref().and_then(|s| s.project_id.clone());
-        // Reuse the parent's own workspace so `skill`/`skill_manage` see the
-        // same project-local skill dirs the parent conversation saw. Project
-        // sessions have a real worktree; chat-first sessions have none — the
-        // same deterministic scratch dir the parent's own harness session
-        // already runs in stands in.
-        let work_dir = parent
-            .as_ref()
-            .and_then(|s| s.worktree_path.clone())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| crate::paths::chat_scratch_dir(&payload.parent_session_pk));
-
-        let review_pk = new_id();
-        let now = now_ms();
-        self.store
-            .insert_session(Session {
-                session_pk: review_pk.clone(),
-                primary_agent_id: None,
-                primary_agent_snapshot: None,
-                project_id: project_id.clone(),
-                agent_session_id: None,
-                worktree_path: None,
-                branch: None,
-                title: None,
-                status: SessionStatus::Running,
-                perm_mode: PermMode::BypassPermissions,
-                started_by: None,
-                created_at: Some(now),
-                last_active: Some(now),
-                resume_attempts: 0,
-                branch_owned: false,
-                kind: SessionKind::Review,
-                speaker: None,
-                agent: None,
-                parent_session_pk: Some(payload.parent_session_pk.clone()),
-            })
-            .await?;
-
-        let settings = SettingsStore::new(store.clone());
-        let extra_skill_dirs = self.registries.plugins.enabled_skill_dirs(&settings).await;
-        let effort_policy =
-            crate::llm_router::model_effort::build_utility_effort_policy(&store, &model).await?;
-        let llm = self.review_llm_factory().create(store.clone());
-
-        let persistence = self.agent_persistence();
-        let primary_agent = persistence
-            .registry
-            .resolved_snapshot(&persistence.registry.default_agent_id().await)
-            .await?;
-        let deps = RunnerDeps {
-            session_pk: review_pk.clone(),
-            primary_agent,
-            run_id: review_pk.clone(),
-            root_run_id: review_pk.clone(),
-            delegation: self.delegation.clone(),
-            isolated_target: false,
-            main_agent_id: persistence.registry.default_agent_id().await,
-            learning_queue: persistence.learning.clone(),
-            agent_knowledge: persistence.knowledge.clone(),
-            kind: SessionKind::Review,
-            work_dir,
-            attachments_dir: None,
-            extra_skill_dirs,
-            model: Some(model.clone()),
-            turn_effort_policy: Arc::new(effort_policy),
-            meta,
-            // BypassPermissions: the review fork is unattended — no human
-            // can ever answer an approval prompt — and the ONLY tools it can
-            // reach at dispatch are `memory`/`skill`/`skill_manage`, whose
-            // real safety boundary is Task 6's origin × provenance guard
-            // (via `write_origin` below), not the interactive gate.
-            perm_mode: Arc::new(std::sync::Mutex::new(PermMode::BypassPermissions)),
-            project_id: project_id.clone(),
-            perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
-            store: store.clone(),
-            events: self.events.clone(),
-            approvals: self.approvals.clone(),
-            automation_events: None,
-            llm,
-            tools: Arc::new(ToolRegistry::builtin()),
-            agent: runner::review_agent(payload.system.clone()),
-            agents: Arc::new(AgentRegistry::builtin()),
-            commands: Arc::new(CommandRegistry::builtin()),
-            allowed_skills: None,
-            memory: None,
-            snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            steer: SteerBuffer::new(),
-            background: self.background.clone(),
-            // The review fork is never a top-level interactive session — no
-            // app-control facade, mirroring the primary builder's default.
-            app_control: None,
-            // Isolated background session: no extension host/event sink, like
-            // sub-agent and test builders.
-            extension_events: None,
-            // A fresh, unshared `NudgeState`: the review fork's own tool
-            // iterations must never feed the PARENT's nudge counters (that
-            // would be a feedback loop), and it drives under
-            // `DisplayMode::Silent` so its own end_turn never fires a nudge
-            // regardless.
-            nudge: Arc::new(NudgeState::default()),
-            // Cache parity: advertise the parent's FULL captured tool set —
-            // dispatch (`agent.tools`, above) still enforces the whitelist.
-            review_tool_defs: Some(payload.tool_defs.clone()),
-            // Irrelevant: `current_tool_defs` short-circuits on
-            // `review_tool_defs` above before ever consulting this field.
-            activated_tools: None,
-            write_origin: WriteOrigin::BackgroundReview,
-            // The review fork's `Agent` sets `can_delegate: false` and its
-            // tool whitelist excludes `delegate_agent` entirely — it is an
-            // unattended background critique loop, never a delegation
-            // source — so there is no catalog to render.
-            delegation_catalog: Vec::new(),
-        };
-
-        let cfg = ContextConfig::with_meta(deps.meta.clone());
-        let mut cm = if cache_parity {
-            ContextManager::seed_projected(&review_pk, cfg, payload.messages.clone())
-        } else {
-            ContextManager::seed_digest(&review_pk, cfg, payload.messages.clone(), 24)
-        };
-        cm.append_user_text(&runner::review_prompt_text(&payload.review_kind))
-            .await?;
-
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = runner::drive_review(&deps, &deps.agent, &mut cm, &cancel).await;
-
-        // The review session is throwaway — never resumed, hidden from every
-        // picker by `kind` — so it never lingers as `running`, whether the
-        // drive succeeded or errored.
-        let _ = self
-            .store
-            .update_status(&review_pk, SessionStatus::Ended, Some(now_ms()))
-            .await;
-
-        let final_text = result?;
-        let outcome_line = {
-            let t = final_text.trim();
-            if t.is_empty() {
-                "reviewed, no changes needed".to_string()
-            } else {
-                t.lines()
-                    .next()
-                    .unwrap_or(t)
-                    .chars()
-                    .take(240)
-                    .collect::<String>()
-            }
-        };
-        let summary = format!("{}: {outcome_line}", runner::SELF_IMPROVEMENT_NOTICE_PREFIX);
-        let notice_payload = serde_json::json!({ "text": summary });
-        if let Ok(seq) = self
-            .store
-            .insert_message(NewMessage::block(
-                &payload.parent_session_pk,
-                "system",
-                "notice",
-                notice_payload.clone(),
-            ))
-            .await
-        {
-            self.emit(CoreEvent::Message {
-                session_pk: payload.parent_session_pk.clone(),
-                seq,
-                role: "system".into(),
-                block_type: "notice".into(),
-                payload: notice_payload,
-                tool_call_id: None,
-                status: None,
-                tool_kind: None,
-                speaker: None,
-            });
-        }
         Ok(())
     }
 }

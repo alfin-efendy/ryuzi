@@ -216,7 +216,7 @@ mod tests {
     async fn set_format_switches_wire_and_auth() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db.path()).await.unwrap();
-        let list = add_custom_provider(&store, "Gate").await.unwrap();
+        let list = add_custom_provider(&store, "Gate Format").await.unwrap();
         let id = list[0].id.clone();
         assert!(matches!(
             registry::descriptor(&id).unwrap().format,
@@ -250,7 +250,7 @@ mod tests {
     async fn remove_deletes_the_providers_connection_rows() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(db.path()).await.unwrap();
-        let list = add_custom_provider(&store, "Gate").await.unwrap();
+        let list = add_custom_provider(&store, "Gate Remove").await.unwrap();
         let id = list[0].id.clone();
         // Attach a connection to the custom provider.
         connections::add_connection(

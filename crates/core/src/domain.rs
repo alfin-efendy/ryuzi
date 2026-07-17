@@ -205,48 +205,6 @@ impl WriteOrigin {
     }
 }
 
-/// Per-skill telemetry (Phase 4 §4/§7): use/view/patch counters and
-/// lifecycle state, read by the `skill_manage` native tool (Task 6) and the
-/// curator (Task 10) to decide when a skill should transition between
-/// `active`, `stale`, and `archived`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillUsage {
-    pub name: String,
-    pub created_by: Option<String>,
-    pub use_count: i64,
-    pub view_count: i64,
-    pub patch_count: i64,
-    pub last_used_at: Option<i64>,
-    pub last_viewed_at: Option<i64>,
-    pub last_patched_at: Option<i64>,
-    pub state: String,
-    pub pinned: bool,
-    pub archived_at: Option<i64>,
-    pub created_at: Option<i64>,
-}
-
-/// One `curator_runs` row (Task 10/Task 1 migration #28): a single curator
-/// sweep's bookkeeping, read back by the Cockpit Learning panel's (Task 11)
-/// history view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct CuratorRun {
-    pub id: String,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
-    /// `running` | `ok` | `error`.
-    pub status: String,
-    /// How many skills the deterministic planner transitioned this run.
-    pub transitioned: i64,
-    /// Whether the opt-in LLM consolidation pass ran this run.
-    pub consolidated: bool,
-    /// Pre-mutation tar.gz snapshot path, set only when `consolidated`.
-    pub snapshot_path: Option<String>,
-    pub error: Option<String>,
-    pub log: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
@@ -382,6 +340,8 @@ pub struct AgentRun {
     pub session_pk: String,
     pub parent_run_id: Option<String>,
     pub retry_of: Option<String>,
+    pub source_tool_call_id: Option<String>,
+    pub dispatch_index: Option<i64>,
     pub primary_agent_id: String,
     pub executing_agent_id: Option<String>,
     pub executing_agent_name_snapshot: String,
@@ -397,6 +357,14 @@ pub struct AgentRun {
     pub error: Option<String>,
 }
 
+/// The session's primary run, if it has one, plus its sorted child runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunRosterInfo {
+    pub root_run_id: Option<String>,
+    pub runs: Vec<AgentRun>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct NewAgentRun {
@@ -404,6 +372,8 @@ pub struct NewAgentRun {
     pub session_pk: String,
     pub parent_run_id: Option<String>,
     pub retry_of: Option<String>,
+    pub source_tool_call_id: Option<String>,
+    pub dispatch_index: Option<i64>,
     pub primary_agent_id: String,
     pub executing_agent_id: Option<String>,
     pub executing_agent_name_snapshot: String,
@@ -664,6 +634,9 @@ pub struct AuditRow {
 pub struct Message {
     pub session_pk: String,
     pub seq: i64,
+    /// The durable agent-run owner when this row was emitted by a run. Rows
+    /// created outside a run (for example startup notices) remain unowned.
+    pub run_id: Option<String>,
     pub role: String,       // user | assistant | system
     pub block_type: String, // text | thought | tool_call | plan | status | error
     pub payload: serde_json::Value,
@@ -775,6 +748,10 @@ pub enum CoreEvent {
     Message {
         session_pk: String,
         seq: i64,
+        /// The primary run that owns this row, when applicable. This lets
+        /// consumers resolve a tool row against its own turn rather than a
+        /// session-wide root selected by position.
+        run_id: Option<String>,
         role: String,
         block_type: String,
         payload: serde_json::Value,
@@ -783,6 +760,19 @@ pub enum CoreEvent {
         tool_kind: Option<String>,
         /// Legacy group-chat attribution retained in message events for
         /// database and wire compatibility.
+        speaker: Option<String>,
+    },
+    /// A durable transcript row owned by a non-primary agent run.
+    AgentRunMessage {
+        session_pk: String,
+        run_id: String,
+        seq: i64,
+        role: String,
+        block_type: String,
+        payload: serde_json::Value,
+        tool_call_id: Option<String>,
+        status: Option<String>,
+        tool_kind: Option<String>,
         speaker: Option<String>,
     },
     SessionQueueChanged {

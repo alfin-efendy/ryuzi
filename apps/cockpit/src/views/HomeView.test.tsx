@@ -591,4 +591,5 @@ test("preserves project, branch, context, voice, and attachment controls while m
   expect(screen.getByRole("button", { name: "Voice" })).toBeTruthy();
   expect(screen.queryByRole("combobox", { name: "Permission mode" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Model and effort" })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Orchestrate/i })).toBeNull();
 });

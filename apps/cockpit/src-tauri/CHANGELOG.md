@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+
+### Features
+
+* **agents:** Agents hub and per-agent detail screens (model/permissions/skills-tools/advanced/Learning tabs), primary-agent selection on New session, `@mention` composer delegation, child-run transcripts with Active/Done right-panel navigation, and per-agent model assignment (concrete model + effort, or a named route)
+
+
+### Removed
+
+* global Learning sidebar/panel, Settings screen agent-default controls, composer model/effort/permission-mode pickers, and the Orchestrate toggle/task strip — superseded by per-agent Learning tabs and `@mention`/`delegate_agent`-based delegation
+
 ## [0.3.0](https://github.com/alfin-efendy/ryuzi/compare/cockpit-v0.2.0...cockpit-v0.3.0) (2026-07-08)
 
 

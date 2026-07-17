@@ -209,8 +209,8 @@ pub async fn update_subagent_model(
 
 // --- per-agent Learning commands (local-engine-only) --------------------------
 //
-// Learning data lives in the local engine's knowledge trees; like the global
-// Learning commands in `learning_cmd.rs`, these never take a `runner_id`.
+// Learning data lives in the local engine's knowledge trees, so these never
+// take a `runner_id`.
 
 #[tauri::command]
 #[specta::specta]

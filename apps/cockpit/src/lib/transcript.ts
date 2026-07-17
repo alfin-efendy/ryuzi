@@ -7,6 +7,8 @@ import { basename } from "./paths";
 export type Row = {
   /** DB seq; 0 for transient error events (they carry no wire seq). */
   seq: number;
+  /** Durable primary-run owner for this row; null for unowned/legacy rows. */
+  ownerRunId?: string | null;
   /** user | assistant | system */
   role: string;
   /** text | thought | tool_call | status | error (unknown values render as text) */
@@ -35,6 +37,13 @@ export type Row = {
   toolSummary: string | null;
   /** Sub-agent label when this tool ran inside a dispatched sub-agent (payload.subagent). */
   toolSubagent: string | null;
+  /** Batch dispatches rejected before child-run admission, keyed by item index. */
+  toolDispatchFailures?: DispatchAdmissionFailure[];
+};
+
+export type DispatchAdmissionFailure = {
+  dispatchIndex: number;
+  error: string;
 };
 
 export type RowAttachment = {
@@ -55,6 +64,7 @@ export type ActivityItem =
   | {
       type: "tool";
       key: string;
+      toolCallId: string | null;
       name: string;
       kind: string | null;
       status: string | null;
@@ -65,6 +75,8 @@ export type ActivityItem =
       exitCode: number | null;
       summary: string | null;
       subagent: string | null;
+      ownerRunId?: string | null;
+      dispatchFailures?: DispatchAdmissionFailure[];
     }
   | { type: "status"; key: string; text: string };
 
@@ -92,6 +104,16 @@ function isInProgress(item: ActivityItem): boolean {
   return item.type === "tool" && (item.status === "pending" || item.status === "in_progress");
 }
 
+/** Native delegation calls remain visible at all times so their child-run
+ * cards are never hidden inside a generic work fold. */
+export function isAgentDispatchTool(name: string): boolean {
+  return name === "task" || name === "delegate_agent";
+}
+
+function isAgentDispatch(item: ActivityItem): boolean {
+  return item.type === "tool" && isAgentDispatchTool(item.name);
+}
+
 /** Split a cluster into folded groups and standalone items.
  *
  *  `liveTail=true` (the cluster is the transcript tail while the agent runs):
@@ -110,7 +132,7 @@ export function partitionActivity(items: ActivityItem[], liveTail: boolean): Act
     fold = [];
   };
   items.forEach((item, index) => {
-    if ((liveTail && index >= tailStart) || isInProgress(item)) {
+    if ((liveTail && index >= tailStart) || isInProgress(item) || isAgentDispatch(item)) {
       flush();
       fragments.push({ kind: "item", item });
     } else {
@@ -172,6 +194,19 @@ function toolPathOf(p: Record<string, unknown>): string | null {
   return null;
 }
 
+function dispatchAdmissionFailures(p: Record<string, unknown>): DispatchAdmissionFailure[] {
+  if (!Array.isArray(p.dispatch_failures)) return [];
+  return p.dispatch_failures.flatMap((failure) => {
+    if (!failure || typeof failure !== "object") return [];
+    const value = failure as Record<string, unknown>;
+    const dispatchIndex = value.dispatch_index;
+    const error = value.error;
+    return Number.isInteger(dispatchIndex) && (dispatchIndex as number) >= 0 && typeof error === "string" && error.trim()
+      ? [{ dispatchIndex: dispatchIndex as number, error }]
+      : [];
+  });
+}
+
 // Projects a persisted/streamed message block onto the render Row shape.
 // Unknown block types fall through as text (forward compatibility).
 export function messageToRow(
@@ -186,13 +221,15 @@ export function messageToRow(
   // Only user rows ever carry attachments, so most call sites (tool_call/
   // status/assistant rows, and every existing test of those) have no reason
   // to pass this — optional with an inert default rather than a required
-  // 9th positional arg everywhere.
+  // 9th/10th positional args everywhere.
   sessionPk = "",
+  ownerRunId: string | null = null,
 ): Row {
   const p = (payload ?? {}) as Record<string, unknown>;
   const text = blockType === "status" ? String(p.summary ?? "") : blockType === "error" ? String(p.message ?? "") : String(p.text ?? "");
   return {
     seq,
+    ownerRunId,
     role,
     blockType,
     text,
@@ -209,6 +246,7 @@ export function messageToRow(
     toolExitCode: blockType === "tool_call" && typeof p.exit_code === "number" ? p.exit_code : null,
     toolSummary: blockType === "tool_call" && typeof p.summary === "string" && p.summary ? p.summary : null,
     toolSubagent: blockType === "tool_call" && typeof p.subagent === "string" && p.subagent ? p.subagent : null,
+    toolDispatchFailures: blockType === "tool_call" ? dispatchAdmissionFailures(p) : [],
   };
 }
 
@@ -226,6 +264,7 @@ export function mergeToolRow(prev: Row, payload: unknown, status: string | null,
     toolExitCode: typeof p.exit_code === "number" ? p.exit_code : prev.toolExitCode,
     toolSummary: typeof p.summary === "string" && p.summary ? p.summary : prev.toolSummary,
     toolSubagent: typeof p.subagent === "string" && p.subagent ? p.subagent : prev.toolSubagent,
+    toolDispatchFailures: p.dispatch_failures !== undefined ? dispatchAdmissionFailures(p) : (prev.toolDispatchFailures ?? []),
   };
 }
 
@@ -263,6 +302,7 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
           ? {
               type: "tool",
               key,
+              toolCallId: row.toolCallId,
               name: row.toolName ?? "Tool",
               kind: row.toolKind,
               status: row.toolStatus,
@@ -273,6 +313,8 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
               exitCode: row.toolExitCode,
               summary: row.toolSummary,
               subagent: row.toolSubagent,
+              ...(row.ownerRunId ? { ownerRunId: row.ownerRunId } : {}),
+              ...(row.toolDispatchFailures?.length ? { dispatchFailures: row.toolDispatchFailures } : {}),
             }
           : { type: "status", key, text: row.text };
       if (item.type === "status" && !item.text.trim()) return;
@@ -290,6 +332,30 @@ export function groupRows(rows: Row[], indexOffset = 0): Group[] {
   // Whitespace-only chunks stay inside runs (they are paragraph separators),
   // but a run that never got visible content is dropped entirely.
   return groups.filter((g) => (g.type !== "agent" && g.type !== "thought") || g.markdown.trim().length > 0);
+}
+
+/** Makes each native dispatch an activity boundary without changing the
+ * ordering of ordinary tool/status activity around it. */
+function splitDispatchActivity(groups: Group[]): Group[] {
+  return groups.flatMap((group) => {
+    if (group.type !== "activity") return [group];
+    const split: Group[] = [];
+    let ordinary: ActivityItem[] = [];
+    const flush = () => {
+      if (ordinary.length > 0) split.push({ type: "activity", key: ordinary[0]!.key, items: ordinary });
+      ordinary = [];
+    };
+    for (const item of group.items) {
+      if (isAgentDispatch(item)) {
+        flush();
+        split.push({ type: "activity", key: item.key, items: [item] });
+      } else {
+        ordinary.push(item);
+      }
+    }
+    flush();
+    return split;
+  });
 }
 
 /** Last-row minus user-row timestamps; null when either is missing. */
@@ -408,7 +474,7 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
   turns.forEach((turnRows, t) => {
     // Absolute row offset keeps transient (seq 0) fallback keys globally unique
     // even though each turn slice is grouped independently.
-    const groups = groupRows(turnRows, rowOffset);
+    const groups = splitDispatchActivity(groupRows(turnRows, rowOffset));
     rowOffset += turnRows.length;
     const live = running && t === turns.length - 1;
     if (live) {
@@ -417,24 +483,32 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
     }
     const agentGroups = groups.filter((g) => g.type === "agent");
     const lastAgent = agentGroups[agentGroups.length - 1];
-    const collapsible = groups.filter((g) => g.type === "activity" || g.type === "thought");
+    let collapsible: Group[] = [];
+    const flushCollapsible = () => {
+      if (collapsible.length === 0) return;
+      const first = collapsible[0]!;
+      out.push({
+        type: "summary",
+        key: `sum-${first.key}`,
+        groups: collapsible,
+        durationMs: turnDurationMs(turnRows),
+        editCards: editCardsForGroups(collapsible),
+      });
+      collapsible = [];
+    };
     for (const g of groups) {
-      if (g.type === "activity" || g.type === "thought") {
-        if (g === collapsible[0]) {
-          out.push({
-            type: "summary",
-            key: `sum-${g.key}`,
-            groups: collapsible,
-            durationMs: turnDurationMs(turnRows),
-            editCards: editCardsForGroups(collapsible),
-          });
-        }
-      } else if (g === lastAgent && g.type === "agent") {
+      if (g.type === "thought" || (g.type === "activity" && !g.items.some(isAgentDispatch))) {
+        collapsible.push(g);
+        continue;
+      }
+      flushCollapsible();
+      if (g === lastAgent && g.type === "agent") {
         out.push({ ...g, turnEnd: true });
       } else {
         out.push(g);
       }
     }
+    flushCollapsible();
   });
   return out;
 }

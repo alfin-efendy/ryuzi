@@ -22,7 +22,15 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { toWorkspaceRelativePath } from "@/lib/paths";
-import { formatToolDuration, partitionActivity, toolCardHeader, type ActivityFragment, type ActivityItem } from "@/lib/transcript";
+import {
+  formatToolDuration,
+  isAgentDispatchTool,
+  partitionActivity,
+  toolCardHeader,
+  type ActivityFragment,
+  type ActivityItem,
+} from "@/lib/transcript";
+import { AgentDispatchGroup } from "@/components/session/AgentDispatchGroup";
 import { TranscriptFileContext, useOpenWorkspaceFile } from "./TranscriptFileContext";
 
 const kindIcon: Record<string, LucideIcon> = {
@@ -105,7 +113,7 @@ function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "mute
   );
 }
 
-function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }>; live: boolean }) {
+export function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "tool" }>; live: boolean }) {
   // Live turns show their work as it happens; completed turns (rendered inside
   // TurnSummary) mount with live=false and start collapsed.
   const [open, setOpen] = useState(live);
@@ -229,7 +237,51 @@ function StatusChip({ text }: { text: string }) {
 
 /** A folded run of steps: one muted "See N steps" row, expanding to the
  *  individual chips (which mount collapsed, like a completed turn's). */
-function StepsFold({ items, runLength }: { items: ActivityItem[]; runLength: number }) {
+type ActivityContext = {
+  runnerId?: string;
+  sessionPk?: string;
+  ownerRunId?: string | null;
+};
+
+function ActivityItemRenderer({ item, live, runnerId, sessionPk, ownerRunId }: { item: ActivityItem; live: boolean } & ActivityContext) {
+  if (item.type !== "tool") return <StatusChip text={item.text} />;
+  const fallback = <ToolChip item={item} live={live} />;
+  if (isAgentDispatchTool(item.name) && runnerId && sessionPk) {
+    return (
+      <AgentDispatchGroup
+        runnerId={runnerId}
+        sessionPk={sessionPk}
+        ownerRunId={item.ownerRunId ?? ownerRunId ?? null}
+        item={item}
+        fallback={fallback}
+        renderAdmissionFailure={(failure) => (
+          <ToolChip
+            key={`failure-${failure.dispatchIndex}`}
+            item={{
+              ...item,
+              key: `${item.key}-dispatch-failure-${failure.dispatchIndex}`,
+              status: "failed",
+              output: failure.error,
+              summary: `Delegation ${failure.dispatchIndex + 1} admission failed`,
+              dispatchFailures: [],
+            }}
+            live={live}
+          />
+        )}
+      />
+    );
+  }
+  return fallback;
+}
+
+function StepsFold({
+  items,
+  runLength,
+  live,
+  runnerId,
+  sessionPk,
+  ownerRunId,
+}: { items: ActivityItem[]; runLength: number; live: boolean } & ActivityContext) {
   const [open, setOpen] = useState(false);
   const label = `See ${runLength} step${runLength === 1 ? "" : "s"}`;
   return (
@@ -245,9 +297,9 @@ function StepsFold({ items, runLength }: { items: ActivityItem[]; runLength: num
         {label}
       </Button>
       {open &&
-        items.map((item) =>
-          item.type === "tool" ? <ToolChip key={item.key} item={item} live={false} /> : <StatusChip key={item.key} text={item.text} />,
-        )}
+        items.map((item) => (
+          <ActivityItemRenderer key={item.key} item={item} live={live} runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId} />
+        ))}
     </div>
   );
 }
@@ -262,18 +314,21 @@ export function ActivityCluster({
   live = false,
   fold = false,
   liveTail = false,
+  runnerId,
+  sessionPk,
+  ownerRunId = null,
 }: {
   items: ActivityItem[];
   live?: boolean;
   fold?: boolean;
   liveTail?: boolean;
-}) {
+} & ActivityContext) {
   if (!fold) {
     return (
       <div className="flex flex-col gap-1.5">
-        {items.map((item) =>
-          item.type === "tool" ? <ToolChip key={item.key} item={item} live={live} /> : <StatusChip key={item.key} text={item.text} />,
-        )}
+        {items.map((item) => (
+          <ActivityItemRenderer key={item.key} item={item} live={live} runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId} />
+        ))}
       </div>
     );
   }
@@ -282,11 +337,24 @@ export function ActivityCluster({
     <div className="flex flex-col gap-1.5">
       {fragments.map((f) =>
         f.kind === "fold" ? (
-          <StepsFold key={f.items[0].key} items={f.items} runLength={f.runLength} />
-        ) : f.item.type === "tool" ? (
-          <ToolChip key={f.item.key} item={f.item} live={live} />
+          <StepsFold
+            key={f.items[0].key}
+            items={f.items}
+            runLength={f.runLength}
+            live={live}
+            runnerId={runnerId}
+            sessionPk={sessionPk}
+            ownerRunId={ownerRunId}
+          />
         ) : (
-          <StatusChip key={f.item.key} text={f.item.text} />
+          <ActivityItemRenderer
+            key={f.item.key}
+            item={f.item}
+            live={live}
+            runnerId={runnerId}
+            sessionPk={sessionPk}
+            ownerRunId={ownerRunId}
+          />
         ),
       )}
     </div>

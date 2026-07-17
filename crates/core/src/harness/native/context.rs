@@ -221,8 +221,7 @@ fn skill_guidance(
         format!(
             "Available skills. You MUST scan this list at the start of every \
              task and load a skill's full instructions with the `skill` tool \
-             BEFORE doing work it covers. Author new skills with \
-             `skill_manage` (keep descriptions ≤60 chars).\n{guidance}"
+             BEFORE doing work it covers.\n{guidance}"
         )
     })
 }

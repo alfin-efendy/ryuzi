@@ -13,7 +13,6 @@ pub mod endpoint_api;
 pub mod extension_status_api;
 pub mod fsview_api;
 pub mod gateways_api;
-pub mod learning_api;
 pub mod native_api;
 pub mod plugins_api;
 pub mod remote_catalog_api;
@@ -88,8 +87,30 @@ impl From<crate::mentions::MentionError> for ApiError {
     }
 }
 
+impl From<crate::sessions::ownership::SessionAccessError> for ApiError {
+    fn from(e: crate::sessions::ownership::SessionAccessError) -> Self {
+        use crate::sessions::ownership::SessionAccessError;
+        match e {
+            // Read-only historical session (legacy or deleted owner): a 409
+            // conflict carrying the exact user-facing message.
+            SessionAccessError::ReadOnly(message) => ApiError::conflict(message),
+            // Unknown / corrupt session ownership: surfaces as a 500 the same
+            // way the underlying resolve error did before this guard existed.
+            SessionAccessError::Resolve(message) => ApiError {
+                status: 500,
+                message,
+            },
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        // A read-only rejection can bubble up through a ControlPlane
+        // `anyhow::Result`; recover its exact 409 rather than a blanket 500.
+        if let Some(access) = e.downcast_ref::<crate::sessions::ownership::SessionAccessError>() {
+            return ApiError::from(access.clone());
+        }
         if let Some(mention) = e.downcast_ref::<crate::mentions::MentionError>() {
             return ApiError::from(mention.clone());
         }
@@ -134,7 +155,6 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if endpoint_api::HANDLES.contains(&m) => endpoint_api::dispatch(state, m, p).await,
         m if connections_api::HANDLES.contains(&m) => connections_api::dispatch(state, m, p).await,
         m if plugins_api::HANDLES.contains(&m) => plugins_api::dispatch(state, m, p).await,
-        m if learning_api::HANDLES.contains(&m) => learning_api::dispatch(state, m, p).await,
         m if audit::HANDLES.contains(&m) => audit::dispatch(state, m, p).await,
         m if remote_catalog_api::HANDLES.contains(&m) => {
             remote_catalog_api::dispatch(state, m, p).await
@@ -477,6 +497,24 @@ mod tests {
                 body["error"],
                 format!("unknown method: {method}"),
                 "{method}"
+            );
+        }
+    }
+
+    /// Task 4: the three learning commands removed with `api::learning_api`
+    /// (`search_sessions`, `list_skill_usage`, `set_skill_pinned`) must no
+    /// longer dispatch. With the `learning_api` arm gone they fall through to
+    /// the catch-all `not_found`, so each is a 404 rather than a handler hit.
+    #[tokio::test]
+    async fn removed_agent_commands_are_not_dispatched() {
+        let state = state().await;
+        for method in ["search_sessions", "list_skill_usage", "set_skill_pinned"] {
+            let err = super::dispatch(&state, method, json!({}))
+                .await
+                .expect_err("a removed method must not dispatch to a live handler");
+            assert_eq!(
+                err.status, 404,
+                "removed method still dispatched (expected 404): {method}"
             );
         }
     }

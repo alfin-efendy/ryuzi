@@ -151,16 +151,6 @@ pub struct ControlPlane {
     /// every startup, so a stale `true` surviving a restart would be
     /// meaningless).
     plugins_restart_required: std::sync::atomic::AtomicBool,
-    /// Builds the `LlmStream` the background review fork (Task 9) drives
-    /// through. Bypasses `registries.harness` (an opaque `Harness` trait
-    /// object with no way to recover its concrete `LlmStreamFactory`)
-    /// because the review fork is a native-runtime-only capability that
-    /// talks to `harness::native::runner::drive_review` directly, not
-    /// through the generic `Harness` trait. Real
-    /// (`RouterLlmStreamFactory`) in production; tests swap in a scripted
-    /// stream via `set_review_llm_factory_for_test` to capture and assert on
-    /// the exact request body the fork sends.
-    review_llm_factory: Mutex<Arc<dyn crate::harness::native::llm::LlmStreamFactory>>,
     /// Track D's extension host — constructed empty here (no real subprocess
     /// spawn; see [`Self::spawn_extensions`]'s hermeticity doc) and shared
     /// as a single `Arc` between the daemon entry (which calls
@@ -253,9 +243,6 @@ impl ControlPlane {
             active_turns: std::sync::atomic::AtomicUsize::new(0),
             background: crate::harness::native::background::BackgroundRegistry::new(),
             plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
-            review_llm_factory: Mutex::new(Arc::new(
-                crate::harness::native::llm::RouterLlmStreamFactory,
-            )),
             extension_host: Arc::new(ExtensionHost::new()),
             agent_persistence: persistence.handles(),
         })
@@ -302,6 +289,10 @@ impl ControlPlane {
         &self.extension_host
     }
 
+    /// The shared Plan 2 persistence graph. Only a daemon-wiring test reads it
+    /// back today (the review fork that used it in production was removed), so
+    /// it is test-only to avoid a dead-code warning in non-test builds.
+    #[cfg(test)]
     pub(crate) fn agent_persistence(&self) -> &crate::agents::bootstrap::AgentPersistenceHandles {
         &self.agent_persistence
     }
@@ -351,27 +342,6 @@ impl ControlPlane {
     /// The shared background-delegation registry (capacity + cancellation).
     pub fn background(&self) -> &Arc<crate::harness::native::background::BackgroundRegistry> {
         &self.background
-    }
-
-    /// The `LlmStreamFactory` `run_review_fork` (control/lifecycle.rs)
-    /// builds its `RunnerDeps.llm` from. See the field doc for why this
-    /// bypasses `registries.harness`.
-    pub(crate) fn review_llm_factory(
-        &self,
-    ) -> Arc<dyn crate::harness::native::llm::LlmStreamFactory> {
-        self.review_llm_factory.lock().unwrap().clone()
-    }
-
-    /// Test-only: override the `LlmStreamFactory` a review fork drives
-    /// through, so a test can inject a scripted/recording stream and assert
-    /// on the exact request the fork sends (Task 9).
-    #[doc(hidden)]
-    #[cfg(test)]
-    pub fn set_review_llm_factory_for_test(
-        &self,
-        factory: Arc<dyn crate::harness::native::llm::LlmStreamFactory>,
-    ) {
-        *self.review_llm_factory.lock().unwrap() = factory;
     }
 
     /// The plugin host — every installed plugin's manifest, capabilities, and
@@ -966,7 +936,7 @@ impl ControlPlane {
     }
 
     pub async fn list_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
-        self.store.list_messages(session_pk).await
+        self.store.list_primary_messages(session_pk).await
     }
 
     /// Retrieve the persisted tool policy for `(project_id, tool)`, if any.

@@ -457,6 +457,7 @@ mod tests {
             Message {
                 session_pk: "s".into(),
                 seq: 1,
+                run_id: None,
                 role: "user".into(),
                 block_type: "text".into(),
                 payload: serde_json::json!({ "text": "hi <script>" }),
@@ -469,6 +470,7 @@ mod tests {
             Message {
                 session_pk: "s".into(),
                 seq: 2,
+                run_id: None,
                 role: "assistant".into(),
                 block_type: "tool_call".into(),
                 payload: serde_json::json!({ "name": "bash", "output": "done" }),

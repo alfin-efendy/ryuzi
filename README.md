@@ -119,7 +119,7 @@ Settings live in a local SQLite database at `~/.local/share/ryuzi/ryuzi.sqlite`.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `workdir_root` | *(required)* | Parent directory where your project repos live. |
-| `default_model` | harness default | Default model for new projects. |
+| `default_model` | harness default | Seeds a newly created project's stored model preference. A session's actual model always comes from its primary agent's own configured model (see [Agents](#agents)) — this setting no longer overrides a running session. |
 | `default_effort` | `medium` | Default reasoning effort for new projects. |
 | `default_perm_mode` | `default` | Default approval mode: `default`, `acceptEdits`, or `bypassPermissions`. `bypassPermissions` selected via Discord `/connect` is allowed only for admins (see `admin_role_ids`). |
 | `max_concurrent_runs` | `3` | Max simultaneous sessions. |
@@ -129,6 +129,46 @@ Settings live in a local SQLite database at `~/.local/share/ryuzi/ryuzi.sqlite`.
 | `discord.token` | *(required for Discord)* | Bot token (secret). |
 | `discord.app_id` | *(required for Discord)* | Application ID. |
 | `discord.guild_id` | *(required for Discord)* | Server (guild) ID. |
+
+## Agents
+
+Cockpit manages one or more persistent **main agents** — the identity a
+session runs as — under the cross-platform Ryuzi config directory
+(`~/.config/ryuzi` on Linux, `~/Library/Application Support/ryuzi` on macOS,
+`%APPDATA%\ryuzi` on Windows):
+
+```text
+agents/index.yaml            # agent order + the default (primary) agent id
+agents/subagents.yaml        # shared model/effort config for memoryless subagents
+agents/<agent-id>.yaml       # one profile per main agent: model, permissions, tools, skills
+agents/<agent-id>/knowledge/ # that agent's own OKF memory, skill, review, and journey concepts
+```
+
+The YAML profiles and per-agent OKF (On-disk Knowledge Format) Markdown are
+**portable and credential-free** — safe to back up, sync, or hand-edit.
+SQLite (`~/.local/share/ryuzi/ryuzi.sqlite`) stays authoritative for
+everything else: projects, provider accounts/routes, sessions, transcripts,
+runs, queues, and provenance.
+
+> **Agent data reset on first upgrade:** The first launch of this agent schema permanently removes the previous global agent settings, freeform memory files, Learning/curator state, and orchestration DAG data, then creates one main agent named **Ryuzi**. Projects, provider accounts/routes, and historical sessions/transcripts are preserved. Pre-upgrade sessions appear as read-only **Legacy agent** history and are not assigned to Ryuzi.
+
+Later launches never repeat this cleanup — it is stamped complete the moment
+it succeeds. There is no routine "start over" button for it; treat an
+explicit agent-data reset the same way — destructive by design, not a
+day-to-day operation.
+
+**Quick start:**
+
+1. Configure a model provider (Cockpit's Models screen, or `ryuzi setup`).
+2. Open **Agents** in Cockpit.
+3. Repair or select the built-in **Ryuzi** agent — a fresh install always
+   has one working main agent; an agent with invalid on-disk YAML shows up
+   flagged for repair instead of silently disappearing.
+4. Choose the primary agent on **New session** — the session executes as a
+   snapshot of that agent's model, permissions, tools, and skills.
+5. Use `@AgentName` in the composer (or let the agent call the
+   `delegate_agent` tool itself) for explicit delegation to another main
+   agent from inside a session.
 
 ## Runner command reference
 

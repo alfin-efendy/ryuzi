@@ -9,6 +9,7 @@ import { useNav } from "@/store-nav";
 import { useDiff } from "@/store-diff";
 import { useNative } from "@/store-native";
 import { useAgents } from "@/store-agents";
+import { delegationSessionKey, useDelegation } from "@/store-delegation";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { sessionIsReadOnly, sessionPrimaryLabel } from "@/lib/session-primary";
@@ -40,6 +41,10 @@ export function SessionView() {
   const draft = nav.drafts[draftKey] ?? "";
   const session = sessions.find((s) => isSession(s, focusedSession));
   const runnerId = session?.runnerId ?? LOCAL_RUNNER;
+  const mountedSessionPk = session?.sessionPk ?? null;
+  const delegationKey = mountedSessionPk ? delegationSessionKey(runnerId, mountedSessionPk) : null;
+  const rootRunId = useDelegation((state) => (delegationKey ? (state.rootRunBySession[delegationKey] ?? null) : null));
+  const loadDelegation = useDelegation((state) => state.load);
   // A local ConPTY/bash and locally-installed apps can't operate on a remote
   // host's workdir — the bottom terminal drawer and Open-in menu are gated
   // off entirely for sessions running on a non-local runner.
@@ -88,6 +93,13 @@ export function SessionView() {
   const projectName = project ? projectLabel(project) : (session?.projectId ?? "");
   const loadCommands = useNative((s) => s.loadCommands);
   const nativeCommands = useNative((s) => (project ? (s.commandsByProject[project.projectId] ?? []) : []));
+
+  // Hydrate child-run metadata as soon as this transcript is mounted. The
+  // store deduplicates requests, so opening the Agents panel never creates a
+  // second request for the same runner/session identity.
+  useEffect(() => {
+    if (mountedSessionPk) void loadDelegation(runnerId, mountedSessionPk);
+  }, [loadDelegation, runnerId, mountedSessionPk]);
 
   useEffect(() => {
     // Slash commands are project metadata on the local engine.
@@ -411,6 +423,7 @@ export function SessionView() {
                 agentName={sessionPrimaryLabel(session.primaryAgentSnapshot, registry?.agents)}
                 agentColor={session.primaryAgentSnapshot?.avatarColor ?? "#71717A"}
                 running={running}
+                ownerRunId={rootRunId}
               >
                 {pendingForSession.map((a, i) => (
                   <div key={`${a.runnerId}:${a.runId}:${a.requestId}`} className="px-4 pb-2">

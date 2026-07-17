@@ -1,10 +1,13 @@
 import { create } from "zustand";
 import { basename } from "./lib/paths";
 import type { ViewMode } from "./lib/preview";
-import { reorder } from "@/lib/sidebar";
+import { reorder, type Ordering } from "@/lib/sidebar";
 import { sessionKey, type UiSession } from "@/lib/session-key";
 
 export type DockTab = { id: string; kind: "file"; path: string; title: string; mode?: ViewMode };
+
+/** Shared bucket key for the top "Tasks" section's manual order. */
+export const TASKS_BUCKET = "__tasks__";
 
 function titleOf(path: string): string {
   return basename(path) || path;
@@ -41,7 +44,12 @@ const KEY = {
   hideInvalidModels: "cockpit.ui.hideInvalidModels",
   notificationsEnabled: "cockpit.ui.notificationsEnabled",
   readAt: "cockpit.ui.readAt",
-  sessionFilter: "cockpit.ui.sessionFilter",
+  organizeBy: "cockpit.ui.organizeBy",
+  taskOrdering: "cockpit.ui.taskOrdering",
+  projectOrdering: "cockpit.ui.projectOrdering",
+  taskOrder: "cockpit.ui.taskOrder",
+  projectOrder: "cockpit.ui.projectOrder",
+  collapsed: "cockpit.ui.collapsed",
 };
 
 function readBool(key: string, fallback: boolean): boolean {
@@ -85,16 +93,35 @@ function readNumMap(key: string): Record<string, number> {
     return {};
   }
 }
-function readSessionFilter(key: string): { statuses: Record<string, true>; unreadOnly: boolean } {
-  if (typeof localStorage === "undefined") return { statuses: {}, unreadOnly: false };
+function readOrdering(key: string): Ordering {
+  if (typeof localStorage === "undefined") return "updated";
+  const v = localStorage.getItem(key);
+  return v === "name" || v === "manual" ? v : "updated";
+}
+function readBoolMap(key: string): Record<string, boolean> {
+  if (typeof localStorage === "undefined") return {};
   try {
     const raw = localStorage.getItem(key);
-    if (!raw) return { statuses: {}, unreadOnly: false };
-    const v = JSON.parse(raw) as { statuses?: Record<string, true>; unreadOnly?: boolean };
-    return { statuses: v.statuses ?? {}, unreadOnly: v.unreadOnly ?? false };
+    return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
   } catch {
-    return { statuses: {}, unreadOnly: false };
+    return {};
   }
+}
+function readOrderMap(key: string): Record<string, string[]> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as Record<string, string[]>) : {};
+  } catch {
+    return {};
+  }
+}
+/** Reconcile a stored manual order to the current visible set: keep stored
+ *  ids still present (in stored order), then append newly-seen ids. */
+function reconcileOrder(stored: string[], currentIds: string[]): string[] {
+  const present = stored.filter((id) => currentIds.includes(id));
+  const added = currentIds.filter((id) => !present.includes(id));
+  return [...present, ...added];
 }
 export function toggleKey(map: Record<string, true>, key: string): Record<string, true> {
   const next = { ...map };
@@ -121,8 +148,15 @@ type UiState = {
   /** Per-session last-read epoch-ms cursor (unread = lastActive > cursor),
    *  keyed by `sessKey(runnerId, pk)`. */
   readAt: Record<string, number>;
-  /** Sidebar session filters: status checkboxes (empty = all) + unread-only toggle. */
-  sessionFilter: { statuses: Record<string, true>; unreadOnly: boolean };
+  /** Sidebar grouping: by project, or a flat task list. */
+  organizeBy: "project" | "task";
+  taskOrdering: Ordering;
+  projectOrdering: Ordering;
+  /** Manual task order, keyed by bucket (project id, chat, or `TASKS_BUCKET`). */
+  taskOrder: Record<string, string[]>;
+  projectOrder: string[];
+  /** Sidebar section/group collapse state, keyed by composite section keys. */
+  collapsed: Record<string, boolean>;
   /** Hide models with a persisted "invalid" verdict app-wide: the Provider
    *  Models card rows AND every model picker (composers, route targets,
    *  runtime config). A picker's current selection always stays visible,
@@ -148,10 +182,13 @@ type UiState = {
   toggleHideInvalidModels: () => void;
   toggleNotifications: () => void;
   markRead: (key: string, ts: number) => void;
-  markAllRead: (sessions: UiSession[]) => void;
   seedReadState: (sessions: UiSession[]) => void;
-  toggleStatusFilter: (status: string) => void;
-  toggleUnreadOnly: () => void;
+  setOrganizeBy: (v: "project" | "task") => void;
+  setTaskOrdering: (o: Ordering) => void;
+  setProjectOrdering: (o: Ordering) => void;
+  reorderTasks: (bucket: string, fromId: string, toId: string, currentIds: string[]) => void;
+  reorderProjects: (fromId: string, toId: string, currentIds: string[]) => void;
+  toggleCollapsed: (key: string) => void;
 };
 
 export const useUi = create<UiState>((set, get) => ({
@@ -163,7 +200,12 @@ export const useUi = create<UiState>((set, get) => ({
   pinnedOrder: readList(KEY.pinnedOrder),
   archived: readSet(KEY.archived),
   readAt: readNumMap(KEY.readAt),
-  sessionFilter: readSessionFilter(KEY.sessionFilter),
+  organizeBy: typeof localStorage !== "undefined" && localStorage.getItem(KEY.organizeBy) === "task" ? "task" : "project",
+  taskOrdering: readOrdering(KEY.taskOrdering),
+  projectOrdering: readOrdering(KEY.projectOrdering),
+  taskOrder: readOrderMap(KEY.taskOrder),
+  projectOrder: readList(KEY.projectOrder),
+  collapsed: readBoolMap(KEY.collapsed),
   hideInvalidModels: readBool(KEY.hideInvalidModels, false),
   notificationsEnabled: readBool(KEY.notificationsEnabled, true),
   toggleLeft: () =>
@@ -258,12 +300,6 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.readAt, JSON.stringify(readAt));
     set({ readAt });
   },
-  markAllRead: (sessions) => {
-    const readAt = { ...get().readAt };
-    for (const s of sessions) readAt[sessionKey(s)] = s.lastActive ?? 0;
-    persist(KEY.readAt, JSON.stringify(readAt));
-    set({ readAt });
-  },
   seedReadState: (sessions) => {
     const cur = get().readAt;
     let changed = false;
@@ -279,16 +315,32 @@ export const useUi = create<UiState>((set, get) => ({
     persist(KEY.readAt, JSON.stringify(readAt));
     set({ readAt });
   },
-  toggleStatusFilter: (status) => {
-    const cur = get().sessionFilter;
-    const next = { ...cur, statuses: toggleKey(cur.statuses, status) };
-    persist(KEY.sessionFilter, JSON.stringify(next));
-    set({ sessionFilter: next });
+  setOrganizeBy: (v) => {
+    persist(KEY.organizeBy, v);
+    set({ organizeBy: v });
   },
-  toggleUnreadOnly: () => {
-    const cur = get().sessionFilter;
-    const next = { ...cur, unreadOnly: !cur.unreadOnly };
-    persist(KEY.sessionFilter, JSON.stringify(next));
-    set({ sessionFilter: next });
+  setTaskOrdering: (o) => {
+    persist(KEY.taskOrdering, o);
+    set({ taskOrdering: o });
+  },
+  setProjectOrdering: (o) => {
+    persist(KEY.projectOrdering, o);
+    set({ projectOrdering: o });
+  },
+  reorderTasks: (bucket, fromId, toId, currentIds) => {
+    const base = reconcileOrder(get().taskOrder[bucket] ?? [], currentIds);
+    const next = { ...get().taskOrder, [bucket]: reorder(base, fromId, toId) };
+    persist(KEY.taskOrder, JSON.stringify(next));
+    set({ taskOrder: next });
+  },
+  reorderProjects: (fromId, toId, currentIds) => {
+    const projectOrder = reorder(reconcileOrder(get().projectOrder, currentIds), fromId, toId);
+    persist(KEY.projectOrder, JSON.stringify(projectOrder));
+    set({ projectOrder });
+  },
+  toggleCollapsed: (key) => {
+    const collapsed = { ...get().collapsed, [key]: !get().collapsed[key] };
+    persist(KEY.collapsed, JSON.stringify(collapsed));
+    set({ collapsed });
   },
 }));

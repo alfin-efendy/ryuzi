@@ -1295,22 +1295,23 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
 
 ---
 
-## Self-learning loop
+## Per-agent memory & learning
 
-The native runtime (`crates/core/src/harness/native`) keeps a small,
-deterministic self-improvement loop running alongside every chat session:
-persistent memory with a threat scan, a periodic "nudge" that forks a
-background review turn to update memory/skills, cross-session recall via
-full-text search, and a weekly curator that ages skills out of active use.
-This section documents what is actually wired today — several pieces
-described in the original design spec are intentionally deferred; each is
-called out below rather than presented as working.
+Every main agent (see [Agent delegation](setup.md#agent-delegation) in the
+setup guide) keeps its own small, deterministic self-improvement loop:
+persistent memory with a threat scan, cross-session recall via full-text
+search, and a durable delivery queue that applies memory/skill/review/
+journey writes into that agent's own OKF bundle. There is no shared global
+memory store, no background "nudge"-driven review fork, and no autonomous
+weekly curator daemon anymore — Plan 6 retired that shared subsystem
+(`crates/core/src/curator.rs` and friends) in favor of per-agent state
+scoped under `agents/<agent-id>/knowledge/`.
 
 ### Memory: scopes, budget, threat scan
 
-`crates/core/src/harness/native/memory.rs` persists freeform text entries to
-plain files under the ryuzi config dir (never inside a session worktree, so
-memory writes can't dirty a feature branch):
+`crates/core/src/harness/native/memory.rs` persists freeform text entries as
+OKF concepts under the calling agent's own knowledge bundle (never inside a
+session worktree, so memory writes can't dirty a feature branch):
 
 - **`global`** — environment and conventions. Always available.
 - **`user`** — who the user is (preferences, style, expectations). Always
@@ -1318,58 +1319,20 @@ memory writes can't dirty a feature branch):
 - **`project`** — codebase-specific facts. Only available when a session has
   a project.
 
-Each scope file has a hard `6000`-character budget (`memory::BUDGET`); the
+Each scope has a hard `6000`-character budget (`memory::BUDGET`); the
 `memory` tool's guidance text (`MEMORY_GUIDANCE`, injected into the system
 prompt alongside the scope snapshot every turn) tells the model to
 consolidate rather than hoard once a scope nears that cap.
 
-Because memory files are hand-editable (and writable by the background
-review fork below), every entry is threat-scanned at the point it's injected
-into the system prompt — never at write time, so the file on disk and
-`MemoryStore::load` always reflect exactly what's there. A hit against the
+Because memory concepts are hand-editable, every entry is threat-scanned at
+the point it's injected into the system prompt — never at write time, so the
+concept on disk always reflects exactly what's there. A hit against the
 prompt-injection pattern list (`memory::THREAT_PATTERNS` — "ignore all
 previous", "system prompt", "you are now", `curl http://`, `<script`, etc.)
 replaces the entry with `[BLOCKED: <reason> — edit this entry to restore
-it]` in the injected snapshot only; a human can still open the raw file and
-fix or remove the line.
-
-### Nudge → background review fork
-
-`maybe_enqueue_review` (`crates/core/src/harness/native/runner.rs`) runs at
-the end of every user-visible turn. It tracks two independent counters — a
-user-turn count and a skill-creation-iteration count — against two
-settings-store thresholds (`memory.nudge_interval`,
-`skills.creation_nudge_interval`; see the settings table below). When either
-threshold is crossed, it captures the **exact** `system` prompt, `tool_defs`,
-and `messages_for_request()` prefix the current turn just used, packages it
-as a `LearningPayload`, and enqueues it as a `kind="learning"` row on the
-background-events rail targeting the same session. The firing counter(s)
-reset to zero; a counter that wasn't due keeps accumulating toward its own
-next nudge.
-
-`ControlPlane::run_review_fork` (`crates/core/src/control/lifecycle.rs`)
-picks up that payload, resolves a model via
-`auxiliary.review.model` (see below), and drives a `kind="review"` session
-that **replays the captured prefix byte-for-byte** before appending one of
-two hermes-agent-ported prompts:
-
-- `MEMORY_REVIEW_PROMPT` — "review the conversation above for durable facts
-  worth remembering," scoped to the same user/global/project distinctions as
-  the memory tool's guidance.
-- `SKILL_REVIEW_PROMPT` — reviews recent tool use for a repeatable procedure
-  worth capturing as a skill.
-
-Because the prefix is byte-identical to what the parent turn just sent, the
-review request rides the parent's warm prompt cache whenever it targets the
-same model — which is the default, since `auxiliary.review.model` is unset
-unless explicitly configured. The fork's tool access is restricted to
-`REVIEW_TOOL_WHITELIST = ["memory", "skill", "skill_manage"]`, enforced at
-**dispatch** time (the `run_tool_call` permission check), not merely omitted
-from the advertised tool schema — the fork still advertises the parent's
-full `tool_defs` for cache parity, but a call to anything else (e.g. `bash`)
-is refused with a tool_result error and never executed. When a review
-completes, the parent session sees a `💾 Self-improvement review` notice
-(`SELF_IMPROVEMENT_NOTICE_PREFIX`).
+it]` in the injected snapshot only; a human can still open the raw concept
+file (or use Cockpit's agent detail **Learning** tab, below) and fix or
+remove the line.
 
 ### `session_search`: cross-session recall
 
@@ -1384,91 +1347,49 @@ normal chat session can recall. Results are capped at
 `session_search::DISCOVERY_LIMIT` (12) hits, ranked by SQLite's FTS5
 `snippet()`/`bm25` ordering.
 
-### `skill_manage`: guarded skill writes
+### Durable Learning delivery queue
 
-`skill_manage` (`crates/core/src/harness/native/tools/skill_manage.rs`) is
-the write tool behind skill create/patch/edit/delete/write-file/remove-file.
-Like `memory`, it bypasses the per-session worktree jail — skills are
-user/agent-global, not per-project — and writes land only under the live
-skills root (`skills_install::skills_root()`, `~/.config/ryuzi/skills` by
-default).
+Memory writes, skill-usage observations, review notes, and journey
+milestones are appended to `agent_learning_queue`
+(`crates/core/src/agents/learning_queue.rs`) with a per-agent monotonic
+sequence, and drained strictly in that order — one event per agent per
+tick — by a daemon-hosted worker (`crates/core/src/learning.rs`, polling
+every 5s) that applies each event into the target agent's OKF bundle.
+Application is idempotent — every produced concept records the event id in
+frontmatter, and a replay that finds the id already recorded is a no-op —
+so the crash window between apply and acknowledge can never duplicate
+knowledge. A stuck head-of-line event blocks only its own agent (until its
+claim goes stale and is reclaimed); every other agent's queue keeps
+draining.
 
-Every mutating call passes through `guard_decision` — a pure
-origin × provenance × action matrix ported from hermes-agent — before any
-filesystem write reaches disk:
+### Cockpit agent detail: the Learning tab
 
-- **Origin** (`crate::domain::WriteOrigin`, stamped on `ToolCtx`): `User` (a
-  direct chat turn), `Agent` (an autonomous sub-agent turn), or
-  `BackgroundReview` (the review fork above). `WriteOrigin::is_autonomous()`
-  is true for `Agent`/`BackgroundReview`.
-- **Provenance**: whether the target skill was itself created by an
-  autonomous write (`AgentCreated`) or by a human.
-- Only a direct `WriteOrigin::User` call may hard-delete a skill outright.
-  Autonomous (agent/review) writes are scoped to skills that are themselves
-  agent-created, and a **pinned** skill (`skill_usage.pinned`) is exempt from
-  autonomous deletion regardless of provenance.
+The old global Learning sidebar/panel is gone. Its replacement lives on
+each agent's own detail screen (`AgentDetailView.tsx`'s **Learning** tab,
+`AgentLearningTab.tsx`), backed by the `get_agent_learning` RPC
+(`crates/core/src/api/agent_api.rs`) — everything shown is scoped to that
+one agent's own `agents/<agent-id>/knowledge/` bundle:
 
-Every use/view/patch is counted in the `skill_usage` table (migration #28:
-counters, timestamps, lifecycle `state`, `pinned`, `created_by`) — the same
-table the curator reads to decide when a skill has gone unused.
-
-### Curator: weekly skill-lifecycle sweep
-
-The curator (`crates/core/src/curator.rs`) is a **dedicated daemon loop**,
-not a row in the user-facing `jobs`/Scheduler table — every scheduler job
-requires a `project_id` and shows up in the Cockpit Scheduler UI, neither of
-which fits a headless housekeeping sweep with no project and nothing for a
-human to approve. The loop wakes once an hour to check whether a sweep is
-due (`curator_state.last_run_at`), and actually sweeps once the cadence
-constant has elapsed — **currently a hardcoded 7-day Rust constant
-(`curator::INTERVAL_DAYS`), not a settings-store value** (see
-`curator.interval_days` in the table below).
-
-A sweep runs a pure, unit-tested decision table (`plan_transitions`) over
-every `skill_usage` row:
-
-- `active` → `stale` after 30 days unused (`STALE_AFTER_DAYS`).
-- `active`/`stale` → `archived` after 90 days unused (`ARCHIVE_AFTER_DAYS`).
-- Any use reactivates `stale`/`archived` → `active` immediately, regardless
-  of grace.
-- A skill younger than 14 days (`GRACE_DAYS`) is never staled or archived.
-- **Pinned** skills and skills referenced by any scheduler job's prompt
-  (`cron_referenced_skills`) are exempt from aging entirely — archiving a
-  skill a cron job invokes by name would silently break that job.
-
-Every sweep — due or not — records a `curator_runs` row (start/finish time,
-status, how many skills transitioned) and stamps
-`curator_state.last_run_at`/`last_run_id`, which the Cockpit Learning
-panel's `curator_status` RPC reads back for its activity feed.
-
-**Deferred: LLM consolidation and rollback.** The spec's opt-in
-consolidation pass — an LLM step that would rewrite/merge memory or skill
-content, snapshotting a pre-mutation `tar.gz` first — is not implemented.
-`curator::tick` unconditionally finishes every run with `consolidated=false`
-and `snapshot_path=None`; nothing in the codebase ever sets either to a
-non-default value. Because of that, the `curator_rollback` RPC always
-returns a real error ("curator rollback isn't available yet…") instead of
-silently no-op'ing — there is never a snapshot to restore yet. See
-`curator.consolidate` in the table below.
-
-### Settings
-
-| Setting key | Default | Status | Notes |
-| --- | --- | --- | --- |
-| `memory.nudge_interval` | `10` (user turns) | **Live** | Read via `usize_setting` in `maybe_enqueue_review` (`runner.rs`). Crossing this many user turns without a memory-review nudge enqueues a `kind="learning"` background-rail row. |
-| `skills.creation_nudge_interval` | `10` (skill-creation iterations) | **Live** | Same mechanism, gated on the skill-iteration counter instead of the turn counter. |
-| `auxiliary.review.model` | unset → falls back to the parent session's model | **Live** | Resolved by `aux_model(store, "review", parent_model)` (`control/lifecycle.rs`) when starting a review fork. Leave unset to keep the fork on the parent's model and ride its warm prompt cache; set it to route review turns to a different (e.g. cheaper) model at the cost of losing cache parity. |
-| `auxiliary.curator.model` | n/a | **Not wired** | No code path reads `auxiliary.curator.model` today — the curator's lifecycle sweep (`plan_transitions`) is a pure deterministic function with no LLM call at all. This key only becomes meaningful once the deferred LLM consolidation pass (see `curator.consolidate`) ships. |
-| `curator.interval_days` | n/a (hardcoded `7`) | **Not a live setting** | The sweep cadence is `curator::INTERVAL_DAYS`, a Rust constant — no settings key of this name is read anywhere in the codebase. A per-install configurable cadence is planned but not shipped; today the cadence can only be changed by editing the constant and rebuilding. |
-| `curator.consolidate` | `false` (hardcoded) | **Reserved / off** | `curator::tick` always finishes a run with `consolidated=false, snapshot_path=None`. The opt-in LLM consolidation pass and its pre-mutation snapshot don't exist yet, so this stays permanently off; `curator_rollback` always errors as a direct consequence. |
-| `memory.write_approval` | n/a | **Planned (Phase 6)** | No key of this name exists anywhere in the codebase. The `WriteOrigin` marker and the `skill_manage`/memory guard matrix (this phase) already track provenance and constrain autonomous writes, but a user-configurable approval/refusal policy layered on top is out of scope until Phase 6. |
-| `skills.write_approval` | n/a | **Planned (Phase 6)** | Same status as `memory.write_approval` — `skill_manage`'s guard matrix is a fixed origin×provenance×action decision table today; there is no settings-driven override or approval prompt yet. |
-
-Like the auxiliary model settings documented in
-[`docs/development/setup.md`](setup.md), the live keys above are plain
-key-value settings with no dedicated Cockpit form yet — set them with the
-`set_setting` RPC/Tauri command (e.g. `{ key: "memory.nudge_interval", value:
-"5" }`) or directly in the `settings` table.
+- **Memory** — every memory concept for this agent, with inline add/edit/
+  delete (`create_agent_concept`/`update_agent_concept`/
+  `delete_agent_concept`).
+- **Journey** — milestone concepts rendered as a timeline
+  (`JourneyGraph`).
+- **Skill usage** — per-skill use/success counters recorded from this
+  agent's own tool calls.
+- **Reviews** — retrospective/finding concepts (`ReviewFeed`).
+- **Curator** — a forward-looking placeholder panel that would list
+  consolidated-state snapshots (`ConceptArea::CuratorHistory`) and offer a
+  **Restore snapshot** action (`CuratorCard`) enqueuing a `Rollback`
+  learning event through the same durable queue above. There is no
+  autonomous background sweep anymore, and — importantly — no in-product
+  path creates the first snapshot today: the concept-CRUD RPCs only ever
+  write `Memory` concepts, and the restore path requires an already-present
+  `curator/history/<id>.md` to restore from. So this panel stays empty until
+  a snapshot producer ships; treat it as reserved UI, not a working feature.
+- **Repair knowledge** — any OKF concept file that failed to parse/validate
+  is listed with its error, editable in place (raw Markdown, validate, then
+  replace) or deletable, via `delete_invalid_agent_concept`.
 
 ## Remote catalog
 

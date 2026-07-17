@@ -67,6 +67,7 @@ jobs:
       - uses: ./.github/actions/setup-bun
       - run: bunx biome ci .
       - run: shellcheck install.sh
+      - run: bun run check:agentic-cleanup
 
   ts:
     needs: changes

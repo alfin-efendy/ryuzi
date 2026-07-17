@@ -140,7 +140,7 @@ const guideColor = "color-mix(in srgb, var(--sidebar-foreground) 20%, var(--side
 // past the row edges to bridge the 1px gaps between rows.
 export function TreeGuide({ tail, reach }: { tail: boolean; reach: number }) {
   return (
-    <span aria-hidden className="relative w-6 shrink-0 self-stretch">
+    <span aria-hidden data-testid="tree-guide" className="relative w-6 shrink-0 self-stretch">
       <span
         className="absolute left-3.5 box-border w-[9px] rounded-bl-[7px]"
         style={{
