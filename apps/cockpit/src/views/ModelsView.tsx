@@ -674,11 +674,7 @@ function RouteCard({
           </div>
           <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
             {route.targets.map((target, index) => (
-              <RouteTargetPill
-                key={`${route.id}-${index}-${targetKey(target)}`}
-                target={target}
-                catalog={catalog}
-              />
+              <RouteTargetPill key={`${route.id}-${index}-${targetKey(target)}`} target={target} catalog={catalog} />
             ))}
           </div>
         </div>

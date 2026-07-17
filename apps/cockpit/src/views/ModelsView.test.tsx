@@ -173,7 +173,13 @@ const routeTargetCapabilities: ModelRouteTargetCapability[] = [
     ],
     providerDefault: null,
   },
-  { provider: "openai", model: "o3", contextWindow: 200_000, supported: [{ value: "high", label: "High", description: null }], providerDefault: null },
+  {
+    provider: "openai",
+    model: "o3",
+    contextWindow: 200_000,
+    supported: [{ value: "high", label: "High", description: null }],
+    providerDefault: null,
+  },
 ];
 const historicalEffortCapabilities: ModelRouteTargetCapability[] = [
   { ...routeTargetCapabilities[0]!, supported: [{ value: "low", label: "Low", description: null }] },
