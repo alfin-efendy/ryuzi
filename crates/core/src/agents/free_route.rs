@@ -46,29 +46,37 @@ pub(crate) async fn rebuild_free_route(
         return Ok(0);
     }
     let count = passing.len();
-    // Replace the existing `free` route (delete + recreate) so its targets are
-    // exactly the passing set; delete is a no-op when it does not yet exist.
+    save_free_route(store, passing).await?;
+    Ok(count)
+}
+
+/// Upsert the `free` route to exactly `targets` in a SINGLE store write.
+///
+/// Reusing any existing `free` route's id (and `created_at`) makes
+/// [`routes::save_model_route`] update it in place — it upserts by id — rather
+/// than delete-then-insert. That removes the transient window a two-step
+/// delete+recreate had, where a crash between the two would leave `free`
+/// missing until the next boot. When no `free` route exists yet, the empty id
+/// inserts a fresh one.
+async fn save_free_route(store: &Store, targets: Vec<ModelRouteTarget>) -> anyhow::Result<()> {
     let existing = routes::list_model_routes(store).await?;
-    if let Some(free) = existing
+    let free = existing
         .iter()
-        .find(|r| r.name.eq_ignore_ascii_case("free"))
-    {
-        routes::delete_model_route(store, &free.id).await?;
-    }
+        .find(|r| r.name.eq_ignore_ascii_case("free"));
     routes::save_model_route(
         store,
         ModelRouteInfo {
-            id: String::new(),
+            id: free.map(|r| r.id.clone()).unwrap_or_default(),
             name: "free".into(),
             enabled: true,
             strategy: ModelRouteStrategy::Fallback,
-            targets: passing,
-            created_at: 0,
+            targets,
+            created_at: free.map(|r| r.created_at).unwrap_or(0),
             updated_at: 0,
         },
     )
     .await?;
-    Ok(count)
+    Ok(())
 }
 
 /// Spawn [`rebuild_free_route`] as a detached background task with a fresh
@@ -153,5 +161,79 @@ mod tests {
         assert_eq!(written, 0);
         let routes = routes::list_model_routes(&store).await.unwrap();
         assert!(routes.iter().any(|r| r.name == "free"));
+    }
+
+    #[tokio::test]
+    async fn save_free_route_updates_the_existing_route_in_place() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        // A pre-existing baseline `free` route (as the synchronous seed writes).
+        routes::save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: String::new(),
+                name: "free".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: "mimo-free".into(),
+                    model: "mimo-auto".into(),
+                    effort: None,
+                }],
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let baseline = routes::list_model_routes(&store).await.unwrap();
+        let baseline_id = baseline
+            .iter()
+            .find(|r| r.name == "free")
+            .unwrap()
+            .id
+            .clone();
+
+        let next = vec![ModelRouteTarget {
+            provider: "opencode-free".into(),
+            model: "grok-code".into(),
+            effort: None,
+        }];
+        save_free_route(&store, next.clone()).await.unwrap();
+
+        let after = routes::list_model_routes(&store).await.unwrap();
+        let frees: Vec<_> = after
+            .iter()
+            .filter(|r| r.name.eq_ignore_ascii_case("free"))
+            .collect();
+        // Exactly one `free` route, SAME id as before — proving an in-place
+        // update rather than delete-then-recreate (so there is no window where
+        // `free` is missing), with the new targets applied.
+        assert_eq!(frees.len(), 1, "still exactly one free route");
+        assert_eq!(frees[0].id, baseline_id, "id preserved: updated in place");
+        assert_eq!(frees[0].targets, next);
+    }
+
+    #[tokio::test]
+    async fn save_free_route_inserts_when_absent() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        assert!(routes::list_model_routes(&store).await.unwrap().is_empty());
+
+        save_free_route(
+            &store,
+            vec![ModelRouteTarget {
+                provider: "mimo-free".into(),
+                model: "mimo-auto".into(),
+                effort: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let routes = routes::list_model_routes(&store).await.unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "free");
+        assert!(!routes[0].id.is_empty(), "insert assigned a fresh id");
     }
 }
