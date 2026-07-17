@@ -5,7 +5,8 @@
 //! inserted, and a metadata-insert failure cleans up the orphaned payload it
 //! would otherwise leave behind.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::artifacts::storage::{ArtifactError, ArtifactStorage};
 use crate::artifacts::types::{ArtifactCreator, ArtifactRecord, ArtifactStatus};
@@ -76,6 +77,7 @@ pub struct ArtifactService {
     store: Arc<Store>,
     storage: ArtifactStorage,
     config: ArtifactConfig,
+    quota_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ArtifactService {
@@ -84,6 +86,7 @@ impl ArtifactService {
             store,
             storage,
             config,
+            quota_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -96,7 +99,22 @@ impl ArtifactService {
     /// writes the payload atomically under a fresh id-derived storage key,
     /// then inserts the metadata row. If the metadata insert fails, the
     /// just-written payload is deleted so no orphaned file survives a failed
-    /// create.
+    /// create; if that cleanup delete itself fails, the error reports the
+    /// cleanup failure (see [`ArtifactError::MetadataInsertCleanupFailed`])
+    /// rather than silently discarding it, without leaking the storage path.
+    ///
+    /// The per-session quota check-then-insert is serialized by an
+    /// in-process async lock keyed on `source_session_pk`
+    /// (`quota_locks`), one lock per session, created lazily. This makes
+    /// concurrent creates for the same session unable to both observe the
+    /// same "room left" snapshot and both proceed, without holding a SQLite
+    /// transaction open across the async payload write (writes only need to
+    /// be ordered relative to each other, not truly serialized against every
+    /// unrelated session, so a global DB-level transaction spanning the disk
+    /// I/O would cost concurrency for no additional safety). The lock is
+    /// held from the quota check through the metadata insert, so a second
+    /// call for the same session only sees the first call's fully committed
+    /// (or fully failed-and-rolled-back) effect on `sum_active_artifact_bytes`.
     pub async fn create_artifact(
         &self,
         input: CreateArtifact,
@@ -109,6 +127,15 @@ impl ArtifactService {
                 max_bytes: self.config.max_bytes,
             });
         }
+
+        let quota_lock = {
+            let mut locks = self.quota_locks.lock().expect("quota lock map poisoned");
+            locks
+                .entry(input.session_pk.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _quota_guard = quota_lock.lock().await;
 
         let existing = self
             .store
@@ -143,9 +170,14 @@ impl ArtifactService {
         };
 
         if let Err(e) = self.store.insert_artifact(&record).await {
-            let _ = self.storage.delete(&storage_key).await;
-            tracing::warn!("artifacts: metadata insert failed, payload cleaned up: {e}");
-            return Err(ArtifactError::StorageFailure);
+            let cleanup = self.storage.delete(&storage_key).await;
+            tracing::warn!("artifacts: metadata insert failed: {e}");
+            return Err(if cleanup.is_err() {
+                tracing::error!("artifacts: payload cleanup failed after metadata insert failure");
+                ArtifactError::MetadataInsertCleanupFailed
+            } else {
+                ArtifactError::StorageFailure
+            });
         }
 
         Ok(record)
@@ -280,6 +312,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_creates_cannot_exceed_session_aggregate_quota() {
+        let (_dir, svc) = service(ArtifactConfig {
+            max_bytes: 1_000,
+            session_max_bytes: 5,
+            read_max_bytes: 1_000,
+        })
+        .await;
+        let first = svc.create_artifact(base_input(b"hello"));
+        let second = svc.create_artifact(base_input(b"world"));
+        let (left, right) = tokio::join!(first, second);
+        assert_eq!(left.is_ok() as u8 + right.is_ok() as u8, 1);
+        let quota_errors = [left, right]
+            .into_iter()
+            .filter(|result| *result == Err(ArtifactError::SessionQuotaExceeded { max_bytes: 5 }))
+            .count();
+        assert_eq!(quota_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_failure_reports_cleanup_failure_without_path_leak() {
+        let (dir, svc) = service(default_config()).await;
+        svc.fail_next_insert_for_test();
+        svc.storage.fail_next_delete_for_test();
+
+        let err = svc.create_artifact(base_input(b"hello")).await.unwrap_err();
+        assert_eq!(err, ArtifactError::MetadataInsertCleanupFailed);
+        assert!(err.to_string().contains("cleanup"));
+        assert!(!err
+            .to_string()
+            .contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
     async fn create_artifact_enforces_the_session_aggregate_quota() {
         let (_dir, svc) = service(ArtifactConfig {
             max_bytes: 1_000,
@@ -374,6 +439,7 @@ mod tests {
             ArtifactError::FileTooLarge { max_bytes: 1 },
             ArtifactError::SessionQuotaExceeded { max_bytes: 1 },
             ArtifactError::NotFound,
+            ArtifactError::MetadataInsertCleanupFailed,
             ArtifactError::StorageFailure,
         ];
         for err in all {

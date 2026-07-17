@@ -9,6 +9,8 @@
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 /// Structured, path-free failure surface for artifact storage and service
@@ -31,6 +33,9 @@ pub enum ArtifactError {
     /// No artifact (or, at the storage layer, no payload file) exists for
     /// the requested id / storage key.
     NotFound,
+    /// The metadata insert failed and cleanup of the payload also failed.
+    /// The payload is an actionable orphan for a later cleanup pass.
+    MetadataInsertCleanupFailed,
     /// The underlying filesystem operation failed. No path or OS error text
     /// is carried, to avoid leaking local paths to callers.
     StorageFailure,
@@ -49,6 +54,10 @@ impl std::fmt::Display for ArtifactError {
                 "session artifact storage quota of {max_bytes} bytes would be exceeded"
             ),
             Self::NotFound => write!(f, "artifact not found"),
+            Self::MetadataInsertCleanupFailed => write!(
+                f,
+                "artifact metadata insert failed and payload cleanup failed; orphan requires cleanup"
+            ),
             Self::StorageFailure => write!(f, "artifact storage operation failed"),
         }
     }
@@ -84,11 +93,22 @@ fn is_safe_storage_key(key: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct ArtifactStorage {
     root: PathBuf,
+    #[cfg(test)]
+    fail_next_delete: std::sync::Arc<AtomicBool>,
 }
 
 impl ArtifactStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            fail_next_delete: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete_for_test(&self) {
+        self.fail_next_delete.store(true, Ordering::SeqCst);
     }
 
     pub fn root(&self) -> &Path {
@@ -209,6 +229,10 @@ impl ArtifactStorage {
     /// Removes the payload stored under `storage_key`. A missing file is
     /// not an error (delete is idempotent).
     pub async fn delete(&self, storage_key: &str) -> Result<(), ArtifactError> {
+        #[cfg(test)]
+        if self.fail_next_delete.swap(false, Ordering::SeqCst) {
+            return Err(ArtifactError::StorageFailure);
+        }
         let path = self.resolve(storage_key)?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
