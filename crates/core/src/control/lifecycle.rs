@@ -1651,6 +1651,7 @@ impl ControlPlane {
             agent_knowledge: self.agent_persistence.knowledge.clone(),
             learning_queue: self.agent_persistence.learning.clone(),
             store: self.store.clone(),
+            telemetry: self.telemetry.clone(),
             app_control,
         };
 

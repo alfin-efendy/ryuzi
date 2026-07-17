@@ -1,9 +1,17 @@
 //! `read` — read a text file within the session worktree.
 
-use super::{jail, truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
+use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
+use crate::harness::native::file_reference::{
+    normalize_resolved_path, path_unavailable, preflight_file_target,
+    recheck_preflight_file_target, resolve_pinned_read_reference, resolve_read_reference,
+    ExpectedFileKind, PinnedFileTarget,
+};
+use crate::harness::native::tool_contract::{
+    NormalizedInput, PreflightMeta, ToolError, ToolErrorStrategy, ToolFieldError, ToolInputCtx,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// 2 MiB read cap, matching Cockpit's `read_file` command.
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
@@ -50,59 +58,77 @@ fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Resolve a virtual `skills/<skill-name>/<relative-path>` read path to the
-/// companion file it names, alongside that skill's `SKILL.md`.
-///
-/// Returns `None` when `path` isn't shaped like a skill virtual path (i.e.
-/// its first component isn't exactly `skills`), in which case the caller
-/// falls back to the normal worktree/attachment resolution. Returns
-/// `Some(Err(_))` for anything that starts with `skills/` but is malformed,
-/// names an unknown skill, or escapes the skill's directory — callers must
-/// NOT silently fall back to a same-named worktree path in that case.
-fn skill_companion_path(ctx: &ToolCtx, path: &str) -> Option<anyhow::Result<PathBuf>> {
-    let mut components = Path::new(path).components();
-    match components.next() {
-        Some(Component::Normal(first)) if first.to_str() == Some("skills") => {}
-        _ => return None,
+fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
+    ToolInputCtx {
+        work_dir: &ctx.work_dir,
+        attachments_dir: ctx.attachments_dir.as_deref(),
+        extra_skill_dirs: &ctx.extra_skill_dirs,
     }
-    let malformed =
-        || anyhow::anyhow!("read: {path}: expected `skills/<skill-name>/<relative-path>`");
-    let skill_name = match components.next() {
-        Some(Component::Normal(name)) => match name.to_str() {
-            Some(s) => s,
-            None => {
-                return Some(Err(anyhow::anyhow!(
-                    "read: {path}: skill name is not valid UTF-8"
+}
+
+fn read_io_error(ctx: &ToolCtx, path: &str, error: &std::io::Error) -> ToolOutput {
+    if ctx.preflight_file_target.is_some() {
+        ToolOutput::from_error(path_unavailable(error))
+    } else {
+        ToolOutput::error(format!("read: {path}: {error}"))
+    }
+}
+
+fn normalize_read_input(
+    ctx: &ToolInputCtx<'_>,
+    input: Value,
+) -> Result<NormalizedInput, ToolError> {
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::caller("invalid_path_reference", "File path is required"))?;
+    let target = resolve_read_reference(ctx, path)?;
+    let line = target.reference.line;
+    let mut normalized = normalize_resolved_path(input, &target)?;
+    if let Some(line) = line {
+        let object = normalized.value.as_object_mut().expect("validated object");
+        match object.get("offset") {
+            Some(offset) if offset.as_u64() == Some(u64::from(line)) => {}
+            Some(_) => {
+                return Err(ToolError::caller(
+                    "conflicting_file_location",
+                    "Path line and explicit offset conflict",
+                )
+                .with_strategy(ToolErrorStrategy::ReviseInput)
+                .with_field_error(ToolFieldError::new(
+                    "path",
+                    "conflicting_file_location",
+                    "Invalid field value",
                 )))
             }
-        },
-        _ => return Some(Err(malformed())),
-    };
-    let rest: PathBuf = components.as_path().to_path_buf();
-    if rest.as_os_str().is_empty() {
-        return Some(Err(malformed()));
+            None => {
+                object.insert("offset".to_string(), Value::from(line));
+                normalized.normalized = true;
+            }
+        }
     }
-    let relative = match rest.to_str() {
-        Some(s) => s,
-        None => {
-            return Some(Err(anyhow::anyhow!(
-                "read: {path}: relative path is not valid UTF-8"
-            )))
-        }
-    };
-    let registry = crate::harness::native::skills::SkillRegistry::load_with(
-        &ctx.work_dir,
-        &ctx.extra_skill_dirs,
-    );
-    let skill = match registry.get(skill_name) {
-        Some(s) => s,
-        None => {
-            return Some(Err(anyhow::anyhow!(
-                "read: {path}: unknown skill `{skill_name}`"
-            )))
-        }
-    };
-    Some(jail(&skill.dir, relative))
+    Ok(normalized)
+}
+
+async fn prepare_read_execution(
+    ctx: &ToolCtx,
+    input: Value,
+) -> Result<(Value, PathBuf), ToolError> {
+    let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.preflight_file_target.as_ref() {
+        let resolved = recheck_preflight_file_target(&input_ctx, target).await?;
+        return Ok((input, resolved.resolved_path));
+    }
+    if let Some(target) = ctx.pinned_file_reference.as_ref() {
+        return resolve_pinned_read_reference(&input_ctx, target).map(|resolved| (input, resolved));
+    }
+
+    let normalized = normalize_read_input(&input_ctx, input)?;
+    let target = normalized
+        .pinned_file_reference()
+        .expect("read normalization pins its selected target");
+    let resolved = resolve_pinned_read_reference(&input_ctx, target)?;
+    Ok((normalized.value, resolved))
 }
 
 pub struct Read;
@@ -133,41 +159,40 @@ impl Tool for Read {
     fn kind(&self) -> &'static str {
         "read"
     }
+    fn normalize_input(
+        &self,
+        ctx: &ToolInputCtx<'_>,
+        input: Value,
+    ) -> Result<NormalizedInput, ToolError> {
+        normalize_read_input(ctx, input)
+    }
+    async fn preflight(
+        &self,
+        ctx: &ToolInputCtx<'_>,
+        _input: &Value,
+        pinned_file_reference: Option<&PinnedFileTarget>,
+    ) -> Result<PreflightMeta, ToolError> {
+        let target = pinned_file_reference.ok_or_else(|| {
+            ToolError::precondition("invalid_path_reference", "File target is not pinned")
+        })?;
+        PreflightMeta::default().with_prepared_file_target(
+            preflight_file_target(ctx, target, ExpectedFileKind::File).await?,
+        )
+    }
     fn permission(&self, input: &Value) -> PermissionSpec {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         PermissionSpec::new("read", format!("read {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
+        let (input, resolved_path) = match prepare_read_execution(ctx, input).await {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(ToolOutput::from_error(error)),
+        };
         let path = input
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("read: `path` is required"))?;
-        // Skill virtual paths (`skills/<name>/<rel>`) resolve to a companion
-        // file beside that skill's SKILL.md; malformed/unknown ones error
-        // outright rather than falling back to a same-named worktree path.
-        if let Some(result) = skill_companion_path(ctx, path) {
-            return match result {
-                Ok(resolved) => finish_read(ctx, path, &resolved, &input).await,
-                Err(e) => Ok(ToolOutput::error(e.to_string())),
-            };
-        }
-        // Primary root: the worktree. Fallback root: the session's attachment
-        // folder — the manifest hands the model ABSOLUTE paths there, which
-        // the worktree jail (correctly) rejects.
-        let resolved = match jail(&ctx.work_dir, path) {
-            Ok(p) => p,
-            Err(primary_err) => {
-                match ctx
-                    .attachments_dir
-                    .as_deref()
-                    .and_then(|root| jail(root, path).ok())
-                {
-                    Some(p) => p,
-                    None => return Ok(ToolOutput::error(primary_err.to_string())),
-                }
-            }
-        };
-        finish_read(ctx, path, &resolved, &input).await
+        finish_read(ctx, path, &resolved_path, &input).await
     }
 }
 
@@ -181,7 +206,7 @@ async fn finish_read(
 ) -> anyhow::Result<ToolOutput> {
     let meta = match tokio::fs::metadata(resolved).await {
         Ok(m) => m,
-        Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+        Err(error) => return Ok(read_io_error(ctx, path, &error)),
     };
     if let Some(media_type) = image_media_type_for_ext(path) {
         if meta.len() > IMAGE_READ_MAX_BYTES {
@@ -199,7 +224,7 @@ async fn finish_read(
         use base64::Engine as _;
         let bytes = match tokio::fs::read(resolved).await {
             Ok(b) => b,
-            Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+            Err(error) => return Ok(read_io_error(ctx, path, &error)),
         };
         match sniff_image_media_type(&bytes) {
             Some(sniffed) if sniffed == media_type => {}
@@ -222,6 +247,7 @@ async fn finish_read(
             })]),
             display: None,
             is_error: false,
+            structured_error: None,
         });
     }
     if meta.len() > MAX_READ_BYTES {
@@ -232,7 +258,7 @@ async fn finish_read(
     }
     let content = match tokio::fs::read_to_string(resolved).await {
         Ok(c) => c,
-        Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+        Err(error) => return Ok(read_io_error(ctx, path, &error)),
     };
     let offset = input
         .get("offset")
@@ -255,6 +281,135 @@ async fn finish_read(
 mod tests {
     use super::super::testutil::ctx_at;
     use super::*;
+    use crate::harness::native::tool_contract::ToolInputCtx;
+
+    fn input_ctx(ctx: &ToolCtx) -> ToolInputCtx<'_> {
+        ToolInputCtx {
+            work_dir: &ctx.work_dir,
+            attachments_dir: ctx.attachments_dir.as_deref(),
+            extra_skill_dirs: &ctx.extra_skill_dirs,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_line_fills_missing_offset_and_preserves_bounded_metadata() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("notes.txt"), "one\ntwo\n").unwrap();
+        let ctx = ctx_at(work.path()).await;
+
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "notes.txt:2"}))
+            .unwrap();
+
+        assert_eq!(normalized.value["path"], "notes.txt");
+        assert_eq!(normalized.value["offset"], 2);
+        assert!(normalized.normalized);
+        let metadata = serde_json::to_value(normalized.metadata()).unwrap();
+        assert_eq!(metadata[0]["kind"], "file_reference");
+        assert_eq!(metadata[0]["value"]["input_path"], "notes.txt:2");
+        assert_eq!(metadata[0]["value"]["resolved_path"], "notes.txt");
+        assert_eq!(metadata[0]["value"]["line"], 2);
+        assert_eq!(metadata[0]["value"]["column"], Value::Null);
+        assert_eq!(metadata[0]["value"]["normalized"], true);
+    }
+
+    #[tokio::test]
+    async fn source_line_accepts_equal_offset_and_rejects_conflict() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("notes.txt"), "one\ntwo\n").unwrap();
+        let ctx = ctx_at(work.path()).await;
+
+        let equal = Read
+            .normalize_input(
+                &input_ctx(&ctx),
+                json!({"path": "notes.txt:2", "offset": 2}),
+            )
+            .unwrap();
+        assert_eq!(equal.value["path"], "notes.txt");
+        assert_eq!(equal.value["offset"], 2);
+
+        let error = Read
+            .normalize_input(
+                &input_ctx(&ctx),
+                json!({"path": "notes.txt:2", "offset": 1}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "conflicting_file_location");
+    }
+
+    #[tokio::test]
+    async fn relative_attachment_path_uses_attachment_after_workspace_miss() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        std::fs::write(attach.path().join("notes.txt"), "attachment\n").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "notes.txt:1"}))
+            .unwrap();
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("attachment"));
+    }
+
+    #[tokio::test]
+    async fn pinned_workspace_read_never_falls_back_to_same_named_attachment() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("notes.txt"), "workspace\n").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "notes.txt"}))
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+
+        std::fs::remove_file(work.path().join("notes.txt")).unwrap();
+        std::fs::write(attach.path().join("notes.txt"), "attachment-secret\n").unwrap();
+
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("file_reference_changed")
+        );
+        assert!(!out.for_model.contains("attachment-secret"));
+    }
+
+    #[tokio::test]
+    async fn absolute_paths_become_logical_in_canonical_input_and_metadata() {
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("notes.txt");
+        std::fs::write(&file, "notes\n").unwrap();
+        let ctx = ctx_at(work.path()).await;
+        for (input, logical_input, expected_offset) in [
+            (file.display().to_string(), "notes.txt", None),
+            (format!("{}:1", file.display()), "notes.txt:1", Some(1)),
+            (format!(":1:{}", file.display()), ":1:notes.txt", Some(1)),
+        ] {
+            let normalized = Read
+                .normalize_input(&input_ctx(&ctx), json!({"path": input}))
+                .unwrap();
+            assert_eq!(normalized.value["path"], "notes.txt");
+            assert_eq!(
+                normalized.value.get("offset").and_then(Value::as_u64),
+                expected_offset
+            );
+            let metadata_value = serde_json::to_value(normalized.metadata()).unwrap();
+            assert_eq!(metadata_value[0]["value"]["input_path"], logical_input);
+            assert_eq!(metadata_value[0]["value"]["resolved_path"], "notes.txt");
+            let metadata = metadata_value.to_string();
+
+            assert!(!metadata.contains(&work.path().to_string_lossy().to_string()));
+            assert!(!metadata.contains("os error"));
+            assert!(!metadata.contains("absolute_path"));
+        }
+    }
 
     #[tokio::test]
     async fn reads_numbered_lines_and_honors_offset_limit() {
@@ -280,6 +435,92 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn v2_preflight_rejects_directory_before_execution() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        let ctx = ctx_at(root.path()).await;
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "folder"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap();
+
+        let error = Read
+            .preflight(&input_ctx(&ctx), &normalized.value, Some(pin))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "expected_file");
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["actual_kind"], "directory");
+        assert_eq!(details["suggested_tool"], "ls");
+    }
+
+    #[tokio::test]
+    async fn prepared_read_target_detects_kind_race_without_attachment_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("same"), "workspace").unwrap();
+        std::fs::write(attachments.path().join("same"), "attachment-secret").unwrap();
+        let mut ctx = ctx_at(root.path()).await;
+        ctx.attachments_dir = Some(attachments.path().to_path_buf());
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "same"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap().clone();
+        let preflight = Read
+            .preflight(&input_ctx(&ctx), &normalized.value, Some(&pin))
+            .await
+            .unwrap();
+        ctx.pinned_file_reference = Some(pin);
+        ctx.preflight_file_target = preflight.prepared_file_target().cloned();
+
+        std::fs::remove_file(root.path().join("same")).unwrap();
+        std::fs::create_dir(root.path().join("same")).unwrap();
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("file_precondition_changed")
+        );
+        assert!(!out.for_model.contains("attachment-secret"));
+    }
+
+    #[tokio::test]
+    async fn v2_post_preflight_io_error_is_stable_and_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
+        let mut ctx = ctx_at(root.path()).await;
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "invalid.txt"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap().clone();
+        let preflight = Read
+            .preflight(&input_ctx(&ctx), &normalized.value, Some(&pin))
+            .await
+            .unwrap();
+        ctx.pinned_file_reference = Some(pin);
+        ctx.preflight_file_target = preflight.prepared_file_target().cloned();
+
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("path_unavailable")
+        );
+        assert!(!out.for_model.contains("UTF-8"));
+        assert!(!out.for_model.contains("os error"));
+        assert!(!out
+            .for_model
+            .contains(&root.path().to_string_lossy().to_string()));
     }
 
     #[tokio::test]
@@ -312,6 +553,26 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.for_model);
         assert!(out.for_model.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn pinned_absolute_attachment_under_skills_is_readable() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        let file = attach.path().join("skills/demo/notes.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "attachment under skills\n").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": file.to_string_lossy()}))
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("attachment under skills"));
     }
 
     #[tokio::test]

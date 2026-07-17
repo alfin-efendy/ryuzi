@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::llm_router::registry::{
-    self, ApiFormat, AuthScheme, ProviderCategory, ProviderDescriptor,
+    self, ApiFormat, AuthScheme, ProviderCategory, ProviderDescriptor, ProviderToolTransport,
 };
 use crate::llm_router::{connections, installed};
 use crate::store::Store;
@@ -85,6 +85,7 @@ pub fn register(cp: &CustomProvider) {
         initial: Box::leak(cp.initial.clone().into_boxed_str()),
         category: ProviderCategory::ApiKey,
         format,
+        tool_transport: ProviderToolTransport::for_format(format),
         base_url: None,
         auth,
         models: &[],
@@ -233,6 +234,43 @@ mod tests {
             registry::descriptor(&id).unwrap().auth,
             AuthScheme::XApiKey
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_custom_descriptors_derive_conservative_tools_from_wire_format() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let list = add_custom_provider(&store, "Transport Facts")
+            .await
+            .unwrap();
+        let id = list[0].id.clone();
+
+        let openai = registry::descriptor(&id)
+            .unwrap()
+            .tool_transport
+            .capabilities();
+        assert_eq!(
+            openai.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+        assert!(openai.supports_function_tools);
+        assert!(!openai.supports_strict_function_schema);
+        assert!(!openai.supports_custom_freeform_tools);
+
+        set_custom_provider_format(&store, &id, "anthropic")
+            .await
+            .unwrap();
+        let anthropic = registry::descriptor(&id)
+            .unwrap()
+            .tool_transport
+            .capabilities();
+        assert_eq!(
+            anthropic.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::AnthropicMessages
+        );
+        assert!(anthropic.supports_function_tools);
+        assert!(!anthropic.supports_strict_function_schema);
+        assert!(!anthropic.supports_custom_freeform_tools);
     }
 
     #[tokio::test]

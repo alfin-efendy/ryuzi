@@ -3,18 +3,30 @@
 //! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
+use super::arguments::{
+    ArgumentGateway, PreparedToolCall, RejectedToolCall, ValidatedToolCall, WireToolCall,
+    MAX_RAW_ARGUMENT_BYTES,
+};
+use super::capabilities::{
+    CapabilityInputs, CapabilityResolver, NativeToolsVersion, RuntimeToolSurfaces,
+    ToolCapabilityProfile, ToolInteractionMode,
+};
 use super::commands::{CommandRegistry, ResolvedCommand};
 use super::context_manager::{
-    compaction::CompactionOutcome, is_context_overflow, truncate_for_context, ContextConfig,
-    ContextManager,
+    compaction::CompactionOutcome, is_context_overflow, ContextConfig, ContextManager,
 };
 use super::iteration_budget::{IterationBudget, PARENT_MAX_ITERS, SUBAGENT_MAX_ITERS};
 use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
+use super::tool_contract::{
+    truncate_utf8_bytes, PreflightMeta, ToolError, ToolErrorCategory, ToolInputCtx, ToolMetadata,
+    ToolMetadataEntry, ToolResultEnvelope, ToolResultMeta,
+};
+use super::tool_plan::{self, CompiledSessionToolPlan, PlannedTool};
 use super::tools::{
     BackgroundDispatch, MainAgentSpawner, MainDelegationResult, OutputCaps, SubagentSpawner,
-    SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolRegistry,
+    SubtaskResult, SubtaskSpec, SubtaskStatus, ToolCtx, ToolOutput, ToolRegistry,
 };
 use super::{context, delegation, summary_budget, NATIVE_ID};
 use crate::approval::ApprovalHub;
@@ -29,7 +41,7 @@ use crate::llm_router::provenance::{
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -49,6 +61,22 @@ const TEXT_FLUSH_BYTES: usize = 120;
 /// but an external hook script is a different trust boundary than the LLM,
 /// so the observational payload still gets a hard size ceiling.
 const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
+const PERSISTED_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const TOOL_DISPLAY_SUMMARY_BYTES: usize = 240;
+
+#[async_trait]
+pub(crate) trait SnapshotTaker: Send + Sync {
+    async fn take(&self, work_dir: &std::path::Path) -> Option<String>;
+}
+
+pub(crate) struct GitSnapshotTaker;
+
+#[async_trait]
+impl SnapshotTaker for GitSnapshotTaker {
+    async fn take(&self, work_dir: &std::path::Path) -> Option<String> {
+        super::snapshot::take(work_dir).await
+    }
+}
 
 /// Everything one native session needs to run turns. Built by
 /// [`super::NativeHarness::start_session`]. Cloneable so a sub-agent spawner
@@ -103,6 +131,7 @@ pub struct RunnerDeps {
     /// Per-session "don't ask again" sets, applied by the permission gate.
     pub perm_overrides: Arc<std::sync::Mutex<super::permission::SessionPermOverrides>>,
     pub store: Arc<Store>,
+    pub telemetry: Arc<dyn crate::telemetry::Telemetry>,
     pub events: broadcast::Sender<CoreEvent>,
     pub approvals: Arc<ApprovalHub>,
     /// Observational UI automation sink. It is deliberately separate from
@@ -110,6 +139,14 @@ pub struct RunnerDeps {
     pub automation_events: Option<Arc<dyn crate::automation::AutomationEventSink>>,
     pub llm: Arc<dyn LlmStream>,
     pub tools: Arc<ToolRegistry>,
+    /// Session-stable native tool contract version. A run-local facade is
+    /// resolved inside `drive`; child runs inherit only this version, never a
+    /// parent's compiled plan.
+    pub native_tools_version: NativeToolsVersion,
+    /// Runtime surfaces intersected with typed transport facts for a new V2
+    /// candidate. These are product capabilities, not model-name inference.
+    pub native_tool_runtime_surfaces: RuntimeToolSurfaces,
+    pub native_tool_override_mode: Option<ToolInteractionMode>,
     /// The selected primary agent for this session.
     pub agent: Agent,
     /// Available agents (for sub-agent spawning).
@@ -125,6 +162,7 @@ pub struct RunnerDeps {
     pub memory: Option<Arc<super::memory::MemoryStore>>,
     /// Worktree snapshot stack for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
+    pub(crate) snapshot_taker: Arc<dyn SnapshotTaker>,
     /// Mid-turn steering buffer (Task B3). Cloned from `NativeSession::steer`
     /// at session start — the SAME buffer, not a fresh one — so a `steer()`
     /// call reaches whichever turn is currently draining it. Survives across
@@ -174,6 +212,248 @@ impl RunnerDeps {
 #[derive(Debug, Clone, Default)]
 struct TurnOptions {
     subtask: bool,
+}
+
+#[derive(Debug, Clone)]
+enum RunToolPlan {
+    V1,
+    CandidateV2(CompiledSessionToolPlan),
+    FrozenV2(CompiledSessionToolPlan),
+}
+
+enum V2BatchCall {
+    Validated(ValidatedToolCall),
+    Rejected(RejectedToolCall),
+}
+
+impl V2BatchCall {
+    fn id(&self) -> &str {
+        match self {
+            Self::Validated(call) => &call.wire.id,
+            Self::Rejected(call) => &call.wire.id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Validated(call) => &call.wire.name,
+            Self::Rejected(call) => &call.wire.name,
+        }
+    }
+
+    fn ledger_input(&self) -> Value {
+        match self {
+            Self::Validated(call) => call.input.clone(),
+            Self::Rejected(_) => json!({"_ryuzi_invalid_arguments": true}),
+        }
+    }
+}
+
+impl RunToolPlan {
+    fn visible_definitions(&self) -> Option<&[Value]> {
+        match self {
+            Self::V1 => None,
+            Self::CandidateV2(plan) | Self::FrozenV2(plan) => Some(&plan.visible_definitions),
+        }
+    }
+
+    fn version(&self) -> NativeToolsVersion {
+        match self {
+            Self::V1 => NativeToolsVersion::V1,
+            Self::CandidateV2(_) | Self::FrozenV2(_) => NativeToolsVersion::V2,
+        }
+    }
+}
+
+fn validate_v2_batch(
+    deps: &RunnerDeps,
+    plan: &CompiledSessionToolPlan,
+    tool_calls: Vec<ToolAccum>,
+) -> Vec<V2BatchCall> {
+    let input_context = ToolInputCtx {
+        work_dir: &deps.work_dir,
+        attachments_dir: deps.attachments_dir.as_deref(),
+        extra_skill_dirs: &deps.extra_skill_dirs,
+    };
+    tool_calls
+        .into_iter()
+        .map(|tool_call| {
+            let mut wire = tool_call.wire_call();
+            let Some(planned) = plan.canonical_tools.get(&wire.name) else {
+                wire.discard_arguments();
+                return V2BatchCall::Rejected(RejectedToolCall {
+                    wire,
+                    canonical_name: None,
+                    error: Box::new(ToolError::precondition(
+                        "tool_not_in_plan",
+                        "Tool is not part of this run's frozen facade",
+                    )),
+                });
+            };
+            let Some(registered) = deps.tools.registered(&wire.name) else {
+                wire.discard_arguments();
+                return V2BatchCall::Rejected(RejectedToolCall {
+                    wire,
+                    canonical_name: Some(planned.canonical_name.clone()),
+                    error: Box::new(ToolError::precondition(
+                        "capability_unavailable",
+                        "Tool is missing from the current registry",
+                    )),
+                });
+            };
+            let current_hash =
+                tool_plan::contract_hash_for_registered(&registered, planned, &plan.plan.body);
+            if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
+                wire.discard_arguments();
+                return V2BatchCall::Rejected(RejectedToolCall {
+                    wire,
+                    canonical_name: Some(planned.canonical_name.clone()),
+                    error: Box::new(ToolError::precondition(
+                        "capability_unavailable",
+                        "Tool no longer matches its frozen contract",
+                    )),
+                });
+            }
+            match ArgumentGateway::validate(wire, planned, registered.tool.clone(), &input_context)
+            {
+                Ok(validated) => V2BatchCall::Validated(validated),
+                Err(rejected) => V2BatchCall::Rejected(rejected),
+            }
+        })
+        .collect()
+}
+
+fn record_normalization_repairs(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    metadata: &ToolMetadata,
+) {
+    for entry in metadata.entries() {
+        let repair_kind = match entry {
+            ToolMetadataEntry::Coercion(token) => match token {
+                super::tool_contract::ToolMetadataToken::LosslessInteger => "lossless_integer",
+                super::tool_contract::ToolMetadataToken::LosslessBoolean => "lossless_boolean",
+                _ => "other",
+            },
+            ToolMetadataEntry::WorkspaceResolution(_)
+            | ToolMetadataEntry::AttachmentResolution(_)
+            | ToolMetadataEntry::SkillResolution(_) => "path_resolution",
+            _ => continue,
+        };
+        record_native_tool_argument_repair(telemetry, repair_kind);
+    }
+}
+
+fn record_v2_batch_metrics(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    calls: &[V2BatchCall],
+) {
+    for call in calls {
+        let V2BatchCall::Validated(validated) = call else {
+            continue;
+        };
+        if let Some(repair) = validated.repair {
+            record_native_tool_argument_repair(telemetry, repair.metric_label());
+        }
+        record_normalization_repairs(telemetry, &validated.normalization);
+    }
+}
+
+async fn append_assistant_and_record_v2_metrics(
+    cm: &mut ContextManager,
+    content: Value,
+    calls: Option<&[V2BatchCall]>,
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+) -> anyhow::Result<()> {
+    cm.append_assistant(content).await?;
+    if let Some(calls) = calls {
+        record_v2_batch_metrics(telemetry, calls);
+    }
+    Ok(())
+}
+
+fn is_valid_response_event(event: &MessageStreamEvent) -> bool {
+    match event {
+        MessageStreamEvent::MessageStart(message) => message
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty()),
+        MessageStreamEvent::TextDelta { text, .. }
+        | MessageStreamEvent::ThinkingDelta { text, .. } => !text.is_empty(),
+        MessageStreamEvent::ContentBlockStart { block, .. } => {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => block.get("text").is_some_and(Value::is_string),
+                Some("thinking") => block.get("thinking").is_some_and(Value::is_string),
+                Some("redacted_thinking") => block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty()),
+                Some("tool_use") => {
+                    block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.trim().is_empty())
+                        && block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.trim().is_empty())
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+async fn resolve_run_tool_plan(deps: &RunnerDeps, agent: &Agent) -> anyhow::Result<RunToolPlan> {
+    if let Some(plan) = tool_plan::load_plan(&deps.store, &deps.run_id).await? {
+        record_native_tool_plan_metric(
+            &deps.telemetry,
+            NativeToolsVersion::V2,
+            Some(&plan.plan.body.capability_profile),
+        );
+        return Ok(RunToolPlan::FrozenV2(plan));
+    }
+    if deps.native_tools_version == NativeToolsVersion::V1 {
+        record_native_tool_plan_metric(&deps.telemetry, NativeToolsVersion::V1, None);
+        return Ok(RunToolPlan::V1);
+    }
+
+    let transport = deps
+        .llm
+        .transport_tool_capabilities(&deps.turn_effort_policy)
+        .await?;
+    let capability_profile = CapabilityResolver::resolve(CapabilityInputs {
+        transport,
+        runtime: deps.native_tool_runtime_surfaces,
+        override_mode: deps.native_tool_override_mode,
+        supports_prompt_cache: deps.meta.supports_prompt_cache,
+    })?;
+    let plan =
+        tool_plan::compile_candidate(&deps.tools, &agent.tools, capability_profile, None).await?;
+    record_native_tool_plan_metric(
+        &deps.telemetry,
+        NativeToolsVersion::V2,
+        Some(&plan.plan.body.capability_profile),
+    );
+    Ok(RunToolPlan::CandidateV2(plan))
+}
+
+async fn verify_or_freeze_run_tool_plan(
+    deps: &RunnerDeps,
+    plan: &mut RunToolPlan,
+) -> anyhow::Result<()> {
+    match plan {
+        RunToolPlan::V1 => Ok(()),
+        RunToolPlan::CandidateV2(candidate) => {
+            tool_plan::freeze_plan(&deps.store, &deps.run_id, &*candidate).await?;
+            *plan = RunToolPlan::FrozenV2(candidate.clone());
+            Ok(())
+        }
+        RunToolPlan::FrozenV2(frozen) => {
+            tool_plan::freeze_plan(&deps.store, &deps.run_id, &*frozen).await?;
+            Ok(())
+        }
+    }
 }
 
 /// Return the resolved command's normal-turn runtime metadata. Kept separate
@@ -313,7 +593,9 @@ pub async fn run_turn(
     }
 
     // 2. Load history + context state and append the user turn.
-    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone())
+        .await
+        .with_native_tools_version(deps.native_tools_version);
     let mut cm = if deps.isolated_target {
         ContextManager::ephemeral(&deps.session_pk, cfg)
     } else {
@@ -404,7 +686,9 @@ pub async fn run_turn(
 /// Manual /compact: persist the user's row, compact the session history, and
 /// record a notice row. No model turn runs.
 async fn run_manual_compact(deps: &RunnerDeps) -> anyhow::Result<()> {
-    let cfg = ContextConfig::load(&deps.store, deps.meta.clone()).await;
+    let cfg = ContextConfig::load(&deps.store, deps.meta.clone())
+        .await
+        .with_native_tools_version(deps.native_tools_version);
     let mut cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg).await?;
     // Same resume-seed as `run_turn` (spec §12): honor a persisted
     // post-overflow total so a manual /compact right after an overflow
@@ -860,6 +1144,10 @@ async fn drive(
     display: DisplayMode,
     budget: &IterationBudget,
 ) -> anyhow::Result<String> {
+    // A facade belongs to this run/drive. Child and delegated drives call this
+    // independently with their own run_id; no compiled parent plan is cloned.
+    let mut run_tool_plan = resolve_run_tool_plan(deps, agent).await?;
+    let mut v2_plan_verified = false;
     let mut system_breakdown: Option<Vec<(&'static str, u64)>> = None;
     let system = match &agent.prompt {
         Some(p) => p.clone(),
@@ -886,8 +1174,12 @@ async fn drive(
         }
     };
     let system = with_delegation_catalog(system, &deps.delegation_catalog);
-    // Tools restricted to what this agent may use, filtered by activation.
-    let tool_defs: Vec<Value> = current_tool_defs(deps, agent).await;
+    // V1 uses the current activation-aware registry view; V2 uses the exact
+    // immutable definitions compiled for this run.
+    let tool_defs: Vec<Value> = match run_tool_plan.visible_definitions() {
+        Some(definitions) => definitions.to_vec(),
+        None => current_tool_defs(deps, agent).await,
+    };
     let model = deps.model.clone().unwrap_or_default();
     let mut final_text = String::new();
 
@@ -993,7 +1285,10 @@ async fn drive(
             } else {
                 json!(system)
             };
-            let tool_defs = current_tool_defs(deps, agent).await;
+            let tool_defs = match run_tool_plan.visible_definitions() {
+                Some(_) => tool_defs.clone(),
+                None => current_tool_defs(deps, agent).await,
+            };
             let body = json!({
                 "model": model,
                 "system": system_value,
@@ -1067,6 +1362,17 @@ async fn drive(
                 let Some(decoded) = MessageStreamEvent::from_event(&ev) else {
                     continue;
                 };
+                let valid_response_event = is_valid_response_event(&decoded);
+                if run_tool_plan.version() == NativeToolsVersion::V2
+                    && !v2_plan_verified
+                    && valid_response_event
+                {
+                    // Persistence is deliberately before processing the first
+                    // response/content event, so no V2 dispatch can occur from
+                    // a facade that failed to freeze or verify.
+                    verify_or_freeze_run_tool_plan(deps, &mut run_tool_plan).await?;
+                    v2_plan_verified = true;
+                }
                 if !ttft_logged {
                     ttft_logged = true;
                     tracing::debug!(
@@ -1114,6 +1420,7 @@ async fn drive(
                                         .to_string(),
                                     start_input: block.get("input").cloned().unwrap_or(json!({})),
                                     input_json: String::new(),
+                                    input_overflowed: false,
                                 },
                             );
                         }
@@ -1123,7 +1430,7 @@ async fn drive(
                         partial_json,
                     } => {
                         if let Some(t) = turn.tools.get_mut(&index) {
-                            t.input_json.push_str(&partial_json);
+                            t.push_input_delta(&partial_json, run_tool_plan.version());
                         }
                     }
                     MessageStreamEvent::MessageDelta {
@@ -1174,13 +1481,31 @@ async fn drive(
                 content.push(json!({ "type": "text", "text": turn.text }));
             }
             let tool_calls: Vec<ToolAccum> = turn.tools.into_values().collect();
-            for t in &tool_calls {
-                content.push(json!({
-                    "type": "tool_use",
-                    "id": t.id,
-                    "name": t.name,
-                    "input": t.parsed_input(),
-                }));
+            let (legacy_calls, v2_calls) = match &run_tool_plan {
+                RunToolPlan::V1 => (Some(tool_calls), None),
+                RunToolPlan::CandidateV2(plan) | RunToolPlan::FrozenV2(plan) => {
+                    (None, Some(validate_v2_batch(deps, plan, tool_calls)))
+                }
+            };
+            if let Some(calls) = &legacy_calls {
+                for call in calls {
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.legacy_input(),
+                    }));
+                }
+            }
+            if let Some(calls) = &v2_calls {
+                for call in calls {
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": call.id(),
+                        "name": call.name(),
+                        "input": call.ledger_input(),
+                    }));
+                }
             }
             if content.is_empty() {
                 // An assistant turn must exist for valid role alternation, but an
@@ -1189,9 +1514,17 @@ async fn drive(
                 // poisons the whole session. Use a non-empty sentinel instead.
                 content.push(json!({ "type": "text", "text": "(no output)" }));
             }
-            cm.append_assistant(json!(content)).await?;
+            append_assistant_and_record_v2_metrics(
+                cm,
+                json!(content),
+                v2_calls.as_deref(),
+                &deps.telemetry,
+            )
+            .await?;
 
-            if tool_calls.is_empty() {
+            let tool_calls_empty = legacy_calls.as_ref().is_none_or(Vec::is_empty)
+                && v2_calls.as_ref().is_none_or(Vec::is_empty);
+            if tool_calls_empty {
                 // The model answered in plain text with no tool call — normally
                 // end_turn. But a steer that landed during this round must not be
                 // dropped: the only other drain site rides the tool-result batch
@@ -1209,14 +1542,50 @@ async fn drive(
 
             // Execute each tool call, collecting tool_result blocks.
             let mut results: Vec<Value> = Vec::new();
-            for (i, t) in tool_calls.iter().enumerate() {
-                if cancel.is_cancelled() {
-                    for rest in &tool_calls[i..] {
-                        results.push(tool_result(&rest.id, "Interrupted by user", true));
+            if let Some(calls) = legacy_calls {
+                for (index, call) in calls.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        for rest in &calls[index..] {
+                            results.push(tool_result(&rest.id, "Interrupted by user", true));
+                        }
+                        break;
                     }
-                    break;
+                    results.push(
+                        run_legacy_tool_call(deps, agent, call, &display, &spawn, cancel).await,
+                    );
                 }
-                results.push(run_tool_call(deps, agent, t, &display, &spawn, cancel).await);
+            }
+            if let Some(calls) = v2_calls {
+                for call in calls {
+                    let result = match call {
+                        V2BatchCall::Validated(validated) if cancel.is_cancelled() => {
+                            complete_queued_v2_cancellation(
+                                deps,
+                                validated,
+                                &display,
+                                &run_tool_plan,
+                            )
+                            .await
+                        }
+                        V2BatchCall::Validated(validated) => {
+                            run_tool_call(
+                                deps,
+                                agent,
+                                validated,
+                                &display,
+                                &spawn,
+                                cancel,
+                                &run_tool_plan,
+                            )
+                            .await
+                        }
+                        V2BatchCall::Rejected(rejected) => {
+                            complete_rejected_v2_call(deps, rejected, &display, &run_tool_plan)
+                                .await
+                        }
+                    };
+                    results.push(result);
+                }
             }
             cm.append_tool_results(results).await?;
 
@@ -1381,21 +1750,45 @@ fn cap_report(s: &str) -> String {
 }
 
 /// The tool filter a delegated child actually runs with: the intersection of
-/// the parent's and the child agent's filters over the registry's tool names,
-/// minus the delegation blocklist.
+/// the parent's and the child agent's filters over immutable registry
+/// contracts, minus the delegation blocklist. Policy aliases participate only
+/// in authorization checks; they are never turned into executable names.
 fn effective_child_filter(
     parent: &super::agents::ToolFilter,
     child: &super::agents::ToolFilter,
-    names: &[String],
+    registry: &ToolRegistry,
     blocklist: &[&str],
 ) -> super::agents::ToolFilter {
-    super::agents::ToolFilter::Only(
-        names
+    let mut allowed = BTreeSet::new();
+    for registered in registry.canonical_snapshot() {
+        let descriptor = &registered.descriptor;
+        let legacy_names = registry
+            .legacy_to_canonical()
             .iter()
-            .filter(|n| parent.allows(n) && child.allows(n) && !blocklist.contains(&n.as_str()))
-            .cloned()
-            .collect(),
-    )
+            .filter_map(|(legacy, canonical)| {
+                (canonical == &descriptor.canonical_name).then_some(legacy.as_str())
+            })
+            .collect::<Vec<_>>();
+        let filter_allows = |filter: &super::agents::ToolFilter| {
+            filter.allows(&descriptor.canonical_name)
+                || descriptor
+                    .policy_aliases
+                    .iter()
+                    .any(|alias| filter.allows(alias))
+                || legacy_names.iter().any(|name| filter.allows(name))
+        };
+        let blocked = blocklist.contains(&descriptor.canonical_name.as_str())
+            || descriptor
+                .policy_aliases
+                .iter()
+                .any(|alias| blocklist.contains(&alias.as_str()))
+            || legacy_names.iter().any(|name| blocklist.contains(name));
+        if filter_allows(parent) && filter_allows(child) && !blocked {
+            allowed.insert(descriptor.canonical_name.clone());
+            allowed.extend(legacy_names.into_iter().map(str::to_owned));
+        }
+    }
+    super::agents::ToolFilter::Only(allowed.into_iter().collect())
 }
 
 /// The `max_spawn_depth` setting controls how many delegation hops a child may make.
@@ -1439,17 +1832,22 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         project_id: deps.project_id.clone(),
         perm_overrides: deps.perm_overrides.clone(),
         store: deps.store.clone(),
+        telemetry: deps.telemetry.clone(),
         events: deps.events.clone(),
         approvals: deps.approvals.clone(),
         automation_events: deps.automation_events.clone(),
         llm: deps.llm.clone(),
         tools: deps.tools.clone(),
+        native_tools_version: deps.native_tools_version,
+        native_tool_runtime_surfaces: deps.native_tool_runtime_surfaces,
+        native_tool_override_mode: deps.native_tool_override_mode,
         agent: deps.agent.clone(),
         agents: deps.agents.clone(),
         commands: deps.commands.clone(),
         allowed_skills: None,
         memory: None,
         snapshots: deps.snapshots.clone(),
+        snapshot_taker: deps.snapshot_taker.clone(),
         steer: deps.steer.clone(),
         background: deps.background.clone(),
         app_control: None,
@@ -1673,7 +2071,8 @@ impl RunnerMainAgentSpawner {
                 .await;
             let mut cm = ContextManager::ephemeral(
                 &child_deps.session_pk,
-                ContextConfig::with_meta(child_deps.meta.clone()),
+                ContextConfig::with_meta(child_deps.meta.clone())
+                    .with_native_tools_version(child_deps.native_tools_version),
             );
             let task = child.run.task.clone();
             let mut prompt = vec![json!({ "type": "text", "text": task })];
@@ -1948,7 +2347,7 @@ impl RunnerSpawner {
         child.tools = effective_child_filter(
             &self.deps.agent.tools,
             &child.tools,
-            &self.deps.tools.names(),
+            &self.deps.tools,
             SUBAGENT_BLOCKLIST,
         );
         // Delegating children get the `task` tool re-armed.
@@ -2005,7 +2404,8 @@ impl RunnerSpawner {
         };
         let mut cm = ContextManager::ephemeral(
             &self.deps.session_pk,
-            ContextConfig::with_meta(self.deps.meta.clone()),
+            ContextConfig::with_meta(self.deps.meta.clone())
+                .with_native_tools_version(self.deps.native_tools_version),
         );
         if let Err(e) = cm
             .append_user(json!([{ "type": "text", "text": spec.prompt }]))
@@ -2240,68 +2640,259 @@ impl SubagentSpawner for RunnerSpawner {
 async fn run_tool_call(
     deps: &RunnerDeps,
     agent: &Agent,
-    t: &ToolAccum,
+    validated: ValidatedToolCall,
     display: &DisplayMode,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
+    run_tool_plan: &RunToolPlan,
 ) -> Value {
-    if t.name == LOAD_TOOLS_NAME {
-        return handle_load_tools(deps, agent, t, display).await;
-    }
-    let input = t.parsed_input();
-    let Some(tool) = deps.tools.get(&t.name) else {
-        let msg = format!("unknown tool `{}`", t.name);
-        insert_tool_row(deps, t, &input, "unknown", display.subagent()).await;
-        finish_tool_row(deps, &t.id, &msg, true).await;
-        return tool_result(&t.id, &msg, true);
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let planned = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) => plan.canonical_tools.get(&validated.canonical_name),
+        RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => None,
     };
-    // Enforce the agent's tool allow-list.
-    if !agent.tools.allows(&t.name) {
-        let msg = format!(
-            "tool `{}` is not permitted for the `{}` agent",
-            t.name, agent.name
-        );
-        insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await;
-        finish_tool_row(deps, &t.id, &msg, true).await;
-        return tool_result(&t.id, &msg, true);
-    }
-    if insert_tool_row(deps, t, &input, tool.kind(), display.subagent()).await {
-        if let Err(error) = deps
-            .store
-            .increment_agent_run_tool_count(&deps.run_id)
-            .await
-        {
-            tracing::warn!(
-                "native: increment_agent_run_tool_count({}) failed: {error}",
-                deps.run_id
-            );
+    let Some(planned) = planned else {
+        return complete_validated_v2_error(
+            deps,
+            validated,
+            display,
+            None,
+            "unknown",
+            &trace_id,
+            ToolError::precondition("capability_unavailable", "The V2 tool facade is not frozen"),
+        )
+        .await;
+    };
+    let tool_kind = planned.descriptor.kind.as_str();
+    let plan = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) => plan,
+        RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => unreachable!(),
+    };
+    let unavailable = |message: &str| ToolError::precondition("capability_unavailable", message);
+    let available = match deps.tools.available(&validated.canonical_name).await {
+        Ok(Some(available)) => available,
+        Ok(None) => {
+            return complete_validated_v2_error(
+                deps,
+                validated,
+                display,
+                Some(planned),
+                tool_kind,
+                &trace_id,
+                unavailable("Tool is missing from the current registry"),
+            )
+            .await;
         }
+        Err(_) => {
+            return complete_validated_v2_error(
+                deps,
+                validated,
+                display,
+                Some(planned),
+                tool_kind,
+                &trace_id,
+                unavailable("Tool is currently unavailable"),
+            )
+            .await;
+        }
+    };
+    let current_hash =
+        tool_plan::contract_hash_for_registered(&available.registered, planned, &plan.plan.body);
+    if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
+        return complete_validated_v2_error(
+            deps,
+            validated,
+            display,
+            Some(planned),
+            tool_kind,
+            &trace_id,
+            unavailable("Tool no longer matches its frozen contract"),
+        )
+        .await;
     }
+    if insert_tool_row_parts(
+        deps,
+        &validated.wire.id,
+        &validated.wire.name,
+        &validated.input,
+        tool_kind,
+        display.subagent(),
+    )
+    .await
+    {
+        increment_tool_count(deps).await;
+    }
+    let input_context = ToolInputCtx {
+        work_dir: &deps.work_dir,
+        attachments_dir: deps.attachments_dir.as_deref(),
+        extra_skill_dirs: &deps.extra_skill_dirs,
+    };
+    let preflight = match validated
+        .tool
+        .preflight(
+            &input_context,
+            &validated.input,
+            validated.pinned_file_reference.as_ref(),
+        )
+        .await
+    {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            return complete_tool_call(
+                deps,
+                &validated.wire.id,
+                ToolCompletionContext {
+                    version: NativeToolsVersion::V2,
+                    planned: Some(planned),
+                    tool_name: &validated.wire.name,
+                    tool_kind,
+                    trace_id: &trace_id,
+                    duration_ms: 0,
+                    normalization: Some(validated.normalization),
+                    preflight: None,
+                },
+                ToolCompletionOutcome::Error {
+                    legacy_text: error.message.clone(),
+                    error,
+                },
+            )
+            .await
+            .provider_result;
+        }
+    };
+    let prepared = PreparedToolCall {
+        validated,
+        preflight,
+    };
+    let (validated, preflight) = prepared.into_parts();
+    let prepared_preflight = preflight.clone();
+    let (preflight_metadata, preflight_file_target) = preflight.into_parts();
+    execute_tool_call(
+        deps,
+        agent,
+        &validated.wire.id,
+        &validated.wire.name,
+        validated.tool,
+        validated.input,
+        validated.pinned_file_reference,
+        preflight_file_target,
+        NativeToolsVersion::V2,
+        Some(planned),
+        tool_kind,
+        &trace_id,
+        Some(validated.normalization),
+        Some(preflight_metadata),
+        Some(prepared_preflight),
+        spawn,
+        cancel,
+    )
+    .await
+}
 
-    // Plugin hooks: a `tool.before` hook (script or extension) may deny the
-    // call — see `hooks::fire_hook`'s combine contract.
+async fn complete_validated_v2_error(
+    deps: &RunnerDeps,
+    validated: ValidatedToolCall,
+    display: &DisplayMode,
+    planned: Option<&PlannedTool>,
+    tool_kind: &str,
+    trace_id: &str,
+    error: ToolError,
+) -> Value {
+    let inserted = insert_tool_row_parts(
+        deps,
+        &validated.wire.id,
+        &validated.wire.name,
+        &validated.input,
+        tool_kind,
+        display.subagent(),
+    )
+    .await;
+    if planned.is_some() && inserted {
+        increment_tool_count(deps).await;
+    }
+    let legacy_text = format!("{}: {}", error.code, error.message);
+    complete_tool_call(
+        deps,
+        &validated.wire.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V2,
+            planned,
+            tool_name: &validated.wire.name,
+            tool_kind,
+            trace_id,
+            duration_ms: 0,
+            normalization: Some(validated.normalization),
+            preflight: None,
+        },
+        ToolCompletionOutcome::Error { error, legacy_text },
+    )
+    .await
+    .provider_result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_call(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    tool_call_id: &str,
+    tool_name: &str,
+    tool: Arc<dyn super::tools::Tool>,
+    input: Value,
+    pinned_file_reference: Option<super::file_reference::PinnedFileTarget>,
+    preflight_file_target: Option<super::file_reference::PreflightFileTarget>,
+    version: NativeToolsVersion,
+    planned: Option<&PlannedTool>,
+    tool_kind: &str,
+    trace_id: &str,
+    normalization: Option<ToolMetadata>,
+    preflight: Option<ToolMetadata>,
+    prepared_preflight: Option<PreflightMeta>,
+    spawn: &Option<Arc<dyn SubagentSpawner>>,
+    cancel: &CancellationToken,
+) -> Value {
     let hook = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolBefore,
-        &json!({ "tool": t.name, "input": input }),
+        &json!({ "tool": tool_name, "input": input }),
     )
     .await;
     crate::automation::dispatch_lifecycle_observation(
         deps.automation_events.clone(),
         crate::automation::TriggerKind::ToolBefore,
         deps.session_pk.clone(),
-        json!({ "tool": t.name, "input": input }),
+        json!({ "tool": tool_name, "input": input }),
     );
     if !hook.allowed {
-        let msg = hook
+        let message = hook
             .message
             .unwrap_or_else(|| "blocked by plugin hook".to_string());
-        finish_tool_row(deps, &t.id, &msg, true).await;
-        return tool_result(&t.id, &msg, true);
+        return complete_tool_call(
+            deps,
+            tool_call_id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name,
+                tool_kind,
+                trace_id,
+                duration_ms: 0,
+                normalization,
+                preflight,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    "hook_denied",
+                    "Tool call was denied by a policy hook",
+                ),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
     }
 
-    // Permission gate. Read the mode fresh so a mid-session change applies.
     let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
     let gate = super::permission::PermGate {
@@ -2314,40 +2905,124 @@ async fn run_tool_call(
         run_id: &deps.run_id,
         requesting_agent_id: &deps.primary_agent.profile.id,
         requesting_agent_name: &agent.name,
-        tool_call_id: &t.id,
+        tool_call_id,
         approvals: &deps.approvals,
         events: &deps.events,
         cancel,
     };
     let decision = evaluate(&spec, &input, &gate).await;
     if decision == PermDecision::Deny {
-        // Plan mode denies mutations outright (no prompt) — tell the model why
-        // so it plans instead of retrying, rather than showing "Denied by user".
-        let msg = if cancel.is_cancelled() {
-            // Stopped while gated/parked: pair the tool_use with an
-            // interrupted tool_result, not a user denial.
+        let message = if cancel.is_cancelled() {
             "Interrupted by user"
-        } else if perm_mode == PermMode::Plan && !matches!(tool.kind(), "read") {
+        } else if perm_mode == PermMode::Plan && !matches!(tool_kind, "read") {
             "Plan mode is read-only: file edits and shell commands are disabled. \
              Propose a plan for the user to review; they can switch to Ask/Edit/Full to execute it."
         } else {
             "Denied by user"
         };
-        finish_tool_row(deps, &t.id, msg, true).await;
-        return tool_result(&t.id, msg, true);
+        let error = if cancel.is_cancelled() {
+            cancelled_tool_error()
+        } else {
+            ToolError::new(
+                ToolErrorCategory::Permission,
+                "permission_denied",
+                "Tool call was denied",
+            )
+        };
+        return complete_tool_call(
+            deps,
+            tool_call_id,
+            ToolCompletionContext {
+                version,
+                planned,
+                tool_name,
+                tool_kind,
+                trace_id,
+                duration_ms: 0,
+                normalization,
+                preflight,
+            },
+            ToolCompletionOutcome::Error {
+                error,
+                legacy_text: message.to_string(),
+            },
+        )
+        .await
+        .provider_result;
     }
 
-    // Snapshot the worktree before a mutating tool runs, so `revert` can undo
-    // it. `revert` itself must not snapshot (it would capture the change it is
-    // about to undo).
-    if matches!(tool.kind(), "edit" | "execute") && t.name != "revert" {
-        if let Some(sha) = super::snapshot::take(&deps.work_dir).await {
+    let prepared_edit_precondition = prepared_preflight
+        .as_ref()
+        .and_then(PreflightMeta::prepared_edit_precondition);
+    if let Some(prepared_preflight) = prepared_preflight.as_ref() {
+        let input_context = ToolInputCtx {
+            work_dir: &deps.work_dir,
+            attachments_dir: deps.attachments_dir.as_deref(),
+            extra_skill_dirs: &deps.extra_skill_dirs,
+        };
+        if let Err(error) = prepared_preflight
+            .recheck_before_snapshot(&input_context)
+            .await
+        {
+            let legacy_text = error.public_message();
+            return complete_tool_call(
+                deps,
+                tool_call_id,
+                ToolCompletionContext {
+                    version,
+                    planned,
+                    tool_name,
+                    tool_kind,
+                    trace_id,
+                    duration_ms: 0,
+                    normalization,
+                    preflight,
+                },
+                ToolCompletionOutcome::Error { error, legacy_text },
+            )
+            .await
+            .provider_result;
+        }
+    }
+
+    let mut provisional_edit_snapshot = None;
+    if matches!(tool_kind, "edit" | "execute") && tool_name != "revert" {
+        let snapshot = deps.snapshot_taker.take(&deps.work_dir).await;
+        if prepared_edit_precondition.is_some() {
+            provisional_edit_snapshot = snapshot;
+        } else if let Some(sha) = snapshot {
             deps.snapshots.lock().await.push(sha);
         }
     }
 
-    // Execute. Timed from here — after the permission gate — so a long human
-    // approval wait never inflates the card's duration badge.
+    if let Some(precondition) = prepared_edit_precondition.as_ref() {
+        let input_context = ToolInputCtx {
+            work_dir: &deps.work_dir,
+            attachments_dir: deps.attachments_dir.as_deref(),
+            extra_skill_dirs: &deps.extra_skill_dirs,
+        };
+        if let Err(error) = precondition.recheck(&input_context).await {
+            let legacy_text = error.public_message();
+            return complete_tool_call(
+                deps,
+                tool_call_id,
+                ToolCompletionContext {
+                    version,
+                    planned,
+                    tool_name,
+                    tool_kind,
+                    trace_id,
+                    duration_ms: 0,
+                    normalization,
+                    preflight,
+                },
+                ToolCompletionOutcome::Error { error, legacy_text },
+            )
+            .await
+            .provider_result;
+        }
+    }
+
     let started = std::time::Instant::now();
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
@@ -2355,6 +3030,9 @@ async fn run_tool_call(
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        pinned_file_reference,
+        preflight_file_target,
+        edit_precondition: prepared_edit_precondition,
         store: deps.store.clone(),
         cancel: cancel.clone(),
         caps: OutputCaps::default(),
@@ -2362,7 +3040,7 @@ async fn run_tool_call(
         main_agent_spawn: Some(Arc::new(RunnerMainAgentSpawner { deps: deps.clone() })),
         memory: deps.memory.clone(),
         snapshots: deps.snapshots.clone(),
-        tool_call_id: t.id.clone(),
+        tool_call_id: tool_call_id.to_string(),
         interaction: Some(Arc::new(super::tools::Interaction {
             approvals: deps.approvals.clone(),
             events: deps.events.clone(),
@@ -2375,47 +3053,265 @@ async fn run_tool_call(
         app: deps.app_control.clone(),
         write_origin: deps.write_origin,
     };
-    // Keep a copy for the `tool.after` payload below — `execute` consumes
-    // `input` by value.
     let hook_input = input.clone();
-    let (tool_use_result, after_summary) = match tool.execute(&ctx, input).await {
-        Ok(mut out) => {
-            let extras = merge_display_duration(out.display.take(), elapsed_ms(started));
-            finish_tool_row_with_display(deps, &t.id, &out.for_model, out.is_error, Some(extras))
-                .await;
-            let is_error = out.is_error;
-            let summary = json!({
-                "ok": !is_error,
-                "output": truncate_for_context(&out.for_model, TOOL_AFTER_OUTPUT_BYTES),
-            });
-            let result = match out.model_blocks.take() {
-                Some(mut blocks) => {
-                    blocks.push(json!({ "type": "text", "text": out.for_model }));
-                    json!({
-                        "type": "tool_result",
-                        "tool_use_id": t.id,
-                        "content": blocks,
-                        "is_error": is_error,
-                    })
-                }
-                None => tool_result(&t.id, &out.for_model, is_error),
-            };
-            (result, summary)
+    let execution = tool.execute(&ctx, input).await;
+    let duration_ms = elapsed_ms(started);
+    if let Some(sha) = provisional_edit_snapshot {
+        let raced = execution.as_ref().ok().is_some_and(|output| {
+            output
+                .structured_error
+                .as_ref()
+                .is_some_and(|error| error.code == "edit_precondition_changed")
+        });
+        if !raced {
+            deps.snapshots.lock().await.push(sha);
         }
-        Err(e) => {
-            let msg = format!("{}: {e}", t.name);
-            let extras = merge_display_duration(None, elapsed_ms(started));
-            finish_tool_row_with_display(deps, &t.id, &msg, true, Some(extras)).await;
-            let summary = json!({
-                "ok": false,
-                "error": truncate_for_context(&msg, TOOL_AFTER_OUTPUT_BYTES),
-            });
-            (tool_result(&t.id, &msg, true), summary)
+    }
+    let outcome = if version == NativeToolsVersion::V2 && cancel.is_cancelled() {
+        ToolCompletionOutcome::Error {
+            error: cancelled_tool_error(),
+            legacy_text: "Interrupted by user".to_string(),
+        }
+    } else {
+        match execution {
+            Ok(output) => ToolCompletionOutcome::Output(output),
+            Err(error) => ToolCompletionOutcome::BareError(error),
         }
     };
-    // Observational: never gates, result ignored. Fires for both Ok and Err
-    // outcomes now that the `ToolOutput` (or its error) has resolved.
-    let after_payload = json!({ "tool": t.name, "input": hook_input, "result": after_summary });
+    let completed = complete_tool_call(
+        deps,
+        tool_call_id,
+        ToolCompletionContext {
+            version,
+            planned,
+            tool_name,
+            tool_kind,
+            trace_id,
+            duration_ms,
+            normalization,
+            preflight,
+        },
+        outcome,
+    )
+    .await;
+    fire_tool_after_observation(deps, tool_name, hook_input, completed.hook_summary).await;
+    completed.provider_result
+}
+
+async fn run_legacy_tool_call(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    tool_call: &ToolAccum,
+    display: &DisplayMode,
+    spawn: &Option<Arc<dyn SubagentSpawner>>,
+    cancel: &CancellationToken,
+) -> Value {
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let input = tool_call.legacy_input();
+    if tool_call.name == LOAD_TOOLS_NAME {
+        return handle_load_tools(deps, agent, tool_call, display).await;
+    }
+    let Some(registered) = deps
+        .tools
+        .legacy_registered(&tool_call.name)
+        .filter(|registered| !registered.descriptor.v2_only)
+    else {
+        let message = format!("unknown tool `{}`", tool_call.name);
+        insert_tool_row(deps, tool_call, &input, "unknown", display.subagent()).await;
+        return complete_tool_call(
+            deps,
+            &tool_call.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V1,
+                planned: None,
+                tool_name: &tool_call.name,
+                tool_kind: "other",
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::precondition("tool_not_found", "Tool was not found"),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
+    };
+    let tool = registered.tool.clone();
+    let tool_kind = tool.kind();
+    if !agent.tools.allows(&tool_call.name) {
+        let message = format!(
+            "tool `{}` is not permitted for the `{}` agent",
+            tool_call.name, agent.name
+        );
+        insert_tool_row(deps, tool_call, &input, tool_kind, display.subagent()).await;
+        return complete_tool_call(
+            deps,
+            &tool_call.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V1,
+                planned: None,
+                tool_name: &tool_call.name,
+                tool_kind,
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    "permission_denied",
+                    "Tool is not permitted for this agent",
+                ),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
+    }
+    if insert_tool_row(deps, tool_call, &input, tool_kind, display.subagent()).await {
+        increment_tool_count(deps).await;
+    }
+    execute_tool_call(
+        deps,
+        agent,
+        &tool_call.id,
+        &tool_call.name,
+        tool,
+        input,
+        None,
+        None,
+        NativeToolsVersion::V1,
+        None,
+        tool_kind,
+        &trace_id,
+        None,
+        None,
+        None,
+        spawn,
+        cancel,
+    )
+    .await
+}
+async fn complete_queued_v2_cancellation(
+    deps: &RunnerDeps,
+    validated: ValidatedToolCall,
+    display: &DisplayMode,
+    run_tool_plan: &RunToolPlan,
+) -> Value {
+    let planned = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) => plan.canonical_tools.get(&validated.canonical_name),
+        RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => None,
+    };
+    let tool_kind = planned
+        .map(|planned| planned.descriptor.kind.as_str())
+        .unwrap_or("other");
+    if insert_tool_row_parts(
+        deps,
+        &validated.wire.id,
+        &validated.wire.name,
+        &validated.input,
+        tool_kind,
+        display.subagent(),
+    )
+    .await
+    {
+        increment_tool_count(deps).await;
+    }
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let completed = complete_tool_call(
+        deps,
+        &validated.wire.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V2,
+            planned,
+            tool_name: &validated.wire.name,
+            tool_kind,
+            trace_id: &trace_id,
+            duration_ms: 0,
+            normalization: Some(validated.normalization),
+            preflight: None,
+        },
+        ToolCompletionOutcome::Error {
+            error: cancelled_tool_error(),
+            legacy_text: "Interrupted by user".to_string(),
+        },
+    )
+    .await;
+    completed.provider_result
+}
+
+async fn complete_rejected_v2_call(
+    deps: &RunnerDeps,
+    rejected: RejectedToolCall,
+    display: &DisplayMode,
+    run_tool_plan: &RunToolPlan,
+) -> Value {
+    let planned = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) | RunToolPlan::CandidateV2(plan) => rejected
+            .canonical_name
+            .as_deref()
+            .and_then(|name| plan.canonical_tools.get(name)),
+        RunToolPlan::V1 => None,
+    };
+    let tool_kind = planned
+        .map(|planned| planned.descriptor.kind.as_str())
+        .unwrap_or("other");
+    let marker = json!({"_ryuzi_invalid_arguments": true});
+    let inserted = insert_tool_row_parts(
+        deps,
+        &rejected.wire.id,
+        &rejected.wire.name,
+        &marker,
+        tool_kind,
+        display.subagent(),
+    )
+    .await;
+    if planned.is_some() && inserted {
+        increment_tool_count(deps).await;
+    }
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let legacy_text = format!("{}: {}", rejected.error.code, rejected.error.message);
+    complete_tool_call(
+        deps,
+        &rejected.wire.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V2,
+            planned,
+            tool_name: &rejected.wire.name,
+            tool_kind,
+            trace_id: &trace_id,
+            duration_ms: 0,
+            normalization: None,
+            preflight: None,
+        },
+        ToolCompletionOutcome::Error {
+            error: *rejected.error,
+            legacy_text,
+        },
+    )
+    .await
+    .provider_result
+}
+
+fn cancelled_tool_error() -> ToolError {
+    ToolError::new(
+        ToolErrorCategory::Cancelled,
+        "cancelled",
+        "Tool call was cancelled",
+    )
+}
+
+async fn fire_tool_after_observation(
+    deps: &RunnerDeps,
+    tool_name: &str,
+    input: Value,
+    hook_summary: Value,
+) {
+    let after_payload = json!({ "tool": tool_name, "input": input, "result": hook_summary });
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
@@ -2429,7 +3325,6 @@ async fn run_tool_call(
         deps.session_pk.clone(),
         after_payload,
     );
-    tool_use_result
 }
 
 /// Handle the synthetic `load_tools` meta-call: activate the requested deferred
@@ -2443,14 +3338,33 @@ async fn handle_load_tools(
     t: &ToolAccum,
     display: &DisplayMode,
 ) -> Value {
-    let input = t.parsed_input();
+    let input = t.legacy_input();
     insert_tool_row(deps, t, &input, "other", display.subagent()).await;
 
     let Some(activated) = deps.activated_tools.as_ref() else {
         let msg = "load_tools is not available in this session";
-        finish_tool_row(deps, &t.id, msg, true).await;
-        return tool_result(&t.id, msg, true);
+        return complete_v1_load_tools(deps, t, ToolOutput::error(msg)).await;
     };
+
+    let load_tools_schema = json!({
+        "type": "object",
+        "properties": {
+            "names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1
+            }
+        },
+        "required": ["names"],
+        "additionalProperties": false
+    });
+    if match jsonschema::validator_for(&load_tools_schema) {
+        Ok(validator) => !validator.is_valid(&input),
+        Err(_) => true,
+    } {
+        let message = "No tool names given. Provide the exact tool names to load, taken from the load_tools description.";
+        return complete_v1_load_tools(deps, t, ToolOutput::error(message)).await;
+    }
 
     let loadable: std::collections::BTreeSet<String> = deps
         .tools
@@ -2471,8 +3385,7 @@ async fn handle_load_tools(
 
     if requested.is_empty() {
         let msg = "No tool names given. Provide the exact tool names to load, taken from the load_tools description.";
-        finish_tool_row(deps, &t.id, msg, true).await;
-        return tool_result(&t.id, msg, true);
+        return complete_v1_load_tools(deps, t, ToolOutput::error(msg)).await;
     }
 
     let (mut loaded, mut unknown) = (Vec::new(), Vec::new());
@@ -2509,8 +3422,33 @@ async fn handle_load_tools(
             unknown.join(", ")
         )
     };
-    finish_tool_row(deps, &t.id, &msg, is_error).await;
-    tool_result(&t.id, &msg, is_error)
+    let output = if is_error {
+        ToolOutput::error(msg)
+    } else {
+        ToolOutput::ok(msg)
+    };
+    complete_v1_load_tools(deps, t, output).await
+}
+
+async fn complete_v1_load_tools(deps: &RunnerDeps, t: &ToolAccum, output: ToolOutput) -> Value {
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    complete_tool_call(
+        deps,
+        &t.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V1,
+            planned: None,
+            tool_name: &t.name,
+            tool_kind: "other",
+            trace_id: &trace_id,
+            duration_ms: 0,
+            normalization: None,
+            preflight: None,
+        },
+        ToolCompletionOutcome::Output(output),
+    )
+    .await
+    .provider_result
 }
 
 /// Insert the initial `tool_call` row (`{name, input}`, in_progress).
@@ -2521,7 +3459,18 @@ async fn insert_tool_row(
     kind: &str,
     subagent: Option<&str>,
 ) -> bool {
-    let mut payload = json!({ "name": t.name, "input": input });
+    insert_tool_row_parts(deps, &t.id, &t.name, input, kind, subagent).await
+}
+
+async fn insert_tool_row_parts(
+    deps: &RunnerDeps,
+    id: &str,
+    name: &str,
+    input: &Value,
+    kind: &str,
+    subagent: Option<&str>,
+) -> bool {
+    let mut payload = json!({ "name": name, "input": input });
     if let Some(label) = subagent {
         payload["subagent"] = json!(label);
     }
@@ -2530,15 +3479,493 @@ async fn insert_tool_row(
         "assistant",
         "tool_call",
         payload,
-        Some(t.id.clone()),
+        Some(id.to_string()),
         Some("in_progress".to_string()),
         Some(kind.to_string()),
     )
     .await
 }
 
+async fn increment_tool_count(deps: &RunnerDeps) {
+    if let Err(error) = deps
+        .store
+        .increment_agent_run_tool_count(&deps.run_id)
+        .await
+    {
+        tracing::warn!(
+            "native: increment_agent_run_tool_count({}) failed: {error}",
+            deps.run_id
+        );
+    }
+}
+
+struct ToolCompletionContext<'a> {
+    version: NativeToolsVersion,
+    planned: Option<&'a PlannedTool>,
+    tool_name: &'a str,
+    tool_kind: &'a str,
+    trace_id: &'a str,
+    duration_ms: u64,
+    normalization: Option<ToolMetadata>,
+    preflight: Option<ToolMetadata>,
+}
+
+enum ToolCompletionOutcome {
+    Output(ToolOutput),
+    Error {
+        error: ToolError,
+        legacy_text: String,
+    },
+    BareError(anyhow::Error),
+}
+
+struct CompletedToolCall {
+    provider_result: Value,
+    hook_summary: Value,
+}
+
+async fn complete_tool_call(
+    deps: &RunnerDeps,
+    tool_call_id: &str,
+    context: ToolCompletionContext<'_>,
+    outcome: ToolCompletionOutcome,
+) -> CompletedToolCall {
+    let (legacy_text, model_blocks, display, error) = match outcome {
+        ToolCompletionOutcome::Output(output) => {
+            let error = output.is_error.then(|| {
+                output
+                    .structured_error
+                    .unwrap_or_else(|| ToolError::internal("tool_failed", "Tool execution failed"))
+            });
+            (output.for_model, output.model_blocks, output.display, error)
+        }
+        ToolCompletionOutcome::Error { error, legacy_text } => {
+            (legacy_text, None, None, Some(error))
+        }
+        ToolCompletionOutcome::BareError(source) => {
+            tracing::warn!(
+                trace_id = context.trace_id,
+                tool_family = safe_tool_family(context.tool_name, context.tool_kind),
+                "native tool handler returned an internal error"
+            );
+            let legacy_text = if context.version == NativeToolsVersion::V1 {
+                format!("{}: {source}", context.tool_name)
+            } else {
+                format!("{}: Tool execution failed", context.tool_name)
+            };
+            drop(source);
+            (
+                legacy_text,
+                None,
+                None,
+                Some(ToolError::internal(
+                    "tool_internal_error",
+                    "Tool execution failed",
+                )),
+            )
+        }
+    };
+    let is_error = error.is_some();
+    let result_limit = context
+        .planned
+        .map(|tool| usize::try_from(tool.descriptor.result_limit_bytes).unwrap_or(usize::MAX))
+        .unwrap_or(50_000);
+    let mut truncated = false;
+    let data_text = if context.version == NativeToolsVersion::V2 && !is_error {
+        let bounded = truncate_utf8_bytes(&legacy_text, result_limit);
+        truncated = bounded.len() < legacy_text.len();
+        bounded
+    } else {
+        legacy_text.clone()
+    };
+
+    let next_cursor = display
+        .as_ref()
+        .and_then(|value| value.get("next_cursor"))
+        .and_then(Value::as_str);
+    let mutation_id = display
+        .as_ref()
+        .and_then(|value| value.get("mutation_id"))
+        .and_then(Value::as_str);
+    let facade_label = context
+        .planned
+        .map(|planned| planned.canonical_name.as_str())
+        .unwrap_or(if context.version == NativeToolsVersion::V2 {
+            "unknown"
+        } else {
+            context.tool_name
+        });
+    let mut meta = ToolResultMeta::new(facade_label, context.trace_id, context.duration_ms)
+        .with_next_cursor(next_cursor)
+        .with_mutation_id(mutation_id)
+        .with_execution_metadata(context.normalization, context.preflight);
+    meta.truncated = truncated;
+
+    let model_text = if context.version == NativeToolsVersion::V2 {
+        let envelope = match error.as_ref() {
+            Some(error) => ToolResultEnvelope::failure(error.clone(), meta.clone()),
+            None => ToolResultEnvelope::success(Value::String(data_text.clone()), meta.clone()),
+        };
+        serde_json::to_string(&envelope).unwrap_or_else(|_| {
+            r#"{"ok":false,"error":{"code":"tool_internal_error","category":"internal","message":"Tool execution failed","retryable":false,"strategy":null,"field_errors":[],"candidates":[]},"meta":{"tool":"other","trace_id":"serialization","duration_ms":0,"truncated":false,"next_cursor":null,"mutation_id":null}}"#.to_string()
+        })
+    } else {
+        legacy_text.clone()
+    };
+
+    let mut display = merge_display_summary_and_duration(
+        display,
+        if is_error {
+            error
+                .as_ref()
+                .map(stable_error_message)
+                .unwrap_or_else(|| "Tool execution failed".to_string())
+        } else {
+            data_text.clone()
+        },
+        context.duration_ms,
+    );
+    if let Value::Object(fields) = &mut display {
+        if truncated {
+            fields.insert("truncated".into(), Value::Bool(true));
+        }
+    }
+    let persisted = if context.version == NativeToolsVersion::V2 {
+        serialize_persisted_v2_envelope(
+            error.as_ref(),
+            &data_text,
+            &meta,
+            PERSISTED_TOOL_OUTPUT_BYTES,
+        )
+    } else if context.version == NativeToolsVersion::V1 {
+        truncate_utf8_bytes(&model_text, PERSISTED_TOOL_OUTPUT_BYTES)
+    } else {
+        model_text.clone()
+    };
+    finish_tool_row_with_display(deps, tool_call_id, &persisted, is_error, Some(display)).await;
+
+    record_native_tool_call_metrics(
+        &deps.telemetry,
+        context.tool_name,
+        context.tool_kind,
+        !is_error,
+        error.as_ref().map(|error| error.code.as_str()),
+        context.duration_ms,
+    );
+
+    let mut hook_summary = json!({
+        "ok": !is_error,
+        "output": truncate_utf8_bytes(
+            if context.version == NativeToolsVersion::V2 {
+                if let Some(error) = error.as_ref() {
+                    stable_error_message(error)
+                } else {
+                    data_text.clone()
+                }
+            } else {
+                legacy_text.clone()
+            }
+            .as_str(),
+            TOOL_AFTER_OUTPUT_BYTES,
+        ),
+    });
+    if let Some(error) = error.as_ref() {
+        hook_summary["code"] = Value::String(error.code.clone());
+        hook_summary["category"] = Value::String(error_category_label(error.category).to_string());
+    }
+
+    let provider_result = match model_blocks {
+        Some(mut blocks) => {
+            blocks.push(json!({ "type": "text", "text": model_text }));
+            json!({
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": blocks,
+                "is_error": is_error,
+            })
+        }
+        None => tool_result(tool_call_id, &model_text, is_error),
+    };
+    CompletedToolCall {
+        provider_result,
+        hook_summary,
+    }
+}
+
+fn serialize_persisted_v2_envelope(
+    error: Option<&ToolError>,
+    data_text: &str,
+    meta: &ToolResultMeta,
+    max_bytes: usize,
+) -> String {
+    let envelope = match error {
+        Some(error) => ToolResultEnvelope::failure(error.clone(), meta.clone()),
+        None => ToolResultEnvelope::success(Value::String(data_text.to_string()), meta.clone()),
+    };
+    let serialized = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| persisted_v2_serialization_fallback(true));
+    if serialized.len() < max_bytes {
+        return serialized;
+    }
+
+    let mut bounded_meta = meta.clone();
+    bounded_meta.truncated = true;
+    if let Some(error) = error {
+        let mut compact_error = ToolError::new(error.category, &error.code, error.public_message());
+        if let Some(strategy) = error.strategy {
+            compact_error = compact_error.with_strategy(strategy);
+        }
+        let compact =
+            serde_json::to_string(&ToolResultEnvelope::failure(compact_error, bounded_meta))
+                .unwrap_or_else(|_| persisted_v2_serialization_fallback(true));
+        if compact.len() < max_bytes {
+            return compact;
+        }
+        return persisted_v2_serialization_fallback(true);
+    }
+
+    let envelope = ToolResultEnvelope::success(Value::String(String::new()), bounded_meta.clone());
+    let mut best = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| persisted_v2_serialization_fallback(true));
+    if best.len() >= max_bytes {
+        return persisted_v2_serialization_fallback(true);
+    }
+    let mut boundaries = data_text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(data_text.len());
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let envelope = ToolResultEnvelope::success(
+            Value::String(truncate_utf8_bytes(data_text, boundaries[mid])),
+            bounded_meta.clone(),
+        );
+        let candidate = serde_json::to_string(&envelope).unwrap_or_else(|_| best.clone());
+        if candidate.len() < max_bytes {
+            best = candidate;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    best
+}
+
+fn persisted_v2_serialization_fallback(truncated: bool) -> String {
+    let mut meta = ToolResultMeta::new("other", "serialization", 0);
+    meta.truncated = truncated;
+    serde_json::to_string(&ToolResultEnvelope::failure(
+        ToolError::internal("tool_internal_error", "Tool execution failed"),
+        meta,
+    ))
+    .expect("static V2 persistence fallback is serializable")
+}
+
+fn stable_error_message(error: &ToolError) -> String {
+    error.public_message()
+}
+
+fn merge_display_summary_and_duration(
+    display: Option<Value>,
+    fallback_summary: String,
+    duration_ms: u64,
+) -> Value {
+    let mut fields = match display {
+        Some(Value::Object(fields)) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let summary = fields
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or(&fallback_summary);
+    fields.insert(
+        "summary".into(),
+        Value::String(truncate_utf8_bytes(summary, TOOL_DISPLAY_SUMMARY_BYTES)),
+    );
+    fields.insert("duration_ms".into(), Value::from(duration_ms));
+    Value::Object(fields)
+}
+
+pub(crate) fn record_native_tool_argument_repair(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    repair_kind: &str,
+) {
+    let repair_kind = match repair_kind {
+        "json_repair"
+        | "trailing_comma"
+        | "missing_closing_delimiter"
+        | "trailing_comma_and_missing_closing_delimiter"
+        | "lossless_integer"
+        | "lossless_boolean"
+        | "path_resolution" => repair_kind,
+        _ => "other",
+    };
+    telemetry.count(
+        "native.tool.argument_repair",
+        vec![("repair_kind", repair_kind.to_string())],
+    );
+}
+
+fn record_native_tool_call_metrics(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    tool_name: &str,
+    tool_kind: &str,
+    ok: bool,
+    error_code: Option<&str>,
+    duration_ms: u64,
+) {
+    let family = safe_tool_family(tool_name, tool_kind);
+    let facade = safe_tool_facade(tool_name);
+    let outcome = if ok { "success" } else { "error" };
+    let error_code = error_code.map(stable_metric_error_code).unwrap_or("none");
+    telemetry.count(
+        "native.tool.call",
+        vec![
+            ("tool_family", family.to_string()),
+            ("facade", facade.to_string()),
+            ("outcome", outcome.to_string()),
+            ("error_code", error_code.to_string()),
+        ],
+    );
+    telemetry.record(
+        "native.tool.duration_ms",
+        duration_ms as f64,
+        vec![
+            ("tool_family", family.to_string()),
+            ("outcome", outcome.to_string()),
+        ],
+    );
+}
+
+fn safe_tool_family(tool_name: &str, tool_kind: &str) -> &'static str {
+    if tool_name.starts_with("mcp__") {
+        "mcp"
+    } else if tool_name.starts_with("extension__") || tool_name.starts_with("ext__") {
+        "extension"
+    } else if !is_builtin_metric_tool(tool_name) {
+        "other"
+    } else {
+        match tool_kind {
+            "read" => "read",
+            "edit" => "edit",
+            "search" => "search",
+            "execute" => "execute",
+            "fetch" => "fetch",
+            _ => "other",
+        }
+    }
+}
+
+fn safe_tool_facade(tool_name: &str) -> &'static str {
+    if tool_name.starts_with("mcp__") {
+        "mcp"
+    } else if tool_name.starts_with("extension__") || tool_name.starts_with("ext__") {
+        "extension"
+    } else if is_builtin_metric_tool(tool_name) {
+        "builtin"
+    } else {
+        "other"
+    }
+}
+
+fn is_builtin_metric_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read"
+            | "ls"
+            | "write"
+            | "edit"
+            | "glob"
+            | "grep"
+            | "bash"
+            | "todowrite"
+            | "todoread"
+            | "webfetch"
+            | "websearch"
+            | "skill"
+            | "memory"
+            | "memory_add"
+            | "memory_replace"
+            | "memory_remove"
+            | "memory_batch"
+            | "revert"
+            | "lsp"
+            | "task"
+            | "delegate_agent"
+            | "session_search"
+            | "exitplanmode"
+            | "askuserquestion"
+            | "app_jobs"
+            | "app_projects"
+            | "clarify"
+            | LOAD_TOOLS_NAME
+    )
+}
+
+fn stable_metric_error_code(code: &str) -> &'static str {
+    match code {
+        "tool_not_found" => "tool_not_found",
+        "capability_unavailable" => "capability_unavailable",
+        "tool_not_in_plan" => "tool_not_in_plan",
+        "invalid_input" => "invalid_input",
+        "permission_denied" => "permission_denied",
+        "cancelled" => "cancelled",
+        "hook_denied" => "hook_denied",
+        "tool_internal_error" => "tool_internal_error",
+        "tool_failed" => "tool_failed",
+        _ => "other",
+    }
+}
+
+fn error_category_label(category: ToolErrorCategory) -> &'static str {
+    match category {
+        ToolErrorCategory::Caller => "caller",
+        ToolErrorCategory::Precondition => "precondition",
+        ToolErrorCategory::Conflict => "conflict",
+        ToolErrorCategory::Permission => "permission",
+        ToolErrorCategory::Transient => "transient",
+        ToolErrorCategory::Timeout => "timeout",
+        ToolErrorCategory::Cancelled => "cancelled",
+        ToolErrorCategory::Internal => "internal",
+    }
+}
+
+fn record_native_tool_plan_metric(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    version: NativeToolsVersion,
+    profile: Option<&ToolCapabilityProfile>,
+) {
+    let (interaction_mode, capability_source) = match profile {
+        Some(profile) => (
+            match profile.interaction_mode {
+                ToolInteractionMode::DirectFunctions => "direct_functions",
+                ToolInteractionMode::CodeOrchestrator => "code_orchestrator",
+                ToolInteractionMode::Hybrid => "hybrid",
+            },
+            match profile.capability_source {
+                super::capabilities::CapabilitySource::TransportDefault => "transport_default",
+                super::capabilities::CapabilitySource::ExplicitOverride => "explicit_override",
+            },
+        ),
+        None => ("legacy", "legacy"),
+    };
+    telemetry.count(
+        "native.tool.plan",
+        vec![
+            ("version", version.as_str().to_string()),
+            ("interaction_mode", interaction_mode.to_string()),
+            ("capability_source", capability_source.to_string()),
+        ],
+    );
+}
+
 /// Patch the tool_call row with its output + terminal status, then re-emit the
 /// merged row with its ORIGINAL seq (the UI upserts by `tool_call_id`).
+#[cfg(test)]
 async fn finish_tool_row(deps: &RunnerDeps, tool_call_id: &str, output: &str, is_error: bool) {
     finish_tool_row_with_display(deps, tool_call_id, output, is_error, None).await;
 }
@@ -2590,20 +4017,6 @@ async fn finish_tool_row_with_display(
 /// Milliseconds elapsed since `started`, saturating into a JSON-safe u64.
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Fold the measured duration into a tool's display extras (`{"summary": …}`,
-/// `{"exit_code": …}`, …). The result is json_patch-merged into the persisted
-/// tool_call payload by [`finish_tool_row_with_display`], so `duration_ms`
-/// and the other extras survive session hydration. Non-object extras are
-/// discarded — a scalar would corrupt the payload merge.
-fn merge_display_duration(display: Option<Value>, duration_ms: u64) -> Value {
-    let mut extras = match display {
-        Some(Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    extras.insert("duration_ms".to_string(), Value::from(duration_ms));
-    Value::Object(extras)
 }
 
 /// Flush any buffered streaming text as one delta-shaped `text` row (only when
@@ -2970,16 +4383,46 @@ struct ToolAccum {
     name: String,
     start_input: Value,
     input_json: String,
+    input_overflowed: bool,
 }
 
 impl ToolAccum {
-    /// The tool input: the streamed `input_json` if present, else the object
-    /// carried on the `content_block_start`.
-    fn parsed_input(&self) -> Value {
+    fn legacy_input(&self) -> Value {
         if self.input_json.trim().is_empty() {
             return self.start_input.clone();
         }
         serde_json::from_str(&self.input_json).unwrap_or_else(|_| self.start_input.clone())
+    }
+
+    fn wire_call(self) -> WireToolCall {
+        WireToolCall::from_owned(
+            self.id,
+            self.name,
+            self.start_input,
+            self.input_json,
+            self.input_overflowed,
+        )
+    }
+
+    fn push_input_delta(&mut self, partial: &str, version: NativeToolsVersion) {
+        if version == NativeToolsVersion::V1 {
+            self.input_json.push_str(partial);
+            return;
+        }
+        if self.input_overflowed {
+            return;
+        }
+        let remaining = MAX_RAW_ARGUMENT_BYTES.saturating_sub(self.input_json.len());
+        if partial.len() <= remaining {
+            self.input_json.push_str(partial);
+            return;
+        }
+        let mut boundary = remaining.min(partial.len());
+        while boundary > 0 && !partial.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        self.input_json.push_str(&partial[..boundary]);
+        self.input_overflowed = true;
     }
 }
 
@@ -3163,15 +4606,686 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use crate::domain::CoreEvent;
+    use crate::harness::native::capabilities::{
+        CapabilitySource, NativeToolsVersion, RuntimeToolSurfaces, ToolCapabilityProfile,
+        ToolInteractionMode, TransportToolCapabilities, WireProtocol,
+    };
+    use crate::harness::native::tool_contract::{
+        AvailabilityProbe, ToolDescriptor, ToolFieldError, MAX_TOOL_ERROR_FIELD_ERRORS,
+    };
     use async_trait::async_trait;
     use serial_test::serial;
 
     struct StaticMcpCaller;
 
+    struct SnapshotWindowMutator {
+        target: std::path::PathBuf,
+        replacement: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SnapshotTaker for SnapshotWindowMutator {
+        async fn take(&self, work_dir: &std::path::Path) -> Option<String> {
+            let snapshot = super::super::snapshot::take(work_dir).await;
+            std::fs::write(&self.target, self.replacement).unwrap();
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            snapshot
+        }
+    }
+
     struct BlockingTool {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct CancellationAwareTool {
+        started: Arc<tokio::sync::Notify>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct V2RecordingLlm {
+        inner: RecordingLlm,
+        capabilities: TransportToolCapabilities,
+        capability_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl V2RecordingLlm {
+        fn new(turns: Vec<Vec<crate::llm_router::client::AnthropicEvent>>) -> Self {
+            Self {
+                inner: RecordingLlm::new(turns),
+                capabilities: TransportToolCapabilities {
+                    wire_protocol: WireProtocol::OpenAiResponses,
+                    supports_function_tools: true,
+                    supports_custom_freeform_tools: false,
+                    supports_parallel_tool_calls: true,
+                    supports_strict_function_schema: true,
+                    supports_tool_output_schema: true,
+                    schema_budget_tokens: 16_000,
+                },
+                capability_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn bodies(&self) -> Vec<Value> {
+            self.inner.bodies.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmStream for V2RecordingLlm {
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            self.inner.stream(request).await
+        }
+
+        async fn transport_tool_capabilities(
+            &self,
+            _policy: &TurnEffortPolicy,
+        ) -> anyhow::Result<TransportToolCapabilities> {
+            self.capability_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.capabilities)
+        }
+    }
+
+    struct FailingV2Llm {
+        capabilities: TransportToolCapabilities,
+    }
+
+    #[async_trait]
+    impl LlmStream for FailingV2Llm {
+        async fn stream(&self, _request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            anyhow::bail!("transport failed before response")
+        }
+
+        async fn transport_tool_capabilities(
+            &self,
+            _policy: &TurnEffortPolicy,
+        ) -> anyhow::Result<TransportToolCapabilities> {
+            Ok(self.capabilities)
+        }
+    }
+
+    struct ContractTool {
+        name: String,
+        description: String,
+        probe_count: std::sync::atomic::AtomicUsize,
+        unavailable_after_first_probe: bool,
+        hard_unavailable: bool,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct PolicyGroupContractTool {
+        name: String,
+        alias: String,
+        typed_members: Option<Vec<String>>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct GatewayCounters {
+        normalize: std::sync::atomic::AtomicUsize,
+        preflight: std::sync::atomic::AtomicUsize,
+        permission: std::sync::atomic::AtomicUsize,
+        execute: std::sync::atomic::AtomicUsize,
+    }
+
+    struct GatewayTool {
+        name: String,
+        schema: Value,
+        counters: Arc<GatewayCounters>,
+        shared_state: Arc<std::sync::atomic::AtomicUsize>,
+        expected_preflight_state: Option<usize>,
+        state_after_execute: Option<usize>,
+        file_after_execute: Option<std::path::PathBuf>,
+    }
+
+    struct FilePreflightSpyTool {
+        name: String,
+        expected: super::super::file_reference::ExpectedFileKind,
+        counters: Arc<GatewayCounters>,
+        mutation: std::path::PathBuf,
+        retarget_parent: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_directory_symlink_for_runner_test(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+        if let Err(error) = result {
+            eprintln!("skipping runner directory symlink case: {error}");
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn retarget_directory_symlink_for_runner_test(
+        link: &std::path::Path,
+        target: &std::path::Path,
+    ) {
+        #[cfg(unix)]
+        std::fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap();
+        assert!(create_directory_symlink_for_runner_test(target, link));
+    }
+
+    struct StatefulContractNormalizer {
+        name: String,
+        description: String,
+        rewrite: bool,
+        normalizations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct CapturingV1InputTool {
+        received: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for CapturingV1InputTool {
+        fn name(&self) -> &str {
+            "v1_large_input_spy"
+        }
+
+        fn description(&self) -> &str {
+            "Captures a large legacy argument object."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("v1-large", "v1 large input")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.received.lock().unwrap().push(input);
+            Ok(crate::harness::native::tools::ToolOutput::ok("captured"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for StatefulContractNormalizer {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn normalize_input(
+            &self,
+            _ctx: &ToolInputCtx<'_>,
+            mut input: Value,
+        ) -> Result<super::super::tool_contract::NormalizedInput, ToolError> {
+            self.normalizations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.rewrite {
+                input["path"] = json!("rewritten-by-changed-contract");
+                super::super::tool_contract::NormalizedInput::changed(input).with_metadata(
+                    ToolMetadataEntry::Coercion(
+                        super::super::tool_contract::ToolMetadataToken::LosslessBoolean,
+                    ),
+                )
+            } else {
+                Ok(super::super::tool_contract::NormalizedInput::unchanged(
+                    input,
+                ))
+            }
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("contract-test", "contract test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            unreachable!("changed contracts must be rejected during batch validation")
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for GatewayTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "argument gateway test tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            self.schema.clone()
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn normalize_input(
+            &self,
+            _ctx: &ToolInputCtx<'_>,
+            input: Value,
+        ) -> Result<super::super::tool_contract::NormalizedInput, ToolError> {
+            self.counters
+                .normalize
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::super::tool_contract::NormalizedInput::unchanged(
+                input,
+            ))
+        }
+
+        async fn preflight(
+            &self,
+            _ctx: &ToolInputCtx<'_>,
+            _input: &Value,
+            _pinned_file_reference: Option<
+                &crate::harness::native::file_reference::PinnedFileTarget,
+            >,
+        ) -> Result<super::super::tool_contract::PreflightMeta, ToolError> {
+            self.counters
+                .preflight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(expected) = self.expected_preflight_state {
+                assert_eq!(
+                    self.shared_state.load(std::sync::atomic::Ordering::SeqCst),
+                    expected,
+                    "preflight must observe state left by the preceding sibling"
+                );
+            }
+            Ok(super::super::tool_contract::PreflightMeta::default())
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            self.counters
+                .permission
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::harness::native::tools::PermissionSpec::new("gateway-test", "gateway test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.counters
+                .execute
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(state) = self.state_after_execute {
+                self.shared_state
+                    .store(state, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(path) = &self.file_after_execute {
+                std::fs::write(path, "handler-ran")?;
+            }
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for FilePreflightSpyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "file preflight ordering spy"
+        }
+
+        fn input_schema(&self) -> Value {
+            gateway_path_schema()
+        }
+
+        fn kind(&self) -> &'static str {
+            "edit"
+        }
+
+        fn normalize_input(
+            &self,
+            ctx: &ToolInputCtx<'_>,
+            input: Value,
+        ) -> Result<super::super::tool_contract::NormalizedInput, ToolError> {
+            self.counters
+                .normalize
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::caller("invalid_path_reference", "Path is required"))?;
+            let target = super::super::file_reference::resolve_workspace_reference(ctx, path)?;
+            super::super::file_reference::normalize_resolved_path(input, &target)
+        }
+
+        async fn preflight(
+            &self,
+            ctx: &ToolInputCtx<'_>,
+            _input: &Value,
+            pinned_file_reference: Option<&super::super::file_reference::PinnedFileTarget>,
+        ) -> Result<super::super::tool_contract::PreflightMeta, ToolError> {
+            self.counters
+                .preflight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let target = pinned_file_reference.ok_or_else(|| {
+                ToolError::precondition("invalid_path_reference", "File target is not pinned")
+            })?;
+            #[cfg(any(unix, windows))]
+            if let Some((link, destination)) = &self.retarget_parent {
+                return Err(
+                    super::super::file_reference::missing_path_error_after_resolution_for_test(
+                        ctx,
+                        target,
+                        self.expected,
+                        || {
+                            retarget_directory_symlink_for_runner_test(link, destination);
+                        },
+                    )
+                    .await,
+                );
+            }
+            super::super::tool_contract::PreflightMeta::default().with_prepared_file_target(
+                super::super::file_reference::preflight_file_target(ctx, target, self.expected)
+                    .await?,
+            )
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            self.counters
+                .permission
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::harness::native::tools::PermissionSpec::new("edit", "file preflight spy")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.counters
+                .execute
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(&self.mutation, "handler-ran")?;
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    impl ContractTool {
+        fn available(
+            name: &str,
+            description: &str,
+        ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    description: description.into(),
+                    probe_count: std::sync::atomic::AtomicUsize::new(0),
+                    unavailable_after_first_probe: false,
+                    hard_unavailable: false,
+                    effects: effects.clone(),
+                }),
+                effects,
+            )
+        }
+
+        fn unavailable(
+            name: &str,
+            description: &str,
+            transient_after_first: bool,
+        ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    description: description.into(),
+                    probe_count: std::sync::atomic::AtomicUsize::new(0),
+                    unavailable_after_first_probe: transient_after_first,
+                    hard_unavailable: !transient_after_first,
+                    effects: effects.clone(),
+                }),
+                effects,
+            )
+        }
+    }
+
+    impl PolicyGroupContractTool {
+        fn new(
+            name: &str,
+            alias: &str,
+            typed_members: Option<Vec<String>>,
+        ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    alias: alias.into(),
+                    typed_members,
+                    effects: effects.clone(),
+                }),
+                effects,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for ContractTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor::conservative(
+                self.name(),
+                self.description(),
+                self.input_schema(),
+                self.kind(),
+            )
+        }
+
+        async fn probe_availability(&self) -> AvailabilityProbe {
+            let probe = self
+                .probe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hard_unavailable || (self.unavailable_after_first_probe && probe > 0) {
+                AvailabilityProbe::Unavailable {
+                    code: "dependency_down".into(),
+                    transient: self.unavailable_after_first_probe,
+                }
+            } else {
+                AvailabilityProbe::Available
+            }
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("contract-test", "contract test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for PolicyGroupContractTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "policy group contract fixture"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            let mut descriptor = ToolDescriptor::conservative(
+                self.name(),
+                self.description(),
+                self.input_schema(),
+                self.kind(),
+            );
+            descriptor.policy_aliases = vec![self.alias.clone()];
+            if let Some(members) = &self.typed_members {
+                descriptor.policy_groups =
+                    vec![crate::harness::native::tool_contract::ToolPolicyGroup {
+                        alias: self.alias.clone(),
+                        members: members.clone(),
+                    }];
+            }
+            descriptor
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new(
+                "policy-group-test",
+                "policy group test",
+            )
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    fn direct_profile() -> ToolCapabilityProfile {
+        ToolCapabilityProfile {
+            interaction_mode: ToolInteractionMode::DirectFunctions,
+            wire_protocol: WireProtocol::OpenAiResponses,
+            supports_custom_freeform_tools: false,
+            supports_parallel_tool_calls: true,
+            supports_strict_function_schema: true,
+            supports_tool_output_schema: true,
+            schema_budget_tokens: 16_000,
+            supports_prompt_cache: true,
+            capability_source: CapabilitySource::TransportDefault,
+            capability_schema_version:
+                crate::harness::native::capabilities::CAPABILITY_SCHEMA_VERSION,
+        }
+    }
+
+    fn gateway_path_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+
+    fn gateway_tool(
+        name: &str,
+        schema: Value,
+        counters: Arc<GatewayCounters>,
+        shared_state: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<GatewayTool> {
+        Arc::new(GatewayTool {
+            name: name.into(),
+            schema,
+            counters,
+            shared_state,
+            expected_preflight_state: None,
+            state_after_execute: None,
+            file_after_execute: None,
+        })
+    }
+
+    fn enable_v2(deps: &mut RunnerDeps) {
+        deps.native_tools_version = NativeToolsVersion::V2;
+        deps.native_tool_runtime_surfaces = RuntimeToolSurfaces::direct_only();
+        deps.native_tool_override_mode = None;
+    }
+
+    fn commit_snapshot_fixture(dir: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "native-tools@example.test"],
+            vec!["config", "user.name", "Native Tools Tests"],
+            vec!["config", "core.autocrlf", "false"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        }
     }
 
     #[async_trait]
@@ -3250,6 +5364,43 @@ mod tests {
                 selection: test_route_selection(),
                 events: rx,
             })
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for CancellationAwareTool {
+        fn name(&self) -> &str {
+            "cancel_aware"
+        }
+
+        fn description(&self) -> &str {
+            "Waits for cancellation and returns a legacy handler error."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": false})
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("cancel-aware", "cancel test")
+        }
+
+        async fn execute(
+            &self,
+            ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.started.notify_one();
+            ctx.cancel.cancelled().await;
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::error(
+                "os error 267: provider cancellation bearer-secret",
+            ))
         }
     }
 
@@ -3445,17 +5596,22 @@ mod tests {
             project_id: None,
             perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
             store,
+            telemetry: Arc::new(crate::telemetry::NoopTelemetry),
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
             llm,
             tools: Arc::new(ToolRegistry::builtin()),
+            native_tools_version: NativeToolsVersion::V1,
+            native_tool_runtime_surfaces: RuntimeToolSurfaces::direct_only(),
+            native_tool_override_mode: None,
             agent,
             agents,
             commands: Arc::new(CommandRegistry::builtin()),
             allowed_skills: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            snapshot_taker: Arc::new(GitSnapshotTaker),
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
             app_control: None,
@@ -3712,9 +5868,18 @@ mod tests {
         reason: &'static str,
     }
 
+    #[derive(Default)]
+    struct RecordingExtensionEvents {
+        calls: std::sync::Mutex<Vec<(crate::harness::native::hooks::HookEvent, serde_json::Value)>>,
+    }
+
     struct BlockingAutomationSink {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    struct RecordingAutomationSink {
+        observed: tokio::sync::mpsc::UnboundedSender<(crate::automation::TriggerKind, Value)>,
     }
 
     #[async_trait::async_trait]
@@ -3735,6 +5900,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl crate::automation::AutomationEventSink for RecordingAutomationSink {
+        async fn observe_lifecycle(
+            &self,
+            trigger: crate::automation::TriggerKind,
+            _session_pk: String,
+            data: Value,
+        ) {
+            let _ = self.observed.send((trigger, data));
+        }
+    }
+
+    #[async_trait::async_trait]
     impl crate::plugins::extension::ExtensionEvents for FixedExtensionEvents {
         async fn dispatch(
             &self,
@@ -3749,6 +5926,18 @@ mod tests {
             } else {
                 crate::harness::native::hooks::HookResult::allow()
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::plugins::extension::ExtensionEvents for RecordingExtensionEvents {
+        async fn dispatch(
+            &self,
+            event: crate::harness::native::hooks::HookEvent,
+            payload: &Value,
+        ) -> crate::harness::native::hooks::HookResult {
+            self.calls.lock().unwrap().push((event, payload.clone()));
+            crate::harness::native::hooks::HookResult::allow()
         }
     }
 
@@ -5721,8 +7910,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_display_duration_folds_duration_into_existing_extras() {
-        let merged = merge_display_duration(Some(json!({ "summary": "todos: 1/2 done" })), 1234);
+    fn merge_display_summary_and_duration_preserves_existing_summary() {
+        let merged = merge_display_summary_and_duration(
+            Some(json!({ "summary": "todos: 1/2 done" })),
+            "fallback".into(),
+            1234,
+        );
         assert_eq!(
             merged,
             json!({ "summary": "todos: 1/2 done", "duration_ms": 1234 })
@@ -5730,12 +7923,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_display_duration_handles_missing_or_non_object_extras() {
-        assert_eq!(merge_display_duration(None, 7), json!({ "duration_ms": 7 }));
+    fn merge_display_summary_and_duration_handles_missing_or_non_object_extras() {
+        assert_eq!(
+            merge_display_summary_and_duration(None, "done".into(), 7),
+            json!({ "summary": "done", "duration_ms": 7 })
+        );
         // A non-object display value would corrupt the json_patch — drop it.
         assert_eq!(
-            merge_display_duration(Some(json!("junk")), 7),
-            json!({ "duration_ms": 7 })
+            merge_display_summary_and_duration(Some(json!("junk")), "done".into(), 7),
+            json!({ "summary": "done", "duration_ms": 7 })
         );
     }
 
@@ -5794,20 +7990,41 @@ mod tests {
     #[test]
     fn effective_child_filter_intersects_and_blocks() {
         use super::super::agents::ToolFilter;
-        let names: Vec<String> = ["read", "bash", "task", "memory", "grep"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let registry = ToolRegistry::builtin();
         let parent = ToolFilter::Only(vec!["read".into(), "task".into(), "bash".into()]);
-        let eff = effective_child_filter(&parent, &ToolFilter::All, &names, SUBAGENT_BLOCKLIST);
+        let eff = effective_child_filter(&parent, &ToolFilter::All, &registry, SUBAGENT_BLOCKLIST);
         assert!(eff.allows("read") && eff.allows("bash"));
         assert!(!eff.allows("task"), "blocklist wins over parent allow");
         assert!(!eff.allows("memory"));
         assert!(!eff.allows("grep"), "parent filter constrains the child");
         // All ∩ All − blocklist keeps everything else.
-        let eff = effective_child_filter(&ToolFilter::All, &ToolFilter::All, &names, &["memory"]);
+        let eff =
+            effective_child_filter(&ToolFilter::All, &ToolFilter::All, &registry, &["memory"]);
         assert!(eff.allows("task") && eff.allows("read"));
-        assert!(!eff.allows("memory"));
+        for blocked in [
+            "memory",
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert!(
+                !eff.allows(blocked),
+                "policy-key block must exclude {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_memory_metric_facades_are_bounded_builtins() {
+        for name in [
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert_eq!(safe_tool_facade(name), "builtin", "{name}");
+        }
     }
 
     #[test]
@@ -5967,6 +8184,1996 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_drive_reuses_one_facade_and_freezes_only_after_valid_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool_name = "contract_counter";
+        let (tool, effects) = ContractTool::available(tool_name, "stable contract");
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "call-1", tool_name),
+                input_json_delta(0, "{}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec![tool_name.into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["tools"], bodies[1]["tools"]);
+        assert!(bodies[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|definition| definition["name"] != LOAD_TOOLS_NAME));
+        assert_eq!(
+            llm.capability_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one drive resolves typed transport capabilities once"
+        );
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(deps
+            .store
+            .get_native_tool_plan(&deps.run_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn v1_large_streamed_arguments_reach_the_handler_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "v".repeat(MAX_RAW_ARGUMENT_BYTES + 1024);
+        let input = json!({"content": content});
+        let streamed = serde_json::to_string(&input).unwrap();
+        assert!(streamed.len() > MAX_RAW_ARGUMENT_BYTES);
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "v1-large-call", "v1_large_input_spy"),
+                input_json_delta(0, &streamed),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(
+            CapturingV1InputTool {
+                received: received.clone(),
+            },
+        )]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["v1_large_input_spy".into()]);
+        assert_eq!(deps.native_tools_version, NativeToolsVersion::V1);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let captured = received.lock().unwrap();
+        assert_eq!(captured.as_slice(), &[input]);
+        assert_eq!(
+            captured[0]["content"].as_str().unwrap().as_bytes(),
+            content.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_have_no_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let would_write = dir.path().join("handler-ran.txt");
+        let counters = Arc::new(GatewayCounters::default());
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tool = GatewayTool {
+            name: "gateway_invalid".into(),
+            schema: gateway_path_schema(),
+            counters: counters.clone(),
+            shared_state: state,
+            expected_preflight_state: None,
+            state_after_execute: None,
+            file_after_execute: Some(would_write.clone()),
+        };
+        tool.state_after_execute = Some(1);
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "invalid-1", "gateway_invalid"),
+                input_json_delta(0, r#"{"path":"private-token","unexpected":"raw-secret"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(tool)]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_invalid".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.normalize.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.preflight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(hook_calls.calls.lock().unwrap().is_empty());
+        assert!(deps.snapshots.lock().await.is_empty());
+        assert!(!would_write.exists());
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let tool_use = turns
+            .iter()
+            .find(|turn| turn.role == "assistant" && turn.payload[0]["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(
+            tool_use.payload[0]["input"],
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "invalid_arguments");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let tool_row = rows
+            .iter()
+            .find(|message| message.block_type == "tool_call")
+            .unwrap();
+        assert_eq!(
+            tool_row.payload["input"],
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        let persisted = serde_json::to_string(&(turns, rows)).unwrap();
+        assert!(!persisted.contains("private-token"));
+        assert!(!persisted.contains("raw-secret"));
+    }
+
+    #[tokio::test]
+    async fn v2_file_preflight_rejection_precedes_hooks_permission_snapshot_and_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".git");
+        let mutation = dir.path().join("handler-mutation.txt");
+        std::fs::write(&target, "requested-file-secret").unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = Arc::new(FilePreflightSpyTool {
+            name: "file_preflight_spy".into(),
+            expected: super::super::file_reference::ExpectedFileKind::Directory,
+            counters: counters.clone(),
+            mutation: mutation.clone(),
+            retarget_parent: None,
+        });
+        let input = serde_json::to_string(&json!({"path": target})).unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "preflight-wrong-kind", "file_preflight_spy"),
+                input_json_delta(0, &input),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        let telemetry = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = telemetry.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["file_preflight_spy".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.normalize.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters.preflight.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(hook_calls.calls.lock().unwrap().is_empty());
+        assert!(deps.snapshots.lock().await.is_empty());
+        assert!(!mutation.exists());
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "expected_directory");
+        assert_eq!(envelope["error"]["details"]["actual_kind"], "file");
+        assert_eq!(envelope["error"]["details"]["suggested_tool"], "read");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let rendered = serde_json::to_string(&(turns, rows)).unwrap();
+        let telemetry = telemetry.lock().unwrap().join("\n");
+        let host_root = dir.path().to_string_lossy();
+        for unsafe_text in ["os error 267", "requested-file-secret", host_root.as_ref()] {
+            assert!(
+                !rendered.contains(unsafe_text),
+                "persisted leak: {unsafe_text}"
+            );
+            assert!(
+                !telemetry.contains(unsafe_text),
+                "telemetry leak: {unsafe_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_missing_file_candidate_is_advisory_and_requested_path_stays_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("apps/cockpit/src");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("store-navigation.test.ts"), "candidate-secret").unwrap();
+        let requested = "apps/cockpit/src/store-navigation.ts";
+        let mutation = dir.path().join("must-not-run");
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = Arc::new(FilePreflightSpyTool {
+            name: "missing_file_preflight_spy".into(),
+            expected: super::super::file_reference::ExpectedFileKind::File,
+            counters: counters.clone(),
+            mutation: mutation.clone(),
+            retarget_parent: None,
+        });
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "preflight-missing", "missing_file_preflight_spy"),
+                input_json_delta(
+                    0,
+                    &serde_json::to_string(&json!({"path": requested})).unwrap(),
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let hooks = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hooks.clone());
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["missing_file_preflight_spy".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "path_not_found");
+        assert_eq!(
+            envelope["error"]["details"]["effective_root"],
+            "worktree/apps/cockpit/src"
+        );
+        assert_eq!(
+            envelope["error"]["candidates"][0],
+            json!({
+                "path": "apps/cockpit/src/store-navigation.test.ts",
+                "kind": "file"
+            })
+        );
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|message| message.block_type == "tool_call")
+            .unwrap();
+        assert_eq!(row.payload["input"]["path"], requested);
+        assert!(!parent.join("store-navigation.ts").exists());
+        assert!(hooks.calls.lock().unwrap().is_empty());
+        assert!(deps.snapshots.lock().await.is_empty());
+        assert!(!mutation.exists());
+        assert_eq!(
+            counters.normalize.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters.preflight.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(!serde_json::to_string(&(turns, rows))
+            .unwrap()
+            .contains("candidate-secret"));
+    }
+
+    #[tokio::test]
+    async fn v2_edit_post_approval_race_has_no_snapshot_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old still unique\n").unwrap();
+        commit_snapshot_fixture(dir.path());
+
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-race", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"old","new_string":"new","replace_all":null}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.set_perm_mode(PermMode::Default);
+        enable_v2(&mut deps);
+        let mut events = deps.events.subscribe();
+        let approvals = deps.approvals.clone();
+        let raced = "prefix old still unique\n";
+        let raced_target = target.clone();
+        let approval = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let CoreEvent::ApprovalRequested {
+                        run_id, request_id, ..
+                    } = events.recv().await.unwrap()
+                    {
+                        std::fs::write(&raced_target, raced).unwrap();
+                        assert!(approvals.resolve_bool(
+                            &crate::approval::ApprovalKey::new(run_id, request_id),
+                            true
+                        ));
+                        break;
+                    }
+                }
+            })
+            .await
+        });
+        run_turn(
+            &deps,
+            TurnPrompt::text("edit it", "edit it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let approval_result = approval.await.unwrap();
+        if approval_result.is_err() {
+            let turns = deps
+                .store
+                .list_provider_turns(&deps.session_pk)
+                .await
+                .unwrap();
+            panic!(
+                "edit must reach approval after successful preflight: {}",
+                serde_json::to_string(&turns).unwrap()
+            );
+        }
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), raced);
+        assert!(deps.snapshots.lock().await.is_empty());
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "edit_precondition_changed");
+    }
+
+    #[tokio::test]
+    async fn v2_edit_snapshot_window_race_has_no_snapshot_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old still unique\n").unwrap();
+        commit_snapshot_fixture(dir.path());
+
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-snapshot-race", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"old","new_string":"new","replace_all":null}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let raced = "prefix old still unique\n";
+        deps.snapshot_taker = Arc::new(SnapshotWindowMutator {
+            target: target.clone(),
+            replacement: raced,
+            calls: calls.clone(),
+        });
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("edit it", "edit it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), raced);
+        assert!(deps.snapshots.lock().await.is_empty());
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "edit_precondition_changed");
+    }
+
+    #[tokio::test]
+    async fn v2_edit_ambiguity_precedes_hooks_approval_snapshot_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        let before = "fn first() { target(); }\n\nfn second() { target(); }\n";
+        std::fs::write(&target, before).unwrap();
+        commit_snapshot_fixture(dir.path());
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-ambiguous", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"target();","new_string":"replacement();","replace_all":null}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.set_perm_mode(PermMode::Default);
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        enable_v2(&mut deps);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_turn(
+                &deps,
+                TurnPrompt::text("edit it", "edit it"),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("ambiguous edit must reject before approval")
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+        assert!(hook_calls.calls.lock().unwrap().is_empty());
+        assert!(!deps.approvals.has_pending());
+        assert!(deps.snapshots.lock().await.is_empty());
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "edit_ambiguous");
+        assert_eq!(envelope["error"]["details"]["match_count"], 2);
+        assert_eq!(
+            envelope["error"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate["line"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_edit_replace_all_preserves_crlf_diff_and_snapshot_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old\r\nold\r\n").unwrap();
+        commit_snapshot_fixture(dir.path());
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-replace-all", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"old\n","new_string":"new\n","replace_all":true}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("edit all", "edit all"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\r\nnew\r\n");
+        assert_eq!(deps.snapshots.lock().await.len(), 1);
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["ok"], true);
+        let text = envelope["data"].as_str().unwrap();
+        assert!(text.contains("edited f.txt"));
+        assert!(text.contains("-old"));
+        assert!(text.contains("+new"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn v2_missing_candidate_scan_does_not_persist_retargeted_outside_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(safe.join("inside-only.rs"), "inside-content").unwrap();
+        std::fs::write(outside.path().join("outside-secret.rs"), "outside-content").unwrap();
+        if !create_directory_symlink_for_runner_test(&safe, &alias) {
+            return;
+        }
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = Arc::new(FilePreflightSpyTool {
+            name: "retargeting_file_preflight_spy".into(),
+            expected: super::super::file_reference::ExpectedFileKind::File,
+            counters,
+            mutation: dir.path().join("must-not-run"),
+            retarget_parent: Some((alias, outside.path().to_path_buf())),
+        });
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "retarget-missing", "retargeting_file_preflight_spy"),
+                input_json_delta(0, r#"{"path":"alias/missing.rs"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["retargeting_file_preflight_spy".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let result = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result.payload[0]["content"].as_str().unwrap()).unwrap();
+        let persisted = serde_json::to_string(&(turns, rows)).unwrap();
+
+        assert_eq!(envelope["error"]["code"], "path_not_found");
+        assert_eq!(
+            envelope["error"]["candidates"][0],
+            json!({"path": "alias/inside-only.rs", "kind": "file"})
+        );
+        for outside_value in ["outside-secret.rs", "outside-content"] {
+            assert!(!envelope.to_string().contains(outside_value));
+            assert!(!persisted.contains(outside_value));
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_earlier_write_makes_later_read_preflight_succeed_just_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "jit-write", "write"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"created.txt","content":"created by earlier sibling\n"}"#,
+                ),
+                tool_use_start(1, "jit-read", "read"),
+                input_json_delta(1, r#"{"path":"created.txt","offset":null,"limit":null}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["write".into(), "read".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let results = turns
+            .iter()
+            .find(|turn| {
+                turn.role == "user"
+                    && turn
+                        .payload
+                        .as_array()
+                        .is_some_and(|payload| payload.len() == 2)
+            })
+            .unwrap();
+        let read: Value =
+            serde_json::from_str(results.payload[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(read["ok"], true, "{read}");
+        assert!(read["data"]
+            .as_str()
+            .unwrap()
+            .contains("created by earlier sibling"));
+    }
+
+    #[tokio::test]
+    async fn mixed_valid_and_invalid_tool_calls_keep_ledger_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = gateway_tool(
+            "gateway_mixed",
+            gateway_path_schema(),
+            counters.clone(),
+            state,
+        );
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "mixed-1", "gateway_mixed"),
+                input_json_delta(0, r#"{"path":"a"}"#),
+                tool_use_start(1, "mixed-2", "gateway_mixed"),
+                input_json_delta(1, r#"{"path":2}"#),
+                tool_use_start(2, "mixed-3", "gateway_mixed"),
+                input_json_delta(2, r#"{"path":"c"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_mixed".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let tool_use = turns
+            .iter()
+            .find(|turn| {
+                turn.role == "assistant"
+                    && turn
+                        .payload
+                        .as_array()
+                        .is_some_and(|payload| payload.len() == 3)
+            })
+            .unwrap();
+        assert_eq!(tool_use.payload[0]["id"], "mixed-1");
+        assert_eq!(tool_use.payload[1]["id"], "mixed-2");
+        assert_eq!(tool_use.payload[2]["id"], "mixed-3");
+        assert_eq!(
+            tool_use.payload[1]["input"],
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        let results = turns
+            .iter()
+            .find(|turn| {
+                turn.role == "user"
+                    && turn
+                        .payload
+                        .as_array()
+                        .is_some_and(|payload| payload.len() == 3)
+            })
+            .unwrap();
+        let ids = results
+            .payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["tool_use_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["mixed-1", "mixed-2", "mixed-3"]);
+        let middle: Value =
+            serde_json::from_str(results.payload[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(middle["error"]["code"], "invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn v2_preflight_is_just_in_time_after_earlier_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_counters = Arc::new(GatewayCounters::default());
+        let second_counters = Arc::new(GatewayCounters::default());
+        let schema = json!({
+            "type":"object",
+            "properties":{},
+            "additionalProperties":false
+        });
+        let first = Arc::new(GatewayTool {
+            name: "gateway_first".into(),
+            schema: schema.clone(),
+            counters: first_counters.clone(),
+            shared_state: state.clone(),
+            expected_preflight_state: Some(0),
+            state_after_execute: Some(1),
+            file_after_execute: None,
+        });
+        let second = Arc::new(GatewayTool {
+            name: "gateway_second".into(),
+            schema,
+            counters: second_counters.clone(),
+            shared_state: state.clone(),
+            expected_preflight_state: Some(1),
+            state_after_execute: None,
+            file_after_execute: None,
+        });
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "dependent-1", "gateway_first"),
+                input_json_delta(0, "{}"),
+                tool_use_start(1, "dependent-2", "gateway_second"),
+                input_json_delta(1, "{}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![first, second]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec![
+            "gateway_first".into(),
+            "gateway_second".into(),
+        ]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            first_counters
+                .preflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            second_counters
+                .preflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            second_counters
+                .execute
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_argument_repair_metric_contains_only_fixed_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = gateway_tool(
+            "gateway_repair",
+            gateway_path_schema(),
+            counters,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "repair-1", "gateway_repair"),
+                input_json_delta(0, r#"{"path":"private/path.txt",}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_repair".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let rendered = lines.lock().unwrap().join("\n");
+        assert!(rendered.contains("native.tool.argument_repair"));
+        assert!(rendered.contains("\"repair_kind\":\"trailing_comma\""));
+        assert!(!rendered.contains("private/path.txt"));
+        assert!(!rendered.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn v2_batch_validation_emits_no_telemetry_before_ledger_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = gateway_tool(
+            "gateway_metric_order",
+            gateway_path_schema(),
+            counters,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["gateway_metric_order".into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let calls = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "metric-order-call".into(),
+                name: "gateway_metric_order".into(),
+                start_input: json!({}),
+                input_json: r#"{"path":"private/path.txt",}"#.into(),
+                input_overflowed: false,
+            }],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "batch validation must remain side-effect free before ledger append"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_metrics_emit_only_after_successful_assistant_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let normalizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool: Arc<dyn crate::harness::native::tools::Tool> =
+            Arc::new(StatefulContractNormalizer {
+                name: "telemetry_commit".into(),
+                description: "stable contract".into(),
+                rewrite: true,
+                normalizations,
+            });
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["telemetry_commit".into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "telemetry-commit-call".into(),
+                name: "telemetry_commit".into(),
+                start_input: json!({}),
+                input_json: r#"{"path":"private/path.txt",}"#.into(),
+                input_overflowed: false,
+            }],
+        );
+        assert!(lines.lock().unwrap().is_empty());
+        let content = json!([{
+            "type": "tool_use",
+            "id": calls[0].id(),
+            "name": calls[0].name(),
+            "input": calls[0].ledger_input(),
+        }]);
+        let cfg = ContextConfig::with_meta(deps.meta.clone())
+            .with_native_tools_version(NativeToolsVersion::V2);
+        let mut failing_cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        deps.store
+            .with_conn(|connection| connection.execute_batch("DROP TABLE provider_turns"))
+            .await
+            .unwrap();
+
+        assert!(append_assistant_and_record_v2_metrics(
+            &mut failing_cm,
+            content.clone(),
+            Some(&calls),
+            &deps.telemetry,
+        )
+        .await
+        .is_err());
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "failed assistant append must not leave repair metrics"
+        );
+
+        let mut successful_cm = ContextManager::ephemeral(
+            "telemetry-success",
+            ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(NativeToolsVersion::V2),
+        );
+        append_assistant_and_record_v2_metrics(
+            &mut successful_cm,
+            content,
+            Some(&calls),
+            &deps.telemetry,
+        )
+        .await
+        .unwrap();
+        let rendered = lines.lock().unwrap().join("\n");
+        assert!(rendered.contains("\"repair_kind\":\"trailing_comma\""));
+        assert!(rendered.contains("\"repair_kind\":\"lossless_boolean\""));
+        assert!(!rendered.contains("private/path.txt"));
+    }
+
+    #[tokio::test]
+    async fn v2_oversized_stream_arguments_are_never_persisted_or_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = gateway_tool(
+            "gateway_oversized",
+            gateway_path_schema(),
+            counters.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let prefix = r#"{"path":"secret-over-cap-"#;
+        let suffix = r#""}"#;
+        let raw = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(MAX_RAW_ARGUMENT_BYTES + 1 - prefix.len() - suffix.len())
+        );
+        assert_eq!(raw.len(), MAX_RAW_ARGUMENT_BYTES + 1);
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "oversized-1", "gateway_oversized"),
+                input_json_delta(0, &raw),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_oversized".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let observed = format!(
+            "{}\n{}",
+            serde_json::to_string(&(turns, rows)).unwrap(),
+            lines.lock().unwrap().join("\n")
+        );
+        assert!(!observed.contains("secret-over-cap"));
+        assert!(observed.contains("invalid_arguments"));
+    }
+
+    #[tokio::test]
+    async fn v2_equal_typed_profiles_ignore_opaque_model_identity() {
+        async fn facade(model: &str) -> Vec<Value> {
+            let dir = tempfile::tempdir().unwrap();
+            let (tool, _) = ContractTool::available("identity_free", "identity-free contract");
+            let llm = Arc::new(V2RecordingLlm::new(vec![final_turn("done")]));
+            let mut deps = deps_at(dir.path(), llm.clone()).await;
+            deps.model = Some(model.into());
+            let mut policy = (*deps.turn_effort_policy).clone();
+            policy.requested_model = model.into();
+            deps.turn_effort_policy = Arc::new(policy);
+            deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+            deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["identity_free".into()]);
+            enable_v2(&mut deps);
+            run_turn(
+                &deps,
+                TurnPrompt::text("go", "go"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            llm.bodies()[0]["tools"].as_array().unwrap().clone()
+        }
+
+        assert_eq!(facade("opaque-alpha").await, facade("opaque-beta").await);
+    }
+
+    #[tokio::test]
+    async fn v2_error_event_and_transport_failure_leave_candidate_unfrozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let error_llm = Arc::new(V2RecordingLlm::new(vec![vec![error_event("boom")]]));
+        let mut error_deps = deps_at(dir.path(), error_llm).await;
+        enable_v2(&mut error_deps);
+        assert!(run_turn(
+            &error_deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert!(error_deps
+            .store
+            .get_native_tool_plan(&error_deps.run_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let failing = Arc::new(FailingV2Llm {
+            capabilities: TransportToolCapabilities {
+                wire_protocol: WireProtocol::OpenAiResponses,
+                supports_function_tools: true,
+                supports_custom_freeform_tools: false,
+                supports_parallel_tool_calls: true,
+                supports_strict_function_schema: true,
+                supports_tool_output_schema: true,
+                schema_budget_tokens: 16_000,
+            },
+        });
+        let mut failing_deps = deps_at(dir.path(), failing).await;
+        enable_v2(&mut failing_deps);
+        assert!(run_turn(
+            &failing_deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert!(failing_deps
+            .store
+            .get_native_tool_plan(&failing_deps.run_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_malformed_or_empty_response_events_do_not_freeze_before_error() {
+        let malformed_heads = vec![
+            vec![("message_start".into(), json!({"type": "message_start"}))],
+            vec![(
+                "content_block_delta".into(),
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta"}}),
+            )],
+            vec![(
+                "content_block_delta".into(),
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "thinking_delta", "thinking": ""}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "unknown"}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text"}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "thinking"}}),
+            )],
+            vec![(
+                "content_block_start".into(),
+                json!({"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "redacted_thinking"}}),
+            )],
+        ];
+
+        for (case, mut events) in malformed_heads.into_iter().enumerate() {
+            events.push(error_event("boom after malformed head"));
+            let dir = tempfile::tempdir().unwrap();
+            let llm = Arc::new(V2RecordingLlm::new(vec![events]));
+            let mut deps = deps_at(dir.path(), llm).await;
+            enable_v2(&mut deps);
+
+            assert!(
+                run_turn(
+                    &deps,
+                    TurnPrompt::text("go", "go"),
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+                "case {case} must terminate with the scripted error"
+            );
+            assert!(
+                deps.store
+                    .get_native_tool_plan(&deps.run_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "case {case} must not freeze on a malformed or empty event"
+            );
+        }
+    }
+
+    fn result_text(result: &Value) -> String {
+        result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| result.to_string())
+    }
+
+    #[tokio::test]
+    async fn v1_guessed_split_memory_names_are_rejected_before_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+                    dir.path().to_path_buf(),
+                )),
+                "legacy",
+                Some("p1"),
+            )
+            .unwrap(),
+        ));
+
+        for (name, input) in [
+            (
+                "memory_add",
+                json!({"scope":"global", "text":"guessed add"}),
+            ),
+            (
+                "memory_replace",
+                json!({"scope":"global", "match":"guessed", "text":"guessed replace"}),
+            ),
+            (
+                "memory_remove",
+                json!({"scope":"global", "match":"guessed"}),
+            ),
+            (
+                "memory_batch",
+                json!({"operations":[{"action":"add", "scope":"global", "text":"guessed batch"}]}),
+            ),
+        ] {
+            let result = run_legacy_tool_call(
+                &deps,
+                &deps.agent,
+                &ToolAccum {
+                    id: format!("legacy-{name}"),
+                    name: name.into(),
+                    start_input: input,
+                    input_json: String::new(),
+                    input_overflowed: false,
+                },
+                &DisplayMode::Silent,
+                &None,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(result_text(&result).contains("unknown tool"), "{name}");
+        }
+
+        assert!(
+            deps.memory
+                .as_ref()
+                .unwrap()
+                .load(crate::harness::native::memory::MemoryScope::Global)
+                .await
+                .unwrap()
+                .is_empty(),
+            "guessed V2-only names must have zero side effects"
+        );
+
+        let compatibility = run_legacy_tool_call(
+            &deps,
+            &deps.agent,
+            &ToolAccum {
+                id: "legacy-memory".into(),
+                name: "memory".into(),
+                start_input: json!({
+                    "action":"add",
+                    "scope":"global",
+                    "text":"compatibility remains dispatchable"
+                }),
+                input_json: String::new(),
+                input_overflowed: false,
+            },
+            &DisplayMode::Silent,
+            &None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(!result_text(&compatibility).contains("unknown tool"));
+    }
+
+    async fn dispatch_input_against_plan(
+        deps: &RunnerDeps,
+        plan: &RunToolPlan,
+        name: &str,
+        input: Value,
+    ) -> Value {
+        dispatch_call_against_plan(deps, plan, &format!("call-{name}"), name, input).await
+    }
+
+    async fn dispatch_call_against_plan(
+        deps: &RunnerDeps,
+        plan: &RunToolPlan,
+        id: &str,
+        name: &str,
+        input: Value,
+    ) -> Value {
+        let compiled = match plan {
+            RunToolPlan::FrozenV2(compiled) | RunToolPlan::CandidateV2(compiled) => compiled,
+            RunToolPlan::V1 => panic!("V2 dispatch helper requires a V2 plan"),
+        };
+        let call = validate_v2_batch(
+            deps,
+            compiled,
+            vec![ToolAccum {
+                id: id.into(),
+                name: name.into(),
+                start_input: json!({}),
+                input_json: input.to_string(),
+                input_overflowed: false,
+            }],
+        )
+        .pop()
+        .unwrap();
+        match call {
+            V2BatchCall::Validated(validated) => {
+                run_tool_call(
+                    deps,
+                    &deps.agent,
+                    validated,
+                    &DisplayMode::Silent,
+                    &None,
+                    &CancellationToken::new(),
+                    plan,
+                )
+                .await
+            }
+            V2BatchCall::Rejected(rejected) => {
+                complete_rejected_v2_call(deps, rejected, &DisplayMode::Silent, plan).await
+            }
+        }
+    }
+
+    async fn dispatch_against_plan(deps: &RunnerDeps, plan: &RunToolPlan, name: &str) -> Value {
+        dispatch_input_against_plan(deps, plan, name, json!({})).await
+    }
+
+    #[tokio::test]
+    async fn prior_format_grouped_memory_plan_loads_and_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                deps.agent_knowledge.clone(),
+                "legacy-group-dispatch",
+                None,
+            )
+            .unwrap(),
+        ));
+        let filter = super::super::agents::ToolFilter::Only(vec!["memory".into()]);
+        deps.agent.tools = filter.clone();
+        let candidate = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let legacy_body = crate::harness::native::tool_plan::prior_format_fixture_body(&candidate);
+        let legacy_plan =
+            crate::harness::native::tool_plan::SessionToolPlan::from_body(legacy_body).unwrap();
+        crate::harness::native::tool_plan::freeze_plan(&deps.store, &deps.run_id, &legacy_plan)
+            .await
+            .unwrap();
+        let loaded = crate::harness::native::tool_plan::load_plan(&deps.store, &deps.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let frozen = RunToolPlan::FrozenV2(loaded);
+
+        let result = dispatch_input_against_plan(
+            &deps,
+            &frozen,
+            "memory_add",
+            json!({"scope":"global", "text":"legacy grouped dispatch"}),
+        )
+        .await;
+
+        assert!(
+            !result_text(&result).contains("capability_unavailable"),
+            "legacy frozen contract must dispatch through the current typed group: {result}"
+        );
+        assert_eq!(
+            deps.memory
+                .as_ref()
+                .unwrap()
+                .load(crate::harness::native::memory::MemoryScope::Global)
+                .await
+                .unwrap(),
+            ["legacy grouped dispatch"]
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_unrelated_legacy_group_loads_but_never_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let alias = "forged_legacy_group";
+        let members: Vec<String> =
+            vec!["forged_legacy_first".into(), "forged_legacy_second".into()];
+        let (frozen_first, _) =
+            PolicyGroupContractTool::new(&members[0], alias, Some(members.clone()));
+        let (frozen_second, _) =
+            PolicyGroupContractTool::new(&members[1], alias, Some(members.clone()));
+        let frozen_registry = ToolRegistry::with_extra(vec![frozen_first, frozen_second]);
+        let filter = super::super::agents::ToolFilter::Only(vec![alias.into()]);
+        let candidate = crate::harness::native::tool_plan::compile_candidate(
+            &frozen_registry,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let legacy_body = crate::harness::native::tool_plan::prior_format_fixture_body(&candidate);
+        let legacy_plan =
+            crate::harness::native::tool_plan::SessionToolPlan::from_body(legacy_body).unwrap();
+        crate::harness::native::tool_plan::freeze_plan(&deps.store, &deps.run_id, &legacy_plan)
+            .await
+            .unwrap();
+        let loaded = crate::harness::native::tool_plan::load_plan(&deps.store, &deps.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.plan.body.policy_aliases[alias],
+            crate::harness::native::tool_plan::PolicyAliasTarget::Canonical(alias.into())
+        );
+        let frozen = RunToolPlan::FrozenV2(loaded);
+
+        let (current_first, first_effects) = PolicyGroupContractTool::new(&members[0], alias, None);
+        let (current_second, second_effects) =
+            PolicyGroupContractTool::new(&members[1], alias, None);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            current_first,
+            current_second,
+        ]));
+        deps.agent.tools = filter;
+
+        let result = dispatch_against_plan(&deps, &frozen, &members[0]).await;
+
+        assert!(result_text(&result).contains("capability_unavailable"));
+        assert_eq!(first_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(second_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v2_frozen_dispatch_rejects_missing_unavailable_and_changed_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "frozen_contract";
+        let (original, _) = ContractTool::available(name, "stable contract");
+        let original_registry = ToolRegistry::with_extra(vec![original]);
+        let filter = super::super::agents::ToolFilter::Only(vec![name.into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &original_registry,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let frozen = RunToolPlan::FrozenV2(compiled);
+        deps.agent.tools = filter;
+
+        deps.tools = Arc::new(ToolRegistry::builtin());
+        let missing =
+            dispatch_call_against_plan(&deps, &frozen, "missing-call", name, json!({})).await;
+        assert!(result_text(&missing).contains("capability_unavailable"));
+
+        let unknown = dispatch_against_plan(&deps, &frozen, "not_in_plan").await;
+        assert!(result_text(&unknown).contains("tool_not_in_plan"));
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            1,
+            "the admitted planned call is counted, while an unknown call is not"
+        );
+
+        let (unavailable, unavailable_effects) =
+            ContractTool::unavailable(name, "stable contract", false);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![unavailable]));
+        let unavailable =
+            dispatch_call_against_plan(&deps, &frozen, "unavailable-call", name, json!({})).await;
+        assert!(result_text(&unavailable).contains("capability_unavailable"));
+        assert_eq!(
+            unavailable_effects.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            2,
+            "the validated planned call is admitted even when live availability fails"
+        );
+
+        let (changed, changed_effects) = ContractTool::available(name, "changed contract");
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![changed]));
+        let changed =
+            dispatch_call_against_plan(&deps, &frozen, "changed-call", name, json!({})).await;
+        assert!(result_text(&changed).contains("capability_unavailable"));
+        assert_eq!(changed_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            3,
+            "the changed-contract rejection is counted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_changed_contract_never_normalizes_or_rewrites_the_ledger_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "stateful_contract";
+        let frozen_normalizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frozen_tool: Arc<dyn crate::harness::native::tools::Tool> =
+            Arc::new(StatefulContractNormalizer {
+                name: name.into(),
+                description: "frozen contract".into(),
+                rewrite: false,
+                normalizations: frozen_normalizations,
+            });
+        let frozen_registry = ToolRegistry::with_extra(vec![frozen_tool]);
+        let filter = super::super::agents::ToolFilter::Only(vec![name.into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &frozen_registry,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let changed_normalizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let changed_tool: Arc<dyn crate::harness::native::tools::Tool> =
+            Arc::new(StatefulContractNormalizer {
+                name: name.into(),
+                description: "changed contract".into(),
+                rewrite: true,
+                normalizations: changed_normalizations.clone(),
+            });
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![changed_tool]));
+
+        let call = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "changed-call".into(),
+                name: name.into(),
+                start_input: json!({}),
+                input_json: r#"{"path":"original"}"#.into(),
+                input_overflowed: false,
+            }],
+        )
+        .pop()
+        .unwrap();
+
+        assert_eq!(
+            changed_normalizations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mismatched current contract must not run its normalizer"
+        );
+        assert_eq!(
+            call.ledger_input(),
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        match call {
+            V2BatchCall::Rejected(rejected) => {
+                assert_eq!(rejected.error.code, "capability_unavailable");
+            }
+            V2BatchCall::Validated(validated) => {
+                panic!("changed contract leaked normalized input/metadata: {validated:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_absolute_read_path_is_logical_in_ledger_row_and_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "notes\n").unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = RunToolPlan::FrozenV2(compiled);
+        let host_root = dir.path().to_string_lossy().to_string();
+        let input = format!("{}:1", file.display());
+
+        let result = dispatch_call_against_plan(
+            &deps,
+            &plan,
+            "absolute-read",
+            "read",
+            json!({"path": input, "offset": null, "limit": null}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let tool_row = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("absolute-read"))
+            .unwrap();
+        assert_eq!(
+            tool_row.payload["input"],
+            json!({"path": "notes.txt", "offset": 1})
+        );
+        let hooks = hook_calls.calls.lock().unwrap();
+        let before = hooks
+            .iter()
+            .find(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolBefore)
+            .unwrap();
+        assert_eq!(before.1["input"], json!({"path": "notes.txt", "offset": 1}));
+        let persisted_and_hooked = format!(
+            "{}{}",
+            serde_json::to_string(&rows).unwrap(),
+            serde_json::to_string(&hooks.iter().map(|(_, payload)| payload).collect::<Vec<_>>())
+                .unwrap()
+        );
+        assert!(!persisted_and_hooked.contains(&host_root));
+        assert!(!persisted_and_hooked.contains(r"\\?\"));
+    }
+
+    #[tokio::test]
+    async fn v2_ls_without_path_defaults_to_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("root.txt"), "").unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["ls".into()]);
+        let mut profile = direct_profile();
+        profile.supports_strict_function_schema = false;
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            profile,
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = RunToolPlan::FrozenV2(compiled);
+
+        let result = dispatch_call_against_plan(&deps, &plan, "root-ls", "ls", json!({})).await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert!(result_text(&result).contains("root.txt"), "{result}");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let tool_row = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("root-ls"))
+            .unwrap();
+        assert_eq!(tool_row.payload["input"], json!({"path": "."}));
+    }
+
+    #[tokio::test]
+    async fn v2_pinned_read_rejects_workspace_to_attachment_substitution() {
+        let work = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("notes.txt"), "workspace\n").unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(work.path(), llm).await;
+        deps.attachments_dir = Some(attachments.path().to_path_buf());
+        enable_v2(&mut deps);
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = RunToolPlan::FrozenV2(compiled.clone());
+        let call = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "pinned-read-race".into(),
+                name: "read".into(),
+                start_input: json!({}),
+                input_json: json!({
+                    "path": "notes.txt",
+                    "offset": null,
+                    "limit": null
+                })
+                .to_string(),
+                input_overflowed: false,
+            }],
+        )
+        .pop()
+        .unwrap();
+        let V2BatchCall::Validated(validated) = call else {
+            panic!("read call must validate before the deterministic race")
+        };
+
+        std::fs::remove_file(work.path().join("notes.txt")).unwrap();
+        std::fs::write(attachments.path().join("notes.txt"), "attachment-secret\n").unwrap();
+
+        let result = run_tool_call(
+            &deps,
+            &deps.agent,
+            validated,
+            &DisplayMode::Silent,
+            &None,
+            &CancellationToken::new(),
+            &plan,
+        )
+        .await;
+        let envelope: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "path_not_found");
+        assert_eq!(
+            envelope["error"]["details"],
+            json!({
+                "expected_kind": "file",
+                "effective_root": "worktree"
+            })
+        );
+        assert!(!result.to_string().contains("attachment-secret"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn v2_frozen_dispatch_rejects_expired_last_good_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "expiring_contract";
+        let (tool, effects) = ContractTool::unavailable(name, "stable contract", true);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec![name.into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let result = dispatch_against_plan(&deps, &RunToolPlan::FrozenV2(compiled), name).await;
+        assert!(result_text(&result).contains("capability_unavailable"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v2_tool_outside_frozen_plan_returns_tool_not_in_plan_without_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "outside_plan";
+        let (tool, effects) = ContractTool::available(name, "outside plan");
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::All;
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &super::super::agents::ToolFilter::Only(Vec::new()),
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let result = dispatch_against_plan(&deps, &RunToolPlan::FrozenV2(compiled), name).await;
+        assert!(result_text(&result).contains("tool_not_in_plan"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v2_child_run_resolves_its_own_plan_instead_of_inheriting_parent_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![final_turn("child done")]));
+        let mut parent = deps_at(dir.path(), llm).await;
+        enable_v2(&mut parent);
+        parent.agent.tools = super::super::agents::ToolFilter::All;
+        let RunToolPlan::CandidateV2(parent_plan) =
+            resolve_run_tool_plan(&parent, &parent.agent).await.unwrap()
+        else {
+            panic!("new parent V2 run must compile a candidate")
+        };
+        crate::harness::native::tool_plan::freeze_plan(&parent.store, &parent.run_id, &parent_plan)
+            .await
+            .unwrap();
+
+        let spawner = RunnerSpawner {
+            deps: parent.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: parent.run_id.clone(),
+        };
+        let results = spawner
+            .run_many(
+                "parent-tool-call",
+                vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "inspect the workspace".into(),
+                }],
+            )
+            .await;
+        assert_eq!(results[0].status, SubtaskStatus::Completed);
+
+        let child = parent
+            .store
+            .list_session_agent_runs(&parent.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.agent_kind == crate::domain::AgentRunKind::Subagent)
+            .expect("the real subagent constructor must persist its child run");
+        let child_plan = crate::harness::native::tool_plan::load_plan(&parent.store, &child.run_id)
+            .await
+            .unwrap()
+            .expect("the real child drive must freeze a plan under its admitted run_id");
+        assert_ne!(
+            parent_plan.visible_definitions,
+            child_plan.visible_definitions
+        );
+        for blocked in [
+            "memory",
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert!(
+                !child_plan.canonical_tools.contains_key(blocked),
+                "plain V2 children must not advertise or dispatch {blocked}"
+            );
+        }
+        assert_ne!(child.run_id, parent.run_id);
+    }
+
+    #[tokio::test]
     async fn load_tools_reveals_a_deferred_tool_on_the_next_turn() {
         let dir = tempfile::tempdir().unwrap();
         // Turn 1: the model calls load_tools(["webfetch"]).
@@ -5989,6 +10196,8 @@ mod tests {
         deps.activated_tools = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::BTreeSet::new(),
         )));
+        assert_eq!(deps.native_tools_version, NativeToolsVersion::V1);
+        let legacy_turn_one = current_tool_defs(&deps, &deps.agent).await;
 
         run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
             .await
@@ -6006,6 +10215,11 @@ mod tests {
         };
         let t1 = names_of(&bodies[0]);
         let t2 = names_of(&bodies[1]);
+        assert_eq!(
+            bodies[0]["tools"],
+            Value::Array(legacy_turn_one),
+            "V1 keeps the existing lazy facade byte-for-byte"
+        );
         // Turn 1: hot core + load_tools, webfetch deferred.
         assert!(t1.contains(&"load_tools".to_string()));
         assert!(t1.contains(&"read".to_string()));
@@ -6110,14 +10324,11 @@ mod tests {
     #[test]
     fn subagent_blocklist_blocks_todo_tools() {
         use super::super::agents::ToolFilter;
-        let names: Vec<String> = ["read", "bash", "todowrite", "todoread"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let registry = ToolRegistry::builtin();
         let eff = effective_child_filter(
             &ToolFilter::All,
             &ToolFilter::All,
-            &names,
+            &registry,
             SUBAGENT_BLOCKLIST,
         );
         assert!(eff.allows("read") && eff.allows("bash"));
@@ -6131,14 +10342,11 @@ mod tests {
     #[test]
     fn subagent_blocklist_blocks_app_tools() {
         use super::super::agents::ToolFilter;
-        let names: Vec<String> = crate::harness::native::tools::APP_TOOLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let registry = ToolRegistry::builtin();
         let eff = effective_child_filter(
             &ToolFilter::All,
             &ToolFilter::All,
-            &names,
+            &registry,
             SUBAGENT_BLOCKLIST,
         );
         for t in crate::harness::native::tools::APP_TOOLS {
@@ -6722,8 +10930,55 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "tu-dangling");
         assert_eq!(messages[2]["content"][0]["is_error"], true);
+        assert_eq!(messages[2]["content"][0]["content"], "interrupted");
         assert_eq!(messages[2]["content"][1]["type"], "text");
         assert_eq!(messages[2]["content"][1]["text"], "next");
+    }
+
+    #[tokio::test]
+    async fn v2_request_body_repairs_a_dangling_tool_use_with_a_cancelled_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![text_delta("ok"), message_delta("end_turn"), message_stop()];
+        let llm = Arc::new(V2RecordingLlm::new(vec![turn]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+        enable_v2(&mut deps);
+        {
+            let mut ledger = Ledger::load(deps.store.clone(), "s1").await.unwrap();
+            ledger
+                .append_user(json!([{"type": "text", "text": "earlier"}]))
+                .await
+                .unwrap();
+            ledger
+                .append_assistant(json!([
+                    {"type": "tool_use", "id": "tu-v2-dangling", "name": "read", "input": {}}
+                ]))
+                .await
+                .unwrap();
+        }
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies();
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        let repair = &messages[2]["content"][0];
+        assert_eq!(repair["type"], "tool_result");
+        assert_eq!(repair["tool_use_id"], "tu-v2-dangling");
+        assert_eq!(repair["is_error"], true);
+        let envelope: Value = serde_json::from_str(repair["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "cancelled");
+        assert_eq!(envelope["error"]["category"], "cancelled");
+        assert_eq!(envelope["meta"]["tool"], "read");
+        assert_eq!(envelope["meta"]["truncated"], false);
+        assert!(envelope["meta"]["trace_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
     }
 
     #[tokio::test]
@@ -8300,6 +12555,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_cancellation_during_a_handler_completes_it_and_queued_siblings_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let first_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sibling_counters = Arc::new(GatewayCounters::default());
+        let never_run = gateway_tool(
+            "never_run",
+            json!({"type": "object", "additionalProperties": false}),
+            sibling_counters.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let tool_turn = vec![
+            tool_use_start(0, "cancel-running", "cancel_aware"),
+            input_json_delta(0, "{}"),
+            tool_use_start(1, "cancel-queued", "never_run"),
+            input_json_delta(1, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(V2RecordingLlm::new(vec![tool_turn]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.agent.tools = crate::harness::native::agents::ToolFilter::All;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            Arc::new(CancellationAwareTool {
+                started: started.clone(),
+                effects: first_effects.clone(),
+            }),
+            never_run,
+        ]));
+        let telemetry_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_telemetry = telemetry_lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured_telemetry.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        let extension_events = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(extension_events.clone());
+        let (automation_tx, mut automation_rx) = tokio::sync::mpsc::unbounded_channel();
+        let automation_events = Arc::new(RecordingAutomationSink {
+            observed: automation_tx,
+        });
+        deps.automation_events = Some(automation_events.clone());
+        let cancel = CancellationToken::new();
+        let running = {
+            let deps = deps.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_turn(
+                    &deps,
+                    TurnPrompt::text("cancel both", "cancel both"),
+                    cancel,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("the real handler must start");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), running)
+            .await
+            .expect("the cancelled V2 turn must settle")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            first_effects.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the in-flight handler observes cancellation exactly once"
+        );
+        assert_eq!(
+            sibling_counters
+                .preflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued sibling must never preflight"
+        );
+        assert_eq!(
+            sibling_counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued sibling must never enter permission or approval handling"
+        );
+        assert_eq!(
+            sibling_counters
+                .execute
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued sibling must never execute"
+        );
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let results = turns.last().unwrap().payload.as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        for (index, expected_id) in ["cancel-running", "cancel-queued"].into_iter().enumerate() {
+            assert_eq!(results[index]["tool_use_id"], expected_id);
+            let envelope: Value =
+                serde_json::from_str(results[index]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], "cancelled");
+            assert_eq!(envelope["error"]["category"], "cancelled");
+            assert!(!results[index].to_string().contains("bearer-secret"));
+        }
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        for expected_id in ["cancel-running", "cancel-queued"] {
+            let row = rows
+                .iter()
+                .find(|row| row.tool_call_id.as_deref() == Some(expected_id))
+                .expect("every cancelled V2 call owns a completed row");
+            let envelope: Value = serde_json::from_str(row.payload["output"].as_str().unwrap())
+                .expect("persisted cancellation stays structured");
+            assert_eq!(envelope["error"]["code"], "cancelled");
+        }
+        let hook_calls = extension_events.calls.lock().unwrap().clone();
+        assert!(hook_calls
+            .iter()
+            .all(|(_, payload)| payload["tool"] != "never_run"));
+        let after_calls = hook_calls
+            .iter()
+            .filter(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolAfter)
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>();
+        assert_eq!(after_calls.len(), 1);
+        assert!(after_calls.iter().all(|payload| {
+            payload["result"]["ok"] == false && payload["result"]["code"] == "cancelled"
+        }));
+        crate::automation::dispatch_lifecycle_observation(
+            Some(automation_events),
+            crate::automation::TriggerKind::SessionEnd,
+            deps.session_pk.clone(),
+            json!({"test_barrier": true}),
+        );
+        let mut automation_calls = Vec::new();
+        loop {
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(5), automation_rx.recv())
+                    .await
+                    .expect("automation observations must drain through the test barrier")
+                    .expect("the recording automation sink must stay open");
+            let is_barrier = observed.0 == crate::automation::TriggerKind::SessionEnd
+                && observed.1["test_barrier"] == true;
+            automation_calls.push(observed);
+            if is_barrier {
+                break;
+            }
+        }
+        assert!(automation_calls.iter().all(|(trigger, payload)| {
+            !matches!(
+                trigger,
+                crate::automation::TriggerKind::ToolBefore
+                    | crate::automation::TriggerKind::ToolAfter
+            ) || payload["tool"] != "never_run"
+        }));
+        assert!(deps.snapshots.lock().await.is_empty());
+        let telemetry = telemetry_lines.lock().unwrap().join("\n");
+        assert_eq!(telemetry.matches("native.tool.call").count(), 2);
+        assert!(!telemetry.contains("bearer-secret"));
+    }
+
+    #[tokio::test]
     async fn isolated_main_target_executes_advertised_task_subagents() {
         let dir = tempfile::tempdir().unwrap();
         let parent_task = vec![
@@ -8486,5 +12908,567 @@ mod tests {
             0,
             "a cancelled worker must not write a stale completion to the rail"
         );
+    }
+
+    fn result_test_planned_tool(name: &str, limit: u64) -> tool_plan::PlannedTool {
+        let mut descriptor = ToolDescriptor::conservative(
+            name,
+            "result test",
+            json!({"type": "object", "additionalProperties": false}),
+            "read",
+        );
+        descriptor.result_limit_bytes = limit;
+        tool_plan::PlannedTool {
+            canonical_name: name.into(),
+            descriptor,
+            canonical_schema: json!({"type": "object", "additionalProperties": false}),
+            wire_schema: json!({"type": "object", "additionalProperties": false}),
+            strict: false,
+            contract_hash: "result-test-hash".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_result_truncates_utf8_data_and_preserves_cursor_images_and_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let tool = ToolAccum {
+            id: "v2-result-1".into(),
+            name: "read".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+            input_overflowed: false,
+        };
+        let input = tool.legacy_input();
+        assert!(insert_tool_row(&deps, &tool, &input, "read", None).await);
+
+        let planned = result_test_planned_tool("read", 10);
+        let output = crate::harness::native::tools::ToolOutput {
+            for_model: "éééééé".into(),
+            model_blocks: Some(vec![json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "abc"}
+            })]),
+            display: Some(json!({"exit_code": 0, "next_cursor": "cursor-2"})),
+            is_error: false,
+            structured_error: None,
+        };
+        let completed = complete_tool_call(
+            &deps,
+            &tool.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: &tool.name,
+                tool_kind: "read",
+                trace_id: "trace-v2-result",
+                duration_ms: 42,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(output),
+        )
+        .await;
+
+        let blocks = completed.provider_result["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["data"], "abc");
+        let envelope: Value = serde_json::from_str(blocks[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"], "ééééé");
+        assert_eq!(envelope["meta"]["truncated"], true);
+        assert_eq!(envelope["meta"]["next_cursor"], "cursor-2");
+        assert_eq!(envelope["meta"]["duration_ms"], 42);
+        assert!(envelope.get("error").is_none());
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some(tool.id.as_str()))
+            .unwrap();
+        assert_eq!(row.payload["exit_code"], 0);
+        assert_eq!(row.payload["next_cursor"], "cursor-2");
+        assert_eq!(row.payload["duration_ms"], 42);
+        assert!(row.payload["summary"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn v2_text_completion_stays_a_valid_envelope_through_context_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let planned = result_test_planned_tool("read", 50_000);
+        let completed = complete_tool_call(
+            &deps,
+            "context-text",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-context-text",
+                duration_ms: 7,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput {
+                for_model: "é".repeat(10_000),
+                model_blocks: None,
+                display: Some(json!({"next_cursor": "cursor-after-ingestion"})),
+                is_error: false,
+                structured_error: None,
+            }),
+        )
+        .await;
+        let cfg = ContextConfig {
+            tool_output_max_bytes: 1_024,
+            ..ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(NativeToolsVersion::V2)
+        };
+        let mut cm = ContextManager::ephemeral("context-text", cfg);
+
+        cm.append_tool_results(vec![completed.provider_result])
+            .await
+            .unwrap();
+
+        let messages = cm.messages_for_request();
+        let text = messages[0]["content"][0]["content"].as_str().unwrap();
+        assert!(text.len() <= 1_024, "V2 ingestion exceeded its text budget");
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["meta"]["truncated"], true);
+        assert_eq!(envelope["meta"]["next_cursor"], "cursor-after-ingestion");
+        assert!(envelope["data"]
+            .as_str()
+            .unwrap()
+            .is_char_boundary(envelope["data"].as_str().unwrap().len()));
+    }
+
+    #[tokio::test]
+    async fn v2_image_completion_preserves_images_and_bounds_its_envelope_at_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let planned = result_test_planned_tool("read", 50_000);
+        let image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAEC"}
+        });
+        let completed = complete_tool_call(
+            &deps,
+            "context-image",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-context-image",
+                duration_ms: 9,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput {
+                for_model: "x".repeat(10_000),
+                model_blocks: Some(vec![image.clone()]),
+                display: Some(json!({"next_cursor": "image-cursor"})),
+                is_error: false,
+                structured_error: None,
+            }),
+        )
+        .await;
+        let cfg = ContextConfig {
+            tool_output_max_bytes: 1_024,
+            ..ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(NativeToolsVersion::V2)
+        };
+        let mut cm = ContextManager::ephemeral("context-image", cfg);
+
+        cm.append_tool_results(vec![completed.provider_result])
+            .await
+            .unwrap();
+
+        let messages = cm.messages_for_request();
+        let blocks = messages[0]["content"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0], image);
+        let text = blocks[1]["text"].as_str().unwrap();
+        assert!(text.len() <= 1_024, "V2 ingestion exceeded its text budget");
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["meta"]["truncated"], true);
+        assert_eq!(envelope["meta"]["next_cursor"], "image-cursor");
+    }
+
+    #[tokio::test]
+    async fn v2_result_persists_large_envelopes_as_bounded_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let tool = ToolAccum {
+            id: "v2-large-result".into(),
+            name: "read".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+            input_overflowed: false,
+        };
+        assert!(insert_tool_row(&deps, &tool, &tool.legacy_input(), "read", None).await);
+        let planned = result_test_planned_tool("read", 200_000);
+        let completed = complete_tool_call(
+            &deps,
+            &tool.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: &tool.name,
+                tool_kind: "read",
+                trace_id: "trace-large",
+                duration_ms: 5,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput::ok("é".repeat(50_000))),
+        )
+        .await;
+        let provider: Value =
+            serde_json::from_str(completed.provider_result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(provider["data"].as_str().unwrap().chars().count(), 50_000);
+
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some(tool.id.as_str()))
+            .unwrap();
+        let persisted = row.payload["output"].as_str().unwrap();
+        assert!(persisted.len() < PERSISTED_TOOL_OUTPUT_BYTES);
+        let persisted: Value = serde_json::from_str(persisted).unwrap();
+        assert_eq!(persisted["ok"], true);
+        assert_eq!(persisted["meta"]["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn v2_result_persists_maximal_failures_below_the_structural_byte_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let tool = ToolAccum {
+            id: "v2-maximal-error".into(),
+            name: "read".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+            input_overflowed: false,
+        };
+        assert!(insert_tool_row(&deps, &tool, &tool.legacy_input(), "read", None).await);
+        let mut error =
+            ToolError::precondition("capability_unavailable", "Tool is currently unavailable")
+                .with_details(json!({
+                    "limit": "MAX_TOOL_SCHEMA_BYTES",
+                    "actual_bytes": 300_000,
+                    "max_bytes": 262_144,
+                }));
+        for index in 0..MAX_TOOL_ERROR_FIELD_ERRORS {
+            error = error
+                .with_field_error(ToolFieldError::new(
+                    format!("field-{index}"),
+                    "invalid",
+                    "invalid value".repeat(128),
+                ))
+                .with_candidate(format!("candidate-{index}"));
+        }
+        let planned = result_test_planned_tool("read", 200_000);
+        complete_tool_call(
+            &deps,
+            &tool.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: &tool.name,
+                tool_kind: "read",
+                trace_id: "trace-maximal-error",
+                duration_ms: 5,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error,
+                legacy_text: "legacy unavailable".into(),
+            },
+        )
+        .await;
+
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some(tool.id.as_str()))
+            .unwrap();
+        let persisted = row.payload["output"].as_str().unwrap();
+        assert!(persisted.len() < PERSISTED_TOOL_OUTPUT_BYTES);
+        let envelope: Value = serde_json::from_str(persisted).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "capability_unavailable");
+    }
+
+    #[test]
+    fn v2_result_structurally_compacts_failure_envelopes_under_a_small_ceiling() {
+        let mut error =
+            ToolError::precondition("capability_unavailable", "Tool is currently unavailable")
+                .with_details(json!({
+                    "limit": "MAX_TOOL_SCHEMA_BYTES",
+                    "actual_bytes": 300_000,
+                    "max_bytes": 262_144,
+                }));
+        for index in 0..MAX_TOOL_ERROR_FIELD_ERRORS {
+            error = error
+                .with_field_error(ToolFieldError::new(
+                    format!("field-{index}"),
+                    "invalid",
+                    "invalid value",
+                ))
+                .with_candidate("retry");
+        }
+        let serialized = serialize_persisted_v2_envelope(
+            Some(&error),
+            "",
+            &ToolResultMeta::new("read", "trace-small-cap", 1),
+            512,
+        );
+
+        assert!(serialized.len() < 512);
+        let envelope: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "capability_unavailable");
+        assert_eq!(envelope["meta"]["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn v2_result_keeps_v1_model_text_byte_exact_and_redacts_bare_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let telemetry_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = telemetry_lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        let plain = "legacy plain text: é";
+
+        let legacy = complete_tool_call(
+            &deps,
+            "legacy-result",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V1,
+                planned: None,
+                tool_name: "bash",
+                tool_kind: "execute",
+                trace_id: "trace-legacy",
+                duration_ms: 1,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(crate::harness::native::tools::ToolOutput::ok(plain)),
+        )
+        .await;
+        assert_eq!(legacy.provider_result["content"], plain);
+
+        let raw = "os error 267: provider source chain /secret/input.txt";
+        let error_call = ToolAccum {
+            id: "v2-error".into(),
+            name: "bash".into(),
+            start_input: json!({}),
+            input_json: String::new(),
+            input_overflowed: false,
+        };
+        assert!(
+            insert_tool_row(
+                &deps,
+                &error_call,
+                &error_call.legacy_input(),
+                "execute",
+                None,
+            )
+            .await
+        );
+        let v2 = complete_tool_call(
+            &deps,
+            "v2-error",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&result_test_planned_tool("bash", 1_024)),
+                tool_name: "bash",
+                tool_kind: "execute",
+                trace_id: "trace-error",
+                duration_ms: 3,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::BareError(anyhow::anyhow!(raw)),
+        )
+        .await;
+        let text = v2.provider_result["content"].as_str().unwrap();
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["error"]["code"], "tool_internal_error");
+        assert_eq!(envelope["error"]["category"], "internal");
+        assert!(!text.contains(raw));
+        assert!(!text.contains("/secret/input.txt"));
+        assert_eq!(
+            v2.hook_summary,
+            json!({
+                "ok": false,
+                "code": "tool_internal_error",
+                "category": "internal",
+                "output": "Tool execution failed"
+            })
+        );
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("v2-error"))
+            .unwrap();
+        let persisted = row.payload.to_string();
+        assert!(!persisted.contains(raw));
+        assert!(!persisted.contains("/secret/input.txt"));
+        let telemetry = telemetry_lines.lock().unwrap().join("\n");
+        assert!(!telemetry.contains(raw));
+        assert!(!telemetry.contains("/secret/input.txt"));
+    }
+
+    #[tokio::test]
+    async fn v2_result_all_terminal_outcomes_use_the_same_envelope_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(RecordingLlm::new(vec![]));
+        let deps = deps_at(dir.path(), llm).await;
+        let planned = result_test_planned_tool("read", 1_024);
+        let outcomes = [
+            ("tool_not_found", ToolErrorCategory::Precondition),
+            ("tool_not_in_plan", ToolErrorCategory::Precondition),
+            ("invalid_input", ToolErrorCategory::Caller),
+            ("permission_denied", ToolErrorCategory::Permission),
+            ("cancelled", ToolErrorCategory::Cancelled),
+            ("hook_denied", ToolErrorCategory::Permission),
+        ];
+        for (index, (code, category)) in outcomes.into_iter().enumerate() {
+            let completed = complete_tool_call(
+                &deps,
+                &format!("outcome-{index}"),
+                ToolCompletionContext {
+                    version: NativeToolsVersion::V2,
+                    planned: Some(&planned),
+                    tool_name: "read",
+                    tool_kind: "read",
+                    trace_id: "trace-outcome",
+                    duration_ms: 0,
+                    normalization: None,
+                    preflight: None,
+                },
+                ToolCompletionOutcome::Error {
+                    error: ToolError::new(category, code, "Stable message"),
+                    legacy_text: "legacy".into(),
+                },
+            )
+            .await;
+            let envelope: Value =
+                serde_json::from_str(completed.provider_result["content"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(envelope["ok"], false, "outcome {code}");
+            assert_eq!(envelope["error"]["code"], code, "outcome {code}");
+            assert!(envelope.get("data").is_none(), "outcome {code}");
+        }
+
+        let handler = complete_tool_call(
+            &deps,
+            "outcome-handler",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-handler",
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::BareError(anyhow::anyhow!("raw provider failure")),
+        )
+        .await;
+        let handler: Value =
+            serde_json::from_str(handler.provider_result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(handler["error"]["code"], "tool_internal_error");
+
+        let success = complete_tool_call(
+            &deps,
+            "outcome-success",
+            ToolCompletionContext {
+                version: NativeToolsVersion::V2,
+                planned: Some(&planned),
+                tool_name: "read",
+                tool_kind: "read",
+                trace_id: "trace-success",
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Output(ToolOutput::ok("done")),
+        )
+        .await;
+        let success: Value =
+            serde_json::from_str(success.provider_result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(success["ok"], true);
+        assert_eq!(success["data"], "done");
+        assert!(success.get("error").is_none());
+    }
+
+    #[test]
+    fn v2_result_telemetry_uses_only_fixed_low_cardinality_labels() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        let telemetry: Arc<dyn crate::telemetry::Telemetry> =
+            Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+                move |line| captured.lock().unwrap().push(line.to_string()),
+                || 0,
+            ));
+        record_native_tool_call_metrics(
+            &telemetry,
+            "mcp__secret_server__read_private_file",
+            "other",
+            false,
+            Some("dynamic_secret_error_code"),
+            123,
+        );
+        record_native_tool_argument_repair(&telemetry, "unknown_dynamic_repair");
+        record_native_tool_plan_metric(&telemetry, NativeToolsVersion::V2, Some(&direct_profile()));
+
+        let rendered = lines.lock().unwrap().join("\n");
+        assert!(rendered.contains("native.tool.call"));
+        assert!(rendered.contains("native.tool.duration_ms"));
+        assert!(rendered.contains("native.tool.argument_repair"));
+        assert!(rendered.contains("native.tool.plan"));
+        assert!(rendered.contains("\"tool_family\":\"mcp\""));
+        assert!(rendered.contains("\"facade\":\"mcp\""));
+        assert!(rendered.contains("\"error_code\":\"other\""));
+        assert!(rendered.contains("\"repair_kind\":\"other\""));
+        assert!(rendered.contains("\"version\":\"v2\""));
+        assert!(rendered.contains("\"interaction_mode\":\"direct_functions\""));
+        assert!(rendered.contains("\"capability_source\":\"transport_default\""));
+        for secret in [
+            "secret_server",
+            "read_private_file",
+            "dynamic_secret_error_code",
+            "/secret/input.txt",
+            "legacy plain text",
+            "os error 267",
+        ] {
+            assert!(!rendered.contains(secret), "telemetry leaked {secret}");
+        }
     }
 }

@@ -171,6 +171,9 @@ fn flatten_tool(tool: &Value) -> Option<Value> {
     {
         out["description"] = json!(desc);
     }
+    if let Some(strict) = f.get("strict") {
+        out["strict"] = strict.clone();
+    }
     Some(out)
 }
 
@@ -983,5 +986,48 @@ mod tests {
         assert_eq!(out["tools"][0]["description"], "read a file");
         assert!(out["tools"][0]["parameters"]["properties"]["path"].is_object());
         assert_eq!(clamp_call_id(&"x".repeat(100)).len(), 64);
+    }
+
+    #[test]
+    fn strict_chat_function_is_flattened_without_dropping_schema_or_marker() {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+            },
+            "required": ["offset", "path"],
+            "additionalProperties": false
+        });
+        let chat = json!({
+            "model": "configured-model",
+            "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": parameters,
+                    "strict": true
+                }
+            }]
+        });
+
+        let out = openai_chat_to_responses_request(&chat);
+        assert_eq!(
+            out["tools"][0],
+            json!({
+                "type": "function",
+                "name": "read",
+                "description": "Read a file",
+                "parameters": parameters,
+                "strict": true
+            })
+        );
+
+        let mut other_model = chat;
+        other_model["model"] = json!("other-opaque-model");
+        let other = openai_chat_to_responses_request(&other_model);
+        assert_eq!(other["tools"], out["tools"]);
     }
 }

@@ -179,12 +179,18 @@ impl ExtensionTools for ExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::plugins::extension::{ExtensionCtx, ExtensionFactory, ExtensionSpec};
+    #[cfg(unix)]
     use crate::plugins::host::{CorePlugin, PluginHost, PluginSource};
+    #[cfg(unix)]
     use crate::settings::SettingsStore;
+    #[cfg(unix)]
     use crate::store::Store;
+    #[cfg(unix)]
     use ryuzi_plugin_sdk::PluginManifest;
     use serde_json::json;
+    #[cfg(unix)]
     use std::time::Duration;
 
     // ---------- parse_tool_def (pure, no I/O) ----------
@@ -256,6 +262,7 @@ mod tests {
     // `extension/initialize` response itself, so a single ack is enough to
     // exercise gathering.
 
+    #[cfg(unix)]
     fn manifest(id: &str, name: &str) -> PluginManifest {
         PluginManifest {
             contract: 1,
@@ -279,10 +286,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct FakeExtensionFactory {
         specs: Vec<ExtensionSpec>,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ExtensionFactory for FakeExtensionFactory {
         async fn extensions(&self, _ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
@@ -290,6 +299,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn extension_only(id: &str, name: &str, specs: Vec<ExtensionSpec>) -> CorePlugin {
         CorePlugin {
             manifest: manifest(id, name),
@@ -301,6 +311,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn open_ctx() -> (ExtensionCtx, std::sync::Arc<Store>, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = std::sync::Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -308,6 +319,7 @@ mod tests {
         (ExtensionCtx { settings }, store, tmp)
     }
 
+    #[cfg(unix)]
     fn base_spec(name: &str, body: &str, provides_tools: bool, timeout: Duration) -> ExtensionSpec {
         ExtensionSpec {
             name: name.to_string(),
@@ -323,6 +335,7 @@ mod tests {
     /// A `sh` script: read the `extension/initialize` request, ack it with
     /// `tools: <tools_json>` (a raw JSON array literal), then block waiting
     /// for further input (so the process stays alive for `shutdown_all`).
+    #[cfg(unix)]
     fn init_ack_with_tools(tools_json: &str) -> String {
         format!(
             "IFS= read -r line; id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \
@@ -580,6 +593,7 @@ mod tests {
     /// Like [`init_ack_with_tools`] but ALSO handles a second request (the
     /// `tool/call` dispatch) with `second_response_body`, mirroring
     /// `events.rs`'s own `handshake_then` helper.
+    #[cfg(unix)]
     fn init_ack_then(tools_json: &str, second_response_body: &str) -> String {
         format!(
             "IFS= read -r line; id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \

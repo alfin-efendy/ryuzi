@@ -12,10 +12,21 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+use super::capabilities::{TransportToolCapabilities, WireProtocol};
+
 /// One provider turn as a stream of Anthropic events.
 #[async_trait]
 pub trait LlmStream: Send + Sync {
     async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream>;
+
+    async fn transport_tool_capabilities(
+        &self,
+        _policy: &TurnEffortPolicy,
+    ) -> anyhow::Result<TransportToolCapabilities> {
+        Ok(TransportToolCapabilities::function_only(
+            WireProtocol::AnthropicMessages,
+        ))
+    }
 }
 
 /// Builds an [`LlmStream`] for a session, given its store. Kept separate from
@@ -35,6 +46,13 @@ impl LlmStream for RouterLlmStream {
     async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
         client::anthropic_messages_stream(&self.ctx, request.body, &request.metadata.effort_policy)
             .await
+    }
+
+    async fn transport_tool_capabilities(
+        &self,
+        policy: &TurnEffortPolicy,
+    ) -> anyhow::Result<TransportToolCapabilities> {
+        client::route_tool_capabilities(&self.ctx.store, &policy.requested_model).await
     }
 }
 

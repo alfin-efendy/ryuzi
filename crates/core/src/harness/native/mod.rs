@@ -9,12 +9,15 @@
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
 pub mod agents;
+pub mod arguments;
 pub mod background;
+pub mod capabilities;
 pub mod commands;
 pub mod context;
 pub mod context_manager;
 pub mod cost;
 pub mod delegation;
+pub mod file_reference;
 pub mod format;
 pub mod hooks;
 pub mod iteration_budget;
@@ -29,6 +32,8 @@ pub mod skills;
 pub mod snapshot;
 pub mod steer;
 pub mod summary_budget;
+pub mod tool_contract;
+pub mod tool_plan;
 pub mod tools;
 
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
@@ -270,10 +275,30 @@ async fn resolve_native_model(
     crate::llm_router::client::default_anthropic_messages_model(store).await
 }
 
+async fn resolve_native_tools_version(
+    store: &crate::store::Store,
+    session_pk: &str,
+    run_id: &str,
+) -> anyhow::Result<capabilities::NativeToolsVersion> {
+    if tool_plan::load_plan(store, run_id).await?.is_some() {
+        return Ok(capabilities::NativeToolsVersion::V2);
+    }
+    let requested = match store.get_setting("native_tools.version").await? {
+        Some(value) => capabilities::NativeToolsVersion::parse(value.trim())?,
+        None => capabilities::NativeToolsVersion::V1,
+    };
+    let stored = store
+        .get_or_insert_native_tool_session_version(session_pk, requested.as_str())
+        .await?;
+    Ok(capabilities::NativeToolsVersion::parse(&stored.version)?)
+}
+
 #[async_trait]
 impl Harness for NativeHarness {
     async fn start_session(&self, ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
         let llm = self.llm_factory.create(ctx.store.clone());
+        let native_tools_version =
+            resolve_native_tools_version(&ctx.store, &ctx.session_pk, &ctx.run_id).await?;
         // Native speaks Anthropic Messages internally; resolve configured
         // routes/models through that capability and fall back to a compatible
         // route/model when a stale project pins a target no connection
@@ -398,17 +423,22 @@ impl Harness for NativeHarness {
                 project_id,
                 perm_overrides: Arc::new(std::sync::Mutex::new(Default::default())),
                 store: ctx.store,
+                telemetry: ctx.telemetry,
                 events: ctx.events,
                 approvals: ctx.approvals,
                 automation_events: ctx.automation_events,
                 llm,
                 tools,
+                native_tools_version,
+                native_tool_runtime_surfaces: capabilities::RuntimeToolSurfaces::direct_only(),
+                native_tool_override_mode: None,
                 agent,
                 agents,
                 commands,
                 allowed_skills: primary_turn.allowed_skills.clone(),
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                snapshot_taker: Arc::new(runner::GitSnapshotTaker),
                 steer,
                 background: ctx.background,
                 // Explicit-target and noninteractive-session facades must
@@ -758,8 +788,46 @@ mod tests {
             agent_knowledge: persistence.knowledge,
             learning_queue: persistence.learning,
             store,
+            telemetry: Arc::new(crate::telemetry::NoopTelemetry),
             app_control: None,
         }
+    }
+
+    #[tokio::test]
+    async fn v2_session_version_stays_frozen_after_global_toggle_to_v1() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(store.clone(), dir.path().to_path_buf()).await;
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "native_tools.version",
+                "v2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_native_tools_version(&store, &ctx.session_pk, &ctx.run_id)
+                .await
+                .unwrap(),
+            capabilities::NativeToolsVersion::V2
+        );
+
+        store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "native_tools.version",
+                "v1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_native_tools_version(&store, &ctx.session_pk, &ctx.run_id)
+                .await
+                .unwrap(),
+            capabilities::NativeToolsVersion::V2
+        );
     }
 
     #[test]

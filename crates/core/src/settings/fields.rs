@@ -1,4 +1,4 @@
-//! ConfigField schema: the 25 global settings fields. Keys, labels, help
+//! ConfigField schema: the global settings fields. Keys, labels, help
 //! text, and defaults are user-visible contracts — settings stored under
 //! these keys must keep resolving across releases.
 
@@ -38,7 +38,7 @@ pub const BASE: ConfigField = ConfigField {
     default: None,
 };
 
-/// The 25 global settings fields.
+/// The global settings fields.
 pub static GLOBAL_FIELDS: &[ConfigField] = &[
     ConfigField {
         key: "workdir_root",
@@ -235,6 +235,16 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         help: "Custom summarization prompt for context compaction (blank = built-in)",
         ..BASE
     },
+    ConfigField {
+        key: "native_tools.version",
+        label: "Native tools contract",
+        field_type: FieldType::Enum,
+        one_of: &["v1", "v2"],
+        default: Some("v1"),
+        control: true,
+        help: "Native tool facade for newly started native sessions",
+        ..BASE
+    },
 ];
 
 #[cfg(test)]
@@ -242,16 +252,16 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_29_keys_and_correct_flags() {
+    fn schema_has_30_keys_and_correct_flags() {
         let fields = all_fields();
-        assert_eq!(fields.len(), 29); // 26 global + 3 discord
+        assert_eq!(fields.len(), 30); // 27 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
-        // list order: 26 globals first, then 3 discord fields
+        // list order: 27 globals first, then 3 discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
         assert!(keys.contains(&"approval_timeout_ms"));
         assert_eq!(
-            &keys[26..],
+            &keys[27..],
             &["discord.token", "discord.app_id", "discord.guild_id"]
         );
         // the only required global is workdir_root; all 3 discord fields required; token is the only secret
@@ -287,5 +297,14 @@ mod tests {
             find_field("context.tool_output_max_bytes").unwrap().default,
             Some("10000")
         );
+    }
+
+    #[test]
+    fn native_tools_version_is_a_validated_rollout_setting() {
+        let field = crate::settings::find_field("native_tools.version").unwrap();
+        assert_eq!(field.default, Some("v1"));
+        assert_eq!(field.one_of, &["v1", "v2"]);
+        assert!(crate::settings::validate_setting("native_tools.version", "v2").is_none());
+        assert!(crate::settings::validate_setting("native_tools.version", "terra").is_some());
     }
 }

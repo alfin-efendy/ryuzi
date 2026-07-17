@@ -587,7 +587,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_41_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1082,7 +1082,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_41_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error. The orch_tasks block is also
         // guarded on the table's existence because migration 39 removes it.
@@ -1145,7 +1145,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_41_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1392,6 +1392,70 @@ fn migrations() -> Migrations<'static> {
         // same provider tool_call_id, so remove it after the ownership schema
         // is in place. The scoped update query keeps writes unambiguous.
         M::up("DROP INDEX IF EXISTS idx_messages_tool_call;"),
+        // 42: immutable native-tool selection per session and content-addressed
+        // tool plans per agent run. The agentic cleanup is intentionally
+        // repeated here: Native Tools V2 development databases that already
+        // consumed version 39 skip main's version-39 slot, so this hook is the
+        // convergence point for both histories. Every operation is idempotent.
+        M::up_with_hook("", |tx: &rusqlite::Transaction<'_>| {
+            let has_settings = tx
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'")?
+                .exists([])?;
+            let has_background_events = tx
+                .prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                )?
+                .exists([])?;
+            let has_sessions = tx
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'")?
+                .exists([])?;
+            if has_settings {
+                tx.execute(
+                    "DELETE FROM settings WHERE key IN (
+                        'agent_model',
+                        'agent_perm_mode',
+                        'agent.max_provider_turns',
+                        'agent.auto_continue_budget',
+                        'memory.nudge_interval'
+                     )",
+                    [],
+                )?;
+            }
+            if has_background_events {
+                tx.execute(
+                    "DELETE FROM background_events WHERE kind IN ('learning', 'orch')",
+                    [],
+                )?;
+            }
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS orch_task_deps;
+                 DROP TABLE IF EXISTS orch_tasks;
+                 DROP TABLE IF EXISTS skill_usage;
+                 DROP TABLE IF EXISTS curator_state;
+                 DROP TABLE IF EXISTS curator_runs;
+                 CREATE TABLE IF NOT EXISTS native_tool_session_versions (
+                    session_pk TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,
+                    version TEXT NOT NULL CHECK(version IN ('v1','v2')),
+                    created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS native_tool_plans (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+                    plan_schema_version INTEGER NOT NULL,
+                    registry_generation INTEGER NOT NULL,
+                    plan_hash TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                 );",
+            )?;
+            if has_sessions {
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_tool_session_versions(session_pk, version, created_at)
+                     SELECT session_pk, 'v1', COALESCE(created_at, 0) FROM sessions",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -1430,6 +1494,23 @@ impl Clone for Store {
 pub struct SessionRuntimeSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolSessionVersion {
+    pub session_pk: String,
+    pub version: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredNativeToolPlan {
+    pub run_id: String,
+    pub plan_schema_version: u32,
+    pub registry_generation: u64,
+    pub plan_hash: String,
+    pub plan_json: String,
+    pub created_at: i64,
 }
 
 /// One `messages_fts` match, joined against its owning session — the unit
@@ -4622,6 +4703,146 @@ impl Store {
         .await
     }
 
+    pub async fn get_native_tool_session_version(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<NativeToolSessionVersion>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT session_pk,version,created_at FROM native_tool_session_versions WHERE session_pk=?1",
+                params![session_pk],
+                |row| {
+                    Ok(NativeToolSessionVersion {
+                        session_pk: row.get(0)?,
+                        version: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn get_or_insert_native_tool_session_version(
+        &self,
+        session_pk: &str,
+        requested_version: &str,
+    ) -> anyhow::Result<NativeToolSessionVersion> {
+        if !matches!(requested_version, "v1" | "v2") {
+            anyhow::bail!("native tool session version must be exactly v1 or v2");
+        }
+        let session_pk = session_pk.to_string();
+        let requested_version = requested_version.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO native_tool_session_versions(session_pk,version,created_at) \
+                 VALUES (?1,?2,?3) ON CONFLICT(session_pk) DO NOTHING",
+                params![session_pk, requested_version, created_at],
+            )?;
+            let stored = tx.query_row(
+                "SELECT session_pk,version,created_at FROM native_tool_session_versions WHERE session_pk=?1",
+                params![session_pk],
+                |row| {
+                    Ok(NativeToolSessionVersion {
+                        session_pk: row.get(0)?,
+                        version: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+    }
+
+    pub async fn get_native_tool_plan(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<StoredNativeToolPlan>> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT run_id,plan_schema_version,registry_generation,plan_hash,plan_json,created_at \
+                 FROM native_tool_plans WHERE run_id=?1",
+                params![run_id],
+                |row| {
+                    Ok(StoredNativeToolPlan {
+                        run_id: row.get(0)?,
+                        plan_schema_version: row.get::<_, i64>(1)? as u32,
+                        registry_generation: row.get::<_, i64>(2)? as u64,
+                        plan_hash: row.get(3)?,
+                        plan_json: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn insert_native_tool_plan(
+        &self,
+        run_id: &str,
+        plan_schema_version: u32,
+        registry_generation: u64,
+        plan_hash: &str,
+        plan_json: &str,
+    ) -> anyhow::Result<StoredNativeToolPlan> {
+        let run_id = run_id.to_string();
+        let plan_hash = plan_hash.to_string();
+        let plan_json = plan_json.to_string();
+        let created_at = now_ms();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO native_tool_plans(\
+                    run_id,plan_schema_version,registry_generation,plan_hash,plan_json,created_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(run_id) DO NOTHING",
+                params![
+                    run_id,
+                    i64::from(plan_schema_version),
+                    registry_generation as i64,
+                    plan_hash,
+                    plan_json,
+                    created_at
+                ],
+            )?;
+            let stored = tx.query_row(
+                "SELECT run_id,plan_schema_version,registry_generation,plan_hash,plan_json,created_at \
+                 FROM native_tool_plans WHERE run_id=?1",
+                params![run_id],
+                |row| {
+                    Ok(StoredNativeToolPlan {
+                        run_id: row.get(0)?,
+                        plan_schema_version: row.get::<_, i64>(1)? as u32,
+                        registry_generation: row.get::<_, i64>(2)? as u64,
+                        plan_hash: row.get(3)?,
+                        plan_json: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )?;
+            if stored.plan_schema_version != plan_schema_version
+                || stored.registry_generation != registry_generation
+                || stored.plan_hash != plan_hash
+                || stored.plan_json != plan_json
+            {
+                return Err(to_sql_json_error(format!(
+                    "native tool plan for run {run_id} is already frozen"
+                )));
+            }
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+    }
+
     pub async fn get_agent_run(&self, run_id: &str) -> anyhow::Result<Option<AgentRun>> {
         let run_id = run_id.to_string();
         self.with_conn(move |c| {
@@ -5124,7 +5345,7 @@ mod tests {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
             conn.execute_batch(
                 "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
-                 CREATE TABLE sessions (session_pk TEXT PRIMARY KEY);
+                 CREATE TABLE sessions (session_pk TEXT PRIMARY KEY, created_at INTEGER);
                  CREATE TABLE messages (
                     session_pk TEXT NOT NULL,
                     seq INTEGER NOT NULL,
@@ -5232,13 +5453,266 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
         );
         assert_eq!(agent_run_tables, ["agent_run_messages", "agent_runs"]);
         assert_eq!(preserved_rows, (1, 1, 1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn native_tool_session_version_is_insert_once() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        let first_version = store
+            .get_or_insert_native_tool_session_version("s1", "v2")
+            .await
+            .unwrap();
+        assert_eq!(first_version.version, "v2");
+
+        let frozen_version = store
+            .get_or_insert_native_tool_session_version("s1", "v1")
+            .await
+            .unwrap();
+        assert_eq!(frozen_version, first_version);
+        assert!(store
+            .get_or_insert_native_tool_session_version("s1", "V2")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn native_tool_plan_is_insert_once_and_compare_after_insert() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(NewAgentRun {
+                run_id: "run-1".into(),
+                session_pk: "s1".into(),
+                parent_run_id: None,
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: "ada".into(),
+                executing_agent_id: Some("ada".into()),
+                executing_agent_name_snapshot: "Ada".into(),
+                agent_kind: AgentRunKind::Primary,
+                task: "test".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+
+        let first = store
+            .insert_native_tool_plan("run-1", 1, 7, "hash-a", r#"{"schema_version":1}"#)
+            .await
+            .unwrap();
+        assert_eq!(first.plan_hash, "hash-a");
+
+        let same = store
+            .insert_native_tool_plan("run-1", 1, 7, "hash-a", r#"{"schema_version":1}"#)
+            .await
+            .unwrap();
+        assert_eq!(same, first);
+
+        for (schema_version, registry_generation, plan_hash, plan_json) in [
+            (2, 7, "hash-a", r#"{"schema_version":1}"#),
+            (1, 8, "hash-a", r#"{"schema_version":1}"#),
+            (1, 7, "hash-b", r#"{"schema_version":1}"#),
+            (1, 7, "hash-a", r#"{"schema_version":2}"#),
+        ] {
+            let error = store
+                .insert_native_tool_plan(
+                    "run-1",
+                    schema_version,
+                    registry_generation,
+                    plan_hash,
+                    plan_json,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("already frozen"));
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_42_upgrades_main_v41_and_backfills_v1() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.insert_session(sample_session()).await.unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "DROP TABLE native_tool_plans;
+                         DROP TABLE native_tool_session_versions;
+                         PRAGMA user_version=41;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let store = Store::open(tmp.path()).await.unwrap();
+        let backfilled = store
+            .get_or_insert_native_tool_session_version("s1", "v2")
+            .await
+            .unwrap();
+        assert_eq!(backfilled.version, "v1");
+        store
+            .insert_primary_agent_run(NewAgentRun {
+                run_id: "run-cascade".into(),
+                session_pk: "s1".into(),
+                parent_run_id: None,
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: "ada".into(),
+                executing_agent_id: Some("ada".into()),
+                executing_agent_name_snapshot: "Ada".into(),
+                agent_kind: AgentRunKind::Primary,
+                task: "test".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_native_tool_plan("run-cascade", 1, 7, "hash", "{}")
+            .await
+            .unwrap();
+
+        store
+            .with_conn(|c| c.execute("DELETE FROM sessions WHERE session_pk='s1'", []))
+            .await
+            .unwrap();
+        assert!(store
+            .get_native_tool_session_version("s1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_native_tool_plan("run-cascade")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_42_converges_feature_v39_without_losing_native_plan() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.insert_session(sample_session()).await.unwrap();
+            store
+                .insert_primary_agent_run(NewAgentRun {
+                    run_id: "feature-v39-run".into(),
+                    session_pk: "s1".into(),
+                    parent_run_id: None,
+                    retry_of: None,
+                    source_tool_call_id: None,
+                    dispatch_index: None,
+                    primary_agent_id: "ada".into(),
+                    executing_agent_id: Some("ada".into()),
+                    executing_agent_name_snapshot: "Ada".into(),
+                    agent_kind: AgentRunKind::Primary,
+                    task: "preserve me".into(),
+                    status: AgentRunStatus::Queued,
+                    resolved_model: None,
+                    resolved_effort: None,
+                })
+                .await
+                .unwrap();
+            store
+                .insert_native_tool_plan(
+                    "feature-v39-run",
+                    1,
+                    7,
+                    "feature-v39-hash",
+                    r#"{"schema_version":1}"#,
+                )
+                .await
+                .unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "DROP INDEX IF EXISTS agent_runs_dispatch_idx;
+                         ALTER TABLE agent_runs DROP COLUMN source_tool_call_id;
+                         ALTER TABLE agent_runs DROP COLUMN dispatch_index;
+                         CREATE UNIQUE INDEX idx_messages_tool_call
+                            ON messages(session_pk, tool_call_id)
+                            WHERE tool_call_id IS NOT NULL;
+                         CREATE TABLE orch_tasks(id TEXT PRIMARY KEY);
+                         CREATE TABLE orch_task_deps(id TEXT PRIMARY KEY);
+                         CREATE TABLE skill_usage(id TEXT PRIMARY KEY);
+                         CREATE TABLE curator_state(id TEXT PRIMARY KEY);
+                         CREATE TABLE curator_runs(id TEXT PRIMARY KEY);
+                         INSERT OR REPLACE INTO settings(key,value)
+                            VALUES ('memory.nudge_interval','10');
+                         PRAGMA user_version=39;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let upgraded = Store::open(tmp.path()).await.unwrap();
+        let plan = upgraded
+            .get_native_tool_plan("feature-v39-run")
+            .await
+            .unwrap()
+            .expect("native plan must survive feature-v39 convergence");
+        assert_eq!(plan.plan_hash, "feature-v39-hash");
+        let (user_version, columns, has_dispatch_index, has_tool_call_index, legacy_tables) =
+            upgraded
+                .with_conn(|c| {
+                    let user_version =
+                        c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+                    let columns = c
+                        .prepare("SELECT name FROM pragma_table_info('agent_runs') ORDER BY cid")?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let has_dispatch_index = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='agent_runs_dispatch_idx'")?
+                        .exists([])?;
+                    let has_tool_call_index = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_tool_call'")?
+                        .exists([])?;
+                    let legacy_tables = c.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                            ('orch_tasks','orch_task_deps','skill_usage','curator_state','curator_runs')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    Ok((
+                        user_version,
+                        columns,
+                        has_dispatch_index,
+                        has_tool_call_index,
+                        legacy_tables,
+                    ))
+                })
+                .await
+                .unwrap();
+        assert_eq!(user_version, 42);
+        assert!(columns.iter().any(|column| column == "source_tool_call_id"));
+        assert!(columns.iter().any(|column| column == "dispatch_index"));
+        assert!(has_dispatch_index);
+        assert!(!has_tool_call_index);
+        assert_eq!(legacy_tables, 0);
+        assert!(upgraded
+            .get_setting("memory.nudge_interval")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -5295,7 +5769,7 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
 
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
@@ -5303,7 +5777,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 41);
+        assert_eq!(reopened_version, 42);
     }
 
     #[tokio::test]
@@ -5324,7 +5798,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -5368,7 +5842,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
     }
 
     #[tokio::test]
@@ -7225,7 +7699,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 41, "forward migration must land at v41");
+        assert_eq!(user_version, 42, "forward migration must land at v42");
     }
 
     #[tokio::test]
@@ -7833,7 +8307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_41_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_42_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -7858,25 +8332,27 @@ mod tests {
         // IF NOT EXISTS; 35 session_prompt_queue; 36 automation hooks/runs/
         // attempts; 37 session_automation_origins plus compatibility queue
         // repair; 38 session ownership and agent runs; 39 agentic cleanup;
-        // 40 durable dispatch linkage — all convergent,
+        // 40 durable dispatch linkage; 41 scoped tool-call ownership; 42
+        // immutable native tool versions/plans plus history convergence — all
+        // convergent,
         // existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 41
-        // defined, wind back twenty-nine.
+        // this test starts failing its assertions). With migrations through 42
+        // defined, wind back thirty.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 29)
+            c.pragma_update(None, "user_version", v - 30)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v30 here, so `harness` was
+                    // The DB is fully migrated to v42 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -7926,9 +8402,9 @@ mod tests {
     #[tokio::test]
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
-        // wind user_version back fifteen, and reopen so 21 (and the tail
-        // migrations 22–41) replay against it. Back TWENTY-ONE: the fully
-        // migrated tail is now v41, so rewinding to v20 is what makes
+        // wind user_version back, and reopen so 21 (and the tail migrations
+        // 22–42) replay against it. Back TWENTY-TWO: the fully migrated tail
+        // is now v42, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
@@ -7937,7 +8413,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 21)
+            c.pragma_update(None, "user_version", v - 22)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -8070,7 +8546,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 41, "forward migration must land at v41");
+        assert_eq!(uv, 42, "forward migration must land at v42");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -8096,7 +8572,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 41, "forward migration must land at v41");
+        assert_eq!(uv, 42, "forward migration must land at v42");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,

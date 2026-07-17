@@ -5,6 +5,10 @@
 //! turns appended after it, instead of replaying the full session history.
 
 use crate::domain::NewProviderTurn;
+use crate::harness::native::capabilities::NativeToolsVersion;
+use crate::harness::native::tool_contract::{
+    ToolError, ToolErrorCategory, ToolResultEnvelope, ToolResultMeta,
+};
 use crate::store::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -141,7 +145,11 @@ impl Ledger {
     /// rows that would otherwise 400 every later Anthropic request. The
     /// durable rows are untouched — this is a per-request projection.
     pub fn messages_for_request(&self) -> Vec<Value> {
-        sanitize_tool_pairing(&self.messages())
+        self.messages_for_request_for_version(NativeToolsVersion::V1)
+    }
+
+    pub fn messages_for_request_for_version(&self, version: NativeToolsVersion) -> Vec<Value> {
+        sanitize_tool_pairing_for_version(&self.messages(), version)
     }
 
     /// Whether any turns have been recorded.
@@ -200,6 +208,13 @@ impl Ledger {
 /// prepended to the next user message when there is one (tool_result blocks
 /// must lead its content), or appended as a standalone user turn at the tail.
 pub fn sanitize_tool_pairing(messages: &[Value]) -> Vec<Value> {
+    sanitize_tool_pairing_for_version(messages, NativeToolsVersion::V1)
+}
+
+pub fn sanitize_tool_pairing_for_version(
+    messages: &[Value],
+    version: NativeToolsVersion,
+) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     let mut i = 0;
     while i < messages.len() {
@@ -211,11 +226,24 @@ pub fn sanitize_tool_pairing(messages: &[Value]) -> Vec<Value> {
         }
         let synthesized: Vec<Value> = dangling
             .iter()
-            .map(|id| {
+            .map(|call| {
+                let content = if version == NativeToolsVersion::V2 {
+                    serde_json::to_string(&ToolResultEnvelope::failure(
+                        ToolError::new(
+                            ToolErrorCategory::Cancelled,
+                            "cancelled",
+                            "Tool call was cancelled",
+                        ),
+                        ToolResultMeta::new(&call.name, "ledger-repair", 0),
+                    ))
+                    .expect("bounded V2 repair envelope is serializable")
+                } else {
+                    "interrupted".to_string()
+                };
                 json!({
                     "type": "tool_result",
-                    "tool_use_id": id,
-                    "content": "interrupted",
+                    "tool_use_id": call.id,
+                    "content": content,
                     "is_error": true,
                 })
             })
@@ -243,17 +271,27 @@ pub fn sanitize_tool_pairing(messages: &[Value]) -> Vec<Value> {
 
 /// The `tool_use` ids in `msg` (an assistant turn) that have NO matching
 /// `tool_result` block in `next`.
-fn missing_tool_results(msg: &Value, next: Option<&Value>) -> Vec<String> {
+struct MissingToolCall {
+    id: String,
+    name: String,
+}
+
+fn missing_tool_results(msg: &Value, next: Option<&Value>) -> Vec<MissingToolCall> {
     if msg["role"] != "assistant" {
         return Vec::new();
     }
     let Some(blocks) = msg["content"].as_array() else {
         return Vec::new();
     };
-    let uses: Vec<String> = blocks
+    let uses: Vec<MissingToolCall> = blocks
         .iter()
         .filter(|b| b["type"] == "tool_use")
-        .filter_map(|b| b["id"].as_str().map(str::to_string))
+        .filter_map(|b| {
+            b["id"].as_str().map(|id| MissingToolCall {
+                id: id.to_string(),
+                name: b["name"].as_str().unwrap_or("unknown").to_string(),
+            })
+        })
         .collect();
     if uses.is_empty() {
         return Vec::new();
@@ -270,7 +308,7 @@ fn missing_tool_results(msg: &Value, next: Option<&Value>) -> Vec<String> {
         })
         .unwrap_or_default();
     uses.into_iter()
-        .filter(|id| !results.contains(id))
+        .filter(|call| !results.contains(&call.id))
         .collect()
 }
 
