@@ -206,12 +206,19 @@ fn sanitize_deny_reason(name: &str, reason: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::plugins::extension::{ExtensionCtx, ExtensionFactory, ExtensionSpec};
+    #[cfg(unix)]
     use crate::plugins::host::{CorePlugin, PluginHost, PluginSource};
+    #[cfg(unix)]
     use crate::settings::SettingsStore;
+    #[cfg(unix)]
     use crate::store::Store;
+    #[cfg(unix)]
     use ryuzi_plugin_sdk::PluginManifest;
+    #[cfg(unix)]
     use serde_json::json;
+    #[cfg(unix)]
     use std::time::Duration;
 
     // ---------- sanitize_deny_reason (pure, no I/O) ----------
@@ -259,6 +266,7 @@ mod tests {
     // plays the fake extension over real stdio pipes, hermetic (no committed
     // script file) and `#[cfg(unix)]`-gated to match this crate's CI matrix.
 
+    #[cfg(unix)]
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
             contract: 1,
@@ -282,10 +290,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct FakeExtensionFactory {
         specs: Vec<ExtensionSpec>,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ExtensionFactory for FakeExtensionFactory {
         async fn extensions(&self, _ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
@@ -293,6 +303,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn extension_only(id: &str, specs: Vec<ExtensionSpec>) -> CorePlugin {
         CorePlugin {
             manifest: manifest(id),
@@ -304,6 +315,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn open_ctx() -> (ExtensionCtx, Arc<Store>, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -311,6 +323,7 @@ mod tests {
         (ExtensionCtx { settings }, store, tmp)
     }
 
+    #[cfg(unix)]
     fn base_spec(
         name: &str,
         body: &str,
@@ -333,6 +346,7 @@ mod tests {
     /// `r#"["tool.before"]"#`), then read the NEXT request (the event
     /// dispatch) and run `second_response_body` — a shell snippet with `$id2`
     /// bound to that second request's JSON-RPC id.
+    #[cfg(unix)]
     fn handshake_then(confirmed_events_json: &str, second_response_body: &str) -> String {
         format!(
             "IFS= read -r line; id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); \

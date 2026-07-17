@@ -181,9 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn detect_platform_is_some_on_supported_hosts() {
-        // On CI (linux/mac x86_64/aarch64) this must resolve to a platform tag.
-        let p = detect_platform().expect("supported host");
-        assert!(platform_tag(p).is_some());
+    fn detect_platform_matches_the_supported_host_matrix() {
+        let detected = detect_platform();
+        let supported = matches!(std::env::consts::OS, "linux" | "macos")
+            && matches!(std::env::consts::ARCH, "x86_64" | "aarch64");
+
+        assert_eq!(detected.is_some(), supported);
+        assert!(detected.is_none_or(|platform| platform_tag(platform).is_some()));
     }
 }

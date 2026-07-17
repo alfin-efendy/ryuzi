@@ -1,6 +1,11 @@
 //! Offline end-to-end update flow (design §9): local fake release server →
 //! stage (real HTTP + tar + sha256) → applier state machine with real
 //! update.json handoffs and real renames → swap, and rollback.
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+
 use ryuzi_core::update::*;
 use std::io::{Read, Write};
 use std::net::TcpListener;
