@@ -1,5 +1,16 @@
 import type { Page } from "@playwright/test";
-import type { ConnectionInfo } from "../src/bindings";
+import type {
+  AgentDetailInfo,
+  AgentRegistryInfo,
+  AgentRun,
+  AgentRunRosterInfo,
+  AgentSummaryInfo,
+  ConnectionInfo,
+  CoreEvent,
+  Message,
+  ModelRouteTargetCapability,
+  Session,
+} from "../src/bindings";
 
 /**
  * Fixtures mirror the generated types in src/bindings.ts (Project, Session,
@@ -293,38 +304,258 @@ export const PROVIDER_FAMILY_ROUTE_SELECTIONS = [
   },
 ];
 
-const DEFAULT_AGENT = {
+/** Two main agents for the agent-management, delegation, and read-only
+ * history journeys: Ryuzi (the executable default) and Reviewer (a second
+ * executable agent used as a delegation target and, in the history journey,
+ * a session owner deliberately absent from a narrower registry override). */
+export const RYUZI_AGENT = {
   id: "ryuzi",
   name: "Ryuzi",
-  description: "Default agent",
-  avatarColor: "#7C3AED",
-  model: { kind: "route", route: "smart" },
+  description: "General-purpose coding agent",
+  avatarColor: "violet",
+  model: { kind: "concrete", name: "fixture/model-alpha", effort: "high" },
   permissionMode: "ask",
-  skillCount: 0,
-  toolCount: 0,
-  knowledgeCount: 0,
+  skillCount: 1,
+  toolCount: 4,
+  knowledgeCount: 1,
   executable: true,
   validation: [],
   isDefault: true,
-};
+} satisfies AgentSummaryInfo;
+
+export const REVIEWER_AGENT = {
+  id: "reviewer",
+  name: "Reviewer",
+  description: "Reviews implementation quality and regressions",
+  avatarColor: "amber",
+  model: { kind: "route", route: "safe" },
+  permissionMode: "ask",
+  skillCount: 1,
+  toolCount: 4,
+  knowledgeCount: 1,
+  executable: true,
+  validation: [],
+  isDefault: false,
+} satisfies AgentSummaryInfo;
 
 const AGENT_REGISTRY = {
-  agents: [DEFAULT_AGENT],
-  defaultAgentId: DEFAULT_AGENT.id,
+  agents: [RYUZI_AGENT, REVIEWER_AGENT],
+  defaultAgentId: RYUZI_AGENT.id,
   recovery: [],
   subagentModel: { kind: "route", route: "smart" },
+} satisfies AgentRegistryInfo;
+
+/** Same registry with Reviewer removed — the deleted-owner history journey
+ * needs a session whose captured `primaryAgentId` no longer resolves against
+ * the live roster (session-primary.ts's "deleted" branch). */
+export const REGISTRY_WITHOUT_REVIEWER = {
+  ...AGENT_REGISTRY,
+  agents: [RYUZI_AGENT],
+} satisfies AgentRegistryInfo;
+
+export const RYUZI_DETAIL = {
+  summary: RYUZI_AGENT,
+  permissionRules: [],
+  skills: ["general-coding"],
+  nativeTools: ["read_file", "grep"],
+  pluginTools: [],
+  apps: [],
+  maxTurns: 40,
+  maxToolRounds: 12,
+  modelInfo: null,
+} satisfies AgentDetailInfo;
+
+export const REVIEWER_DETAIL = {
+  summary: REVIEWER_AGENT,
+  permissionRules: [],
+  skills: ["code-review"],
+  nativeTools: ["read_file", "grep"],
+  pluginTools: [],
+  apps: [],
+  maxTurns: 40,
+  maxToolRounds: 12,
+  modelInfo: null,
+} satisfies AgentDetailInfo;
+
+/** `get_agent` is dispatched dynamically by `agentId` (see installMockIPC's
+ * `get_agent` branch below) — unlike the fixed-shape commands in FIXTURES,
+ * this bag is looked up by id at call time. */
+const AGENT_DETAILS: Record<string, AgentDetailInfo> = {
+  ryuzi: RYUZI_DETAIL,
+  reviewer: REVIEWER_DETAIL,
 };
 
+const EMPTY_AGENT_RUN_ROSTER: AgentRunRosterInfo = { rootRunId: null, runs: [] };
+type ChildRunMockState = {
+  agentRunRoster: AgentRunRosterInfo;
+  childMessages: Record<string, Message[]>;
+  retryChildMessages: Record<string, Message[]>;
+};
+export type MockIPCOverrides = Record<string, unknown> & Partial<ChildRunMockState>;
+/** One active main-delegate run (Ryuzi → Reviewer) and one completed subagent
+ * run, returned by `get_child_runs` for the delegation/child-transcript
+ * journey. Subagents are ephemeral runtime workers with no agent profile
+ * (AgentsView's SubagentSettings: "Subagents do not have profiles"), so
+ * `executingAgentId` stays null for the subagent row. */
+export const DELEGATE_ACTIVE_RUN = {
+  runId: "run-active-1",
+  sessionPk: CHAT_SESSION.sessionPk,
+  parentRunId: null,
+  retryOf: null,
+  sourceToolCallId: null,
+  dispatchIndex: null,
+  primaryAgentId: "ryuzi",
+  executingAgentId: "reviewer",
+  executingAgentNameSnapshot: "Reviewer",
+  agentKind: "main-delegate",
+  task: "Review the diff for regressions",
+  status: "running",
+  startedAt: 0,
+  finishedAt: null,
+  toolCount: 2,
+  resolvedModel: "fixture/model-alpha",
+  resolvedEffort: "high",
+  result: null,
+  error: null,
+} satisfies AgentRun;
+
+export const DELEGATE_DONE_RUN = {
+  runId: "run-done-1",
+  sessionPk: CHAT_SESSION.sessionPk,
+  parentRunId: null,
+  retryOf: null,
+  sourceToolCallId: null,
+  dispatchIndex: null,
+  primaryAgentId: "ryuzi",
+  executingAgentId: null,
+  executingAgentNameSnapshot: "Subagent worker",
+  agentKind: "subagent",
+  task: "Run the test suite",
+  status: "completed",
+  startedAt: 0,
+  finishedAt: 30_000,
+  toolCount: 5,
+  resolvedModel: "fixture/model-beta",
+  resolvedEffort: null,
+  result: "All tests passed.",
+  error: null,
+} satisfies AgentRun;
+
+export const REVIEWER_CHILD_TRANSCRIPT = [
+  {
+    sessionPk: CHAT_SESSION.sessionPk,
+    seq: 1,
+    role: "assistant",
+    blockType: "text",
+    payload: { text: "Reviewing the diff for regressions now." },
+    toolCallId: null,
+    status: null,
+    toolKind: null,
+    createdAt: 0,
+    speaker: null,
+  },
+] satisfies Message[];
+
+/** The parent chat session's own transcript, seeded so the delegation
+ * journey can prove the main transcript survives a Right Panel round trip
+ * (open the Reviewer child run, then Back). */
+export const DELEGATION_PARENT_MESSAGE = {
+  sessionPk: CHAT_SESSION.sessionPk,
+  seq: 1,
+  role: "assistant",
+  blockType: "text",
+  payload: { text: "Kicking off the review delegation." },
+  toolCallId: null,
+  status: null,
+  toolKind: null,
+  createdAt: 0,
+  speaker: null,
+} satisfies Message;
+
+/** Legacy (no captured owner) and deleted-owner (captured owner absent from
+ * the current registry) sessions for the read-only history journey. Both are
+ * chat-first (`kind: "chat"`) and idle so `composeReadOnly` in SessionView is
+ * driven purely by session-primary.ts's ownership logic, not by `running`. */
+export const LEGACY_SESSION = {
+  ...SESSION,
+  sessionPk: "s-legacy",
+  primaryAgentId: null,
+  primaryAgentSnapshot: null,
+  projectId: null,
+  branch: null,
+  kind: "chat",
+  status: "idle",
+  title: "Legacy history",
+  permMode: "default",
+} satisfies Session;
+
+export const DELETED_OWNER_SESSION = {
+  ...SESSION,
+  sessionPk: "s-deleted",
+  primaryAgentId: "reviewer",
+  primaryAgentSnapshot: { id: "reviewer", name: "Reviewer", avatarColor: "amber" },
+  projectId: null,
+  branch: null,
+  kind: "chat",
+  status: "idle",
+  title: "Deleted owner history",
+  permMode: "default",
+} satisfies Session;
+
+export const LEGACY_MESSAGE = {
+  sessionPk: "s-legacy",
+  seq: 1,
+  role: "assistant",
+  blockType: "text",
+  payload: { text: "This is the preserved legacy transcript." },
+  toolCallId: null,
+  status: null,
+  toolKind: null,
+  createdAt: 0,
+  speaker: null,
+} satisfies Message;
+
+export const DELETED_OWNER_MESSAGE = {
+  sessionPk: "s-deleted",
+  seq: 1,
+  role: "assistant",
+  blockType: "text",
+  payload: { text: "This is the preserved reviewer transcript." },
+  toolCallId: null,
+  status: null,
+  toolKind: null,
+  createdAt: 0,
+  speaker: null,
+} satisfies Message;
+
+/** Route target capabilities for the route-effort journey: model-alpha
+ * supports an explicit "high" override, model-beta supports none. Keyed to
+ * match PROVIDER_CATALOG/CONNECTIONS' "fixture" family models above, so the
+ * Route tab's target picker (routeTargetOptions) resolves two real targets
+ * without any per-test override. */
+export const ROUTE_TARGET_CAPABILITIES = [
+  { provider: "fixture", model: "model-alpha", supported: [{ value: "high", label: "High", description: null }], providerDefault: null },
+  { provider: "fixture", model: "model-beta", supported: [], providerDefault: null },
+] satisfies ModelRouteTargetCapability[];
+
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
-const FIXTURES: Record<string, unknown> = {
+const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   list_projects: [PROJECT],
   list_sessions: [],
   list_messages: [],
+  agentRunRoster: EMPTY_AGENT_RUN_ROSTER,
+  childMessages: {} as Record<string, Message[]>,
+  retryChildMessages: {} as Record<string, Message[]>,
   list_agents: AGENT_REGISTRY,
   refresh_agents: [],
   list_providers: [],
   list_provider_catalog: PROVIDER_CATALOG,
   list_connections: CONNECTIONS,
+  // `list_installed_providers` is answered DYNAMICALLY in the invoke dispatch
+  // below (from the live catalog + connections) so per-test connection
+  // overrides still surface; the static `list_`-fallback `[]` would empty the
+  // installed set and hide every provider row. Custom providers: none here.
+  list_custom_providers: [],
   list_selectable_models: NATIVE_RUNTIME.selectableModels,
   list_runtimes: [NATIVE_RUNTIME],
   refresh_runtimes: [NATIVE_RUNTIME],
@@ -367,6 +598,17 @@ const FIXTURES: Record<string, unknown> = {
   connection_usage: null,
   set_model_effort_preference: null,
   start_chat_session: CHAT_SESSION,
+  list_model_routes: [],
+  list_model_route_target_capabilities: ROUTE_TARGET_CAPABILITIES,
+  // Not session-scoped in this mock (get_child_runs/get_child_transcript take
+  // a sessionPk but the fixture always answers with the same value) — empty
+  // by default so a test that never dispatches has an empty roster; the
+  // delegation journey overrides both per-test.
+  get_child_runs: [],
+  get_child_transcript: [],
+  // Internal lookup bag for the dynamically-dispatched `get_agent` command
+  // (see its branch in installMockIPC) — not a real Tauri command name.
+  agent_details: AGENT_DETAILS,
 };
 
 /**
@@ -375,22 +617,38 @@ const FIXTURES: Record<string, unknown> = {
  * missing Tauri bridge. `plugin:*` invokes (event listen, window show)
  * resolve to null. Every call is recorded on `window.__mockCalls`.
  */
-export async function installMockIPC(page: Page, overrides: Record<string, unknown> = {}): Promise<void> {
+export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {}): Promise<void> {
   await page.addInitScript(
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
       const storageKey = "ryuzi.e2e.route-state.v1";
-      type MockMessage = {
-        sessionPk: string;
-        seq: number;
-        role: string;
-        blockType: string;
-        payload: { text: string };
-        toolCallId: null;
-        status: null;
-        toolKind: null;
-        createdAt: number;
-      };
+      // Command names Plan 6 (agentic cleanup) permanently deleted from the
+      // Tauri invoke surface — the single-agent settings/memory/Learning/
+      // curator/orch commands, and the `learning_cmd` trio. If the UI ever
+      // calls one of these again (a regression `check-agentic-cleanup.ts`
+      // can't catch, since it only scans source text, not runtime
+      // invocations), the unmocked-command fallback below throws instead of
+      // silently resolving — so an accidental call fails the test
+      // immediately rather than degrading quietly.
+      const removedCommands = new Set([
+        "search_sessions",
+        "list_skill_usage",
+        "set_skill_pinned",
+        "get_agent_settings",
+        "set_agent_settings",
+        "read_memory",
+        "write_memory",
+        "learning_graph",
+        "curator_status",
+        "curator_rollback",
+        "orch_submit",
+        "orch_list_roots",
+        "orch_tasks",
+        "orch_cancel",
+        "orch_retry",
+        "orch_answer_block",
+        "orch_steer",
+      ]);
       type RouteIdentity = {
         resolvedProviderId: string;
         resolvedFamily: string;
@@ -407,7 +665,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
       };
       type DurableState = {
         sessions: (typeof SESSION)[];
-        messages: MockMessage[];
+        messages: Message[];
+        agentRunRoster: AgentRunRosterInfo;
+        childMessages: Record<string, Message[]>;
         route: RouteIdentity | null;
         routeRequests: number;
         modelRoutes: Array<{
@@ -425,12 +685,21 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         ? (JSON.parse(stored) as DurableState)
         : {
             sessions: fixtures.list_sessions as (typeof SESSION)[],
-            messages: [],
+            // Seeds pre-existing history (e.g. legacy/deleted-owner
+            // transcripts) — most fixtures start empty and grow only via
+            // observeRoute's route-switch notices.
+            messages: (fixtures.list_messages as Message[] | undefined) ?? [],
+            agentRunRoster: (fixtures.agentRunRoster as AgentRunRosterInfo | undefined) ?? EMPTY_AGENT_RUN_ROSTER,
+            childMessages: (fixtures.childMessages as Record<string, Message[]> | undefined) ?? {},
             route: null,
             routeRequests: 0,
             modelRoutes: fixtures.list_model_routes as DurableState["modelRoutes"],
           };
+      durable.agentRunRoster ??= (fixtures.agentRunRoster as AgentRunRosterInfo | undefined) ?? EMPTY_AGENT_RUN_ROSTER;
+      durable.childMessages ??= (fixtures.childMessages as Record<string, Message[]> | undefined) ?? {};
       let sessions = durable.sessions;
+      let agentRunRoster = durable.agentRunRoster;
+      let childMessages = durable.childMessages;
       let connections = fixtures.list_connections as ConnectionInfo[];
       let modelRoutes = durable.modelRoutes;
       const quotaAttempts = new Map<string, number>();
@@ -473,6 +742,8 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
 
       const persist = () => {
         durable.sessions = sessions;
+        durable.agentRunRoster = agentRunRoster;
+        durable.childMessages = childMessages;
         durable.modelRoutes = modelRoutes;
         localStorage.setItem(storageKey, JSON.stringify(durable));
       };
@@ -488,6 +759,54 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           const callback = (window as unknown as Record<string, (payload: unknown) => void>)[`_${handler}`];
           callback?.({ event: "core-event-msg", id: 0, payload: { runnerId: "local", event } });
         }
+      };
+
+      const appendChildMessage = (runId: string, message: Message) => {
+        const rows = childMessages[runId] ?? [];
+        const index = message.toolCallId
+          ? rows.findIndex((row) => row.toolCallId === message.toolCallId)
+          : rows.findIndex((row) => row.seq === message.seq);
+        const next = rows.slice();
+        if (index >= 0) next[index] = message;
+        else next.push(message);
+        childMessages = { ...childMessages, [runId]: next.sort((left, right) => left.seq - right.seq) };
+      };
+
+      type MockCoreEventInput = {
+        event: CoreEvent;
+        roster?: AgentRunRosterInfo;
+        childMessage?: { runId: string; message: Message };
+      };
+
+      w.__emitMockCoreEvent = (input: MockCoreEventInput) => {
+        if (input.roster) agentRunRoster = input.roster;
+        if (input.childMessage) appendChildMessage(input.childMessage.runId, input.childMessage.message);
+        persist();
+        emitCoreEvent(input.event as unknown as Record<string, unknown>);
+      };
+
+      const createRetryRun = (args: unknown): AgentRun => {
+        const { runId } = args as { runId: string };
+        const previous = agentRunRoster.runs.find((run) => run.runId === runId);
+        if (!previous) throw new Error(`Unknown child run: ${runId}`);
+        const retried: AgentRun = {
+          ...previous,
+          runId: `${previous.runId}-retry`,
+          retryOf: previous.runId,
+          status: "queued",
+          startedAt: null,
+          finishedAt: null,
+          toolCount: 0,
+          result: null,
+          error: null,
+        };
+        agentRunRoster = { ...agentRunRoster, runs: [...agentRunRoster.runs, retried] };
+        childMessages = {
+          ...childMessages,
+          [retried.runId]: fixtures.retryChildMessages?.[previous.runId] ?? childMessages[retried.runId] ?? [],
+        };
+        persist();
+        return retried;
       };
 
       const observeRoute = (sessionPk: string) => {
@@ -546,7 +865,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         }
 
         if (text) {
-          const message: MockMessage = {
+          const message: Message = {
             sessionPk,
             seq: durable.messages.length + 1,
             role: "system",
@@ -556,6 +875,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             status: null,
             toolKind: null,
             createdAt: Date.now(),
+            speaker: null,
           };
           durable.messages.push(message);
           persist();
@@ -597,7 +917,34 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           if (cmd.startsWith("plugin:")) return Promise.resolve(null);
           if (cmd === "list_sessions") return Promise.resolve(sessions);
           if (cmd === "list_connections") return Promise.resolve(connections);
-          if (cmd === "list_messages") return Promise.resolve(durable.messages);
+          if (cmd === "list_installed_providers") {
+            // The Models list filters to installed families. Derive them live
+            // from the (possibly per-test-overridden) catalog + connections so
+            // every provider row surfaces, mirroring production where a
+            // connected/seeded provider is installed.
+            const catalog = (fixtures.list_provider_catalog as Array<{ id: string; family: string }>) ?? [];
+            const familyOf = (provider: string) => catalog.find((entry) => entry.id === provider)?.family ?? provider;
+            const families = new Set<string>([
+              ...catalog.map((entry) => entry.family),
+              ...connections.map((connection) => familyOf(connection.provider)),
+            ]);
+            return Promise.resolve([...families]);
+          }
+          if (cmd === "list_messages") {
+            const { sessionPk } = args as { sessionPk: string };
+            return Promise.resolve(durable.messages.filter((message) => message.sessionPk === sessionPk));
+          }
+          if (cmd === "get_child_runs") return Promise.resolve(agentRunRoster);
+          if (cmd === "get_child_transcript") {
+            const { runId } = args as { runId: string };
+            return Promise.resolve(childMessages[runId] ?? []);
+          }
+          if (cmd === "retry_child_run") return Promise.resolve(createRetryRun(args));
+          if (cmd === "get_agent") {
+            const { agentId } = args as { agentId: string };
+            const details = fixtures.agent_details as Record<string, unknown>;
+            return Promise.resolve(details[agentId] ?? null);
+          }
           if (cmd === "list_model_routes") return Promise.resolve(modelRoutes);
           if (cmd === "save_model_route") {
             const { route } = args as { route: (typeof modelRoutes)[number] };
@@ -702,6 +1049,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             return Promise.resolve(connections);
           }
           if (cmd in fixtures) return Promise.resolve(fixtures[cmd]);
+          if (removedCommands.has(cmd)) {
+            throw new Error(`[mock-ipc] removed command invoked by UI: ${cmd} — this should never be called`);
+          }
           console.warn("[mock-ipc] unmocked command:", cmd);
           if (cmd.startsWith("list_") || cmd.startsWith("refresh_") || cmd.startsWith("probe_")) {
             return Promise.resolve([]);

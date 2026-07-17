@@ -15,7 +15,6 @@ mod error;
 mod events;
 mod fsview_cmd;
 mod gateways_cmd;
-mod learning_cmd;
 mod native_cmd;
 mod open_cmd;
 mod plugins_cmd;
@@ -163,6 +162,13 @@ fn make_builder() -> Builder<tauri::Wry> {
             connections_cmd::begin_oauth_manual,
             connections_cmd::complete_oauth_manual,
             connections_cmd::add_free_connection,
+            connections_cmd::list_installed_providers,
+            connections_cmd::install_provider,
+            connections_cmd::uninstall_provider,
+            connections_cmd::list_custom_providers,
+            connections_cmd::add_custom_provider,
+            connections_cmd::set_custom_provider_format,
+            connections_cmd::remove_custom_provider,
             native_cmd::native_agents,
             native_cmd::native_commands,
             native_cmd::session_todos,
@@ -197,9 +203,6 @@ fn make_builder() -> Builder<tauri::Wry> {
             plugins_cmd::set_plugin_pin,
             plugins_cmd::plugin_doctor,
             plugins_cmd::plugins_restart_required,
-            learning_cmd::search_sessions,
-            learning_cmd::list_skill_usage,
-            learning_cmd::set_skill_pinned,
             audit_cmd::list_audit,
             plugins_cmd::refresh_catalog,
             plugins_cmd::catalog_status,
@@ -418,6 +421,18 @@ mod tests {
             assert!(
                 !bindings.contains(draft_name),
                 "obsolete draft command {draft_name} was exported"
+            );
+        }
+
+        for contract in [
+            "export type AgentRunRosterInfo = { rootRunId: string | null; runs: AgentRun[] }",
+            "sourceToolCallId: string | null",
+            "dispatchIndex: number | null",
+            "{ kind: \"agentRunMessage\"; session_pk: string; run_id: string;",
+        ] {
+            assert!(
+                bindings.contains(contract),
+                "missing generated binding contract {contract}"
             );
         }
     }

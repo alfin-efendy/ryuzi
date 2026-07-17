@@ -4,6 +4,7 @@ import { commands } from "./bindings";
 import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
+import { useDelegation } from "./store-delegation";
 import type { AgentSummaryInfo, TurnInput } from "./bindings";
 import { LAST_PRIMARY_AGENT_KEY, choosePrimaryAgent } from "./store-nav";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
@@ -927,7 +928,7 @@ test("choosePrimaryAgent integrates pending, persisted, default, then executable
     name: id,
     description: "",
     avatarColor: "violet",
-    model: { kind: "route", route: "smart" },
+    model: { kind: "route", route: "free" },
     permissionMode: "ask",
     skillCount: 0,
     toolCount: 0,
@@ -1461,4 +1462,29 @@ test("two runners with the same session_pk keep separate transcripts and separat
   expect(useStore.getState().focusedSession).toEqual({ runnerId: LOCAL_RUNNER, pk: "s1" });
   useStore.getState().setFocused({ runnerId: remote, pk: "s1" });
   expect(useStore.getState().focusedSession).toEqual({ runnerId: remote, pk: "s1" });
+});
+
+test("store routes child transcript events to delegation without adding them to the primary transcript", () => {
+  reset();
+  useDelegation.setState({ transcriptByRun: {} });
+
+  useStore.getState().applyCoreEvent(
+    {
+      kind: "agentRunMessage",
+      session_pk: "s1",
+      run_id: "child-1",
+      seq: 1,
+      role: "assistant",
+      block_type: "text",
+      payload: { text: "child-only update" },
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+      speaker: null,
+    },
+    LOCAL_RUNNER,
+  );
+
+  expect(useDelegation.getState().transcriptByRun[`${LOCAL_RUNNER}:s1:child-1`]?.[0]?.payload).toEqual({ text: "child-only update" });
+  expect(useStore.getState().transcripts[k1]).toBeUndefined();
 });

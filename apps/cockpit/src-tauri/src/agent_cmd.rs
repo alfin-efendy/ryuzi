@@ -209,8 +209,8 @@ pub async fn update_subagent_model(
 
 // --- per-agent Learning commands (local-engine-only) --------------------------
 //
-// Learning data lives in the local engine's knowledge trees; like the global
-// Learning commands in `learning_cmd.rs`, these never take a `runner_id`.
+// Learning data lives in the local engine's knowledge trees, so these never
+// take a `runner_id`.
 
 #[tauri::command]
 #[specta::specta]
@@ -359,7 +359,7 @@ mod tests {
             description: "Reviews implementation quality and regressions.".to_owned(),
             avatar_color: "violet".to_owned(),
             model: AgentModelInfo::Route {
-                route: "smart".to_owned(),
+                route: "free".to_owned(),
             },
             permission_mode: "ask".to_owned(),
             permission_rules: Vec::new(),

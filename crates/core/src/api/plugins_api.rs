@@ -351,12 +351,12 @@ fn installed_flag(
     kind: &str,
     enabled: bool,
     configured: bool,
-    has_family_connection: bool,
+    provider_installed: bool,
     gateway_settings_complete: bool,
     skill_pack_installed: bool,
 ) -> bool {
     match kind {
-        "provider" => has_family_connection,
+        "provider" => provider_installed,
         "gateway" => gateway_settings_complete,
         "skill-pack" => skill_pack_installed,
         _ => configured || enabled,
@@ -1094,14 +1094,14 @@ async fn exchange_plugin_oauth_code(
 }
 
 struct InstalledCtx {
-    connections: Vec<crate::llm_router::connections::ConnectionRow>,
     installed_skills: Vec<crate::skills_install::InstalledSkillInfo>,
+    installed_providers: Vec<String>,
 }
 
 async fn installed_ctx(store: &Store) -> anyhow::Result<InstalledCtx> {
     Ok(InstalledCtx {
-        connections: crate::llm_router::connections::list_connections(store).await?,
         installed_skills: crate::skills_install::list_installed_skills().unwrap_or_default(),
+        installed_providers: crate::llm_router::installed::list_installed_providers(store).await?,
     })
 }
 
@@ -1114,12 +1114,18 @@ async fn compute_installed(
     ctx: &InstalledCtx,
 ) -> anyhow::Result<bool> {
     let id = &plugin.manifest.id;
-    let has_family_connection = kind == "provider" && {
-        let family = provider_family(id);
-        ctx.connections
-            .iter()
-            .any(|c| provider_family(&c.provider) == family)
-    };
+    // Provider installed-ness is authoritative on the persisted installed set
+    // ALONE — never on whether a connection exists. The Models list filters on
+    // the same set, so both surfaces agree in lockstep. Existing-connection
+    // families are unioned into the set at boot by
+    // `ensure_default_installed_providers`, and connections are only ever added
+    // to already-installed providers, so a real connection always has its
+    // family in the set.
+    let provider_installed = kind == "provider"
+        && crate::llm_router::installed::is_installed(
+            &ctx.installed_providers,
+            &provider_family(id),
+        );
     let gateway_settings_complete = if kind == "gateway" {
         // A gateway with no manifest settings has nothing to configure, so its
         // installed-ness is just whether it's enabled — otherwise it could
@@ -1150,7 +1156,7 @@ async fn compute_installed(
         kind,
         enabled,
         configured,
-        has_family_connection,
+        provider_installed,
         gateway_settings_complete,
         skill_pack_installed,
     ))
@@ -1886,8 +1892,8 @@ mod tests {
         let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let plugin = gateway_only("bare-gateway");
         let ctx = InstalledCtx {
-            connections: vec![],
             installed_skills: vec![],
+            installed_providers: vec![],
         };
 
         let installed_when_enabled =
@@ -1906,6 +1912,88 @@ mod tests {
         assert!(
             !installed_when_disabled,
             "disabled settings-less gateway is not installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_installed_provider_follows_installed_set_without_connection() {
+        // A default-installed provider with zero connections is "installed"
+        // because it is in the persisted set; a provider that is neither seeded
+        // nor connected is not.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+        crate::llm_router::installed::ensure_default_installed_providers(&store)
+            .await
+            .unwrap();
+        let ctx = installed_ctx(&store).await.unwrap();
+
+        // `anthropic` is in DEFAULT_INSTALLED; no connection exists.
+        let anthropic = provider_only("anthropic");
+        assert!(
+            compute_installed(&store, &anthropic, "provider", false, false, &ctx)
+                .await
+                .unwrap(),
+            "a default-installed provider is installed with zero connections"
+        );
+
+        // `xai` is not a default and has no connection.
+        let xai = provider_only("xai");
+        assert!(
+            !compute_installed(&store, &xai, "provider", false, false, &ctx)
+                .await
+                .unwrap(),
+            "a non-installed, connectionless provider is not installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_installed_provider_is_set_authoritative_ignoring_connections() {
+        // Provider installed-ness is authoritative on the persisted set ONLY,
+        // matching the Models list (which filters on the set). A family in the
+        // set is installed; a family absent from the set is NOT installed even
+        // when a connection row for it exists — so the Plugins card and the
+        // Models list can never disagree.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = std::sync::Arc::new(crate::Store::open(tmp.path()).await.unwrap());
+
+        // A live connection for `xai`, but `xai` is deliberately NOT in the set.
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "x1".into(),
+                provider: "xai".into(),
+                auth_type: "api_key".into(),
+                label: "xAI".into(),
+                priority: 0,
+                enabled: true,
+                data: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        // `openai` is installed via the set alone (no connection needed).
+        crate::llm_router::installed::install_provider(&store, "openai")
+            .await
+            .unwrap();
+
+        let ctx = installed_ctx(&store).await.unwrap();
+
+        let openai = provider_only("openai");
+        assert!(
+            compute_installed(&store, &openai, "provider", false, false, &ctx)
+                .await
+                .unwrap(),
+            "a family in the installed set is installed"
+        );
+
+        let xai = provider_only("xai");
+        assert!(
+            !compute_installed(&store, &xai, "provider", false, false, &ctx)
+                .await
+                .unwrap(),
+            "a family with a connection but absent from the set is NOT installed"
         );
     }
 

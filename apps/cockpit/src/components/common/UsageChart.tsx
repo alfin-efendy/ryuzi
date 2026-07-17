@@ -15,7 +15,7 @@ export function UsageChart({ points }: { points: UsagePoint[] }) {
         return (
           <div
             key={p.day}
-            className="flex flex-1 flex-col items-center gap-1"
+            className="flex h-full flex-1 flex-col items-center justify-end gap-1"
             title={`${p.day}: ${t.toLocaleString()} tokens, ${p.requests} req`}
           >
             <div className="w-full rounded-sm bg-primary/70" style={{ height: `${Math.max(2, h)}%` }} />

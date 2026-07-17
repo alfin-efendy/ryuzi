@@ -31,6 +31,8 @@ import { Chip, Pill, StatusDot } from "@/components/common/bits";
 import { ModelCapabilityIcons } from "@/components/ModelCapabilityIcons";
 import { KEYCHAIN_FILE_FALLBACK_WARNING, KEYCHAIN_UNAVAILABLE_WARNING } from "@/constants";
 import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
+import { AddProviderModal } from "@/components/modals/AddProviderModal";
+import { AddCustomProviderModal } from "@/components/modals/AddCustomProviderModal";
 
 type Tab = "providers" | "route" | "endpoint";
 
@@ -326,8 +328,13 @@ function ProviderRow({ row }: { row: ProviderRowInfo }) {
 }
 
 function ProvidersTab() {
-  const { catalog, connections, loaded } = useConnections();
-  const rows = useMemo(() => buildProviderRows(catalog, connections), [catalog, connections]);
+  const { catalog, connections, installedProviders, installProvider, addCustomProvider, loaded } = useConnections();
+  const [addOpen, setAddOpen] = useState(false);
+  const [addCustomOpen, setAddCustomOpen] = useState(false);
+  const rows = useMemo(
+    () => buildProviderRows(catalog, connections).filter((row) => installedProviders.includes(row.id)),
+    [catalog, connections, installedProviders],
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -338,9 +345,25 @@ function ProvidersTab() {
           ))}
         </Card>
       )}
-      {loaded && rows.length === 0 && (
-        <div className="py-8 text-center text-[13px] text-muted-foreground">No providers in the catalog yet.</div>
-      )}
+      {loaded && rows.length === 0 && <div className="py-8 text-center text-[13px] text-muted-foreground">No providers installed yet.</div>}
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" onClick={() => setAddOpen(true)} aria-label="Add provider">
+          <Plus aria-hidden size={14} className="mr-1.5" />
+          Add provider
+        </Button>
+        <Button variant="outline" onClick={() => setAddCustomOpen(true)} aria-label="Add custom provider">
+          <Plus aria-hidden size={14} className="mr-1.5" />
+          Add Custom Provider
+        </Button>
+      </div>
+      <AddProviderModal
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        catalog={catalog}
+        installed={installedProviders}
+        onInstall={installProvider}
+      />
+      <AddCustomProviderModal open={addCustomOpen} onClose={() => setAddCustomOpen(false)} onCreate={addCustomProvider} />
     </div>
   );
 }
@@ -483,7 +506,7 @@ function RouteForm({
         <Input
           value={draft.name}
           onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
-          placeholder="smart"
+          placeholder="free"
           className="flex-1 font-mono"
         />
       </CardRow>

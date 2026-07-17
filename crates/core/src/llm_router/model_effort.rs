@@ -755,11 +755,11 @@ mod tests {
             model: "gpt-custom".into(),
         };
         let target = RouteTargetEffortKey {
-            route_id: "smart".into(),
+            route_id: "free".into(),
             target_index: 0,
         };
         let policy = TurnEffortPolicy {
-            requested_model: "smart".into(),
+            requested_model: "free".into(),
             caller_override: Some("low".into()),
             route_targets: HashMap::from([(target.clone(), "high".into())]),
             configured: HashMap::from([(preference.clone(), "medium".into())]),

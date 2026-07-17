@@ -4,6 +4,7 @@ import {
   Archive,
   Bot,
   Workflow,
+  ChevronDown,
   ChevronRight,
   ChevronsUpDown,
   Folder,
@@ -14,7 +15,6 @@ import {
   LayoutGrid,
   ListFilter,
   Pencil,
-  Pin,
   Plus,
   Server,
   Settings,
@@ -35,30 +35,31 @@ import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, us
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useStore } from "@/store";
-import { useUi } from "@/store-ui";
+import { TASKS_BUCKET, useUi } from "@/store-ui";
 import { useNav, type View } from "@/store-nav";
 import { useGateways } from "@/store-gateways";
 import { useTerms } from "@/store-terms";
 import { commands } from "@/bindings";
 import {
   archivedCount,
-  chatSessions,
+  dropTarget,
   isUnreadVisible,
   orderProjects,
+  orderTasks,
   projectLabel,
   sessionTitle,
-  sessionsForProject,
+  visibleTasks,
   type Ordering,
 } from "@/lib/sidebar";
 import { LOCAL_RUNNER, isSession, refOf, sessionKey, type UiSession } from "@/lib/session-key";
-import { statusMeta } from "@/lib/status";
 import { StatusDot, TreeGuide } from "@/components/common/bits";
 import { AddProjectModal } from "@/components/modals/AddProjectModal";
-import { SessionRow } from "@/components/shell/SessionRow";
+import type { SessionRowProps } from "@/components/shell/SessionRow";
 import { SortableSessionRow } from "@/components/shell/SortableSessionRow";
+import { SortableProjectRow } from "@/components/shell/SortableProjectRow";
 
 const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"][] }[] = [
-  { label: "New session", icon: Pencil, view: { kind: "home" }, group: ["home"] },
+  { label: "New Task", icon: Pencil, view: { kind: "home" }, group: ["home"] },
   { label: "Inbox", icon: Inbox, view: { kind: "inbox" }, group: ["inbox"] },
   { label: "Models", icon: Grip, view: { kind: "models" }, group: ["models", "providerDetail"] },
   { label: "Automations", icon: Workflow, view: { kind: "automations" }, group: ["automations", "scheduler", "jobDetail", "jobNew"] },
@@ -70,6 +71,93 @@ const NAV: { label: string; icon: typeof Pencil; view: View; group: View["kind"]
 // Layout-only overrides for the tiny ghost icon Buttons in tree rows.
 const iconBtn = "shrink-0 rounded-sm text-muted-foreground";
 
+// Collapse key for the whole Projects section (mirrors TASKS_BUCKET for the
+// Tasks section). Distinct from any project id so a project named "__projects__"
+// can't collide with the section's own collapse state.
+const PROJECTS_SECTION = "__projects__";
+
+// Slim Organize/Ordering popover shared by the Tasks and Projects headers —
+// each caller supplies its own open/close state and the Ordering slice it
+// controls (task vs. project), but "Organize" (chat-first vs. per-project
+// grouping) is global, so both instances read/write the same organizeBy.
+function OrganizeMenu({
+  open,
+  onClose,
+  organizeBy,
+  setOrganizeBy,
+  ordering,
+  setOrdering,
+  className,
+}: {
+  open: boolean;
+  onClose: () => void;
+  organizeBy: "project" | "task";
+  setOrganizeBy: (v: "project" | "task") => void;
+  ordering: Ordering;
+  setOrdering: (o: Ordering) => void;
+  className: string;
+}) {
+  const [orgSub, setOrgSub] = useState(false);
+  const [ordSub, setOrdSub] = useState(false);
+  if (!open) return null;
+  const orgLabel = organizeBy === "task" ? "By Task" : "By Project";
+  const ordLabel = ordering === "name" ? "Name" : ordering === "manual" ? "Manual Order" : "Updated";
+  return (
+    <MenuPanel onClose={onClose} className={className}>
+      <MenuItem
+        onClick={() => {
+          setOrgSub((v) => !v);
+          setOrdSub(false);
+        }}
+      >
+        <span className="flex-1">Organize</span>
+        <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
+          {orgLabel} <ChevronRight aria-hidden size={11} strokeWidth={2} />
+        </span>
+      </MenuItem>
+      {orgSub &&
+        (["project", "task"] as const).map((v) => (
+          <MenuItem
+            key={v}
+            selected={organizeBy === v}
+            onClick={() => {
+              setOrganizeBy(v);
+              setOrgSub(false);
+            }}
+            className="py-1.5 pl-[22px] text-[12.5px]"
+          >
+            <span className="flex-1">{v === "task" ? "By Task" : "By Project"}</span>
+          </MenuItem>
+        ))}
+      <MenuItem
+        onClick={() => {
+          setOrdSub((v) => !v);
+          setOrgSub(false);
+        }}
+      >
+        <span className="flex-1">Ordering</span>
+        <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
+          {ordLabel} <ChevronRight aria-hidden size={11} strokeWidth={2} />
+        </span>
+      </MenuItem>
+      {ordSub &&
+        (["updated", "name", "manual"] as const).map((o) => (
+          <MenuItem
+            key={o}
+            selected={ordering === o}
+            onClick={() => {
+              setOrdering(o);
+              setOrdSub(false);
+            }}
+            className="py-1.5 pl-[22px] text-[12.5px]"
+          >
+            <span className="flex-1">{o === "name" ? "Name" : o === "manual" ? "Manual Order" : "Updated"}</span>
+          </MenuItem>
+        ))}
+    </MenuPanel>
+  );
+}
+
 export function Sidebar() {
   const { projects, sessions, setFocused, focusedSession, selectProject, end } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
@@ -79,12 +167,20 @@ export function Sidebar() {
     togglePin,
     setArchived,
     readAt,
-    sessionFilter,
-    toggleStatusFilter,
-    toggleUnreadOnly,
-    markAllRead,
     pinnedOrder,
     reorderPinned,
+    organizeBy,
+    setOrganizeBy,
+    taskOrdering,
+    setTaskOrdering,
+    projectOrdering,
+    setProjectOrdering,
+    taskOrder,
+    projectOrder,
+    reorderTasks,
+    reorderProjects,
+    collapsed,
+    toggleCollapsed,
   } = useUi();
   const [confirmArchive, setConfirmArchive] = useState<{ session: UiSession; reason: string } | null>(null);
   const archiveCancelRef = useRef<HTMLButtonElement>(null);
@@ -93,9 +189,28 @@ export function Sidebar() {
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
-  const onPinnedDragEnd = (e: DragEndEvent) => {
+  // A row's partition (pinned vs. manual-ordered) is decided by `dropTarget`;
+  // cross-partition drops and no-ops are rejected there. Reordering unpinned
+  // rows always switches that section's Ordering to Manual — dragging is an
+  // explicit request for manual control.
+  const onTaskDragEnd = (bucket: string, visibleKeys: string[]) => (e: DragEndEvent) => {
     const { active, over } = e;
-    if (over && active.id !== over.id) reorderPinned(String(active.id), String(over.id));
+    if (!over) return;
+    const activeId = String(active.id);
+    const overId = String(over.id);
+    const target = dropTarget(activeId, overId, !!pinned[activeId], !!pinned[overId]);
+    if (target === "pinned") reorderPinned(activeId, overId);
+    else if (target === "manual") {
+      const unpinned = visibleKeys.filter((k) => !pinned[k]);
+      reorderTasks(bucket, activeId, overId, unpinned);
+      setTaskOrdering("manual");
+    }
+  };
+  const onProjectDragEnd = (visibleIds: string[]) => (e: DragEndEvent) => {
+    const { active, over } = e;
+    if (!over || active.id === over.id) return;
+    reorderProjects(String(active.id), String(over.id), visibleIds);
+    setProjectOrdering("manual");
   };
 
   // Archive = real teardown: end the session (interrupt + stop the agent,
@@ -157,32 +272,27 @@ export function Sidebar() {
     if (!gatewaysLoaded) void hydrateGateways();
   }, [gatewaysLoaded, hydrateGateways]);
 
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [showArchived, setShowArchived] = useState<Record<string, boolean>>({});
-  const [archivedGlobal, setArchivedGlobal] = useState(false);
-  const [ordering, setOrdering] = useState<Ordering>("updated");
   const [projectsMenuOpen, setProjectsMenuOpen] = useState(false);
-  const [orderingSubOpen, setOrderingSubOpen] = useState(false);
+  const [tasksMenuOpen, setTasksMenuOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [addProjectOpen, setAddProjectOpen] = useState(false);
 
   const q = nav.searchQuery;
   const ws = gateways.find((w) => w.id === activeGateway) ?? gateways[0];
-  const projList = orderProjects(projects, ordering);
-  // Chat-first sessions (no project) get their own bucket above the project
-  // tree — same query/archived/pin treatment as a project's session list,
-  // just flat (no project to nest under).
-  const qLower = q.trim().toLowerCase();
-  const chatList = chatSessions(sessions)
-    .filter((s) => !qLower || sessionTitle(s).toLowerCase().includes(qLower))
-    .filter((s) => archivedGlobal || !archived[sessionKey(s)])
-    .sort((a, b) => {
-      const pin = (pinned[sessionKey(b)] ? 1 : 0) - (pinned[sessionKey(a)] ? 1 : 0);
-      if (pin !== 0) return pin;
-      return (b.lastActive ?? 0) - (a.lastActive ?? 0);
-    });
-  const filter = { statuses: sessionFilter.statuses, unreadOnly: sessionFilter.unreadOnly, readAt, focusedSession };
-  const filterActive = Object.keys(sessionFilter.statuses).length > 0 || sessionFilter.unreadOnly;
+  const projList = orderProjects(projects, projectOrdering, projectOrder);
+  // Top "Tasks" bucket. By Project: chat-first tasks only (project tasks nest
+  // under their project below). By Task: every task, flat. Section-level archived
+  // reveal is gone, so archived rows stay hidden here (showArchived = false);
+  // per-project reveal still lives on each project row.
+  const tasksScope = organizeBy === "task" ? "all" : "chat";
+  const taskList = orderTasks(
+    visibleTasks(sessions, tasksScope, q, false, archived),
+    pinned,
+    pinnedOrder,
+    taskOrdering,
+    taskOrder[TASKS_BUCKET] ?? [],
+  );
 
   const openSession = (s: UiSession) => {
     setFocused(refOf(s));
@@ -194,6 +304,27 @@ export function Sidebar() {
   const runnerLabel = (runnerId: string): string | null => {
     if (runnerId === LOCAL_RUNNER) return null;
     return gateways.find((g) => g.id === runnerId)?.name ?? runnerId;
+  };
+
+  // Shared row-prop builder for every task-row render site (top Tasks bucket,
+  // By-Project nested lists) so the three paths can't drift on click/pin/
+  // archive wiring. `hasTail`/`showGuide` are the only per-site variance.
+  const makeRowProps = (s: UiSession, opts: { hasTail: boolean; showGuide?: boolean }): Omit<SessionRowProps, "dragHandle"> => {
+    const key = sessionKey(s);
+    return {
+      session: s,
+      isActive: view.kind === "session" && isSession(s, focusedSession),
+      isPinned: !!pinned[key],
+      unread: isUnreadVisible(s, readAt, focusedSession),
+      isArchived: !!archived[key],
+      hasTail: opts.hasTail,
+      showGuide: opts.showGuide,
+      archiveDisabled: archivingPk === s.sessionPk,
+      runnerLabel: runnerLabel(s.runnerId),
+      onOpen: () => openSession(s),
+      onTogglePin: () => togglePin(key),
+      onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
+    };
   };
 
   return (
@@ -226,69 +357,89 @@ export function Sidebar() {
         })}
       </div>
 
-      {/* Chat sessions — chat-first sessions with no project, bucketed apart
-          from the project tree below so they never look like they belong to
-          whichever project happens to be first. */}
-      {chatList.length > 0 && (
+      {/* Tasks — the top flat bucket. By Project it holds only chat-first tasks
+          (project tasks nest under their project); By Task it holds every task,
+          flat. Rendered as guide-less SessionRows apart from the project tree. */}
+      {taskList.length > 0 && (
         <div className="box-border flex w-[260px] flex-col gap-px px-2.5">
           <div className="flex items-center gap-[2px] py-2 pl-2.5 pr-1.5">
-            <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Chat</span>
-          </div>
-          {chatList.map((s) => {
-            const m = statusMeta(s.status);
-            const key = sessionKey(s);
-            const isActive = view.kind === "session" && isSession(s, focusedSession);
-            const isPinned = !!pinned[key];
-            const rLabel = runnerLabel(s.runnerId);
-            return (
-              <div key={key} className={`group flex min-h-7 items-stretch text-sidebar-foreground ${archived[key] ? "opacity-55" : ""}`}>
-                <span
-                  className={`my-px flex min-w-0 flex-1 items-center gap-2 rounded-md py-[5px] pl-2 pr-1.5 hover:bg-sidebar-accent ${isActive ? "bg-sidebar-accent" : ""}`}
+            <div className="relative flex flex-1 items-center gap-[2px]">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className={iconBtn}
+                title={collapsed[TASKS_BUCKET] ? "Expand Tasks" : "Collapse Tasks"}
+                onClick={() => toggleCollapsed(TASKS_BUCKET)}
+              >
+                <ChevronDown
+                  aria-hidden
+                  size={14}
+                  strokeWidth={2}
+                  className={`size-[14px] transition-transform ${collapsed[TASKS_BUCKET] ? "-rotate-90" : ""}`}
+                />
+              </Button>
+              <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Tasks</span>
+              <span className="relative">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className={iconBtn}
+                  title="Sort and organize"
+                  onClick={() => setTasksMenuOpen((v) => !v)}
                 >
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    onClick={() => openSession(s)}
-                    className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                  >
-                    <StatusDot color={m.color} pulse={m.pulse} />
-                    <span className="min-w-0 flex-1 truncate">{sessionTitle(s)}</span>
-                    {rLabel && (
-                      <Badge variant="secondary" className="h-4 shrink-0 px-1 text-[9.5px] font-medium">
-                        {rLabel}
-                      </Badge>
-                    )}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    title={isPinned ? "Unpin" : "Pin"}
-                    className={`size-[22px] shrink-0 rounded-sm ${isPinned ? "flex text-foreground" : "hidden text-muted-foreground group-hover:flex"}`}
-                    onClick={() => togglePin(key)}
-                  >
-                    <Pin aria-hidden size={12} strokeWidth={2} fill={isPinned ? "currentColor" : "none"} />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    title={archived[key] ? "Restore" : "Archive — ends the session and removes its scratch dir"}
-                    disabled={archivingPk === s.sessionPk}
-                    className="hidden size-[22px] shrink-0 rounded-sm text-muted-foreground disabled:opacity-40 group-hover:flex"
-                    onClick={() => (archived[key] ? setArchived(key, false) : void archiveSession(s))}
-                  >
-                    <Archive aria-hidden size={12} strokeWidth={2} />
-                  </Button>
-                </span>
-              </div>
-            );
-          })}
+                  <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                </Button>
+              </span>
+              <OrganizeMenu
+                open={tasksMenuOpen}
+                onClose={() => setTasksMenuOpen(false)}
+                organizeBy={organizeBy}
+                setOrganizeBy={setOrganizeBy}
+                ordering={taskOrdering}
+                setOrdering={setTaskOrdering}
+                className="left-2.5 top-8 z-[70] w-[238px]"
+              />
+            </div>
+          </div>
+          {!collapsed[TASKS_BUCKET] && (
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              modifiers={[restrictToVerticalAxis]}
+              onDragEnd={onTaskDragEnd(
+                TASKS_BUCKET,
+                taskList.map((s) => sessionKey(s)),
+              )}
+            >
+              <SortableContext items={taskList.map((s) => sessionKey(s))} strategy={verticalListSortingStrategy}>
+                {taskList.map((s) => (
+                  <SortableSessionRow key={sessionKey(s)} {...makeRowProps(s, { hasTail: false, showGuide: false })} />
+                ))}
+              </SortableContext>
+            </DndContext>
+          )}
         </div>
       )}
 
       {/* Projects header */}
-      <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-5 pr-3">
+      <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-2.5 pr-3">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className={iconBtn}
+          title={collapsed[PROJECTS_SECTION] ? "Expand Projects" : "Collapse Projects"}
+          onClick={() => toggleCollapsed(PROJECTS_SECTION)}
+        >
+          <ChevronDown
+            aria-hidden
+            size={14}
+            strokeWidth={2}
+            className={`size-[14px] transition-transform ${collapsed[PROJECTS_SECTION] ? "-rotate-90" : ""}`}
+          />
+        </Button>
         <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Projects</span>
         <span className="relative">
           <Button
@@ -296,15 +447,11 @@ export function Sidebar() {
             variant="ghost"
             size="icon-xs"
             className={iconBtn}
-            title="Sort and filter"
-            onClick={() => {
-              setProjectsMenuOpen((v) => !v);
-              setOrderingSubOpen(false);
-            }}
+            title="Sort and organize"
+            onClick={() => setProjectsMenuOpen((v) => !v)}
           >
             <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
           </Button>
-          {filterActive && <span aria-hidden className="pointer-events-none absolute right-0 top-0 size-1.5 rounded-full bg-primary" />}
         </span>
         <Button
           type="button"
@@ -317,168 +464,162 @@ export function Sidebar() {
           <FolderPlus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
         </Button>
 
-        {projectsMenuOpen && (
-          <MenuPanel onClose={() => setProjectsMenuOpen(false)} className="left-2.5 top-8 z-[70] w-[238px]">
-            <MenuItem>
-              <span className="flex-1">Grouping</span>
-              <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
-                Project <ChevronRight aria-hidden size={11} strokeWidth={2} />
-              </span>
-            </MenuItem>
-            <MenuItem onClick={() => setOrderingSubOpen((v) => !v)}>
-              <span className="flex-1">Ordering</span>
-              <span className="flex items-center gap-1 text-[12.5px] text-muted-foreground">
-                {ordering === "name" ? "Name" : "Updated"} <ChevronRight aria-hidden size={11} strokeWidth={2} />
-              </span>
-            </MenuItem>
-            {orderingSubOpen &&
-              (["updated", "name"] as const).map((o) => (
-                <MenuItem
-                  key={o}
-                  selected={ordering === o}
-                  onClick={() => {
-                    setOrdering(o);
-                    setOrderingSubOpen(false);
-                  }}
-                  className="py-1.5 pl-[22px] text-[12.5px]"
-                >
-                  <span className="flex-1">{o === "name" ? "Name" : "Updated"}</span>
-                </MenuItem>
-              ))}
-            <MenuSeparator />
-            <MenuSectionLabel>Status</MenuSectionLabel>
-            {(["idle", "running", "interrupted", "ended"] as const).map((st) => (
-              <MenuItem key={st} selected={!!sessionFilter.statuses[st]} onClick={() => toggleStatusFilter(st)}>
-                <span className="flex-1 capitalize">{st}</span>
-              </MenuItem>
-            ))}
-            <MenuItem selected={sessionFilter.unreadOnly} onClick={() => toggleUnreadOnly()}>
-              <span className="flex-1">Unread only</span>
-            </MenuItem>
-            <MenuItem selected={archivedGlobal} onClick={() => setArchivedGlobal((v) => !v)}>
-              <span className="flex-1">Archived</span>
-            </MenuItem>
-            <MenuSeparator />
-            <MenuItem
-              onClick={() => {
-                setExpanded(Object.fromEntries(projects.map((p) => [p.projectId, false])));
-                setProjectsMenuOpen(false);
-              }}
-            >
-              Collapse all
-            </MenuItem>
-            <MenuItem
-              onClick={() => {
-                markAllRead(sessions);
-                setProjectsMenuOpen(false);
-              }}
-            >
-              Mark all as read
-            </MenuItem>
-          </MenuPanel>
-        )}
+        <OrganizeMenu
+          open={projectsMenuOpen}
+          onClose={() => setProjectsMenuOpen(false)}
+          organizeBy={organizeBy}
+          setOrganizeBy={setOrganizeBy}
+          ordering={projectOrdering}
+          setOrdering={setProjectOrdering}
+          className="left-2.5 top-8 z-[70] w-[238px]"
+        />
       </div>
 
-      {/* Projects tree */}
+      {/* Projects — a flat navigable list (By Task) or the nested task tree
+          (By Project). The whole section collapses via the header chevron. */}
       <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
-        {projList.map((p) => {
-          const showArch = archivedGlobal || !!showArchived[p.projectId];
-          const sess = sessionsForProject(sessions, p.projectId, q, showArch, pinned, archived, filter, pinnedOrder);
-          const archCount = archivedCount(sessions, p.projectId, archived);
-          const open = q.trim() ? sess.length > 0 : (expanded[p.projectId] ?? true);
-          return (
-            <div key={p.projectId} className="flex flex-col gap-px">
-              <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                  onClick={() => setExpanded((e) => ({ ...e, [p.projectId]: !open }))}
-                >
-                  {open ? (
-                    <FolderOpen aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
-                  ) : (
-                    <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
-                  )}
-                  <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  title="Project settings"
-                  className={`${iconBtn} hidden group-hover:flex`}
-                  onClick={() => nav.setProjectSettingsFor(p.projectId)}
-                >
-                  <Settings aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  title="New session"
-                  className={`${iconBtn} hidden group-hover:flex`}
-                  onClick={() => {
-                    selectProject(p.projectId);
-                    nav.navigate({ kind: "home" });
-                    setExpanded((e) => ({ ...e, [p.projectId]: true }));
-                  }}
-                >
-                  <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
-                </Button>
-              </div>
-              {open && (
-                <>
-                  <DndContext
-                    sensors={sensors}
-                    collisionDetection={closestCenter}
-                    modifiers={[restrictToVerticalAxis]}
-                    onDragEnd={onPinnedDragEnd}
-                  >
-                    <SortableContext
-                      items={sess.filter((s) => pinned[sessionKey(s)]).map((s) => sessionKey(s))}
-                      strategy={verticalListSortingStrategy}
-                    >
-                      {sess.map((s, i) => {
-                        const key = sessionKey(s);
-                        const isActive = view.kind === "session" && isSession(s, focusedSession);
-                        const isPinned = !!pinned[key];
-                        const unread = isUnreadVisible(s, readAt, focusedSession);
-                        const showArchivedLabel = archCount > 0 && !archivedGlobal;
-                        const hasTail = i < sess.length - 1 || showArchivedLabel;
-                        const rowProps = {
-                          session: s,
-                          isActive,
-                          isPinned,
-                          unread,
-                          isArchived: !!archived[key],
-                          hasTail,
-                          archiveDisabled: archivingPk === s.sessionPk,
-                          runnerLabel: runnerLabel(s.runnerId),
-                          onOpen: () => openSession(s),
-                          onTogglePin: () => togglePin(key),
-                          onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
-                        };
-                        return isPinned ? <SortableSessionRow key={key} {...rowProps} /> : <SessionRow key={key} {...rowProps} />;
-                      })}
-                    </SortableContext>
-                  </DndContext>
-                  {archCount > 0 && !archivedGlobal && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      className="h-auto min-h-6 items-stretch justify-start gap-0 rounded-sm border-0 p-0 pr-2 text-left text-[11.5px] font-normal text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent"
-                      onClick={() => setShowArchived((m) => ({ ...m, [p.projectId]: !m[p.projectId] }))}
-                    >
-                      <TreeGuide tail={false} reach={1} />
-                      <span className="self-center pl-[7px]">{showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}</span>
-                    </Button>
-                  )}
-                </>
-              )}
-            </div>
-          );
-        })}
+        {!collapsed[PROJECTS_SECTION] && (
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            modifiers={[restrictToVerticalAxis]}
+            onDragEnd={onProjectDragEnd(projList.map((p) => p.projectId))}
+          >
+            <SortableContext items={projList.map((p) => p.projectId)} strategy={verticalListSortingStrategy}>
+              {organizeBy === "task"
+                ? projList.map((p) => (
+                    <SortableProjectRow key={p.projectId} id={p.projectId}>
+                      {(dragHandle) => (
+                        <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
+                          {dragHandle}
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                            onClick={() => nav.setProjectSettingsFor(p.projectId)}
+                          >
+                            <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+                            <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            title="New task"
+                            className={`${iconBtn} hidden group-hover:flex`}
+                            onClick={() => {
+                              selectProject(p.projectId);
+                              nav.navigate({ kind: "home" });
+                            }}
+                          >
+                            <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                          </Button>
+                        </div>
+                      )}
+                    </SortableProjectRow>
+                  ))
+                : projList.map((p) => {
+                    const showArch = !!showArchived[p.projectId];
+                    const sess = orderTasks(
+                      visibleTasks(sessions, { projectId: p.projectId }, q, showArch, archived),
+                      pinned,
+                      pinnedOrder,
+                      taskOrdering,
+                      taskOrder[p.projectId] ?? [],
+                    );
+                    const archCount = archivedCount(sessions, p.projectId, archived);
+                    const open = q.trim() ? sess.length > 0 : !collapsed[p.projectId];
+                    return (
+                      <div key={p.projectId} className="flex flex-col gap-px">
+                        <SortableProjectRow id={p.projectId}>
+                          {(dragHandle) => (
+                            <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
+                              {dragHandle}
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                                onClick={() => toggleCollapsed(p.projectId)}
+                              >
+                                {open ? (
+                                  <FolderOpen
+                                    aria-hidden
+                                    size={14}
+                                    strokeWidth={2}
+                                    className="size-[14px] shrink-0 text-muted-foreground"
+                                  />
+                                ) : (
+                                  <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+                                )}
+                                <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                title="Project settings"
+                                className={`${iconBtn} hidden group-hover:flex`}
+                                onClick={() => nav.setProjectSettingsFor(p.projectId)}
+                              >
+                                <Settings aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                title="New task"
+                                className={`${iconBtn} hidden group-hover:flex`}
+                                onClick={() => {
+                                  selectProject(p.projectId);
+                                  nav.navigate({ kind: "home" });
+                                  if (collapsed[p.projectId]) toggleCollapsed(p.projectId);
+                                }}
+                              >
+                                <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+                              </Button>
+                            </div>
+                          )}
+                        </SortableProjectRow>
+                        {open && (
+                          <>
+                            <DndContext
+                              sensors={sensors}
+                              collisionDetection={closestCenter}
+                              modifiers={[restrictToVerticalAxis]}
+                              onDragEnd={onTaskDragEnd(
+                                p.projectId,
+                                sess.map((s) => sessionKey(s)),
+                              )}
+                            >
+                              <SortableContext items={sess.map((s) => sessionKey(s))} strategy={verticalListSortingStrategy}>
+                                {sess.map((s, i) => {
+                                  const showArchivedLabel = archCount > 0;
+                                  const hasTail = i < sess.length - 1 || showArchivedLabel;
+                                  return <SortableSessionRow key={sessionKey(s)} {...makeRowProps(s, { hasTail })} />;
+                                })}
+                              </SortableContext>
+                            </DndContext>
+                            {archCount > 0 && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                className="h-auto min-h-6 items-stretch justify-start gap-0 rounded-sm border-0 p-0 pr-2 text-left text-[11.5px] font-normal text-muted-foreground hover:bg-transparent hover:text-foreground dark:hover:bg-transparent"
+                                onClick={() => setShowArchived((m) => ({ ...m, [p.projectId]: !m[p.projectId] }))}
+                              >
+                                <TreeGuide tail={false} reach={1} />
+                                <span className="self-center pl-[7px]">
+                                  {showArchived[p.projectId] ? "Hide archived" : `${archCount} archived`}
+                                </span>
+                              </Button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+            </SortableContext>
+          </DndContext>
+        )}
       </div>
 
       {/* Workspace / gateway switcher */}

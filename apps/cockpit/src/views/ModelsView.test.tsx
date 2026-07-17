@@ -143,7 +143,7 @@ const catalog: CatalogEntry[] = [
 const routes: ModelRouteInfo[] = [
   {
     id: "r1",
-    name: "smart",
+    name: "free",
     enabled: true,
     strategy: "fallback",
     targets: [{ provider: "openai", model: "gpt-4.1", effort: null }],
@@ -199,6 +199,7 @@ const setConnectionEnabled = mock((_runnerId: string, _id: string, enabled: bool
   Promise.resolve({ status: "ok" as const, data: [{ ...connection, enabled }, secondConnection] }),
 );
 const removeConnection = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [secondConnection] }));
+const removeCustomProvider = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
 const reconnectOauth = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [claudeConnection] }));
 const resetCodexCredit = mock(
   (_runnerId: string, _id: string): Promise<Result<CodexResetCreditResult, CmdError>> =>
@@ -214,7 +215,9 @@ mock.module("@/bindings", () => ({
     endpointStatus: () => Promise.resolve({ status: "ok", data: status }),
     listEndpointKeys: () => Promise.resolve({ status: "ok", data: keys }),
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
+    listCustomProviders: () => Promise.resolve({ status: "ok", data: [] }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
+    listInstalledProviders: () => Promise.resolve({ status: "ok", data: ["openai", "anthropic"] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
     listModelRouteTargetCapabilities: () => Promise.resolve({ status: "ok", data: routeTargetCapabilities }),
     projectRuntimeInfo: (projectId: string) =>
@@ -232,7 +235,7 @@ mock.module("@/bindings", () => ({
         },
       }),
     listAgents: () =>
-      Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "smart" } } }),
+      Promise.resolve({ status: "ok", data: { agents: [], defaultAgentId: "", subagentModel: { kind: "route", route: "free" } } }),
     listSelectableModels: () => Promise.resolve({ status: "ok", data: [] }),
     saveModelRoute,
     refreshProviderModels,
@@ -245,6 +248,7 @@ mock.module("@/bindings", () => ({
     renameConnection,
     setConnectionEnabled,
     removeConnection,
+    removeCustomProvider,
     reconnectOauth,
     resetCodexCredit,
     moveConnection: () => Promise.resolve({ status: "ok", data: [secondConnection, connection] }),
@@ -286,7 +290,15 @@ const { useAgents } = await import("@/store-agents");
 // fixtures) would otherwise satisfy the `loaded` guard and skip ours.
 function resetStores() {
   useEndpoint.setState({ status: null, keys: [], loaded: false });
-  useConnections.setState({ catalog: [], connections: [], loaded: false });
+  // Default the installed set to a superset of every family used across these
+  // tests so ProvidersTab (which now filters to installed families) still shows
+  // them; individual tests override `installedProviders` to assert the filter.
+  useConnections.setState({
+    catalog: [],
+    connections: [],
+    installedProviders: ["openai", "anthropic", "openrouter", "kiro"],
+    loaded: false,
+  });
   useModelRoutes.setState({ routes: [], targetCapabilities: [], loaded: false });
   useUsage.setState({ byConnection: {}, endpoint: null });
   useNav.setState({ history: { back: [], current: { kind: "models" }, forward: [] } });
@@ -327,6 +339,43 @@ test("provider list has no global Add connection button", async () => {
   expect(screen.queryByRole("button", { name: /add connection/i })).toBeNull();
 });
 
+test("a user custom provider renders its own installed row", async () => {
+  useConnections.setState({
+    catalog: [
+      {
+        id: "custom-my-gw",
+        name: "My Gateway",
+        family: "custom-my-gw",
+        color: "#8b8b8b",
+        initial: "M",
+        category: "api_key",
+        format: "openai",
+        requiresBaseUrl: true,
+        models: [],
+        freeTier: false,
+        riskNotice: false,
+        usesDeviceGrant: false,
+      },
+    ],
+    customProviders: [{ id: "custom-my-gw", name: "My Gateway", format: "openai", color: "#8b8b8b", initial: "M", createdAt: 0 }],
+    connections: [],
+    installedProviders: ["custom-my-gw"],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  expect(await screen.findByRole("button", { name: /My Gateway/ })).toBeTruthy();
+});
+
+test("the Add Custom Provider button opens the name popup", async () => {
+  useConnections.setState({ catalog: [], customProviders: [], connections: [], installedProviders: [], loaded: true });
+  render(<ModelsView />);
+
+  const button = await screen.findByRole("button", { name: "Add custom provider" });
+  fireEvent.click(button);
+  expect(await screen.findByLabelText("Provider name")).toBeTruthy();
+});
+
 test("providers tab groups anthropic + anthropic-oauth accounts into one Anthropic row", async () => {
   useConnections.setState({
     catalog,
@@ -341,6 +390,33 @@ test("providers tab groups anthropic + anthropic-oauth accounts into one Anthrop
 
   fireEvent.click(anthropicRow);
   expect(useNav.getState().history.current).toEqual({ kind: "providerDetail", provider: "anthropic" });
+});
+
+test("providers tab hides catalog families absent from the installed set", async () => {
+  const xai: CatalogEntry = {
+    id: "xai",
+    name: "xAI",
+    family: "xai",
+    color: "#111111",
+    initial: "X",
+    category: "api_key",
+    format: "openai",
+    requiresBaseUrl: false,
+    models: ["grok-4"],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  };
+  useConnections.setState({
+    catalog: [catalog[1]!, xai],
+    connections: [],
+    installedProviders: ["anthropic"],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  expect(await screen.findByText("Anthropic")).toBeTruthy();
+  expect(screen.queryByText("xAI")).toBeNull();
 });
 
 test("provider rows show plain account and model counts without category or active badges", async () => {
@@ -460,6 +536,45 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("Usage")).toBeTruthy();
   expect(screen.getAllByText("Models").length).toBeGreaterThan(0);
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
+  // A built-in provider offers no custom-provider removal affordance.
+  expect(screen.queryByRole("button", { name: "Remove custom provider" })).toBeNull();
+});
+
+test("custom provider detail exposes a destructive remove that confirms, calls the engine, and returns to Models", async () => {
+  removeCustomProvider.mockClear();
+  const customEntry: CatalogEntry = {
+    id: "custom-gw",
+    name: "My Gateway",
+    family: "custom-gw",
+    color: "#8b8b8b",
+    initial: "M",
+    category: "api_key",
+    format: "openai",
+    requiresBaseUrl: true,
+    models: [],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  };
+  useConnections.setState({
+    catalog: [customEntry],
+    customProviders: [{ id: "custom-gw", name: "My Gateway", format: "openai", color: "#8b8b8b", initial: "M", createdAt: 0 }],
+    connections: [],
+    installedProviders: ["custom-gw"],
+    loaded: true,
+  });
+  render(<ProviderDetailView provider="custom-gw" />);
+
+  const trigger = await screen.findByRole("button", { name: "Remove custom provider" });
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: "Remove custom provider?" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Remove provider" }));
+
+  await waitFor(() => expect(removeCustomProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-gw"));
+  await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "models" }));
+  await act(async () => {
+    await Promise.resolve();
+  });
 });
 
 test("provider detail reads dynamic effort metadata from the agent store", async () => {
@@ -637,7 +752,7 @@ test("Route tab lists model route aliases and their ordered targets", async () =
 
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
 
-  expect(await screen.findByText("smart")).toBeTruthy();
+  expect(await screen.findByText("free")).toBeTruthy();
   expect(screen.getByText("By order")).toBeTruthy();
   expect(screen.getByText("OpenAI / gpt-4.1")).toBeTruthy();
   expect(screen.getByRole("button", { name: "New route" })).toBeTruthy();
@@ -808,7 +923,7 @@ test("route form saves targets as {provider, model} scoped to the family, not th
 
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
-  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "combo" } });
+  fireEvent.change(screen.getByPlaceholderText("free"), { target: { value: "combo" } });
   fireEvent.click(screen.getByRole("button", { name: "Save route" }));
 
   await waitFor(() => expect(saveModelRoute).toHaveBeenCalled());
@@ -848,7 +963,7 @@ test("shows empty states for API keys, providers, and routes", async () => {
   useModelRoutes.setState({ routes: [], loaded: true });
   render(<ModelsView />);
 
-  expect(await screen.findByText("No providers in the catalog yet.")).toBeTruthy();
+  expect(await screen.findByText("No providers installed yet.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Route" }));
   expect(screen.getByText("No routes yet. Create a route alias to expose a combo-style model.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Endpoint" }));
@@ -891,7 +1006,7 @@ test("route target adapter round-trips a slash-containing model id (cloudflare-a
 
   fireEvent.click(await screen.findByRole("button", { name: "Route" }));
   fireEvent.click(screen.getByRole("button", { name: "New route" }));
-  fireEvent.change(screen.getByPlaceholderText("smart"), { target: { value: "cf-route" } });
+  fireEvent.change(screen.getByPlaceholderText("free"), { target: { value: "cf-route" } });
 
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
   fireEvent.click(await screen.findByRole("option", { name: "@cf/meta/llama-3.1-8b-instruct" }));

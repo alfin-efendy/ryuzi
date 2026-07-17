@@ -1,7 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { CatalogEntry, ConnectionInfo, SelectableModelInfo } from "@/bindings";
-import { accountReconnectKind, ModelEffortDefaultCombobox, modelEffortDefaultOptions } from "./ProviderDetailView";
+import { accountReconnectKind, isCustomProvider, ModelEffortDefaultCombobox, modelEffortDefaultOptions } from "./ProviderDetailView";
 
 afterEach(() => {
   cleanup();
@@ -37,6 +37,14 @@ const catalogEntry = {
   usesDeviceGrant: false,
 } satisfies CatalogEntry;
 
+test("isCustomProvider matches only custom- family ids", () => {
+  expect(isCustomProvider("custom-my-gw")).toBe(true);
+  expect(isCustomProvider("custom-")).toBe(true);
+  expect(isCustomProvider("openai")).toBe(false);
+  expect(isCustomProvider("anthropic-oauth")).toBe(false);
+  expect(isCustomProvider("")).toBe(false);
+});
+
 test("account reconnect is redirect for browser OAuth, device for device sign-in, and absent for API/free accounts", () => {
   expect(accountReconnectKind(account, catalogEntry)).toBe("redirect");
   expect(accountReconnectKind(account, { ...catalogEntry, category: "device" })).toBe("device");
@@ -47,7 +55,7 @@ test("account reconnect is redirect for browser OAuth, device for device sign-in
 test("provider_model_default_selector_clears_and_reports_varied_defaults", () => {
   const metadata: SelectableModelInfo = {
     kind: "namedRoute",
-    requestValue: "smart",
+    requestValue: "free",
     displayName: "Smart",
     preferenceKey: { family: "openai", model: "gpt-5" },
     supported: [{ value: "high", label: "High", description: "Deep reasoning" }],

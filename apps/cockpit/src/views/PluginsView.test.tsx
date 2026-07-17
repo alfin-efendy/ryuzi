@@ -252,7 +252,17 @@ const { useApps } = await import("@/store-apps");
 const { usePlugins } = await import("@/store-plugins");
 const { useGateways } = await import("@/store-gateways");
 const { useNav } = await import("@/store-nav");
+const { useConnections } = await import("@/store-connections");
 const { filterByCategory, PluginsView } = await import("./PluginsView");
+
+// Provider install/uninstall now flow through the connections store's installed
+// set, not the add-account modal. Override just those two actions with mocks and
+// restore the real ones on the way out (this store singleton is shared across
+// test files in one bun process).
+const installProviderMock = mock(async (_family: string) => true);
+const uninstallProviderMock = mock(async (_family: string) => true);
+const defaultInstallProvider = useConnections.getState().installProvider;
+const defaultUninstallProvider = useConnections.getState().uninstallProvider;
 
 const all = [plugin("github", ["vcs", "issues"]), plugin("notion", ["docs", "wiki", "productivity"]), plugin("ollama", ["model-provider"])];
 
@@ -308,6 +318,9 @@ beforeEach(() => {
   toastSuccess.mockClear();
   toastWarning.mockClear();
   toastError.mockClear();
+  installProviderMock.mockClear();
+  uninstallProviderMock.mockClear();
+  useConnections.setState({ installProvider: installProviderMock, uninstallProvider: uninstallProviderMock });
   useApps.setState({ apps: [], loaded: false, probing: null });
   resetPluginsStore();
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
@@ -319,6 +332,7 @@ beforeEach(() => {
 // in the same bun process would otherwise inherit this file's fixtures.
 afterEach(() => {
   cleanup();
+  useConnections.setState({ installProvider: defaultInstallProvider, uninstallProvider: defaultUninstallProvider });
   useApps.setState({ apps: [], loaded: false, probing: null });
   resetPluginsStore();
   useGateways.setState({ gateways: [], eventsById: {}, loaded: false, probing: false });
@@ -367,7 +381,7 @@ test("browse install routes an integration to the install wizard", async () => {
   await waitFor(() => expect(beginPluginInstall).toHaveBeenCalledWith(LOCAL_RUNNER, "github"));
 });
 
-test("browse install routes a provider to the connection modal", async () => {
+test("browse install adds a provider to the installed set instead of opening the connection modal", async () => {
   pluginsFixture = [github, anthropic, superpowers];
   await renderView();
 
@@ -376,7 +390,9 @@ test("browse install routes a provider to the connection modal", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Install anthropic" }));
 
-  expect((await screen.findAllByText("Add account")).length).toBeGreaterThan(0);
+  await waitFor(() => expect(installProviderMock).toHaveBeenCalledWith("anthropic"));
+  // Installing a provider no longer opens the add-account modal.
+  expect(screen.queryByText("Add account")).toBeNull();
 });
 
 test("browse install routes a skill pack through the two-phase trust flow (beginSkillInstall)", async () => {
@@ -414,6 +430,17 @@ test("installed aggregates apps and installed plugins with uninstall", async () 
   fireEvent.click(screen.getByRole("button", { name: "Uninstall notion" }));
 
   await waitFor(() => expect(uninstallPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "notion"));
+});
+
+test("uninstalling an installed provider removes it from the set via uninstallProvider", async () => {
+  pluginsFixture = [plugin("anthropic", ["model-provider"], { kind: "provider", family: "anthropic", source: "builtin", installed: true })];
+  await renderView();
+
+  fireEvent.click(await screen.findByRole("button", { name: "Uninstall anthropic" }));
+
+  await waitFor(() => expect(uninstallProviderMock).toHaveBeenCalledWith("anthropic"));
+  // The provider path does not go through the plugin-uninstall command.
+  expect(uninstallPlugin).not.toHaveBeenCalled();
 });
 
 test("an installed curated pack renders as exactly one card, not a duplicate manual row", async () => {

@@ -58,7 +58,17 @@ test("image preview uses the shared shell with visible X and footer action", asy
     toolSummary: null,
     toolSubagent: null,
   };
-  render(<Transcript runnerId={LOCAL_RUNNER} sessionPk="s1" rows={[row]} agentName="Ryuzi" agentColor="#fff" running={false} />);
+  render(
+    <Transcript
+      runnerId={LOCAL_RUNNER}
+      sessionPk="s1"
+      rows={[row]}
+      agentName="Ryuzi"
+      agentColor="#fff"
+      running={false}
+      ownerRunId={null}
+    />,
+  );
   // The image loads asynchronously via `commands.fetchAttachment` (remote-safe
   // attachment fetch) — let that microtask settle before the titled button exists.
   await act(async () => {});

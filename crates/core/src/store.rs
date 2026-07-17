@@ -1,7 +1,7 @@
 use crate::domain::{
-    AgentIdentitySnapshot, AgentRun, AgentRunKind, AgentRunStatus, CuratorRun, Message,
-    NewAgentRun, NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, QueuedSessionPrompt,
-    Session, SessionKind, SessionStatus, SkillUsage, Surface, ToolPolicyRow,
+    AgentIdentitySnapshot, AgentRun, AgentRunKind, AgentRunStatus, Message, NewAgentRun,
+    NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, QueuedSessionPrompt, Session,
+    SessionKind, SessionStatus, Surface, ToolPolicyRow,
 };
 use crate::llm_router::secrets::{decrypt_field, encrypt_field};
 use crate::paths::now_ms;
@@ -587,7 +587,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_39_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1082,9 +1082,12 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_39_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
-        // instead of a "duplicate column" error.
+        // instead of a "duplicate column" error. The orch_tasks block is also
+        // guarded on the table's existence because migration 39 removes it.
+        // A replay from an already-cleaned database must not try to resurrect
+        // that legacy table just to add obsolete columns.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
             let has_messages_speaker = tx
                 .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='speaker'")?
@@ -1092,40 +1095,45 @@ fn migrations() -> Migrations<'static> {
             if !has_messages_speaker {
                 tx.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", [])?;
             }
-            let has_home_session_pk = tx
-                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='home_session_pk'")?
+            let has_orch_tasks_table = tx
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='orch_tasks'")?
                 .exists([])?;
-            if !has_home_session_pk {
-                tx.execute(
-                    "ALTER TABLE orch_tasks ADD COLUMN home_session_pk TEXT",
-                    [],
-                )?;
-            }
-            let has_consecutive_failures = tx
-                .prepare(
-                    "SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='consecutive_failures'",
-                )?
-                .exists([])?;
-            if !has_consecutive_failures {
-                tx.execute(
-                    "ALTER TABLE orch_tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-            let has_gave_up = tx
-                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='gave_up'")?
-                .exists([])?;
-            if !has_gave_up {
-                tx.execute(
-                    "ALTER TABLE orch_tasks ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )?;
-            }
-            let has_steer_note = tx
-                .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='steer_note'")?
-                .exists([])?;
-            if !has_steer_note {
-                tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+            if has_orch_tasks_table {
+                let has_home_session_pk = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='home_session_pk'")?
+                    .exists([])?;
+                if !has_home_session_pk {
+                    tx.execute(
+                        "ALTER TABLE orch_tasks ADD COLUMN home_session_pk TEXT",
+                        [],
+                    )?;
+                }
+                let has_consecutive_failures = tx
+                    .prepare(
+                        "SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='consecutive_failures'",
+                    )?
+                    .exists([])?;
+                if !has_consecutive_failures {
+                    tx.execute(
+                        "ALTER TABLE orch_tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+                let has_gave_up = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='gave_up'")?
+                    .exists([])?;
+                if !has_gave_up {
+                    tx.execute(
+                        "ALTER TABLE orch_tasks ADD COLUMN gave_up INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+                let has_steer_note = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('orch_tasks') WHERE name='steer_note'")?
+                    .exists([])?;
+                if !has_steer_note {
+                    tx.execute("ALTER TABLE orch_tasks ADD COLUMN steer_note TEXT", [])?;
+                }
             }
             Ok(())
         }),
@@ -1137,7 +1145,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_39_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1314,26 +1322,140 @@ fn migrations() -> Migrations<'static> {
             )?;
             Ok(())
         }),
-        // 39: immutable native-tool selection per session and content-addressed
-        // tool plans per agent run. The tail migration is replay-safe because
-        // migration tests intentionally rewind current schemas and reapply it.
-        M::up(
-            "CREATE TABLE IF NOT EXISTS native_tool_session_versions (\
-                session_pk TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,\
-                version TEXT NOT NULL CHECK(version IN ('v1','v2')),\
-                created_at INTEGER NOT NULL\
-            );\
-            INSERT OR IGNORE INTO native_tool_session_versions(session_pk, version, created_at)\
-                SELECT session_pk, 'v1', COALESCE(created_at, 0) FROM sessions;\
-            CREATE TABLE IF NOT EXISTS native_tool_plans (\
-                run_id TEXT PRIMARY KEY NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,\
-                plan_schema_version INTEGER NOT NULL,\
-                registry_generation INTEGER NOT NULL,\
-                plan_hash TEXT NOT NULL,\
-                plan_json TEXT NOT NULL,\
-                created_at INTEGER NOT NULL\
-            );",
-        ),
+        // 39: one-time removal of superseded single-agent, Learning, and
+        // orchestrator state. This cleanup must precede all newer additive
+        // migrations so existing v38 databases converge safely.
+        M::up_with_hook("", |tx: &rusqlite::Transaction<'_>| {
+            let has_background_events = tx
+                .prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                )?
+                .exists([])?;
+            tx.execute(
+                "DELETE FROM settings WHERE key IN (
+                    'agent_model',
+                    'agent_perm_mode',
+                    'agent.max_provider_turns',
+                    'agent.auto_continue_budget',
+                    'memory.nudge_interval'
+                 )",
+                [],
+            )?;
+            if has_background_events {
+                tx.execute(
+                    "DELETE FROM background_events WHERE kind IN ('learning', 'orch')",
+                    [],
+                )?;
+            }
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS orch_task_deps;
+                 DROP TABLE IF EXISTS orch_tasks;
+                 DROP TABLE IF EXISTS skill_usage;
+                 DROP TABLE IF EXISTS curator_state;
+                 DROP TABLE IF EXISTS curator_runs;",
+            )?;
+            Ok(())
+        }),
+        // 40: durable linkage back to the tool call that dispatched a child
+        // run. The guards keep the migration convergent for the migration
+        // replay test and databases opened from an already-migrated build.
+        M::up_with_hook("", |tx: &rusqlite::Transaction| {
+            let has_source_tool_call_id = tx
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('agent_runs') WHERE name='source_tool_call_id'",
+                )?
+                .exists([])?;
+            if !has_source_tool_call_id {
+                tx.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN source_tool_call_id TEXT",
+                    [],
+                )?;
+            }
+            let has_dispatch_index = tx
+                .prepare("SELECT 1 FROM pragma_table_info('agent_runs') WHERE name='dispatch_index'")?
+                .exists([])?;
+            if !has_dispatch_index {
+                tx.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN dispatch_index INTEGER CHECK(dispatch_index IS NULL OR dispatch_index >= 0)",
+                    [],
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS agent_runs_dispatch_idx \
+                   ON agent_runs(session_pk,parent_run_id,source_tool_call_id,dispatch_index);",
+            )?;
+            Ok(())
+        }),
+        // 41: child agent runs share the session message ledger, but each run
+        // owns its tool-call lifecycle through agent_run_messages. The original
+        // per-session unique index prevents different runs from recording the
+        // same provider tool_call_id, so remove it after the ownership schema
+        // is in place. The scoped update query keeps writes unambiguous.
+        M::up("DROP INDEX IF EXISTS idx_messages_tool_call;"),
+        // 42: immutable native-tool selection per session and content-addressed
+        // tool plans per agent run. The agentic cleanup is intentionally
+        // repeated here: Native Tools V2 development databases that already
+        // consumed version 39 skip main's version-39 slot, so this hook is the
+        // convergence point for both histories. Every operation is idempotent.
+        M::up_with_hook("", |tx: &rusqlite::Transaction<'_>| {
+            let has_settings = tx
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'")?
+                .exists([])?;
+            let has_background_events = tx
+                .prepare(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='background_events'",
+                )?
+                .exists([])?;
+            let has_sessions = tx
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'")?
+                .exists([])?;
+            if has_settings {
+                tx.execute(
+                    "DELETE FROM settings WHERE key IN (
+                        'agent_model',
+                        'agent_perm_mode',
+                        'agent.max_provider_turns',
+                        'agent.auto_continue_budget',
+                        'memory.nudge_interval'
+                     )",
+                    [],
+                )?;
+            }
+            if has_background_events {
+                tx.execute(
+                    "DELETE FROM background_events WHERE kind IN ('learning', 'orch')",
+                    [],
+                )?;
+            }
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS orch_task_deps;
+                 DROP TABLE IF EXISTS orch_tasks;
+                 DROP TABLE IF EXISTS skill_usage;
+                 DROP TABLE IF EXISTS curator_state;
+                 DROP TABLE IF EXISTS curator_runs;
+                 CREATE TABLE IF NOT EXISTS native_tool_session_versions (
+                    session_pk TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_pk) ON DELETE CASCADE,
+                    version TEXT NOT NULL CHECK(version IN ('v1','v2')),
+                    created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS native_tool_plans (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES agent_runs(run_id) ON DELETE CASCADE,
+                    plan_schema_version INTEGER NOT NULL,
+                    registry_generation INTEGER NOT NULL,
+                    plan_hash TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                 );",
+            )?;
+            if has_sessions {
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_tool_session_versions(session_pk, version, created_at)
+                     SELECT session_pk, 'v1', COALESCE(created_at, 0) FROM sessions",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -1519,40 +1641,6 @@ fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
         last_attach_at: r.get(1)?,
         outcome: r.get(2)?,
         reason: r.get(3)?,
-    })
-}
-
-const SKILL_USAGE_COLS: &str = "name, created_by, use_count, view_count, patch_count, \
-     last_used_at, last_viewed_at, last_patched_at, state, pinned, archived_at, created_at";
-
-fn map_skill_usage_row(r: &Row) -> rusqlite::Result<SkillUsage> {
-    Ok(SkillUsage {
-        name: r.get(0)?,
-        created_by: r.get(1)?,
-        use_count: r.get(2)?,
-        view_count: r.get(3)?,
-        patch_count: r.get(4)?,
-        last_used_at: r.get(5)?,
-        last_viewed_at: r.get(6)?,
-        last_patched_at: r.get(7)?,
-        state: r.get(8)?,
-        pinned: r.get::<_, i64>(9)? != 0,
-        archived_at: r.get(10)?,
-        created_at: r.get(11)?,
-    })
-}
-
-fn map_curator_run_row(r: &Row) -> rusqlite::Result<CuratorRun> {
-    Ok(CuratorRun {
-        id: r.get(0)?,
-        started_at: r.get(1)?,
-        finished_at: r.get(2)?,
-        status: r.get(3)?,
-        transitioned: r.get(4)?,
-        consolidated: r.get::<_, i64>(5)? != 0,
-        snapshot_path: r.get(6)?,
-        error: r.get(7)?,
-        log: r.get(8)?,
     })
 }
 
@@ -2591,6 +2679,7 @@ impl Store {
                     Ok(Message {
                         session_pk: session_pk.clone(),
                         seq,
+                        run_id: None,
                         role: "system".into(),
                         block_type: "notice".into(),
                         payload,
@@ -2636,29 +2725,40 @@ impl Store {
         let session_pk = session_pk.to_string();
         self.with_conn(move |c| -> rusqlite::Result<Vec<Message>> {
             let mut stmt = c.prepare(
-                "SELECT session_pk,seq,role,block_type,payload,tool_call_id,status,tool_kind,created_at,speaker \
-                 FROM messages WHERE session_pk=?1 ORDER BY seq",
+                "SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker,rm.run_id \
+                 FROM messages m \
+                 LEFT JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq \
+                 WHERE m.session_pk=?1 ORDER BY m.seq",
             )?;
             let items = stmt
-                .query_map(params![session_pk], |r| {
-                    let payload: String = r.get(4)?;
-                    Ok(Message {
-                        session_pk: r.get(0)?,
-                        seq: r.get(1)?,
-                        role: r.get(2)?,
-                        block_type: r.get(3)?,
-                        payload: serde_json::from_str(&payload).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
-                        })?,
-                        tool_call_id: r.get(5)?,
-                        status: r.get(6)?,
-                        tool_kind: r.get(7)?,
-                        created_at: r.get(8)?,
-                        speaker: r.get(9)?,
-                    })
-                })?
+                .query_map(params![session_pk], row_to_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
+        })
+        .await
+    }
+
+    /// List transcript rows that belong to the primary session view. The full
+    /// durable ledger remains available through [`Self::list_messages`] for
+    /// exports, search, and other run-aware consumers.
+    pub async fn list_primary_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,\
+                        m.status,m.tool_kind,m.created_at,m.speaker,rm.run_id \
+                 FROM messages m \
+                 LEFT JOIN agent_run_messages rm \
+                   ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq \
+                 LEFT JOIN agent_runs ar ON ar.run_id=rm.run_id \
+                 WHERE m.session_pk=?1 \
+                   AND (rm.run_id IS NULL OR ar.parent_run_id IS NULL) \
+                 ORDER BY m.seq",
+            )?;
+            let rows = stmt
+                .query_map(params![session_pk], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
         .await
     }
@@ -3460,13 +3560,15 @@ impl Store {
     /// so the original `{name, input}` survives an `{output: …}` update),
     /// optionally flip status, and return the row's seq, the merged payload,
     /// and its persisted tool_kind — the caller re-emits all three.
-    pub async fn update_tool_call(
+    pub async fn update_run_tool_call(
         &self,
+        run_id: &str,
         session_pk: &str,
         tool_call_id: &str,
         status: Option<&str>,
         patch: &serde_json::Value,
     ) -> anyhow::Result<(i64, serde_json::Value, Option<String>)> {
+        let run_id = run_id.to_string();
         let session_pk = session_pk.to_string();
         let tool_call_id = tool_call_id.to_string();
         let status = status.map(|s| s.to_string());
@@ -3474,9 +3576,17 @@ impl Store {
         let (seq, payload, tool_kind) = self
             .with_conn(move |c| {
                 c.query_row(
-                    "UPDATE messages SET payload=json_patch(payload, ?3), status=COALESCE(?4, status) \
-                     WHERE session_pk=?1 AND tool_call_id=?2 RETURNING seq, payload, tool_kind",
-                    params![session_pk, tool_call_id, patch, status],
+                    "UPDATE messages \
+                     SET payload=json_patch(payload, ?4), status=COALESCE(?5, status) \
+                     WHERE session_pk=?2 AND tool_call_id=?3 \
+                       AND EXISTS ( \
+                           SELECT 1 FROM agent_run_messages rm \
+                           WHERE rm.session_pk=messages.session_pk \
+                             AND rm.message_seq=messages.seq \
+                             AND rm.run_id=?1 \
+                       ) \
+                     RETURNING seq,payload,tool_kind",
+                    params![run_id, session_pk, tool_call_id, patch, status],
                     |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
@@ -4327,226 +4437,6 @@ impl Store {
         .await
     }
 
-    /// Bump `deploy`'s use counter and `last_used_at` — recorded on every
-    /// successful `skill_manage` USE action (Task 6).
-    pub async fn record_skill_use(&self, name: &str) -> anyhow::Result<()> {
-        self.bump_skill_counter(name, "use_count", "last_used_at")
-            .await
-    }
-
-    /// Bump the view counter — recorded when a skill's body is read (e.g. the
-    /// `skill` discovery tool), independent of whether it is later used.
-    pub async fn record_skill_view(&self, name: &str) -> anyhow::Result<()> {
-        self.bump_skill_counter(name, "view_count", "last_viewed_at")
-            .await
-    }
-
-    /// Bump the patch counter — recorded on every `skill_manage` PATCH
-    /// action, feeding the curator's (Task 10) edit-frequency heuristics.
-    pub async fn record_skill_patch(&self, name: &str) -> anyhow::Result<()> {
-        self.bump_skill_counter(name, "patch_count", "last_patched_at")
-            .await
-    }
-
-    /// Upsert-increment one `skill_usage` counter column and stamp its
-    /// paired timestamp column. `count_col`/`ts_col` are internal constants
-    /// supplied only by the three `record_skill_*` wrappers above, never
-    /// user input — safe to interpolate into the SQL text.
-    async fn bump_skill_counter(
-        &self,
-        name: &str,
-        count_col: &str,
-        ts_col: &str,
-    ) -> anyhow::Result<()> {
-        let (name, now) = (name.to_string(), now_ms());
-        let sql = format!(
-            "INSERT INTO skill_usage(name, {count_col}, {ts_col}, created_at) \
-                 VALUES (?1, 1, ?2, ?2) \
-             ON CONFLICT(name) DO UPDATE SET \
-                 {count_col} = {count_col} + 1, {ts_col} = ?2",
-        );
-        self.with_conn(move |c| c.execute(&sql, params![name, now]).map(|_| ()))
-            .await
-    }
-
-    /// Transition a skill's lifecycle state (e.g. `active` → `stale` →
-    /// `archived`), driven by the curator (Task 10). `archived_at` is
-    /// typically `Some(now)` only for the `archived` transition.
-    pub async fn set_skill_state(
-        &self,
-        name: &str,
-        state: &str,
-        archived_at: Option<i64>,
-    ) -> anyhow::Result<()> {
-        let (name, state, now) = (name.to_string(), state.to_string(), now_ms());
-        self.with_conn(move |c| {
-            c.execute(
-                "INSERT INTO skill_usage(name, state, archived_at, created_at) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(name) DO UPDATE SET \
-                     state=excluded.state, archived_at=excluded.archived_at",
-                params![name, state, archived_at, now],
-            )
-            .map(|_| ())
-        })
-        .await
-    }
-
-    /// Pin/unpin a skill — a pinned skill is exempt from curator archival
-    /// regardless of staleness.
-    pub async fn set_skill_pinned(&self, name: &str, pinned: bool) -> anyhow::Result<()> {
-        let (name, now) = (name.to_string(), now_ms());
-        self.with_conn(move |c| {
-            c.execute(
-                "INSERT INTO skill_usage(name, pinned, created_at) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(name) DO UPDATE SET pinned=excluded.pinned",
-                params![name, pinned as i64, now],
-            )
-            .map(|_| ())
-        })
-        .await
-    }
-
-    /// Record that a skill was authored by an autonomous agent turn rather
-    /// than a human (Tasks 8/9 review-fork provenance).
-    pub async fn mark_skill_created_by_agent(&self, name: &str) -> anyhow::Result<()> {
-        let (name, now) = (name.to_string(), now_ms());
-        self.with_conn(move |c| {
-            c.execute(
-                "INSERT INTO skill_usage(name, created_by, created_at) \
-                     VALUES (?1, 'agent', ?2) \
-                 ON CONFLICT(name) DO UPDATE SET created_by='agent'",
-                params![name, now],
-            )
-            .map(|_| ())
-        })
-        .await
-    }
-
-    pub async fn get_skill_usage(&self, name: &str) -> anyhow::Result<Option<SkillUsage>> {
-        let name = name.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                &format!("SELECT {SKILL_USAGE_COLS} FROM skill_usage WHERE name=?1"),
-                params![name],
-                map_skill_usage_row,
-            )
-            .optional()
-        })
-        .await
-    }
-
-    /// All tracked skills, ordered by name — the curator's (Task 10) and the
-    /// Cockpit Learning panel's (Task 11) full-sweep read.
-    pub async fn list_skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
-        self.with_conn(move |c| {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {SKILL_USAGE_COLS} FROM skill_usage ORDER BY name"
-            ))?;
-            let rows = stmt
-                .query_map([], map_skill_usage_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-    }
-
-    /// The curator's (Task 10) last completed-or-started run timestamp, or
-    /// `None` if it has never run. `curator_state` is a singleton row
-    /// (`id=1`); `curator::tick`'s weekly-cadence gate reads this before
-    /// deciding whether a sweep is due.
-    pub async fn curator_last_run(&self) -> anyhow::Result<Option<i64>> {
-        self.with_conn(|c| {
-            c.query_row(
-                "SELECT last_run_at FROM curator_state WHERE id=1",
-                [],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .map(|v| v.flatten())
-        })
-        .await
-    }
-
-    /// Open a new `curator_runs` row (`status='running'`) and stamp
-    /// `curator_state.last_run_at`/`last_run_id` to it in the same call —
-    /// the write `curator_last_run` observes, so a second daemon boot within
-    /// the same interval can't double-start a sweep.
-    pub async fn insert_curator_run(&self, id: &str, started_at: i64) -> anyhow::Result<()> {
-        let id = id.to_string();
-        self.with_conn(move |c| {
-            c.execute(
-                "INSERT INTO curator_runs(id, started_at, status) VALUES (?1, ?2, 'running')",
-                params![id, started_at],
-            )?;
-            c.execute(
-                "INSERT INTO curator_state(id, last_run_at, last_run_id) VALUES (1, ?1, ?2) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                     last_run_at=excluded.last_run_at, last_run_id=excluded.last_run_id",
-                params![started_at, id],
-            )
-            .map(|_| ())
-        })
-        .await
-    }
-
-    /// Close out a `curator_runs` row: final `status` (`"ok"`/`"error"`), how
-    /// many skills the deterministic planner transitioned, whether the
-    /// opt-in consolidation pass ran, its pre-mutation snapshot path (if it
-    /// did), and an error message on failure.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn finish_curator_run(
-        &self,
-        id: &str,
-        finished_at: i64,
-        status: &str,
-        transitioned: i64,
-        consolidated: bool,
-        snapshot_path: Option<&str>,
-        error: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let (id, status, snapshot_path, error) = (
-            id.to_string(),
-            status.to_string(),
-            snapshot_path.map(str::to_string),
-            error.map(str::to_string),
-        );
-        self.with_conn(move |c| {
-            c.execute(
-                "UPDATE curator_runs SET finished_at=?1, status=?2, transitioned=?3, \
-                     consolidated=?4, snapshot_path=?5, error=?6 WHERE id=?7",
-                params![
-                    finished_at,
-                    status,
-                    transitioned,
-                    consolidated as i64,
-                    snapshot_path,
-                    error,
-                    id,
-                ],
-            )
-            .map(|_| ())
-        })
-        .await
-    }
-
-    /// Most recent `curator_runs` rows, newest first — the Cockpit Learning
-    /// panel's (Task 11) history view.
-    pub async fn list_curator_runs(&self, limit: i64) -> anyhow::Result<Vec<CuratorRun>> {
-        self.with_conn(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT id, started_at, finished_at, status, transitioned, consolidated, \
-                     snapshot_path, error, log \
-                 FROM curator_runs ORDER BY started_at DESC LIMIT ?1",
-            )?;
-            let rows = stmt
-                .query_map(params![limit], map_curator_run_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-    }
-
     /// Replace the entire cached remote catalog with `rows` in one
     /// transaction. Called after a signed feed fetch verifies successfully;
     /// an empty slice clears the cache.
@@ -4956,23 +4846,26 @@ impl Store {
     pub async fn get_agent_run(&self, run_id: &str) -> anyhow::Result<Option<AgentRun>> {
         let run_id = run_id.to_string();
         self.with_conn(move |c| {
-            c.query_row(
-                "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE run_id=?1",
-                params![run_id],
-                row_to_agent_run,
-            ).optional()
-        }).await
+            let query = format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE run_id=?1");
+            c.query_row(&query, params![run_id], row_to_agent_run)
+                .optional()
+        })
+        .await
     }
 
     pub async fn list_session_agent_runs(&self, session_pk: &str) -> anyhow::Result<Vec<AgentRun>> {
         let session_pk = session_pk.to_string();
         self.with_conn(move |c| {
-            let mut stmt = c.prepare("SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE session_pk=?1 ORDER BY rowid")?;
+            let query = format!(
+                "SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE session_pk=?1 ORDER BY rowid"
+            );
+            let mut stmt = c.prepare(&query)?;
             let rows = stmt
                 .query_map(params![session_pk], row_to_agent_run)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
-        }).await
+        })
+        .await
     }
 
     pub async fn root_agent_run_id(&self, run_id: &str) -> anyhow::Result<Option<String>> {
@@ -4994,7 +4887,10 @@ impl Store {
     ) -> anyhow::Result<Vec<AgentRun>> {
         let root_run_id = root_run_id.to_string();
         self.with_conn(move |c| {
-            let mut stmt = c.prepare("WITH RECURSIVE descendants AS (SELECT * FROM agent_runs WHERE parent_run_id=?1 UNION ALL SELECT child.* FROM agent_runs child JOIN descendants parent ON child.parent_run_id=parent.run_id) SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM descendants ORDER BY started_at, run_id")?;
+            let query = format!(
+                "WITH RECURSIVE descendants AS (SELECT * FROM agent_runs WHERE parent_run_id=?1 UNION ALL SELECT child.* FROM agent_runs child JOIN descendants parent ON child.parent_run_id=parent.run_id) SELECT {AGENT_RUN_COLS} FROM descendants ORDER BY started_at, run_id"
+            );
+            let mut stmt = c.prepare(&query)?;
             let rows = stmt
                 .query_map(params![root_run_id], row_to_agent_run)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5065,9 +4961,10 @@ impl Store {
         let at = now_ms();
         self.with_conn(move |c| {
             let tx = c.transaction()?;
-            let mut stmt = tx.prepare(
-                "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE status IN ('queued','running') ORDER BY rowid",
-            )?;
+            let query = format!(
+                "SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE status IN ('queued','running') ORDER BY rowid"
+            );
+            let mut stmt = tx.prepare(&query)?;
             let mut runs = stmt
                 .query_map([], row_to_agent_run)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5120,7 +5017,7 @@ impl Store {
         let session_pk = session_pk.to_string();
         let run_id = run_id.to_string();
         self.with_conn(move |c| {
-            let mut stmt = c.prepare("SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker FROM messages m JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq WHERE rm.session_pk=?1 AND rm.run_id=?2 ORDER BY m.seq")?;
+            let mut stmt = c.prepare("SELECT m.session_pk,m.seq,m.role,m.block_type,m.payload,m.tool_call_id,m.status,m.tool_kind,m.created_at,m.speaker,rm.run_id FROM messages m JOIN agent_run_messages rm ON rm.session_pk=m.session_pk AND rm.message_seq=m.seq WHERE rm.session_pk=?1 AND rm.run_id=?2 ORDER BY m.seq")?;
             let rows = stmt
                 .query_map(params![session_pk, run_id], row_to_message)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5145,26 +5042,31 @@ impl Store {
     }
 }
 
+const AGENT_RUN_COLS: &str =
+    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error";
+
 fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
-    let tool_count: i64 = r.get(12)?;
+    let tool_count: i64 = r.get(14)?;
     Ok(AgentRun {
         run_id: r.get(0)?,
         session_pk: r.get(1)?,
         parent_run_id: r.get(2)?,
         retry_of: r.get(3)?,
-        primary_agent_id: r.get(4)?,
-        executing_agent_id: r.get(5)?,
-        executing_agent_name_snapshot: r.get(6)?,
-        agent_kind: AgentRunKind::from_db(&r.get::<_, String>(7)?)?,
-        task: r.get(8)?,
-        status: AgentRunStatus::from_db(&r.get::<_, String>(9)?)?,
-        started_at: r.get(10)?,
-        finished_at: r.get(11)?,
+        source_tool_call_id: r.get(4)?,
+        dispatch_index: r.get(5)?,
+        primary_agent_id: r.get(6)?,
+        executing_agent_id: r.get(7)?,
+        executing_agent_name_snapshot: r.get(8)?,
+        agent_kind: AgentRunKind::from_db(&r.get::<_, String>(9)?)?,
+        task: r.get(10)?,
+        status: AgentRunStatus::from_db(&r.get::<_, String>(11)?)?,
+        started_at: r.get(12)?,
+        finished_at: r.get(13)?,
         tool_count: u32::try_from(tool_count).map_err(to_sql_json_error)?,
-        resolved_model: r.get(13)?,
-        resolved_effort: r.get(14)?,
-        result: r.get(15)?,
-        error: r.get(16)?,
+        resolved_model: r.get(15)?,
+        resolved_effort: r.get(16)?,
+        result: r.get(17)?,
+        error: r.get(18)?,
     })
 }
 
@@ -5173,14 +5075,11 @@ fn insert_agent_run_row(
     run: NewAgentRun,
 ) -> rusqlite::Result<AgentRun> {
     tx.execute(
-        "INSERT INTO agent_runs(run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,resolved_model,resolved_effort) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![run.run_id, run.session_pk, run.parent_run_id, run.retry_of, run.primary_agent_id, run.executing_agent_id, run.executing_agent_name_snapshot, run.agent_kind.as_db(), run.task, run.status.as_db(), run.resolved_model, run.resolved_effort],
+        "INSERT INTO agent_runs(run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,resolved_model,resolved_effort) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![run.run_id, run.session_pk, run.parent_run_id, run.retry_of, run.source_tool_call_id, run.dispatch_index, run.primary_agent_id, run.executing_agent_id, run.executing_agent_name_snapshot, run.agent_kind.as_db(), run.task, run.status.as_db(), run.resolved_model, run.resolved_effort],
     )?;
-    tx.query_row(
-        "SELECT run_id,session_pk,parent_run_id,retry_of,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error FROM agent_runs WHERE run_id=?1",
-        params![run.run_id],
-        row_to_agent_run,
-    )
+    let query = format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE run_id=?1");
+    tx.query_row(&query, params![run.run_id], row_to_agent_run)
 }
 
 fn validate_agent_run(
@@ -5188,6 +5087,20 @@ fn validate_agent_run(
     run: &NewAgentRun,
     root: bool,
 ) -> rusqlite::Result<()> {
+    match (&run.source_tool_call_id, run.dispatch_index) {
+        (None, None) => {}
+        (Some(source), Some(index)) if !source.trim().is_empty() && index >= 0 => {}
+        _ => {
+            return Err(to_sql_json_error(
+                "agent run dispatch linkage must be a non-empty source id paired with a non-negative index",
+            ));
+        }
+    }
+    if root && (run.source_tool_call_id.is_some() || run.dispatch_index.is_some()) {
+        return Err(to_sql_json_error(
+            "a primary agent run cannot be linked to a dispatch tool call",
+        ));
+    }
     if root {
         if run.agent_kind != AgentRunKind::Primary
             || run.parent_run_id.is_some()
@@ -5216,21 +5129,46 @@ fn validate_agent_run(
     }
     if let Some(retry_of) = &run.retry_of {
         let retry = tx.query_row(
-            "SELECT session_pk,parent_run_id,primary_agent_id FROM agent_runs WHERE run_id=?1",
+            "SELECT session_pk,parent_run_id,primary_agent_id,source_tool_call_id,dispatch_index,status FROM agent_runs WHERE run_id=?1",
             params![retry_of],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    AgentRunStatus::from_db(&row.get::<_, String>(5)?)?,
                 ))
             },
         )?;
         if retry.0 != run.session_pk
             || retry.1 != run.parent_run_id
             || retry.2 != run.primary_agent_id
+            || retry.3 != run.source_tool_call_id
+            || retry.4 != run.dispatch_index
         {
-            return Err(to_sql_json_error("agent run retry belongs to another tree"));
+            return Err(to_sql_json_error(
+                "agent run retry must inherit its predecessor's tree and dispatch linkage",
+            ));
+        }
+        if !matches!(
+            retry.5,
+            AgentRunStatus::Failed | AgentRunStatus::Cancelled | AgentRunStatus::Interrupted
+        ) {
+            return Err(to_sql_json_error(
+                "agent run retry must reference a failed, cancelled, or interrupted predecessor",
+            ));
+        }
+        let has_retry_branch: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE retry_of=?1)",
+            params![retry_of],
+            |row| row.get(0),
+        )?;
+        if has_retry_branch {
+            return Err(to_sql_json_error(
+                "agent run retry predecessor already has a retry branch",
+            ));
         }
     }
     Ok(())
@@ -5241,6 +5179,7 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
     Ok(Message {
         session_pk: r.get(0)?,
         seq: r.get(1)?,
+        run_id: r.get(10)?,
         role: r.get(2)?,
         block_type: r.get(3)?,
         payload: serde_json::from_str(&payload).map_err(|error| from_sql_json_error(4, error))?,
@@ -5343,6 +5282,31 @@ mod tests {
             perm_mode: PermMode::Default,
             created_at: Some(123),
             is_git: false,
+        }
+    }
+
+    fn agent_run_input(
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        retry_of: Option<&str>,
+        agent_kind: AgentRunKind,
+        status: AgentRunStatus,
+    ) -> NewAgentRun {
+        NewAgentRun {
+            run_id: run_id.into(),
+            session_pk: "s1".into(),
+            parent_run_id: parent_run_id.map(str::to_string),
+            retry_of: retry_of.map(str::to_string),
+            source_tool_call_id: None,
+            dispatch_index: None,
+            primary_agent_id: "ada".into(),
+            executing_agent_id: Some("ada".into()),
+            executing_agent_name_snapshot: "Ada".into(),
+            agent_kind,
+            task: "test dispatch linkage".into(),
+            status,
+            resolved_model: None,
+            resolved_effort: None,
         }
     }
 
@@ -5489,7 +5453,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 39);
+        assert_eq!(user_version, 42);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -5532,6 +5496,8 @@ mod tests {
                 session_pk: "s1".into(),
                 parent_run_id: None,
                 retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
                 primary_agent_id: "ada".into(),
                 executing_agent_id: Some("ada".into()),
                 executing_agent_name_snapshot: "Ada".into(),
@@ -5577,7 +5543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_tool_migration_backfills_v1_and_session_delete_cascades() {
+    async fn migration_42_upgrades_main_v41_and_backfills_v1() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -5587,7 +5553,7 @@ mod tests {
                     c.execute_batch(
                         "DROP TABLE native_tool_plans;
                          DROP TABLE native_tool_session_versions;
-                         PRAGMA user_version=38;",
+                         PRAGMA user_version=41;",
                     )
                 })
                 .await
@@ -5606,6 +5572,8 @@ mod tests {
                 session_pk: "s1".into(),
                 parent_run_id: None,
                 retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
                 primary_agent_id: "ada".into(),
                 executing_agent_id: Some("ada".into()),
                 executing_agent_name_snapshot: "Ada".into(),
@@ -5636,6 +5604,205 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_42_converges_feature_v39_without_losing_native_plan() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store.insert_session(sample_session()).await.unwrap();
+            store
+                .insert_primary_agent_run(NewAgentRun {
+                    run_id: "feature-v39-run".into(),
+                    session_pk: "s1".into(),
+                    parent_run_id: None,
+                    retry_of: None,
+                    source_tool_call_id: None,
+                    dispatch_index: None,
+                    primary_agent_id: "ada".into(),
+                    executing_agent_id: Some("ada".into()),
+                    executing_agent_name_snapshot: "Ada".into(),
+                    agent_kind: AgentRunKind::Primary,
+                    task: "preserve me".into(),
+                    status: AgentRunStatus::Queued,
+                    resolved_model: None,
+                    resolved_effort: None,
+                })
+                .await
+                .unwrap();
+            store
+                .insert_native_tool_plan(
+                    "feature-v39-run",
+                    1,
+                    7,
+                    "feature-v39-hash",
+                    r#"{"schema_version":1}"#,
+                )
+                .await
+                .unwrap();
+            store
+                .with_conn(|c| {
+                    c.execute_batch(
+                        "DROP INDEX IF EXISTS agent_runs_dispatch_idx;
+                         ALTER TABLE agent_runs DROP COLUMN source_tool_call_id;
+                         ALTER TABLE agent_runs DROP COLUMN dispatch_index;
+                         CREATE UNIQUE INDEX idx_messages_tool_call
+                            ON messages(session_pk, tool_call_id)
+                            WHERE tool_call_id IS NOT NULL;
+                         CREATE TABLE orch_tasks(id TEXT PRIMARY KEY);
+                         CREATE TABLE orch_task_deps(id TEXT PRIMARY KEY);
+                         CREATE TABLE skill_usage(id TEXT PRIMARY KEY);
+                         CREATE TABLE curator_state(id TEXT PRIMARY KEY);
+                         CREATE TABLE curator_runs(id TEXT PRIMARY KEY);
+                         INSERT OR REPLACE INTO settings(key,value)
+                            VALUES ('memory.nudge_interval','10');
+                         PRAGMA user_version=39;",
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let upgraded = Store::open(tmp.path()).await.unwrap();
+        let plan = upgraded
+            .get_native_tool_plan("feature-v39-run")
+            .await
+            .unwrap()
+            .expect("native plan must survive feature-v39 convergence");
+        assert_eq!(plan.plan_hash, "feature-v39-hash");
+        let (user_version, columns, has_dispatch_index, has_tool_call_index, legacy_tables) =
+            upgraded
+                .with_conn(|c| {
+                    let user_version =
+                        c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+                    let columns = c
+                        .prepare("SELECT name FROM pragma_table_info('agent_runs') ORDER BY cid")?
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let has_dispatch_index = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='agent_runs_dispatch_idx'")?
+                        .exists([])?;
+                    let has_tool_call_index = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_tool_call'")?
+                        .exists([])?;
+                    let legacy_tables = c.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                            ('orch_tasks','orch_task_deps','skill_usage','curator_state','curator_runs')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    Ok((
+                        user_version,
+                        columns,
+                        has_dispatch_index,
+                        has_tool_call_index,
+                        legacy_tables,
+                    ))
+                })
+                .await
+                .unwrap();
+        assert_eq!(user_version, 42);
+        assert!(columns.iter().any(|column| column == "source_tool_call_id"));
+        assert!(columns.iter().any(|column| column == "dispatch_index"));
+        assert!(has_dispatch_index);
+        assert!(!has_tool_call_index);
+        assert_eq!(legacy_tables, 0);
+        assert!(upgraded
+            .get_setting("memory.nudge_interval")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn migration_40_adds_nullable_agent_dispatch_linkage() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE agent_runs (
+                    run_id TEXT PRIMARY KEY,
+                    session_pk TEXT NOT NULL,
+                    parent_run_id TEXT
+                 );
+                 INSERT INTO agent_runs(run_id,session_pk) VALUES ('legacy-run','legacy-session');
+                 PRAGMA user_version=38;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = Store::open(tmp.path()).await.unwrap();
+        let columns = upgraded
+            .with_conn(|c| {
+                c.prepare("SELECT name FROM pragma_table_info('agent_runs') ORDER BY cid")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert!(
+            columns.iter().any(|column| column == "source_tool_call_id"),
+            "migration 40 must add source_tool_call_id: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|column| column == "dispatch_index"),
+            "migration 40 must add dispatch_index: {columns:?}"
+        );
+
+        let (linkage, has_index, user_version): ((Option<String>, Option<i64>), bool, i64) =
+            upgraded
+                .with_conn(|c| {
+                    let linkage = c.query_row(
+                        "SELECT source_tool_call_id,dispatch_index FROM agent_runs WHERE run_id='legacy-run'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let has_index = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='agent_runs_dispatch_idx'")?
+                        .exists([])?;
+                    let user_version = c.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                    Ok((linkage, has_index, user_version))
+                })
+                .await
+                .unwrap();
+        assert_eq!(linkage, (None, None));
+        assert!(has_index, "migration 40 must add the dispatch lookup index");
+        assert_eq!(user_version, 42);
+
+        drop(upgraded);
+        let reopened = Store::open(tmp.path()).await.unwrap();
+        let reopened_version: i64 = reopened
+            .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(reopened_version, 42);
+    }
+
+    #[tokio::test]
+    async fn migration_41_removes_session_wide_tool_call_uniqueness() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let (user_version, has_unique_tool_call_index) = store
+            .with_conn(|c| {
+                let user_version: i64 = c.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                let has_unique_tool_call_index = c
+                    .prepare(
+                        "SELECT 1 FROM sqlite_master \
+                         WHERE type='index' AND name='idx_messages_tool_call'",
+                    )?
+                    .exists([])?;
+                Ok((user_version, has_unique_tool_call_index))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(user_version, 42);
+        assert!(
+            !has_unique_tool_call_index,
+            "tool call IDs must be reusable by separate agent runs"
+        );
     }
 
     #[tokio::test]
@@ -5675,7 +5842,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 39);
+        assert_eq!(user_version, 42);
     }
 
     #[tokio::test]
@@ -6221,29 +6388,15 @@ mod tests {
                     .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='pre_check'")?
                     .exists([])?;
                 assert!(has_pre_check, "jobs.pre_check column");
-                // Migration 11: the orch task graph roundtrips.
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
-                     VALUES ('t1', NULL, 'p1', 'root goal', 'do it', 1)",
-                    [],
-                )?;
-                c.execute(
-                    "INSERT INTO orch_tasks(id, root_id, project_id, title, body, created_at) \
-                     VALUES ('t2', 't1', 'p1', 'child', 'step one', 2)",
-                    [],
-                )?;
-                c.execute(
-                    "INSERT INTO orch_task_deps(task_id, dep_id) VALUES ('t2', 't1')",
-                    [],
-                )?;
-                let status: String =
-                    c.query_row("SELECT status FROM orch_tasks WHERE id='t2'", [], |r| {
-                        r.get(0)
-                    })?;
-                assert_eq!(status, "todo", "default status");
-                let deps: i64 =
-                    c.query_row("SELECT count(*) FROM orch_task_deps", [], |r| r.get(0))?;
-                assert_eq!(deps, 1);
+                // Migration 11 created this graph, then migration 39 removed
+                // it as superseded orchestration state. A current store must
+                // not resurrect either legacy table.
+                for table in ["orch_tasks", "orch_task_deps"] {
+                    let exists: bool = c
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+                        .exists([table])?;
+                    assert!(!exists, "{table} must not survive migration 39");
+                }
                 Ok(())
             })
             .await
@@ -6586,27 +6739,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_messages_exclude_child_owned_rows() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_agent_run(agent_run_input(
+                "child",
+                Some("root"),
+                None,
+                AgentRunKind::Subagent,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+
+        store
+            .insert_message(NewMessage::block(
+                "s1",
+                "user",
+                "text",
+                serde_json::json!({"text": "unowned"}),
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_run_message(
+                "root",
+                NewMessage::block(
+                    "s1",
+                    "assistant",
+                    "text",
+                    serde_json::json!({"text": "root owned"}),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .insert_run_message(
+                "child",
+                NewMessage::block(
+                    "s1",
+                    "assistant",
+                    "text",
+                    serde_json::json!({"text": "child owned"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let primary = store.list_primary_messages("s1").await.unwrap();
+        assert_eq!(
+            primary
+                .iter()
+                .map(|message| message.payload["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["unowned", "root owned"]
+        );
+        assert_eq!(
+            primary
+                .iter()
+                .map(|message| message.run_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("root")],
+            "the transcript must retain the owning primary run for every persisted row"
+        );
+        assert_eq!(store.list_messages("s1").await.unwrap().len(), 3);
+        let child = store.list_run_messages("s1", "child").await.unwrap();
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].payload["text"], "child owned");
+    }
+
+    #[tokio::test]
+    async fn update_run_tool_call_does_not_cross_run_tool_call_id_collisions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_agent_run(agent_run_input(
+                "child",
+                Some("root"),
+                None,
+                AgentRunKind::Subagent,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+
+        let tool_row = |output: &str| NewMessage {
+            session_pk: "s1".into(),
+            role: "assistant".into(),
+            block_type: "tool_call".into(),
+            payload: serde_json::json!({"name": "Bash", "output": output}),
+            tool_call_id: Some("shared-id".into()),
+            status: Some("in_progress".into()),
+            tool_kind: Some("execute".into()),
+            speaker: None,
+        };
+        let root_seq = store
+            .insert_run_message("root", tool_row("root"))
+            .await
+            .unwrap();
+        let child_seq = store
+            .insert_run_message("child", tool_row("child"))
+            .await
+            .unwrap();
+
+        let (seq, payload, kind) = store
+            .update_run_tool_call(
+                "child",
+                "s1",
+                "shared-id",
+                Some("completed"),
+                &serde_json::json!({"output": "child updated"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(seq, child_seq);
+        assert_eq!(payload["output"], "child updated");
+        assert_eq!(kind.as_deref(), Some("execute"));
+        let root = store.list_run_messages("s1", "root").await.unwrap();
+        assert_eq!(root[0].seq, root_seq);
+        assert_eq!(root[0].payload["output"], "root");
+        assert_eq!(root[0].status.as_deref(), Some("in_progress"));
+        let child = store.list_run_messages("s1", "child").await.unwrap();
+        assert_eq!(child[0].seq, child_seq);
+        assert_eq!(child[0].payload["output"], "child updated");
+        assert_eq!(child[0].status.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
     async fn tool_call_update_merges_output_and_returns_kind() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
 
         store
-            .insert_message(NewMessage {
-                session_pk: "s1".into(),
-                role: "assistant".into(),
-                block_type: "tool_call".into(),
-                payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
-                tool_call_id: Some("tc-1".into()),
-                status: Some("pending".into()),
-                tool_kind: Some("execute".into()),
-                speaker: None,
-            })
+            .insert_run_message(
+                "root",
+                NewMessage {
+                    session_pk: "s1".into(),
+                    role: "assistant".into(),
+                    block_type: "tool_call".into(),
+                    payload: serde_json::json!({"name": "Bash", "input": {"command": "ls"}}),
+                    tool_call_id: Some("tc-1".into()),
+                    status: Some("pending".into()),
+                    tool_kind: Some("execute".into()),
+                    speaker: None,
+                },
+            )
             .await
             .unwrap();
 
         // The caller now sends ONLY the update patch; the store merges it.
         let (seq, merged, kind) = store
-            .update_tool_call(
+            .update_run_tool_call(
+                "root",
                 "s1",
                 "tc-1",
                 Some("completed"),
@@ -6614,7 +6933,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(seq, 1, "update_tool_call must return the row's real seq");
+        assert_eq!(
+            seq, 1,
+            "update_run_tool_call must return the row's real seq"
+        );
         assert_eq!(
             merged["name"], "Bash",
             "merge must preserve the original name"
@@ -6638,7 +6960,7 @@ mod tests {
 
         // An empty patch (ToolCallDone with no raw_output) must leave payload intact.
         let (_, merged2, _) = store
-            .update_tool_call("s1", "tc-1", None, &serde_json::json!({}))
+            .update_run_tool_call("root", "s1", "tc-1", None, &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(merged2["name"], "Bash");
@@ -6650,7 +6972,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let res = store
-            .update_tool_call(
+            .update_run_tool_call(
+                "root",
                 "s1",
                 "missing-tc",
                 Some("completed"),
@@ -7376,7 +7699,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 39, "forward migration must land at v39");
+        assert_eq!(user_version, 42, "forward migration must land at v42");
     }
 
     #[tokio::test]
@@ -7407,6 +7730,8 @@ mod tests {
             session_pk: "s1".into(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: "ada".into(),
             executing_agent_id: Some("ada".into()),
             executing_agent_name_snapshot: "Ada".into(),
@@ -7464,6 +7789,8 @@ mod tests {
             session_pk: "owned".into(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: "ada".into(),
             executing_agent_id: Some("ada".into()),
             executing_agent_name_snapshot: "Ada".into(),
@@ -7587,6 +7914,8 @@ mod tests {
             session_pk: "owned".into(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: "ada".into(),
             executing_agent_id: Some("ada".into()),
             executing_agent_name_snapshot: "Ada".into(),
@@ -7608,6 +7937,8 @@ mod tests {
             session_pk: "owned".into(),
             parent_run_id: Some("root".into()),
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: "ada".into(),
             executing_agent_id: Some("delegate".into()),
             executing_agent_name_snapshot: "Delegate".into(),
@@ -7692,6 +8023,119 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_run_dispatch_linkage_roundtrips_and_requires_paired_fields() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+
+        let mut linked_input = agent_run_input(
+            "linked",
+            Some("root"),
+            None,
+            AgentRunKind::MainDelegate,
+            AgentRunStatus::Queued,
+        );
+        linked_input.source_tool_call_id = Some("tool-dispatch-1".into());
+        linked_input.dispatch_index = Some(2);
+        let linked = store.insert_agent_run(linked_input.clone()).await.unwrap();
+        assert_eq!(
+            linked.source_tool_call_id.as_deref(),
+            Some("tool-dispatch-1")
+        );
+        assert_eq!(linked.dispatch_index, Some(2));
+
+        let mut source_only = linked_input.clone();
+        source_only.run_id = "source-only".into();
+        source_only.dispatch_index = None;
+        assert!(store.insert_agent_run(source_only).await.is_err());
+
+        let mut index_only = linked_input.clone();
+        index_only.run_id = "index-only".into();
+        index_only.source_tool_call_id = None;
+        assert!(store.insert_agent_run(index_only).await.is_err());
+
+        let mut negative_index = linked_input.clone();
+        negative_index.run_id = "negative-index".into();
+        negative_index.dispatch_index = Some(-1);
+        assert!(store.insert_agent_run(negative_index).await.is_err());
+
+        let mut blank_source = linked_input.clone();
+        blank_source.run_id = "blank-source".into();
+        blank_source.source_tool_call_id = Some("   ".into());
+        assert!(store.insert_agent_run(blank_source).await.is_err());
+
+        let mut linked_root = agent_run_input(
+            "linked-root",
+            None,
+            None,
+            AgentRunKind::Primary,
+            AgentRunStatus::Queued,
+        );
+        linked_root.source_tool_call_id = Some("tool-dispatch-1".into());
+        linked_root.dispatch_index = Some(2);
+        assert!(store.insert_primary_agent_run(linked_root).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_requires_inherited_dispatch_linkage_and_rejects_branches() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+        store
+            .insert_primary_agent_run(agent_run_input(
+                "root",
+                None,
+                None,
+                AgentRunKind::Primary,
+                AgentRunStatus::Queued,
+            ))
+            .await
+            .unwrap();
+
+        let mut failed_child = agent_run_input(
+            "failed-child",
+            Some("root"),
+            None,
+            AgentRunKind::MainDelegate,
+            AgentRunStatus::Failed,
+        );
+        failed_child.source_tool_call_id = Some("tool-dispatch-1".into());
+        failed_child.dispatch_index = Some(2);
+        store.insert_agent_run(failed_child.clone()).await.unwrap();
+
+        let mut retry = failed_child.clone();
+        retry.run_id = "retry".into();
+        retry.retry_of = Some("failed-child".into());
+        store.insert_agent_run(retry.clone()).await.unwrap();
+
+        let mut second_branch = retry.clone();
+        second_branch.run_id = "second-branch".into();
+        second_branch.retry_of = Some("failed-child".into());
+        assert!(store.insert_agent_run(second_branch).await.is_err());
+
+        let mut changed_linkage = retry;
+        changed_linkage.run_id = "changed-linkage".into();
+        changed_linkage.retry_of = Some("retry".into());
+        changed_linkage.source_tool_call_id = Some("tool-dispatch-2".into());
+        assert!(store.insert_agent_run(changed_linkage).await.is_err());
+        assert_eq!(
+            store.list_session_agent_runs("s1").await.unwrap().len(),
+            3,
+            "rejected retry branches must not insert rows"
+        );
     }
 
     #[tokio::test]
@@ -7863,7 +8307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_39_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_42_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -7887,26 +8331,28 @@ mod tests {
         // 34 agent_learning_state + agent_learning_queue — CREATE TABLE
         // IF NOT EXISTS; 35 session_prompt_queue; 36 automation hooks/runs/
         // attempts; 37 session_automation_origins plus compatibility queue
-        // repair; 38 session ownership and agent runs; 39 immutable native
-        // tool session versions and run plans — all convergent,
+        // repair; 38 session ownership and agent runs; 39 agentic cleanup;
+        // 40 durable dispatch linkage; 41 scoped tool-call ownership; 42
+        // immutable native tool versions/plans plus history convergence — all
+        // convergent,
         // existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 39
-        // defined, wind back twenty-seven.
+        // this test starts failing its assertions). With migrations through 42
+        // defined, wind back thirty.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 27)
+            c.pragma_update(None, "user_version", v - 30)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v39 here, so `harness` was
+                    // The DB is fully migrated to v42 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -7957,13 +8403,17 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
-        // 22–39) replay against it. Back NINETEEN: the fully migrated tail is
-        // now v39, so rewinding to v20 is what makes
+        // 22–42) replay against it. Back TWENTY-TWO: the fully migrated tail
+        // is now v42, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Replaying from v20 also crosses migration 29's `ALTER TABLE
+        // orch_tasks ADD COLUMN ...` hook, but migration 39 already dropped
+        // orch_tasks in this fully-migrated store. The hook must therefore
+        // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 19)
+            c.pragma_update(None, "user_version", v - 22)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -8026,19 +8476,14 @@ mod tests {
                 .prompt,
             "run it"
         );
-        // Native prefs copied into KV; dead settings keys deleted.
-        assert_eq!(
-            store.get_setting("agent_model").await.unwrap().as_deref(),
-            Some("openrouter/qwen3:free")
-        );
-        assert_eq!(
-            store
-                .get_setting("agent_perm_mode")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("edit")
-        );
+        // Migration 21 copies native prefs, then migration 39 removes those
+        // superseded single-agent settings in the same replay pass.
+        assert!(store.get_setting("agent_model").await.unwrap().is_none());
+        assert!(store
+            .get_setting("agent_perm_mode")
+            .await
+            .unwrap()
+            .is_none());
         for key in [
             "enabled_runtimes",
             "default_runtime",
@@ -8057,7 +8502,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
 
-        // KV-absent rule: a pre-existing agent_model must NOT be clobbered on replay.
+        // The cleanup is unconditional, so replaying the tail removes even a
+        // user-set legacy value.
         store
             .set_setting(WriteOrigin::User, "agent_model", "user-chose-this")
             .await
@@ -8065,10 +8511,9 @@ mod tests {
         store.with_conn(rewind).await.unwrap();
         drop(store);
         let store = Store::open(tmp.path()).await.unwrap();
-        assert_eq!(
-            store.get_setting("agent_model").await.unwrap().as_deref(),
-            Some("user-chose-this"),
-            "replay on an already-migrated DB must be a no-op"
+        assert!(
+            store.get_setting("agent_model").await.unwrap().is_none(),
+            "migration 39 must remove agent_model on replay"
         );
         let route_state_exists: bool = store
             .with_conn(|c| {
@@ -8101,13 +8546,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 39, "forward migration must land at v39");
+        assert_eq!(uv, 42, "forward migration must land at v42");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
-    async fn migration_28_adds_fts_skill_usage_and_curator_tables() {
+    async fn migration_28_adds_fts_but_migration_39_drops_legacy_agentic_tables() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         let (uv, has_fts, has_usage, has_cstate, has_cruns) = store
@@ -8127,8 +8572,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 39, "forward migration must land at v39");
-        assert!(has_fts && has_usage && has_cstate && has_cruns);
+        assert_eq!(uv, 42, "forward migration must land at v42");
+        assert!(has_fts, "messages_fts must survive agentic cleanup");
+        assert!(
+            !has_usage && !has_cstate && !has_cruns,
+            "legacy agentic tables must be removed"
+        );
     }
 
     #[tokio::test]
@@ -9005,151 +9454,7 @@ mod tests {
         assert_eq!(store.list_plugin_attach().await.unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn skill_usage_records_and_transitions() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store.record_skill_view("deploy").await.unwrap();
-        store.record_skill_use("deploy").await.unwrap();
-        store.record_skill_use("deploy").await.unwrap();
-        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
-        assert_eq!(u.use_count, 2);
-        assert_eq!(u.view_count, 1);
-        assert_eq!(u.state, "active");
-        store
-            .set_skill_state("deploy", "stale", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .get_skill_usage("deploy")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            "stale"
-        );
-    }
-
-    #[tokio::test]
-    async fn skill_usage_patch_created_by_and_pinned_round_trip() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store.record_skill_patch("deploy").await.unwrap();
-        store.record_skill_patch("deploy").await.unwrap();
-        store.mark_skill_created_by_agent("deploy").await.unwrap();
-        store.set_skill_pinned("deploy", true).await.unwrap();
-        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
-        assert_eq!(u.patch_count, 2);
-        assert_eq!(u.created_by.as_deref(), Some("agent"));
-        assert!(u.pinned);
-        assert!(u.last_patched_at.is_some());
-
-        store
-            .set_skill_state("deploy", "archived", Some(42))
-            .await
-            .unwrap();
-        let u = store.get_skill_usage("deploy").await.unwrap().unwrap();
-        assert_eq!(u.state, "archived");
-        assert_eq!(u.archived_at, Some(42));
-        // set_skill_state/pinned/mark_skill_created_by_agent must not clobber
-        // counters recorded by earlier upserts on the same row.
-        assert_eq!(u.patch_count, 2);
-        assert!(u.pinned);
-    }
-
-    #[tokio::test]
-    async fn get_skill_usage_missing_returns_none_list_skill_usage_orders_by_name() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        assert!(store.get_skill_usage("nope").await.unwrap().is_none());
-
-        store.record_skill_use("zeta").await.unwrap();
-        store.record_skill_use("alpha").await.unwrap();
-        let all = store.list_skill_usage().await.unwrap();
-        assert_eq!(
-            all.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
-            vec!["alpha", "zeta"]
-        );
-    }
-
     // ---------- curator_state / curator_runs (Task 10) ----------
-
-    #[tokio::test]
-    async fn curator_last_run_is_none_until_a_run_is_inserted() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        assert!(store.curator_last_run().await.unwrap().is_none());
-
-        store.insert_curator_run("run-1", 1_000).await.unwrap();
-        assert_eq!(store.curator_last_run().await.unwrap(), Some(1_000));
-
-        // A later run overwrites the singleton `curator_state` anchor.
-        store.insert_curator_run("run-2", 2_000).await.unwrap();
-        assert_eq!(store.curator_last_run().await.unwrap(), Some(2_000));
-    }
-
-    #[tokio::test]
-    async fn finish_curator_run_updates_the_row_and_list_curator_runs_orders_newest_first() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        store.insert_curator_run("run-1", 1_000).await.unwrap();
-        store.insert_curator_run("run-2", 2_000).await.unwrap();
-
-        store
-            .finish_curator_run("run-1", 1_500, "ok", 3, false, None, None)
-            .await
-            .unwrap();
-        store
-            .finish_curator_run(
-                "run-2",
-                2_500,
-                "error",
-                0,
-                true,
-                Some("/tmp/snap.tar.gz"),
-                Some("boom"),
-            )
-            .await
-            .unwrap();
-
-        let runs = store.list_curator_runs(10).await.unwrap();
-        assert_eq!(
-            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            vec!["run-2", "run-1"],
-            "newest (highest started_at) first"
-        );
-
-        let run1 = runs.iter().find(|r| r.id == "run-1").unwrap();
-        assert_eq!(run1.finished_at, Some(1_500));
-        assert_eq!(run1.status, "ok");
-        assert_eq!(run1.transitioned, 3);
-        assert!(!run1.consolidated);
-        assert_eq!(run1.snapshot_path, None);
-        assert_eq!(run1.error, None);
-
-        let run2 = runs.iter().find(|r| r.id == "run-2").unwrap();
-        assert_eq!(run2.finished_at, Some(2_500));
-        assert_eq!(run2.status, "error");
-        assert_eq!(run2.transitioned, 0);
-        assert!(run2.consolidated);
-        assert_eq!(run2.snapshot_path.as_deref(), Some("/tmp/snap.tar.gz"));
-        assert_eq!(run2.error.as_deref(), Some("boom"));
-    }
-
-    #[tokio::test]
-    async fn list_curator_runs_respects_limit() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::open(tmp.path()).await.unwrap();
-        for (i, id) in ["run-a", "run-b", "run-c"].into_iter().enumerate() {
-            store
-                .insert_curator_run(id, 1_000 + i as i64)
-                .await
-                .unwrap();
-        }
-        assert_eq!(store.list_curator_runs(2).await.unwrap().len(), 2);
-        assert_eq!(store.list_curator_runs(100).await.unwrap().len(), 3);
-    }
 
     #[tokio::test]
     async fn migration_24_creates_catalog_tables_and_roundtrips() {

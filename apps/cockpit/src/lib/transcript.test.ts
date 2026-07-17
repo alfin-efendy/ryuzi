@@ -95,6 +95,7 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
     {
       type: "tool",
       key: "s1",
+      toolCallId: "t1",
       name: "Bash",
       kind: "execute",
       status: "completed",
@@ -110,6 +111,7 @@ test("consecutive tool_call/status rows cluster into one activity group", () => 
     {
       type: "tool",
       key: "s4",
+      toolCallId: "t2",
       name: "Tool",
       kind: null,
       status: "pending",
@@ -309,6 +311,25 @@ test("completed turn collapses thought+activity into one summary, text stays vis
   const summary = blocks[1] as Extract<(typeof blocks)[number], { type: "summary" }>;
   expect(summary.groups.map((g) => g.type)).toEqual(["thought", "activity"]);
   expect(summary.durationMs).toBe(36000);
+});
+
+test("completed turns retain dispatch activity outside collapsed ordinary work", () => {
+  const rows = [
+    row({ seq: 1, role: "user", text: "delegate", createdAt: 1 }),
+    row({ seq: 2, blockType: "tool_call", toolCallId: "read", toolName: "read", toolKind: "read", toolStatus: "completed" }),
+    row({ seq: 3, blockType: "tool_call", toolCallId: "task", toolName: "task", toolKind: "other", toolStatus: "completed" }),
+    row({ seq: 4, blockType: "tool_call", toolCallId: "delegate", toolName: "delegate_agent", toolKind: "other", toolStatus: "completed" }),
+    row({ seq: 5, blockType: "tool_call", toolCallId: "write", toolName: "write", toolKind: "write", toolStatus: "completed" }),
+    row({ seq: 6, text: "done", createdAt: 6 }),
+  ];
+
+  const blocks = buildTranscript(rows, false);
+  expect(blocks.map((block) => block.type)).toEqual(["user", "summary", "activity", "activity", "summary", "agent"]);
+  const dispatches = blocks.filter((block) => block.type === "activity") as Extract<TurnBlock, { type: "activity" }>[];
+  expect(dispatches.flatMap((block) => block.items.map((item) => (item.type === "tool" ? item.name : "status")))).toEqual([
+    "task",
+    "delegate_agent",
+  ]);
 });
 
 test("summary blocks carry the turn's edit cards", () => {
@@ -519,6 +540,24 @@ test("groupRows tool items carry input/duration/exitCode/summary", () => {
   expect(groups[0].items[0].summary).toBeNull();
 });
 
+test("groupRows preserves each tool row's durable owner and indexed dispatch admission failures", () => {
+  const groups = groupRows([
+    row({
+      seq: 1,
+      blockType: "tool_call",
+      ownerRunId: "later-primary",
+      toolCallId: "delegate-call",
+      toolName: "delegate_agent",
+      toolKind: "other",
+      toolStatus: "completed",
+      toolDispatchFailures: [{ dispatchIndex: 1, error: "capacity reached" }],
+    }),
+  ]);
+  if (groups[0].type !== "activity" || groups[0].items[0].type !== "tool") throw new Error("expected a tool item");
+  expect(groups[0].items[0].ownerRunId).toBe("later-primary");
+  expect(groups[0].items[0].dispatchFailures).toEqual([{ dispatchIndex: 1, error: "capacity reached" }]);
+});
+
 test("toolInputSummary derives a header line from the input shape", () => {
   expect(toolInputSummary({ command: "bun test\n# second line" }, null)).toBe("$ bun test");
   expect(toolInputSummary({ pattern: "TODO|FIXME" }, null)).toBe("TODO|FIXME");
@@ -559,10 +598,15 @@ test("formatToolDuration", () => {
   expect(formatToolDuration(null)).toBe("");
 });
 
-function toolItem(key: string, status: string, over: Partial<Extract<ActivityItem, { type: "tool" }>> = {}) {
+function toolItem(
+  key: string,
+  status: string,
+  { toolCallId = null, ...over }: Partial<Extract<ActivityItem, { type: "tool" }>> = {},
+): Extract<ActivityItem, { type: "tool" }> {
   return {
     type: "tool" as const,
     key,
+    toolCallId,
     name: "read",
     kind: "read",
     status,
@@ -583,6 +627,18 @@ test("liveTail keeps the last 3 visible and folds the rest with the full run len
   const frags = partitionActivity(items, true);
   expect(frags[0]).toEqual({ kind: "fold", items: items.slice(0, 2), runLength: 5 });
   expect(frags.slice(1)).toEqual(items.slice(2).map((item) => ({ kind: "item", item })));
+});
+
+test("completed dispatch items stay visible outside a live-tail fold", () => {
+  const dispatch = toolItem("dispatch", "completed", { name: "task", toolCallId: "dispatch-1" });
+  const items = [dispatch, ...[1, 2, 3, 4].map((n) => toolItem(`t${n}`, "completed"))];
+  expect(partitionActivity(items, true)).toEqual([
+    { kind: "item", item: dispatch },
+    { kind: "fold", items: [items[1]], runLength: 5 },
+    { kind: "item", item: items[2] },
+    { kind: "item", item: items[3] },
+    { kind: "item", item: items[4] },
+  ]);
 });
 
 test("liveTail with 3 or fewer items folds nothing", () => {

@@ -1242,63 +1242,11 @@ impl From<crate::plugins::doctor::DoctorFinding> for DoctorFinding {
     }
 }
 
-// --- learning_api (Task 11: Learning RPC family for the Cockpit Learning panel) ---
-
-/// One node in the Learning panel's journey graph: either a skill
-/// (`kind == "skill"`, `state` set from `skill_usage.state`) or a memory
-/// entry (`kind == "memory"`, `scope` set to which memory file it lives in).
-/// `id` is content-stable (see `learning_api::build_learning_graph`) so a
-/// re-fetch after an unrelated edit doesn't reshuffle node identity —
-/// unlike Hermes' fragile positional memory ids (spec §7.6).
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct LearningGraphNode {
-    pub id: String,
-    /// `"skill"` | `"memory"`.
-    pub kind: String,
-    pub label: String,
-    /// Skill lifecycle state (`active`/`stale`/`archived`); `None` for a
-    /// memory node.
-    pub state: Option<String>,
-    /// Memory scope (`global`/`user`/`project`); `None` for a skill node.
-    pub scope: Option<String>,
-}
-
-/// One edge in the Learning panel's journey graph: `related_skills` links
-/// two skills whose names share a token (a lexical relatedness signal, since
-/// `skill_usage` carries no free-text description to compare); `lexical`
-/// links a memory entry to a skill its text mentions by name.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct LearningGraphEdge {
-    pub source: String,
-    pub target: String,
-    /// `"related_skills"` | `"lexical"`.
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct LearningGraph {
-    pub nodes: Vec<LearningGraphNode>,
-    pub edges: Vec<LearningGraphEdge>,
-}
-
-/// `curator_status`'s response: when the curator last swept (`None` if it
-/// has never run) plus its recent run history for the Learning panel's
-/// curator-activity feed.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct CuratorStatus {
-    pub last_run_at: Option<i64>,
-    pub recent: Vec<crate::domain::CuratorRun>,
-}
-
 // --- agent_api (Plan 3: agent management RPC family for the Cockpit Agents panel) ---
 
 /// An agent's model assignment: either a concrete provider model (with an
-/// optional effort override) or a symbolic router route (`smart`, `fast`,
-/// ...). Routes never carry an effort — `deny_unknown_fields` makes a
+/// optional effort override) or a symbolic router route (`free`, ...).
+/// Routes never carry an effort — `deny_unknown_fields` makes a
 /// `{"kind":"route", ..., "effort": ...}` payload a decode error rather
 /// than a silently dropped field.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1590,10 +1538,10 @@ mod agent_management_dto_tests {
         );
         assert_eq!(
             serde_json::to_value(AgentModelInfo::Route {
-                route: "smart".into()
+                route: "free".into()
             })
             .unwrap(),
-            json!({"kind":"route","route":"smart"})
+            json!({"kind":"route","route":"free"})
         );
     }
 
@@ -1603,7 +1551,7 @@ mod agent_management_dto_tests {
             "name":"Reviewer",
             "description":"Reviews changes",
             "avatarColor":"violet",
-            "model":{"kind":"route","route":"smart","effort":"high"},
+            "model":{"kind":"route","route":"free","effort":"high"},
             "permissionMode":"ask",
             "permissionRules":[],
             "skills":[],

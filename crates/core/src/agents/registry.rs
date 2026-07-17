@@ -1349,7 +1349,7 @@ mod tests {
         fixture.write_index(&["broken"], "broken");
         fixture.write_raw(
             "agents/broken/agent.yaml",
-            "schema_version: 1\nid: broken\nname: Broken\nmodel: { route: smart, effort: high }\n",
+            "schema_version: 1\nid: broken\nname: Broken\nmodel: { route: free, effort: high }\n",
         );
         let registry = AgentRegistry::load(fixture.config_root(), fixture.store.clone())
             .await

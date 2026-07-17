@@ -99,14 +99,18 @@ export function RightPanel({
   const runs = useDelegation((state) => state.bySession[delegationKey] ?? []);
   const loadChildRuns = useDelegation((state) => state.load);
   const selectedRun = runs.find((run) => run.runId === selectedRunId) ?? null;
+  const previousDelegationKey = useRef(delegationKey);
 
   useEffect(() => {
     void loadChildRuns(runnerId, sessionPk);
   }, [loadChildRuns, runnerId, sessionPk]);
 
   useEffect(() => {
-    useDelegation.getState().select(runnerId, sessionPk, null);
-  }, [runnerId, sessionPk]);
+    if (previousDelegationKey.current !== delegationKey) {
+      useDelegation.getState().select(runnerId, sessionPk, null);
+      previousDelegationKey.current = delegationKey;
+    }
+  }, [delegationKey, runnerId, sessionPk]);
 
   // Fetched once per session and reused both to open files from Review
   // (below) and to resolve the file viewer's session-relative reads.

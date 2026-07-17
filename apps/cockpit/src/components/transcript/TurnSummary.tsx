@@ -7,7 +7,19 @@ import { ActivityCluster } from "./ToolChip";
 
 /** A completed turn's collapsed work: "Worked for 36s" + chevron, expanding
  *  to the same thought/activity rendering the live view streams. */
-export function TurnSummary({ groups, durationMs }: { groups: Group[]; durationMs: number | null }) {
+export function TurnSummary({
+  groups,
+  durationMs,
+  runnerId,
+  sessionPk,
+  ownerRunId,
+}: {
+  groups: Group[];
+  durationMs: number | null;
+  runnerId: string;
+  sessionPk: string;
+  ownerRunId: string | null;
+}) {
   const [open, setOpen] = useState(false);
   const Chevron = open ? ChevronDown : ChevronRight;
   const duration = formatTurnDuration(durationMs);
@@ -27,7 +39,7 @@ export function TurnSummary({ groups, durationMs }: { groups: Group[]; durationM
         <div className="mt-1.5 flex flex-col gap-2 border-l-2 border-border pl-3">
           {groups.map((g) =>
             g.type === "activity" ? (
-              <ActivityCluster key={g.key} items={g.items} />
+              <ActivityCluster key={g.key} items={g.items} runnerId={runnerId} sessionPk={sessionPk} ownerRunId={ownerRunId} />
             ) : g.type === "thought" ? (
               <ThoughtBlock key={g.key} markdown={g.markdown} streaming={false} />
             ) : null,

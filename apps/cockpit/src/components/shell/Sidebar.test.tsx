@@ -67,7 +67,14 @@ beforeEach(() => {
     selectedProjectId: null,
     end: endSession,
   });
-  useUi.setState({ pinned: {}, archived: {}, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({
+    pinned: {},
+    archived: {},
+    organizeBy: "project",
+    collapsed: {},
+    taskOrder: {},
+    projectOrder: [],
+  });
   useNav.setState({
     history: { back: [], current: { kind: "home" }, forward: [] },
     sidebarOpen: true,
@@ -160,7 +167,7 @@ const k1 = sessKey(LOCAL_RUNNER, "s1");
 const k2 = sessKey(LOCAL_RUNNER, "s2");
 
 test("renders an unread dot for an unread, non-focused session", () => {
-  useUi.setState({ readAt: { [k1]: 100, [k2]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100, [k2]: 100 } });
   useStore.setState({
     projects: [project],
     sessions: [sessionFixture("s1", 500), sessionFixture("s2", 50)],
@@ -173,7 +180,7 @@ test("renders an unread dot for an unread, non-focused session", () => {
 });
 
 test("does not show an unread dot for the focused session even if unseen", () => {
-  useUi.setState({ readAt: { [k1]: 100 }, sessionFilter: { statuses: {}, unreadOnly: false } });
+  useUi.setState({ readAt: { [k1]: 100 } });
   useStore.setState({
     projects: [project],
     sessions: [sessionFixture("s1", 500)],
@@ -182,4 +189,79 @@ test("does not show an unread dot for the focused session even if unseen", () =>
   });
   render(<Sidebar />);
   expect(screen.queryByTestId("unread-dot-s1")).toBeNull();
+});
+
+test("renders New Task nav and a Tasks section header, not the old labels", () => {
+  useStore.setState({
+    projects: [project],
+    sessions: [{ ...session, projectId: null, kind: "chat" }],
+    pendingApprovals: [],
+    focusedSession: null,
+  });
+  render(<Sidebar />);
+  expect(screen.getByRole("button", { name: "New Task" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
+  expect(screen.getByText("Tasks")).toBeTruthy();
+  expect(screen.queryByText("Chat")).toBeNull();
+});
+
+test("Organize menu switches By Project / By Task and offers Manual Order; no Status filter", () => {
+  render(<Sidebar />);
+  // open the Projects-header menu
+  fireEvent.click(screen.getAllByTitle("Sort and organize")[0]);
+  expect(screen.getByText("Organize")).toBeTruthy();
+  expect(screen.queryByText("Status")).toBeNull();
+  expect(screen.queryByText("Collapse all")).toBeNull();
+  expect(screen.queryByText("Mark all as read")).toBeNull();
+});
+
+test("By Task mode shows all tasks flat and a Projects section without nested tasks", () => {
+  useUi.setState({ organizeBy: "task", collapsed: {} });
+  useStore.setState({
+    projects: [project],
+    sessions: [
+      { ...session, sessionPk: "cx", projectId: null, kind: "chat", title: "chat task" },
+      { ...session, sessionPk: "px", projectId: "p1", kind: "project", title: "project task" },
+    ],
+    pendingApprovals: [],
+    focusedSession: null,
+  });
+  render(<Sidebar />);
+  // both tasks appear in the flat Tasks list
+  expect(screen.getByText("chat task")).toBeTruthy();
+  expect(screen.getByText("project task")).toBeTruthy();
+  // Projects section still lists the project for navigation
+  expect(screen.getByText("Ryuzi")).toBeTruthy();
+  // …but flat (no nested per-project tree, so no per-project settings gear).
+  expect(screen.queryByTitle("Project settings")).toBeNull();
+});
+
+test("By Project mode keeps project tasks nested and chat tasks in the Tasks section", () => {
+  useUi.setState({ organizeBy: "project", collapsed: {} });
+  useStore.setState({
+    projects: [project],
+    sessions: [
+      { ...session, sessionPk: "cx", projectId: null, kind: "chat", title: "chat task" },
+      { ...session, sessionPk: "px", projectId: "p1", kind: "project", title: "nested task" },
+    ],
+    pendingApprovals: [],
+    focusedSession: null,
+  });
+  render(<Sidebar />);
+  expect(screen.getByText("chat task")).toBeTruthy();
+  expect(screen.getByText("nested task")).toBeTruthy();
+});
+
+test("collapsing the Tasks section hides its rows", () => {
+  useStore.setState({
+    projects: [project],
+    sessions: [{ ...session, projectId: null, kind: "chat", title: "chatty" }],
+    pendingApprovals: [],
+    focusedSession: null,
+  });
+  useUi.setState({ collapsed: {} });
+  render(<Sidebar />);
+  expect(screen.getByText("chatty")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /collapse tasks/i }));
+  expect(screen.queryByText("chatty")).toBeNull();
 });

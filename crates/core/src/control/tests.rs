@@ -132,6 +132,7 @@ impl HarnessSession for FakeSession {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: self.session_pk.clone(),
                 seq,
+                run_id: self.isolated_target.then(|| self.run_id.clone()),
                 role: "assistant".into(),
                 block_type: "text".into(),
                 payload: serde_json::json!({ "text": "working" }),
@@ -3838,6 +3839,7 @@ async fn end_session_cancels_deferred_background_descendants_before_they_can_del
             task: "deferred background work".into(),
             context: None,
             background: true,
+            dispatch: None,
         })
         .await
         .unwrap();
@@ -5477,7 +5479,7 @@ async fn provision_project_named_route_legacy_effort_requires_no_target_preferen
         .set("workdir_root", root.path().to_str().unwrap())
         .await
         .unwrap();
-    settings.set("default_model", "smart").await.unwrap();
+    settings.set("default_model", "free").await.unwrap();
     settings.set("default_effort", "high").await.unwrap();
     crate::llm_router::connections::add_connection(
         &store,
@@ -5498,18 +5500,18 @@ async fn provision_project_named_route_legacy_effort_requires_no_target_preferen
     )
     .await
     .unwrap();
-    let existing_smart = crate::llm_router::routes::list_model_routes(&store)
+    let existing_free = crate::llm_router::routes::list_model_routes(&store)
         .await
         .unwrap()
         .into_iter()
-        .find(|route| route.name == "smart");
+        .find(|route| route.name == "free");
     crate::llm_router::routes::save_model_route(
         &store,
         crate::llm_router::routes::ModelRouteInfo {
-            id: existing_smart
+            id: existing_free
                 .map(|route| route.id)
-                .unwrap_or_else(|| "smart-route".into()),
-            name: "smart".into(),
+                .unwrap_or_else(|| "free-route".into()),
+            name: "free".into(),
             enabled: true,
             strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
             targets: vec![crate::llm_router::routes::ModelRouteTarget {
@@ -6141,356 +6143,4 @@ async fn worktree_dir_setting_overrides_the_default_worktree_root() {
         "worktree {wt} must live under the configured worktree_dir {}",
         custom_root.path().display()
     );
-}
-
-/// End-to-end coverage of `run_review_fork` (Phase 4 Task 9) through the
-/// PUBLIC `ControlPlane` entrypoint `learning::tick` actually calls — not
-/// just the lower-level `drive_review` seam already covered byte-for-byte in
-/// `harness::native::runner::tests`. Proves the full glue: a scripted
-/// `skill_manage create` call actually writes to disk and is stamped
-/// `created_by="agent"` (the fork's `ToolCtx.write_origin` really is
-/// `BackgroundReview`, not the hardcoded `User` of the pre-Task-9 runner),
-/// and a `💾 Self-improvement review: …` notice lands in the PARENT
-/// transcript once the fork completes.
-#[tokio::test]
-#[serial]
-async fn run_review_fork_writes_a_parent_notice_and_carries_background_review_write_origin() {
-    use crate::harness::native::llm::{LlmStream, LlmStreamFactory};
-    use crate::harness::native::runner::testutil::{
-        input_json_delta, message_delta, message_stop, text_delta, tool_use_start, ScriptedLlm,
-    };
-    use crate::harness::native::runner::{LearningPayload, SELF_IMPROVEMENT_NOTICE_PREFIX};
-
-    let _guard = StateDirGuard::new();
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = test_control_plane(store, registries(false)).await;
-
-    // A real parent chat session the notice must land on.
-    let now = now_ms();
-    cp.store()
-        .insert_session(Session {
-            session_pk: "parent-1".into(),
-            primary_agent_id: None,
-            primary_agent_snapshot: None,
-            project_id: None,
-            agent_session_id: None,
-            worktree_path: None,
-            branch: None,
-            title: None,
-            status: SessionStatus::Idle,
-            perm_mode: PermMode::Default,
-            started_by: None,
-            created_at: Some(now),
-            last_active: Some(now),
-            resume_attempts: 0,
-            branch_owned: false,
-            kind: SessionKind::Chat,
-            speaker: None,
-            agent: None,
-            parent_session_pk: None,
-        })
-        .await
-        .unwrap();
-
-    // Always hands out the same scripted stream — `run_review_fork` builds
-    // its `RunnerDeps.llm` via `ControlPlane::review_llm_factory()`,
-    // bypassing `registries.harness` entirely.
-    struct FixedLlmFactory(Arc<dyn LlmStream>);
-    impl LlmStreamFactory for FixedLlmFactory {
-        fn create(&self, _store: Arc<Store>) -> Arc<dyn LlmStream> {
-            self.0.clone()
-        }
-    }
-    let create_args = serde_json::json!({
-        "action": "create",
-        "name": "deploy",
-        "description": "How to deploy",
-        "body": "Run make deploy.",
-    });
-    let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![
-        vec![
-            tool_use_start(0, "call-1", "skill_manage"),
-            input_json_delta(0, &create_args.to_string()),
-            message_delta("tool_use"),
-            message_stop(),
-        ],
-        vec![
-            text_delta("Captured a deploy skill."),
-            message_delta("end_turn"),
-            message_stop(),
-        ],
-    ]));
-    cp.set_review_llm_factory_for_test(Arc::new(FixedLlmFactory(llm)));
-
-    let payload = LearningPayload {
-        native_tools_version: crate::harness::native::capabilities::NativeToolsVersion::V1,
-        tool_capability_profile: None,
-        review_kind: "skill".into(),
-        parent_session_pk: "parent-1".into(),
-        model: "test/model".into(),
-        supports_prompt_cache: false,
-        system: "You are ryuzi.".into(),
-        tool_defs: vec![],
-        messages: vec![
-            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
-        ],
-    };
-    let payload_json = serde_json::to_string(&payload).unwrap();
-
-    // Redirect `skill_manage`'s skills root to a KNOWN tempdir (on top of
-    // `StateDirGuard`'s HOME redirect) so this test can assert on it
-    // directly, without reaching into `StateDirGuard`'s private tempdir.
-    let skills_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("RYUZI_TEST_CONFIG_ROOT", skills_dir.path());
-    let result = cp.run_review_fork(&payload_json).await;
-    std::env::remove_var("RYUZI_TEST_CONFIG_ROOT");
-    result.unwrap();
-
-    let reviews = cp.store().list_sessions_by_kind("review").await.unwrap();
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, SessionStatus::Ended);
-    let review_runs = cp
-        .store()
-        .list_session_agent_runs(&reviews[0].session_pk)
-        .await
-        .unwrap();
-    assert_eq!(review_runs.len(), 1);
-    assert_eq!(
-        review_runs[0].status,
-        crate::domain::AgentRunStatus::Completed
-    );
-
-    let md = std::fs::read_to_string(skills_dir.path().join("skills/deploy/SKILL.md"))
-        .expect("skill_manage create must have written SKILL.md");
-    assert!(md.contains("Run make deploy."));
-    let usage = cp
-        .store()
-        .get_skill_usage("deploy")
-        .await
-        .unwrap()
-        .expect("skill_manage create must record skill_usage");
-    assert_eq!(
-        usage.created_by.as_deref(),
-        Some("agent"),
-        "the fork's ToolCtx must carry an autonomous write_origin \
-         (BackgroundReview), not the hardcoded User of the pre-Task-9 runner"
-    );
-
-    let messages = cp.store().list_messages("parent-1").await.unwrap();
-    let notice = messages
-        .iter()
-        .find(|m| m.role == "system" && m.block_type == "notice")
-        .expect("run_review_fork must insert a notice into the PARENT transcript");
-    let text = notice.payload["text"].as_str().unwrap();
-    assert!(text.starts_with(SELF_IMPROVEMENT_NOTICE_PREFIX));
-    assert!(text.contains("Captured a deploy skill."));
-}
-
-fn v2_review_payload(
-    profile: Option<crate::harness::native::capabilities::ToolCapabilityProfile>,
-) -> crate::harness::native::runner::LearningPayload {
-    crate::harness::native::runner::LearningPayload {
-        native_tools_version: crate::harness::native::capabilities::NativeToolsVersion::V2,
-        tool_capability_profile: profile,
-        review_kind: "memory".into(),
-        parent_session_pk: "missing-parent-is-allowed".into(),
-        model: "test/model".into(),
-        supports_prompt_cache: false,
-        system: "review".into(),
-        tool_defs: vec![serde_json::json!({
-            "name": "read",
-            "description": "stale captured definition",
-            "input_schema": {"type": "object"},
-            "strict": false
-        })],
-        messages: vec![],
-    }
-}
-
-fn direct_review_profile() -> crate::harness::native::capabilities::ToolCapabilityProfile {
-    use crate::harness::native::capabilities::{
-        CapabilitySource, ToolCapabilityProfile, ToolInteractionMode, WireProtocol,
-        CAPABILITY_SCHEMA_VERSION,
-    };
-    ToolCapabilityProfile {
-        interaction_mode: ToolInteractionMode::DirectFunctions,
-        wire_protocol: WireProtocol::OpenAiResponses,
-        supports_custom_freeform_tools: false,
-        supports_parallel_tool_calls: true,
-        supports_strict_function_schema: true,
-        supports_tool_output_schema: true,
-        schema_budget_tokens: 16_000,
-        supports_prompt_cache: false,
-        capability_source: CapabilitySource::TransportDefault,
-        capability_schema_version: CAPABILITY_SCHEMA_VERSION,
-    }
-}
-
-#[tokio::test]
-async fn v2_review_projects_dangling_tool_results_as_structured_envelopes() {
-    use crate::harness::native::llm::{LlmStream, LlmStreamFactory};
-    use crate::harness::native::runner::testutil::{
-        message_delta, message_stop, text_delta, ScriptedLlm,
-    };
-    use crate::llm_router::provenance::{LlmRequest, RoutedStream};
-
-    struct CapturingReviewLlm {
-        inner: ScriptedLlm,
-        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    }
-
-    #[async_trait]
-    impl LlmStream for CapturingReviewLlm {
-        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
-            self.bodies.lock().unwrap().push(request.body.clone());
-            self.inner.stream(request).await
-        }
-    }
-
-    struct FixedLlmFactory(Arc<dyn LlmStream>);
-
-    impl LlmStreamFactory for FixedLlmFactory {
-        fn create(&self, _store: Arc<Store>) -> Arc<dyn LlmStream> {
-            self.0.clone()
-        }
-    }
-
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = test_control_plane(store, registries(false)).await;
-    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let llm: Arc<dyn LlmStream> = Arc::new(CapturingReviewLlm {
-        inner: ScriptedLlm::new(vec![vec![
-            text_delta("review complete"),
-            message_delta("end_turn"),
-            message_stop(),
-        ]]),
-        bodies: bodies.clone(),
-    });
-    cp.set_review_llm_factory_for_test(Arc::new(FixedLlmFactory(llm)));
-
-    let profile = direct_review_profile();
-    let read_definition = crate::harness::native::tools::ToolRegistry::builtin()
-        .v2_definition("read", &profile)
-        .unwrap();
-    let mut payload = v2_review_payload(Some(profile));
-    payload.tool_defs = vec![read_definition];
-    payload.messages = vec![serde_json::json!({
-        "role": "assistant",
-        "content": [{
-            "type": "tool_use",
-            "id": "dangling-review-call",
-            "name": "read",
-            "input": {}
-        }]
-    })];
-
-    cp.run_review_fork(&serde_json::to_string(&payload).unwrap())
-        .await
-        .unwrap();
-
-    let captured = bodies.lock().unwrap();
-    let messages = captured[0]["messages"].as_array().unwrap();
-    let repair = messages
-        .iter()
-        .flat_map(|message| message["content"].as_array().into_iter().flatten())
-        .find(|block| block["tool_use_id"] == "dangling-review-call")
-        .expect("review request must repair the captured dangling tool call");
-    let envelope: serde_json::Value =
-        serde_json::from_str(repair["content"].as_str().unwrap()).unwrap();
-    assert_eq!(envelope["error"]["code"], "cancelled");
-    assert_eq!(envelope["error"]["category"], "cancelled");
-    assert_eq!(envelope["meta"]["tool"], "read");
-}
-
-#[tokio::test]
-async fn v2_review_missing_profile_fails_before_creating_durable_review_state() {
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = test_control_plane(store, registries(false)).await;
-    let error = cp
-        .run_review_fork(&serde_json::to_string(&v2_review_payload(None)).unwrap())
-        .await
-        .unwrap_err();
-
-    assert!(error.to_string().contains("capability_unavailable"));
-    assert!(cp
-        .store()
-        .list_sessions_by_kind("review")
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-#[tokio::test]
-async fn review_setup_failure_after_root_insert_terminalizes_session_and_run() {
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = test_control_plane(store, registries(false)).await;
-    rusqlite::Connection::open(db.path())
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_review_version BEFORE INSERT ON native_tool_session_versions
-             BEGIN SELECT RAISE(ABORT, 'injected review version setup failure'); END;",
-        )
-        .unwrap();
-
-    let payload = v2_review_payload(Some(direct_review_profile()));
-    let error = cp
-        .run_review_fork(&serde_json::to_string(&payload).unwrap())
-        .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("injected review version setup failure"));
-
-    let reviews = cp.store().list_sessions_by_kind("review").await.unwrap();
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, SessionStatus::Ended);
-    let runs = cp
-        .store()
-        .list_session_agent_runs(&reviews[0].session_pk)
-        .await
-        .unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, crate::domain::AgentRunStatus::Failed);
-    assert!(runs[0]
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("injected review version setup failure")));
-}
-
-#[tokio::test]
-async fn review_operation_and_cleanup_failures_are_combined() {
-    let db = tempfile::NamedTempFile::new().unwrap();
-    let store = crate::store::Store::open(db.path()).await.unwrap();
-    let cp = test_control_plane(store, registries(false)).await;
-    rusqlite::Connection::open(db.path())
-        .unwrap()
-        .execute_batch(
-            "CREATE TRIGGER fail_review_session_cleanup BEFORE UPDATE OF status ON sessions
-             WHEN OLD.kind = 'review' AND NEW.status = 'ended'
-             BEGIN SELECT RAISE(ABORT, 'injected review cleanup failure'); END;",
-        )
-        .unwrap();
-
-    let payload = v2_review_payload(Some(direct_review_profile()));
-    let error = cp
-        .run_review_fork(&serde_json::to_string(&payload).unwrap())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("capability_unavailable"), "{error}");
-    assert!(error.contains("injected review cleanup failure"), "{error}");
-
-    let reviews = cp.store().list_sessions_by_kind("review").await.unwrap();
-    assert_eq!(reviews.len(), 1);
-    let runs = cp
-        .store()
-        .list_session_agent_runs(&reviews[0].session_pk)
-        .await
-        .unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, crate::domain::AgentRunStatus::Failed);
 }

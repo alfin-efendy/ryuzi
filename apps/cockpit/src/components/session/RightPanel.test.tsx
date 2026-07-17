@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AgentRun, CmdError, Message, Result } from "@/bindings";
+import type { AgentRun, AgentRunRosterInfo, CmdError, Message, Result } from "@/bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
 
 const getChildRuns = mock(
-  (_runnerId: string | null, _sessionPk: string): Promise<Result<AgentRun[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
+  (_runnerId: string | null, _sessionPk: string): Promise<Result<AgentRunRosterInfo, CmdError>> =>
+    Promise.resolve({ status: "ok", data: { rootRunId: null, runs: [] } }),
 );
 const getChildTranscript = mock(
   (_runnerId: string | null, _sessionPk: string, _runId: string): Promise<Result<Message[], CmdError>> =>
@@ -31,6 +32,7 @@ const { RightPanel } = await import("./RightPanel");
 const { useNav } = await import("@/store-nav");
 const { useDiff } = await import("@/store-diff");
 const { useUi } = await import("@/store-ui");
+const { useDelegation, delegationSessionKey } = await import("@/store-delegation");
 
 const APP_DIFF = ["diff --git a/src/app.ts b/src/app.ts", "--- a/src/app.ts", "+++ b/src/app.ts", "@@ -1 +1 @@", "-old", "+new"].join("\n");
 const FRESH_DIFF = [
@@ -41,12 +43,14 @@ const FRESH_DIFF = [
   "+const fresh = true;",
 ].join("\n");
 
-function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
+function childRun({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Partial<AgentRun> = {}): AgentRun {
   return {
     runId: "child-1",
     sessionPk: "s1",
     parentRunId: null,
     retryOf: null,
+    sourceToolCallId,
+    dispatchIndex,
     primaryAgentId: "primary",
     executingAgentId: "worker",
     executingAgentNameSnapshot: "Researcher",
@@ -68,9 +72,18 @@ beforeEach(() => {
   useNav.setState({ rightOpen: true, rightTab: "review", rightMaximized: false });
   useDiff.setState({ bySession: {}, pendingReview: null });
   useUi.setState({ tabs: [], activeTabId: null });
+  useDelegation.setState({
+    bySession: {},
+    rootRunBySession: {},
+    rosterStateBySession: {},
+    transcriptByRun: {},
+    transcriptStateByRun: {},
+    seenRunsByDispatch: {},
+    selectedBySession: {},
+  });
   gitDiff.mockClear();
   getChildRuns.mockClear();
-  getChildRuns.mockImplementation((_runnerId, _sessionPk) => Promise.resolve({ status: "ok", data: [] }));
+  getChildRuns.mockImplementation((_runnerId, _sessionPk) => Promise.resolve({ status: "ok", data: { rootRunId: null, runs: [] } }));
   getChildTranscript.mockClear();
   getChildTranscript.mockImplementation((_runnerId, _sessionPk, _runId) => Promise.resolve({ status: "ok", data: [] }));
   gitDiff.mockImplementation(() => Promise.resolve({ status: "ok", data: "" }));
@@ -340,9 +353,36 @@ test("Review error keeps Refresh available and retries", async () => {
   await waitFor(() => expect(screen.queryByText("diff failed")).toBeNull());
 });
 
+test("panel mount preserves an external selection but a scope change clears its own stale selection", async () => {
+  const firstKey = delegationSessionKey("runner-a", "session-a");
+  const secondKey = delegationSessionKey("runner-b", "session-b");
+  const first = childRun({ runId: "first-run", sessionPk: "session-a", task: "Selected from chat" });
+  const second = childRun({ runId: "second-run", sessionPk: "session-b", task: "Stale selection in next scope" });
+  getChildRuns.mockImplementation((runnerId, sessionPk) =>
+    Promise.resolve({
+      status: "ok",
+      data: { rootRunId: null, runs: runnerId === "runner-a" && sessionPk === "session-a" ? [first] : [second] },
+    }),
+  );
+  useDelegation.setState({
+    bySession: { [firstKey]: [first], [secondKey]: [second] },
+    selectedBySession: { [firstKey]: first.runId, [secondKey]: second.runId },
+  });
+  useNav.setState({ rightTab: "agents" });
+
+  const panel = render(<RightPanel runnerId="runner-a" sessionPk="session-a" branch="main" running={false} isGit />);
+
+  await waitFor(() => expect(useDelegation.getState().selectedBySession[firstKey]).toBe(first.runId));
+  expect(screen.getByText("Selected from chat")).toBeTruthy();
+
+  panel.rerender(<RightPanel runnerId="runner-b" sessionPk="session-b" branch="main" running={false} isGit />);
+  await waitFor(() => expect(useDelegation.getState().selectedBySession[secondKey]).toBeNull());
+  expect(screen.getByRole("button", { name: /Researcher/i })).toBeTruthy();
+});
+
 test("switching runners, sessions, and full detail resets the selected child run", async () => {
   getChildRuns.mockImplementation((runnerId: string | null, sessionPk: string) =>
-    Promise.resolve({ status: "ok", data: [childRun({ runId: `${runnerId}-${sessionPk}`, sessionPk })] }),
+    Promise.resolve({ status: "ok", data: { rootRunId: null, runs: [childRun({ runId: `${runnerId}-${sessionPk}`, sessionPk })] } }),
   );
   getChildTranscript.mockImplementation((_runnerId: string | null, _sessionPk: string, runId: string) =>
     Promise.resolve({
@@ -384,8 +424,8 @@ test("switching runners, sessions, and full detail resets the selected child run
   expect(screen.queryByText("Live transcript for runner-a-session-b")).toBeNull();
 });
 
-test("agent-run events refresh the visible child transcript", async () => {
-  getChildRuns.mockResolvedValue({ status: "ok", data: [childRun()] });
+test("agent-run events refresh metadata without reloading the selected child transcript", async () => {
+  getChildRuns.mockResolvedValue({ status: "ok", data: { rootRunId: null, runs: [childRun()] } });
   getChildTranscript.mockResolvedValue({ status: "ok", data: [] });
   useNav.setState({ rightTab: "agents" });
   render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch="main" running={false} isGit />);
@@ -404,7 +444,8 @@ test("agent-run events refresh the visible child transcript", async () => {
       );
   });
 
-  await waitFor(() => expect(getChildTranscript).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledTimes(2));
+  expect(getChildTranscript).toHaveBeenCalledTimes(1);
 });
 
 test("many file tabs do not move the expand action out of the fixed header", () => {

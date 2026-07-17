@@ -3405,7 +3405,7 @@ mod tests {
             &ctx.store,
             routes::ModelRouteInfo {
                 id: "rr-route".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::RoundRobin,
                 targets: vec![
@@ -3428,8 +3428,8 @@ mod tests {
         .unwrap();
         let routed = anthropic_messages_stream(
             &ctx,
-            json!({"model":"smart","messages":[]}),
-            utility_policy(&ctx, "smart").await.as_ref(),
+            json!({"model":"free","messages":[]}),
+            utility_policy(&ctx, "free").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3650,7 +3650,7 @@ mod tests {
             &ctx.store,
             routes::ModelRouteInfo {
                 id: "continuation".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
@@ -4260,7 +4260,7 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 64);
         assert!(body.get("max_tokens").is_none());
 
-        for id in ["mimo-free", "qwen", "github-copilot", "custom-openai"] {
+        for id in ["mimo-free", "qwen", "github-copilot", "deepseek"] {
             let mut body = json!({"model": "m", "max_tokens": 64, "messages": []});
             apply_max_completion_tokens(registry::descriptor(id).unwrap(), &mut body);
             assert_eq!(body["max_tokens"], 64, "{id} must keep max_tokens");
@@ -5246,22 +5246,22 @@ mod tests {
     #[tokio::test]
     async fn route_tool_capabilities_intersect_fallbacks_without_advancing_order() {
         let ctx = test_ctx().await;
-        for (id, provider, model) in [
-            ("openai-1", "openai", "opaque-primary"),
-            ("openai-2", "openai", "opaque-primary"),
-            ("custom", "custom-openai", "opaque-fallback"),
-        ] {
+        let custom_id =
+            crate::llm_router::custom::add_custom_provider(&ctx.store, "Capability Fallback")
+                .await
+                .unwrap()[0]
+                .id
+                .clone();
+        for id in ["openai-1", "openai-2"] {
             connections::add_connection(
                 &ctx.store,
                 mk_conn(
                     id,
-                    provider,
+                    "openai",
                     "api_key",
                     ConnectionData {
                         api_key: Some("key".into()),
-                        base_url_override: (provider == "custom-openai")
-                            .then(|| "http://127.0.0.1:9/v1".into()),
-                        models_override: Some(vec![model.into()]),
+                        models_override: Some(vec!["opaque-primary".into()]),
                         ..Default::default()
                     },
                 ),
@@ -5269,6 +5269,22 @@ mod tests {
             .await
             .unwrap();
         }
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "custom",
+                &custom_id,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    base_url_override: Some("http://127.0.0.1:9/v1".into()),
+                    models_override: Some(vec!["opaque-fallback".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
         routes::save_provider_account_route(
             &ctx.store,
             "openai",
@@ -5290,7 +5306,7 @@ mod tests {
                         effort: None,
                     },
                     routes::ModelRouteTarget {
-                        provider: "custom-openai".into(),
+                        provider: custom_id,
                         model: "opaque-fallback".into(),
                         effort: None,
                     },
@@ -5317,22 +5333,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_tool_requirements_hard_filter_incompatible_route_targets() {
+    async fn dynamic_free_route_intersects_and_filters_declared_transport_facts() {
         let ctx = test_ctx().await;
         for (id, provider, model) in [
-            ("custom", "custom-openai", "opaque-custom"),
-            ("official", "openai", "opaque-official"),
+            ("mimo-free-account", "mimo-free", "mimo-auto"),
+            ("opencode-free-account", "opencode-free", "grok-code"),
         ] {
             connections::add_connection(
                 &ctx.store,
                 mk_conn(
                     id,
                     provider,
-                    "api_key",
+                    "free",
                     ConnectionData {
-                        api_key: Some("key".into()),
-                        base_url_override: (provider == "custom-openai")
-                            .then(|| "http://127.0.0.1:9/v1".into()),
                         models_override: Some(vec![model.into()]),
                         ..Default::default()
                     },
@@ -5344,13 +5357,100 @@ mod tests {
         routes::save_model_route(
             &ctx.store,
             routes::ModelRouteInfo {
+                id: "dynamic-free-route".into(),
+                name: "free".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "mimo-free".into(),
+                        model: "mimo-auto".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "opencode-free".into(),
+                        model: "grok-code".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "free").await.unwrap();
+        assert_eq!(
+            capabilities.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+        assert!(capabilities.supports_function_tools);
+        assert!(!capabilities.supports_strict_function_schema);
+
+        let strict_request = json!({"tools": [{"type": "function", "function": {
+            "name": "lookup",
+            "strict": true,
+            "parameters": {"type": "object"}
+        }}]});
+        assert!(
+            route_models_for_body(&ctx.store, "free", Some(&strict_request))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_tool_requirements_hard_filter_incompatible_route_targets() {
+        let ctx = test_ctx().await;
+        let custom_id =
+            crate::llm_router::custom::add_custom_provider(&ctx.store, "Strict Incompatible")
+                .await
+                .unwrap()[0]
+                .id
+                .clone();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "custom",
+                &custom_id,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    base_url_override: Some("http://127.0.0.1:9/v1".into()),
+                    models_override: Some(vec!["opaque-custom".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "official",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["opaque-official".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
                 id: "strict-route".into(),
                 name: "strict".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
                     routes::ModelRouteTarget {
-                        provider: "custom-openai".into(),
+                        provider: custom_id,
                         model: "opaque-custom".into(),
                         effort: None,
                     },

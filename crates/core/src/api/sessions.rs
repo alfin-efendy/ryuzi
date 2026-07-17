@@ -162,6 +162,12 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "update_session_perm_mode" => {
             let a: UpdateSessionPermModeP = params(p)?;
+            crate::sessions::ownership::require_executable_session_agent(
+                cp.store(),
+                &state.agents,
+                &a.session_pk,
+            )
+            .await?;
             ok(cp
                 .store()
                 .update_session_perm_mode(&a.session_pk, a.perm_mode)
@@ -228,6 +234,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "remove_session_message" => {
             let a: RemoveSessionMessageP = params(p)?;
+            // Historical (legacy / deleted-owner) sessions are read-only:
+            // reject before the queue row is mutated.
+            crate::sessions::ownership::require_executable_session_agent(
+                cp.store(),
+                &state.agents,
+                &a.session_pk,
+            )
+            .await?;
             ensure_session_exists(cp, &a.session_pk).await?;
             let removed = cp.remove_session_prompt(&a.session_pk, &a.id).await?;
             ok(removed)
@@ -395,6 +409,14 @@ async fn enqueue_session_message(
     options: Option<ChatRequestOptions>,
 ) -> Result<QueuedMessageInfo, ApiError> {
     let cp = &state.cp;
+    // Historical (legacy / deleted-owner) sessions are read-only: reject
+    // before the queue row is durably inserted.
+    crate::sessions::ownership::require_executable_session_agent(
+        cp.store(),
+        &state.agents,
+        session_pk,
+    )
+    .await?;
     ensure_session_exists(cp, session_pk).await?;
     let options = options.unwrap_or_default();
     let id = crate::paths::new_id();

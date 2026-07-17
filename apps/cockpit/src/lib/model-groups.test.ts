@@ -137,7 +137,7 @@ test("modelStatusKey resolves entry-id/model to the entry's family via the catal
 });
 
 test("modelStatusKey returns null for bare route aliases and unknown prefixes", () => {
-  expect(modelStatusKey("smart", catalog)).toBeNull();
+  expect(modelStatusKey("free", catalog)).toBeNull();
   expect(modelStatusKey("low_task", catalog)).toBeNull();
   expect(modelStatusKey("mystery/whatever", catalog)).toBeNull();
 });
@@ -200,12 +200,12 @@ test("invalid options are flagged (not hidden) when hideInvalid is off", () => {
 
 test("route aliases are never filtered; grouping survives filtering", () => {
   const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
-  const groups = groupModelOptions(["smart", "openai/gpt-5.5", "anthropic/claude-fable-5"], catalog, [], {
+  const groups = groupModelOptions(["free", "openai/gpt-5.5", "anthropic/claude-fable-5"], catalog, [], {
     statuses,
     hideInvalid: true,
   });
   expect(groups).toEqual([
-    { label: "Route", options: [{ value: "smart", label: "smart", mono: true }] },
+    { label: "Route", options: [{ value: "free", label: "free", mono: true }] },
     { label: "Anthropic", options: [{ value: "anthropic/claude-fable-5", label: "claude-fable-5", mono: true }] },
   ]);
 });
@@ -214,8 +214,8 @@ test("the ungrouped fallback honors hide-invalid too (no resurrection)", () => {
   // All grouped options filtered away → byFamily is empty → the fallback
   // must return the FILTERED flat list, not the raw input.
   const statuses = { [statusKey("openai", "gpt-5.5")]: "invalid" as const };
-  const flat = groupModelOptions(["smart", "openai/gpt-5.5"], catalog, [], { statuses, hideInvalid: true });
-  expect(flat).toEqual([{ value: "smart", label: "smart", mono: true }]);
+  const flat = groupModelOptions(["free", "openai/gpt-5.5"], catalog, [], { statuses, hideInvalid: true });
+  expect(flat).toEqual([{ value: "free", label: "free", mono: true }]);
 });
 
 test("hideInvalid resolves bare ids without applying a base verdict to effort suffixes", () => {

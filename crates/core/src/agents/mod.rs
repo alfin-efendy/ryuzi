@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub(crate) mod free_route;
 pub mod knowledge;
 pub mod learning_queue;
 pub mod okf;

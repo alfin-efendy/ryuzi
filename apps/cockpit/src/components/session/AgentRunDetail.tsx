@@ -1,5 +1,6 @@
-import { ArrowLeft, Copy, RotateCw, Square, Waypoints } from "lucide-react";
+import { ArrowLeft, Bot, Copy, RotateCw, Square, Waypoints } from "lucide-react";
 import type { AgentRun } from "@/bindings";
+import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
 import { messageToRow } from "@/lib/transcript";
 import { useDelegation, delegationRunKey } from "@/store-delegation";
 import { Transcript } from "@/components/transcript/Transcript";
@@ -7,13 +8,6 @@ import { Button } from "@ryuzi/ui";
 
 const activeStatuses = new Set(["queued", "running"]);
 const retryableStatuses = new Set(["failed", "cancelled", "interrupted"]);
-
-function duration(run: AgentRun): string {
-  if (run.startedAt === null) return run.status === "queued" ? "Queued" : "—";
-  const milliseconds = (run.finishedAt ?? Date.now()) - run.startedAt;
-  const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-}
 
 export function AgentRunDetail({
   runnerId,
@@ -26,8 +20,11 @@ export function AgentRunDetail({
   run: AgentRun;
   onRelatedChanges: () => void;
 }) {
-  const transcript = useDelegation((state) => state.transcriptByRun[delegationRunKey(runnerId, sessionPk, run.runId)] ?? []);
+  const transcriptKey = delegationRunKey(runnerId, sessionPk, run.runId);
+  const transcript = useDelegation((state) => state.transcriptByRun[transcriptKey] ?? []);
+  const transcriptState = useDelegation((state) => state.transcriptStateByRun[transcriptKey]);
   const select = useDelegation((state) => state.select);
+  const loadTranscript = useDelegation((state) => state.loadTranscript);
   const stop = useDelegation((state) => state.stop);
   const retry = useDelegation((state) => state.retry);
   const rows = transcript.map((message) =>
@@ -44,14 +41,35 @@ export function AgentRunDetail({
     ),
   );
   const active = activeStatuses.has(run.status);
+  const duration = formatAgentRunDuration(run);
+  const status = agentRunStatusPresentation(run.status);
 
   return (
     <div className="min-h-0 flex flex-1 flex-col">
-      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
+      <header className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border px-3 py-2">
         <Button variant="ghost" size="sm" aria-label="Back to Agents" onClick={() => select(runnerId, sessionPk, null)} className="-ml-1">
           <ArrowLeft aria-hidden size={14} /> Back to Agents
         </Button>
-        <span className="min-w-0 flex-1 truncate font-medium">{run.executingAgentNameSnapshot}</span>
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <div
+            role="img"
+            aria-label={`Agent avatar for ${run.executingAgentNameSnapshot}`}
+            className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground"
+          >
+            <Bot aria-hidden size={13} />
+          </div>
+          <span className="min-w-0 truncate font-medium">{run.executingAgentNameSnapshot}</span>
+        </div>
+        <div className="order-3 flex w-full flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+          <span>{kindLabel(run)}</span>
+          <span className={`font-medium ${status.tone}`}>{status.label}</span>
+          <span>
+            {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
+          </span>
+          {duration && <span>{duration}</span>}
+          {run.resolvedModel && <span>{run.resolvedModel}</span>}
+          {run.resolvedEffort && <span>{run.resolvedEffort}</span>}
+        </div>
         {active && (
           <Button variant="ghost" size="sm" onClick={() => void stop(runnerId, sessionPk, run.runId)} className="text-destructive">
             <Square aria-hidden size={13} /> Stop
@@ -66,20 +84,6 @@ export function AgentRunDetail({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="border-b border-border px-4 py-3">
           <h3 className="text-[13px] font-medium">{run.task}</h3>
-          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-            <span className="capitalize">{run.status}</span>
-            <span>{run.agentKind === "subagent" ? "Subagent" : "Main agent"}</span>
-            <span>
-              {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
-            </span>
-            <span>{duration(run)}</span>
-            {run.resolvedModel && (
-              <span>
-                {run.resolvedModel}
-                {run.resolvedEffort ? ` · ${run.resolvedEffort}` : ""}
-              </span>
-            )}
-          </div>
           {run.error && <p className="mb-0 mt-2 text-[12px] text-destructive">{run.error}</p>}
           {run.result && (
             <div className="mt-3 rounded-md border border-border bg-muted/30 p-2.5">
@@ -101,6 +105,22 @@ export function AgentRunDetail({
             <Waypoints aria-hidden size={13} /> Related changes
           </Button>
         </div>
+        {transcriptState?.status === "error" && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-2 border-b border-destructive/30 bg-destructive/5 px-4 py-2 text-[12px] text-destructive"
+          >
+            <span>{transcriptState.error ?? "Could not load transcript."}</span>
+            <Button
+              variant="ghost"
+              size="xs"
+              onClick={() => void loadTranscript(runnerId, sessionPk, run.runId)}
+              className="text-destructive"
+            >
+              Retry transcript
+            </Button>
+          </div>
+        )}
         <div className="min-h-[240px]">
           <Transcript
             runnerId={runnerId}
@@ -109,6 +129,7 @@ export function AgentRunDetail({
             agentName={run.executingAgentNameSnapshot}
             agentColor="#6b7280"
             running={active}
+            ownerRunId={run.runId}
             approvalRunId={run.runId}
           />
         </div>

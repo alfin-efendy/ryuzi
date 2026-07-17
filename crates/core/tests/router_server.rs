@@ -5,6 +5,30 @@ use ryuzi_core::Store;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Register `custom-openai`/`custom-anthropic` as user custom providers so the
+/// router resolves their wire format/auth exactly as the (now-removed) static
+/// catalog entries did: OpenAI/Bearer and Anthropic/x-api-key, base-URL-driven.
+/// Idempotent; safe to call from every test setup path.
+fn register_custom_test_providers() {
+    use ryuzi_core::llm_router::custom::{register, CustomProvider};
+    register(&CustomProvider {
+        id: "custom-openai".into(),
+        name: "Custom (OpenAI-compatible)".into(),
+        format: "openai".into(),
+        color: "#8B8B8B".into(),
+        initial: "C".into(),
+        created_at: 0,
+    });
+    register(&CustomProvider {
+        id: "custom-anthropic".into(),
+        name: "Custom (Anthropic-compatible)".into(),
+        format: "anthropic".into(),
+        color: "#8B8B8B".into(),
+        initial: "C".into(),
+        created_at: 0,
+    });
+}
+
 async fn mock_openai_upstream() -> (u16, tokio::task::JoinHandle<()>) {
     use axum::body::Body;
     use axum::http::header;
@@ -95,6 +119,7 @@ async fn setup() -> (Arc<Store>, String, u16) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let (_, path) = tmp.keep().unwrap();
     let store = Arc::new(Store::open(&path).await.unwrap());
+    register_custom_test_providers();
     let (up_port, _h) = mock_openai_upstream().await;
     connections::add_connection(
         &store,
@@ -133,6 +158,7 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let (_, path) = tmp.keep().unwrap();
     let store = Arc::new(Store::open(&path).await.unwrap());
+    register_custom_test_providers();
     let (up_port, _h1) = mock_openai_upstream().await;
     let (anthropic_port, _h2) = mock_anthropic_upstream().await;
     connections::add_connection(
@@ -558,6 +584,7 @@ async fn mock_truncating_openai_upstream() -> (u16, tokio::task::JoinHandle<()>)
 async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    register_custom_test_providers();
     let (up_port, _h) = mock_truncating_openai_upstream().await;
     // custom-openai connection pointing at the truncating mock
     connections::add_connection(
@@ -648,6 +675,7 @@ async fn mock_clean_eof_no_terminal_openai_upstream() -> (u16, tokio::task::Join
 async fn anthropic_client_gets_error_frame_on_clean_eof_before_terminal() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    register_custom_test_providers();
     let (up_port, _h) = mock_clean_eof_no_terminal_openai_upstream().await;
     connections::add_connection(
         &store,
@@ -1828,6 +1856,7 @@ async fn openai_target_gets_max_completion_tokens_while_custom_openai_keeps_max_
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let (_, path) = tmp.keep().unwrap();
     let store = Arc::new(Store::open(&path).await.unwrap());
+    register_custom_test_providers();
     connections::add_connection(
         &store,
         connections::ConnectionRow {
@@ -1944,6 +1973,7 @@ async fn responses_endpoint_applies_max_completion_tokens_for_openai_target() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let (_, path) = tmp.keep().unwrap();
     let store = Arc::new(Store::open(&path).await.unwrap());
+    register_custom_test_providers();
     connections::add_connection(
         &store,
         connections::ConnectionRow {

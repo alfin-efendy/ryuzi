@@ -485,6 +485,104 @@ pub async fn add_free_connection(
         .await
 }
 
+/// The explicit "installed providers" set gates the Models list. These proxy
+/// the engine RPCs; the set is visibility-only and independent of connections.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_installed_providers(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("list_installed_providers", serde_json::json!({}))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn install_provider(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    family: String,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("install_provider", serde_json::json!({ "family": family }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn uninstall_provider(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    family: String,
+) -> R<Vec<String>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "uninstall_provider",
+            serde_json::json!({ "family": family }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_custom_providers(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<Vec<ryuzi_core::llm_router::custom::CustomProvider>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("list_custom_providers", serde_json::json!({}))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn add_custom_provider(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    name: String,
+) -> R<Vec<ryuzi_core::llm_router::custom::CustomProvider>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("add_custom_provider", serde_json::json!({ "name": name }))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_custom_provider_format(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    format: String,
+) -> R<Vec<ryuzi_core::llm_router::custom::CustomProvider>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "set_custom_provider_format",
+            serde_json::json!({ "id": id, "format": format }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_custom_provider(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<Vec<ryuzi_core::llm_router::custom::CustomProvider>> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("remove_custom_provider", serde_json::json!({ "id": id }))
+        .await
+}
+
 /// Start Kiro's AWS SSO-OIDC device-code flow: registers a public client,
 /// starts a device authorization, opens the browser to the verification URL,
 /// and stashes the in-flight state under a fresh `flow_id` for

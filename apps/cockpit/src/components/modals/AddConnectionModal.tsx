@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { useConnections } from "@/store-connections";
 import { events, type CatalogEntry, type DeviceFlowInfo } from "@/bindings";
 import { Chip } from "@/components/common/bits";
-import { Button, ChoiceCard, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
+import { Button, ChoiceCard, Combobox, FormField, Input, Modal, ModalBody, ModalFooter, ModalHeader, RadioGroup } from "@ryuzi/ui";
 import {
   DEVICE_SIGNIN_ACTION,
   KIRO_DEVICE_CODE_HINT,
@@ -21,13 +21,23 @@ import { usesDeviceSignin } from "./deviceSignin";
 type DeviceStep = "form" | "waiting";
 type SignInFlow = "device" | "oauth" | "apiKey" | "free";
 
-const SUBSCRIPTION_LABELS: Record<string, string> = {
-  "anthropic-oauth": "Claude subscription",
-  "openai-oauth": "ChatGPT subscription",
-};
-
 const BASE_URL_PLACEHOLDERS: Record<string, string> = {
   "cloudflare-ai": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+};
+
+type MimoRegion = { id: string; label: string; baseUrl: string };
+// The MiMo Token Plan is region-specific: the picker sets the connection's
+// base_url_override to the chosen cluster host (sgp is the default).
+const MIMO_REGIONS: MimoRegion[] = [
+  { id: "sgp", label: "Singapore (sgp)", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1" },
+  { id: "cn", label: "China (cn)", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
+  { id: "ams", label: "Amsterdam (ams)", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1" },
+];
+
+/** Where to obtain the subscription credential, by member id. */
+const KEY_SOURCE_HINTS: Record<string, string> = {
+  mimo: "Get a Token Plan key (starts with tp-) at mimo.xiaomi.com.",
+  opencode: "Get a Go plan key at opencode.ai/auth.",
 };
 
 function signInFlow(entry: CatalogEntry): SignInFlow {
@@ -42,22 +52,39 @@ function authMethodLabel(entry: CatalogEntry): string {
     case "device":
       return "Device sign-in";
     case "oauth":
-      return SUBSCRIPTION_LABELS[entry.id] ?? "Subscription";
+      return "Subscription";
     case "free":
       return "Free tier";
     case "apiKey":
-      return "API key";
+      // An API-key member that joins another family's head (its id differs from
+      // its family) is a paid upgrade to that free tier — a "Subscription"
+      // (e.g. MiMo Token Plan, OpenCode Go). Standalone API-key providers, whose
+      // id equals their family, keep the plain "API Key" label.
+      return entry.id !== entry.family ? "Subscription" : "API Key";
   }
 }
 
 export function AddConnectionModal({ open, onClose, family }: { open: boolean; onClose: () => void; family: string }) {
-  const { catalog, add, connectOauth, addFree, startKiroDevice, awaitKiroDevice, importKiro, startDeviceFlow, awaitDeviceFlow } =
-    useConnections();
+  const {
+    catalog,
+    add,
+    connectOauth,
+    addFree,
+    setCustomProviderFormat,
+    startKiroDevice,
+    awaitKiroDevice,
+    importKiro,
+    startDeviceFlow,
+    awaitDeviceFlow,
+  } = useConnections();
   const members = useMemo(() => catalog.filter((entry) => entry.family === family), [catalog, family]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  // OpenAI-/Anthropic-compatible choice for custom providers (chosen per
+  // account and persisted onto the provider before the connection is added).
+  const [compat, setCompat] = useState<"openai" | "anthropic">("openai");
   const [saving, setSaving] = useState(false);
   const [oauthWaiting, setOauthWaiting] = useState(false);
   const [oauthAuthorizeUrl, setOauthAuthorizeUrl] = useState("");
@@ -79,7 +106,11 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
       setSelectedId(null);
       setLabel("");
       setApiKey("");
-      setBaseUrl("");
+      // The default-selected member (api-key member, else the first) drives the
+      // initial base URL; MiMo's Token Plan defaults to its sgp region host.
+      const defaultMember = members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
+      setBaseUrl(defaultMember?.id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
+      setCompat((defaultMember?.format as "openai" | "anthropic") ?? "openai");
       setSaving(false);
       setOauthWaiting(false);
       setOauthAuthorizeUrl("");
@@ -135,6 +166,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
   };
 
   const flow = selected ? signInFlow(selected) : null;
+  const isCustom = selected?.id.startsWith("custom-") ?? false;
   const baseUrlMissing = flow === "apiKey" && !!selected?.requiresBaseUrl && baseUrl.trim().length === 0;
   const canSubmit = !!selected && !saving && !baseUrlMissing;
   const shortCommitBusy = saving && (flow === "apiKey" || flow === "free");
@@ -143,6 +175,8 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     if (shortCommitBusy || id === selected?.id) return;
     operationRef.current += 1;
     setSelectedId(id);
+    setBaseUrl(id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
+    setCompat((members.find((entry) => entry.id === id)?.format as "openai" | "anthropic") ?? "openai");
     setSaving(false);
     setOauthWaiting(false);
     setOauthAuthorizeUrl("");
@@ -155,6 +189,11 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     const target = selected;
     const operation = beginOperation();
     setSaving(true);
+    // Persist the OpenAI-/Anthropic-compatible choice onto the custom provider
+    // (re-registers its wire format/auth) before the connection is added.
+    if (isCustom && compat !== target.format) {
+      await setCustomProviderFormat(target.id, compat);
+    }
     const ok = await add(target.id, label.trim() || target.name, apiKey, baseUrl.trim() || null);
     if (!operationIsCurrent(operation)) return;
     setSaving(false);
@@ -331,26 +370,51 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             </FormField>
             {flow === "apiKey" && (
               <>
-                <FormField label="API key">
+                {isCustom && (
+                  <RadioGroup
+                    aria-label="Compatibility"
+                    value={compat}
+                    onValueChange={(value) => setCompat(value as "openai" | "anthropic")}
+                    className="grid-cols-2"
+                  >
+                    <ChoiceCard value="openai" title="OpenAI-compatible" description="/chat/completions, Bearer key" />
+                    <ChoiceCard value="anthropic" title="Anthropic-compatible" description="/messages, x-api-key" />
+                  </RadioGroup>
+                )}
+                {KEY_SOURCE_HINTS[selected.id] && <p className="text-xs text-muted-foreground">{KEY_SOURCE_HINTS[selected.id]}</p>}
+                <FormField label="API Key">
                   <Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-..." />
                 </FormField>
-                <FormField
-                  label={
-                    selected.requiresBaseUrl ? (
-                      "Base URL"
-                    ) : (
-                      <>
-                        Base URL override<span className="font-normal text-muted-foreground"> - optional</span>
-                      </>
-                    )
-                  }
-                >
-                  <Input
-                    value={baseUrl}
-                    onChange={(event) => setBaseUrl(event.target.value)}
-                    placeholder={BASE_URL_PLACEHOLDERS[selected.id] ?? "https://host/v1"}
-                  />
-                </FormField>
+                {selected.id === "mimo" ? (
+                  <FormField label="Region">
+                    <Combobox
+                      aria-label="Region"
+                      value={MIMO_REGIONS.find((region) => region.baseUrl === baseUrl)?.id ?? MIMO_REGIONS[0].id}
+                      onValueChange={(regionId) =>
+                        setBaseUrl(MIMO_REGIONS.find((region) => region.id === regionId)?.baseUrl ?? MIMO_REGIONS[0].baseUrl)
+                      }
+                      options={MIMO_REGIONS.map((region) => ({ value: region.id, label: region.label }))}
+                    />
+                  </FormField>
+                ) : (
+                  <FormField
+                    label={
+                      selected.requiresBaseUrl ? (
+                        "Base URL"
+                      ) : (
+                        <>
+                          Base URL override<span className="font-normal text-muted-foreground"> - optional</span>
+                        </>
+                      )
+                    }
+                  >
+                    <Input
+                      value={baseUrl}
+                      onChange={(event) => setBaseUrl(event.target.value)}
+                      placeholder={BASE_URL_PLACEHOLDERS[selected.id] ?? "https://host/v1"}
+                    />
+                  </FormField>
+                )}
               </>
             )}
           </div>

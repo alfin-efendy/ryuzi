@@ -599,8 +599,8 @@ x_vendor: { enabled: true }
     #[test]
     fn route_model_rejects_effort_and_both_union_arms() {
         for raw in [
-            "schema_version: 1\nmodel: { route: smart, effort: high }\n",
-            "schema_version: 1\nmodel: { route: smart, name: openai/gpt-5 }\n",
+            "schema_version: 1\nmodel: { route: free, effort: high }\n",
+            "schema_version: 1\nmodel: { route: free, name: openai/gpt-5 }\n",
         ] {
             assert!(parse_subagent_config(raw).is_err(), "accepted {raw}");
         }
@@ -622,7 +622,7 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
         let mut doc = parse_agent_profile_document(raw).unwrap();
         let mut typed = doc.typed().clone();
         typed.model = AgentModel::Route {
-            route: "smart".into(),
+            route: "free".into(),
         };
         doc.merge_typed(typed);
         let rendered = render_agent_profile_document(&doc).unwrap();
@@ -630,7 +630,7 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
         assert_eq!(
             reparsed.typed().model,
             AgentModel::Route {
-                route: "smart".into()
+                route: "free".into()
             }
         );
         assert_eq!(reparsed.extensions()["model"]["x_model"], "keep");
@@ -659,7 +659,7 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
     #[test]
     fn merge_typed_subagent_route_to_concrete_renders_reparseable_yaml() {
         let mut doc =
-            parse_subagent_config_document("schema_version: 1\nmodel: { route: smart }\n").unwrap();
+            parse_subagent_config_document("schema_version: 1\nmodel: { route: free }\n").unwrap();
         let mut typed = doc.typed().clone();
         typed.model = AgentModel::Concrete {
             name: "anthropic/claude-opus-4-8".into(),

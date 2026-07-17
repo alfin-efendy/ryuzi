@@ -16,6 +16,7 @@ import { AddConnectionModal } from "@/components/modals/AddConnectionModal";
 import { InstallWizardModal } from "@/components/modals/InstallWizardModal";
 import { SkillInstallModal } from "@/components/modals/SkillInstallModal";
 import { useNav } from "@/store-nav";
+import { useConnections } from "@/store-connections";
 
 const WARN = "#F59E0B";
 
@@ -170,6 +171,7 @@ export function PluginsView() {
     catalogStatus,
     refreshCatalog,
   } = usePlugins();
+  const { installProvider, uninstallProvider } = useConnections();
   const skills = useSkills((s) => s.skills);
   const skillsLoading = useSkills((s) => s.loading);
   const refreshSkills = useSkills((s) => s.refresh);
@@ -214,7 +216,10 @@ export function PluginsView() {
   const startInstall = (plugin: PluginInfo) => {
     if (installBusy) return;
     if (plugin.kind === "provider") {
-      setConnectingFamily(plugin.family ?? plugin.id);
+      // Providers install into the persisted set (visibility only); adding an
+      // account is a separate step from the provider's detail view. Re-fetch
+      // the plugins list so the card moves from Browse to Installed.
+      void installProvider(plugin.family ?? plugin.id).then((ok) => ok && void loadPlugins());
     } else if (plugin.kind === "skill-pack") {
       // Curated catalog packs resolve `completed: true` immediately; the
       // trust step only ever shows up for arbitrary sources (see
@@ -235,6 +240,12 @@ export function PluginsView() {
   };
 
   const uninstallPlugin = (plugin: PluginInfo) => {
+    if (plugin.kind === "provider") {
+      // Uninstalling a provider only removes it from the installed set; its
+      // connections stay intact. Re-fetch so the card returns to Browse.
+      void uninstallProvider(plugin.family ?? plugin.id).then((ok) => ok && void loadPlugins());
+      return;
+    }
     // `uninstall` already swaps in the fresh plugins list from the command,
     // so the Installed/Browse grids reconcile on their own. The extra
     // `refreshSkills` is only to update the manual "Skill sources" card,

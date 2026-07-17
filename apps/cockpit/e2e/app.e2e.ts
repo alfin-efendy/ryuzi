@@ -1,7 +1,44 @@
 import { expect, test } from "@playwright/test";
-import { ACCOUNT_CATALOG, ACCOUNT_CONNECTIONS, installMockIPC, mockCalls, PROVIDER_FAMILY_ROUTE_SELECTIONS } from "./mock-ipc";
+import type { AgentMention, AgentRun, AgentRunRosterInfo, CoreEvent, Message } from "../src/bindings";
+import {
+  ACCOUNT_CATALOG,
+  ACCOUNT_CONNECTIONS,
+  DELEGATE_ACTIVE_RUN,
+  DELEGATE_DONE_RUN,
+  DELEGATION_PARENT_MESSAGE,
+  DELETED_OWNER_MESSAGE,
+  DELETED_OWNER_SESSION,
+  installMockIPC,
+  LEGACY_MESSAGE,
+  LEGACY_SESSION,
+  mockCalls,
+  PROVIDER_FAMILY_ROUTE_SELECTIONS,
+  REGISTRY_WITHOUT_REVIEWER,
+  REVIEWER_CHILD_TRANSCRIPT,
+  SESSION,
+} from "./mock-ipc";
 
 test.beforeEach(async ({ page }, testInfo) => {
+  const dispatchOverrides = testInfo.title.startsWith("agent dispatch:")
+    ? {
+        list_sessions: [dispatchSession],
+        list_messages: [dispatchToolRow()],
+        agentRunRoster: roster([
+          childRun(testInfo.title.includes("retry") ? { status: "failed", error: "The fixture worker timed out.", finishedAt: 3_000 } : {}),
+        ]),
+        childMessages: testInfo.title.includes("retry")
+          ? {
+              [childRunId]: [
+                {
+                  ...childTextRow(),
+                  payload: { text: "The first attempt exceeded its timeout." },
+                },
+              ],
+            }
+          : { [childRunId]: [] },
+        retryChildMessages: testInfo.title.includes("retry") ? { [childRunId]: [retryChildTextRow()] } : {},
+      }
+    : {};
   const accountOverrides = testInfo.title.startsWith("accounts:")
     ? {
         list_provider_catalog: ACCOUNT_CATALOG,
@@ -10,11 +47,28 @@ test.beforeEach(async ({ page }, testInfo) => {
         ...(testInfo.title.includes("late quota") ? { delayed_quota: "codex-primary" } : {}),
       }
     : {};
+  const delegationOverrides = testInfo.title.startsWith("delegation:")
+    ? {
+        agentRunRoster: { rootRunId: null, runs: [DELEGATE_ACTIVE_RUN, DELEGATE_DONE_RUN] },
+        childMessages: { [DELEGATE_ACTIVE_RUN.runId]: REVIEWER_CHILD_TRANSCRIPT },
+        list_messages: [DELEGATION_PARENT_MESSAGE],
+      }
+    : {};
+  const historyOverrides = testInfo.title.startsWith("history:")
+    ? {
+        list_agents: REGISTRY_WITHOUT_REVIEWER,
+        list_sessions: [LEGACY_SESSION, DELETED_OWNER_SESSION],
+        list_messages: [LEGACY_MESSAGE, DELETED_OWNER_MESSAGE],
+      }
+    : {};
   await installMockIPC(page, {
     ...(testInfo.title === "resolved provider and family changes are durable identity changes"
       ? { route_selections: PROVIDER_FAMILY_ROUTE_SELECTIONS }
       : {}),
     ...accountOverrides,
+    ...dispatchOverrides,
+    ...delegationOverrides,
+    ...historyOverrides,
   });
 });
 
@@ -27,6 +81,254 @@ async function selectDemoProject(page: import("@playwright/test").Page) {
   await page.getByRole("combobox", { name: "Project" }).click();
   await page.getByRole("option", { name: /demo/ }).click();
 }
+
+const dispatchSession = { ...SESSION, sessionPk: "dispatch-session", title: "Dispatch lifecycle", status: "running" as const };
+const rootRunId = "primary-dispatch-run";
+const dispatchToolCallId = "dispatch-tool-call";
+const childRunId = "release-scout-run";
+const retryRunId = `${childRunId}-retry`;
+const childPreviewText = "Child found the release script.";
+const retryTranscriptText = "The replacement attempt is checking the release checklist from the beginning.";
+const terminalResult = "Release checklist is ready for review.";
+
+function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
+  return {
+    runId: childRunId,
+    sessionPk: dispatchSession.sessionPk,
+    parentRunId: rootRunId,
+    retryOf: null,
+    sourceToolCallId: dispatchToolCallId,
+    dispatchIndex: 0,
+    primaryAgentId: "ryuzi",
+    executingAgentId: "release-scout",
+    executingAgentNameSnapshot: "Release Scout",
+    agentKind: "subagent",
+    task: "Inspect the release checklist",
+    status: "queued",
+    startedAt: null,
+    finishedAt: null,
+    toolCount: 0,
+    resolvedModel: "fixture/model-alpha",
+    resolvedEffort: "medium",
+    result: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+function dispatchToolRow(): Message {
+  return {
+    sessionPk: dispatchSession.sessionPk,
+    seq: 1,
+    role: "assistant",
+    blockType: "tool_call",
+    payload: { name: "task", input: { prompt: "Inspect the release checklist" } },
+    toolCallId: dispatchToolCallId,
+    status: "in_progress",
+    toolKind: "task",
+    createdAt: 1_000,
+    speaker: null,
+  };
+}
+
+function roster(runs: AgentRun[]): AgentRunRosterInfo {
+  return { rootRunId, runs };
+}
+
+function childToolRow(): Message {
+  return {
+    sessionPk: dispatchSession.sessionPk,
+    seq: 1,
+    role: "assistant",
+    blockType: "tool_call",
+    payload: { name: "read", input: { path: "package.json" } },
+    toolCallId: "release-scout-read-package",
+    status: "completed",
+    toolKind: "read",
+    createdAt: 2_000,
+    speaker: null,
+  };
+}
+
+function childTextRow(): Message {
+  return {
+    sessionPk: dispatchSession.sessionPk,
+    seq: 2,
+    role: "assistant",
+    blockType: "text",
+    payload: { text: childPreviewText },
+    toolCallId: null,
+    status: null,
+    toolKind: null,
+    createdAt: 2_100,
+    speaker: null,
+  };
+}
+
+function retryChildTextRow(): Message {
+  return {
+    ...childTextRow(),
+    seq: 1,
+    payload: { text: retryTranscriptText },
+    createdAt: 2_200,
+  };
+}
+
+type MockCoreEventInput = {
+  event: CoreEvent;
+  roster?: AgentRunRosterInfo;
+  childMessage?: { runId: string; message: Message };
+};
+
+async function emitMockCoreEvent(page: import("@playwright/test").Page, input: MockCoreEventInput): Promise<void> {
+  await page.evaluate((payload) => {
+    (window as unknown as { __emitMockCoreEvent: (input: MockCoreEventInput) => void }).__emitMockCoreEvent(payload);
+  }, input);
+}
+
+function selectedAgentRunDetail(page: import("@playwright/test").Page) {
+  return page.getByRole("button", { name: "Back to Agents" }).locator("xpath=../..");
+}
+
+test("agent dispatch: lifecycle cards hydrate, stream, complete, and reload", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+
+  const card = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText("Queued");
+  await expect(page.getByText("task", { exact: true })).toHaveCount(0);
+
+  const runningRun = childRun({ status: "running", startedAt: 2_000 });
+  await emitMockCoreEvent(page, {
+    roster: roster([runningRun]),
+    event: {
+      kind: "agentRunChanged",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      parent_run_id: rootRunId,
+      status: "running",
+    },
+  });
+  await expect(card).toContainText("Running");
+
+  await emitMockCoreEvent(page, {
+    childMessage: { runId: childRunId, message: childToolRow() },
+    event: {
+      kind: "agentRunMessage",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      seq: 1,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: childToolRow().payload,
+      tool_call_id: childToolRow().toolCallId,
+      status: childToolRow().status,
+      tool_kind: childToolRow().toolKind,
+      speaker: null,
+    },
+  });
+  await emitMockCoreEvent(page, {
+    childMessage: { runId: childRunId, message: childTextRow() },
+    event: {
+      kind: "agentRunMessage",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      seq: 2,
+      role: "assistant",
+      block_type: "text",
+      payload: childTextRow().payload,
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+      speaker: null,
+    },
+  });
+
+  await expect(card).toContainText("read · package.json");
+  await expect(card).toContainText(childPreviewText);
+  await expect(page.getByText("read", { exact: true })).toHaveCount(0);
+
+  await card.click();
+  await expect(page.getByTestId("right-panel-header").getByRole("button", { name: "Agents" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back to Agents" })).toBeVisible();
+  await page.getByRole("button", { name: "See 1 step" }).click();
+  await expect(page.getByText("read", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("package.json", { exact: true })).toHaveCount(1);
+  await expect(page.getByText(childPreviewText, { exact: true })).toHaveCount(2);
+
+  const completedRun = childRun({ status: "completed", startedAt: 2_000, finishedAt: 4_000, result: terminalResult, toolCount: 1 });
+  await emitMockCoreEvent(page, {
+    roster: roster([completedRun]),
+    event: {
+      kind: "agentRunChanged",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      parent_run_id: rootRunId,
+      status: "completed",
+    },
+  });
+  await expect(card).toContainText(terminalResult);
+
+  await page.reload();
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+  const rehydratedCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(rehydratedCard).toHaveCount(1);
+  await expect(rehydratedCard).toContainText("Completed");
+  await expect(rehydratedCard).toContainText(terminalResult);
+  await rehydratedCard.click();
+  await expect(page.getByText(terminalResult, { exact: true }).last()).toBeVisible();
+  await expect(page.getByText(childPreviewText, { exact: true }).last()).toBeVisible();
+});
+
+test("agent dispatch: retry keeps one card slot and both durable attempts", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+
+  const initialCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(initialCard).toHaveCount(1);
+  await initialCard.click();
+  await expect(page.getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
+  await page.getByRole("button", { name: "Retry" }).click();
+
+  const retryCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(retryCard).toHaveCount(1);
+  await expect(retryCard).toContainText("Queued");
+  await expect(retryCard).toContainText("Retry 2");
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "retry_child_run").at(-1)?.args)
+    .toMatchObject({
+      runId: childRunId,
+    });
+
+  await page.reload();
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+  const rehydratedCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(rehydratedCard).toHaveCount(1);
+  await expect(rehydratedCard).toContainText("Queued");
+  await expect(rehydratedCard).toContainText("Retry 2");
+  await rehydratedCard.click();
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await expect(page.getByText("Done (1)", { exact: true })).toBeVisible();
+  await expect(page.getByText("Active (1)", { exact: true })).toBeVisible();
+  const activeRoster = page.getByText("Active (1)", { exact: true }).locator("xpath=..");
+  const doneRoster = page.getByText("Done (1)", { exact: true }).locator("xpath=..");
+  await expect(activeRoster.getByText("Release Scout", { exact: true })).toHaveCount(1);
+  await expect(doneRoster.getByText("Release Scout", { exact: true })).toHaveCount(1);
+  await activeRoster.getByText("Release Scout", { exact: true }).click();
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await doneRoster.getByText("Release Scout", { exact: true }).click();
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(0);
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "get_child_transcript").map((call) => call.args?.runId))
+    .toEqual(expect.arrayContaining([childRunId, retryRunId]));
+});
 
 test("boots to Home with the project loaded", async ({ page }) => {
   await page.goto("/");
@@ -59,7 +361,7 @@ test("sidebar navigation leaves the Home view", async ({ page }) => {
     await page.getByText(label, { exact: true }).first().click();
     await expect(homeHeading).toHaveCount(0);
     // back to Home for the next iteration
-    await page.getByText("New session", { exact: true }).first().click();
+    await page.getByText("New Task", { exact: true }).first().click();
     await expect(homeHeading).toBeVisible();
   }
 });
@@ -271,4 +573,194 @@ test("accounts: late quota cannot repopulate an unmounted provider and reload st
   await page.reload();
   await openProvider(page, "Codex");
   await expect(page.getByRole("progressbar", { name: "Codex Primary Codex primary quota" })).toHaveAttribute("aria-valuenow", "20");
+});
+
+// --- Agentic journeys (Plans 3-5): agent management + start-chat, mention
+// delegation + child transcript, legacy/deleted read-only history, and the
+// Models route editor's per-target effort contract. Every substitution of a
+// stale brief string for the real UI element is called out inline.
+
+test("agents: manage a non-default agent and start a chat session for it", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Agents", { exact: true }).first().click();
+  await expect(page.getByText("Main Agent", { exact: true })).toBeVisible();
+  await expect(page.getByText("Sub Agent", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open Reviewer" }).click();
+  const tabs = page.getByTestId("agent-detail-tabs");
+  for (const label of ["Overview", "Model", "Permissions", "Skills & Tools", "Learning", "Advanced"]) {
+    await expect(tabs.getByText(label, { exact: true })).toBeVisible();
+  }
+
+  // Only the action menu drives "Start chat" — no separate start button.
+  await page.getByRole("button", { name: "Actions for Reviewer" }).click();
+  await page.getByTestId("agent-actions-panel").getByRole("button", { name: "Start chat" }).click();
+  await expect(page.getByRole("heading", { name: /What should we build/ })).toBeVisible();
+
+  // Substitution: the brief's "New session primary-agent combobox contains
+  // Reviewer" doesn't exist — HomeView.tsx has no primary-agent picker at
+  // all. openAgentChat records Reviewer via nav.pendingPrimaryAgentId
+  // (store-nav.ts), consumed by choosePrimaryAgent; the only observable proof
+  // is mentions.ts's matchMentionAgents excluding the CURRENT primary from
+  // @-suggestions. With Reviewer primary, "@" now offers Ryuzi, not Reviewer.
+  // "@" alone is ambiguous with composer-context.ts's file-reference query
+  // (an empty context query is falsy, so its early-return guard doesn't
+  // fire, and mentionMenuOpen requires contextQuery === null) — a query
+  // character disambiguates, matching how a real user would type it.
+  const composer = page.getByPlaceholder("Do anything");
+  await composer.fill("@Ry");
+  await expect(page.getByRole("menu")).toContainText("Ryuzi");
+  await expect(page.getByRole("menu")).not.toContainText("Reviewer");
+
+  // Substitution: "no model/effort/permission/Orchestrate control" — none of
+  // these exist anywhere in the Home composer (models are picked per-composer
+  // via the Project/Branch pickers only; ProjectSettingsModal.tsx explicitly
+  // dropped model/effort/permission fields). Asserted directly for drift.
+  await expect(page.getByText("Orchestrate", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /model/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /effort/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /permission/i })).toHaveCount(0);
+
+  await composer.fill("kick off the review");
+  await composer.press("Enter");
+
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
+  const start = (await mockCalls(page)).find((c) => c.cmd === "start_chat_session");
+  expect(start?.args).toMatchObject({ primaryAgentId: "reviewer", turn: { text: "kick off the review" } });
+});
+
+test("delegation: mention-selected child run opens its transcript and returns to the roster", async ({ page }) => {
+  await page.goto("/");
+  const homeComposer = page.getByPlaceholder("Do anything");
+  await homeComposer.fill("investigate the flaky test");
+  await homeComposer.press("Enter");
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "start_chat_session")).toBe(true);
+
+  // Stop the running turn so the follow-up send goes through continue_session
+  // (a running session's Enter/Send instead enqueues via ChatRequestOptions,
+  // which has no structured-mentions field — see SessionView.tsx's submit()).
+  await page.getByTitle("Stop").click();
+  await expect(page.getByTitle("Send")).toBeVisible();
+
+  // A freshly-started session's focusedSession is set directly by store.ts's
+  // start/startChat (not via the setFocused action), so hydrateTranscript
+  // never fires for it and the seeded parent message wouldn't load. Reload
+  // and reselect from the sidebar — same pattern as the existing "route
+  // switch notices" test — to force the real hydrate path.
+  await page.reload();
+  await page.getByText("Untitled session", { exact: true }).click();
+  await expect(page.getByText("Kicking off the review delegation.")).toBeVisible();
+
+  const sessionComposer = page.getByPlaceholder("Ask for follow-up changes");
+  await sessionComposer.fill("@Rev");
+  await expect(page.getByRole("menu")).toContainText("Reviewer");
+  await sessionComposer.press("Enter"); // keyboard-selects Reviewer (the only match)
+  await expect(sessionComposer).toHaveValue("@Reviewer ");
+  await page.getByTitle("Send").click();
+  await expect(page.getByTitle("Send")).toBeVisible();
+
+  // Real structured-mention shape confirmed against mentions.ts/bindings.ts's
+  // AgentMention — matches the brief's guess exactly, verified rather than
+  // assumed.
+  const expectedMention = { agentId: "reviewer", labelSnapshot: "Reviewer", startUtf16: 0, endUtf16: 9 } satisfies AgentMention;
+  await expect.poll(async () => (await mockCalls(page)).some((c) => c.cmd === "continue_session")).toBe(true);
+  const delegateCall = (await mockCalls(page)).find((c) => c.cmd === "continue_session");
+  const turn = delegateCall?.args?.turn as { mentions: AgentMention[] } | undefined;
+  expect(turn?.mentions).toEqual([expectedMention]);
+  expect((await mockCalls(page)).filter((c) => c.cmd === "continue_session")).toHaveLength(1);
+
+  // Substitution: the brief's "Active/Done tabs" are section headings inside
+  // AgentRunRoster.tsx, not tabs — "Active (N)" / "Done (N)" `<h3>`s.
+  await page.getByTitle("Toggle right panel").click();
+  await page.getByTestId("right-panel-header").getByRole("button", { name: "Agents", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Active (1)", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Done (1)", exact: true })).toBeVisible();
+  await expect(page.getByText("Main agent", { exact: true })).toBeVisible();
+  await expect(page.getByText("Subagent", { exact: true })).toBeVisible();
+
+  await page.getByText("Reviewer", { exact: true }).click();
+  await expect(page.getByText("Reviewing the diff for regressions now.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await expect(page.getByRole("heading", { name: "Active (1)", exact: true })).toBeVisible();
+  await expect(page.getByText("Kicking off the review delegation.")).toBeVisible();
+
+  expect((await mockCalls(page)).some((c) => c.cmd === "retry_child_run")).toBe(false);
+  expect((await mockCalls(page)).some((c) => c.cmd === "cancel_child_run")).toBe(false);
+});
+
+test("history: legacy and deleted-owner sessions stay read-only", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByText("Legacy history", { exact: true }).click();
+  // Substitution: "Legacy agent" / "Deleted" labels are derived through the
+  // real access logic (lib/session-primary.ts's sessionPrimaryLabel), not
+  // fixture-only display fields — a null primaryAgentSnapshot always renders
+  // "Legacy agent" regardless of registry contents.
+  await expect(page.getByText("Legacy agent", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("This is the preserved legacy transcript.")).toBeVisible();
+  await expect(page.getByPlaceholder("Legacy sessions are read-only.")).toBeDisabled();
+  await expect(page.getByTitle("Send")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Repair agent" })).toHaveCount(0);
+  await expect(page.getByTitle("Stop")).toHaveCount(0);
+  // No per-session model/effort/permission control exists in SessionView at
+  // all (models are chosen per-composer, not stored per session) — asserted
+  // directly rather than skipped.
+  await expect(page.getByRole("combobox", { name: /model/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /effort/i })).toHaveCount(0);
+  await expect(page.getByRole("combobox", { name: /permission/i })).toHaveCount(0);
+
+  await page.getByText("Deleted owner history", { exact: true }).click();
+  // sessionPrimaryLabel renders "<name> (Deleted)" as one string when the
+  // captured owner is absent from the live registry — REGISTRY_WITHOUT_REVIEWER
+  // makes "reviewer" genuinely absent, not a fixture-only deletion flag.
+  await expect(page.getByText("Reviewer (Deleted)", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("This is the preserved reviewer transcript.")).toBeVisible();
+  await expect(page.getByPlaceholder("The session’s primary agent was deleted, so this session is read-only.")).toBeDisabled();
+  await expect(page.getByTitle("Send")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Repair agent" })).toHaveCount(0);
+  await expect(page.getByTitle("Stop")).toHaveCount(0);
+
+  const calls = await mockCalls(page);
+  for (const forbidden of ["continue_session", "steer_session", "retry_child_run", "cancel_child_run"]) {
+    expect(calls.some((c) => c.cmd === forbidden)).toBe(false);
+  }
+});
+
+test("route effort: preserves an explicit override and clears it for effort-less targets", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Models", { exact: true }).first().click();
+  await page.getByRole("button", { name: "Route", exact: true }).click();
+
+  await page.getByRole("button", { name: "New route" }).click();
+  await page.getByPlaceholder("free").fill("smart-route");
+
+  const effortCombobox = page.getByRole("combobox", { name: "Target 1 effort", exact: true });
+  await expect(effortCombobox).toBeVisible();
+  await effortCombobox.click();
+  await page.getByRole("option", { name: "High", exact: true }).click();
+  await page.getByRole("button", { name: "Save route" }).click();
+  await expect(page.getByText(/High override/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "Target 1 effort", exact: true })).toContainText("High");
+
+  const targetPicker = page.getByRole("combobox", { name: "Target 1", exact: true });
+  await targetPicker.click();
+  await expect(page.getByRole("option", { name: "model-beta", exact: true })).toBeVisible();
+  const optionTexts = await page.getByRole("option").allTextContents();
+  expect(optionTexts.length).toBeGreaterThan(0);
+  for (const text of optionTexts) {
+    expect(text).not.toMatch(/-(high|medium|xhigh|low)$/i);
+  }
+  await page.getByRole("option", { name: "model-beta", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "Target 1 effort", exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Save route" }).click();
+  await expect(page.getByText(/override/)).toHaveCount(0);
+
+  const saves = (await mockCalls(page)).filter((c) => c.cmd === "save_model_route");
+  expect(saves).toHaveLength(2);
+  const savedRoute = saves[saves.length - 1]?.args?.route as { targets: Array<{ provider: string; model: string; effort: string | null }> };
+  expect(savedRoute.targets[0]).toMatchObject({ provider: "fixture", model: "model-beta", effort: null });
 });

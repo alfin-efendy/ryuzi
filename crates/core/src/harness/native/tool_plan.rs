@@ -1158,6 +1158,8 @@ mod tests {
                 session_pk: "plan-session".into(),
                 parent_run_id: None,
                 retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
                 primary_agent_id: "ada".into(),
                 executing_agent_id: Some("ada".into()),
                 executing_agent_name_snapshot: "Ada".into(),

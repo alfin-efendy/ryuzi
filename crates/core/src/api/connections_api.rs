@@ -55,6 +55,13 @@ pub(crate) const HANDLES: &[&str] = &[
     "reconnect_oauth",
     "complete_oauth_manual",
     "add_free_connection",
+    "list_installed_providers",
+    "install_provider",
+    "uninstall_provider",
+    "list_custom_providers",
+    "add_custom_provider",
+    "set_custom_provider_format",
+    "remove_custom_provider",
     "start_kiro_device_flow",
     "await_kiro_device_flow",
     "import_kiro_token",
@@ -187,6 +194,15 @@ struct AwaitDeviceFlowP {
     label: String,
     flow_id: String,
 }
+#[derive(Deserialize)]
+struct AddCustomProviderP {
+    name: String,
+}
+#[derive(Deserialize)]
+struct SetCustomProviderFormatP {
+    id: String,
+    format: String,
+}
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
@@ -285,6 +301,35 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "add_free_connection" => {
             let a: AddFreeConnectionP = params(p)?;
             ok(add_free_connection(cp, a.provider, a.label).await?)
+        }
+        "list_installed_providers" => {
+            ok(crate::llm_router::installed::list_installed_providers(cp.store()).await?)
+        }
+        "install_provider" => {
+            let a: FamilyP = params(p)?;
+            ok(crate::llm_router::installed::install_provider(cp.store(), &a.family).await?)
+        }
+        "uninstall_provider" => {
+            let a: FamilyP = params(p)?;
+            ok(crate::llm_router::installed::uninstall_provider(cp.store(), &a.family).await?)
+        }
+        "list_custom_providers" => {
+            ok(crate::llm_router::custom::list_custom_providers(cp.store()).await?)
+        }
+        "add_custom_provider" => {
+            let a: AddCustomProviderP = params(p)?;
+            ok(crate::llm_router::custom::add_custom_provider(cp.store(), &a.name).await?)
+        }
+        "set_custom_provider_format" => {
+            let a: SetCustomProviderFormatP = params(p)?;
+            ok(
+                crate::llm_router::custom::set_custom_provider_format(cp.store(), &a.id, &a.format)
+                    .await?,
+            )
+        }
+        "remove_custom_provider" => {
+            let a: IdP = params(p)?;
+            ok(crate::llm_router::custom::remove_custom_provider(cp.store(), &a.id).await?)
         }
         "start_kiro_device_flow" => ok(start_kiro_device_flow().await?),
         "await_kiro_device_flow" => {
@@ -1658,5 +1703,50 @@ mod tests {
         assert_eq!(disabled["enabled"], false);
         assert!(disabled.get("keyMasked").is_none());
         assert!(disabled.get("claudeCloaking").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn add_connection_accepts_the_subscription_members() {
+        // The MiMo Token Plan and OpenCode Go descriptors are `ApiKey`, so they
+        // skip add_connection's non-ApiKey "coming in a later phase" refusal.
+        let s = state().await;
+
+        let list = dispatch(
+            &s,
+            "add_connection",
+            json!({
+                "provider": "mimo", "label": "MiMo (Token Plan)",
+                "api_key": "tp-test",
+                "base_url": "https://token-plan-sgp.xiaomimimo.com/v1"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|connection| connection["provider"] == "mimo"),
+            "mimo subscription connection should be added"
+        );
+
+        let list = dispatch(
+            &s,
+            "add_connection",
+            json!({
+                "provider": "opencode", "label": "OpenCode (Go)",
+                "api_key": "sk-oc-test", "base_url": null
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|connection| connection["provider"] == "opencode"),
+            "opencode subscription connection should be added"
+        );
     }
 }

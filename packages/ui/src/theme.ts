@@ -53,9 +53,15 @@ export function resolveBackdropAttr(cap: BackdropCapability, transparency: boole
 
 export function applyBackdrop(cap: BackdropCapability, transparency: boolean): void {
   if (typeof document === "undefined") return;
+  const root = document.documentElement;
   const attr = resolveBackdropAttr(cap, transparency);
-  if (attr) document.documentElement.dataset.backdrop = attr;
-  else delete document.documentElement.dataset.backdrop;
+  if (attr) root.dataset.backdrop = attr;
+  else delete root.dataset.backdrop;
+  // Transparency off => fully solid surfaces: no OS backdrop and no wallpaper
+  // bleed. The transparent sidebar/main read the opaque acrylic overrides
+  // gated on this attribute instead of the green wallpaper showing through.
+  if (transparency) delete root.dataset.opaque;
+  else root.dataset.opaque = "";
 }
 
 export function applyTheme(mode: Mode, accent: Accent, systemAccentHex?: string | null): void {

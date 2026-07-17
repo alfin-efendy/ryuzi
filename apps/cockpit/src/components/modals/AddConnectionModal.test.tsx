@@ -5,12 +5,18 @@ import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
+const setCustomProviderFormat = mock((_runnerId: string, id: string, format: string) =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: [{ id, name: "Custom Test", format, color: "#8b8b8b", initial: "C", createdAt: 0 }],
+  }),
+);
 const listRuntimes = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const listSelectableModels = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const listAgents = mock(() =>
   Promise.resolve({
     status: "ok" as const,
-    data: { agents: [], defaultAgentId: "", recovery: [], subagentModel: { kind: "route" as const, route: "smart" } },
+    data: { agents: [], defaultAgentId: "", recovery: [], subagentModel: { kind: "route" as const, route: "free" } },
   }),
 );
 // refreshModelConfiguration() (fired after every successful account mutation)
@@ -27,7 +33,7 @@ const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string;
 });
 
 mock.module("@/bindings", () => ({
-  commands: { addConnection, connectOauth, listRuntimes, listSelectableModels, listAgents, projectRuntimeInfo },
+  commands: { addConnection, connectOauth, setCustomProviderFormat, listRuntimes, listSelectableModels, listAgents, projectRuntimeInfo },
   events: { oauthAuthorizeUrlMsg: { listen: listenOauthAuthorizeUrl } },
 }));
 
@@ -63,10 +69,10 @@ const claudeOauth: CatalogEntry = {
   riskNotice: false,
   usesDeviceGrant: false,
 };
-const customOpenAi: CatalogEntry = {
-  id: "custom-openai",
-  name: "Custom (OpenAI-compatible)",
-  family: "custom-openai",
+const customTest: CatalogEntry = {
+  id: "custom-test",
+  name: "Custom Test",
+  family: "custom-test",
   color: "#8b8b8b",
   initial: "C",
   category: "api_key",
@@ -91,11 +97,71 @@ const kiroProvider: CatalogEntry = {
   riskNotice: true,
   usesDeviceGrant: false,
 };
+const mimoFree: CatalogEntry = {
+  id: "mimo-free",
+  name: "MiMo (free)",
+  family: "mimo-free",
+  color: "#ff6900",
+  initial: "M",
+  category: "free",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: ["mimo-auto"],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+const mimo: CatalogEntry = {
+  id: "mimo",
+  name: "MiMo (Token Plan)",
+  family: "mimo-free",
+  color: "#ff6900",
+  initial: "M",
+  category: "api_key",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: ["mimo-v2.5-pro", "mimo-v2.5"],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+const opencodeFree: CatalogEntry = {
+  id: "opencode-free",
+  name: "OpenCode (free)",
+  family: "opencode-free",
+  color: "#f5a623",
+  initial: "OC",
+  category: "free",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: [],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
+const opencode: CatalogEntry = {
+  id: "opencode",
+  name: "OpenCode (Go)",
+  family: "opencode-free",
+  color: "#f5a623",
+  initial: "OC",
+  category: "api_key",
+  format: "openai",
+  requiresBaseUrl: false,
+  models: ["glm-5.2", "kimi-k2.7-code", "deepseek-v4-pro", "mimo-v2.5-pro"],
+  freeTier: false,
+  riskNotice: false,
+  usesDeviceGrant: false,
+};
 
 beforeEach(() => {
-  useConnections.setState({ catalog: [anthropic, claudeOauth, customOpenAi, kiroProvider], connections: [] });
+  useConnections.setState({
+    catalog: [anthropic, claudeOauth, customTest, kiroProvider, mimoFree, mimo, opencodeFree, opencode],
+    connections: [],
+  });
   addConnection.mockClear();
   connectOauth.mockClear();
+  setCustomProviderFormat.mockClear();
   listenOauthAuthorizeUrl.mockClear();
   oauthAuthorizeUrlListener = null;
 });
@@ -123,28 +189,70 @@ test("single-member family (kiro) goes straight to its device form, no chooser s
   expect(screen.getByLabelText("Label")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Sign in with Kiro" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Import from Kiro IDE" })).toBeTruthy();
-  expect(screen.queryByLabelText("API key")).toBeNull();
+  expect(screen.queryByLabelText("API Key")).toBeNull();
 });
 
-test("anthropic family offers API key vs Claude subscription, then the chosen form", () => {
+test("anthropic family offers API Key vs Subscription, then the chosen form", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
   expect(within(group).getByRole("radio", { name: /api key/i })).toBeTruthy();
-  expect(within(group).getByRole("radio", { name: /claude subscription/i })).toBeTruthy();
-  expect(screen.getByLabelText("API key", { selector: "input" })).toBeTruthy();
-  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  expect(within(group).getByRole("radio", { name: /subscription/i })).toBeTruthy();
+  expect(screen.getByLabelText("API Key", { selector: "input" })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
   expect(screen.getByRole("button", { name: /connect with browser/i })).toBeTruthy();
-  expect(screen.queryByLabelText("API key", { selector: "input" })).toBeNull();
+  expect(screen.queryByLabelText("API Key", { selector: "input" })).toBeNull();
 });
 
 test("submitting api key for anthropic family calls addConnection with the member id", async () => {
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.change(screen.getByLabelText("API key", { selector: "input" }), { target: { value: "sk-ant-test" } });
+  fireEvent.change(screen.getByLabelText("API Key", { selector: "input" }), { target: { value: "sk-ant-test" } });
   fireEvent.click(screen.getByRole("button", { name: "Add account" }));
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic", "Anthropic", "sk-ant-test", null);
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("mimo family offers Free tier vs Subscription and a region picker", async () => {
+  render(<AddConnectionModal open onClose={() => {}} family="mimo-free" />);
+  const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
+  expect(within(group).getByRole("radio", { name: /free tier/i })).toBeTruthy();
+  expect(within(group).getByRole("radio", { name: /subscription/i })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
+  expect(screen.getByLabelText("API Key", { selector: "input" })).toBeTruthy();
+  // The region picker is present for the MiMo Token Plan.
+  expect(screen.getByText(/region/i)).toBeTruthy();
+});
+
+test("submitting the mimo subscription sends the region base URL", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="mimo-free" />);
+  fireEvent.click(screen.getByRole("radio", { name: /subscription/i }));
+  fireEvent.change(screen.getByLabelText("API Key", { selector: "input" }), { target: { value: "tp-test" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  expect(addConnection).toHaveBeenCalledWith(
+    LOCAL_RUNNER,
+    "mimo",
+    "MiMo (Token Plan)",
+    "tp-test",
+    "https://token-plan-sgp.xiaomimimo.com/v1",
+  );
+});
+
+test("opencode subscription shows a key hint, no region picker, and sends its descriptor base URL", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="opencode-free" />);
+  const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
+  expect(within(group).getByRole("radio", { name: /free tier/i })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
+  expect(screen.getByText(/opencode\.ai\/auth/i)).toBeTruthy();
+  // OpenCode Go has no region picker — only a Base URL override field.
+  expect(screen.queryByText(/^Region$/)).toBeNull();
+  fireEvent.change(screen.getByLabelText("API Key", { selector: "input" }), { target: { value: "sk-oc" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode", "OpenCode (Go)", "sk-oc", null);
 });
 
 test("connecting subscription calls connectOauth with the oauth member id and tracks the authorize URL", async () => {
@@ -152,7 +260,7 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
   Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
-  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
   expect(connectOauth).toHaveBeenCalledWith(LOCAL_RUNNER, "anthropic-oauth", "Claude Code");
 
@@ -168,7 +276,7 @@ test("connecting subscription calls connectOauth with the oauth member id and tr
 test("switching auth method mid-flight clears the latched OAuth waiting state", () => {
   render(<AddConnectionModal open onClose={() => {}} family="anthropic" />);
   const group = screen.getByRole("radiogroup", { name: /sign-in method/i });
-  fireEvent.click(within(group).getByRole("radio", { name: /claude subscription/i }));
+  fireEvent.click(within(group).getByRole("radio", { name: /subscription/i }));
   fireEvent.click(screen.getByRole("button", { name: /connect with browser/i }));
   expect(connectOauth).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("button", { name: /connect with browser/i })).toBeNull();
@@ -176,20 +284,49 @@ test("switching auth method mid-flight clears the latched OAuth waiting state", 
   expect((screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
-test("single-member custom-openai family requires a base URL before it can be submitted", async () => {
+test("single-member custom family requires a base URL before it can be submitted", async () => {
   const onClose = mock(() => {});
-  render(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
+  render(<AddConnectionModal open onClose={onClose} family="custom-test" />);
   expect(screen.queryByRole("radiogroup", { name: /sign-in method/i })).toBeNull();
   const submit = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
   expect(submit.disabled).toBe(true);
   fireEvent.change(screen.getByLabelText("Label"), { target: { value: "Local router" } });
-  fireEvent.change(screen.getByLabelText("API key"), { target: { value: "sk-test-123" } });
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test-123" } });
   fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
   expect(submit.disabled).toBe(false);
   fireEvent.click(submit);
   await screen.findByText("Add account");
-  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("custom family offers the OpenAI/Anthropic compatibility choice and persists it before adding", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="custom-test" />);
+  const group = screen.getByRole("radiogroup", { name: /compatibility/i });
+  expect(within(group).getByRole("radio", { name: /openai-compatible/i })).toBeTruthy();
+  expect(within(group).getByRole("radio", { name: /anthropic-compatible/i })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /anthropic-compatible/i }));
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test" } });
+  fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  // Anthropic chosen → format persisted before the connection is created.
+  expect(setCustomProviderFormat).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "anthropic");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Custom Test", "sk-test", "http://127.0.0.1:4000/v1");
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("custom family with the default OpenAI choice does not re-persist the format", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="custom-test" />);
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test" } });
+  fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  // OpenAI is already the provider's format → no redundant set call.
+  expect(setCustomProviderFormat).not.toHaveBeenCalled();
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Custom Test", "sk-test", "http://127.0.0.1:4000/v1");
 });
 
 test("account methods are Choice Cards without category chips", () => {
@@ -197,7 +334,7 @@ test("account methods are Choice Cards without category chips", () => {
   expect(screen.getAllByRole("radio").length).toBeGreaterThan(1);
   const chooser = screen.getByRole("radiogroup", { name: "Sign-in method" });
   expect(within(chooser).queryByText(/^OAuth$/)).toBeNull();
-  expect(within(chooser).getAllByText(/^API key$/)).toHaveLength(1);
+  expect(within(chooser).getAllByText(/^API Key$/)).toHaveLength(1);
   const connect = screen.getByRole("button", { name: /Add account|Connect with browser/ });
   expect(connect.closest('[data-slot="modal-footer"]')).not.toBeNull();
   expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
@@ -213,7 +350,7 @@ test("closing a pending OAuth flow ignores its late completion", async () => {
   );
   const onClose = mock(() => {});
   render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
   await act(async () => {
@@ -232,12 +369,12 @@ test("external close and reopen invalidates a pending OAuth completion", async (
   );
   const onClose = mock(() => {});
   const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
 
   view.rerender(<AddConnectionModal open={false} onClose={onClose} family="anthropic" />);
   view.rerender(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  const currentApiKey = screen.getByLabelText("API key", { selector: "input" });
+  const currentApiKey = screen.getByLabelText("API Key", { selector: "input" });
   fireEvent.change(currentApiKey, { target: { value: "current-session-key" } });
 
   await act(async () => {
@@ -258,10 +395,10 @@ test("family transition invalidates a pending OAuth completion", async () => {
   );
   const onClose = mock(() => {});
   const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
 
-  view.rerender(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
+  view.rerender(<AddConnectionModal open onClose={onClose} family="custom-test" />);
   const currentLabel = screen.getByLabelText("Label");
   fireEvent.change(currentLabel, { target: { value: "Current family" } });
 
@@ -283,7 +420,7 @@ test("unmount invalidates a pending OAuth completion", async () => {
   );
   const onClose = mock(() => {});
   const view = render(<AddConnectionModal open onClose={onClose} family="anthropic" />);
-  fireEvent.click(screen.getByRole("radio", { name: /Claude subscription/ }));
+  fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
   view.unmount();
 
@@ -322,7 +459,7 @@ test("risk-notice providers show the account-suspension warning", () => {
 });
 
 test("no risk notice for ordinary providers", () => {
-  useConnections.setState({ catalog: [customOpenAi], connections: [], loaded: true });
-  render(<AddConnectionModal open onClose={() => {}} family="custom-openai" />);
+  useConnections.setState({ catalog: [customTest], connections: [], loaded: true });
+  render(<AddConnectionModal open onClose={() => {}} family="custom-test" />);
   expect(screen.queryByText(PROVIDER_RISK_NOTICE)).toBeNull();
 });

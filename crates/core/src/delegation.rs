@@ -12,12 +12,19 @@ pub const MAX_MAIN_DELEGATION_DEPTH: usize = 4;
 pub const MAX_ACTIVE_CHILD_RUNS: usize = 8;
 pub const RESTART_INTERRUPTION_REASON: &str = "Ryuzi restarted before this run completed.";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDispatchLink {
+    pub source_tool_call_id: String,
+    pub dispatch_index: i64,
+}
+
 pub struct MainDelegationRequest {
     pub parent_run_id: String,
     pub target_agent_id: String,
     pub task: String,
     pub context: Option<String>,
     pub background: bool,
+    pub dispatch: Option<AgentDispatchLink>,
 }
 
 pub struct SubagentRunRequest {
@@ -26,6 +33,7 @@ pub struct SubagentRunRequest {
     pub task: String,
     pub context: Option<String>,
     pub background: bool,
+    pub dispatch: Option<AgentDispatchLink>,
 }
 
 pub struct RunHandle {
@@ -93,15 +101,16 @@ impl DelegationRuntime {
         let _admission = self.admission.lock().await;
         let run = self
             .store
-            .insert_primary_agent_run(new_run(
+            .insert_primary_agent_run(new_run(NewRunArgs {
                 session_pk,
-                None,
-                None,
-                &snapshot.profile.id,
-                Some(&snapshot),
-                AgentRunKind::Primary,
+                parent_run_id: None,
+                retry_of: None,
+                primary_agent_id: &snapshot.profile.id,
+                snapshot: Some(&snapshot),
+                agent_kind: AgentRunKind::Primary,
                 task,
-            ))
+                dispatch: None,
+            }))
             .await?;
         Ok(self.register(run, Some(snapshot)).await)
     }
@@ -143,15 +152,16 @@ impl DelegationRuntime {
         self.ensure_capacity(&root).await?;
         let run = self
             .store
-            .insert_agent_run(new_run(
-                &parent.session_pk,
-                Some(&parent.run_id),
-                None,
-                &root.primary_agent_id,
-                Some(&target),
-                AgentRunKind::MainDelegate,
-                &request.task,
-            ))
+            .insert_agent_run(new_run(NewRunArgs {
+                session_pk: &parent.session_pk,
+                parent_run_id: Some(&parent.run_id),
+                retry_of: None,
+                primary_agent_id: &root.primary_agent_id,
+                snapshot: Some(&target),
+                agent_kind: AgentRunKind::MainDelegate,
+                task: &request.task,
+                dispatch: request.dispatch,
+            }))
             .await?;
         Ok(self.register(run, Some(target)).await)
     }
@@ -162,6 +172,10 @@ impl DelegationRuntime {
         let (parent, _, root) = self.tree(&request.parent_run_id).await?;
         self.ensure_capacity(&root).await?;
         let (resolved_model, resolved_effort) = model_parts(&subagents);
+        let (source_tool_call_id, dispatch_index) = request
+            .dispatch
+            .map(|link| (Some(link.source_tool_call_id), Some(link.dispatch_index)))
+            .unwrap_or((None, None));
         let run = self
             .store
             .insert_agent_run(NewAgentRun {
@@ -169,6 +183,8 @@ impl DelegationRuntime {
                 session_pk: parent.session_pk,
                 parent_run_id: Some(parent.run_id),
                 retry_of: None,
+                source_tool_call_id,
+                dispatch_index,
                 primary_agent_id: root.primary_agent_id,
                 executing_agent_id: None,
                 executing_agent_name_snapshot: request.subagent_type,
@@ -330,6 +346,15 @@ impl DelegationRuntime {
                 "only failed, cancelled, or interrupted child runs in this session can be retried"
             );
         }
+        if self
+            .store
+            .list_session_agent_runs(session_pk)
+            .await?
+            .iter()
+            .any(|run| run.retry_of.as_deref() == Some(previous.run_id.as_str()))
+        {
+            bail!("child run already has a retry; retry branches are not allowed");
+        }
         let (_, _, root) = self.tree(&previous.run_id).await?;
         self.ensure_capacity(&root).await?;
         let snapshot = match previous.executing_agent_id.as_deref() {
@@ -347,6 +372,8 @@ impl DelegationRuntime {
                 session_pk: previous.session_pk.clone(),
                 parent_run_id: previous.parent_run_id.clone(),
                 retry_of: Some(previous.run_id),
+                source_tool_call_id: previous.source_tool_call_id,
+                dispatch_index: previous.dispatch_index,
                 primary_agent_id: previous.primary_agent_id,
                 executing_agent_id: previous.executing_agent_id,
                 executing_agent_name_snapshot: snapshot
@@ -567,30 +594,41 @@ impl DelegationRuntime {
     }
 }
 
-fn new_run(
-    session_pk: &str,
-    parent_run_id: Option<&str>,
-    retry_of: Option<&str>,
-    primary_agent_id: &str,
-    snapshot: Option<&AgentSnapshot>,
+struct NewRunArgs<'a> {
+    session_pk: &'a str,
+    parent_run_id: Option<&'a str>,
+    retry_of: Option<&'a str>,
+    primary_agent_id: &'a str,
+    snapshot: Option<&'a AgentSnapshot>,
     agent_kind: AgentRunKind,
-    task: &str,
-) -> NewAgentRun {
-    let (resolved_model, resolved_effort) = snapshot
+    task: &'a str,
+    dispatch: Option<AgentDispatchLink>,
+}
+
+fn new_run(args: NewRunArgs<'_>) -> NewAgentRun {
+    let (resolved_model, resolved_effort) = args
+        .snapshot
         .map(|snapshot| model_parts(&snapshot.profile.model))
+        .unwrap_or((None, None));
+    let (source_tool_call_id, dispatch_index) = args
+        .dispatch
+        .map(|link| (Some(link.source_tool_call_id), Some(link.dispatch_index)))
         .unwrap_or((None, None));
     NewAgentRun {
         run_id: uuid::Uuid::new_v4().to_string(),
-        session_pk: session_pk.to_string(),
-        parent_run_id: parent_run_id.map(str::to_string),
-        retry_of: retry_of.map(str::to_string),
-        primary_agent_id: primary_agent_id.to_string(),
-        executing_agent_id: snapshot.map(|snapshot| snapshot.profile.id.clone()),
-        executing_agent_name_snapshot: snapshot
+        session_pk: args.session_pk.to_string(),
+        parent_run_id: args.parent_run_id.map(str::to_string),
+        retry_of: args.retry_of.map(str::to_string),
+        source_tool_call_id,
+        dispatch_index,
+        primary_agent_id: args.primary_agent_id.to_string(),
+        executing_agent_id: args.snapshot.map(|snapshot| snapshot.profile.id.clone()),
+        executing_agent_name_snapshot: args
+            .snapshot
             .map(|snapshot| snapshot.profile.name.clone())
             .unwrap_or_else(|| "subagent".to_string()),
-        agent_kind,
-        task: task.to_string(),
+        agent_kind: args.agent_kind,
+        task: args.task.to_string(),
         status: AgentRunStatus::Queued,
         resolved_model,
         resolved_effort,
@@ -720,6 +758,7 @@ mod tests {
                 task: "self".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .err()
@@ -742,6 +781,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -753,6 +793,7 @@ mod tests {
                 task: "cycle".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .err()
@@ -774,6 +815,7 @@ mod tests {
                     task: "main".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .expect("the first four main delegation edges are allowed")
@@ -788,6 +830,7 @@ mod tests {
                 task: "fifth".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .err()
@@ -807,6 +850,7 @@ mod tests {
                 task: "main".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -818,6 +862,7 @@ mod tests {
                     task: "sub".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();
@@ -829,6 +874,7 @@ mod tests {
                 task: "nested-main".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -840,6 +886,7 @@ mod tests {
                     task: "sub".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();
@@ -852,6 +899,7 @@ mod tests {
                 task: "sub".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .err()
@@ -871,6 +919,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -904,6 +953,7 @@ mod tests {
                 task: "sibling".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -914,6 +964,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -924,6 +975,7 @@ mod tests {
                 task: "grandchild".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -971,6 +1023,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1001,6 +1054,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1044,6 +1098,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1094,6 +1149,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1234,6 +1290,7 @@ mod tests {
                 task: "terminal".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1246,6 +1303,7 @@ mod tests {
                     task: "active".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();
@@ -1270,6 +1328,7 @@ mod tests {
                 task: "parent".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1280,6 +1339,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1318,6 +1378,7 @@ mod tests {
                 task: "child".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -1382,5 +1443,166 @@ mod tests {
             recovered.error.as_deref(),
             Some(RESTART_INTERRUPTION_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_persists_for_admitted_main_and_subagent_runs_only() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, second) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let main = runtime
+            .queue_main(MainDelegationRequest {
+                parent_run_id: root.run.run_id.clone(),
+                target_agent_id: second.profile.id.clone(),
+                task: "main".into(),
+                context: None,
+                background: false,
+                dispatch: Some(AgentDispatchLink {
+                    source_tool_call_id: "delegate-call".into(),
+                    dispatch_index: 0,
+                }),
+            })
+            .await
+            .unwrap();
+        let subagent = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id.clone(),
+                subagent_type: "general".into(),
+                task: "subagent".into(),
+                context: None,
+                background: false,
+                dispatch: Some(AgentDispatchLink {
+                    source_tool_call_id: "task-call".into(),
+                    dispatch_index: 1,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                main.run.source_tool_call_id.as_deref(),
+                main.run.dispatch_index
+            ),
+            (Some("delegate-call"), Some(0))
+        );
+        assert_eq!(
+            (
+                subagent.run.source_tool_call_id.as_deref(),
+                subagent.run.dispatch_index
+            ),
+            (Some("task-call"), Some(1))
+        );
+
+        let before = runtime
+            .store
+            .list_session_agent_runs("s")
+            .await
+            .unwrap()
+            .len();
+        let error = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: "missing-parent".into(),
+                subagent_type: "general".into(),
+                task: "refused".into(),
+                context: None,
+                background: false,
+                dispatch: Some(AgentDispatchLink {
+                    source_tool_call_id: "failed-tool-call".into(),
+                    dispatch_index: 0,
+                }),
+            })
+            .await
+            .err()
+            .expect("a missing parent must reject dispatch before insertion");
+        assert!(error.to_string().contains("unknown agent run"));
+        assert_eq!(
+            runtime
+                .store
+                .list_session_agent_runs("s")
+                .await
+                .unwrap()
+                .len(),
+            before,
+            "a refused dispatch must not insert a linked child run"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_survives_retry_and_rejects_retry_branches() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, _) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let child = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id,
+                subagent_type: "general".into(),
+                task: "child".into(),
+                context: None,
+                background: false,
+                dispatch: Some(AgentDispatchLink {
+                    source_tool_call_id: "task-call".into(),
+                    dispatch_index: 2,
+                }),
+            })
+            .await
+            .unwrap();
+        runtime.fail(&child.run.run_id, "failed").await.unwrap();
+
+        let retry = runtime.retry_child("s", &child.run.run_id).await.unwrap();
+        assert_eq!(retry.source_tool_call_id.as_deref(), Some("task-call"));
+        assert_eq!(retry.dispatch_index, Some(2));
+        let error = runtime
+            .retry_child("s", &child.run.run_id)
+            .await
+            .expect_err("a predecessor with an existing retry must not branch");
+        assert!(error.to_string().contains("already has a retry"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_survives_cancel_and_interrupt_transitions() {
+        let (runtime, registry, _, _directory) = runtime().await;
+        let (first, _) = two_agents(&registry).await;
+        let root = runtime.begin_primary("s", first, "root").await.unwrap();
+        let cancelled = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id.clone(),
+                subagent_type: "general".into(),
+                task: "cancel".into(),
+                context: None,
+                background: false,
+                dispatch: Some(AgentDispatchLink {
+                    source_tool_call_id: "task-call".into(),
+                    dispatch_index: 0,
+                }),
+            })
+            .await
+            .unwrap();
+        let interrupted = runtime
+            .queue_subagent(SubagentRunRequest {
+                parent_run_id: root.run.run_id,
+                subagent_type: "general".into(),
+                task: "interrupt".into(),
+                context: None,
+                background: false,
+                dispatch: Some(AgentDispatchLink {
+                    source_tool_call_id: "task-call".into(),
+                    dispatch_index: 1,
+                }),
+            })
+            .await
+            .unwrap();
+        runtime
+            .cancel_child("s", &cancelled.run.run_id)
+            .await
+            .unwrap();
+        runtime
+            .interrupt(&interrupted.run.run_id, "interrupted")
+            .await
+            .unwrap();
+        for (run_id, index) in [(&cancelled.run.run_id, 0), (&interrupted.run.run_id, 1)] {
+            let stored = runtime.store.get_agent_run(run_id).await.unwrap().unwrap();
+            assert_eq!(stored.source_tool_call_id.as_deref(), Some("task-call"));
+            assert_eq!(stored.dispatch_index, Some(index));
+        }
     }
 }
