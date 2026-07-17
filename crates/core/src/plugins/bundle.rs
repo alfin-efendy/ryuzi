@@ -48,7 +48,8 @@
 //!    escapes; canonicalization also requires the component actually
 //!    exists).
 //! 4. Hash the component with SHA-256 and require the release's
-//!    `component_sha256` is lowercase hex and matches exactly.
+//!    `component_sha256` is exactly 64 lowercase hex characters and matches
+//!    exactly.
 //! 5. Parse the `plugin.sig` envelope, reject an unrecognized `key_id`, and
 //!    verify the signature against `release.json`'s exact raw staged bytes
 //!    using `ed25519_dalek::VerifyingKey::verify_strict` (matching the
@@ -148,12 +149,13 @@ pub fn verify_bundle(
         .with_context(|| format!("reading component {}", canonical_component.display()))?;
     let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
     let declared_hash = &release.component_sha256;
-    if !declared_hash
-        .chars()
-        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    if declared_hash.len() != 64
+        || !declared_hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
     {
         bail!(
-            "release component_sha256 must be lowercase hex, got {:?}",
+            "release component_sha256 is malformed: expected exactly 64 lowercase hex characters, got {:?}",
             declared_hash
         );
     }
@@ -312,6 +314,72 @@ component = "acme_connector.wasm"
     }
 
     #[test]
+    fn signature_over_wrong_bytes_from_trusted_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_bundle(dir.path(), &signing_key(), KEY_ID);
+
+        // Re-sign with the *trusted* key, but over different bytes than what
+        // is actually staged as release.json. Everything else (manifest,
+        // release, component hash, path, key id) stays valid, so this must
+        // fail specifically inside `verify_strict`, not because of an
+        // unknown key id or a component hash mismatch.
+        let staged_release_bytes = fs::read(dir.path().join("release.json")).unwrap();
+        let mut signed_over_bytes = staged_release_bytes.clone();
+        signed_over_bytes.push(b'\n');
+        assert_ne!(
+            staged_release_bytes, signed_over_bytes,
+            "signed bytes must differ from staged release.json bytes"
+        );
+        let signature = signing_key().sign(&signed_over_bytes);
+        let envelope = serde_json::json!({
+            "key_id": KEY_ID,
+            "signature": b64url(&signature.to_bytes()),
+        });
+        fs::write(
+            dir.path().join("plugin.sig"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_bundle(dir.path(), &trusted_keys()).expect_err(
+            "a signature computed over bytes other than the staged release.json must be rejected",
+        );
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupted_signature_bytes_from_trusted_key_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_bundle(dir.path(), &signing_key(), KEY_ID);
+
+        // Corrupt the signature bytes themselves (still a valid trusted
+        // `key_id`, still 64 bytes once decoded), so this must fail inside
+        // `verify_strict`, not because of an unknown key id.
+        let signature = signing_key().sign(&fs::read(dir.path().join("release.json")).unwrap());
+        let mut corrupted = signature.to_bytes();
+        corrupted[0] ^= 0xff;
+        let envelope = serde_json::json!({
+            "key_id": KEY_ID,
+            "signature": b64url(&corrupted),
+        });
+        fs::write(
+            dir.path().join("plugin.sig"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_bundle(dir.path(), &trusted_keys())
+            .expect_err("a corrupted signature from a trusted key id must be rejected");
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn unknown_signing_key_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         // Sign with a key whose id is not present in `trusted_keys()`.
@@ -444,6 +512,46 @@ component = "../{outside_name}"
         assert!(
             err.to_string().contains("escapes the staging directory"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn short_component_sha256_is_rejected_as_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let component_bytes = b"fake wasm component bytes".to_vec();
+        fs::write(dir.path().join("acme_connector.wasm"), &component_bytes).unwrap();
+        fs::write(
+            dir.path().join("ryuzi-plugin.toml"),
+            manifest_toml("acme-connector", "0.1.0"),
+        )
+        .unwrap();
+
+        // A short, all-lowercase-hex string: passes a naive "is every char
+        // hex?" check but is not a 64-char SHA-256 digest.
+        let release_bytes = release_json("acme-connector", "0.1.0", "ab");
+        fs::write(dir.path().join("release.json"), &release_bytes).unwrap();
+
+        let key = signing_key();
+        let signature = key.sign(&release_bytes);
+        let envelope = serde_json::json!({
+            "key_id": KEY_ID,
+            "signature": b64url(&signature.to_bytes()),
+        });
+        fs::write(
+            dir.path().join("plugin.sig"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_bundle(dir.path(), &trusted_keys())
+            .expect_err("a component_sha256 that is not exactly 64 hex chars must be rejected");
+        assert!(
+            err.to_string().contains("malformed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.to_string().contains("hash mismatch"),
+            "malformed checksum must not be reported as a generic hash mismatch: {err}"
         );
     }
 }
