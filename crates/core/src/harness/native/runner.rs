@@ -2756,7 +2756,7 @@ async fn complete_validated_v2_error(
     trace_id: &str,
     error: ToolError,
 ) -> Value {
-    insert_tool_row_parts(
+    let inserted = insert_tool_row_parts(
         deps,
         &validated.wire.id,
         &validated.wire.name,
@@ -2765,6 +2765,9 @@ async fn complete_validated_v2_error(
         display.subagent(),
     )
     .await;
+    if planned.is_some() && inserted {
+        increment_tool_count(deps).await;
+    }
     let legacy_text = format!("{}: {}", error.code, error.message);
     complete_tool_call(
         deps,
@@ -8534,6 +8537,16 @@ mod tests {
         name: &str,
         input: Value,
     ) -> Value {
+        dispatch_call_against_plan(deps, plan, &format!("call-{name}"), name, input).await
+    }
+
+    async fn dispatch_call_against_plan(
+        deps: &RunnerDeps,
+        plan: &RunToolPlan,
+        id: &str,
+        name: &str,
+        input: Value,
+    ) -> Value {
         let compiled = match plan {
             RunToolPlan::FrozenV2(compiled) | RunToolPlan::CandidateV2(compiled) => compiled,
             RunToolPlan::V1 => panic!("V2 dispatch helper requires a V2 plan"),
@@ -8542,7 +8555,7 @@ mod tests {
             deps,
             compiled,
             vec![ToolAccum {
-                id: format!("call-{name}"),
+                id: id.into(),
                 name: name.into(),
                 start_input: json!({}),
                 input_json: input.to_string(),
@@ -8596,7 +8609,8 @@ mod tests {
         deps.agent.tools = filter;
 
         deps.tools = Arc::new(ToolRegistry::builtin());
-        let missing = dispatch_against_plan(&deps, &frozen, name).await;
+        let missing =
+            dispatch_call_against_plan(&deps, &frozen, "missing-call", name, json!({})).await;
         assert!(result_text(&missing).contains("capability_unavailable"));
 
         let unknown = dispatch_against_plan(&deps, &frozen, "not_in_plan").await;
@@ -8615,18 +8629,40 @@ mod tests {
         let (unavailable, unavailable_effects) =
             ContractTool::unavailable(name, "stable contract", false);
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![unavailable]));
-        let unavailable = dispatch_against_plan(&deps, &frozen, name).await;
+        let unavailable =
+            dispatch_call_against_plan(&deps, &frozen, "unavailable-call", name, json!({})).await;
         assert!(result_text(&unavailable).contains("capability_unavailable"));
         assert_eq!(
             unavailable_effects.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            2,
+            "the validated planned call is admitted even when live availability fails"
+        );
 
         let (changed, changed_effects) = ContractTool::available(name, "changed contract");
         deps.tools = Arc::new(ToolRegistry::with_extra(vec![changed]));
-        let changed = dispatch_against_plan(&deps, &frozen, name).await;
+        let changed =
+            dispatch_call_against_plan(&deps, &frozen, "changed-call", name, json!({})).await;
         assert!(result_text(&changed).contains("capability_unavailable"));
         assert_eq!(changed_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            deps.store
+                .get_agent_run(&deps.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_count,
+            3,
+            "the changed-contract rejection is counted exactly once"
+        );
     }
 
     #[tokio::test]
