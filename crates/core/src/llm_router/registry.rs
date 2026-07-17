@@ -393,50 +393,6 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         uses_max_completion_tokens: false,
         device_grant: None,
     },
-    ProviderDescriptor {
-        id: "custom-openai",
-        name: "Custom (OpenAI-compatible)",
-        family: "custom-openai",
-        color: "#8B8B8B",
-        initial: "C",
-        category: ApiKey,
-        format: ApiFormat::OpenAi,
-        base_url: None,
-        auth: AuthScheme::Bearer,
-        models: &[],
-        requires_base_url: true,
-        oauth: None,
-        no_auth: false,
-        device_flow: None,
-        free_tier: false,
-        risk_notice: false,
-        chat_path: None,
-        has_models_endpoint: true,
-        uses_max_completion_tokens: false,
-        device_grant: None,
-    },
-    ProviderDescriptor {
-        id: "custom-anthropic",
-        name: "Custom (Anthropic-compatible)",
-        family: "custom-anthropic",
-        color: "#8B8B8B",
-        initial: "C",
-        category: ApiKey,
-        format: ApiFormat::Anthropic,
-        base_url: None,
-        auth: AuthScheme::XApiKey,
-        models: &[],
-        requires_base_url: true,
-        oauth: None,
-        no_auth: false,
-        device_flow: None,
-        free_tier: false,
-        risk_notice: false,
-        chat_path: None,
-        has_models_endpoint: true,
-        uses_max_completion_tokens: false,
-        device_grant: None,
-    },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
     ProviderDescriptor {
@@ -969,7 +925,6 @@ mod tests {
         assert_eq!(family_of("openai-oauth"), Some("openai"));
         assert_eq!(family_of("anthropic"), Some("anthropic"));
         assert_eq!(family_of("kiro"), Some("kiro"));
-        assert_eq!(family_of("custom-openai"), Some("custom-openai"));
         assert_eq!(family_of("nope"), None);
     }
 
@@ -1037,8 +992,6 @@ mod tests {
             "mistral",
             "xai",
             "ollama",
-            "custom-openai",
-            "custom-anthropic",
             "anthropic-oauth",
             "openai-oauth",
             "kiro",

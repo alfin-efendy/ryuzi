@@ -63,10 +63,10 @@ const claudeOauth: CatalogEntry = {
   riskNotice: false,
   usesDeviceGrant: false,
 };
-const customOpenAi: CatalogEntry = {
-  id: "custom-openai",
-  name: "Custom (OpenAI-compatible)",
-  family: "custom-openai",
+const customTest: CatalogEntry = {
+  id: "custom-test",
+  name: "Custom Test",
+  family: "custom-test",
   color: "#8b8b8b",
   initial: "C",
   category: "api_key",
@@ -150,7 +150,7 @@ const opencode: CatalogEntry = {
 
 beforeEach(() => {
   useConnections.setState({
-    catalog: [anthropic, claudeOauth, customOpenAi, kiroProvider, mimoFree, mimo, opencodeFree, opencode],
+    catalog: [anthropic, claudeOauth, customTest, kiroProvider, mimoFree, mimo, opencodeFree, opencode],
     connections: [],
   });
   addConnection.mockClear();
@@ -277,9 +277,9 @@ test("switching auth method mid-flight clears the latched OAuth waiting state", 
   expect((screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
-test("single-member custom-openai family requires a base URL before it can be submitted", async () => {
+test("single-member custom family requires a base URL before it can be submitted", async () => {
   const onClose = mock(() => {});
-  render(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
+  render(<AddConnectionModal open onClose={onClose} family="custom-test" />);
   expect(screen.queryByRole("radiogroup", { name: /sign-in method/i })).toBeNull();
   const submit = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
   expect(submit.disabled).toBe(true);
@@ -289,7 +289,7 @@ test("single-member custom-openai family requires a base URL before it can be su
   expect(submit.disabled).toBe(false);
   fireEvent.click(submit);
   await screen.findByText("Add account");
-  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-openai", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
 });
 
@@ -362,7 +362,7 @@ test("family transition invalidates a pending OAuth completion", async () => {
   fireEvent.click(screen.getByRole("radio", { name: /Subscription/ }));
   fireEvent.click(screen.getByRole("button", { name: "Connect with browser" }));
 
-  view.rerender(<AddConnectionModal open onClose={onClose} family="custom-openai" />);
+  view.rerender(<AddConnectionModal open onClose={onClose} family="custom-test" />);
   const currentLabel = screen.getByLabelText("Label");
   fireEvent.change(currentLabel, { target: { value: "Current family" } });
 
@@ -423,7 +423,7 @@ test("risk-notice providers show the account-suspension warning", () => {
 });
 
 test("no risk notice for ordinary providers", () => {
-  useConnections.setState({ catalog: [customOpenAi], connections: [], loaded: true });
-  render(<AddConnectionModal open onClose={() => {}} family="custom-openai" />);
+  useConnections.setState({ catalog: [customTest], connections: [], loaded: true });
+  render(<AddConnectionModal open onClose={() => {}} family="custom-test" />);
   expect(screen.queryByText(PROVIDER_RISK_NOTICE)).toBeNull();
 });

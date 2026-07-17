@@ -4122,7 +4122,7 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 64);
         assert!(body.get("max_tokens").is_none());
 
-        for id in ["mimo-free", "qwen", "github-copilot", "custom-openai"] {
+        for id in ["mimo-free", "qwen", "github-copilot", "deepseek"] {
             let mut body = json!({"model": "m", "max_tokens": 64, "messages": []});
             apply_max_completion_tokens(registry::descriptor(id).unwrap(), &mut body);
             assert_eq!(body["max_tokens"], 64, "{id} must keep max_tokens");
