@@ -33,6 +33,7 @@ const targetCapabilities: ModelRouteTargetCapability[] = [
   {
     provider: "anthropic",
     model: "claude-opus-4",
+    contextWindow: 200_000,
     supported: [{ value: "high", label: "High", description: null }],
     providerDefault: null,
   },
