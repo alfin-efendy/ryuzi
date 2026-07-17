@@ -9,6 +9,7 @@ description = "Ryuzi plugin contract: manifest types, validation, and substituti
 workspace = true
 
 [dependencies]
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

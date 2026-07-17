@@ -4561,6 +4561,7 @@ dependencies = [
 name = "ryuzi-plugin-sdk"
 version = "0.0.0"
 dependencies = [
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
