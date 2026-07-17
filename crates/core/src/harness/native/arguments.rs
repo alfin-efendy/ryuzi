@@ -509,6 +509,7 @@ fn branch_accepts_candidate(
     root_schema: &Value,
     candidate: &Value,
 ) -> Result<bool, ToolError> {
+    let branch = resolve_local_ref(branch, root_schema)?;
     let mut rooted_branch = branch.clone();
     if let (Some(branch_object), Some(root_object)) =
         (rooted_branch.as_object_mut(), root_schema.as_object())
@@ -530,33 +531,50 @@ fn branch_accepts_candidate(
     Ok(validator.is_valid(candidate))
 }
 
+const MAX_LOCAL_REF_DEPTH: usize = 64;
+
 fn resolve_local_ref<'a>(schema: &'a Value, root: &'a Value) -> Result<&'a Value, ToolError> {
-    let Some(reference) = schema
-        .as_object()
-        .and_then(|object| object.get("$ref"))
-        .and_then(Value::as_str)
-    else {
-        return Ok(schema);
-    };
-    let Some(pointer) = reference.strip_prefix('#') else {
-        return Err(ToolError::precondition(
-            "invalid_persisted_tool_plan",
-            "The frozen tool schema contains an unsupported reference",
-        ));
-    };
-    root.pointer(pointer).ok_or_else(|| {
-        ToolError::precondition(
-            "invalid_persisted_tool_plan",
-            "The frozen tool schema contains an invalid reference",
-        )
-    })
+    let mut current = schema;
+    let mut visited_pointers = std::collections::BTreeSet::new();
+    for _ in 0..MAX_LOCAL_REF_DEPTH {
+        let Some(reference) = current
+            .as_object()
+            .and_then(|object| object.get("$ref"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(current);
+        };
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return Err(ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "The frozen tool schema contains an unsupported reference",
+            ));
+        };
+        if !visited_pointers.insert(pointer) {
+            return Err(ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "The frozen tool schema contains a reference cycle",
+            ));
+        }
+        current = root.pointer(pointer).ok_or_else(|| {
+            ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "The frozen tool schema contains an invalid reference",
+            )
+        })?;
+    }
+    Err(ToolError::precondition(
+        "invalid_persisted_tool_plan",
+        "The frozen tool schema reference chain is too deep",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::harness::native::tool_contract::{
-        compile_openai_strict_schema, NormalizedInput, ToolDescriptor, ToolInputCtx,
+        compile_openai_strict_schema, NormalizedInput, ToolDescriptor, ToolErrorCategory,
+        ToolInputCtx,
     };
     use crate::harness::native::tool_plan::PlannedTool;
     use crate::harness::native::tools::{PermissionSpec, Tool, ToolCtx, ToolOutput};
@@ -1019,6 +1037,80 @@ mod tests {
         .unwrap();
 
         assert_eq!(valid.input, json!({"choice":{"kind":"a"}}));
+    }
+
+    #[test]
+    fn strict_chained_local_refs_remove_optional_null_sentinels() {
+        let schema = json!({
+            "$defs": {
+                "choice_alias": {"$ref": "#/$defs/choice_shape"},
+                "choice_shape": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "a"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {
+                "choice": {"$ref": "#/$defs/choice_alias"}
+            },
+            "required": ["choice"],
+            "additionalProperties": false
+        });
+        let wire_schema = json!({
+            "$defs": {
+                "choice_alias": {"$ref": "#/$defs/choice_shape"},
+                "choice_shape": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"enum": ["a"]},
+                        "note": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                    },
+                    "required": ["kind", "note"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {
+                "choice": {"$ref": "#/$defs/choice_alias"}
+            },
+            "required": ["choice"],
+            "additionalProperties": false
+        });
+        let plan = planned_with_wire(schema.clone(), wire_schema, true);
+        let tool: Arc<dyn Tool> = Arc::new(SchemaTool {
+            schema,
+            invalidating_normalization: false,
+        });
+
+        let valid = validate(
+            r#"{"choice":{"kind":"a","note":null}}"#,
+            json!({}),
+            &plan,
+            tool,
+        )
+        .unwrap();
+
+        assert_eq!(valid.input, json!({"choice":{"kind":"a"}}));
+    }
+
+    #[test]
+    fn cyclic_local_refs_are_rejected_deterministically() {
+        let schema = json!({
+            "$defs": {
+                "first": {"$ref": "#/$defs/second"},
+                "second": {"$ref": "#/$defs/first"}
+            }
+        });
+
+        let error = resolve_local_ref(&schema["$defs"]["first"], &schema).unwrap_err();
+
+        assert_eq!(error.category, ToolErrorCategory::Precondition);
+        assert_eq!(error.code, "invalid_persisted_tool_plan");
     }
 
     #[test]
