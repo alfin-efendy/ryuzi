@@ -58,6 +58,10 @@ pub(crate) const HANDLES: &[&str] = &[
     "list_installed_providers",
     "install_provider",
     "uninstall_provider",
+    "list_custom_providers",
+    "add_custom_provider",
+    "set_custom_provider_format",
+    "remove_custom_provider",
     "start_kiro_device_flow",
     "await_kiro_device_flow",
     "import_kiro_token",
@@ -190,6 +194,15 @@ struct AwaitDeviceFlowP {
     label: String,
     flow_id: String,
 }
+#[derive(Deserialize)]
+struct AddCustomProviderP {
+    name: String,
+}
+#[derive(Deserialize)]
+struct SetCustomProviderFormatP {
+    id: String,
+    format: String,
+}
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
@@ -299,6 +312,24 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "uninstall_provider" => {
             let a: FamilyP = params(p)?;
             ok(crate::llm_router::installed::uninstall_provider(cp.store(), &a.family).await?)
+        }
+        "list_custom_providers" => {
+            ok(crate::llm_router::custom::list_custom_providers(cp.store()).await?)
+        }
+        "add_custom_provider" => {
+            let a: AddCustomProviderP = params(p)?;
+            ok(crate::llm_router::custom::add_custom_provider(cp.store(), &a.name).await?)
+        }
+        "set_custom_provider_format" => {
+            let a: SetCustomProviderFormatP = params(p)?;
+            ok(
+                crate::llm_router::custom::set_custom_provider_format(cp.store(), &a.id, &a.format)
+                    .await?,
+            )
+        }
+        "remove_custom_provider" => {
+            let a: IdP = params(p)?;
+            ok(crate::llm_router::custom::remove_custom_provider(cp.store(), &a.id).await?)
         }
         "start_kiro_device_flow" => ok(start_kiro_device_flow().await?),
         "await_kiro_device_flow" => {
