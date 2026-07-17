@@ -10666,6 +10666,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn component_release_upsert_preserves_revoked_state_on_metadata_refresh() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .mark_component_release_revoked("github", "0.1.0", "reason A")
+            .await
+            .unwrap();
+
+        // Refresh metadata (e.g. re-verified source_url/sha256/signing_key_id)
+        // via upsert. installed_at is also bumped as if the caller re-derived
+        // it. None of that should clobber the durable revoked/reason state
+        // set above by mark_component_release_revoked.
+        let mut refreshed = component_release("github", "0.1.0", 2000);
+        refreshed.source_url = "https://example.test/github/0.1.0-mirror.wasm".into();
+        refreshed.sha256 = "sha256-github-0.1.0-mirror".into();
+        refreshed.signing_key_id = "key-2".into();
+        store.upsert_component_release(&refreshed).await.unwrap();
+
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert_eq!(releases.len(), 1);
+        let rec = &releases[0];
+        assert!(rec.revoked);
+        assert!(!rec.active);
+        assert_eq!(rec.revocation_reason.as_deref(), Some("reason A"));
+        assert_eq!(
+            rec.source_url,
+            "https://example.test/github/0.1.0-mirror.wasm"
+        );
+        assert_eq!(rec.sha256, "sha256-github-0.1.0-mirror");
+        assert_eq!(rec.signing_key_id, "key-2");
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn plugin_attach_status_records_latest() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
