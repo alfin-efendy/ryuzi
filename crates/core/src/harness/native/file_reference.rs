@@ -111,6 +111,12 @@ struct RankedFileCandidates {
     candidates: Vec<FileTargetCandidate>,
 }
 
+#[derive(Clone, Copy)]
+enum MissingCandidatePolicy {
+    Scan,
+    Omit,
+}
+
 impl From<&ResolvedFileTarget> for PinnedFileTarget {
     fn from(target: &ResolvedFileTarget) -> Self {
         Self {
@@ -765,13 +771,7 @@ fn rank_file_candidates(
 ) -> RankedFileCandidates {
     let requested_stem = lowercase_stem(requested_name);
     let requested_lower = file_name(requested_name).to_lowercase();
-    let bounded = candidates.into_iter().take(256).collect::<Vec<_>>();
-    if bounded.len() == 256 {
-        return RankedFileCandidates {
-            candidates: Vec::new(),
-        };
-    }
-    let mut ranked = bounded
+    let mut ranked = candidates
         .into_iter()
         .map(|candidate| {
             let name = file_name(&candidate.logical_path);
@@ -802,6 +802,19 @@ fn rank_file_candidates(
             .take(5)
             .collect(),
     }
+}
+
+fn rank_scanned_file_candidates(
+    requested_name: &str,
+    candidates: impl IntoIterator<Item = FileTargetCandidate>,
+    scan_cap_reached: bool,
+) -> RankedFileCandidates {
+    if scan_cap_reached {
+        return RankedFileCandidates {
+            candidates: Vec::new(),
+        };
+    }
+    rank_file_candidates(requested_name, candidates)
 }
 
 fn logical_parent(path: &str) -> String {
@@ -847,6 +860,7 @@ async fn missing_path_error(
     target: &PinnedFileTarget,
     resolution: &ExactPinnedResolution,
     expected: ExpectedFileKind,
+    candidate_policy: MissingCandidatePolicy,
 ) -> ToolError {
     let mut physical_parent = resolution
         .resolved_path
@@ -869,39 +883,43 @@ async fn missing_path_error(
     }
 
     let mut siblings = Vec::new();
-    let scan_parent = physical_parent
-        .to_str()
-        .and_then(|path| jail(&resolution.root, path).ok());
-    if let Some(scan_parent) = scan_parent {
-        if let Ok(mut directory) = tokio::fs::read_dir(scan_parent).await {
-            let mut scanned = 0;
-            while scanned < 256 {
-                let entry = match directory.next_entry().await {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) | Err(_) => break,
-                };
-                scanned += 1;
-                let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                    continue;
-                };
-                let kind = match entry.file_type().await {
-                    Ok(file_type) if file_type.is_symlink() => FileTargetKind::Symlink,
-                    Ok(file_type) if file_type.is_file() => FileTargetKind::File,
-                    Ok(file_type) if file_type.is_dir() => FileTargetKind::Directory,
-                    Ok(_) => FileTargetKind::Other,
-                    Err(_) => continue,
-                };
-                let logical_path = if parent.is_empty() || parent == "." {
-                    name
-                } else {
-                    format!("{}/{name}", parent.trim_matches('/'))
-                };
-                siblings.push(FileTargetCandidate { logical_path, kind });
+    let mut scan_cap_reached = false;
+    if matches!(candidate_policy, MissingCandidatePolicy::Scan) {
+        let scan_parent = physical_parent
+            .to_str()
+            .and_then(|path| jail(&resolution.root, path).ok());
+        if let Some(scan_parent) = scan_parent {
+            if let Ok(mut directory) = tokio::fs::read_dir(scan_parent).await {
+                let mut scanned = 0;
+                while scanned < 256 {
+                    let entry = match directory.next_entry().await {
+                        Ok(Some(entry)) => entry,
+                        Ok(None) | Err(_) => break,
+                    };
+                    scanned += 1;
+                    let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                        continue;
+                    };
+                    let kind = match entry.file_type().await {
+                        Ok(file_type) if file_type.is_symlink() => FileTargetKind::Symlink,
+                        Ok(file_type) if file_type.is_file() => FileTargetKind::File,
+                        Ok(file_type) if file_type.is_dir() => FileTargetKind::Directory,
+                        Ok(_) => FileTargetKind::Other,
+                        Err(_) => continue,
+                    };
+                    let logical_path = if parent.is_empty() || parent == "." {
+                        name
+                    } else {
+                        format!("{}/{name}", parent.trim_matches('/'))
+                    };
+                    siblings.push(FileTargetCandidate { logical_path, kind });
+                }
+                scan_cap_reached = scanned == 256;
             }
         }
     }
     let requested = requested_component_below(&target.logical_path, &parent);
-    let ranked = rank_file_candidates(&requested, siblings);
+    let ranked = rank_scanned_file_candidates(&requested, siblings, scan_cap_reached);
     let mut error = ToolError::precondition("path_not_found", "Path was not found")
         .with_strategy(ToolErrorStrategy::ReviseInput)
         .with_details(serde_json::json!({
@@ -926,7 +944,7 @@ pub(crate) async fn missing_path_error_after_resolution_for_test(
         Err(error) => return error,
     };
     after_resolution();
-    missing_path_error(target, &resolution, expected).await
+    missing_path_error(target, &resolution, expected, MissingCandidatePolicy::Scan).await
 }
 
 pub(crate) async fn preflight_file_target(
@@ -938,7 +956,13 @@ pub(crate) async fn preflight_file_target(
     let link_metadata = match tokio::fs::symlink_metadata(&resolution.access_path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(missing_path_error(target, &resolution, expected).await);
+            return Err(missing_path_error(
+                target,
+                &resolution,
+                expected,
+                MissingCandidatePolicy::Scan,
+            )
+            .await);
         }
         Err(error) => return Err(path_unavailable(&error)),
     };
@@ -947,7 +971,13 @@ pub(crate) async fn preflight_file_target(
         match tokio::fs::metadata(&resolution.access_path).await {
             Ok(metadata) => kind_from_metadata(&metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(missing_path_error(target, &resolution, expected).await);
+                return Err(missing_path_error(
+                    target,
+                    &resolution,
+                    expected,
+                    MissingCandidatePolicy::Omit,
+                )
+                .await);
             }
             Err(error) => return Err(path_unavailable(&error)),
         }
@@ -1638,6 +1668,33 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn dangling_final_symlink_does_not_emit_false_logical_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nearby.txt"), "nearby").unwrap();
+        if !create_file_symlink_for_test(&sub.join("missing.txt"), &root.path().join("link.txt")) {
+            return;
+        }
+        let requested = "link.txt";
+        let ctx = workspace_ctx(root.path());
+        let target = resolve_workspace_reference(&ctx, requested).unwrap();
+        let pinned = PinnedFileTarget::from(&target);
+
+        let error = preflight_file_target(&ctx, &pinned, ExpectedFileKind::File)
+            .await
+            .unwrap_err();
+        let serialized = serde_json::to_value(error).unwrap();
+
+        assert_eq!(serialized["code"], "path_not_found");
+        assert_eq!(target.reference.path, requested);
+        assert_eq!(target.logical_path, requested);
+        assert_eq!(serialized["candidates"], json!([]));
+        assert!(!serialized.to_string().contains("nearby.txt"));
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn dangling_outside_symlink_is_rejected_by_jail() {
         let root = tempfile::tempdir().unwrap();
@@ -1747,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_ranking_is_deterministic_bounded_and_scans_only_256_siblings() {
+    fn candidate_ranking_is_deterministic_and_bounded_to_five_results() {
         let ranking_cases = vec![
             FileTargetCandidate {
                 logical_path: "src/name.zzz".into(),
@@ -1784,28 +1841,6 @@ mod tests {
         assert_eq!(forward.candidates[2].logical_path, "src/names.ts");
         assert_eq!(forward.candidates[3].logical_path, "src/name-test.ts");
 
-        let forward_inspected = std::cell::Cell::new(0);
-        let forward_siblings = (0..300)
-            .inspect(|_| forward_inspected.set(forward_inspected.get() + 1))
-            .map(|index| FileTargetCandidate {
-                logical_path: format!("src/noise-{index:03}.txt"),
-                kind: FileTargetKind::File,
-            });
-        let reverse_inspected = std::cell::Cell::new(0);
-        let reverse_siblings = (0..300)
-            .rev()
-            .inspect(|_| reverse_inspected.set(reverse_inspected.get() + 1))
-            .map(|index| FileTargetCandidate {
-                logical_path: format!("src/noise-{index:03}.txt"),
-                kind: FileTargetKind::File,
-            });
-        let bounded_forward = rank_file_candidates("noise-299.txt", forward_siblings);
-        let bounded_reverse = rank_file_candidates("noise-299.txt", reverse_siblings);
-        assert_eq!(forward_inspected.get(), 256);
-        assert_eq!(reverse_inspected.get(), 256);
-        assert_eq!(bounded_forward.candidates, bounded_reverse.candidates);
-        assert!(bounded_forward.candidates.is_empty());
-
         let ties = rank_file_candidates(
             "same",
             vec![
@@ -1820,6 +1855,47 @@ mod tests {
             ],
         );
         assert_eq!(ties.candidates[0].logical_path, "src/aame");
+    }
+
+    #[test]
+    fn capped_candidate_scan_is_suppressed_even_when_raw_entries_are_rejected() {
+        fn simulate_scan(
+            entries: impl IntoIterator<Item = usize>,
+            rejected_index: usize,
+        ) -> (RankedFileCandidates, usize) {
+            let mut scanned = 0;
+            let mut rejected_seen = false;
+            let mut candidates = Vec::new();
+            for index in entries {
+                if scanned == 256 {
+                    break;
+                }
+                scanned += 1;
+                if index == rejected_index {
+                    rejected_seen = true;
+                    continue;
+                }
+                candidates.push(FileTargetCandidate {
+                    logical_path: format!("src/noise-{index:03}.txt"),
+                    kind: FileTargetKind::File,
+                });
+            }
+            assert!(rejected_seen, "simulated file_type failure was not scanned");
+            (
+                rank_scanned_file_candidates("noise-299.txt", candidates, scanned == 256),
+                scanned,
+            )
+        }
+
+        let (forward, forward_scanned) = simulate_scan(0..300, 0);
+        let (reverse, reverse_scanned) = simulate_scan((0..300).rev(), 299);
+
+        assert!(forward_scanned <= 256);
+        assert!(reverse_scanned <= 256);
+        assert_eq!(forward_scanned, 256);
+        assert_eq!(reverse_scanned, 256);
+        assert_eq!(forward.candidates, reverse.candidates);
+        assert!(forward.candidates.is_empty());
     }
 
     #[cfg(any(unix, windows))]
