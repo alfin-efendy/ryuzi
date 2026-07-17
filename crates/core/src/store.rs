@@ -1449,6 +1449,20 @@ fn migrations() -> Migrations<'static> {
                updated_at INTEGER NOT NULL\
              );",
         ),
+        // 43: persist the nullable archive timestamp for sessions. The pragma
+        // guard keeps replay against an already-upgraded database convergent.
+        M::up_with_hook("", |tx: &rusqlite::Transaction<'_>| {
+            let has_archived_at = tx
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name='archived_at'")?
+                .exists([])?;
+            if !has_archived_at {
+                tx.execute(
+                    "ALTER TABLE sessions ADD COLUMN archived_at INTEGER",
+                    [],
+                )?;
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -2191,7 +2205,55 @@ impl Store {
         .await
     }
 
-    /// Set a session's title (used by the native runtime's title generation).
+    /// Archive a session exactly once by setting its archive timestamp.
+    pub async fn archive_session(
+        &self,
+        session_pk: &str,
+        archived_at: i64,
+    ) -> anyhow::Result<bool> {
+        let session_pk = session_pk.to_string();
+        let updated = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE sessions SET archived_at=?2 WHERE session_pk=?1 AND archived_at IS NULL",
+                    params![session_pk, archived_at],
+                )
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// Restore a session only when it is currently archived.
+    pub async fn restore_session(&self, session_pk: &str) -> anyhow::Result<bool> {
+        let session_pk = session_pk.to_string();
+        let updated = self
+            .with_conn(move |c| {
+                c.execute(
+                    "UPDATE sessions SET archived_at=NULL WHERE session_pk=?1 AND archived_at IS NOT NULL",
+                    params![session_pk],
+                )
+            })
+            .await?;
+        Ok(updated == 1)
+    }
+
+    /// Return a session's archive timestamp, distinguishing an unknown session
+    /// from a known session that has not been archived.
+    pub async fn session_archived_at(&self, session_pk: &str) -> anyhow::Result<Option<i64>> {
+        let session_pk = session_pk.to_string();
+        let archived_at = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT archived_at FROM sessions WHERE session_pk=?1",
+                    params![session_pk],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+            })
+            .await?;
+        archived_at.ok_or_else(|| anyhow::anyhow!("unknown session"))
+    }
+
     pub async fn set_session_title(&self, pk: &str, title: &str) -> anyhow::Result<()> {
         let pk = pk.to_string();
         let title = title.to_string();
@@ -5093,6 +5155,24 @@ impl Store {
         Ok(u64::try_from(total).unwrap_or(0))
     }
 
+    /// Update artifacts originating from a session only when they currently have
+    /// the exact `from` status, returning the number of changed rows.
+    pub async fn set_source_artifact_status(
+        &self,
+        source_session_pk: &str,
+        from: ArtifactStatus,
+        to: ArtifactStatus,
+    ) -> anyhow::Result<usize> {
+        let source_session_pk = source_session_pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE artifacts SET status=?3 WHERE source_session_pk=?1 AND status=?2",
+                params![source_session_pk, from.as_db(), to.as_db()],
+            )
+        })
+        .await
+    }
+
     /// Mark every non-deleted artifact originated by `source_session_pk` as
     /// deleted, stamping `deleted_at`, and return the updated rows. Intended
     /// for use when a session (and thus its content root) is destroyed.
@@ -5306,7 +5386,7 @@ fn row_to_message(r: &Row) -> rusqlite::Result<Message> {
 }
 
 const SESSION_COLS: &str =
-    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk,primary_agent_id,primary_agent_snapshot";
+    "session_pk,project_id,agent_session_id,worktree_path,branch,title,status,created_at,last_active,started_by,resume_attempts,branch_owned,perm_mode,kind,speaker,agent,parent_session_pk,primary_agent_id,primary_agent_snapshot,archived_at";
 
 fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
     let snapshot: Option<String> = r.get(18)?;
@@ -5338,7 +5418,7 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         speaker: r.get(14)?,
         agent: r.get(15)?,
         parent_session_pk: r.get(16)?,
-        archived_at: None,
+        archived_at: r.get(19)?,
     })
 }
 
@@ -5568,7 +5648,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -5631,7 +5711,7 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
 
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
@@ -5639,7 +5719,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 42);
+        assert_eq!(reopened_version, 43);
     }
 
     #[tokio::test]
@@ -5660,7 +5740,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -5704,7 +5784,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
     }
 
     #[tokio::test]
@@ -7563,7 +7643,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 42, "forward migration must land at v42");
+        assert_eq!(user_version, 43, "forward migration must land at v43");
     }
 
     #[tokio::test]
@@ -8197,15 +8277,16 @@ mod tests {
         // attempts; 37 session_automation_origins plus compatibility queue
         // repair; 38 session ownership and agent runs; 39 agentic cleanup;
         // 40 durable dispatch linkage; 41 removes session-wide tool-call
-        // uniqueness; 42 artifacts/artifact_references/artifact_storage_jobs —
-        // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
+        // uniqueness; 42 artifacts/artifact_references/artifact_storage_jobs;
+        // 43 sessions.archived_at — all convergent, existence-guarded, or
+        // CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 42
-        // defined, wind back thirty.
+        // this test starts failing its assertions). With migrations through 43
+        // defined, wind back thirty-one.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -8266,8 +8347,8 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail
-        // migrations 22–42) replay against it. Back TWENTY-TWO: the fully
-        // migrated tail is now v42, so rewinding to v20 is what makes
+        // migrations 22–43) replay against it. Back TWENTY-THREE: the fully
+        // migrated tail is now v43, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
@@ -8409,7 +8490,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 42, "forward migration must land at v42");
+        assert_eq!(uv, 43, "forward migration must land at v43");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -8435,7 +8516,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 42, "forward migration must land at v42");
+        assert_eq!(uv, 43, "forward migration must land at v43");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
@@ -9871,6 +9952,92 @@ mod tests {
             parent_reference_id: None,
             created_at: 1_700_000_000_100,
         }
+    }
+
+    #[tokio::test]
+    async fn archive_session_persists_idempotently_and_reports_missing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap();
+
+        assert_eq!(store.session_archived_at("s1").await.unwrap(), None);
+        assert!(store
+            .archive_session("s1", 1_700_000_000_000)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.session_archived_at("s1").await.unwrap(),
+            Some(1_700_000_000_000)
+        );
+        assert!(!store
+            .archive_session("s1", 1_700_000_000_001)
+            .await
+            .unwrap());
+        assert!(store.restore_session("s1").await.unwrap());
+        assert_eq!(store.session_archived_at("s1").await.unwrap(), None);
+        assert!(!store.restore_session("s1").await.unwrap());
+
+        let err = store.session_archived_at("missing").await.unwrap_err();
+        assert_eq!(err.to_string(), "unknown session");
+    }
+
+    #[tokio::test]
+    async fn source_artifact_status_updates_only_exact_transitions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        for (id, status) in [
+            ("art-available", ArtifactStatus::Available),
+            ("art-archived", ArtifactStatus::SourceArchived),
+            ("art-deleted", ArtifactStatus::Deleted),
+        ] {
+            store
+                .insert_artifact(&sample_artifact(id, "s1", status))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .set_source_artifact_status(
+                    "s1",
+                    ArtifactStatus::Available,
+                    ArtifactStatus::SourceArchived,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .set_source_artifact_status(
+                    "s1",
+                    ArtifactStatus::SourceArchived,
+                    ArtifactStatus::Available,
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .artifact_by_id("art-deleted")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ArtifactStatus::Deleted
+        );
+        assert_eq!(
+            store
+                .set_source_artifact_status(
+                    "s1",
+                    ArtifactStatus::Available,
+                    ArtifactStatus::SourceArchived,
+                )
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]
