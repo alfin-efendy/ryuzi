@@ -166,13 +166,20 @@ const routeTargetCapabilities: ModelRouteTargetCapability[] = [
   {
     provider: "openai",
     model: "gpt-4.1",
+    contextWindow: 128_000,
     supported: [
       { value: "low", label: "Low", description: null },
       { value: "high", label: "High", description: null },
     ],
     providerDefault: null,
   },
-  { provider: "openai", model: "o3", supported: [{ value: "high", label: "High", description: null }], providerDefault: null },
+  {
+    provider: "openai",
+    model: "o3",
+    contextWindow: 200_000,
+    supported: [{ value: "high", label: "High", description: null }],
+    providerDefault: null,
+  },
 ];
 const historicalEffortCapabilities: ModelRouteTargetCapability[] = [
   { ...routeTargetCapabilities[0]!, supported: [{ value: "low", label: "Low", description: null }] },
@@ -820,6 +827,21 @@ test("route target dropdown collapses anthropic + anthropic-oauth accounts shari
   fireEvent.click(screen.getByRole("combobox", { name: "Target 1" }));
   expect(await screen.findAllByRole("option", { name: sharedModel })).toHaveLength(1);
   expect(screen.getByText("Anthropic")).toBeTruthy();
+});
+
+test("route cards show target context windows alongside effort overrides", async () => {
+  useModelRoutes.setState({
+    routes: [{ ...routes[0]!, targets: [{ provider: "openai", model: "gpt-4.1", effort: "high" }] }],
+    targetCapabilities: [{ ...routeTargetCapabilities[0]! }],
+    targetCapabilitiesLoaded: true,
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Route" }));
+
+  expect(screen.getByText("gpt-4.1: 128K context")).toBeTruthy();
+  expect(screen.getByText("High override")).toBeTruthy();
 });
 
 test("route target effort picker exposes only model default and exact capability options", async () => {

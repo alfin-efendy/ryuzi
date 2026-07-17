@@ -45,6 +45,7 @@ beforeEach(() => {
         {
           seq: 1,
           sessionPk: "s1",
+          runId: null,
           role: "assistant",
           blockType: "text",
           payload: { text: "The complete child transcript" },
@@ -150,6 +151,7 @@ test("renders a grandchild dispatch card inside the child transcript", () => {
         {
           seq: 1,
           sessionPk: "s1",
+          runId: null,
           role: "assistant",
           blockType: "tool_call",
           payload: { name: "task", input: { prompt: "Inspect nested work" } },

@@ -1950,7 +1950,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
 /**
  * A durable transcript row owned by a non-primary agent run.
  */
@@ -2160,7 +2160,12 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry, one row per native-runtime event block.
  */
-export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
+export type Message = { sessionPk: string; seq: number;
+/**
+ * The durable agent-run owner when this row was emitted by a run. Rows
+ * created outside a run (for example startup notices) remain unowned.
+ */
+runId: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
  * Legacy group-chat attribution retained so existing databases and event
  * payloads remain readable. New message constructors leave it unset.
@@ -2187,7 +2192,7 @@ provider: string; model: string;
  * Explicit effort policy; `None` uses the model default.
  */
 effort?: string | null }
-export type ModelRouteTargetCapability = { provider: string; model: string; supported: ReasoningEffortOption[]; providerDefault: string | null }
+export type ModelRouteTargetCapability = { provider: string; model: string; contextWindow: number; supported: ReasoningEffortOption[]; providerDefault: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.

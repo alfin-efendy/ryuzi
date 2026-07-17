@@ -534,8 +534,14 @@ export const DELETED_OWNER_MESSAGE = {
  * Route tab's target picker (routeTargetOptions) resolves two real targets
  * without any per-test override. */
 export const ROUTE_TARGET_CAPABILITIES = [
-  { provider: "fixture", model: "model-alpha", supported: [{ value: "high", label: "High", description: null }], providerDefault: null },
-  { provider: "fixture", model: "model-beta", supported: [], providerDefault: null },
+  {
+    provider: "fixture",
+    model: "model-alpha",
+    contextWindow: 128000,
+    supported: [{ value: "high", label: "High", description: null }],
+    providerDefault: null,
+  },
+  { provider: "fixture", model: "model-beta", contextWindow: 128000, supported: [], providerDefault: null },
 ] satisfies ModelRouteTargetCapability[];
 
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
