@@ -2,9 +2,13 @@
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::file_reference::{
-    normalize_resolved_path, resolve_pinned_workspace_reference, resolve_workspace_reference,
+    normalize_resolved_path, path_unavailable, preflight_file_target,
+    recheck_preflight_file_target, resolve_pinned_workspace_reference, resolve_workspace_reference,
+    ExpectedFileKind, PinnedFileTarget,
 };
-use crate::harness::native::tool_contract::{NormalizedInput, ToolError, ToolInputCtx};
+use crate::harness::native::tool_contract::{
+    NormalizedInput, PreflightMeta, ToolError, ToolInputCtx,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -36,8 +40,12 @@ fn normalize_ls_input(ctx: &ToolInputCtx<'_>, input: Value) -> Result<Normalized
     Ok(normalized)
 }
 
-fn prepare_ls_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
+async fn prepare_ls_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
     let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.preflight_file_target.as_ref() {
+        let resolved = recheck_preflight_file_target(&input_ctx, target).await?;
+        return Ok((input, resolved.resolved_path));
+    }
     if let Some(target) = ctx.pinned_file_reference.as_ref() {
         return resolve_pinned_workspace_reference(&input_ctx, target)
             .map(|resolved| (input, resolved));
@@ -78,22 +86,46 @@ impl Tool for Ls {
     ) -> Result<NormalizedInput, ToolError> {
         normalize_ls_input(ctx, input)
     }
+    async fn preflight(
+        &self,
+        ctx: &ToolInputCtx<'_>,
+        _input: &Value,
+        pinned_file_reference: Option<&PinnedFileTarget>,
+    ) -> Result<PreflightMeta, ToolError> {
+        let target = pinned_file_reference.ok_or_else(|| {
+            ToolError::precondition("invalid_path_reference", "File target is not pinned")
+        })?;
+        PreflightMeta::default().with_prepared_file_target(
+            preflight_file_target(ctx, target, ExpectedFileKind::Directory).await?,
+        )
+    }
     fn permission(&self, input: &Value) -> PermissionSpec {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         PermissionSpec::new("read", format!("list {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let (input, resolved_path) = match prepare_ls_execution(ctx, input) {
+        let (input, resolved_path) = match prepare_ls_execution(ctx, input).await {
             Ok(prepared) => prepared,
             Err(error) => return Ok(ToolOutput::from_error(error)),
         };
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let mut rd = match tokio::fs::read_dir(&resolved_path).await {
             Ok(r) => r,
-            Err(e) => return Ok(ToolOutput::error(format!("ls: {path}: {e}"))),
+            Err(error) if ctx.preflight_file_target.is_some() => {
+                return Ok(ToolOutput::from_error(path_unavailable(&error)));
+            }
+            Err(error) => return Ok(ToolOutput::error(format!("ls: {path}: {error}"))),
         };
         let mut entries: Vec<String> = Vec::new();
-        while let Ok(Some(entry)) = rd.next_entry().await {
+        loop {
+            let entry = match rd.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) if ctx.preflight_file_target.is_some() => {
+                    return Ok(ToolOutput::from_error(path_unavailable(&error)));
+                }
+                Err(_) => break,
+            };
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             entries.push(if is_dir { format!("{name}/") } else { name });
@@ -191,5 +223,57 @@ mod tests {
         let out = Ls.execute(&ctx, normalized.value).await.unwrap();
         assert!(!out.is_error, "{}", out.for_model);
         assert_eq!(out.for_model, "item.txt");
+    }
+
+    #[tokio::test]
+    async fn v2_preflight_rejects_file_with_stable_windows_safe_error() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".git"), "file").unwrap();
+        let ctx = ctx_at(root.path()).await;
+        let normalized = Ls
+            .normalize_input(&input_context(&ctx), json!({"path": ".git"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap();
+
+        let error = Ls
+            .preflight(&input_context(&ctx), &normalized.value, Some(pin))
+            .await
+            .unwrap_err();
+        let serialized = serde_json::to_string(&error).unwrap();
+
+        assert_eq!(error.code, "expected_directory");
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["actual_kind"], "file");
+        assert_eq!(details["suggested_tool"], "read");
+        assert!(!serialized.contains("os error 267"));
+        assert!(!serialized.contains(&root.path().to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    async fn prepared_ls_target_detects_existence_race() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        let mut ctx = ctx_at(root.path()).await;
+        let normalized = Ls
+            .normalize_input(&input_context(&ctx), json!({"path": "folder"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap().clone();
+        let preflight = Ls
+            .preflight(&input_context(&ctx), &normalized.value, Some(&pin))
+            .await
+            .unwrap();
+        ctx.pinned_file_reference = Some(pin);
+        ctx.preflight_file_target = preflight.prepared_file_target().cloned();
+
+        std::fs::remove_dir(root.path().join("folder")).unwrap();
+        let out = Ls.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("file_precondition_changed")
+        );
     }
 }

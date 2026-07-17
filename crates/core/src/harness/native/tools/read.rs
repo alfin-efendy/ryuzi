@@ -2,10 +2,12 @@
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::file_reference::{
-    normalize_resolved_path, resolve_pinned_read_reference, resolve_read_reference,
+    normalize_resolved_path, path_unavailable, preflight_file_target,
+    recheck_preflight_file_target, resolve_pinned_read_reference, resolve_read_reference,
+    ExpectedFileKind, PinnedFileTarget,
 };
 use crate::harness::native::tool_contract::{
-    NormalizedInput, ToolError, ToolErrorStrategy, ToolFieldError, ToolInputCtx,
+    NormalizedInput, PreflightMeta, ToolError, ToolErrorStrategy, ToolFieldError, ToolInputCtx,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -64,6 +66,14 @@ fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
     }
 }
 
+fn read_io_error(ctx: &ToolCtx, path: &str, error: &std::io::Error) -> ToolOutput {
+    if ctx.preflight_file_target.is_some() {
+        ToolOutput::from_error(path_unavailable(error))
+    } else {
+        ToolOutput::error(format!("read: {path}: {error}"))
+    }
+}
+
 fn normalize_read_input(
     ctx: &ToolInputCtx<'_>,
     input: Value,
@@ -100,8 +110,15 @@ fn normalize_read_input(
     Ok(normalized)
 }
 
-fn prepare_read_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
+async fn prepare_read_execution(
+    ctx: &ToolCtx,
+    input: Value,
+) -> Result<(Value, PathBuf), ToolError> {
     let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.preflight_file_target.as_ref() {
+        let resolved = recheck_preflight_file_target(&input_ctx, target).await?;
+        return Ok((input, resolved.resolved_path));
+    }
     if let Some(target) = ctx.pinned_file_reference.as_ref() {
         return resolve_pinned_read_reference(&input_ctx, target).map(|resolved| (input, resolved));
     }
@@ -149,12 +166,25 @@ impl Tool for Read {
     ) -> Result<NormalizedInput, ToolError> {
         normalize_read_input(ctx, input)
     }
+    async fn preflight(
+        &self,
+        ctx: &ToolInputCtx<'_>,
+        _input: &Value,
+        pinned_file_reference: Option<&PinnedFileTarget>,
+    ) -> Result<PreflightMeta, ToolError> {
+        let target = pinned_file_reference.ok_or_else(|| {
+            ToolError::precondition("invalid_path_reference", "File target is not pinned")
+        })?;
+        PreflightMeta::default().with_prepared_file_target(
+            preflight_file_target(ctx, target, ExpectedFileKind::File).await?,
+        )
+    }
     fn permission(&self, input: &Value) -> PermissionSpec {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         PermissionSpec::new("read", format!("read {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let (input, resolved_path) = match prepare_read_execution(ctx, input) {
+        let (input, resolved_path) = match prepare_read_execution(ctx, input).await {
             Ok(prepared) => prepared,
             Err(error) => return Ok(ToolOutput::from_error(error)),
         };
@@ -176,7 +206,7 @@ async fn finish_read(
 ) -> anyhow::Result<ToolOutput> {
     let meta = match tokio::fs::metadata(resolved).await {
         Ok(m) => m,
-        Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+        Err(error) => return Ok(read_io_error(ctx, path, &error)),
     };
     if let Some(media_type) = image_media_type_for_ext(path) {
         if meta.len() > IMAGE_READ_MAX_BYTES {
@@ -194,7 +224,7 @@ async fn finish_read(
         use base64::Engine as _;
         let bytes = match tokio::fs::read(resolved).await {
             Ok(b) => b,
-            Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+            Err(error) => return Ok(read_io_error(ctx, path, &error)),
         };
         match sniff_image_media_type(&bytes) {
             Some(sniffed) if sniffed == media_type => {}
@@ -228,7 +258,7 @@ async fn finish_read(
     }
     let content = match tokio::fs::read_to_string(resolved).await {
         Ok(c) => c,
-        Err(e) => return Ok(ToolOutput::error(format!("read: {path}: {e}"))),
+        Err(error) => return Ok(read_io_error(ctx, path, &error)),
     };
     let offset = input
         .get("offset")
@@ -405,6 +435,92 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn v2_preflight_rejects_directory_before_execution() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        let ctx = ctx_at(root.path()).await;
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "folder"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap();
+
+        let error = Read
+            .preflight(&input_ctx(&ctx), &normalized.value, Some(pin))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "expected_file");
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["actual_kind"], "directory");
+        assert_eq!(details["suggested_tool"], "ls");
+    }
+
+    #[tokio::test]
+    async fn prepared_read_target_detects_kind_race_without_attachment_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("same"), "workspace").unwrap();
+        std::fs::write(attachments.path().join("same"), "attachment-secret").unwrap();
+        let mut ctx = ctx_at(root.path()).await;
+        ctx.attachments_dir = Some(attachments.path().to_path_buf());
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "same"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap().clone();
+        let preflight = Read
+            .preflight(&input_ctx(&ctx), &normalized.value, Some(&pin))
+            .await
+            .unwrap();
+        ctx.pinned_file_reference = Some(pin);
+        ctx.preflight_file_target = preflight.prepared_file_target().cloned();
+
+        std::fs::remove_file(root.path().join("same")).unwrap();
+        std::fs::create_dir(root.path().join("same")).unwrap();
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("file_precondition_changed")
+        );
+        assert!(!out.for_model.contains("attachment-secret"));
+    }
+
+    #[tokio::test]
+    async fn v2_post_preflight_io_error_is_stable_and_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
+        let mut ctx = ctx_at(root.path()).await;
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "invalid.txt"}))
+            .unwrap();
+        let pin = normalized.pinned_file_reference().unwrap().clone();
+        let preflight = Read
+            .preflight(&input_ctx(&ctx), &normalized.value, Some(&pin))
+            .await
+            .unwrap();
+        ctx.pinned_file_reference = Some(pin);
+        ctx.preflight_file_target = preflight.prepared_file_target().cloned();
+
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("path_unavailable")
+        );
+        assert!(!out.for_model.contains("UTF-8"));
+        assert!(!out.for_model.contains("os error"));
+        assert!(!out
+            .for_model
+            .contains(&root.path().to_string_lossy().to_string()));
     }
 
     #[tokio::test]

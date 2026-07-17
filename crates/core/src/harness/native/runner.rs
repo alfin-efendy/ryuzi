@@ -2713,7 +2713,11 @@ async fn run_tool_call(
     };
     let preflight = match validated
         .tool
-        .preflight(&input_context, &validated.input)
+        .preflight(
+            &input_context,
+            &validated.input,
+            validated.pinned_file_reference.as_ref(),
+        )
         .await
     {
         Ok(preflight) => preflight,
@@ -2748,6 +2752,7 @@ async fn run_tool_call(
         validated,
         preflight,
     } = prepared;
+    let (preflight_metadata, preflight_file_target) = preflight.into_parts();
     execute_tool_call(
         deps,
         agent,
@@ -2756,12 +2761,13 @@ async fn run_tool_call(
         validated.tool,
         validated.input,
         validated.pinned_file_reference,
+        preflight_file_target,
         NativeToolsVersion::V2,
         Some(planned),
         tool_kind,
         &trace_id,
         Some(validated.normalization),
-        Some(preflight.metadata().clone()),
+        Some(preflight_metadata),
         spawn,
         cancel,
     )
@@ -2818,6 +2824,7 @@ async fn execute_tool_call(
     tool: Arc<dyn super::tools::Tool>,
     input: Value,
     pinned_file_reference: Option<super::file_reference::PinnedFileTarget>,
+    preflight_file_target: Option<super::file_reference::PreflightFileTarget>,
     version: NativeToolsVersion,
     planned: Option<&PlannedTool>,
     tool_kind: &str,
@@ -2942,6 +2949,7 @@ async fn execute_tool_call(
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         pinned_file_reference,
+        preflight_file_target,
         store: deps.store.clone(),
         cancel: cancel.clone(),
         caps: OutputCaps::default(),
@@ -3080,6 +3088,7 @@ async fn run_legacy_tool_call(
         &tool_call.name,
         tool,
         input,
+        None,
         None,
         NativeToolsVersion::V1,
         None,
@@ -4621,6 +4630,13 @@ mod tests {
         file_after_execute: Option<std::path::PathBuf>,
     }
 
+    struct FilePreflightSpyTool {
+        name: String,
+        expected: super::super::file_reference::ExpectedFileKind,
+        counters: Arc<GatewayCounters>,
+        mutation: std::path::PathBuf,
+    }
+
     struct StatefulContractNormalizer {
         name: String,
         description: String,
@@ -4760,6 +4776,9 @@ mod tests {
             &self,
             _ctx: &ToolInputCtx<'_>,
             _input: &Value,
+            _pinned_file_reference: Option<
+                &crate::harness::native::file_reference::PinnedFileTarget,
+            >,
         ) -> Result<super::super::tool_contract::PreflightMeta, ToolError> {
             self.counters
                 .preflight
@@ -4796,6 +4815,78 @@ mod tests {
             if let Some(path) = &self.file_after_execute {
                 std::fs::write(path, "handler-ran")?;
             }
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for FilePreflightSpyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "file preflight ordering spy"
+        }
+
+        fn input_schema(&self) -> Value {
+            gateway_path_schema()
+        }
+
+        fn kind(&self) -> &'static str {
+            "edit"
+        }
+
+        fn normalize_input(
+            &self,
+            ctx: &ToolInputCtx<'_>,
+            input: Value,
+        ) -> Result<super::super::tool_contract::NormalizedInput, ToolError> {
+            self.counters
+                .normalize
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::caller("invalid_path_reference", "Path is required"))?;
+            let target = super::super::file_reference::resolve_workspace_reference(ctx, path)?;
+            super::super::file_reference::normalize_resolved_path(input, &target)
+        }
+
+        async fn preflight(
+            &self,
+            ctx: &ToolInputCtx<'_>,
+            _input: &Value,
+            pinned_file_reference: Option<&super::super::file_reference::PinnedFileTarget>,
+        ) -> Result<super::super::tool_contract::PreflightMeta, ToolError> {
+            self.counters
+                .preflight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let target = pinned_file_reference.ok_or_else(|| {
+                ToolError::precondition("invalid_path_reference", "File target is not pinned")
+            })?;
+            super::super::tool_contract::PreflightMeta::default().with_prepared_file_target(
+                super::super::file_reference::preflight_file_target(ctx, target, self.expected)
+                    .await?,
+            )
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            self.counters
+                .permission
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::harness::native::tools::PermissionSpec::new("edit", "file preflight spy")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.counters
+                .execute
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(&self.mutation, "handler-ran")?;
             Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
         }
     }
@@ -8109,6 +8200,257 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_file_preflight_rejection_precedes_hooks_permission_snapshot_and_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".git");
+        let mutation = dir.path().join("handler-mutation.txt");
+        std::fs::write(&target, "requested-file-secret").unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = Arc::new(FilePreflightSpyTool {
+            name: "file_preflight_spy".into(),
+            expected: super::super::file_reference::ExpectedFileKind::Directory,
+            counters: counters.clone(),
+            mutation: mutation.clone(),
+        });
+        let input = serde_json::to_string(&json!({"path": target})).unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "preflight-wrong-kind", "file_preflight_spy"),
+                input_json_delta(0, &input),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        let telemetry = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = telemetry.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["file_preflight_spy".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.normalize.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters.preflight.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(hook_calls.calls.lock().unwrap().is_empty());
+        assert!(deps.snapshots.lock().await.is_empty());
+        assert!(!mutation.exists());
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "expected_directory");
+        assert_eq!(envelope["error"]["details"]["actual_kind"], "file");
+        assert_eq!(envelope["error"]["details"]["suggested_tool"], "read");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let rendered = serde_json::to_string(&(turns, rows)).unwrap();
+        let telemetry = telemetry.lock().unwrap().join("\n");
+        let host_root = dir.path().to_string_lossy();
+        for unsafe_text in ["os error 267", "requested-file-secret", host_root.as_ref()] {
+            assert!(
+                !rendered.contains(unsafe_text),
+                "persisted leak: {unsafe_text}"
+            );
+            assert!(
+                !telemetry.contains(unsafe_text),
+                "telemetry leak: {unsafe_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_missing_file_candidate_is_advisory_and_requested_path_stays_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("apps/cockpit/src");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("store-navigation.test.ts"), "candidate-secret").unwrap();
+        let requested = "apps/cockpit/src/store-navigation.ts";
+        let mutation = dir.path().join("must-not-run");
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = Arc::new(FilePreflightSpyTool {
+            name: "missing_file_preflight_spy".into(),
+            expected: super::super::file_reference::ExpectedFileKind::File,
+            counters: counters.clone(),
+            mutation: mutation.clone(),
+        });
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "preflight-missing", "missing_file_preflight_spy"),
+                input_json_delta(
+                    0,
+                    &serde_json::to_string(&json!({"path": requested})).unwrap(),
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let hooks = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hooks.clone());
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["missing_file_preflight_spy".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "path_not_found");
+        assert_eq!(
+            envelope["error"]["details"]["effective_root"],
+            "worktree/apps/cockpit/src"
+        );
+        assert_eq!(
+            envelope["error"]["candidates"][0],
+            json!({
+                "path": "apps/cockpit/src/store-navigation.test.ts",
+                "kind": "file"
+            })
+        );
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|message| message.block_type == "tool_call")
+            .unwrap();
+        assert_eq!(row.payload["input"]["path"], requested);
+        assert!(!parent.join("store-navigation.ts").exists());
+        assert!(hooks.calls.lock().unwrap().is_empty());
+        assert!(deps.snapshots.lock().await.is_empty());
+        assert!(!mutation.exists());
+        assert_eq!(
+            counters.normalize.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters.preflight.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(!serde_json::to_string(&(turns, rows))
+            .unwrap()
+            .contains("candidate-secret"));
+    }
+
+    #[tokio::test]
+    async fn v2_earlier_write_makes_later_read_preflight_succeed_just_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "jit-write", "write"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"created.txt","content":"created by earlier sibling\n"}"#,
+                ),
+                tool_use_start(1, "jit-read", "read"),
+                input_json_delta(1, r#"{"path":"created.txt","offset":null,"limit":null}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["write".into(), "read".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let results = turns
+            .iter()
+            .find(|turn| {
+                turn.role == "user"
+                    && turn
+                        .payload
+                        .as_array()
+                        .is_some_and(|payload| payload.len() == 2)
+            })
+            .unwrap();
+        let read: Value =
+            serde_json::from_str(results.payload[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(read["ok"], true, "{read}");
+        assert!(read["data"]
+            .as_str()
+            .unwrap()
+            .contains("created by earlier sibling"));
+    }
+
+    #[tokio::test]
     async fn mixed_valid_and_invalid_tool_calls_keep_ledger_valid() {
         let dir = tempfile::tempdir().unwrap();
         let counters = Arc::new(GatewayCounters::default());
@@ -9216,7 +9558,14 @@ mod tests {
         )
         .await;
         let envelope: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
-        assert_eq!(envelope["error"]["code"], "file_reference_changed");
+        assert_eq!(envelope["error"]["code"], "path_not_found");
+        assert_eq!(
+            envelope["error"]["details"],
+            json!({
+                "expected_kind": "file",
+                "effective_root": "worktree"
+            })
+        );
         assert!(!result.to_string().contains("attachment-secret"));
     }
 

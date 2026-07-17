@@ -216,8 +216,38 @@ pub struct ToolError {
     pub retryable: bool,
     pub strategy: Option<ToolErrorStrategy>,
     pub field_errors: Box<Vec<ToolFieldError>>,
-    pub candidates: Box<Vec<String>>,
+    pub candidates: Box<Vec<ToolErrorCandidate>>,
     pub details: Option<Box<Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolErrorCandidate {
+    Token(String),
+    File { path: String, kind: String },
+}
+
+impl From<String> for ToolErrorCandidate {
+    fn from(value: String) -> Self {
+        Self::Token(value)
+    }
+}
+
+impl From<&str> for ToolErrorCandidate {
+    fn from(value: &str) -> Self {
+        Self::Token(value.to_string())
+    }
+}
+
+impl PartialEq<String> for ToolErrorCandidate {
+    fn eq(&self, other: &String) -> bool {
+        matches!(self, Self::Token(value) if value == other)
+    }
+}
+
+impl PartialEq<ToolErrorCandidate> for String {
+    fn eq(&self, other: &ToolErrorCandidate) -> bool {
+        other == self
+    }
 }
 
 impl ToolError {
@@ -279,7 +309,26 @@ impl ToolError {
     pub fn with_candidate(mut self, candidate: impl Into<String>) -> Self {
         if self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES {
             self.candidates
-                .push(stable_error_candidate(&candidate.into()));
+                .push(ToolErrorCandidate::Token(stable_error_candidate(
+                    &candidate.into(),
+                )));
+        }
+        self
+    }
+
+    pub fn with_file_candidate(mut self, path: impl Into<String>, kind: impl Into<String>) -> Self {
+        if self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES {
+            let path = path.into();
+            let kind = kind.into();
+            if let (Some(path), Some(kind)) = (
+                stable_file_candidate_path(&path),
+                stable_file_candidate_kind(&kind),
+            ) {
+                self.candidates.push(ToolErrorCandidate::File {
+                    path,
+                    kind: kind.to_string(),
+                });
+            }
         }
         self
     }
@@ -311,7 +360,7 @@ impl Serialize for ToolError {
             .candidates
             .iter()
             .take(MAX_TOOL_ERROR_CANDIDATES)
-            .map(|candidate| stable_error_candidate(candidate))
+            .filter_map(stable_error_candidate_value)
             .collect::<Vec<_>>();
         let mut stable = json!({
             "code": stable_error_code(&self.code),
@@ -351,7 +400,7 @@ impl<'de> Deserialize<'de> for ToolError {
             #[serde(default)]
             field_errors: Vec<ToolFieldError>,
             #[serde(default)]
-            candidates: Vec<String>,
+            candidates: Vec<Value>,
             #[serde(default)]
             details: Option<Value>,
         }
@@ -367,7 +416,18 @@ impl<'de> Deserialize<'de> for ToolError {
             error = error.with_field_error(field_error);
         }
         for candidate in raw.candidates.into_iter().take(MAX_TOOL_ERROR_CANDIDATES) {
-            error = error.with_candidate(candidate);
+            match candidate {
+                Value::String(token) => error = error.with_candidate(token),
+                Value::Object(candidate) => {
+                    if let (Some(path), Some(kind)) = (
+                        candidate.get("path").and_then(Value::as_str),
+                        candidate.get("kind").and_then(Value::as_str),
+                    ) {
+                        error = error.with_file_candidate(path, kind);
+                    }
+                }
+                _ => {}
+            }
         }
         if let Some(details) = raw.details {
             error = error.with_details(details);
@@ -403,6 +463,11 @@ fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
         "unsupported_open_object_schema" => "Tool input schema is not supported",
         "tool_contract_too_large" => "Tool contract exceeds a safety limit",
         "path_kind_mismatch" => "Path kind does not match the tool contract",
+        "expected_file" => "Expected a file",
+        "expected_directory" => "Expected a directory",
+        "path_not_found" => "Path was not found",
+        "path_unavailable" => "Path is unavailable",
+        "file_precondition_changed" => "File target changed after preflight",
         "invalid_path_reference" => "File path reference is invalid",
         "conflicting_file_location" => "File location conflicts with explicit arguments",
         "tool_not_in_plan" => "Tool is not part of this run's frozen facade",
@@ -466,6 +531,50 @@ fn stable_error_candidate(candidate: &str) -> String {
     }
 }
 
+fn stable_error_candidate_value(candidate: &ToolErrorCandidate) -> Option<Value> {
+    match candidate {
+        ToolErrorCandidate::Token(token) => Some(Value::String(stable_error_candidate(token))),
+        ToolErrorCandidate::File { path, kind } => Some(json!({
+            "path": stable_file_candidate_path(path)?,
+            "kind": stable_file_candidate_kind(kind)?,
+        })),
+    }
+}
+
+fn stable_file_candidate_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "file" => Some("file"),
+        "directory" => Some("directory"),
+        "symlink" => Some("symlink"),
+        "other" => Some("other"),
+        _ => None,
+    }
+}
+
+fn stable_file_candidate_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    let windows_absolute =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    if normalized.is_empty()
+        || normalized.len() > MAX_FILE_REFERENCE_PATH_BYTES
+        || normalized.starts_with('/')
+        || normalized.starts_with("//")
+        || windows_absolute
+        || Path::new(&normalized).components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
 fn typed_error_details(value: &Value) -> Option<Value> {
     let object = value.as_object()?;
     if let Some(reason) = object.get("reason").and_then(Value::as_str) {
@@ -503,7 +612,53 @@ fn typed_error_details(value: &Value) -> Option<Value> {
             "actual_kind": actual_kind,
         }));
     }
+    if let Some(expected_kind) = object.get("expected_kind").and_then(Value::as_str) {
+        let expected_kind = match expected_kind {
+            "file" | "directory" => expected_kind,
+            _ => return None,
+        };
+        let mut details = Map::new();
+        details.insert("expected_kind".to_string(), json!(expected_kind));
+        if let Some(actual_kind) = object.get("actual_kind").and_then(Value::as_str) {
+            let actual_kind = stable_file_candidate_kind(actual_kind)?;
+            details.insert("actual_kind".to_string(), json!(actual_kind));
+        }
+        if let Some(suggested_tool) = object.get("suggested_tool").and_then(Value::as_str) {
+            let suggested_tool = match suggested_tool {
+                "read" | "ls" => suggested_tool,
+                _ => return None,
+            };
+            details.insert("suggested_tool".to_string(), json!(suggested_tool));
+        }
+        if let Some(effective_root) = object.get("effective_root").and_then(Value::as_str) {
+            let effective_root = stable_effective_root(effective_root)?;
+            details.insert("effective_root".to_string(), json!(effective_root));
+        }
+        if details.len() > 1 {
+            return Some(Value::Object(details));
+        }
+    }
     None
+}
+
+fn stable_effective_root(root: &str) -> Option<String> {
+    let normalized = root.replace('\\', "/");
+    let allowed = normalized == "worktree"
+        || normalized == "attachments"
+        || normalized.starts_with("worktree/")
+        || normalized.starts_with("attachments/")
+        || normalized.starts_with("skills/");
+    if !allowed || normalized.len() > MAX_FILE_REFERENCE_PATH_BYTES {
+        return None;
+    }
+    let suffix = normalized
+        .strip_prefix("worktree/")
+        .or_else(|| normalized.strip_prefix("attachments/"))
+        .or_else(|| normalized.strip_prefix("skills/"));
+    if suffix.is_some_and(|suffix| stable_file_candidate_path(suffix).is_none()) {
+        return None;
+    }
+    Some(normalized)
 }
 
 pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
@@ -1228,6 +1383,8 @@ impl NormalizedInput {
 pub struct PreflightMeta {
     #[serde(default, skip_serializing_if = "ToolMetadata::is_empty")]
     metadata: ToolMetadata,
+    #[serde(skip)]
+    prepared_file_target: Option<super::file_reference::PreflightFileTarget>,
 }
 
 impl PreflightMeta {
@@ -1238,6 +1395,36 @@ impl PreflightMeta {
     pub fn with_metadata(mut self, entry: ToolMetadataEntry) -> Result<Self, ToolError> {
         self.metadata.insert(entry)?;
         Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_file_target(
+        &self,
+    ) -> Option<&super::file_reference::PreflightFileTarget> {
+        self.prepared_file_target.as_ref()
+    }
+
+    pub(crate) fn with_prepared_file_target(
+        mut self,
+        target: super::file_reference::PreflightFileTarget,
+    ) -> Result<Self, ToolError> {
+        if self.prepared_file_target.is_some() {
+            return Err(ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "Tool preflight has duplicate private execution state",
+            ));
+        }
+        self.prepared_file_target = Some(target);
+        Ok(self)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ToolMetadata,
+        Option<super::file_reference::PreflightFileTarget>,
+    ) {
+        (self.metadata, self.prepared_file_target)
     }
 }
 
@@ -2569,6 +2756,43 @@ mod tests {
         assert_eq!(
             serde_json::to_value(path_kind).unwrap()["details"],
             json!({"expected_directory": true, "actual_kind": "file"})
+        );
+    }
+
+    #[test]
+    fn file_error_candidates_are_typed_bounded_and_reject_host_paths() {
+        let error = ToolError::precondition("path_not_found", "missing")
+            .with_file_candidate("apps/cockpit/src/store-navigation.test.ts", "file")
+            .with_file_candidate(r"C:\Users\private\secret.txt", "file")
+            .with_file_candidate("../../private/secret.txt", "file")
+            .with_file_candidate("safe.txt", "dynamic-kind");
+        let serialized = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(
+            serialized["candidates"],
+            json!([{
+                "path": "apps/cockpit/src/store-navigation.test.ts",
+                "kind": "file"
+            }])
+        );
+        let rendered = serialized.to_string();
+        assert!(!rendered.contains("Users"));
+        assert!(!rendered.contains("private"));
+        assert!(!rendered.contains("dynamic-kind"));
+
+        let decoded: ToolError = serde_json::from_value(json!({
+            "category": "precondition",
+            "code": "path_not_found",
+            "candidates": [
+                {"path": "safe/nearby.rs", "kind": "file"},
+                {"path": "/host/secret", "kind": "file"},
+                {"path": "safe/other", "kind": "unknown"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["candidates"],
+            json!([{"path": "safe/nearby.rs", "kind": "file"}])
         );
     }
 }

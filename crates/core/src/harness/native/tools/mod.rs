@@ -342,6 +342,8 @@ pub struct ToolCtx {
     pub extra_skill_dirs: Vec<PathBuf>,
     pub(crate) pinned_file_reference:
         Option<crate::harness::native::file_reference::PinnedFileTarget>,
+    pub(crate) preflight_file_target:
+        Option<crate::harness::native::file_reference::PreflightFileTarget>,
     pub store: Arc<Store>,
     pub cancel: CancellationToken,
     pub caps: OutputCaps,
@@ -484,6 +486,7 @@ pub trait Tool: Send + Sync {
         &self,
         _ctx: &ToolInputCtx<'_>,
         _input: &Value,
+        _pinned_file_reference: Option<&crate::harness::native::file_reference::PinnedFileTarget>,
     ) -> Result<PreflightMeta, ToolError> {
         Ok(PreflightMeta::default())
     }
@@ -1086,6 +1089,7 @@ pub(crate) mod testutil {
             attachments_dir: None,
             extra_skill_dirs: vec![],
             pinned_file_reference: None,
+            preflight_file_target: None,
             store,
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
@@ -1893,7 +1897,9 @@ mod tests {
         };
 
         assert_eq!(
-            tool.preflight(&ctx, &serde_json::json!({})).await.unwrap(),
+            tool.preflight(&ctx, &serde_json::json!({}), None)
+                .await
+                .unwrap(),
             Default::default()
         );
     }

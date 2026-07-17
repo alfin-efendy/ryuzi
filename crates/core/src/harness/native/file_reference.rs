@@ -1,7 +1,7 @@
 use crate::harness::native::skills::SkillRegistry;
 use crate::harness::native::tool_contract::{
-    FileReferenceMetadata, NormalizedInput, ToolError, ToolErrorStrategy, ToolFieldError,
-    ToolInputCtx, ToolMetadataEntry, ToolMetadataToken,
+    FileReferenceMetadata, NormalizedInput, ToolError, ToolErrorCategory, ToolErrorStrategy,
+    ToolFieldError, ToolInputCtx, ToolMetadataEntry, ToolMetadataToken,
 };
 use crate::harness::native::tools::jail;
 use serde_json::Value;
@@ -46,11 +46,69 @@ pub struct ResolvedFileTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PinnedFileTarget {
+pub struct PinnedFileTarget {
     root: FileReferenceRoot,
     interpretation: FileReferenceInterpretation,
     logical_path: String,
     expected_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedFileKind {
+    File,
+    Directory,
+}
+
+impl ExpectedFileKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
+
+    const fn suggested_tool(self) -> &'static str {
+        match self {
+            Self::File => "ls",
+            Self::Directory => "read",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTargetKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+impl FileTargetKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreflightFileTarget {
+    pub(crate) target: ResolvedFileTarget,
+    pub(crate) kind: FileTargetKind,
+    pub(crate) resolved_kind: FileTargetKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileTargetCandidate {
+    logical_path: String,
+    kind: FileTargetKind,
+}
+
+struct RankedFileCandidates {
+    candidates: Vec<FileTargetCandidate>,
 }
 
 impl From<&ResolvedFileTarget> for PinnedFileTarget {
@@ -380,28 +438,44 @@ impl FilesystemProbe<'_> {
         &self,
         root: FileReferenceRoot,
         reference: &FileReference,
-        resolved_path: &Path,
+        _resolved_path: &Path,
     ) -> Option<String> {
         if root == FileReferenceRoot::SkillDirectory {
-            return Some(reference.path.clone());
+            return Some(reference.path.replace('\\', "/"));
         }
         let policy_root = match root {
             FileReferenceRoot::Workspace => self.context.work_dir,
             FileReferenceRoot::Attachments => self.context.attachments_dir?,
             FileReferenceRoot::SkillDirectory => unreachable!(),
         };
-        let canonical_root = policy_root.canonicalize().ok()?;
-        resolved_path
-            .strip_prefix(canonical_root)
-            .ok()?
-            .to_str()
-            .map(|path| {
-                if path.is_empty() {
-                    ".".to_string()
-                } else {
-                    path.to_string()
+        let reference_path = Path::new(&reference.path);
+        let logical = if reference_path.is_relative() {
+            let mut components = Vec::new();
+            for component in reference_path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::Normal(value) => components.push(value.to_os_string()),
+                    Component::ParentDir => {
+                        components.pop()?;
+                    }
+                    Component::RootDir | Component::Prefix(_) => return None,
                 }
-            })
+            }
+            components.into_iter().collect::<PathBuf>()
+        } else {
+            let canonical_root = policy_root.canonicalize().ok()?;
+            reference_path
+                .strip_prefix(&canonical_root)
+                .or_else(|_| reference_path.strip_prefix(policy_root))
+                .ok()?
+                .to_path_buf()
+        };
+        let path = logical.to_str()?;
+        if path.is_empty() {
+            Some(".".to_string())
+        } else {
+            Some(path.replace('\\', "/"))
+        }
     }
 }
 
@@ -535,6 +609,373 @@ pub(crate) fn resolve_pinned_workspace_reference(
     target: &PinnedFileTarget,
 ) -> Result<PathBuf, ToolError> {
     resolve_pinned_reference(context, target, &[FileReferenceRoot::Workspace])
+}
+
+struct ExactPinnedResolution {
+    access_path: PathBuf,
+    resolved_path: PathBuf,
+}
+
+fn exact_pinned_resolution(
+    context: &ToolInputCtx<'_>,
+    target: &PinnedFileTarget,
+) -> Result<ExactPinnedResolution, ToolError> {
+    if target.logical_path.is_empty() {
+        return Err(changed_file_reference());
+    }
+    let (root, relative) = match target.root {
+        FileReferenceRoot::Workspace => (
+            context.work_dir.to_path_buf(),
+            PathBuf::from(&target.logical_path),
+        ),
+        FileReferenceRoot::Attachments => (
+            context
+                .attachments_dir
+                .ok_or_else(changed_file_reference)?
+                .to_path_buf(),
+            PathBuf::from(&target.logical_path),
+        ),
+        FileReferenceRoot::SkillDirectory => {
+            let mut components = Path::new(&target.logical_path).components();
+            match components.next() {
+                Some(Component::Normal(prefix)) if prefix.to_str() == Some("skills") => {}
+                _ => return Err(changed_file_reference()),
+            }
+            let Some(Component::Normal(name)) = components.next() else {
+                return Err(changed_file_reference());
+            };
+            let Some(name) = name.to_str() else {
+                return Err(changed_file_reference());
+            };
+            let relative = components.as_path();
+            if relative.as_os_str().is_empty() {
+                return Err(changed_file_reference());
+            }
+            let registry = SkillRegistry::load_with(context.work_dir, context.extra_skill_dirs);
+            let skill = registry.get(name).ok_or_else(changed_file_reference)?;
+            (skill.dir.clone(), relative.to_path_buf())
+        }
+    };
+    let relative = relative.to_str().ok_or_else(changed_file_reference)?;
+    let resolved_path = jail(&root, relative).map_err(|_| changed_file_reference())?;
+    let canonical_root = root.canonicalize().map_err(|_| changed_file_reference())?;
+    Ok(ExactPinnedResolution {
+        access_path: canonical_root.join(relative),
+        resolved_path,
+    })
+}
+
+fn kind_from_metadata(metadata: &std::fs::Metadata) -> FileTargetKind {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        FileTargetKind::Symlink
+    } else if file_type.is_file() {
+        FileTargetKind::File
+    } else if file_type.is_dir() {
+        FileTargetKind::Directory
+    } else {
+        FileTargetKind::Other
+    }
+}
+
+pub(crate) fn path_unavailable(error: &std::io::Error) -> ToolError {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => ToolError::new(
+            ToolErrorCategory::Permission,
+            "path_unavailable",
+            "Path is unavailable",
+        ),
+        std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::TimedOut => {
+            ToolError::transient("path_unavailable", "Path is unavailable")
+                .with_strategy(ToolErrorStrategy::Retry)
+        }
+        _ => ToolError::precondition("path_unavailable", "Path is unavailable"),
+    }
+}
+
+fn expected_kind_error(
+    expected: ExpectedFileKind,
+    kind: FileTargetKind,
+    resolved_kind: FileTargetKind,
+) -> ToolError {
+    let code = match expected {
+        ExpectedFileKind::File => "expected_file",
+        ExpectedFileKind::Directory => "expected_directory",
+    };
+    let mut details = serde_json::json!({
+        "expected_kind": expected.as_str(),
+        "actual_kind": kind.as_str(),
+    });
+    let opposite = match expected {
+        ExpectedFileKind::File => FileTargetKind::Directory,
+        ExpectedFileKind::Directory => FileTargetKind::File,
+    };
+    if resolved_kind == opposite {
+        details["suggested_tool"] = Value::String(expected.suggested_tool().to_string());
+    }
+    ToolError::precondition(code, "Path kind does not match the tool contract")
+        .with_strategy(ToolErrorStrategy::ReviseInput)
+        .with_details(details)
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn lowercase_stem(path: &str) -> String {
+    Path::new(file_name(path))
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_else(|| file_name(path))
+        .to_lowercase()
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.to_lowercase()
+        .chars()
+        .zip(right.to_lowercase().chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn local_levenshtein(left: &str, right: &str) -> usize {
+    let left = left.to_lowercase().chars().take(128).collect::<Vec<_>>();
+    let right = right.to_lowercase().chars().take(128).collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.iter().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_char != right_char));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+fn rank_file_candidates(
+    requested_name: &str,
+    candidates: impl IntoIterator<Item = FileTargetCandidate>,
+) -> RankedFileCandidates {
+    let requested_stem = lowercase_stem(requested_name);
+    let requested_lower = file_name(requested_name).to_lowercase();
+    let mut ranked = candidates
+        .into_iter()
+        .take(256)
+        .map(|candidate| {
+            let name = file_name(&candidate.logical_path);
+            let name_lower = name.to_lowercase();
+            let score = (
+                lowercase_stem(name) == requested_stem,
+                common_prefix_len(&requested_lower, &name_lower),
+                local_levenshtein(&requested_lower, &name_lower),
+                name_lower,
+                name.to_string(),
+            );
+            (score, candidate)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left, _), (right, _)| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+    RankedFileCandidates {
+        candidates: ranked
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .take(5)
+            .collect(),
+    }
+}
+
+fn logical_parent(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("")
+        .replace('\\', "/")
+}
+
+fn effective_root(root: FileReferenceRoot, parent: &str) -> String {
+    let parent = parent.trim_matches('/');
+    match root {
+        FileReferenceRoot::Workspace if parent.is_empty() || parent == "." => {
+            "worktree".to_string()
+        }
+        FileReferenceRoot::Workspace => format!("worktree/{parent}"),
+        FileReferenceRoot::Attachments if parent.is_empty() || parent == "." => {
+            "attachments".to_string()
+        }
+        FileReferenceRoot::Attachments => format!("attachments/{parent}"),
+        FileReferenceRoot::SkillDirectory => parent.to_string(),
+    }
+}
+
+async fn missing_path_error(
+    target: &PinnedFileTarget,
+    resolution: &ExactPinnedResolution,
+    expected: ExpectedFileKind,
+) -> ToolError {
+    let mut physical_parent = resolution
+        .access_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolution.access_path.clone());
+    let mut parent = logical_parent(&target.logical_path);
+    loop {
+        match tokio::fs::symlink_metadata(&physical_parent).await {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(next_physical) = physical_parent.parent() else {
+                    break;
+                };
+                physical_parent = next_physical.to_path_buf();
+                parent = logical_parent(&parent);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let mut siblings = Vec::new();
+    if let Ok(mut directory) = tokio::fs::read_dir(&physical_parent).await {
+        let mut scanned = 0;
+        while scanned < 256 {
+            let entry = match directory.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) | Err(_) => break,
+            };
+            scanned += 1;
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let kind = match entry.file_type().await {
+                Ok(file_type) if file_type.is_symlink() => FileTargetKind::Symlink,
+                Ok(file_type) if file_type.is_file() => FileTargetKind::File,
+                Ok(file_type) if file_type.is_dir() => FileTargetKind::Directory,
+                Ok(_) => FileTargetKind::Other,
+                Err(_) => continue,
+            };
+            let logical_path = if parent.is_empty() || parent == "." {
+                name
+            } else {
+                format!("{}/{name}", parent.trim_matches('/'))
+            };
+            siblings.push(FileTargetCandidate { logical_path, kind });
+        }
+    }
+    let ranked = rank_file_candidates(file_name(&target.logical_path), siblings);
+    let mut error = ToolError::precondition("path_not_found", "Path was not found")
+        .with_strategy(ToolErrorStrategy::ReviseInput)
+        .with_details(serde_json::json!({
+            "expected_kind": expected.as_str(),
+            "effective_root": effective_root(target.root, &parent),
+        }));
+    for candidate in ranked.candidates {
+        error = error.with_file_candidate(candidate.logical_path, candidate.kind.as_str());
+    }
+    error
+}
+
+pub(crate) async fn preflight_file_target(
+    context: &ToolInputCtx<'_>,
+    target: &PinnedFileTarget,
+    expected: ExpectedFileKind,
+) -> Result<PreflightFileTarget, ToolError> {
+    let resolution = exact_pinned_resolution(context, target)?;
+    let link_metadata = match tokio::fs::symlink_metadata(&resolution.access_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(missing_path_error(target, &resolution, expected).await);
+        }
+        Err(error) => return Err(path_unavailable(&error)),
+    };
+    let kind = kind_from_metadata(&link_metadata);
+    let resolved_kind = if kind == FileTargetKind::Symlink {
+        match tokio::fs::metadata(&resolution.access_path).await {
+            Ok(metadata) => kind_from_metadata(&metadata),
+            Err(error) => return Err(path_unavailable(&error)),
+        }
+    } else {
+        kind
+    };
+    let matches = matches!(
+        (expected, resolved_kind),
+        (ExpectedFileKind::File, FileTargetKind::File)
+            | (ExpectedFileKind::Directory, FileTargetKind::Directory)
+    );
+    if !matches {
+        return Err(expected_kind_error(expected, kind, resolved_kind));
+    }
+    Ok(PreflightFileTarget {
+        target: ResolvedFileTarget {
+            reference: FileReference {
+                input_path: target.logical_path.clone(),
+                path: target.logical_path.clone(),
+                line: None,
+                column: None,
+            },
+            interpretation: target.interpretation,
+            root: target.root,
+            resolved_path: resolution.resolved_path,
+            logical_path: target.logical_path.clone(),
+            exists: true,
+        },
+        kind,
+        resolved_kind,
+    })
+}
+
+pub(crate) async fn recheck_preflight_file_target(
+    context: &ToolInputCtx<'_>,
+    prepared: &PreflightFileTarget,
+) -> Result<ResolvedFileTarget, ToolError> {
+    let pin = PinnedFileTarget::from(&prepared.target);
+    let resolution = exact_pinned_resolution(context, &pin)
+        .map_err(|_| ToolError::precondition("file_precondition_changed", "File target changed"))?;
+    let link_metadata = match tokio::fs::symlink_metadata(&resolution.access_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolError::precondition(
+                "file_precondition_changed",
+                "File target changed",
+            ));
+        }
+        Err(error) => return Err(path_unavailable(&error)),
+    };
+    let kind = kind_from_metadata(&link_metadata);
+    let resolved_kind = if kind == FileTargetKind::Symlink {
+        match tokio::fs::metadata(&resolution.access_path).await {
+            Ok(metadata) => kind_from_metadata(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolError::precondition(
+                    "file_precondition_changed",
+                    "File target changed",
+                ));
+            }
+            Err(error) => return Err(path_unavailable(&error)),
+        }
+    } else {
+        kind
+    };
+    if kind != prepared.kind
+        || resolved_kind != prepared.resolved_kind
+        || resolution.resolved_path != prepared.target.resolved_path
+    {
+        return Err(ToolError::precondition(
+            "file_precondition_changed",
+            "File target changed",
+        ));
+    }
+    Ok(prepared.target.clone())
 }
 
 pub fn normalize_resolved_path(
@@ -1038,5 +1479,223 @@ mod tests {
         let resolved = resolve_workspace_reference(&ctx, &input).unwrap();
         assert_eq!(resolved.reference.path, file.to_string_lossy());
         assert_eq!(resolved.reference.line, Some(2));
+    }
+
+    fn workspace_ctx(path: &Path) -> ToolInputCtx<'_> {
+        ToolInputCtx {
+            work_dir: path,
+            attachments_dir: None,
+            extra_skill_dirs: &[],
+        }
+    }
+
+    async fn workspace_preflight(
+        root: &Path,
+        logical_path: &str,
+        expected: ExpectedFileKind,
+    ) -> Result<PreflightFileTarget, ToolError> {
+        let ctx = workspace_ctx(root);
+        let target = resolve_workspace_reference(&ctx, logical_path)?;
+        preflight_file_target(&ctx, &PinnedFileTarget::from(&target), expected).await
+    }
+
+    #[tokio::test]
+    async fn preflight_reports_stable_wrong_kind_errors_without_os_details() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".git"), "not a directory").unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+
+        let ls_error = workspace_preflight(root.path(), ".git", ExpectedFileKind::Directory)
+            .await
+            .unwrap_err();
+        let read_error = workspace_preflight(root.path(), "folder", ExpectedFileKind::File)
+            .await
+            .unwrap_err();
+
+        assert_eq!(ls_error.code, "expected_directory");
+        assert_eq!(read_error.code, "expected_file");
+        assert_eq!(
+            serde_json::to_value(&ls_error).unwrap()["details"],
+            json!({
+                "expected_kind": "directory",
+                "actual_kind": "file",
+                "suggested_tool": "read"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&read_error).unwrap()["details"],
+            json!({
+                "expected_kind": "file",
+                "actual_kind": "directory",
+                "suggested_tool": "ls"
+            })
+        );
+        let rendered = serde_json::to_string(&(ls_error, read_error)).unwrap();
+        assert!(!rendered.contains("os error"));
+        assert!(!rendered.contains(&root.path().to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    async fn missing_preflight_is_advisory_and_uses_bounded_logical_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("apps/cockpit/src");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("store-navigation.test.ts"), "candidate-secret").unwrap();
+        std::fs::write(parent.join("unrelated.ts"), "other-secret").unwrap();
+
+        let error = workspace_preflight(
+            root.path(),
+            "apps/cockpit/src/store-navigation.ts",
+            ExpectedFileKind::File,
+        )
+        .await
+        .unwrap_err();
+        let serialized = serde_json::to_value(error).unwrap();
+
+        assert_eq!(serialized["code"], "path_not_found");
+        assert_eq!(
+            serialized["details"],
+            json!({
+                "expected_kind": "file",
+                "effective_root": "worktree/apps/cockpit/src"
+            })
+        );
+        assert_eq!(
+            serialized["candidates"][0],
+            json!({
+                "path": "apps/cockpit/src/store-navigation.test.ts",
+                "kind": "file"
+            })
+        );
+        assert!(serialized["candidates"].as_array().unwrap().len() <= 5);
+        let rendered = serialized.to_string();
+        assert!(!rendered.contains("candidate-secret"));
+        assert!(!rendered.contains(&root.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn candidate_ranking_is_deterministic_bounded_and_scans_only_256_siblings() {
+        let ranking_cases = vec![
+            FileTargetCandidate {
+                logical_path: "src/name.zzz".into(),
+                kind: FileTargetKind::File,
+            },
+            FileTargetCandidate {
+                logical_path: "src/NAME.rs".into(),
+                kind: FileTargetKind::File,
+            },
+            FileTargetCandidate {
+                logical_path: "src/name-test.ts".into(),
+                kind: FileTargetKind::File,
+            },
+            FileTargetCandidate {
+                logical_path: "src/names.ts".into(),
+                kind: FileTargetKind::File,
+            },
+            FileTargetCandidate {
+                logical_path: "src/other.txt".into(),
+                kind: FileTargetKind::File,
+            },
+            FileTargetCandidate {
+                logical_path: "src/unrelated.txt".into(),
+                kind: FileTargetKind::File,
+            },
+        ];
+        let forward = rank_file_candidates("name.ts", ranking_cases.clone());
+        let reverse = rank_file_candidates("name.ts", ranking_cases.into_iter().rev());
+
+        assert_eq!(forward.candidates, reverse.candidates);
+        assert_eq!(forward.candidates.len(), 5);
+        assert_eq!(forward.candidates[0].logical_path, "src/NAME.rs");
+        assert_eq!(forward.candidates[1].logical_path, "src/name.zzz");
+        assert_eq!(forward.candidates[2].logical_path, "src/names.ts");
+        assert_eq!(forward.candidates[3].logical_path, "src/name-test.ts");
+
+        let inspected = std::cell::Cell::new(0);
+        let siblings = (0..300)
+            .inspect(|_| inspected.set(inspected.get() + 1))
+            .map(|index| FileTargetCandidate {
+                logical_path: format!("src/noise-{index:03}.txt"),
+                kind: FileTargetKind::File,
+            });
+        let bounded = rank_file_candidates("name.ts", siblings);
+        assert_eq!(inspected.get(), 256);
+        assert_eq!(bounded.candidates.len(), 5);
+
+        let ties = rank_file_candidates(
+            "same",
+            vec![
+                FileTargetCandidate {
+                    logical_path: "src/bame".into(),
+                    kind: FileTargetKind::File,
+                },
+                FileTargetCandidate {
+                    logical_path: "src/aame".into(),
+                    kind: FileTargetKind::File,
+                },
+            ],
+        );
+        assert_eq!(ties.candidates[0].logical_path, "src/aame");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn in_jail_symlinks_retain_link_and_resolved_kind_while_escape_is_rejected() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("target.txt"), "ok").unwrap();
+        std::fs::create_dir(root.path().join("target-dir")).unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        #[cfg(unix)]
+        {
+            symlink(
+                root.path().join("target.txt"),
+                root.path().join("file-link"),
+            )
+            .unwrap();
+            symlink(root.path().join("target-dir"), root.path().join("dir-link")).unwrap();
+            symlink(
+                outside.path().join("secret.txt"),
+                root.path().join("escape-link"),
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            if symlink_file(
+                root.path().join("target.txt"),
+                root.path().join("file-link"),
+            )
+            .is_err()
+                || symlink_dir(root.path().join("target-dir"), root.path().join("dir-link"))
+                    .is_err()
+                || symlink_file(
+                    outside.path().join("secret.txt"),
+                    root.path().join("escape-link"),
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        let file = workspace_preflight(root.path(), "file-link", ExpectedFileKind::File)
+            .await
+            .unwrap();
+        let directory = workspace_preflight(root.path(), "dir-link", ExpectedFileKind::Directory)
+            .await
+            .unwrap();
+        let escaped = resolve_workspace_reference(&workspace_ctx(root.path()), "escape-link");
+
+        assert_eq!(file.kind, FileTargetKind::Symlink);
+        assert_eq!(file.resolved_kind, FileTargetKind::File);
+        assert_eq!(directory.kind, FileTargetKind::Symlink);
+        assert_eq!(directory.resolved_kind, FileTargetKind::Directory);
+        assert_eq!(escaped.unwrap_err().code, "invalid_path_reference");
     }
 }
