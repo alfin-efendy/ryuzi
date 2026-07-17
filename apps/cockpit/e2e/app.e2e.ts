@@ -733,7 +733,7 @@ test("route effort: preserves an explicit override and clears it for effort-less
   await page.getByRole("button", { name: "Route", exact: true }).click();
 
   await page.getByRole("button", { name: "New route" }).click();
-  await page.getByPlaceholder("smart").fill("smart-route");
+  await page.getByPlaceholder("free").fill("smart-route");
 
   const effortCombobox = page.getByRole("combobox", { name: "Target 1 effort", exact: true });
   await expect(effortCombobox).toBeVisible();

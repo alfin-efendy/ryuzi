@@ -551,6 +551,11 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   list_providers: [],
   list_provider_catalog: PROVIDER_CATALOG,
   list_connections: CONNECTIONS,
+  // `list_installed_providers` is answered DYNAMICALLY in the invoke dispatch
+  // below (from the live catalog + connections) so per-test connection
+  // overrides still surface; the static `list_`-fallback `[]` would empty the
+  // installed set and hide every provider row. Custom providers: none here.
+  list_custom_providers: [],
   list_selectable_models: NATIVE_RUNTIME.selectableModels,
   list_runtimes: [NATIVE_RUNTIME],
   refresh_runtimes: [NATIVE_RUNTIME],
@@ -912,6 +917,19 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
           if (cmd.startsWith("plugin:")) return Promise.resolve(null);
           if (cmd === "list_sessions") return Promise.resolve(sessions);
           if (cmd === "list_connections") return Promise.resolve(connections);
+          if (cmd === "list_installed_providers") {
+            // The Models list filters to installed families. Derive them live
+            // from the (possibly per-test-overridden) catalog + connections so
+            // every provider row surfaces, mirroring production where a
+            // connected/seeded provider is installed.
+            const catalog = (fixtures.list_provider_catalog as Array<{ id: string; family: string }>) ?? [];
+            const familyOf = (provider: string) => catalog.find((entry) => entry.id === provider)?.family ?? provider;
+            const families = new Set<string>([
+              ...catalog.map((entry) => entry.family),
+              ...connections.map((connection) => familyOf(connection.provider)),
+            ]);
+            return Promise.resolve([...families]);
+          }
           if (cmd === "list_messages") {
             const { sessionPk } = args as { sessionPk: string };
             return Promise.resolve(durable.messages.filter((message) => message.sessionPk === sessionPk));
