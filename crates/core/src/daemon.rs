@@ -470,7 +470,21 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
             let value = settings.get(field.key).await?.unwrap_or_default();
             config.insert(field.key.to_string(), serde_json::Value::String(value));
         }
-        let gw = factory.create(&serde_json::Value::Object(config))?;
+        // A gateway that cannot be built from its settings is a configuration
+        // gap, not an engine fault — skip it (like the two cases above) rather
+        // than failing the whole daemon. A fresh install seeds
+        // `enabled_gateways = "discord"` with no token, so making this fatal
+        // meant a clean machine could never boot the engine at all: the daemon
+        // exited, and Cockpit's `setup()` panicked before showing its window.
+        // The gateway stays enabled in settings and starts on the next boot
+        // once its fields are filled in.
+        let gw = match factory.create(&serde_json::Value::Object(config)) {
+            Ok(gw) => gw,
+            Err(e) => {
+                eprintln!("[ryuzi] gateway {id} is enabled but could not start: {e} — skipping");
+                continue;
+            }
+        };
         gateways.push(gw);
     }
 
@@ -1281,6 +1295,19 @@ mod tests {
         }
     }
 
+    /// Stands in for a real factory that cannot build from the configuration
+    /// it was given — e.g. the Discord factory with a blank `discord.token`,
+    /// which is exactly what a fresh install has. Kept feature-independent:
+    /// `cargo test -p ryuzi-core` (what CI runs) builds without the `discord`
+    /// feature, so `discord::factory_entries()` is empty here and the real
+    /// factory cannot be used to cover this.
+    struct UnconfiguredGatewayFactory;
+    impl GatewayFactory for UnconfiguredGatewayFactory {
+        fn create(&self, _config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
+            anyhow::bail!("discord gateway requires a non-empty discord.token");
+        }
+    }
+
     struct StaticGatewayFactory {
         gateway: Arc<FakeGateway>,
     }
@@ -1304,6 +1331,38 @@ mod tests {
             runs.len(),
             expected,
             "gateway status transition did not produce the expected number of runs"
+        );
+    }
+
+    /// Fresh install: `Store::open` seeds `enabled_gateways = "discord"` (a
+    /// runner-era default) while `discord.token` is unset, so the factory
+    /// cannot build the gateway. That is a configuration gap, not an engine
+    /// fault: the daemon must still boot with the gateway skipped. When this
+    /// failed the build instead, the engine daemon exited, and Cockpit's
+    /// `setup()` panicked on `.expect("engine daemon unreachable")` before the
+    /// window was ever shown — a fresh install just silently did nothing.
+    ///
+    /// No settings are written here on purpose; the seed alone reproduces it.
+    #[tokio::test]
+    async fn build_daemon_skips_an_enabled_gateway_its_factory_cannot_build() {
+        let (_guard, db_path) = temp_db_path();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![(
+                "discord".to_string(),
+                Arc::new(UnconfiguredGatewayFactory) as Arc<dyn GatewayFactory>,
+            )],
+            harness_factory: None,
+        })
+        .await
+        .expect("a fresh install must boot even though the seeded gateway is unconfigured");
+
+        assert!(
+            daemon.gateways.is_empty(),
+            "an unbuildable gateway must be skipped, not wired"
         );
     }
 
