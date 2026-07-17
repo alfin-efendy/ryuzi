@@ -52,7 +52,7 @@ const { useNav } = await import("@/store-nav");
 
 const routeInfo: SelectableModelInfo = {
   kind: "namedRoute",
-  requestValue: "smart",
+  requestValue: "free",
   displayName: "Smart",
   preferenceKey: null,
   supported: [],
@@ -114,7 +114,7 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
       name: "Reviewer",
       description: "Reviews implementation quality.",
       avatarColor: "violet",
-      model: { kind: "route", route: "smart" },
+      model: { kind: "route", route: "free" },
       permissionMode: "ask",
       skillCount: 1,
       toolCount: 3,
@@ -139,7 +139,7 @@ const registry: AgentRegistryInfo = {
   agents: [detail().summary, { ...detail().summary, id: "ryuzi", name: "Ryuzi", isDefault: true }],
   defaultAgentId: "ryuzi",
   recovery: [],
-  subagentModel: { kind: "route", route: "fast" },
+  subagentModel: { kind: "route", route: "free" },
 };
 
 const learningSnapshot: AgentLearningInfo = {
@@ -317,7 +317,7 @@ test("permission rules preserve unknown stable tool IDs and allow editing them",
       name: "Reviewer",
       description: "Reviews implementation quality.",
       avatarColor: "violet",
-      model: { kind: "route", route: "smart" },
+      model: { kind: "route", route: "free" },
       permissionMode: "ask",
       permissionRules: [{ id: "custom-rule", tool: "mcp__github__create_issue", decision: "deny", commandPrefix: null }],
       skills: ["requesting-code-review"],

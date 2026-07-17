@@ -17,7 +17,7 @@ const reviewerDetail: AgentDetailInfo = {
     name: "Reviewer",
     description: "Reviews implementation quality.",
     avatarColor: "violet",
-    model: { kind: "route", route: "smart" },
+    model: { kind: "route", route: "free" },
     permissionMode: "ask",
     skillCount: 1,
     toolCount: 3,
@@ -40,7 +40,7 @@ const registry: AgentRegistryInfo = {
   agents: [reviewerDetail.summary, { ...reviewerDetail.summary, id: "ryuzi", name: "Ryuzi", isDefault: true }],
   defaultAgentId: "ryuzi",
   recovery: [],
-  subagentModel: { kind: "route", route: "fast" },
+  subagentModel: { kind: "route", route: "free" },
 };
 
 beforeEach(() => {

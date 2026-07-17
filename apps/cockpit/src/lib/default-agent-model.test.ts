@@ -22,12 +22,12 @@ function registry(model: AgentSummaryInfo["model"]): AgentRegistryInfo {
     ],
     defaultAgentId: "ryuzi",
     recovery: [],
-    subagentModel: { kind: "route", route: "smart" },
+    subagentModel: { kind: "route", route: "free" },
   };
 }
 
 test("default agent model fallback returns a route name", () => {
-  expect(defaultAgentModel(registry({ kind: "route", route: "smart" }))).toBe("smart");
+  expect(defaultAgentModel(registry({ kind: "route", route: "free" }))).toBe("free");
 });
 
 test("default agent model fallback returns a concrete model name", () => {
@@ -38,5 +38,5 @@ test("default agent model fallback returns a concrete model name", () => {
 
 test("default agent model fallback tolerates a missing registry or default agent", () => {
   expect(defaultAgentModel(null)).toBeNull();
-  expect(defaultAgentModel({ ...registry({ kind: "route", route: "smart" }), defaultAgentId: "missing" })).toBeNull();
+  expect(defaultAgentModel({ ...registry({ kind: "route", route: "free" }), defaultAgentId: "missing" })).toBeNull();
 });

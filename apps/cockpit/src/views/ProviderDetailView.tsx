@@ -29,9 +29,17 @@ import { AccountQuotaSummary } from "@/components/AccountQuotaSummary";
 import { usesDeviceSignin } from "@/components/modals/deviceSignin";
 import { RenameAccountModal } from "@/components/modals/RenameAccountModal";
 import { ConfirmAccountActionModal, type ConfirmAccountAction } from "@/components/modals/ConfirmAccountActionModal";
+import { ConfirmActionModal } from "@/components/modals/ConfirmActionModal";
 
 function accountLabel(count: number): string {
   return `${count} account${count === 1 ? "" : "s"}`;
+}
+
+// User-defined custom providers are their own family head with a `custom-`
+// prefixed id (see `add_custom_provider` in the engine). Only these expose the
+// destructive "Remove provider" affordance; built-in families never do.
+export function isCustomProvider(provider: string): boolean {
+  return provider.startsWith("custom-");
 }
 
 function modelLabel(count: number, prefix = ""): string {
@@ -410,7 +418,7 @@ function ProviderModelsCard({
 
 export function ProviderDetailView({ provider }: { provider: string }) {
   const nav = useNav();
-  const { catalog, connections, loaded, hydrate, rename, remove } = useConnections();
+  const { catalog, connections, loaded, hydrate, rename, remove, removeCustomProvider } = useConnections();
   const usageByConnection = useUsage((s) => s.byConnection);
   const loadUsage = useUsage((s) => s.loadConnection);
   const [addOpen, setAddOpen] = useState(false);
@@ -418,6 +426,8 @@ export function ProviderDetailView({ provider }: { provider: string }) {
   const [savingStrategy, setSavingStrategy] = useState(false);
   const [renameConnection, setRenameConnection] = useState<ConnectionInfo | null>(null);
   const [confirmAction, setConfirmAction] = useState<ConfirmAccountAction | null>(null);
+  const [removeCustomTrigger, setRemoveCustomTrigger] = useState<HTMLButtonElement | null>(null);
+  const custom = isCustomProvider(provider);
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -573,8 +583,42 @@ export function ProviderDetailView({ provider }: { provider: string }) {
         </Card>
 
         <ProviderModelsCard family={provider} connections={providerConnections} catalogModels={catalogModels} />
+
+        {custom && (
+          <Card className="mt-3">
+            <CardHeader>
+              <CardTitle>Remove provider</CardTitle>
+              <CardHint>Delete this custom provider and every account connected to it.</CardHint>
+            </CardHeader>
+            <div className="flex items-center justify-between gap-3 px-[18px] py-3.5">
+              <span className="text-[13px] text-muted-foreground">Removing {name} cannot be undone.</span>
+              <Button
+                variant="destructive"
+                aria-label="Remove custom provider"
+                onClick={(event) => setRemoveCustomTrigger(event.currentTarget)}
+              >
+                <Trash2 aria-hidden data-icon="inline-start" />
+                Remove provider
+              </Button>
+            </div>
+          </Card>
+        )}
       </div>
       <AddConnectionModal open={addOpen} onClose={() => setAddOpen(false)} family={provider} />
+      <ConfirmActionModal
+        open={removeCustomTrigger !== null}
+        title="Remove custom provider?"
+        description={`Remove ${name}? This deletes the provider and all of its accounts. This cannot be undone.`}
+        confirmLabel="Remove provider"
+        busyLabel="Removing…"
+        trigger={removeCustomTrigger}
+        onClose={() => setRemoveCustomTrigger(null)}
+        onConfirm={async () => {
+          const ok = await removeCustomProvider(provider);
+          if (ok) nav.navigate({ kind: "models" });
+          return ok;
+        }}
+      />
       <RenameAccountModal
         open={renameConnection !== null}
         connection={renameConnection}

@@ -2,6 +2,9 @@
 //! Ported from 9router (MIT, (c) 2024-2026 decolua and contributors) —
 //! concept and provider list from open-sse/providers/registry/.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 /// Wire format the provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFormat {
@@ -390,50 +393,6 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         uses_max_completion_tokens: false,
         device_grant: None,
     },
-    ProviderDescriptor {
-        id: "custom-openai",
-        name: "Custom (OpenAI-compatible)",
-        family: "custom-openai",
-        color: "#8B8B8B",
-        initial: "C",
-        category: ApiKey,
-        format: ApiFormat::OpenAi,
-        base_url: None,
-        auth: AuthScheme::Bearer,
-        models: &[],
-        requires_base_url: true,
-        oauth: None,
-        no_auth: false,
-        device_flow: None,
-        free_tier: false,
-        risk_notice: false,
-        chat_path: None,
-        has_models_endpoint: true,
-        uses_max_completion_tokens: false,
-        device_grant: None,
-    },
-    ProviderDescriptor {
-        id: "custom-anthropic",
-        name: "Custom (Anthropic-compatible)",
-        family: "custom-anthropic",
-        color: "#8B8B8B",
-        initial: "C",
-        category: ApiKey,
-        format: ApiFormat::Anthropic,
-        base_url: None,
-        auth: AuthScheme::XApiKey,
-        models: &[],
-        requires_base_url: true,
-        oauth: None,
-        no_auth: false,
-        device_flow: None,
-        free_tier: false,
-        risk_notice: false,
-        chat_path: None,
-        has_models_endpoint: true,
-        uses_max_completion_tokens: false,
-        device_grant: None,
-    },
     // F2/F3 teasers: visible in the catalog, greyed "Coming soon" in the UI.
     // Not connectable in F1 (add_connection refuses non-ApiKey categories).
     ProviderDescriptor {
@@ -564,6 +523,35 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         device_grant: None,
     },
     ProviderDescriptor {
+        id: "opencode",
+        name: "OpenCode (Go)",
+        family: "opencode-free",
+        color: "#F5A623",
+        initial: "OC",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        // OpenCode Go subscription ($5/mo); key from https://opencode.ai/auth.
+        base_url: Some("https://opencode.ai/zen/go/v1"),
+        auth: AuthScheme::Bearer,
+        models: &[
+            "glm-5.2",
+            "kimi-k2.7-code",
+            "deepseek-v4-pro",
+            "mimo-v2.5-pro",
+        ],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
+        // Seed list stands; the /models route is not relied upon here.
+        has_models_endpoint: false,
+        uses_max_completion_tokens: false,
+        device_grant: None,
+    },
+    ProviderDescriptor {
         id: "mimo-free",
         name: "MiMo (free)",
         family: "mimo-free",
@@ -583,6 +571,33 @@ pub const CATALOG: &[ProviderDescriptor] = &[
         free_tier: false,
         risk_notice: false,
         chat_path: Some("/chat"),
+        has_models_endpoint: false,
+        uses_max_completion_tokens: false,
+        device_grant: None,
+    },
+    ProviderDescriptor {
+        id: "mimo",
+        name: "MiMo (Token Plan)",
+        family: "mimo-free",
+        color: "#FF6900",
+        initial: "M",
+        category: ApiKey,
+        format: ApiFormat::OpenAi,
+        // Xiaomi MiMo Token Plan (key starts with `tp-`); key from
+        // https://mimo.xiaomi.com. The region-specific host
+        // (token-plan-<sgp|cn|ams>.xiaomimimo.com) is chosen in the Add Account
+        // region picker and stored as the connection's base_url_override; this
+        // static default is the sgp cluster.
+        base_url: Some("https://token-plan-sgp.xiaomimimo.com/v1"),
+        auth: AuthScheme::Bearer,
+        models: &["mimo-v2.5-pro", "mimo-v2.5"],
+        requires_base_url: false,
+        oauth: None,
+        no_auth: false,
+        device_flow: None,
+        free_tier: false,
+        risk_notice: false,
+        chat_path: None,
         has_models_endpoint: false,
         uses_max_completion_tokens: false,
         device_grant: None,
@@ -719,8 +734,44 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     },
 ];
 
+/// Runtime cache of user-defined custom providers, each leaked to `&'static`
+/// so `descriptor` can return it like a built-in. Keyed by provider id.
+static CUSTOM_DESCRIPTORS: OnceLock<Mutex<HashMap<String, &'static ProviderDescriptor>>> =
+    OnceLock::new();
+
+fn custom_cache() -> &'static Mutex<HashMap<String, &'static ProviderDescriptor>> {
+    CUSTOM_DESCRIPTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Insert (or replace) a leaked custom descriptor into the cache.
+pub fn register_custom_descriptor(desc: &'static ProviderDescriptor) {
+    custom_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(desc.id.to_string(), desc);
+}
+
+/// Drop a custom descriptor from the cache. The leaked allocation is not
+/// reclaimed, but the id becomes unresolvable.
+pub fn unregister_custom_descriptor(id: &str) {
+    custom_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(id);
+}
+
+/// Resolve a provider id to its descriptor. Checks the static `CATALOG` first
+/// (no lock, keeping the routing hot path lock-free for built-ins), then the
+/// leaked custom-provider cache on a miss.
 pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
-    CATALOG.iter().find(|d| d.id == id)
+    if let Some(d) = CATALOG.iter().find(|d| d.id == id) {
+        return Some(d);
+    }
+    custom_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .copied()
 }
 
 pub fn family_of(id: &str) -> Option<&'static str> {
@@ -874,8 +925,25 @@ mod tests {
         assert_eq!(family_of("openai-oauth"), Some("openai"));
         assert_eq!(family_of("anthropic"), Some("anthropic"));
         assert_eq!(family_of("kiro"), Some("kiro"));
-        assert_eq!(family_of("custom-openai"), Some("custom-openai"));
         assert_eq!(family_of("nope"), None);
+    }
+
+    #[test]
+    fn mimo_and_opencode_subscription_members_join_the_free_family() {
+        // Subscription members share the free tier's family head so they pool
+        // into one provider card and trigger the Free/Subscription chooser.
+        let mimo = descriptor("mimo").expect("mimo descriptor");
+        assert_eq!(mimo.family, "mimo-free");
+        assert_eq!(mimo.category, ProviderCategory::ApiKey);
+        assert!(matches!(mimo.format, ApiFormat::OpenAi));
+        assert!(matches!(mimo.auth, AuthScheme::Bearer));
+        assert_eq!(family_of("mimo"), Some("mimo-free"));
+
+        let oc = descriptor("opencode").expect("opencode descriptor");
+        assert_eq!(oc.family, "opencode-free");
+        assert_eq!(oc.category, ProviderCategory::ApiKey);
+        assert!(matches!(oc.auth, AuthScheme::Bearer));
+        assert_eq!(family_of("opencode"), Some("opencode-free"));
     }
 
     #[test]
@@ -924,8 +992,6 @@ mod tests {
             "mistral",
             "xai",
             "ollama",
-            "custom-openai",
-            "custom-anthropic",
             "anthropic-oauth",
             "openai-oauth",
             "kiro",

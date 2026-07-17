@@ -7,7 +7,7 @@ const command: ProjectCommandInfo = {
   description: "Review the current change",
   template: "Review $ARGUMENTS and $1",
   agent: "reviewer",
-  model: "smart",
+  model: "free",
   subtask: true,
   revision: "rev-1",
 };
@@ -26,7 +26,7 @@ const project: Project = {
 
 const modelOption: SelectableModelInfo = {
   kind: "namedRoute",
-  requestValue: "smart",
+  requestValue: "free",
   displayName: "Smart",
   preferenceKey: null,
   supported: [],
@@ -289,7 +289,7 @@ test("loads agents and model registry for the selected local project and submits
   expect(createProjectCommand).toHaveBeenCalledWith(
     "local",
     "p1",
-    expect.objectContaining({ name: "ship", agent: "reviewer", model: "smart" }),
+    expect.objectContaining({ name: "ship", agent: "reviewer", model: "free" }),
   );
 });
 

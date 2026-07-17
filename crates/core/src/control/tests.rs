@@ -5479,7 +5479,7 @@ async fn provision_project_named_route_legacy_effort_requires_no_target_preferen
         .set("workdir_root", root.path().to_str().unwrap())
         .await
         .unwrap();
-    settings.set("default_model", "smart").await.unwrap();
+    settings.set("default_model", "free").await.unwrap();
     settings.set("default_effort", "high").await.unwrap();
     crate::llm_router::connections::add_connection(
         &store,
@@ -5500,18 +5500,18 @@ async fn provision_project_named_route_legacy_effort_requires_no_target_preferen
     )
     .await
     .unwrap();
-    let existing_smart = crate::llm_router::routes::list_model_routes(&store)
+    let existing_free = crate::llm_router::routes::list_model_routes(&store)
         .await
         .unwrap()
         .into_iter()
-        .find(|route| route.name == "smart");
+        .find(|route| route.name == "free");
     crate::llm_router::routes::save_model_route(
         &store,
         crate::llm_router::routes::ModelRouteInfo {
-            id: existing_smart
+            id: existing_free
                 .map(|route| route.id)
-                .unwrap_or_else(|| "smart-route".into()),
-            name: "smart".into(),
+                .unwrap_or_else(|| "free-route".into()),
+            name: "free".into(),
             enabled: true,
             strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
             targets: vec![crate::llm_router::routes::ModelRouteTarget {

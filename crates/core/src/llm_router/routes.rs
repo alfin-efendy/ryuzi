@@ -672,6 +672,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sanitize_accepts_a_registered_custom_provider_target() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let list = crate::llm_router::custom::add_custom_provider(&store, "Router X")
+            .await
+            .unwrap();
+        let id = list[0].id.clone();
+        // A route targeting the custom family head must save without error.
+        let saved = save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: String::new(),
+                name: "cx".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: id.clone(),
+                    model: "gpt-x".into(),
+                    effort: None,
+                }],
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await;
+        assert!(saved.is_ok(), "custom target rejected: {saved:?}");
+    }
+
     #[test]
     fn parses_one_terminal_legacy_openai_effort_suffix_after_review() {
         for (model, expected) in [
@@ -984,8 +1013,8 @@ mod tests {
     #[tokio::test]
     async fn save_if_name_absent_preserves_case_insensitive_existing_route() {
         let store = mem_store().await;
-        let existing = save_model_route(&store, route("Smart")).await.unwrap();
-        let inserted = save_model_route_if_name_absent(&store, route("smart"))
+        let existing = save_model_route(&store, route("Free")).await.unwrap();
+        let inserted = save_model_route_if_name_absent(&store, route("free"))
             .await
             .unwrap();
 
@@ -996,8 +1025,8 @@ mod tests {
     #[tokio::test]
     async fn save_if_name_absent_ignores_invalid_effort_for_existing_route() {
         let store = mem_store().await;
-        let existing = save_model_route(&store, route("Smart")).await.unwrap();
-        let mut duplicate = route("smart");
+        let existing = save_model_route(&store, route("Free")).await.unwrap();
+        let mut duplicate = route("free");
         duplicate.targets[0] = ModelRouteTarget {
             provider: "anthropic".into(),
             model: "claude-opus-4-5".into(),
@@ -1015,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn save_if_name_absent_rejects_invalid_effort_for_new_route() {
         let store = mem_store().await;
-        let mut route = route("smart");
+        let mut route = route("free");
         route.targets[0] = ModelRouteTarget {
             provider: "anthropic".into(),
             model: "claude-opus-4-5".into(),
@@ -1034,8 +1063,8 @@ mod tests {
     #[tokio::test]
     async fn save_lists_and_replaces_routes() {
         let store = mem_store().await;
-        let saved = save_model_route(&store, route("smart")).await.unwrap();
-        assert_eq!(saved.name, "smart");
+        let saved = save_model_route(&store, route("free")).await.unwrap();
+        assert_eq!(saved.name, "free");
         assert_eq!(list_model_routes(&store).await.unwrap().len(), 1);
 
         let mut updated = saved;
@@ -1049,7 +1078,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_supported_target_effort_persists_and_model_default_resets_it() {
         let store = mem_store().await;
-        let mut route = route("smart");
+        let mut route = route("free");
         route.targets[0] = ModelRouteTarget {
             provider: "anthropic".into(),
             model: "claude-opus-4-7".into(),
@@ -1161,7 +1190,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_stored_target_effort_remains_readable_but_cannot_be_saved() {
         let store = mem_store().await;
-        let raw = r#"[{"id":"r1","name":"smart","enabled":true,"strategy":"fallback","targets":[{"provider":"anthropic","model":"claude-opus-4-5","effort":"max"}],"createdAt":1,"updatedAt":1}]"#;
+        let raw = r#"[{"id":"r1","name":"free","enabled":true,"strategy":"fallback","targets":[{"provider":"anthropic","model":"claude-opus-4-5","effort":"max"}],"createdAt":1,"updatedAt":1}]"#;
         store
             .set_setting(crate::domain::WriteOrigin::User, SETTING_KEY, raw)
             .await
@@ -1233,10 +1262,10 @@ mod tests {
     #[tokio::test]
     async fn targets_must_reference_a_family_head() {
         let store = mem_store().await;
-        let mut bad = route("smart");
+        let mut bad = route("free");
         bad.targets[0].provider = "anthropic-oauth".into(); // member, not head
         assert!(save_model_route(&store, bad).await.is_err());
-        let mut unknown = route("smart2");
+        let mut unknown = route("free-2");
         unknown.targets[0].provider = "nope".into();
         assert!(save_model_route(&store, unknown).await.is_err());
     }
@@ -1291,7 +1320,7 @@ mod tests {
             .await
             .unwrap();
         let ids = vec!["c1".to_string(), "c2".to_string()];
-        let mut model_route = route("smart");
+        let mut model_route = route("free");
         model_route.strategy = ModelRouteStrategy::RoundRobin;
         model_route.targets.push(ModelRouteTarget {
             provider: "anthropic".into(),

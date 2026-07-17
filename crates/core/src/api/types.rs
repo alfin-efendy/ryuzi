@@ -1245,8 +1245,8 @@ impl From<crate::plugins::doctor::DoctorFinding> for DoctorFinding {
 // --- agent_api (Plan 3: agent management RPC family for the Cockpit Agents panel) ---
 
 /// An agent's model assignment: either a concrete provider model (with an
-/// optional effort override) or a symbolic router route (`smart`, `fast`,
-/// ...). Routes never carry an effort — `deny_unknown_fields` makes a
+/// optional effort override) or a symbolic router route (`free`, ...).
+/// Routes never carry an effort — `deny_unknown_fields` makes a
 /// `{"kind":"route", ..., "effort": ...}` payload a decode error rather
 /// than a silently dropped field.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1538,10 +1538,10 @@ mod agent_management_dto_tests {
         );
         assert_eq!(
             serde_json::to_value(AgentModelInfo::Route {
-                route: "smart".into()
+                route: "free".into()
             })
             .unwrap(),
-            json!({"kind":"route","route":"smart"})
+            json!({"kind":"route","route":"free"})
         );
     }
 
@@ -1551,7 +1551,7 @@ mod agent_management_dto_tests {
             "name":"Reviewer",
             "description":"Reviews changes",
             "avatarColor":"violet",
-            "model":{"kind":"route","route":"smart","effort":"high"},
+            "model":{"kind":"route","route":"free","effort":"high"},
             "permissionMode":"ask",
             "permissionRules":[],
             "skills":[],

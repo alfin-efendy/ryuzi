@@ -1183,6 +1183,66 @@ async addFreeConnection(runnerId: string | null, provider: string, label: string
 }
 },
 /**
+ * The explicit "installed providers" set gates the Models list. These proxy
+ * the engine RPCs; the set is visibility-only and independent of connections.
+ */
+async listInstalledProviders(runnerId: string | null) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_installed_providers", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async installProvider(runnerId: string | null, family: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_provider", { runnerId, family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async uninstallProvider(runnerId: string | null, family: string) : Promise<Result<string[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("uninstall_provider", { runnerId, family }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listCustomProviders(runnerId: string | null) : Promise<Result<CustomProvider[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_custom_providers", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async addCustomProvider(runnerId: string | null, name: string) : Promise<Result<CustomProvider[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_custom_provider", { runnerId, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setCustomProviderFormat(runnerId: string | null, id: string, format: string) : Promise<Result<CustomProvider[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_custom_provider_format", { runnerId, id, format }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async removeCustomProvider(runnerId: string | null, id: string) : Promise<Result<CustomProvider[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_custom_provider", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The agents available for a project (built-ins plus discovered custom agents).
  */
 async nativeAgents(runnerId: string | null, projectId: string) : Promise<Result<AgentInfo[], CmdError>> {
@@ -1746,8 +1806,8 @@ export type AgentLearningInfo = { concepts: KnowledgeConceptInfo[]; invalid: Inv
 export type AgentMention = { agentId: string; labelSnapshot: string; startUtf16: number; endUtf16: number }
 /**
  * An agent's model assignment: either a concrete provider model (with an
- * optional effort override) or a symbolic router route (`smart`, `fast`,
- * ...). Routes never carry an effort — `deny_unknown_fields` makes a
+ * optional effort override) or a symbolic router route (`free`, ...).
+ * Routes never carry an effort — `deny_unknown_fields` makes a
  * `{"kind":"route", ..., "effort": ...}` payload a decode error rather
  * than a silently dropped field.
  */
@@ -1954,6 +2014,11 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
 export type CoreEventMsg = { runnerId: string; event: CoreEvent }
 export type CuratorHistorySnapshotInfo = { snapshotId: string; concept: KnowledgeConceptInfo }
 export type CuratorStateInfo = { concept: KnowledgeConceptInfo | null; lastEventId: string | null }
+export type CustomProvider = { id: string; name: string;
+/**
+ * "openai" | "anthropic" — the wire format the endpoint speaks.
+ */
+format: string; color: string; initial: string; createdAt: number }
 /**
  * Device-code flow info shown to the user while they complete the browser
  * step (Kiro): the short code to enter, the URL to visit, and the poll

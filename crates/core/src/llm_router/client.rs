@@ -3267,7 +3267,7 @@ mod tests {
             &ctx.store,
             routes::ModelRouteInfo {
                 id: "rr-route".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::RoundRobin,
                 targets: vec![
@@ -3290,8 +3290,8 @@ mod tests {
         .unwrap();
         let routed = anthropic_messages_stream(
             &ctx,
-            json!({"model":"smart","messages":[]}),
-            utility_policy(&ctx, "smart").await.as_ref(),
+            json!({"model":"free","messages":[]}),
+            utility_policy(&ctx, "free").await.as_ref(),
         )
         .await
         .unwrap();
@@ -3512,7 +3512,7 @@ mod tests {
             &ctx.store,
             routes::ModelRouteInfo {
                 id: "continuation".into(),
-                name: "smart".into(),
+                name: "free".into(),
                 enabled: true,
                 strategy: routes::ModelRouteStrategy::Fallback,
                 targets: vec![
@@ -4122,7 +4122,7 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 64);
         assert!(body.get("max_tokens").is_none());
 
-        for id in ["mimo-free", "qwen", "github-copilot", "custom-openai"] {
+        for id in ["mimo-free", "qwen", "github-copilot", "deepseek"] {
             let mut body = json!({"model": "m", "max_tokens": 64, "messages": []});
             apply_max_completion_tokens(registry::descriptor(id).unwrap(), &mut body);
             assert_eq!(body["max_tokens"], 64, "{id} must keep max_tokens");

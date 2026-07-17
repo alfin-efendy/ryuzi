@@ -1260,7 +1260,7 @@ mod tests {
             "name": name,
             "description": "Reviews implementation quality and regressions.",
             "avatarColor": "violet",
-            "model": {"kind":"route","route":"smart"},
+            "model": {"kind":"route","route":"free"},
             "permissionMode": "ask",
             "permissionRules": [],
             "skills": ["requesting-code-review"],
@@ -1366,12 +1366,12 @@ mod tests {
             dispatch(
                 &s,
                 "update_subagent_model",
-                json!({"model": {"kind": "route", "route": "smart"}}),
+                json!({"model": {"kind": "route", "route": "free"}}),
             ),
         )
         .await
         .unwrap();
-        assert_eq!(subagent["subagentModel"]["route"], "smart");
+        assert_eq!(subagent["subagentModel"]["route"], "free");
 
         let deleted = super::with_post_commit_enrichment_failure(
             super::PostCommitEnrichmentFailure::Knowledge,
@@ -1397,7 +1397,7 @@ mod tests {
             .all(|agent| agent.profile.id != duplicate_id));
         assert!(matches!(
             authoritative.subagent_model,
-            crate::agents::types::AgentModel::Route { ref route } if route == "smart"
+            crate::agents::types::AgentModel::Route { ref route } if route == "free"
         ));
     }
 
@@ -1592,7 +1592,7 @@ mod tests {
             &s,
             "update_subagent_model",
             json!({
-                "model": {"kind":"route","route":"fast","effort":"high"}
+                "model": {"kind":"route","route":"free","effort":"high"}
             }),
         )
         .await
@@ -1603,21 +1603,39 @@ mod tests {
     #[tokio::test]
     async fn subagent_model_round_trips_through_rpc() {
         let s = state_with_agents().await;
+        crate::llm_router::routes::save_model_route(
+            s.cp.store(),
+            crate::llm_router::routes::ModelRouteInfo {
+                id: String::new(),
+                name: "free-2".into(),
+                enabled: true,
+                strategy: crate::llm_router::routes::ModelRouteStrategy::Fallback,
+                targets: vec![crate::llm_router::routes::ModelRouteTarget {
+                    provider: "anthropic".into(),
+                    model: "claude-opus-4-8".into(),
+                    effort: None,
+                }],
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
         let got = dispatch(&s, "get_subagent_model", json!({})).await.unwrap();
-        assert_eq!(got, json!({"kind":"route","route":"fast"}));
+        assert_eq!(got, json!({"kind":"route","route":"free"}));
         let updated = dispatch(
             &s,
             "update_subagent_model",
-            json!({"model": {"kind":"route","route":"smart"}}),
+            json!({"model": {"kind":"route","route":"free-2"}}),
         )
         .await
         .unwrap();
         assert_eq!(
             updated["subagentModel"],
-            json!({"kind":"route","route":"smart"})
+            json!({"kind":"route","route":"free-2"})
         );
         let got = dispatch(&s, "get_subagent_model", json!({})).await.unwrap();
-        assert_eq!(got, json!({"kind":"route","route":"smart"}));
+        assert_eq!(got, json!({"kind":"route","route":"free-2"}));
     }
 
     #[tokio::test]
@@ -1654,19 +1672,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             updated["summary"]["model"],
-            json!({"kind":"route","route":"smart"})
+            json!({"kind":"route","route":"free"})
         );
 
         let subagents = dispatch(
             &s,
             "update_subagent_model",
-            json!({"model": {"kind":"route","route":"smart"}}),
+            json!({"model": {"kind":"route","route":"free"}}),
         )
         .await
         .unwrap();
         assert_eq!(
             subagents["subagentModel"],
-            json!({"kind":"route","route":"smart"})
+            json!({"kind":"route","route":"free"})
         );
     }
 
@@ -2342,7 +2360,7 @@ mod tests {
         };
         s.cp.store().insert_session(chat.clone()).await.unwrap();
         s.cp.store()
-            .update_session_runtime_settings("chat-1", Some("route:smart".into()), None)
+            .update_session_runtime_settings("chat-1", Some("route:free".into()), None)
             .await
             .unwrap();
 
@@ -2350,7 +2368,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(info["sessionPk"], "chat-1");
-        assert_eq!(info["model"], "route:smart");
+        assert_eq!(info["model"], "route:free");
 
         let updated = dispatch(
             &s,

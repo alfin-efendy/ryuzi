@@ -7,7 +7,7 @@ import { commands, type ConnectionInfo, type ModelRouteInfo, type ModelRouteTarg
 
 const route: ModelRouteInfo = {
   id: "r1",
-  name: "smart",
+  name: "free",
   enabled: true,
   strategy: "fallback",
   targets: [{ provider: "anthropic", model: "claude-opus-4", effort: null }],

@@ -186,7 +186,7 @@ test("choosePrimaryAgent prefers requested, then stored, default, then first exe
     name: id,
     description: "",
     avatarColor: "violet",
-    model: { kind: "route", route: "smart" },
+    model: { kind: "route", route: "free" },
     permissionMode: "ask",
     skillCount: 0,
     toolCount: 0,

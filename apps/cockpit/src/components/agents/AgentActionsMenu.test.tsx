@@ -11,7 +11,7 @@ function summary(id: string, name: string, overrides: Partial<AgentSummaryInfo> 
     name,
     description: "",
     avatarColor: "violet",
-    model: route("smart"),
+    model: route("free"),
     permissionMode: "ask",
     skillCount: 0,
     toolCount: 0,
@@ -31,7 +31,7 @@ function registry(): AgentRegistryInfo {
     agents: [ryuziSummary(), reviewerSummary()],
     defaultAgentId: "ryuzi",
     recovery: [],
-    subagentModel: route("fast"),
+    subagentModel: route("free"),
   };
 }
 

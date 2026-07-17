@@ -12,6 +12,20 @@ use ryuzi_core::Store;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
+/// Register `custom-openai` as a user custom provider so the router resolves
+/// its OpenAI wire format/auth exactly as the (now-removed) static catalog
+/// entry did. Idempotent; safe to call from every test setup path.
+fn register_custom_test_providers() {
+    ryuzi_core::llm_router::custom::register(&ryuzi_core::llm_router::custom::CustomProvider {
+        id: "custom-openai".into(),
+        name: "Custom (OpenAI-compatible)".into(),
+        format: "openai".into(),
+        color: "#8B8B8B".into(),
+        initial: "C".into(),
+        created_at: 0,
+    });
+}
+
 /// Hermetic test seam: point the process-global master key at a
 /// process-unique temp file instead of the real OS keychain / the real
 /// `state_dir()/secret.key` (mirrors the `Once`-guarded helper of the same
@@ -78,6 +92,7 @@ async fn encrypted_connection_serves_plaintext_credential() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    register_custom_test_providers();
 
     connections::add_connection(
         &store,
@@ -161,6 +176,7 @@ async fn legacy_plaintext_db_swept_then_serves() {
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+    register_custom_test_providers();
 
     // Insert a `custom-openai` connection row DIRECTLY, simulating a pre-F3b
     // database: raw plaintext `data` JSON, bypassing `add_connection`'s
