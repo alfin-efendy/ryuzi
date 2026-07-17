@@ -2755,6 +2755,7 @@ async fn run_tool_call(
         &validated.wire.name,
         validated.tool,
         validated.input,
+        validated.pinned_file_reference,
         NativeToolsVersion::V2,
         Some(planned),
         tool_kind,
@@ -2816,6 +2817,7 @@ async fn execute_tool_call(
     tool_name: &str,
     tool: Arc<dyn super::tools::Tool>,
     input: Value,
+    pinned_file_reference: Option<super::file_reference::PinnedFileTarget>,
     version: NativeToolsVersion,
     planned: Option<&PlannedTool>,
     tool_kind: &str,
@@ -2939,6 +2941,7 @@ async fn execute_tool_call(
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        pinned_file_reference,
         store: deps.store.clone(),
         cancel: cancel.clone(),
         caps: OutputCaps::default(),
@@ -3077,6 +3080,7 @@ async fn run_legacy_tool_call(
         &tool_call.name,
         tool,
         input,
+        None,
         NativeToolsVersion::V1,
         None,
         tool_kind,
@@ -9065,6 +9069,123 @@ mod tests {
                 panic!("changed contract leaked normalized input/metadata: {validated:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn v2_absolute_read_path_is_logical_in_ledger_row_and_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "notes\n").unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = RunToolPlan::FrozenV2(compiled);
+        let host_root = dir.path().to_string_lossy().to_string();
+        let input = format!("{}:1", file.display());
+
+        let result = dispatch_call_against_plan(
+            &deps,
+            &plan,
+            "absolute-read",
+            "read",
+            json!({"path": input, "offset": null, "limit": null}),
+        )
+        .await;
+        assert_eq!(result["is_error"], false, "{result}");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let tool_row = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("absolute-read"))
+            .unwrap();
+        assert_eq!(
+            tool_row.payload["input"],
+            json!({"path": "notes.txt", "offset": 1})
+        );
+        let hooks = hook_calls.calls.lock().unwrap();
+        let before = hooks
+            .iter()
+            .find(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolBefore)
+            .unwrap();
+        assert_eq!(before.1["input"], json!({"path": "notes.txt", "offset": 1}));
+        let persisted_and_hooked = format!(
+            "{}{}",
+            serde_json::to_string(&rows).unwrap(),
+            serde_json::to_string(&hooks.iter().map(|(_, payload)| payload).collect::<Vec<_>>())
+                .unwrap()
+        );
+        assert!(!persisted_and_hooked.contains(&host_root));
+        assert!(!persisted_and_hooked.contains(r"\\?\"));
+    }
+
+    #[tokio::test]
+    async fn v2_pinned_read_rejects_workspace_to_attachment_substitution() {
+        let work = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("notes.txt"), "workspace\n").unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(work.path(), llm).await;
+        deps.attachments_dir = Some(attachments.path().to_path_buf());
+        enable_v2(&mut deps);
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["read".into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = RunToolPlan::FrozenV2(compiled.clone());
+        let call = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "pinned-read-race".into(),
+                name: "read".into(),
+                start_input: json!({}),
+                input_json: json!({
+                    "path": "notes.txt",
+                    "offset": null,
+                    "limit": null
+                })
+                .to_string(),
+                input_overflowed: false,
+            }],
+        )
+        .pop()
+        .unwrap();
+        let V2BatchCall::Validated(validated) = call else {
+            panic!("read call must validate before the deterministic race")
+        };
+
+        std::fs::remove_file(work.path().join("notes.txt")).unwrap();
+        std::fs::write(attachments.path().join("notes.txt"), "attachment-secret\n").unwrap();
+
+        let result = run_tool_call(
+            &deps,
+            &deps.agent,
+            validated,
+            &DisplayMode::Silent,
+            &None,
+            &CancellationToken::new(),
+            &plan,
+        )
+        .await;
+        let envelope: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "file_reference_changed");
+        assert!(!result.to_string().contains("attachment-secret"));
     }
 
     #[tokio::test(start_paused = true)]

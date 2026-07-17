@@ -1,7 +1,7 @@
 use crate::harness::native::skills::SkillRegistry;
 use crate::harness::native::tool_contract::{
     FileReferenceMetadata, NormalizedInput, ToolError, ToolErrorStrategy, ToolFieldError,
-    ToolInputCtx, ToolMetadataEntry,
+    ToolInputCtx, ToolMetadataEntry, ToolMetadataToken,
 };
 use crate::harness::native::tools::jail;
 use serde_json::Value;
@@ -41,7 +41,27 @@ pub struct ResolvedFileTarget {
     pub interpretation: FileReferenceInterpretation,
     pub root: FileReferenceRoot,
     pub resolved_path: PathBuf,
+    pub logical_path: String,
     pub exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinnedFileTarget {
+    root: FileReferenceRoot,
+    interpretation: FileReferenceInterpretation,
+    logical_path: String,
+    expected_exists: bool,
+}
+
+impl From<&ResolvedFileTarget> for PinnedFileTarget {
+    fn from(target: &ResolvedFileTarget) -> Self {
+        Self {
+            root: target.root,
+            interpretation: target.interpretation,
+            logical_path: target.logical_path.clone(),
+            expected_exists: target.exists,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +74,15 @@ pub enum CandidateProbeResult {
 
 pub trait CandidateProbe {
     fn probe(&self, root: FileReferenceRoot, reference: &FileReference) -> CandidateProbeResult;
+
+    fn logical_path(
+        &self,
+        _root: FileReferenceRoot,
+        reference: &FileReference,
+        _resolved_path: &Path,
+    ) -> Option<String> {
+        Some(reference.path.clone())
+    }
 }
 
 type ParsedSuffix<'a> = (&'a str, u32, Option<u32>);
@@ -82,6 +111,12 @@ fn positive_location(value: &str) -> Result<u32, ToolError> {
 fn is_bare_windows_drive(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn windows_drive_prefix(path: &str) -> Option<(&str, &str)> {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| path.split_at(2))
 }
 
 fn looks_signed_numeric(value: &str) -> bool {
@@ -144,14 +179,35 @@ pub fn parse_file_references(input: &str) -> Result<Vec<SyntacticFileCandidate>,
         return source_candidates(input, path, line, None);
     }
 
-    if let Some((path, line, column)) = suffix_location(input)? {
-        return source_candidates(input, path, line, column);
-    }
+    let delimiter_input = if let Some((drive, remainder)) = windows_drive_prefix(input) {
+        if let Some((path, line, column)) = suffix_location(remainder)? {
+            let drive_relative_numeric_path = !remainder.starts_with(['\\', '/'])
+                && !path.is_empty()
+                && path.bytes().all(|byte| byte.is_ascii_digit());
+            if !drive_relative_numeric_path {
+                let path = format!("{drive}{path}");
+                return source_candidates(input, &path, line, column);
+            }
+        }
+        remainder
+    } else {
+        if let Some((path, line, column)) = suffix_location(input)? {
+            return source_candidates(input, path, line, column);
+        }
+        input
+    };
 
-    if input.ends_with(':') || looks_signed_numeric(input.rsplit(':').next().unwrap_or(input)) {
+    if input.ends_with(':')
+        || looks_signed_numeric(
+            delimiter_input
+                .rsplit(':')
+                .next()
+                .unwrap_or(delimiter_input),
+        )
+    {
         return Err(invalid_path_reference());
     }
-    if has_interior_numeric_delimiter(input) {
+    if has_interior_numeric_delimiter(delimiter_input) {
         return Err(invalid_path_reference());
     }
 
@@ -229,11 +285,15 @@ pub fn resolve_candidates(
         }
         if let Some((index, resolved_path)) = existing.pop() {
             let candidate = &candidates[index];
+            let logical_path = probe
+                .logical_path(*root, &candidate.reference, &resolved_path)
+                .ok_or_else(invalid_path_reference)?;
             return Ok(ResolvedFileTarget {
                 reference: candidate.reference.clone(),
                 interpretation: candidate.interpretation,
                 root: *root,
                 resolved_path,
+                logical_path,
                 exists: true,
             });
         }
@@ -250,11 +310,15 @@ pub fn resolve_candidates(
         .find(|(index, _, _)| *index == preferred)
     {
         let candidate = &candidates[preferred];
+        let logical_path = probe
+            .logical_path(root, &candidate.reference, &resolved_path)
+            .ok_or_else(invalid_path_reference)?;
         return Ok(ResolvedFileTarget {
             reference: candidate.reference.clone(),
             interpretation: candidate.interpretation,
             root,
             resolved_path,
+            logical_path,
             exists: false,
         });
     }
@@ -320,6 +384,34 @@ impl CandidateProbe for FilesystemProbe<'_> {
             }
         }
     }
+
+    fn logical_path(
+        &self,
+        root: FileReferenceRoot,
+        reference: &FileReference,
+        resolved_path: &Path,
+    ) -> Option<String> {
+        if root == FileReferenceRoot::SkillDirectory {
+            return Some(reference.path.clone());
+        }
+        let policy_root = match root {
+            FileReferenceRoot::Workspace => self.context.work_dir,
+            FileReferenceRoot::Attachments => self.context.attachments_dir?,
+            FileReferenceRoot::SkillDirectory => unreachable!(),
+        };
+        let canonical_root = policy_root.canonicalize().ok()?;
+        resolved_path
+            .strip_prefix(canonical_root)
+            .ok()?
+            .to_str()
+            .map(|path| {
+                if path.is_empty() {
+                    ".".to_string()
+                } else {
+                    path.to_string()
+                }
+            })
+    }
 }
 
 pub fn resolve_read_reference(
@@ -350,6 +442,57 @@ pub fn resolve_workspace_reference(
     )
 }
 
+fn changed_file_reference() -> ToolError {
+    ToolError::precondition(
+        "file_reference_changed",
+        "File target changed after validation",
+    )
+}
+
+fn resolve_pinned_reference(
+    context: &ToolInputCtx<'_>,
+    target: &PinnedFileTarget,
+    allowed_roots: &[FileReferenceRoot],
+) -> Result<PathBuf, ToolError> {
+    if !allowed_roots.contains(&target.root) || target.logical_path.is_empty() {
+        return Err(changed_file_reference());
+    }
+    let reference = FileReference {
+        input_path: target.logical_path.clone(),
+        path: target.logical_path.clone(),
+        line: None,
+        column: None,
+    };
+    let current = FilesystemProbe { context }.probe(target.root, &reference);
+    match (target.expected_exists, current) {
+        (true, CandidateProbeResult::Existing(path))
+        | (false, CandidateProbeResult::Missing(path)) => Ok(path),
+        _ => Err(changed_file_reference()),
+    }
+}
+
+pub(crate) fn resolve_pinned_read_reference(
+    context: &ToolInputCtx<'_>,
+    target: &PinnedFileTarget,
+) -> Result<PathBuf, ToolError> {
+    resolve_pinned_reference(
+        context,
+        target,
+        &[
+            FileReferenceRoot::SkillDirectory,
+            FileReferenceRoot::Workspace,
+            FileReferenceRoot::Attachments,
+        ],
+    )
+}
+
+pub(crate) fn resolve_pinned_workspace_reference(
+    context: &ToolInputCtx<'_>,
+    target: &PinnedFileTarget,
+) -> Result<PathBuf, ToolError> {
+    resolve_pinned_reference(context, target, &[FileReferenceRoot::Workspace])
+}
+
 pub fn normalize_resolved_path(
     mut input: Value,
     target: &ResolvedFileTarget,
@@ -357,14 +500,29 @@ pub fn normalize_resolved_path(
     let Some(object) = input.as_object_mut() else {
         return Err(invalid_path_reference());
     };
-    let normalized = target.reference.input_path != target.reference.path;
+    let logical_input_path = match target.interpretation {
+        FileReferenceInterpretation::SourceReference => {
+            let line = target.reference.line.expect("source reference line");
+            if target.reference.input_path.starts_with(':') {
+                format!(":{line}:{}", target.logical_path)
+            } else if let Some(column) = target.reference.column {
+                format!("{}:{line}:{column}", target.logical_path)
+            } else {
+                format!("{}:{line}", target.logical_path)
+            }
+        }
+        FileReferenceInterpretation::Plain | FileReferenceInterpretation::LiteralPath => {
+            target.logical_path.clone()
+        }
+    };
+    let normalized = target.reference.input_path != target.logical_path;
     object.insert(
         "path".to_string(),
-        Value::String(target.reference.path.clone()),
+        Value::String(target.logical_path.clone()),
     );
     let metadata = FileReferenceMetadata::new(
-        &target.reference.input_path,
-        &target.reference.path,
+        &logical_input_path,
+        &target.logical_path,
         target.reference.line,
         target.reference.column,
         normalized,
@@ -374,13 +532,28 @@ pub fn normalize_resolved_path(
     } else {
         NormalizedInput::unchanged(input)
     };
-    normalized_input.with_metadata(ToolMetadataEntry::FileReference(metadata))
+    let root_metadata = match target.root {
+        FileReferenceRoot::Workspace => {
+            ToolMetadataEntry::WorkspaceResolution(ToolMetadataToken::Workspace)
+        }
+        FileReferenceRoot::Attachments => {
+            ToolMetadataEntry::AttachmentResolution(ToolMetadataToken::Attachments)
+        }
+        FileReferenceRoot::SkillDirectory => {
+            ToolMetadataEntry::SkillResolution(ToolMetadataToken::SkillDirectory)
+        }
+    };
+    normalized_input
+        .with_metadata(ToolMetadataEntry::FileReference(metadata))?
+        .with_metadata(root_metadata)?
+        .with_pinned_file_reference(PinnedFileTarget::from(target))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::harness::native::tool_contract::ToolInputCtx;
+    use serde_json::json;
     use std::collections::BTreeSet;
 
     #[test]
@@ -455,10 +628,48 @@ mod tests {
         assert_eq!(plain[0].reference.path, r"D:\code\app.rs");
         assert_eq!(plain[0].reference.line, None);
 
+        for drive_relative in [r"C:12", r"C:12:3"] {
+            let candidates = parse_file_references(drive_relative).unwrap();
+            assert_eq!(candidates.len(), 1, "{drive_relative}");
+            assert_eq!(candidates[0].reference.path, drive_relative);
+            assert_eq!(candidates[0].reference.line, None);
+            assert_eq!(candidates[0].reference.column, None);
+            assert_eq!(
+                candidates[0].interpretation,
+                FileReferenceInterpretation::Plain
+            );
+        }
+
+        let drive_relative_source = parse_file_references(r"C:notes:12").unwrap();
+        assert_eq!(drive_relative_source.len(), 2);
+        assert_eq!(drive_relative_source[1].reference.path, r"C:notes");
+        assert_eq!(drive_relative_source[1].reference.line, Some(12));
+
         let located = parse_file_references(r"D:\code\app.rs:27:9").unwrap();
         assert_eq!(located[1].reference.path, r"D:\code\app.rs");
         assert_eq!(located[1].reference.line, Some(27));
         assert_eq!(located[1].reference.column, Some(9));
+    }
+
+    #[test]
+    fn resolver_never_reclassifies_numeric_drive_relative_paths() {
+        for drive_relative in [r"C:12", r"C:12:3"] {
+            let candidates = parse_file_references(drive_relative).unwrap();
+            let resolved = resolve_candidates(
+                &candidates,
+                &[FileReferenceRoot::Workspace],
+                &SetProbe {
+                    existing: [(FileReferenceRoot::Workspace, drive_relative.to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(resolved.reference.path, drive_relative);
+            assert_eq!(resolved.reference.line, None);
+            assert_eq!(resolved.interpretation, FileReferenceInterpretation::Plain);
+        }
     }
 
     struct SetProbe {
@@ -544,6 +755,71 @@ mod tests {
 
         assert_eq!(resolved.root, FileReferenceRoot::Workspace);
         assert_eq!(resolved.reference.path, "notes");
+    }
+
+    #[test]
+    fn absolute_plain_suffix_and_prefix_normalize_to_logical_paths() {
+        let cases = [
+            ("/home/private/repo/notes.rs", "notes.rs", "notes.rs"),
+            ("/home/private/repo/notes.rs:12", "notes.rs", "notes.rs:12"),
+            (
+                ":12:/home/private/repo/notes.rs",
+                "notes.rs",
+                ":12:notes.rs",
+            ),
+            (r"C:\Users\private\repo\notes.rs", "notes.rs", "notes.rs"),
+            (
+                r"C:\Users\private\repo\notes.rs:12",
+                "notes.rs",
+                "notes.rs:12",
+            ),
+            (
+                r":12:C:\Users\private\repo\notes.rs",
+                "notes.rs",
+                ":12:notes.rs",
+            ),
+        ];
+
+        for (input_path, logical_path, logical_input_path) in cases {
+            let candidates = parse_file_references(input_path).unwrap();
+            let candidate = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.interpretation == FileReferenceInterpretation::SourceReference
+                })
+                .unwrap_or(&candidates[0]);
+            let target = ResolvedFileTarget {
+                reference: candidate.reference.clone(),
+                interpretation: candidate.interpretation,
+                root: FileReferenceRoot::Workspace,
+                resolved_path: PathBuf::from("ignored-host-path"),
+                logical_path: logical_path.to_string(),
+                exists: true,
+            };
+
+            let normalized = normalize_resolved_path(json!({"path": input_path}), &target).unwrap();
+            assert_eq!(normalized.value["path"], logical_path, "{input_path}");
+            let metadata = serde_json::to_value(normalized.metadata()).unwrap();
+            assert_eq!(metadata.as_array().unwrap().len(), 2);
+            assert_eq!(metadata[1]["kind"], "workspace_resolution");
+            assert_eq!(metadata[1]["value"], "workspace");
+            assert_eq!(
+                metadata[0]["value"]["input_path"], logical_input_path,
+                "{input_path}"
+            );
+            assert_eq!(
+                metadata[0]["value"]["resolved_path"], logical_path,
+                "{input_path}"
+            );
+            let pinned = normalized.pinned_file_reference().unwrap();
+            assert_eq!(pinned.root, FileReferenceRoot::Workspace);
+            assert_eq!(pinned.interpretation, candidate.interpretation);
+            assert_eq!(pinned.logical_path, logical_path);
+            assert!(pinned.expected_exists);
+            let serialized = metadata.to_string();
+            assert!(!serialized.contains("/home/private"), "{input_path}");
+            assert!(!serialized.contains(r"C:\Users\private"), "{input_path}");
+        }
     }
 
     #[test]

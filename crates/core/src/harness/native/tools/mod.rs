@@ -340,6 +340,8 @@ pub struct ToolCtx {
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), consulted by the
     /// `skill` tool alongside `work_dir`'s own skill dirs.
     pub extra_skill_dirs: Vec<PathBuf>,
+    pub(crate) pinned_file_reference:
+        Option<crate::harness::native::file_reference::PinnedFileTarget>,
     pub store: Arc<Store>,
     pub cancel: CancellationToken,
     pub caps: OutputCaps,
@@ -1083,6 +1085,7 @@ pub(crate) mod testutil {
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
+            pinned_file_reference: None,
             store,
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),

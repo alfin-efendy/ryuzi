@@ -145,6 +145,7 @@ pub struct ValidatedToolCall {
     pub input: Value,
     pub repair: Option<ArgumentRepairKind>,
     pub normalization: ToolMetadata,
+    pub(crate) pinned_file_reference: Option<super::file_reference::PinnedFileTarget>,
 }
 
 impl std::fmt::Debug for ValidatedToolCall {
@@ -193,13 +194,14 @@ impl ArgumentGateway {
     ) -> Result<ValidatedToolCall, RejectedToolCall> {
         let result = Self::validate_inner(&mut wire, planned, tool.clone(), context);
         match result {
-            Ok((input, repair, normalization)) => Ok(ValidatedToolCall {
+            Ok((input, repair, normalization, pinned_file_reference)) => Ok(ValidatedToolCall {
                 wire,
                 canonical_name: planned.canonical_name.clone(),
                 tool,
                 input,
                 repair,
                 normalization,
+                pinned_file_reference,
             }),
             Err(error) => Err(RejectedToolCall {
                 wire,
@@ -214,7 +216,15 @@ impl ArgumentGateway {
         planned: &PlannedTool,
         tool: Arc<dyn Tool>,
         context: &ToolInputCtx<'_>,
-    ) -> Result<(Value, Option<ArgumentRepairKind>, ToolMetadata), ToolError> {
+    ) -> Result<
+        (
+            Value,
+            Option<ArgumentRepairKind>,
+            ToolMetadata,
+            Option<super::file_reference::PinnedFileTarget>,
+        ),
+        ToolError,
+    > {
         let decoded = wire.decode()?;
         validate_schema(&planned.wire_schema, &decoded.input)?;
 
@@ -230,7 +240,13 @@ impl ArgumentGateway {
         let normalized = tool.normalize_input(context, canonical_input)?;
         validate_schema(&planned.canonical_schema, &normalized.value)?;
         let normalization = normalized.metadata().clone();
-        Ok((normalized.value, decoded.repair, normalization))
+        let pinned_file_reference = normalized.pinned_file_reference().cloned();
+        Ok((
+            normalized.value,
+            decoded.repair,
+            normalization,
+            pinned_file_reference,
+        ))
     }
 }
 
@@ -669,6 +685,7 @@ mod tests {
         assert_eq!(validated.input["path"], "missing.rs");
         assert_eq!(validated.input["offset"], 12);
         assert!(!validated.normalization.is_empty());
+        assert!(validated.pinned_file_reference.is_some());
     }
 
     fn validate(

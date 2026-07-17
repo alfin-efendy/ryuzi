@@ -1,13 +1,15 @@
 //! `read` — read a text file within the session worktree.
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
-use crate::harness::native::file_reference::{normalize_resolved_path, resolve_read_reference};
+use crate::harness::native::file_reference::{
+    normalize_resolved_path, resolve_pinned_read_reference, resolve_read_reference,
+};
 use crate::harness::native::tool_contract::{
     NormalizedInput, ToolError, ToolErrorStrategy, ToolFieldError, ToolInputCtx,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 2 MiB read cap, matching Cockpit's `read_file` command.
 const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
@@ -98,6 +100,20 @@ fn normalize_read_input(
     Ok(normalized)
 }
 
+fn prepare_read_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
+    let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.pinned_file_reference.as_ref() {
+        return resolve_pinned_read_reference(&input_ctx, target).map(|resolved| (input, resolved));
+    }
+
+    let normalized = normalize_read_input(&input_ctx, input)?;
+    let target = normalized
+        .pinned_file_reference()
+        .expect("read normalization pins its selected target");
+    let resolved = resolve_pinned_read_reference(&input_ctx, target)?;
+    Ok((normalized.value, resolved))
+}
+
 pub struct Read;
 
 #[async_trait]
@@ -138,19 +154,15 @@ impl Tool for Read {
         PermissionSpec::new("read", format!("read {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let input = match normalize_read_input(&input_context(ctx), input) {
-            Ok(input) => input.value,
+        let (input, resolved_path) = match prepare_read_execution(ctx, input) {
+            Ok(prepared) => prepared,
             Err(error) => return Ok(ToolOutput::from_error(error)),
         };
         let path = input
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("read: `path` is required"))?;
-        let target = match resolve_read_reference(&input_context(ctx), path) {
-            Ok(target) => target,
-            Err(error) => return Ok(ToolOutput::from_error(error)),
-        };
-        finish_read(ctx, path, &target.resolved_path, &input).await
+        finish_read(ctx, path, &resolved_path, &input).await
     }
 }
 
@@ -313,21 +325,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absolute_paths_are_redacted_from_normalization_metadata() {
+    async fn pinned_workspace_read_never_falls_back_to_same_named_attachment() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("notes.txt"), "workspace\n").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": "notes.txt"}))
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+
+        std::fs::remove_file(work.path().join("notes.txt")).unwrap();
+        std::fs::write(attach.path().join("notes.txt"), "attachment-secret\n").unwrap();
+
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("file_reference_changed")
+        );
+        assert!(!out.for_model.contains("attachment-secret"));
+    }
+
+    #[tokio::test]
+    async fn absolute_paths_become_logical_in_canonical_input_and_metadata() {
         let work = tempfile::tempdir().unwrap();
         let file = work.path().join("notes.txt");
         std::fs::write(&file, "notes\n").unwrap();
         let ctx = ctx_at(work.path()).await;
-        let input = format!("{}:1", file.display());
+        for (input, logical_input, expected_offset) in [
+            (file.display().to_string(), "notes.txt", None),
+            (format!("{}:1", file.display()), "notes.txt:1", Some(1)),
+            (format!(":1:{}", file.display()), ":1:notes.txt", Some(1)),
+        ] {
+            let normalized = Read
+                .normalize_input(&input_ctx(&ctx), json!({"path": input}))
+                .unwrap();
+            assert_eq!(normalized.value["path"], "notes.txt");
+            assert_eq!(
+                normalized.value.get("offset").and_then(Value::as_u64),
+                expected_offset
+            );
+            let metadata_value = serde_json::to_value(normalized.metadata()).unwrap();
+            assert_eq!(metadata_value[0]["value"]["input_path"], logical_input);
+            assert_eq!(metadata_value[0]["value"]["resolved_path"], "notes.txt");
+            let metadata = metadata_value.to_string();
 
-        let normalized = Read
-            .normalize_input(&input_ctx(&ctx), json!({"path": input}))
-            .unwrap();
-        let metadata = serde_json::to_string(normalized.metadata()).unwrap();
-
-        assert!(!metadata.contains(&work.path().to_string_lossy().to_string()));
-        assert!(!metadata.contains("os error"));
-        assert!(metadata.contains("absolute_path"));
+            assert!(!metadata.contains(&work.path().to_string_lossy().to_string()));
+            assert!(!metadata.contains("os error"));
+            assert!(!metadata.contains("absolute_path"));
+        }
     }
 
     #[tokio::test]

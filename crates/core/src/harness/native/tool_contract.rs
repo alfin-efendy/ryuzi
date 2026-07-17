@@ -711,13 +711,24 @@ impl<'de> Deserialize<'de> for FileReferenceMetadata {
 }
 
 fn safe_logical_path(path: &str) -> String {
-    let bytes = path.as_bytes();
+    let parsed_path = path
+        .strip_prefix(':')
+        .and_then(|prefixed| prefixed.split_once(':'))
+        .filter(|(line, parsed_path)| {
+            !parsed_path.is_empty()
+                && !line.is_empty()
+                && line.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map(|(_, parsed_path)| parsed_path)
+        .unwrap_or(path);
+    let bytes = parsed_path.as_bytes();
     let windows_absolute = bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'\\' | b'/');
-    let unc_absolute = path.starts_with(r"\\") || path.starts_with("//");
-    if Path::new(path).is_absolute() || windows_absolute || unc_absolute {
+    let unix_absolute = parsed_path.starts_with('/');
+    let unc_absolute = parsed_path.starts_with(r"\\") || parsed_path.starts_with("//");
+    if Path::new(parsed_path).is_absolute() || windows_absolute || unix_absolute || unc_absolute {
         "absolute_path".to_string()
     } else {
         truncate_utf8_bytes(path, MAX_FILE_REFERENCE_PATH_BYTES)
@@ -1163,6 +1174,7 @@ pub struct NormalizedInput {
     pub value: Value,
     pub normalized: bool,
     metadata: ToolMetadata,
+    pinned_file_reference: Option<super::file_reference::PinnedFileTarget>,
 }
 
 impl NormalizedInput {
@@ -1171,6 +1183,7 @@ impl NormalizedInput {
             value,
             normalized: false,
             metadata: ToolMetadata::default(),
+            pinned_file_reference: None,
         }
     }
 
@@ -1179,6 +1192,7 @@ impl NormalizedInput {
             value,
             normalized: true,
             metadata: ToolMetadata::default(),
+            pinned_file_reference: None,
         }
     }
 
@@ -1188,6 +1202,24 @@ impl NormalizedInput {
 
     pub fn with_metadata(mut self, entry: ToolMetadataEntry) -> Result<Self, ToolError> {
         self.metadata.insert(entry)?;
+        Ok(self)
+    }
+
+    pub(crate) fn pinned_file_reference(&self) -> Option<&super::file_reference::PinnedFileTarget> {
+        self.pinned_file_reference.as_ref()
+    }
+
+    pub(crate) fn with_pinned_file_reference(
+        mut self,
+        target: super::file_reference::PinnedFileTarget,
+    ) -> Result<Self, ToolError> {
+        if self.pinned_file_reference.is_some() {
+            return Err(ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "Tool input has duplicate private execution state",
+            ));
+        }
+        self.pinned_file_reference = Some(target);
         Ok(self)
     }
 }
@@ -2240,6 +2272,41 @@ mod tests {
             }
         }))
         .is_err());
+    }
+
+    #[test]
+    fn file_reference_metadata_serde_redacts_decorated_absolute_paths() {
+        for absolute_input in [
+            "/home/private/repo/notes.rs",
+            "/home/private/repo/notes.rs:12",
+            ":12:/home/private/repo/notes.rs",
+            r"C:\Users\private\repo\notes.rs",
+            r"C:\Users\private\repo\notes.rs:12",
+            r":12:C:\Users\private\repo\notes.rs",
+        ] {
+            let metadata: ToolMetadataEntry = serde_json::from_value(json!({
+                "kind": "file_reference",
+                "value": {
+                    "input_path": absolute_input,
+                    "resolved_path": r"C:\Users\private\repo\notes.rs",
+                    "line": 12,
+                    "column": null,
+                    "normalized": true
+                }
+            }))
+            .unwrap();
+            let serialized = serde_json::to_value(metadata).unwrap();
+
+            assert_eq!(
+                serialized["value"]["input_path"], "absolute_path",
+                "{absolute_input}"
+            );
+            assert_eq!(serialized["value"]["resolved_path"], "absolute_path");
+            assert!(
+                !serialized.to_string().contains("private"),
+                "{absolute_input}"
+            );
+        }
     }
 
     #[test]

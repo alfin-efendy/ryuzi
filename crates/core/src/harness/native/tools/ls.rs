@@ -2,11 +2,12 @@
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::file_reference::{
-    normalize_resolved_path, resolve_workspace_reference,
+    normalize_resolved_path, resolve_pinned_workspace_reference, resolve_workspace_reference,
 };
 use crate::harness::native::tool_contract::{NormalizedInput, ToolError, ToolInputCtx};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 pub struct Ls;
 
@@ -24,6 +25,21 @@ fn normalize_ls_input(ctx: &ToolInputCtx<'_>, input: Value) -> Result<Normalized
     };
     let target = resolve_workspace_reference(ctx, path)?;
     normalize_resolved_path(input, &target)
+}
+
+fn prepare_ls_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
+    let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.pinned_file_reference.as_ref() {
+        return resolve_pinned_workspace_reference(&input_ctx, target)
+            .map(|resolved| (input, resolved));
+    }
+
+    let normalized = normalize_ls_input(&input_ctx, input)?;
+    let target = normalized
+        .pinned_file_reference()
+        .expect("ls normalization pins its selected target");
+    let resolved = resolve_pinned_workspace_reference(&input_ctx, target)?;
+    Ok((normalized.value, resolved))
 }
 
 #[async_trait]
@@ -58,16 +74,12 @@ impl Tool for Ls {
         PermissionSpec::new("read", format!("list {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let input = match normalize_ls_input(&input_context(ctx), input) {
-            Ok(input) => input.value,
+        let (input, resolved_path) = match prepare_ls_execution(ctx, input) {
+            Ok(prepared) => prepared,
             Err(error) => return Ok(ToolOutput::from_error(error)),
         };
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let target = match resolve_workspace_reference(&input_context(ctx), path) {
-            Ok(target) => target,
-            Err(error) => return Ok(ToolOutput::from_error(error)),
-        };
-        let mut rd = match tokio::fs::read_dir(&target.resolved_path).await {
+        let mut rd = match tokio::fs::read_dir(&resolved_path).await {
             Ok(r) => r,
             Err(e) => return Ok(ToolOutput::error(format!("ls: {path}: {e}"))),
         };

@@ -2,13 +2,14 @@
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::file_reference::{
-    normalize_resolved_path, resolve_workspace_reference,
+    normalize_resolved_path, resolve_pinned_workspace_reference, resolve_workspace_reference,
 };
 use crate::harness::native::tool_contract::{NormalizedInput, ToolError, ToolInputCtx};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 use similar::TextDiff;
+use std::path::PathBuf;
 
 pub struct Edit;
 
@@ -30,6 +31,21 @@ fn normalize_edit_input(
         .ok_or_else(|| ToolError::caller("invalid_path_reference", "File path is required"))?;
     let target = resolve_workspace_reference(ctx, path)?;
     normalize_resolved_path(input, &target)
+}
+
+fn prepare_edit_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
+    let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.pinned_file_reference.as_ref() {
+        return resolve_pinned_workspace_reference(&input_ctx, target)
+            .map(|resolved| (input, resolved));
+    }
+
+    let normalized = normalize_edit_input(&input_ctx, input)?;
+    let target = normalized
+        .pinned_file_reference()
+        .expect("edit normalization pins its selected target");
+    let resolved = resolve_pinned_workspace_reference(&input_ctx, target)?;
+    Ok((normalized.value, resolved))
 }
 
 /// Build a literal pattern that permits bare-LF input to match either LF or
@@ -121,8 +137,8 @@ impl Tool for Edit {
         PermissionSpec::new("edit", format!("edit {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let input = match normalize_edit_input(&input_context(ctx), input) {
-            Ok(input) => input.value,
+        let (input, resolved_path) = match prepare_edit_execution(ctx, input) {
+            Ok(prepared) => prepared,
             Err(error) => return Ok(ToolOutput::from_error(error)),
         };
         let path = input
@@ -142,11 +158,7 @@ impl Tool for Edit {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let target = match resolve_workspace_reference(&input_context(ctx), path) {
-            Ok(target) => target,
-            Err(error) => return Ok(ToolOutput::from_error(error)),
-        };
-        let content = match tokio::fs::read_to_string(&target.resolved_path).await {
+        let content = match tokio::fs::read_to_string(&resolved_path).await {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(format!("edit: {path}: {e}"))),
         };
@@ -164,18 +176,17 @@ impl Tool for Edit {
         }
         let replacement = replacement_for_file(new, &content);
         let updated = replace_matches(&pattern, &content, &replacement, replace_all);
-        if let Err(e) = tokio::fs::write(&target.resolved_path, &updated).await {
+        if let Err(e) = tokio::fs::write(&resolved_path, &updated).await {
             return Ok(ToolOutput::error(format!("edit: {path}: {e}")));
         }
         let diff = TextDiff::from_lines(&content, &updated)
             .unified_diff()
             .header(path, path)
             .to_string();
-        let fmt_note =
-            match crate::harness::native::format::maybe_format(&target.resolved_path).await {
-                Some(fmt) => format!(" (formatted with {fmt})"),
-                None => String::new(),
-            };
+        let fmt_note = match crate::harness::native::format::maybe_format(&resolved_path).await {
+            Some(fmt) => format!(" (formatted with {fmt})"),
+            None => String::new(),
+        };
         Ok(ToolOutput::ok(truncate(
             &format!("edited {path}{fmt_note}\n{diff}"),
             &ctx.caps,
@@ -187,6 +198,9 @@ impl Tool for Edit {
 mod tests {
     use super::super::testutil::ctx_at;
     use super::*;
+    use crate::harness::native::file_reference::{
+        FileReference, FileReferenceInterpretation, FileReferenceRoot, ResolvedFileTarget,
+    };
     use crate::harness::native::tool_contract::ToolInputCtx;
 
     #[tokio::test]
@@ -415,6 +429,80 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "old\nold\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn disappeared_pinned_literal_never_switches_to_source_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes"), "old\n").unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+        let target = ResolvedFileTarget {
+            reference: FileReference {
+                input_path: "notes:12".to_string(),
+                path: "notes:12".to_string(),
+                line: None,
+                column: None,
+            },
+            interpretation: FileReferenceInterpretation::LiteralPath,
+            root: FileReferenceRoot::Workspace,
+            resolved_path: dir.path().join("notes:12"),
+            logical_path: "notes:12".to_string(),
+            exists: true,
+        };
+        let normalized = normalize_resolved_path(
+            json!({
+                "path": "notes:12",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+            &target,
+        )
+        .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+
+        let out = Edit.execute(&ctx, normalized.value).await.unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("file_reference_changed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_source_edit_ignores_literal_candidate_appearing_later() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes"), "old\n").unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+        let normalized = Edit
+            .normalize_input(
+                &input_context(&ctx),
+                json!({
+                    "path": "notes:12",
+                    "old_string": "old",
+                    "new_string": "new"
+                }),
+            )
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+        std::fs::write(dir.path().join("notes:12"), "alternate\n").unwrap();
+
+        let out = Edit.execute(&ctx, normalized.value).await.unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes:12")).unwrap(),
+            "alternate\n"
         );
     }
 }
