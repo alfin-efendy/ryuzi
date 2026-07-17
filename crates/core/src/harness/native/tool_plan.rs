@@ -1053,9 +1053,21 @@ mod tests {
 
     #[test]
     fn plan_contract_has_no_model_identity_field() {
+        fn assert_no_model_identity_key(value: &Value) {
+            match value {
+                Value::Array(values) => values.iter().for_each(assert_no_model_identity_key),
+                Value::Object(object) => {
+                    assert!(object
+                        .keys()
+                        .all(|key| key != "model" && key != "model_id" && key != "model_name"));
+                    object.values().for_each(assert_no_model_identity_key);
+                }
+                _ => {}
+            }
+        }
+
         let serialized = serde_json::to_value(test_plan()).unwrap();
-        assert!(serialized.get("model").is_none());
-        assert!(serialized.to_string().find("terra").is_none());
+        assert_no_model_identity_key(&serialized);
     }
 
     #[tokio::test]
@@ -1113,6 +1125,89 @@ mod tests {
         assert!(!read.strict);
         assert_eq!(read.wire_schema, read.canonical_schema);
         assert_eq!(read.canonical_schema["additionalProperties"], false);
+    }
+
+    #[tokio::test]
+    async fn strict_openai_plan_selects_closed_required_nullable_and_disjoint_wire_schemas() {
+        fn assert_every_object_is_closed_and_fully_required(value: &Value) {
+            match value {
+                Value::Array(values) => values
+                    .iter()
+                    .for_each(assert_every_object_is_closed_and_fully_required),
+                Value::Object(object) => {
+                    if object.get("type").and_then(Value::as_str) == Some("object")
+                        || object.contains_key("properties")
+                    {
+                        assert_eq!(
+                            object.get("additionalProperties"),
+                            Some(&Value::Bool(false))
+                        );
+                        let properties = object
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .expect("strict object has properties");
+                        let required = object
+                            .get("required")
+                            .and_then(Value::as_array)
+                            .expect("strict object has required");
+                        assert_eq!(required.len(), properties.len());
+                        assert!(required
+                            .windows(2)
+                            .all(|pair| pair[0].as_str() < pair[1].as_str()));
+                    }
+                    object
+                        .values()
+                        .for_each(assert_every_object_is_closed_and_fully_required);
+                }
+                _ => {}
+            }
+        }
+
+        let registry = ToolRegistry::builtin();
+        let compiled = compile_candidate(
+            &registry,
+            &ToolFilter::Only(vec!["read".into(), "memory_batch".into()]),
+            profile(16_000),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let read = compiled.canonical_tools.get("read").unwrap();
+        assert!(read.strict);
+        assert_every_object_is_closed_and_fully_required(&read.wire_schema);
+        assert_eq!(
+            read.wire_schema["required"],
+            json!(["limit", "offset", "path"])
+        );
+        for optional in ["limit", "offset"] {
+            assert_eq!(
+                read.wire_schema["properties"][optional]["anyOf"][1],
+                json!({"type": "null"})
+            );
+        }
+
+        let batch = compiled.canonical_tools.get("memory_batch").unwrap();
+        let branches = batch.wire_schema["properties"]["operations"]["items"]["anyOf"]
+            .as_array()
+            .unwrap();
+        assert!(batch.strict);
+        assert_every_object_is_closed_and_fully_required(&batch.wire_schema);
+        assert!(batch.wire_schema["properties"]["operations"]["items"]
+            .get("oneOf")
+            .is_none());
+        assert_eq!(branches.len(), 3);
+
+        for name in ["read", "memory_batch"] {
+            let definition = compiled
+                .visible_definitions
+                .iter()
+                .find(|definition| definition["name"] == name)
+                .unwrap();
+            let planned = compiled.canonical_tools.get(name).unwrap();
+            assert_eq!(definition["input_schema"], planned.wire_schema);
+            assert_eq!(definition["strict"], true);
+        }
     }
 
     #[tokio::test]
