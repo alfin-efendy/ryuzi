@@ -575,6 +575,11 @@ impl ToolRegistry {
             .map(|registered| registered.tool.clone())
     }
 
+    /// The immutable descriptor/tool snapshot behind legacy last-wins lookup.
+    pub fn legacy_registered(&self, name: &str) -> Option<Arc<RegisteredTool>> {
+        self.legacy_tools.get(name).cloned()
+    }
+
     pub fn registered(&self, name: &str) -> Option<Arc<RegisteredTool>> {
         self.canonical_tools.get(name).cloned()
     }
@@ -895,6 +900,7 @@ fn contract_hash(
     hash_part(&mut hasher, &descriptor.result_limit_bytes);
     hash_part(&mut hasher, &descriptor.facade_priority);
     hash_part(&mut hasher, &descriptor.policy_aliases);
+    hash_part(&mut hasher, &descriptor.policy_groups);
     hash_part(&mut hasher, &descriptor.v2_only);
     hash_part(&mut hasher, &descriptor.v1_only);
     hash_part(&mut hasher, &descriptor.allow_lossless_coercions);

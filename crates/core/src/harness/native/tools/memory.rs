@@ -2,7 +2,9 @@
 
 use super::{PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::memory as mem;
-use crate::harness::native::tool_contract::{ToolDescriptor, ToolEffect, ToolError};
+use crate::harness::native::tool_contract::{
+    ToolDescriptor, ToolEffect, ToolError, ToolPolicyGroup,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -304,6 +306,18 @@ fn v2_descriptor(name: &str, action: &str, schema: Value) -> ToolDescriptor {
     let mut descriptor = ToolDescriptor::conservative(name, DESCRIPTION, schema, "other");
     descriptor.effect = ToolEffect::Mutating;
     descriptor.policy_aliases = vec!["memory".into()];
+    descriptor.policy_groups = vec![ToolPolicyGroup {
+        alias: "memory".into(),
+        members: [
+            "memory_add",
+            "memory_batch",
+            "memory_remove",
+            "memory_replace",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    }];
     descriptor.v2_only = true;
     descriptor.description = format!("{DESCRIPTION} This facade performs `{action}` operations.");
     descriptor

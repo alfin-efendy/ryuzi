@@ -46,6 +46,25 @@ pub enum FacadePriority {
     Deferred,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrictSchemaDialect {
+    /// Schema-v1 plans written before bounded strings were introduced. Bounds
+    /// unsupported by that compiler fall back to the canonical non-strict wire.
+    LegacyV1,
+    /// Current direct-function dialect. Canonical validation retains string
+    /// bounds while the provider wire conservatively omits them.
+    ConservativeV1,
+}
+
+pub const CURRENT_STRICT_SCHEMA_DIALECT: StrictSchemaDialect = StrictSchemaDialect::ConservativeV1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyGroup {
+    pub alias: String,
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub canonical_name: String,
@@ -61,6 +80,8 @@ pub struct ToolDescriptor {
     pub result_limit_bytes: u64,
     pub facade_priority: FacadePriority,
     pub policy_aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_groups: Vec<ToolPolicyGroup>,
     pub v2_only: bool,
     pub v1_only: bool,
     pub allow_lossless_coercions: bool,
@@ -98,6 +119,7 @@ impl ToolDescriptor {
             result_limit_bytes: 50_000,
             facade_priority: FacadePriority::Normal,
             policy_aliases: Vec::new(),
+            policy_groups: Vec::new(),
             v2_only: false,
             v1_only: false,
             allow_lossless_coercions: false,
@@ -1237,6 +1259,13 @@ fn type_includes(value: &Option<&Value>, expected: &str) -> bool {
 }
 
 pub fn compile_openai_strict_schema(canonical: &Value) -> Result<Value, SchemaCompileError> {
+    compile_strict_schema(canonical, CURRENT_STRICT_SCHEMA_DIALECT)
+}
+
+pub fn compile_strict_schema(
+    canonical: &Value,
+    dialect: StrictSchemaDialect,
+) -> Result<Value, SchemaCompileError> {
     let mut wire = compile_canonical_schema(canonical.clone());
     if wire
         .as_object()
@@ -1248,8 +1277,19 @@ pub fn compile_openai_strict_schema(canonical: &Value) -> Result<Value, SchemaCo
         ));
     }
     rewrite_schema_consts(&mut wire)?;
+    if dialect == StrictSchemaDialect::ConservativeV1 {
+        strip_conservative_string_bounds(&mut wire);
+    }
     compile_strict_node(&mut wire)?;
     Ok(wire)
+}
+
+fn strip_conservative_string_bounds(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("minLength");
+    visit_schema_children_mut(object, strip_conservative_string_bounds);
 }
 
 fn rewrite_schema_consts(value: &mut Value) -> Result<(), SchemaCompileError> {
@@ -1514,7 +1554,6 @@ fn reject_unsupported_keywords(object: &Map<String, Value>) -> Result<(), Schema
         "maxItems",
         "maximum",
         "minItems",
-        "minLength",
         "minimum",
         "multipleOf",
         "oneOf",
@@ -1600,6 +1639,24 @@ mod tests {
             wire["properties"]["offset"]["anyOf"][1],
             json!({"type": "null"})
         );
+    }
+
+    #[test]
+    fn strict_schema_conservatively_omits_min_length_from_wire() {
+        let canonical = json!({
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "minLength": 1}
+            },
+            "required": ["text"],
+            "additionalProperties": false
+        });
+
+        let wire = compile_openai_strict_schema(&canonical).unwrap();
+
+        assert_eq!(canonical["properties"]["text"]["minLength"], 1);
+        assert!(wire["properties"]["text"].get("minLength").is_none());
+        assert_eq!(wire["properties"]["text"]["type"], "string");
     }
 
     #[test]
@@ -1951,6 +2008,7 @@ mod tests {
             result_limit_bytes: 50_000,
             facade_priority: FacadePriority::Normal,
             policy_aliases: vec![],
+            policy_groups: vec![],
             v2_only: false,
             v1_only: false,
             allow_lossless_coercions: false,

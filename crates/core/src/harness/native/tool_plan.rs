@@ -3,7 +3,8 @@ use crate::harness::native::capabilities::{
     ToolCapabilityProfile, ToolInteractionMode, CAPABILITY_SCHEMA_VERSION,
 };
 use crate::harness::native::tool_contract::{
-    compile_canonical_schema, compile_openai_strict_schema, ToolDescriptor,
+    compile_canonical_schema, compile_strict_schema, StrictSchemaDialect, ToolDescriptor,
+    CURRENT_STRICT_SCHEMA_DIALECT,
 };
 use crate::harness::native::tools::{RegisteredTool, ToolRegistry};
 use crate::store::Store;
@@ -32,14 +33,35 @@ pub struct PlannedTool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PolicyAliasTarget {
+    Canonical(String),
+    Group(Vec<String>),
+}
+
+impl From<String> for PolicyAliasTarget {
+    fn from(value: String) -> Self {
+        Self::Canonical(value)
+    }
+}
+
+impl From<&str> for PolicyAliasTarget {
+    fn from(value: &str) -> Self {
+        Self::Canonical(value.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToolPlanBody {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_schema_dialect: Option<StrictSchemaDialect>,
     pub capability_profile: ToolCapabilityProfile,
     pub registry_generation: u64,
     pub canonical_tools: Vec<PlannedTool>,
     pub visible_definitions: Vec<Value>,
     pub deferred_catalog: Vec<Value>,
-    pub policy_aliases: BTreeMap<String, String>,
+    pub policy_aliases: BTreeMap<String, PolicyAliasTarget>,
     pub limits: ToolPlanLimits,
 }
 
@@ -281,6 +303,7 @@ pub async fn compile_candidate(
 
     let plan = SessionToolPlan::from_body(SessionToolPlanBody {
         schema_version: SESSION_TOOL_PLAN_SCHEMA_VERSION,
+        strict_schema_dialect: Some(CURRENT_STRICT_SCHEMA_DIALECT),
         registry_generation: registry.generation(),
         limits: ToolPlanLimits {
             schema_budget_tokens: capability_profile.schema_budget_tokens,
@@ -467,7 +490,11 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
                 "stored tool output schema is invalid",
             ));
         }
-        let strict_schema = compile_openai_strict_schema(&planned.canonical_schema);
+        let strict_schema = compile_strict_schema(
+            &planned.canonical_schema,
+            body.strict_schema_dialect
+                .unwrap_or(StrictSchemaDialect::LegacyV1),
+        );
         let expected_strict =
             body.capability_profile.supports_strict_function_schema && strict_schema.is_ok();
         if planned.strict != expected_strict {
@@ -516,13 +543,28 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
 
 fn derive_policy_aliases(
     planned_tools: &[PlannedTool],
-) -> Result<BTreeMap<String, String>, &'static str> {
+) -> Result<BTreeMap<String, PolicyAliasTarget>, &'static str> {
     let canonical_names = planned_tools
         .iter()
         .map(|tool| tool.canonical_name.as_str())
         .collect::<BTreeSet<_>>();
     let mut targets = BTreeMap::<String, Vec<&PlannedTool>>::new();
     for planned in planned_tools {
+        let mut declared_aliases = BTreeSet::new();
+        for group in &planned.descriptor.policy_groups {
+            if group.alias.is_empty()
+                || !declared_aliases.insert(group.alias.as_str())
+                || !planned.descriptor.policy_aliases.contains(&group.alias)
+                || group.members.len() < 2
+                || !is_sorted_unique(group.members.iter().map(String::as_str))
+                || group
+                    .members
+                    .binary_search(&planned.canonical_name)
+                    .is_err()
+            {
+                return Err("tool policy group declaration is invalid");
+            }
+        }
         for alias in &planned.descriptor.policy_aliases {
             if canonical_names.contains(alias.as_str()) && alias != &planned.canonical_name {
                 return Err("tool policy alias conflicts with a canonical tool name");
@@ -535,13 +577,22 @@ fn derive_policy_aliases(
         planned.sort_by(|left, right| left.canonical_name.cmp(&right.canonical_name));
         planned.dedup_by(|left, right| left.canonical_name == right.canonical_name);
         let target = match planned.as_slice() {
-            [one] => one.canonical_name.clone(),
-            // A split V2 facade may intentionally share one policy key. Keep a
-            // deterministic group marker in the persisted map; dispatch still
-            // resolves only canonical tools from the frozen plan.
-            many if many.iter().all(|tool| tool.descriptor.v2_only) => alias.clone(),
-            _ => {
-                return Err("tool policy alias resolves to multiple canonical tools");
+            [one] => PolicyAliasTarget::Canonical(one.canonical_name.clone()),
+            many => {
+                let members = many
+                    .iter()
+                    .map(|tool| tool.canonical_name.clone())
+                    .collect::<Vec<_>>();
+                let exact_group = many.iter().all(|tool| {
+                    tool.descriptor
+                        .policy_groups
+                        .iter()
+                        .any(|group| group.alias == alias && group.members == members)
+                });
+                if !exact_group {
+                    return Err("tool policy alias resolves to multiple canonical tools");
+                }
+                PolicyAliasTarget::Group(members)
             }
         };
         aliases.insert(alias, target);
@@ -690,6 +741,7 @@ mod tests {
         first_canonical_name: &'static str,
         later_canonical_name: &'static str,
         policy_aliases: Vec<String>,
+        v2_only: bool,
         descriptor_calls: AtomicUsize,
     }
 
@@ -702,6 +754,7 @@ mod tests {
                 first_canonical_name: canonical_name,
                 later_canonical_name: canonical_name,
                 policy_aliases: Vec::new(),
+                v2_only: false,
                 descriptor_calls: AtomicUsize::new(0),
             }
         }
@@ -713,6 +766,11 @@ mod tests {
 
         fn with_policy_alias(mut self, alias: &str) -> Self {
             self.policy_aliases.push(alias.to_string());
+            self
+        }
+
+        fn with_v2_only(mut self) -> Self {
+            self.v2_only = true;
             self
         }
     }
@@ -750,6 +808,7 @@ mod tests {
             }
             .to_string();
             descriptor.policy_aliases = self.policy_aliases.clone();
+            descriptor.v2_only = self.v2_only;
             descriptor
         }
 
@@ -792,12 +851,14 @@ mod tests {
             result_limit_bytes: 50_000,
             facade_priority: FacadePriority::Preferred,
             policy_aliases: vec![],
+            policy_groups: vec![],
             v2_only: false,
             v1_only: false,
             allow_lossless_coercions: false,
         };
         SessionToolPlan::from_body(SessionToolPlanBody {
             schema_version: SESSION_TOOL_PLAN_SCHEMA_VERSION,
+            strict_schema_dialect: Some(CURRENT_STRICT_SCHEMA_DIALECT),
             capability_profile: profile(16_000),
             registry_generation: 7,
             canonical_tools: vec![PlannedTool {
@@ -1073,6 +1134,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_regression_candidate_rejects_unrelated_v2_only_alias_collision() {
+        let first: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "unrelated_v2_first_legacy",
+                "unrelated_v2_first",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("shared_v2_policy_alias")
+            .with_v2_only(),
+        );
+        let second: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "unrelated_v2_second_legacy",
+                "unrelated_v2_second",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("shared_v2_policy_alias")
+            .with_v2_only(),
+        );
+        let registry = ToolRegistry::with_extra(vec![first, second]);
+
+        let error = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "capability_unavailable");
+    }
+
+    #[tokio::test]
     async fn v2_memory_policy_alias_selects_only_the_split_facade() {
         let registry = ToolRegistry::builtin();
         let aliased = compile_candidate(
@@ -1098,7 +1188,15 @@ mod tests {
         );
         assert!(!aliased.canonical_tools.contains_key("memory"));
         assert!(!aliased.canonical_tools.contains_key("read"));
-        assert_eq!(aliased.plan.body.policy_aliases["memory"], "memory");
+        assert_eq!(
+            serde_json::to_value(&aliased.plan.body).unwrap()["policy_aliases"]["memory"],
+            json!([
+                "memory_add",
+                "memory_batch",
+                "memory_remove",
+                "memory_replace"
+            ])
+        );
 
         for expected in [
             "memory_add",
@@ -1123,6 +1221,14 @@ mod tests {
                 [expected]
             );
         }
+
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &aliased).await.unwrap();
+        let loaded = load_plan(&store, "plan-run").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.plan.body.policy_aliases,
+            aliased.plan.body.policy_aliases
+        );
     }
 
     async fn store_with_run() -> (tempfile::NamedTempFile, Store) {
@@ -1232,6 +1338,48 @@ mod tests {
 
         let loaded = load_plan(&store, "plan-run").await.unwrap().unwrap();
         assert_eq!(loaded, candidate);
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_plan_without_dialect_loads_canonical_min_length_fallback() {
+        let registry = ToolRegistry::builtin();
+        let candidate = compile_candidate(
+            &registry,
+            &ToolFilter::Only(vec!["memory_add".into()]),
+            profile(16_000),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let mut legacy_json = serde_json::to_value(&candidate.plan.body).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("strict_schema_dialect");
+        legacy_json["canonical_tools"][0]["descriptor"]
+            .as_object_mut()
+            .unwrap()
+            .remove("policy_groups");
+        let mut legacy_body: SessionToolPlanBody = serde_json::from_value(legacy_json).unwrap();
+        let planned = &mut legacy_body.canonical_tools[0];
+        assert_eq!(
+            planned.canonical_schema["properties"]["text"]["minLength"],
+            1
+        );
+        planned.strict = false;
+        planned.wire_schema = planned.canonical_schema.clone();
+        refresh_planned_tool(&mut legacy_body, "memory_add");
+        replace_stored_body(&store, legacy_body).await;
+
+        let loaded = load_plan(&store, "plan-run").await.unwrap().unwrap();
+        assert!(!loaded.canonical_tools["memory_add"].strict);
+        assert_eq!(
+            loaded.canonical_tools["memory_add"].wire_schema,
+            loaded.canonical_tools["memory_add"].canonical_schema
+        );
     }
 
     #[tokio::test]
@@ -1349,7 +1497,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             candidate.plan.body.policy_aliases["approved_policy_alias"],
-            "policy_alias_tool"
+            PolicyAliasTarget::Canonical("policy_alias_tool".into())
         );
         let (_tmp, store) = store_with_run().await;
         freeze_plan(&store, "plan-run", &candidate).await.unwrap();
@@ -1425,6 +1573,60 @@ mod tests {
         assert_eq!(
             load_plan(&store, "plan-run").await.unwrap_err().code,
             "invalid_persisted_tool_plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_load_rejects_unrelated_v2_alias_collision() {
+        let first: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "persisted_v2_first_legacy",
+                "persisted_v2_first",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("first_v2_unique_alias")
+            .with_v2_only(),
+        );
+        let second: Arc<dyn Tool> = Arc::new(
+            SnapshotTestTool::new(
+                "persisted_v2_second_legacy",
+                "persisted_v2_second",
+                json!({"type":"object"}),
+            )
+            .with_policy_alias("second_v2_unique_alias")
+            .with_v2_only(),
+        );
+        let registry = ToolRegistry::with_extra(vec![first, second]);
+        let candidate = compile_candidate(&registry, &ToolFilter::All, profile(16_000), None)
+            .await
+            .unwrap();
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let mut body = candidate.plan.body;
+        let second = body
+            .canonical_tools
+            .iter_mut()
+            .find(|tool| tool.canonical_name == "persisted_v2_second")
+            .unwrap();
+        second.descriptor.policy_aliases = vec!["first_v2_unique_alias".into()];
+        refresh_planned_tool(&mut body, "persisted_v2_second");
+        body.policy_aliases.remove("first_v2_unique_alias");
+        body.policy_aliases.remove("second_v2_unique_alias");
+        body.policy_aliases.insert(
+            "first_v2_unique_alias".into(),
+            PolicyAliasTarget::Group(vec![
+                "persisted_v2_first".into(),
+                "persisted_v2_second".into(),
+            ]),
+        );
+        replace_stored_body(&store, body).await;
+
+        let error = load_plan(&store, "plan-run").await.unwrap_err();
+        assert_eq!(error.code, "invalid_persisted_tool_plan");
+        assert_eq!(
+            error.message,
+            "tool policy alias resolves to multiple canonical tools"
         );
     }
 

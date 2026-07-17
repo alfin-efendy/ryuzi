@@ -41,7 +41,7 @@ use crate::llm_router::provenance::{
 use crate::store::Store;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -1737,21 +1737,45 @@ fn cap_report(s: &str) -> String {
 }
 
 /// The tool filter a delegated child actually runs with: the intersection of
-/// the parent's and the child agent's filters over the registry's tool names,
-/// minus the delegation blocklist.
+/// the parent's and the child agent's filters over immutable registry
+/// contracts, minus the delegation blocklist. Policy aliases participate only
+/// in authorization checks; they are never turned into executable names.
 fn effective_child_filter(
     parent: &super::agents::ToolFilter,
     child: &super::agents::ToolFilter,
-    names: &[String],
+    registry: &ToolRegistry,
     blocklist: &[&str],
 ) -> super::agents::ToolFilter {
-    super::agents::ToolFilter::Only(
-        names
+    let mut allowed = BTreeSet::new();
+    for registered in registry.canonical_snapshot() {
+        let descriptor = &registered.descriptor;
+        let legacy_names = registry
+            .legacy_to_canonical()
             .iter()
-            .filter(|n| parent.allows(n) && child.allows(n) && !blocklist.contains(&n.as_str()))
-            .cloned()
-            .collect(),
-    )
+            .filter_map(|(legacy, canonical)| {
+                (canonical == &descriptor.canonical_name).then_some(legacy.as_str())
+            })
+            .collect::<Vec<_>>();
+        let filter_allows = |filter: &super::agents::ToolFilter| {
+            filter.allows(&descriptor.canonical_name)
+                || descriptor
+                    .policy_aliases
+                    .iter()
+                    .any(|alias| filter.allows(alias))
+                || legacy_names.iter().any(|name| filter.allows(name))
+        };
+        let blocked = blocklist.contains(&descriptor.canonical_name.as_str())
+            || descriptor
+                .policy_aliases
+                .iter()
+                .any(|alias| blocklist.contains(&alias.as_str()))
+            || legacy_names.iter().any(|name| blocklist.contains(name));
+        if filter_allows(parent) && filter_allows(child) && !blocked {
+            allowed.insert(descriptor.canonical_name.clone());
+            allowed.extend(legacy_names.into_iter().map(str::to_owned));
+        }
+    }
+    super::agents::ToolFilter::Only(allowed.into_iter().collect())
 }
 
 /// The `max_spawn_depth` setting controls how many delegation hops a child may make.
@@ -2309,7 +2333,7 @@ impl RunnerSpawner {
         child.tools = effective_child_filter(
             &self.deps.agent.tools,
             &child.tools,
-            &self.deps.tools.names(),
+            &self.deps.tools,
             SUBAGENT_BLOCKLIST,
         );
         // Delegating children get the `task` tool re-armed.
@@ -2986,7 +3010,11 @@ async fn run_legacy_tool_call(
     if tool_call.name == LOAD_TOOLS_NAME {
         return handle_load_tools(deps, agent, tool_call, display).await;
     }
-    let Some(tool) = deps.tools.get(&tool_call.name) else {
+    let Some(registered) = deps
+        .tools
+        .legacy_registered(&tool_call.name)
+        .filter(|registered| !registered.descriptor.v2_only)
+    else {
         let message = format!("unknown tool `{}`", tool_call.name);
         insert_tool_row(deps, tool_call, &input, "unknown", display.subagent()).await;
         return complete_tool_call(
@@ -3010,6 +3038,7 @@ async fn run_legacy_tool_call(
         .await
         .provider_result;
     };
+    let tool = registered.tool.clone();
     let tool_kind = tool.kind();
     if !agent.tools.allows(&tool_call.name) {
         let message = format!(
@@ -3755,6 +3784,10 @@ fn is_builtin_metric_tool(tool_name: &str) -> bool {
             | "websearch"
             | "skill"
             | "memory"
+            | "memory_add"
+            | "memory_replace"
+            | "memory_remove"
+            | "memory_batch"
             | "revert"
             | "lsp"
             | "task"
@@ -7608,20 +7641,41 @@ mod tests {
     #[test]
     fn effective_child_filter_intersects_and_blocks() {
         use super::super::agents::ToolFilter;
-        let names: Vec<String> = ["read", "bash", "task", "memory", "grep"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let registry = ToolRegistry::builtin();
         let parent = ToolFilter::Only(vec!["read".into(), "task".into(), "bash".into()]);
-        let eff = effective_child_filter(&parent, &ToolFilter::All, &names, SUBAGENT_BLOCKLIST);
+        let eff = effective_child_filter(&parent, &ToolFilter::All, &registry, SUBAGENT_BLOCKLIST);
         assert!(eff.allows("read") && eff.allows("bash"));
         assert!(!eff.allows("task"), "blocklist wins over parent allow");
         assert!(!eff.allows("memory"));
         assert!(!eff.allows("grep"), "parent filter constrains the child");
         // All ∩ All − blocklist keeps everything else.
-        let eff = effective_child_filter(&ToolFilter::All, &ToolFilter::All, &names, &["memory"]);
+        let eff =
+            effective_child_filter(&ToolFilter::All, &ToolFilter::All, &registry, &["memory"]);
         assert!(eff.allows("task") && eff.allows("read"));
-        assert!(!eff.allows("memory"));
+        for blocked in [
+            "memory",
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert!(
+                !eff.allows(blocked),
+                "policy-key block must exclude {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_memory_metric_facades_are_bounded_builtins() {
+        for name in [
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert_eq!(safe_tool_facade(name), "builtin", "{name}");
+        }
     }
 
     #[test]
@@ -8531,6 +8585,91 @@ mod tests {
             .unwrap_or_else(|| result.to_string())
     }
 
+    #[tokio::test]
+    async fn v1_guessed_split_memory_names_are_rejected_before_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+                    dir.path().to_path_buf(),
+                )),
+                "legacy",
+                Some("p1"),
+            )
+            .unwrap(),
+        ));
+
+        for (name, input) in [
+            (
+                "memory_add",
+                json!({"scope":"global", "text":"guessed add"}),
+            ),
+            (
+                "memory_replace",
+                json!({"scope":"global", "match":"guessed", "text":"guessed replace"}),
+            ),
+            (
+                "memory_remove",
+                json!({"scope":"global", "match":"guessed"}),
+            ),
+            (
+                "memory_batch",
+                json!({"operations":[{"action":"add", "scope":"global", "text":"guessed batch"}]}),
+            ),
+        ] {
+            let result = run_legacy_tool_call(
+                &deps,
+                &deps.agent,
+                &ToolAccum {
+                    id: format!("legacy-{name}"),
+                    name: name.into(),
+                    start_input: input,
+                    input_json: String::new(),
+                    input_overflowed: false,
+                },
+                &DisplayMode::Silent,
+                &None,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(result_text(&result).contains("unknown tool"), "{name}");
+        }
+
+        assert!(
+            deps.memory
+                .as_ref()
+                .unwrap()
+                .load(crate::harness::native::memory::MemoryScope::Global)
+                .await
+                .unwrap()
+                .is_empty(),
+            "guessed V2-only names must have zero side effects"
+        );
+
+        let compatibility = run_legacy_tool_call(
+            &deps,
+            &deps.agent,
+            &ToolAccum {
+                id: "legacy-memory".into(),
+                name: "memory".into(),
+                start_input: json!({
+                    "action":"add",
+                    "scope":"global",
+                    "text":"compatibility remains dispatchable"
+                }),
+                input_json: String::new(),
+                input_overflowed: false,
+            },
+            &DisplayMode::Silent,
+            &None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(!result_text(&compatibility).contains("unknown tool"));
+    }
+
     async fn dispatch_input_against_plan(
         deps: &RunnerDeps,
         plan: &RunToolPlan,
@@ -8807,7 +8946,7 @@ mod tests {
             .run_many(
                 "parent-tool-call",
                 vec![SubtaskSpec {
-                    agent_type: "explore".into(),
+                    agent_type: "general".into(),
                     prompt: "inspect the workspace".into(),
                 }],
             )
@@ -8830,6 +8969,18 @@ mod tests {
             parent_plan.visible_definitions,
             child_plan.visible_definitions
         );
+        for blocked in [
+            "memory",
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert!(
+                !child_plan.canonical_tools.contains_key(blocked),
+                "plain V2 children must not advertise or dispatch {blocked}"
+            );
+        }
         assert_ne!(child.run_id, parent.run_id);
     }
 
@@ -8984,14 +9135,11 @@ mod tests {
     #[test]
     fn subagent_blocklist_blocks_todo_tools() {
         use super::super::agents::ToolFilter;
-        let names: Vec<String> = ["read", "bash", "todowrite", "todoread"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let registry = ToolRegistry::builtin();
         let eff = effective_child_filter(
             &ToolFilter::All,
             &ToolFilter::All,
-            &names,
+            &registry,
             SUBAGENT_BLOCKLIST,
         );
         assert!(eff.allows("read") && eff.allows("bash"));
@@ -9005,14 +9153,11 @@ mod tests {
     #[test]
     fn subagent_blocklist_blocks_app_tools() {
         use super::super::agents::ToolFilter;
-        let names: Vec<String> = crate::harness::native::tools::APP_TOOLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let registry = ToolRegistry::builtin();
         let eff = effective_child_filter(
             &ToolFilter::All,
             &ToolFilter::All,
-            &names,
+            &registry,
             SUBAGENT_BLOCKLIST,
         );
         for t in crate::harness::native::tools::APP_TOOLS {
