@@ -128,17 +128,20 @@ impl ArtifactService {
             });
         }
 
-        match self.store.session_archived_at(&input.session_pk).await {
-            Ok(Some(_)) => return Err(ArtifactError::ArchivedSource),
-            Ok(None) => {}
-            // Every pre-archive-support `create_artifact` test exercises a
-            // bare `session_pk` that was never inserted as a real
-            // `sessions` row, so `session_archived_at` reports exactly
-            // this error text. Tolerating only that exact message lets
-            // those tests keep passing while any other lookup failure
-            // still surfaces as a storage failure below.
-            Err(error) if error.to_string() == "unknown session" => {}
-            Err(_) => return Err(ArtifactError::StorageFailure),
+        // Existing Task 2 callers may create test or imported artifacts before
+        // their source session is persisted. Only a known archived session is
+        // rejected; a missing session is left for the control-plane ingestion
+        // path to validate when it has an active-session requirement.
+        match self
+            .store
+            .get_session(&input.session_pk)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+        {
+            Some(session) if session.archived_at.is_some() => {
+                return Err(ArtifactError::ArchivedSource);
+            }
+            Some(_) | None => {}
         }
 
         let quota_lock = {
@@ -505,6 +508,18 @@ mod tests {
         let (_dir, _store, svc) = service(default_config()).await;
         let err = svc.read_range("does-not-exist", 0, None).await.unwrap_err();
         assert_eq!(err, ArtifactError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn create_artifact_rejects_a_known_archived_source_session() {
+        let (_dir, store, svc) = service(default_config()).await;
+        store.insert_session(sample_session()).await.unwrap();
+        assert!(store.archive_session("sess-1", 10).await.unwrap());
+
+        assert_eq!(
+            svc.create_artifact(base_input(b"hello")).await.unwrap_err(),
+            ArtifactError::ArchivedSource
+        );
     }
 
     #[tokio::test]
