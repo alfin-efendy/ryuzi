@@ -148,7 +148,13 @@ export function HomeView() {
     () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", primaryAgentId, mentions),
     [registry?.agents, mentionQuery?.query, primaryAgentId, mentions],
   );
-  const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
+  const contextQuery = useMemo(() => {
+    const activeContext = activeContextQuery(draft, mentionCaret);
+    if (activeContext && activeContext.query.length > 0 && (activeContext.query.includes("/") || activeContext.query.includes("."))) {
+      return activeContext;
+    }
+    return null;
+  }, [draft, mentionCaret]);
   const contextQueryText = contextQuery?.query ?? null;
   const mentionMenuOpen = mentionQuery !== null && contextQuery === null && slashQuery === null && mentionMatches.length > 0;
 
@@ -160,7 +166,16 @@ export function HomeView() {
     let cancelled = false;
     const t = setTimeout(() => {
       void commands.searchFiles(LOCAL_RUNNER, projectId, contextQueryText).then((res) => {
-        if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
+        if (!cancelled) {
+          setContextHits(
+            res.status === "ok"
+              ? res.data
+                  .filter((entry) => !entry.dir)
+                  .map((entry) => entry.path)
+                  .slice(0, 6)
+              : [],
+          );
+        }
       });
     }, 120);
     return () => {
@@ -170,7 +185,7 @@ export function HomeView() {
   }, [projectId, contextQueryText]);
 
   const pickContext = (path: string) => {
-    updateDraft((cur) => replaceActiveContextToken(cur, path));
+    updateDraft((cur) => replaceActiveContextToken(cur, mentionCaret, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
     setContextHits([]);
   };

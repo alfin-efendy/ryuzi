@@ -1,11 +1,23 @@
 //! Read-only project/worktree views for the session right dock: a jailed
 //! directory listing, the real git diff, and filename search for the palette.
 
+use serde::{Deserialize, Serialize};
+use specta::Type;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirEntry {
     pub name: String,
+    pub dir: bool,
+}
+
+/// One workspace search hit for the unified `@` context picker: a
+/// root-relative, forward-slash path plus whether it names a directory.
+/// Serialized camelCase for the Tauri binding (`{ path, dir }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchEntryInfo {
+    pub path: String,
     pub dir: bool,
 }
 
@@ -187,41 +199,72 @@ pub async fn revert_file(workdir: &str, rel_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Case-insensitive substring search over relative file paths (capped).
-pub fn search_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
+/// Case-insensitive substring search over the workspace tree, returning
+/// typed hits (files AND matching directories) for the unified `@` context
+/// picker. An empty query matches everything, so the caller gets a safe,
+/// bounded set of initial entries instead of nothing. Traversal is
+/// depth-first, pre-order, with each directory's children sorted by name
+/// first — a deterministic order regardless of filesystem enumeration order,
+/// and stable across repeated calls for the same `cap`. Directories listed
+/// in `SKIP_DIRS` are neither returned nor traversed, at any depth. Paths
+/// are root-relative with forward slashes on every platform.
+pub fn search_entries(root: &Path, query: &str, cap: usize) -> Vec<SearchEntryInfo> {
     let needle = query.to_lowercase();
-    if needle.is_empty() {
-        return vec![];
-    }
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    search_entries_into(root, root, &needle, cap, &mut out);
+    out
+}
+
+fn search_entries_into(
+    dir: &Path,
+    root: &Path,
+    needle: &str,
+    cap: usize,
+    out: &mut Vec<SearchEntryInfo>,
+) {
+    if out.len() >= cap {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut items: Vec<_> = entries.flatten().collect();
+    items.sort_by_key(|e| e.file_name());
+    for entry in items {
+        if out.len() >= cap {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir && SKIP_DIRS.contains(&name.as_str()) {
             continue;
-        };
-        for entry in entries.flatten() {
-            if out.len() >= cap {
-                return out;
-            }
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
-                continue;
-            }
-            let rel = path
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            if rel.to_lowercase().contains(&needle) {
-                out.push(rel);
-            }
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if needle.is_empty() || rel.to_lowercase().contains(needle) {
+            out.push(SearchEntryInfo {
+                path: rel,
+                dir: is_dir,
+            });
+        }
+        if is_dir {
+            search_entries_into(&path, root, needle, cap, out);
         }
     }
-    out
+}
+
+/// Case-insensitive substring search over relative file paths (capped).
+/// Thin wrapper over [`search_entries`] for the (few) callers that only ever
+/// want files, not directories.
+pub fn search_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
+    search_entries(root, query, cap)
+        .into_iter()
+        .filter(|entry| !entry.dir)
+        .map(|entry| entry.path)
+        .collect()
 }
 
 #[cfg(test)]
@@ -448,6 +491,39 @@ mod tests {
         let hits = search_files(tmp.path(), "app.TSX", 50);
         assert_eq!(hits, vec!["src/components/App.tsx".to_string()]);
         assert!(search_files(tmp.path(), "node_modules", 50).is_empty());
-        assert!(search_files(tmp.path(), "", 50).is_empty());
+        assert!(!search_files(tmp.path(), "", 50).is_empty());
+    }
+
+    #[test]
+    fn search_entries_returns_matching_files_and_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/components")).unwrap();
+        std::fs::write(tmp.path().join("src/components/SessionView.tsx"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/session")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules/session")).unwrap();
+
+        let mut hits = search_entries(tmp.path(), "session", 50);
+        hits.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            hits,
+            vec![
+                SearchEntryInfo {
+                    path: "src/components/SessionView.tsx".into(),
+                    dir: false,
+                },
+                SearchEntryInfo {
+                    path: "src/session".into(),
+                    dir: true,
+                },
+            ]
+        );
+
+        // node_modules is skipped entirely: neither returned nor traversed.
+        assert!(!hits.iter().any(|e| e.path.contains("node_modules")));
+
+        // Empty query returns safe bounded initial entries, not an empty vec.
+        let initial = search_entries(tmp.path(), "", 50);
+        assert!(!initial.is_empty());
+        assert!(initial.iter().all(|e| !e.path.contains('\\')));
     }
 }
