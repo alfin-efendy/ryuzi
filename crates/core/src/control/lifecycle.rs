@@ -2564,8 +2564,11 @@ impl ControlPlane {
             } else {
                 ContextManager::seed_digest(&review_pk, cfg, payload.messages.clone(), 24)
             };
-            cm.append_user_text(&runner::review_prompt_text(&payload.review_kind))
-                .await?;
+            cm.append_user_text(&runner::review_prompt_text(
+                &payload.review_kind,
+                payload.native_tools_version,
+            ))
+            .await?;
 
             let cancel = tokio_util::sync::CancellationToken::new();
             runner::drive_review(&deps, &deps.agent, &mut cm, &cancel).await

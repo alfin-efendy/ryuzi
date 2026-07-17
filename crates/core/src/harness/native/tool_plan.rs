@@ -521,19 +521,30 @@ fn derive_policy_aliases(
         .iter()
         .map(|tool| tool.canonical_name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut aliases = BTreeMap::new();
+    let mut targets = BTreeMap::<String, Vec<&PlannedTool>>::new();
     for planned in planned_tools {
         for alias in &planned.descriptor.policy_aliases {
             if canonical_names.contains(alias.as_str()) && alias != &planned.canonical_name {
                 return Err("tool policy alias conflicts with a canonical tool name");
             }
-            if aliases
-                .insert(alias.clone(), planned.canonical_name.clone())
-                .is_some_and(|existing| existing != planned.canonical_name)
-            {
+            targets.entry(alias.clone()).or_default().push(planned);
+        }
+    }
+    let mut aliases = BTreeMap::new();
+    for (alias, mut planned) in targets {
+        planned.sort_by(|left, right| left.canonical_name.cmp(&right.canonical_name));
+        planned.dedup_by(|left, right| left.canonical_name == right.canonical_name);
+        let target = match planned.as_slice() {
+            [one] => one.canonical_name.clone(),
+            // A split V2 facade may intentionally share one policy key. Keep a
+            // deterministic group marker in the persisted map; dispatch still
+            // resolves only canonical tools from the frozen plan.
+            many if many.iter().all(|tool| tool.descriptor.v2_only) => alias.clone(),
+            _ => {
                 return Err("tool policy alias resolves to multiple canonical tools");
             }
-        }
+        };
+        aliases.insert(alias, target);
     }
     Ok(aliases)
 }
@@ -1059,6 +1070,59 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "capability_unavailable");
+    }
+
+    #[tokio::test]
+    async fn v2_memory_policy_alias_selects_only_the_split_facade() {
+        let registry = ToolRegistry::builtin();
+        let aliased = compile_candidate(
+            &registry,
+            &ToolFilter::Only(vec!["memory".into()]),
+            profile(16_000),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            aliased
+                .canonical_tools
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "memory_add",
+                "memory_batch",
+                "memory_remove",
+                "memory_replace"
+            ]
+        );
+        assert!(!aliased.canonical_tools.contains_key("memory"));
+        assert!(!aliased.canonical_tools.contains_key("read"));
+        assert_eq!(aliased.plan.body.policy_aliases["memory"], "memory");
+
+        for expected in [
+            "memory_add",
+            "memory_batch",
+            "memory_remove",
+            "memory_replace",
+        ] {
+            let direct = compile_candidate(
+                &registry,
+                &ToolFilter::Only(vec![expected.into()]),
+                profile(16_000),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                direct
+                    .canonical_tools
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+        }
     }
 
     async fn store_with_run() -> (tempfile::NamedTempFile, Store) {

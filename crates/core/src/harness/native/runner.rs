@@ -1905,6 +1905,16 @@ facts (project scope). Do not record task state, transient details, or secrets. 
 Prefer editing an existing entry over adding a near-duplicate. If nothing is \
 worth remembering, do nothing and end your turn.";
 
+pub const V2_MEMORY_REVIEW_PROMPT: &str = "\
+Take a moment to review the conversation above for durable facts worth \
+remembering. Use `memory_add` for new facts, `memory_replace` or `memory_remove` \
+for existing facts, and `memory_batch` when several changes should be atomic. \
+Only record things that will still be true and useful next week: user \
+preferences and style (user scope), environment and conventions (global \
+scope), or codebase facts (project scope). Do not record task state, transient \
+details, or secrets. Prefer replacing an existing entry over adding a \
+near-duplicate. If nothing is worth remembering, do nothing and end your turn.";
+
 /// Hermes-agent's skill review prompt, ported verbatim (Task 9 §3).
 pub const SKILL_REVIEW_PROMPT: &str = "\
 Review the conversation above for a reusable procedure worth capturing as a \
@@ -1920,16 +1930,32 @@ pub const REVIEW_TOOL_RESTRICTION_NOTE: &str = "\
 For this review you may ONLY use the tools `memory`, `skill`, and \
 `skill_manage`. All other tools are disabled and will return an error.";
 
+pub const V2_REVIEW_TOOL_RESTRICTION_NOTE: &str = "\
+For this review you may ONLY use the tools `memory_add`, `memory_replace`, \
+`memory_remove`, `memory_batch`, `skill`, and `skill_manage`. All other tools \
+are disabled and will return an error.";
+
 /// The final user turn appended after the replayed/digested prefix:
 /// `review_kind`'s prompt(s) plus the tool-restriction note. `"combined"`
 /// (and any other value — defensively, the safest choice) runs both.
-pub(crate) fn review_prompt_text(review_kind: &str) -> String {
-    let body = match review_kind {
-        "memory" => MEMORY_REVIEW_PROMPT.to_string(),
-        "skill" => SKILL_REVIEW_PROMPT.to_string(),
-        _ => format!("{MEMORY_REVIEW_PROMPT}\n\n{SKILL_REVIEW_PROMPT}"),
+pub(crate) fn review_prompt_text(
+    review_kind: &str,
+    native_tools_version: NativeToolsVersion,
+) -> String {
+    let memory_prompt = match native_tools_version {
+        NativeToolsVersion::V1 => MEMORY_REVIEW_PROMPT,
+        NativeToolsVersion::V2 => V2_MEMORY_REVIEW_PROMPT,
     };
-    format!("{body}\n\n{REVIEW_TOOL_RESTRICTION_NOTE}")
+    let body = match review_kind {
+        "memory" => memory_prompt.to_string(),
+        "skill" => SKILL_REVIEW_PROMPT.to_string(),
+        _ => format!("{memory_prompt}\n\n{SKILL_REVIEW_PROMPT}"),
+    };
+    let restriction = match native_tools_version {
+        NativeToolsVersion::V1 => REVIEW_TOOL_RESTRICTION_NOTE,
+        NativeToolsVersion::V2 => V2_REVIEW_TOOL_RESTRICTION_NOTE,
+    };
+    format!("{body}\n\n{restriction}")
 }
 
 /// The synthetic primary agent a review fork drives as — `prompt` carries the
@@ -2919,7 +2945,13 @@ async fn run_tool_call(
         )
         .await;
     }
-    if deps.review_tool_defs.is_some() && !agent.tools.allows(&validated.canonical_name) {
+    let review_policy_allows = agent.tools.allows(&validated.canonical_name)
+        || planned
+            .descriptor
+            .policy_aliases
+            .iter()
+            .any(|alias| agent.tools.allows(alias));
+    if deps.review_tool_defs.is_some() && !review_policy_allows {
         return complete_validated_v2_error(
             deps,
             validated,
@@ -6034,9 +6066,12 @@ mod tests {
         let agent = review_agent(payload.system.clone());
         let cfg = ContextConfig::with_meta(deps.meta.clone());
         let mut cm = ContextManager::seed_projected("review-1", cfg, payload.messages.clone());
-        cm.append_user_text(&review_prompt_text(&payload.review_kind))
-            .await
-            .unwrap();
+        cm.append_user_text(&review_prompt_text(
+            &payload.review_kind,
+            payload.native_tools_version,
+        ))
+        .await
+        .unwrap();
 
         let final_text = drive_review(&deps, &agent, &mut cm, &CancellationToken::new())
             .await
@@ -6175,7 +6210,7 @@ mod tests {
             cfg,
             vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
         );
-        cm.append_user_text(&review_prompt_text("skill"))
+        cm.append_user_text(&review_prompt_text("skill", NativeToolsVersion::V1))
             .await
             .unwrap();
 
@@ -8619,7 +8654,12 @@ mod tests {
             .unwrap_or_else(|| result.to_string())
     }
 
-    async fn dispatch_against_plan(deps: &RunnerDeps, plan: &RunToolPlan, name: &str) -> Value {
+    async fn dispatch_input_against_plan(
+        deps: &RunnerDeps,
+        plan: &RunToolPlan,
+        name: &str,
+        input: Value,
+    ) -> Value {
         let compiled = match plan {
             RunToolPlan::FrozenV2(compiled) | RunToolPlan::CandidateV2(compiled) => compiled,
             RunToolPlan::V1 => panic!("V2 dispatch helper requires a V2 plan"),
@@ -8631,7 +8671,7 @@ mod tests {
                 id: format!("call-{name}"),
                 name: name.into(),
                 start_input: json!({}),
-                input_json: String::new(),
+                input_json: input.to_string(),
                 input_overflowed: false,
             }],
         )
@@ -8654,6 +8694,10 @@ mod tests {
                 complete_rejected_v2_call(deps, rejected, &DisplayMode::Silent, plan).await
             }
         }
+    }
+
+    async fn dispatch_against_plan(deps: &RunnerDeps, plan: &RunToolPlan, name: &str) -> Value {
+        dispatch_input_against_plan(deps, plan, name, json!({})).await
     }
 
     #[tokio::test]
@@ -8812,6 +8856,109 @@ mod tests {
         let result = dispatch_against_plan(&deps, &RunToolPlan::FrozenV2(compiled), name).await;
         assert!(result_text(&result).contains("tool_not_in_plan"));
         assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v2_memory_review_alias_authorizes_split_facade_but_not_unrelated_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let (unrelated_tool, unrelated_effects) =
+            ContractTool::available("unrelated_review_handler", "unrelated review handler");
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![unrelated_tool]));
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                Arc::new(crate::agents::knowledge::AgentKnowledgeStore::new(
+                    dir.path().to_path_buf(),
+                )),
+                "review",
+                Some("p1"),
+            )
+            .unwrap(),
+        ));
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &super::super::agents::ToolFilter::All,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        deps.agent = review_agent("review".into());
+        deps.review_tool_defs = Some(compiled.visible_definitions.clone());
+        let frozen = RunToolPlan::FrozenV2(compiled);
+
+        let memory = dispatch_input_against_plan(
+            &deps,
+            &frozen,
+            "memory_add",
+            json!({"scope":"global", "text":"durable fact"}),
+        )
+        .await;
+        assert!(!result_text(&memory).contains("permission_denied"));
+        assert_eq!(
+            deps.memory
+                .as_ref()
+                .unwrap()
+                .load(crate::harness::native::memory::MemoryScope::Global)
+                .await
+                .unwrap(),
+            ["durable fact"]
+        );
+
+        let legacy_name = dispatch_input_against_plan(
+            &deps,
+            &frozen,
+            "memory",
+            json!({"action":"add", "scope":"global", "text":"must not run"}),
+        )
+        .await;
+        assert!(result_text(&legacy_name).contains("tool_not_in_plan"));
+        assert_eq!(
+            deps.memory
+                .as_ref()
+                .unwrap()
+                .load(crate::harness::native::memory::MemoryScope::Global)
+                .await
+                .unwrap(),
+            ["durable fact"]
+        );
+
+        let unrelated =
+            dispatch_input_against_plan(&deps, &frozen, "unrelated_review_handler", json!({}))
+                .await;
+        assert!(result_text(&unrelated).contains("permission_denied"));
+        assert_eq!(
+            unrelated_effects.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(deps.tools.get("memory").is_some());
+        assert!(frozen
+            .visible_definitions()
+            .unwrap()
+            .iter()
+            .all(|definition| definition["name"] != "memory"));
+    }
+
+    #[test]
+    fn v2_memory_review_prompt_names_only_explicit_operations() {
+        let legacy = review_prompt_text("memory", NativeToolsVersion::V1);
+        assert_eq!(
+            legacy,
+            format!("{MEMORY_REVIEW_PROMPT}\n\n{REVIEW_TOOL_RESTRICTION_NOTE}")
+        );
+
+        let prompt = review_prompt_text("memory", NativeToolsVersion::V2);
+        for name in [
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
+            "memory_batch",
+        ] {
+            assert!(prompt.contains(name));
+        }
+        assert!(!prompt.contains("Use the `memory` tool"));
     }
 
     #[test]

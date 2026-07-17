@@ -584,6 +584,7 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<Value> {
         self.legacy_tools
             .values()
+            .filter(|registered| !registered.descriptor.v2_only)
             .map(|registered| registered.tool.definition())
             .collect()
     }
@@ -693,6 +694,10 @@ impl ToolRegistry {
             Arc::new(skill::SkillTool),
             Arc::new(skill_manage::SkillManage),
             Arc::new(memory::MemoryTool),
+            Arc::new(memory::MemoryAdd),
+            Arc::new(memory::MemoryReplace),
+            Arc::new(memory::MemoryRemove),
+            Arc::new(memory::MemoryBatch),
             Arc::new(revert::Revert),
             Arc::new(lsp::Lsp),
             Arc::new(task::Task),

@@ -1514,6 +1514,7 @@ fn reject_unsupported_keywords(object: &Map<String, Value>) -> Result<(), Schema
         "maxItems",
         "maximum",
         "minItems",
+        "minLength",
         "minimum",
         "multipleOf",
         "oneOf",
