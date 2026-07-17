@@ -978,6 +978,19 @@ fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
         )
     })?;
 
+    sandbox_from_root(&canonical_root, path, 0)
+}
+
+fn sandbox_from_root(
+    canonical_root: &Path,
+    path: &Path,
+    symlink_depth: usize,
+) -> anyhow::Result<PathBuf> {
+    const MAX_SYMLINK_DEPTH: usize = 40;
+    if symlink_depth >= MAX_SYMLINK_DEPTH {
+        anyhow::bail!("sandbox: too many symlink indirections");
+    }
+
     // Construct the candidate (absolute) path, resolving `..` lexically.
     // Use the *canonicalized* root as the base for relative joins so that any
     // symlink in work_dir is resolved before we concatenate the user path.
@@ -1008,28 +1021,59 @@ fn sandbox(work_dir: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     // as macOS's `/var` alias for `/private/var`).
     let mut ancestor = normalized.as_path();
     loop {
-        if ancestor.exists() {
-            let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
-                anyhow::anyhow!("sandbox: cannot canonicalize {}: {e}", ancestor.display())
-            })?;
-            // Verify the canonicalized ancestor is still under the root.
-            if !canonical_ancestor.starts_with(&canonical_root) {
-                anyhow::bail!(
-                    "sandbox: path {} escapes the worktree {} (symlink)",
-                    path.display(),
-                    canonical_root.display()
-                );
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(ancestor).map_err(|error| {
+                    anyhow::anyhow!(
+                        "sandbox: cannot read symlink {}: {error}",
+                        ancestor.display()
+                    )
+                })?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    ancestor.parent().unwrap_or(canonical_root).join(target)
+                };
+                let suffix = normalized
+                    .strip_prefix(ancestor)
+                    .unwrap_or(std::path::Path::new(""));
+                let followed = if suffix.as_os_str().is_empty() {
+                    target
+                } else {
+                    target.join(suffix)
+                };
+                return sandbox_from_root(canonical_root, &followed, symlink_depth + 1);
             }
-            // Reconstruct: canonical_ancestor + the suffix that didn't exist.
-            // NOTE: PathBuf::join("") appends a trailing slash which causes
-            // "Not a directory" on stat, so guard the empty-suffix case.
-            let suffix = normalized
-                .strip_prefix(ancestor)
-                .unwrap_or(std::path::Path::new(""));
-            if suffix == std::path::Path::new("") {
-                return Ok(canonical_ancestor);
+            Ok(_) => {
+                let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
+                    anyhow::anyhow!("sandbox: cannot canonicalize {}: {e}", ancestor.display())
+                })?;
+                // Verify the canonicalized ancestor is still under the root.
+                if !canonical_ancestor.starts_with(canonical_root) {
+                    anyhow::bail!(
+                        "sandbox: path {} escapes the worktree {} (symlink)",
+                        path.display(),
+                        canonical_root.display()
+                    );
+                }
+                // Reconstruct: canonical_ancestor + the suffix that didn't exist.
+                // NOTE: PathBuf::join("") appends a trailing slash which causes
+                // "Not a directory" on stat, so guard the empty-suffix case.
+                let suffix = normalized
+                    .strip_prefix(ancestor)
+                    .unwrap_or(std::path::Path::new(""));
+                if suffix == std::path::Path::new("") {
+                    return Ok(canonical_ancestor);
+                }
+                return Ok(canonical_ancestor.join(suffix));
             }
-            return Ok(canonical_ancestor.join(suffix));
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "sandbox: cannot inspect {}: {error}",
+                    ancestor.display()
+                ));
+            }
         }
         match ancestor.parent() {
             Some(p) => ancestor = p,

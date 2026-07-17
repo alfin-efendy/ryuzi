@@ -612,6 +612,7 @@ pub(crate) fn resolve_pinned_workspace_reference(
 }
 
 struct ExactPinnedResolution {
+    root: PathBuf,
     access_path: PathBuf,
     resolved_path: PathBuf,
 }
@@ -660,6 +661,7 @@ fn exact_pinned_resolution(
     let resolved_path = jail(&root, relative).map_err(|_| changed_file_reference())?;
     let canonical_root = root.canonicalize().map_err(|_| changed_file_reference())?;
     Ok(ExactPinnedResolution {
+        root: canonical_root.clone(),
         access_path: canonical_root.join(relative),
         resolved_path,
     })
@@ -763,9 +765,14 @@ fn rank_file_candidates(
 ) -> RankedFileCandidates {
     let requested_stem = lowercase_stem(requested_name);
     let requested_lower = file_name(requested_name).to_lowercase();
-    let mut ranked = candidates
+    let bounded = candidates.into_iter().take(256).collect::<Vec<_>>();
+    if bounded.len() == 256 {
+        return RankedFileCandidates {
+            candidates: Vec::new(),
+        };
+    }
+    let mut ranked = bounded
         .into_iter()
-        .take(256)
         .map(|candidate| {
             let name = file_name(&candidate.logical_path);
             let name_lower = name.to_lowercase();
@@ -805,6 +812,22 @@ fn logical_parent(path: &str) -> String {
         .replace('\\', "/")
 }
 
+fn requested_component_below(logical_path: &str, parent: &str) -> String {
+    let parent_depth = Path::new(parent)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    Path::new(logical_path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .nth(parent_depth)
+        .unwrap_or_else(|| file_name(logical_path))
+        .to_string()
+}
+
 fn effective_root(root: FileReferenceRoot, parent: &str) -> String {
     let parent = parent.trim_matches('/');
     match root {
@@ -826,10 +849,10 @@ async fn missing_path_error(
     expected: ExpectedFileKind,
 ) -> ToolError {
     let mut physical_parent = resolution
-        .access_path
+        .resolved_path
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| resolution.access_path.clone());
+        .unwrap_or_else(|| resolution.resolved_path.clone());
     let mut parent = logical_parent(&target.logical_path);
     loop {
         match tokio::fs::symlink_metadata(&physical_parent).await {
@@ -846,33 +869,39 @@ async fn missing_path_error(
     }
 
     let mut siblings = Vec::new();
-    if let Ok(mut directory) = tokio::fs::read_dir(&physical_parent).await {
-        let mut scanned = 0;
-        while scanned < 256 {
-            let entry = match directory.next_entry().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) | Err(_) => break,
-            };
-            scanned += 1;
-            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
-            let kind = match entry.file_type().await {
-                Ok(file_type) if file_type.is_symlink() => FileTargetKind::Symlink,
-                Ok(file_type) if file_type.is_file() => FileTargetKind::File,
-                Ok(file_type) if file_type.is_dir() => FileTargetKind::Directory,
-                Ok(_) => FileTargetKind::Other,
-                Err(_) => continue,
-            };
-            let logical_path = if parent.is_empty() || parent == "." {
-                name
-            } else {
-                format!("{}/{name}", parent.trim_matches('/'))
-            };
-            siblings.push(FileTargetCandidate { logical_path, kind });
+    let scan_parent = physical_parent
+        .to_str()
+        .and_then(|path| jail(&resolution.root, path).ok());
+    if let Some(scan_parent) = scan_parent {
+        if let Ok(mut directory) = tokio::fs::read_dir(scan_parent).await {
+            let mut scanned = 0;
+            while scanned < 256 {
+                let entry = match directory.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) | Err(_) => break,
+                };
+                scanned += 1;
+                let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                    continue;
+                };
+                let kind = match entry.file_type().await {
+                    Ok(file_type) if file_type.is_symlink() => FileTargetKind::Symlink,
+                    Ok(file_type) if file_type.is_file() => FileTargetKind::File,
+                    Ok(file_type) if file_type.is_dir() => FileTargetKind::Directory,
+                    Ok(_) => FileTargetKind::Other,
+                    Err(_) => continue,
+                };
+                let logical_path = if parent.is_empty() || parent == "." {
+                    name
+                } else {
+                    format!("{}/{name}", parent.trim_matches('/'))
+                };
+                siblings.push(FileTargetCandidate { logical_path, kind });
+            }
         }
     }
-    let ranked = rank_file_candidates(file_name(&target.logical_path), siblings);
+    let requested = requested_component_below(&target.logical_path, &parent);
+    let ranked = rank_file_candidates(&requested, siblings);
     let mut error = ToolError::precondition("path_not_found", "Path was not found")
         .with_strategy(ToolErrorStrategy::ReviseInput)
         .with_details(serde_json::json!({
@@ -883,6 +912,21 @@ async fn missing_path_error(
         error = error.with_file_candidate(candidate.logical_path, candidate.kind.as_str());
     }
     error
+}
+
+#[cfg(test)]
+pub(crate) async fn missing_path_error_after_resolution_for_test(
+    context: &ToolInputCtx<'_>,
+    target: &PinnedFileTarget,
+    expected: ExpectedFileKind,
+    after_resolution: impl FnOnce(),
+) -> ToolError {
+    let resolution = match exact_pinned_resolution(context, target) {
+        Ok(resolution) => resolution,
+        Err(error) => return error,
+    };
+    after_resolution();
+    missing_path_error(target, &resolution, expected).await
 }
 
 pub(crate) async fn preflight_file_target(
@@ -902,6 +946,9 @@ pub(crate) async fn preflight_file_target(
     let resolved_kind = if kind == FileTargetKind::Symlink {
         match tokio::fs::metadata(&resolution.access_path).await {
             Ok(metadata) => kind_from_metadata(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(missing_path_error(target, &resolution, expected).await);
+            }
             Err(error) => return Err(path_unavailable(&error)),
         }
     } else {
@@ -1499,6 +1546,43 @@ mod tests {
         preflight_file_target(&ctx, &PinnedFileTarget::from(&target), expected).await
     }
 
+    #[cfg(any(unix, windows))]
+    fn create_file_symlink_for_test(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+        if let Err(error) = result {
+            eprintln!("skipping symlink case: {error}");
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_directory_symlink_for_test(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+        if let Err(error) = result {
+            eprintln!("skipping directory symlink case: {error}");
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn retarget_directory_symlink_for_test(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap();
+        assert!(create_directory_symlink_for_test(target, link));
+    }
+
     #[tokio::test]
     async fn preflight_reports_stable_wrong_kind_errors_without_os_details() {
         let root = tempfile::tempdir().unwrap();
@@ -1533,6 +1617,42 @@ mod tests {
         let rendered = serde_json::to_string(&(ls_error, read_error)).unwrap();
         assert!(!rendered.contains("os error"));
         assert!(!rendered.contains(&root.path().to_string_lossy().to_string()));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn dangling_in_jail_symlink_is_reported_as_path_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        if !create_file_symlink_for_test(
+            &root.path().join("missing-target.txt"),
+            &root.path().join("dangling-link.txt"),
+        ) {
+            return;
+        }
+
+        let error = workspace_preflight(root.path(), "dangling-link.txt", ExpectedFileKind::File)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "path_not_found");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn dangling_outside_symlink_is_rejected_by_jail() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        if !create_file_symlink_for_test(
+            &outside.path().join("missing-secret.txt"),
+            &root.path().join("dangling-escape.txt"),
+        ) {
+            return;
+        }
+
+        let error = resolve_workspace_reference(&workspace_ctx(root.path()), "dangling-escape.txt")
+            .unwrap_err();
+
+        assert_eq!(error.code, "invalid_path_reference");
     }
 
     #[tokio::test]
@@ -1573,6 +1693,59 @@ mod tests {
         assert!(!rendered.contains(&root.path().to_string_lossy().to_string()));
     }
 
+    #[tokio::test]
+    async fn missing_preflight_ranks_the_first_missing_component_below_deepest_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("src");
+        std::fs::create_dir_all(parent.join("misspelled")).unwrap();
+        std::fs::write(parent.join("file.rs"), "final-leaf-decoy").unwrap();
+
+        let requested = "src/mispelled/deep/file.rs";
+        let error = workspace_preflight(root.path(), requested, ExpectedFileKind::File)
+            .await
+            .unwrap_err();
+        let serialized = serde_json::to_value(error).unwrap();
+
+        assert_eq!(serialized["code"], "path_not_found");
+        assert_eq!(serialized["details"]["effective_root"], "worktree/src");
+        assert_eq!(
+            serialized["candidates"][0],
+            json!({"path": "src/misspelled", "kind": "directory"})
+        );
+        assert_eq!(requested, "src/mispelled/deep/file.rs");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn missing_candidate_scan_uses_jailed_path_after_parent_alias_retarget() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let safe = root.path().join("safe");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(safe.join("inside-only.rs"), "inside").unwrap();
+        std::fs::write(outside.path().join("outside-secret.rs"), "secret").unwrap();
+        if !create_directory_symlink_for_test(&safe, &alias) {
+            return;
+        }
+        let ctx = workspace_ctx(root.path());
+        let target = resolve_workspace_reference(&ctx, "alias/missing.rs").unwrap();
+        let pin = PinnedFileTarget::from(&target);
+
+        let error = missing_path_error_after_resolution_for_test(
+            &ctx,
+            &pin,
+            ExpectedFileKind::File,
+            || retarget_directory_symlink_for_test(&alias, outside.path()),
+        )
+        .await;
+        let serialized = serde_json::to_value(error).unwrap();
+        let rendered = serialized.to_string();
+
+        assert!(rendered.contains("alias/inside-only.rs"), "{serialized}");
+        assert!(!rendered.contains("outside-secret.rs"), "{serialized}");
+    }
+
     #[test]
     fn candidate_ranking_is_deterministic_bounded_and_scans_only_256_siblings() {
         let ranking_cases = vec![
@@ -1611,16 +1784,27 @@ mod tests {
         assert_eq!(forward.candidates[2].logical_path, "src/names.ts");
         assert_eq!(forward.candidates[3].logical_path, "src/name-test.ts");
 
-        let inspected = std::cell::Cell::new(0);
-        let siblings = (0..300)
-            .inspect(|_| inspected.set(inspected.get() + 1))
+        let forward_inspected = std::cell::Cell::new(0);
+        let forward_siblings = (0..300)
+            .inspect(|_| forward_inspected.set(forward_inspected.get() + 1))
             .map(|index| FileTargetCandidate {
                 logical_path: format!("src/noise-{index:03}.txt"),
                 kind: FileTargetKind::File,
             });
-        let bounded = rank_file_candidates("name.ts", siblings);
-        assert_eq!(inspected.get(), 256);
-        assert_eq!(bounded.candidates.len(), 5);
+        let reverse_inspected = std::cell::Cell::new(0);
+        let reverse_siblings = (0..300)
+            .rev()
+            .inspect(|_| reverse_inspected.set(reverse_inspected.get() + 1))
+            .map(|index| FileTargetCandidate {
+                logical_path: format!("src/noise-{index:03}.txt"),
+                kind: FileTargetKind::File,
+            });
+        let bounded_forward = rank_file_candidates("noise-299.txt", forward_siblings);
+        let bounded_reverse = rank_file_candidates("noise-299.txt", reverse_siblings);
+        assert_eq!(forward_inspected.get(), 256);
+        assert_eq!(reverse_inspected.get(), 256);
+        assert_eq!(bounded_forward.candidates, bounded_reverse.candidates);
+        assert!(bounded_forward.candidates.is_empty());
 
         let ties = rank_file_candidates(
             "same",
@@ -1640,62 +1824,75 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[tokio::test]
-    async fn in_jail_symlinks_retain_link_and_resolved_kind_while_escape_is_rejected() {
-        #[cfg(unix)]
-        use std::os::unix::fs::symlink;
-        #[cfg(windows)]
-        use std::os::windows::fs::{symlink_dir, symlink_file};
-
+    async fn in_jail_file_symlink_retains_link_and_resolved_kind() {
         let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("target.txt"), "ok").unwrap();
-        std::fs::create_dir(root.path().join("target-dir")).unwrap();
-        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
-        #[cfg(unix)]
-        {
-            symlink(
-                root.path().join("target.txt"),
-                root.path().join("file-link"),
-            )
-            .unwrap();
-            symlink(root.path().join("target-dir"), root.path().join("dir-link")).unwrap();
-            symlink(
-                outside.path().join("secret.txt"),
-                root.path().join("escape-link"),
-            )
-            .unwrap();
-        }
-        #[cfg(windows)]
-        {
-            if symlink_file(
-                root.path().join("target.txt"),
-                root.path().join("file-link"),
-            )
-            .is_err()
-                || symlink_dir(root.path().join("target-dir"), root.path().join("dir-link"))
-                    .is_err()
-                || symlink_file(
-                    outside.path().join("secret.txt"),
-                    root.path().join("escape-link"),
-                )
-                .is_err()
-            {
-                return;
-            }
+        if !create_file_symlink_for_test(
+            &root.path().join("target.txt"),
+            &root.path().join("file-link"),
+        ) {
+            return;
         }
 
         let file = workspace_preflight(root.path(), "file-link", ExpectedFileKind::File)
             .await
             .unwrap();
-        let directory = workspace_preflight(root.path(), "dir-link", ExpectedFileKind::Directory)
-            .await
-            .unwrap();
-        let escaped = resolve_workspace_reference(&workspace_ctx(root.path()), "escape-link");
 
         assert_eq!(file.kind, FileTargetKind::Symlink);
         assert_eq!(file.resolved_kind, FileTargetKind::File);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn in_jail_directory_symlink_retains_link_and_resolved_kind() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target-dir")).unwrap();
+        if !create_directory_symlink_for_test(
+            &root.path().join("target-dir"),
+            &root.path().join("dir-link"),
+        ) {
+            return;
+        }
+
+        let directory = workspace_preflight(root.path(), "dir-link", ExpectedFileKind::Directory)
+            .await
+            .unwrap();
+
         assert_eq!(directory.kind, FileTargetKind::Symlink);
         assert_eq!(directory.resolved_kind, FileTargetKind::Directory);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn symlink_escape_is_rejected_independently() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        if !create_file_symlink_for_test(
+            &outside.path().join("secret.txt"),
+            &root.path().join("escape-link"),
+        ) {
+            return;
+        }
+
+        let escaped = resolve_workspace_reference(&workspace_ctx(root.path()), "escape-link");
+
         assert_eq!(escaped.unwrap_err().code, "invalid_path_reference");
+    }
+
+    #[test]
+    fn metadata_kind_classifier_covers_regular_file_and_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), "ok").unwrap();
+        std::fs::create_dir(root.path().join("directory")).unwrap();
+
+        assert_eq!(
+            kind_from_metadata(&std::fs::symlink_metadata(root.path().join("file")).unwrap()),
+            FileTargetKind::File
+        );
+        assert_eq!(
+            kind_from_metadata(&std::fs::symlink_metadata(root.path().join("directory")).unwrap()),
+            FileTargetKind::Directory
+        );
     }
 }

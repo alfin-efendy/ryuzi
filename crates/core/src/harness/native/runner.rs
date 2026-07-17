@@ -4635,6 +4635,36 @@ mod tests {
         expected: super::super::file_reference::ExpectedFileKind,
         counters: Arc<GatewayCounters>,
         mutation: std::path::PathBuf,
+        retarget_parent: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    }
+
+    #[cfg(any(unix, windows))]
+    fn create_directory_symlink_for_runner_test(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(target, link);
+        if let Err(error) = result {
+            eprintln!("skipping runner directory symlink case: {error}");
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn retarget_directory_symlink_for_runner_test(
+        link: &std::path::Path,
+        target: &std::path::Path,
+    ) {
+        #[cfg(unix)]
+        std::fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap();
+        assert!(create_directory_symlink_for_runner_test(target, link));
     }
 
     struct StatefulContractNormalizer {
@@ -4865,6 +4895,20 @@ mod tests {
             let target = pinned_file_reference.ok_or_else(|| {
                 ToolError::precondition("invalid_path_reference", "File target is not pinned")
             })?;
+            #[cfg(any(unix, windows))]
+            if let Some((link, destination)) = &self.retarget_parent {
+                return Err(
+                    super::super::file_reference::missing_path_error_after_resolution_for_test(
+                        ctx,
+                        target,
+                        self.expected,
+                        || {
+                            retarget_directory_symlink_for_runner_test(link, destination);
+                        },
+                    )
+                    .await,
+                );
+            }
             super::super::tool_contract::PreflightMeta::default().with_prepared_file_target(
                 super::super::file_reference::preflight_file_target(ctx, target, self.expected)
                     .await?,
@@ -8211,6 +8255,7 @@ mod tests {
             expected: super::super::file_reference::ExpectedFileKind::Directory,
             counters: counters.clone(),
             mutation: mutation.clone(),
+            retarget_parent: None,
         });
         let input = serde_json::to_string(&json!({"path": target})).unwrap();
         let llm = Arc::new(V2RecordingLlm::new(vec![
@@ -8311,6 +8356,7 @@ mod tests {
             expected: super::super::file_reference::ExpectedFileKind::File,
             counters: counters.clone(),
             mutation: mutation.clone(),
+            retarget_parent: None,
         });
         let llm = Arc::new(V2RecordingLlm::new(vec![
             vec![
@@ -8394,6 +8440,75 @@ mod tests {
         assert!(!serde_json::to_string(&(turns, rows))
             .unwrap()
             .contains("candidate-secret"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn v2_missing_candidate_scan_does_not_persist_retargeted_outside_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(safe.join("inside-only.rs"), "inside-content").unwrap();
+        std::fs::write(outside.path().join("outside-secret.rs"), "outside-content").unwrap();
+        if !create_directory_symlink_for_runner_test(&safe, &alias) {
+            return;
+        }
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = Arc::new(FilePreflightSpyTool {
+            name: "retargeting_file_preflight_spy".into(),
+            expected: super::super::file_reference::ExpectedFileKind::File,
+            counters,
+            mutation: dir.path().join("must-not-run"),
+            retarget_parent: Some((alias, outside.path().to_path_buf())),
+        });
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "retarget-missing", "retargeting_file_preflight_spy"),
+                input_json_delta(0, r#"{"path":"alias/missing.rs"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["retargeting_file_preflight_spy".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let result = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result.payload[0]["content"].as_str().unwrap()).unwrap();
+        let persisted = serde_json::to_string(&(turns, rows)).unwrap();
+
+        assert_eq!(envelope["error"]["code"], "path_not_found");
+        assert_eq!(
+            envelope["error"]["candidates"][0],
+            json!({"path": "alias/inside-only.rs", "kind": "file"})
+        );
+        for outside_value in ["outside-secret.rs", "outside-content"] {
+            assert!(!envelope.to_string().contains(outside_value));
+            assert!(!persisted.contains(outside_value));
+        }
     }
 
     #[tokio::test]

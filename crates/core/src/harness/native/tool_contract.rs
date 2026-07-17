@@ -13,6 +13,7 @@ pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 16 * 1024;
 pub const MAX_TOOL_METADATA_ENTRIES: usize = 8;
 pub const MAX_TOOL_ERROR_FIELD_ERRORS: usize = 8;
 pub const MAX_TOOL_ERROR_CANDIDATES: usize = 8;
+const MAX_FILE_TOOL_ERROR_CANDIDATES: usize = 5;
 const MAX_TOOL_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_TOOL_RESULT_LABEL_BYTES: usize = 128;
 const MAX_TOOL_RESULT_CURSOR_BYTES: usize = 256;
@@ -317,7 +318,14 @@ impl ToolError {
     }
 
     pub fn with_file_candidate(mut self, path: impl Into<String>, kind: impl Into<String>) -> Self {
-        if self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES {
+        let file_candidate_count = self
+            .candidates
+            .iter()
+            .filter(|candidate| matches!(candidate, ToolErrorCandidate::File { .. }))
+            .count();
+        if self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES
+            && file_candidate_count < MAX_FILE_TOOL_ERROR_CANDIDATES
+        {
             let path = path.into();
             let kind = kind.into();
             if let (Some(path), Some(kind)) = (
@@ -356,11 +364,25 @@ impl Serialize for ToolError {
                 })
             })
             .collect::<Vec<_>>();
+        let mut file_candidate_count = 0;
         let candidates = self
             .candidates
             .iter()
             .take(MAX_TOOL_ERROR_CANDIDATES)
-            .filter_map(stable_error_candidate_value)
+            .filter_map(|candidate| {
+                if matches!(candidate, ToolErrorCandidate::File { .. }) {
+                    if file_candidate_count >= MAX_FILE_TOOL_ERROR_CANDIDATES {
+                        return None;
+                    }
+                    let stable = stable_error_candidate_value(candidate);
+                    if stable.is_some() {
+                        file_candidate_count += 1;
+                    }
+                    stable
+                } else {
+                    stable_error_candidate_value(candidate)
+                }
+            })
             .collect::<Vec<_>>();
         let mut stable = json!({
             "code": stable_error_code(&self.code),
@@ -1379,12 +1401,25 @@ impl NormalizedInput {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightMeta {
     #[serde(default, skip_serializing_if = "ToolMetadata::is_empty")]
     metadata: ToolMetadata,
     #[serde(skip)]
     prepared_file_target: Option<super::file_reference::PreflightFileTarget>,
+}
+
+impl std::fmt::Debug for PreflightMeta {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreflightMeta")
+            .field("metadata", &self.metadata)
+            .field(
+                "has_prepared_file_target",
+                &self.prepared_file_target.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl PreflightMeta {
@@ -1909,10 +1944,11 @@ mod tests {
     use super::{
         compile_canonical_schema, compile_openai_strict_schema, explicit_open_object_schema,
         FacadePriority, FileReferenceMetadata, NormalizedInput, PreflightMeta, ResourceScopeHint,
-        ToolDescriptor, ToolEffect, ToolError, ToolErrorCategory, ToolErrorStrategy,
-        ToolFieldError, ToolMetadata, ToolMetadataEntry, ToolMetadataToken, ToolResultEnvelope,
-        ToolResultMeta, MAX_FILE_REFERENCE_PATH_BYTES, MAX_TOOL_ERROR_CANDIDATES,
-        MAX_TOOL_ERROR_FIELD_ERRORS, MAX_TOOL_METADATA_ENTRIES, MAX_TOOL_SCHEMA_BYTES,
+        ToolDescriptor, ToolEffect, ToolError, ToolErrorCandidate, ToolErrorCategory,
+        ToolErrorStrategy, ToolFieldError, ToolMetadata, ToolMetadataEntry, ToolMetadataToken,
+        ToolResultEnvelope, ToolResultMeta, MAX_FILE_REFERENCE_PATH_BYTES,
+        MAX_TOOL_ERROR_CANDIDATES, MAX_TOOL_ERROR_FIELD_ERRORS, MAX_TOOL_METADATA_ENTRIES,
+        MAX_TOOL_SCHEMA_BYTES,
     };
     use serde_json::json;
 
@@ -2794,5 +2830,103 @@ mod tests {
             serde_json::to_value(decoded).unwrap()["candidates"],
             json!([{"path": "safe/nearby.rs", "kind": "file"}])
         );
+    }
+
+    #[test]
+    fn file_error_candidate_cap_is_five_across_build_serialize_and_deserialize() {
+        let mut built = ToolError::precondition("path_not_found", "missing");
+        for index in 0..8 {
+            built = built.with_file_candidate(format!("src/candidate-{index}.rs"), "file");
+        }
+        assert_eq!(
+            serde_json::to_value(built).unwrap()["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+
+        let direct = ToolError {
+            category: ToolErrorCategory::Precondition,
+            code: "path_not_found".into(),
+            message: "untrusted".into(),
+            retryable: false,
+            strategy: None,
+            field_errors: Box::default(),
+            candidates: Box::new(
+                (0..8)
+                    .map(|index| ToolErrorCandidate::File {
+                        path: format!("src/direct-{index}.rs"),
+                        kind: "file".into(),
+                    })
+                    .collect(),
+            ),
+            details: None,
+        };
+        assert_eq!(
+            serde_json::to_value(direct).unwrap()["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+
+        let mut mixed = (0..6)
+            .map(|index| json!({"path": format!("src/mixed-{index}.rs"), "kind": "file"}))
+            .collect::<Vec<_>>();
+        mixed.extend([json!("retry"), json!("wait")]);
+        let decoded: ToolError = serde_json::from_value(json!({
+            "category": "precondition",
+            "code": "path_not_found",
+            "candidates": mixed,
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(decoded).unwrap();
+        let candidates = serialized["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 7);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.is_object())
+                .count(),
+            5
+        );
+        assert!(candidates.contains(&json!("retry")));
+        assert!(candidates.contains(&json!("wait")));
+    }
+
+    #[test]
+    fn preflight_debug_redacts_private_prepared_host_path() {
+        use crate::harness::native::file_reference::{
+            FileReference, FileReferenceInterpretation, FileReferenceRoot, FileTargetKind,
+            PreflightFileTarget, ResolvedFileTarget,
+        };
+
+        let host_path = std::path::PathBuf::from(r"C:\Users\private\workspace\secret.txt");
+        let prepared = PreflightFileTarget {
+            target: ResolvedFileTarget {
+                reference: FileReference {
+                    input_path: "secret.txt".into(),
+                    path: "secret.txt".into(),
+                    line: None,
+                    column: None,
+                },
+                interpretation: FileReferenceInterpretation::Plain,
+                root: FileReferenceRoot::Workspace,
+                resolved_path: host_path.clone(),
+                logical_path: "secret.txt".into(),
+                exists: true,
+            },
+            kind: FileTargetKind::File,
+            resolved_kind: FileTargetKind::File,
+        };
+        let preflight = PreflightMeta::default()
+            .with_prepared_file_target(prepared)
+            .unwrap();
+
+        let rendered = format!("{preflight:?}");
+        assert!(!rendered.contains(&host_path.to_string_lossy().to_string()));
+        assert!(!rendered.contains("Users"));
+        assert!(rendered.contains("has_prepared_file_target: true"));
     }
 }
