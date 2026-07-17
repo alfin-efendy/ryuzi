@@ -1475,6 +1475,54 @@ pub struct PreflightMeta {
     edit_content_digest: Option<[u8; 32]>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PreparedEditPrecondition {
+    target: super::file_reference::PreflightFileTarget,
+    content_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for PreparedEditPrecondition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedEditPrecondition")
+            .field("has_target", &true)
+            .field("has_content_digest", &true)
+            .finish()
+    }
+}
+
+impl PreparedEditPrecondition {
+    fn changed() -> ToolError {
+        ToolError::new(
+            ToolErrorCategory::Conflict,
+            "edit_precondition_changed",
+            "Edit precondition changed after approval",
+        )
+        .with_strategy(ToolErrorStrategy::ReviseInput)
+    }
+
+    pub(crate) async fn read_current(
+        &self,
+        context: &ToolInputCtx<'_>,
+    ) -> Result<(PathBuf, String), ToolError> {
+        let resolved = super::file_reference::recheck_preflight_file_target(context, &self.target)
+            .await
+            .map_err(|_| Self::changed())?;
+        let bytes = tokio::fs::read(&resolved.resolved_path)
+            .await
+            .map_err(|_| Self::changed())?;
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != self.content_digest {
+            return Err(Self::changed());
+        }
+        let content = String::from_utf8(bytes).map_err(|_| Self::changed())?;
+        Ok((resolved.resolved_path, content))
+    }
+
+    pub(crate) async fn recheck(&self, context: &ToolInputCtx<'_>) -> Result<(), ToolError> {
+        self.read_current(context).await.map(|_| ())
+    }
+}
+
 impl std::fmt::Debug for PreflightMeta {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1537,37 +1585,21 @@ impl PreflightMeta {
         Ok(self)
     }
 
+    pub(crate) fn prepared_edit_precondition(&self) -> Option<PreparedEditPrecondition> {
+        Some(PreparedEditPrecondition {
+            target: self.prepared_file_target.clone()?,
+            content_digest: self.edit_content_digest?,
+        })
+    }
+
     pub(crate) async fn recheck_before_snapshot(
         &self,
         context: &ToolInputCtx<'_>,
     ) -> Result<(), ToolError> {
-        let Some(expected_digest) = self.edit_content_digest else {
+        let Some(precondition) = self.prepared_edit_precondition() else {
             return Ok(());
         };
-        let prepared = self.prepared_file_target.as_ref().ok_or_else(|| {
-            ToolError::precondition(
-                "invalid_persisted_tool_plan",
-                "Tool preflight has invalid private execution state",
-            )
-        })?;
-        let changed = || {
-            ToolError::new(
-                ToolErrorCategory::Conflict,
-                "edit_precondition_changed",
-                "Edit precondition changed after approval",
-            )
-            .with_strategy(ToolErrorStrategy::ReviseInput)
-        };
-        let resolved = super::file_reference::recheck_preflight_file_target(context, prepared)
-            .await
-            .map_err(|_| changed())?;
-        let content = tokio::fs::read(&resolved.resolved_path)
-            .await
-            .map_err(|_| changed())?;
-        if <[u8; 32]>::from(Sha256::digest(&content)) != expected_digest {
-            return Err(changed());
-        }
-        Ok(())
+        precondition.recheck(context).await
     }
 
     pub(crate) fn into_parts(

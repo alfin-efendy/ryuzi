@@ -64,6 +64,20 @@ const TOOL_AFTER_OUTPUT_BYTES: usize = 2_000;
 const PERSISTED_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const TOOL_DISPLAY_SUMMARY_BYTES: usize = 240;
 
+#[async_trait]
+pub(crate) trait SnapshotTaker: Send + Sync {
+    async fn take(&self, work_dir: &std::path::Path) -> Option<String>;
+}
+
+pub(crate) struct GitSnapshotTaker;
+
+#[async_trait]
+impl SnapshotTaker for GitSnapshotTaker {
+    async fn take(&self, work_dir: &std::path::Path) -> Option<String> {
+        super::snapshot::take(work_dir).await
+    }
+}
+
 /// Everything one native session needs to run turns. Built by
 /// [`super::NativeHarness::start_session`]. Cloneable so a sub-agent spawner
 /// can carry a copy.
@@ -148,6 +162,7 @@ pub struct RunnerDeps {
     pub memory: Option<Arc<super::memory::MemoryStore>>,
     /// Worktree snapshot stack for the `revert` tool (most recent last).
     pub snapshots: Arc<tokio::sync::Mutex<Vec<String>>>,
+    pub(crate) snapshot_taker: Arc<dyn SnapshotTaker>,
     /// Mid-turn steering buffer (Task B3). Cloned from `NativeSession::steer`
     /// at session start — the SAME buffer, not a fresh one — so a `steer()`
     /// call reaches whichever turn is currently draining it. Survives across
@@ -1832,6 +1847,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         allowed_skills: None,
         memory: None,
         snapshots: deps.snapshots.clone(),
+        snapshot_taker: deps.snapshot_taker.clone(),
         steer: deps.steer.clone(),
         background: deps.background.clone(),
         app_control: None,
@@ -2935,6 +2951,9 @@ async fn execute_tool_call(
         .provider_result;
     }
 
+    let prepared_edit_precondition = prepared_preflight
+        .as_ref()
+        .and_then(PreflightMeta::prepared_edit_precondition);
     if let Some(prepared_preflight) = prepared_preflight.as_ref() {
         let input_context = ToolInputCtx {
             work_dir: &deps.work_dir,
@@ -2966,9 +2985,41 @@ async fn execute_tool_call(
         }
     }
 
+    let mut provisional_edit_snapshot = None;
     if matches!(tool_kind, "edit" | "execute") && tool_name != "revert" {
-        if let Some(sha) = super::snapshot::take(&deps.work_dir).await {
+        let snapshot = deps.snapshot_taker.take(&deps.work_dir).await;
+        if prepared_edit_precondition.is_some() {
+            provisional_edit_snapshot = snapshot;
+        } else if let Some(sha) = snapshot {
             deps.snapshots.lock().await.push(sha);
+        }
+    }
+
+    if let Some(precondition) = prepared_edit_precondition.as_ref() {
+        let input_context = ToolInputCtx {
+            work_dir: &deps.work_dir,
+            attachments_dir: deps.attachments_dir.as_deref(),
+            extra_skill_dirs: &deps.extra_skill_dirs,
+        };
+        if let Err(error) = precondition.recheck(&input_context).await {
+            let legacy_text = error.public_message();
+            return complete_tool_call(
+                deps,
+                tool_call_id,
+                ToolCompletionContext {
+                    version,
+                    planned,
+                    tool_name,
+                    tool_kind,
+                    trace_id,
+                    duration_ms: 0,
+                    normalization,
+                    preflight,
+                },
+                ToolCompletionOutcome::Error { error, legacy_text },
+            )
+            .await
+            .provider_result;
         }
     }
 
@@ -2981,6 +3032,7 @@ async fn execute_tool_call(
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         pinned_file_reference,
         preflight_file_target,
+        edit_precondition: prepared_edit_precondition,
         store: deps.store.clone(),
         cancel: cancel.clone(),
         caps: OutputCaps::default(),
@@ -3004,6 +3056,17 @@ async fn execute_tool_call(
     let hook_input = input.clone();
     let execution = tool.execute(&ctx, input).await;
     let duration_ms = elapsed_ms(started);
+    if let Some(sha) = provisional_edit_snapshot {
+        let raced = execution.as_ref().ok().is_some_and(|output| {
+            output
+                .structured_error
+                .as_ref()
+                .is_some_and(|error| error.code == "edit_precondition_changed")
+        });
+        if !raced {
+            deps.snapshots.lock().await.push(sha);
+        }
+    }
     let outcome = if version == NativeToolsVersion::V2 && cancel.is_cancelled() {
         ToolCompletionOutcome::Error {
             error: cancelled_tool_error(),
@@ -4555,6 +4618,22 @@ mod tests {
 
     struct StaticMcpCaller;
 
+    struct SnapshotWindowMutator {
+        target: std::path::PathBuf,
+        replacement: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SnapshotTaker for SnapshotWindowMutator {
+        async fn take(&self, work_dir: &std::path::Path) -> Option<String> {
+            let snapshot = super::super::snapshot::take(work_dir).await;
+            std::fs::write(&self.target, self.replacement).unwrap();
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            snapshot
+        }
+    }
+
     struct BlockingTool {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -5532,6 +5611,7 @@ mod tests {
             allowed_skills: None,
             memory: None,
             snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            snapshot_taker: Arc::new(GitSnapshotTaker),
             steer: SteerBuffer::new(),
             background: super::super::background::BackgroundRegistry::new(),
             app_control: None,
@@ -8556,6 +8636,60 @@ mod tests {
             );
         }
 
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), raced);
+        assert!(deps.snapshots.lock().await.is_empty());
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "edit_precondition_changed");
+    }
+
+    #[tokio::test]
+    async fn v2_edit_snapshot_window_race_has_no_snapshot_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old still unique\n").unwrap();
+        commit_snapshot_fixture(dir.path());
+
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-snapshot-race", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"old","new_string":"new","replace_all":null}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let raced = "prefix old still unique\n";
+        deps.snapshot_taker = Arc::new(SnapshotWindowMutator {
+            target: target.clone(),
+            replacement: raced,
+            calls: calls.clone(),
+        });
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("edit it", "edit it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), raced);
         assert!(deps.snapshots.lock().await.is_empty());
         let turns = deps

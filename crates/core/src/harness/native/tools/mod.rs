@@ -344,6 +344,8 @@ pub struct ToolCtx {
         Option<crate::harness::native::file_reference::PinnedFileTarget>,
     pub(crate) preflight_file_target:
         Option<crate::harness::native::file_reference::PreflightFileTarget>,
+    pub(crate) edit_precondition:
+        Option<crate::harness::native::tool_contract::PreparedEditPrecondition>,
     pub store: Arc<Store>,
     pub cancel: CancellationToken,
     pub caps: OutputCaps,
@@ -1134,6 +1136,7 @@ pub(crate) mod testutil {
             extra_skill_dirs: vec![],
             pinned_file_reference: None,
             preflight_file_target: None,
+            edit_precondition: None,
             store,
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),

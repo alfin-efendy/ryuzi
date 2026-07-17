@@ -438,6 +438,7 @@ impl Harness for NativeHarness {
                 allowed_skills: primary_turn.allowed_skills.clone(),
                 memory: memory_store,
                 snapshots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                snapshot_taker: Arc::new(runner::GitSnapshotTaker),
                 steer,
                 background: ctx.background,
                 // Explicit-target and noninteractive-session facades must

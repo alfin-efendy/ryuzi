@@ -19,7 +19,11 @@ use std::path::PathBuf;
 pub struct Edit;
 
 const MIN_NO_MATCH_SIMILARITY_PERCENT: usize = 75;
-const MIN_SUGGESTION_PATTERN_CHARS: usize = 4;
+const MIN_SUGGESTION_PATTERN_CHARS: usize = 8;
+const MAX_SUGGESTION_PATTERNS: usize = 8;
+const MAX_SUGGESTION_PATTERN_LINES_SCANNED: usize = 64;
+const MAX_SUGGESTION_FILE_LINES_SCANNED: usize = 4_096;
+const MAX_SUGGESTION_WORK_CELLS: usize = 250_000;
 
 fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
     ToolInputCtx {
@@ -44,8 +48,12 @@ fn normalize_edit_input(
 async fn prepare_edit_execution(
     ctx: &ToolCtx,
     input: Value,
-) -> Result<(Value, PathBuf), ToolError> {
+) -> Result<(Value, PathBuf, Option<String>), ToolError> {
     let input_ctx = input_context(ctx);
+    if let Some(precondition) = ctx.edit_precondition.as_ref() {
+        let (resolved_path, content) = precondition.read_current(&input_ctx).await?;
+        return Ok((input, resolved_path, Some(content)));
+    }
     if let Some(target) = ctx.preflight_file_target.as_ref() {
         let resolved = recheck_preflight_file_target(&input_ctx, target)
             .await
@@ -57,11 +65,11 @@ async fn prepare_edit_execution(
                 )
                 .with_strategy(ToolErrorStrategy::ReviseInput)
             })?;
-        return Ok((input, resolved.resolved_path));
+        return Ok((input, resolved.resolved_path, None));
     }
     if let Some(target) = ctx.pinned_file_reference.as_ref() {
         return resolve_pinned_workspace_reference(&input_ctx, target)
-            .map(|resolved| (input, resolved));
+            .map(|resolved| (input, resolved, None));
     }
 
     let normalized = normalize_edit_input(&input_ctx, input)?;
@@ -69,7 +77,7 @@ async fn prepare_edit_execution(
         .pinned_file_reference()
         .expect("edit normalization pins its selected target");
     let resolved = resolve_pinned_workspace_reference(&input_ctx, target)?;
-    Ok((normalized.value, resolved))
+    Ok((normalized.value, resolved, None))
 }
 
 /// Build a literal pattern that permits bare-LF input to match either LF or
@@ -135,7 +143,18 @@ fn match_candidates(content: &str, pattern: &Regex) -> Vec<(usize, String)> {
         .collect()
 }
 
-fn substring_edit_distance(pattern: &[char], text: &[char]) -> usize {
+fn substring_edit_distance(
+    pattern: &[char],
+    text: &[char],
+    stats: &mut SuggestionSearchStats,
+) -> Option<usize> {
+    let cells = pattern.len().saturating_mul(text.len());
+    let next_work = stats.work_cells.saturating_add(cells);
+    if next_work > MAX_SUGGESTION_WORK_CELLS {
+        stats.exhausted = true;
+        return None;
+    }
+    stats.work_cells = next_work;
     let mut previous = vec![0; text.len() + 1];
     let mut current = vec![0; text.len() + 1];
     for (pattern_index, pattern_char) in pattern.iter().enumerate() {
@@ -147,7 +166,13 @@ fn substring_edit_distance(pattern: &[char], text: &[char]) -> usize {
         }
         std::mem::swap(&mut previous, &mut current);
     }
-    previous.into_iter().min().unwrap_or(pattern.len())
+    Some(previous.into_iter().min().unwrap_or(pattern.len()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuggestionPattern {
+    chars: Vec<char>,
+    ordinal: usize,
 }
 
 struct SimilarLine {
@@ -157,62 +182,162 @@ struct SimilarLine {
     pattern_len: usize,
 }
 
-fn no_match_candidates(content: &str, old: &str) -> Vec<(usize, String)> {
-    let patterns = old
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SuggestionSearchStats {
+    patterns: usize,
+    pattern_lines_scanned: usize,
+    work_cells: usize,
+    exhausted: bool,
+    lines_scanned: usize,
+    qualifying_candidates: usize,
+    retained_peak: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuggestionSearch {
+    candidates: Vec<(usize, String)>,
+    stats: SuggestionSearchStats,
+}
+
+fn suggestion_patterns(old: &str, stats: &mut SuggestionSearchStats) -> Vec<SuggestionPattern> {
+    let mut patterns = Vec::<SuggestionPattern>::new();
+    for (ordinal, line) in old
         .split('\n')
-        .map(|line| line.trim_end_matches('\r').trim())
-        .filter_map(|line| {
-            let pattern = line
-                .chars()
-                .take(MAX_TOOL_ERROR_LINE_PREVIEW_CHARS)
-                .collect::<Vec<_>>();
-            (pattern.len() >= MIN_SUGGESTION_PATTERN_CHARS).then_some(pattern)
-        })
-        .collect::<Vec<_>>();
+        .take(MAX_SUGGESTION_PATTERN_LINES_SCANNED)
+        .enumerate()
+    {
+        stats.pattern_lines_scanned += 1;
+        let chars = line
+            .trim_end_matches('\r')
+            .trim()
+            .chars()
+            .take(MAX_TOOL_ERROR_LINE_PREVIEW_CHARS)
+            .collect::<Vec<_>>();
+        if chars.len() < MIN_SUGGESTION_PATTERN_CHARS
+            || patterns.iter().any(|pattern| pattern.chars == chars)
+        {
+            continue;
+        }
+        patterns.push(SuggestionPattern { chars, ordinal });
+        patterns.sort_by(|left, right| {
+            right
+                .chars
+                .len()
+                .cmp(&left.chars.len())
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+        });
+        patterns.truncate(MAX_SUGGESTION_PATTERNS);
+    }
+    stats.patterns = patterns.len();
+    patterns
+}
+
+fn similar_line_order(left: &SimilarLine, right: &SimilarLine) -> std::cmp::Ordering {
+    (left.edits * right.pattern_len)
+        .cmp(&(right.edits * left.pattern_len))
+        .then_with(|| left.line.cmp(&right.line))
+}
+
+fn retain_similar_line(
+    candidates: &mut Vec<SimilarLine>,
+    candidate: SimilarLine,
+    stats: &mut SuggestionSearchStats,
+) {
+    stats.qualifying_candidates += 1;
+    if candidates.len() < MAX_TOOL_ERROR_LINE_CANDIDATES {
+        candidates.push(candidate);
+    } else {
+        let worst = candidates
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| similar_line_order(left, right))
+            .map(|(index, _)| index)
+            .expect("the bounded candidate set is non-empty");
+        if similar_line_order(&candidate, &candidates[worst]).is_lt() {
+            candidates[worst] = candidate;
+        }
+    }
+    stats.retained_peak = stats.retained_peak.max(candidates.len());
+}
+
+fn no_match_candidates_with_stats(content: &str, old: &str) -> SuggestionSearch {
+    let mut stats = SuggestionSearchStats::default();
+    let patterns = suggestion_patterns(old, &mut stats);
     if patterns.is_empty() {
-        return Vec::new();
+        return SuggestionSearch {
+            candidates: Vec::new(),
+            stats,
+        };
     }
 
-    let starts = line_starts(content);
-    let mut candidates = starts
+    let request_chars = patterns
         .iter()
+        .map(|pattern| pattern.chars.len())
+        .sum::<usize>();
+    let mut candidates = Vec::with_capacity(MAX_TOOL_ERROR_LINE_CANDIDATES);
+    'lines: for (line_index, line) in content
+        .split_inclusive('\n')
+        .take(MAX_SUGGESTION_FILE_LINES_SCANNED)
         .enumerate()
-        .filter_map(|(line_index, offset)| {
-            let preview = bounded_line_preview(content, &starts, *offset);
-            let text = preview.trim().chars().collect::<Vec<_>>();
-            if text.is_empty() {
-                return None;
+    {
+        stats.lines_scanned += 1;
+        let physical_line = line.strip_suffix('\n').unwrap_or(line);
+        let physical_line = physical_line.strip_suffix('\r').unwrap_or(physical_line);
+        let preview = physical_line
+            .chars()
+            .take(MAX_TOOL_ERROR_LINE_PREVIEW_CHARS)
+            .collect::<String>();
+        let text = preview.trim().chars().collect::<Vec<_>>();
+        if text.is_empty() {
+            continue;
+        }
+        let mut best = None::<(usize, usize)>;
+        for pattern in &patterns {
+            let Some(local_edits) = substring_edit_distance(&pattern.chars, &text, &mut stats)
+            else {
+                break 'lines;
+            };
+            // Missing request context counts as edits. A short exact fragment
+            // therefore cannot outweigh the distinctive remainder of a
+            // multi-line `old_string`.
+            let score = (
+                local_edits + request_chars.saturating_sub(pattern.chars.len()),
+                request_chars,
+            );
+            if best.is_none_or(|current| (score.0 * current.1).cmp(&(current.0 * score.1)).is_lt())
+            {
+                best = Some(score);
             }
-            let (edits, pattern_len) = patterns
-                .iter()
-                .map(|pattern| (substring_edit_distance(pattern, &text), pattern.len()))
-                .min_by(|left, right| {
-                    (left.0 * right.1)
-                        .cmp(&(right.0 * left.1))
-                        .then_with(|| right.1.cmp(&left.1))
-                })?;
-            // At least 75% local character similarity is required. Below that
-            // threshold a line is advisory guessing rather than a useful retry.
-            (edits * 100 <= pattern_len * (100 - MIN_NO_MATCH_SIMILARITY_PERCENT)).then_some(
+        }
+        let Some((edits, pattern_len)) = best else {
+            continue;
+        };
+        // At least 75% whole-request character similarity is required. Below
+        // that threshold a line is advisory guessing rather than a useful retry.
+        if edits * 100 <= pattern_len * (100 - MIN_NO_MATCH_SIMILARITY_PERCENT) {
+            retain_similar_line(
+                &mut candidates,
                 SimilarLine {
                     line: line_index + 1,
                     preview,
                     edits,
                     pattern_len,
                 },
-            )
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        (left.edits * right.pattern_len)
-            .cmp(&(right.edits * left.pattern_len))
-            .then_with(|| left.line.cmp(&right.line))
-    });
-    candidates
+                &mut stats,
+            );
+        }
+    }
+    candidates.sort_by(similar_line_order);
+    let candidates = candidates
         .into_iter()
         .take(MAX_TOOL_ERROR_LINE_CANDIDATES)
         .map(|candidate| (candidate.line, candidate.preview))
-        .collect()
+        .collect();
+    SuggestionSearch { candidates, stats }
+}
+
+fn no_match_candidates(content: &str, old: &str) -> Vec<(usize, String)> {
+    no_match_candidates_with_stats(content, old).candidates
 }
 
 fn validate_edit_match(input: &Value, content: &str) -> Result<(), ToolError> {
@@ -335,10 +460,11 @@ impl Tool for Edit {
         PermissionSpec::new("edit", format!("edit {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let (input, resolved_path) = match prepare_edit_execution(ctx, input).await {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(ToolOutput::from_error(error)),
-        };
+        let (input, resolved_path, prepared_content) =
+            match prepare_edit_execution(ctx, input).await {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(ToolOutput::from_error(error)),
+            };
         let path = input
             .get("path")
             .and_then(|v| v.as_str())
@@ -356,9 +482,12 @@ impl Tool for Edit {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let content = match tokio::fs::read_to_string(&resolved_path).await {
-            Ok(c) => c,
-            Err(e) => return Ok(ToolOutput::error(format!("edit: {path}: {e}"))),
+        let content = match prepared_content {
+            Some(content) => content,
+            None => match tokio::fs::read_to_string(&resolved_path).await {
+                Ok(content) => content,
+                Err(error) => return Ok(ToolOutput::error(format!("edit: {path}: {error}"))),
+            },
         };
         let pattern = newline_tolerant_pattern(old);
         let count = pattern.find_iter(&content).count();
@@ -374,6 +503,11 @@ impl Tool for Edit {
         }
         let replacement = replacement_for_file(new, &content);
         let updated = replace_matches(&pattern, &content, &replacement, replace_all);
+        if let Some(precondition) = ctx.edit_precondition.as_ref() {
+            if let Err(error) = precondition.recheck(&input_context(ctx)).await {
+                return Ok(ToolOutput::from_error(error));
+            }
+        }
         if let Err(e) = tokio::fs::write(&resolved_path, &updated).await {
             return Ok(ToolOutput::error(format!("edit: {path}: {e}")));
         }
@@ -526,6 +660,112 @@ mod tests {
         .await;
         assert_eq!(unrelated_error.code, "edit_match_not_found");
         assert!(serialized_line_candidates(&unrelated_error).is_empty());
+
+        let common_fragment_dir = tempfile::tempdir().unwrap();
+        let (_ctx, common_fragment_error) = edit_preflight_error(
+            &common_fragment_dir,
+            "const model = load_fixture();\n",
+            json!({
+                "path": "f.txt",
+                "old_string": "delete_all_customer_records();\nmode\ncommit_transaction();",
+                "new_string": "replacement"
+            }),
+        )
+        .await;
+        assert_eq!(common_fragment_error.code, "edit_match_not_found");
+        assert!(serialized_line_candidates(&common_fragment_error).is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_edit_rechecks_digest_immediately_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old still unique\n").unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+        let normalized = Edit
+            .normalize_input(
+                &input_context(&ctx),
+                json!({
+                    "path": "f.txt",
+                    "old_string": "old",
+                    "new_string": "new"
+                }),
+            )
+            .unwrap();
+        let preflight = Edit
+            .preflight(
+                &input_context(&ctx),
+                &normalized.value,
+                normalized.pinned_file_reference(),
+            )
+            .await
+            .unwrap();
+        ctx.preflight_file_target = preflight.prepared_file_target().cloned();
+        ctx.edit_precondition = preflight.prepared_edit_precondition();
+
+        let raced = "prefix old still unique\n";
+        std::fs::write(&target, raced).unwrap();
+        let out = Edit.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.structured_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("edit_precondition_changed")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), raced);
+    }
+
+    #[test]
+    fn no_match_search_has_deterministic_pattern_and_work_budgets() {
+        let old = (0..128)
+            .map(|index| format!("requested-pattern-{:02}-not-present", index % 16))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = (0..2_000)
+            .map(|index| format!("unrelated-file-line-{index:04}\n"))
+            .collect::<String>();
+
+        let first = no_match_candidates_with_stats(&content, &old);
+        let second = no_match_candidates_with_stats(&content, &old);
+
+        assert_eq!(first, second);
+        assert_eq!(first.stats.patterns, MAX_SUGGESTION_PATTERNS);
+        assert!(first.stats.pattern_lines_scanned <= MAX_SUGGESTION_PATTERN_LINES_SCANNED);
+        assert!(first.stats.work_cells <= MAX_SUGGESTION_WORK_CELLS);
+        assert!(first.stats.exhausted);
+        assert!(first.stats.lines_scanned < 2_000);
+        assert!(first.candidates.len() <= MAX_TOOL_ERROR_LINE_CANDIDATES);
+    }
+
+    #[test]
+    fn no_match_search_retains_only_the_best_five_while_scanning() {
+        let content = (0..1_000)
+            .map(|_| "let total = calculate_value();\n")
+            .collect::<String>();
+        let search = no_match_candidates_with_stats(&content, "let total = calculate_values();");
+
+        assert!(search.stats.qualifying_candidates > MAX_TOOL_ERROR_LINE_CANDIDATES);
+        assert_eq!(search.stats.retained_peak, MAX_TOOL_ERROR_LINE_CANDIDATES);
+        assert_eq!(
+            search
+                .candidates
+                .iter()
+                .map(|(line, _)| *line)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn no_match_search_bounds_empty_physical_lines_without_dp_work() {
+        let content = "\n".repeat(10_000);
+        let search = no_match_candidates_with_stats(&content, "a distinctive requested line");
+
+        assert_eq!(search.stats.work_cells, 0);
+        assert_eq!(search.stats.lines_scanned, 4_096);
+        assert!(search.candidates.is_empty());
     }
 
     #[tokio::test]
