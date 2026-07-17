@@ -181,13 +181,8 @@ pub fn parse_file_references(input: &str) -> Result<Vec<SyntacticFileCandidate>,
 
     let delimiter_input = if let Some((drive, remainder)) = windows_drive_prefix(input) {
         if let Some((path, line, column)) = suffix_location(remainder)? {
-            let drive_relative_numeric_path = !remainder.starts_with(['\\', '/'])
-                && !path.is_empty()
-                && path.bytes().all(|byte| byte.is_ascii_digit());
-            if !drive_relative_numeric_path {
-                let path = format!("{drive}{path}");
-                return source_candidates(input, &path, line, column);
-            }
+            let path = format!("{drive}{path}");
+            return source_candidates(input, &path, line, column);
         }
         remainder
     } else {
@@ -362,26 +357,22 @@ impl FilesystemProbe<'_> {
         };
         Self::result(jail(&skill.dir, relative))
     }
-}
 
-impl CandidateProbe for FilesystemProbe<'_> {
-    fn probe(&self, root: FileReferenceRoot, reference: &FileReference) -> CandidateProbeResult {
-        let is_skill_path = Path::new(&reference.path).components().next().is_some_and(
-            |first| matches!(first, Component::Normal(value) if value.to_str() == Some("skills")),
-        );
+    fn probe_named_root(
+        &self,
+        root: FileReferenceRoot,
+        reference: &FileReference,
+    ) -> CandidateProbeResult {
         match root {
             FileReferenceRoot::SkillDirectory => self.skill_path(&reference.path),
-            FileReferenceRoot::Workspace if !is_skill_path => {
+            FileReferenceRoot::Workspace => {
                 Self::result(jail(self.context.work_dir, &reference.path))
             }
-            FileReferenceRoot::Attachments if !is_skill_path => self
+            FileReferenceRoot::Attachments => self
                 .context
                 .attachments_dir
                 .map(|root| Self::result(jail(root, &reference.path)))
                 .unwrap_or(CandidateProbeResult::NotApplicable),
-            FileReferenceRoot::Workspace | FileReferenceRoot::Attachments => {
-                CandidateProbeResult::NotApplicable
-            }
         }
     }
 
@@ -414,6 +405,55 @@ impl CandidateProbe for FilesystemProbe<'_> {
     }
 }
 
+struct ReadCandidateProbe<'a> {
+    filesystem: FilesystemProbe<'a>,
+}
+
+impl CandidateProbe for ReadCandidateProbe<'_> {
+    fn probe(&self, root: FileReferenceRoot, reference: &FileReference) -> CandidateProbeResult {
+        let is_skill_path = Path::new(&reference.path).components().next().is_some_and(
+            |first| matches!(first, Component::Normal(value) if value.to_str() == Some("skills")),
+        );
+        match root {
+            FileReferenceRoot::SkillDirectory => self.filesystem.skill_path(&reference.path),
+            FileReferenceRoot::Workspace | FileReferenceRoot::Attachments if !is_skill_path => {
+                self.filesystem.probe_named_root(root, reference)
+            }
+            FileReferenceRoot::Workspace | FileReferenceRoot::Attachments => {
+                CandidateProbeResult::NotApplicable
+            }
+        }
+    }
+
+    fn logical_path(
+        &self,
+        root: FileReferenceRoot,
+        reference: &FileReference,
+        resolved_path: &Path,
+    ) -> Option<String> {
+        self.filesystem.logical_path(root, reference, resolved_path)
+    }
+}
+
+struct ExactRootProbe<'a> {
+    filesystem: FilesystemProbe<'a>,
+}
+
+impl CandidateProbe for ExactRootProbe<'_> {
+    fn probe(&self, root: FileReferenceRoot, reference: &FileReference) -> CandidateProbeResult {
+        self.filesystem.probe_named_root(root, reference)
+    }
+
+    fn logical_path(
+        &self,
+        root: FileReferenceRoot,
+        reference: &FileReference,
+        resolved_path: &Path,
+    ) -> Option<String> {
+        self.filesystem.logical_path(root, reference, resolved_path)
+    }
+}
+
 pub fn resolve_read_reference(
     context: &ToolInputCtx<'_>,
     input: &str,
@@ -426,7 +466,9 @@ pub fn resolve_read_reference(
             FileReferenceRoot::Workspace,
             FileReferenceRoot::Attachments,
         ],
-        &FilesystemProbe { context },
+        &ReadCandidateProbe {
+            filesystem: FilesystemProbe { context },
+        },
     )
 }
 
@@ -438,7 +480,9 @@ pub fn resolve_workspace_reference(
     resolve_candidates(
         &candidates,
         &[FileReferenceRoot::Workspace],
-        &FilesystemProbe { context },
+        &ExactRootProbe {
+            filesystem: FilesystemProbe { context },
+        },
     )
 }
 
@@ -463,7 +507,7 @@ fn resolve_pinned_reference(
         line: None,
         column: None,
     };
-    let current = FilesystemProbe { context }.probe(target.root, &reference);
+    let current = FilesystemProbe { context }.probe_named_root(target.root, &reference);
     match (target.expected_exists, current) {
         (true, CandidateProbeResult::Existing(path))
         | (false, CandidateProbeResult::Missing(path)) => Ok(path),
@@ -622,21 +666,35 @@ mod tests {
     }
 
     #[test]
-    fn drive_colon_is_never_a_location_separator() {
+    fn drive_colon_is_protected_before_parsing_location_suffixes() {
         let plain = parse_file_references(r"D:\code\app.rs").unwrap();
         assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].reference.path, r"D:\code\app.rs");
         assert_eq!(plain[0].reference.line, None);
 
-        for drive_relative in [r"C:12", r"C:12:3"] {
-            let candidates = parse_file_references(drive_relative).unwrap();
-            assert_eq!(candidates.len(), 1, "{drive_relative}");
-            assert_eq!(candidates[0].reference.path, drive_relative);
-            assert_eq!(candidates[0].reference.line, None);
-            assert_eq!(candidates[0].reference.column, None);
+        let drive_relative = parse_file_references(r"C:12").unwrap();
+        assert_eq!(drive_relative.len(), 1);
+        assert_eq!(drive_relative[0].reference.path, r"C:12");
+        assert_eq!(drive_relative[0].reference.line, None);
+        assert_eq!(
+            drive_relative[0].interpretation,
+            FileReferenceInterpretation::Plain
+        );
+
+        for (input, expected_column) in [(r"C:12:3", None), (r"C:12:3:4", Some(4))] {
+            let candidates = parse_file_references(input).unwrap();
+            assert_eq!(candidates.len(), 2, "{input}");
+            assert_eq!(candidates[0].reference.path, input);
             assert_eq!(
                 candidates[0].interpretation,
-                FileReferenceInterpretation::Plain
+                FileReferenceInterpretation::LiteralPath
+            );
+            assert_eq!(candidates[1].reference.path, r"C:12");
+            assert_eq!(candidates[1].reference.line, Some(3));
+            assert_eq!(candidates[1].reference.column, expected_column);
+            assert_eq!(
+                candidates[1].interpretation,
+                FileReferenceInterpretation::SourceReference
             );
         }
 
@@ -652,24 +710,60 @@ mod tests {
     }
 
     #[test]
-    fn resolver_never_reclassifies_numeric_drive_relative_paths() {
-        for drive_relative in [r"C:12", r"C:12:3"] {
-            let candidates = parse_file_references(drive_relative).unwrap();
+    fn injected_resolver_handles_numeric_drive_relative_locations() {
+        let plain = resolve_candidates(
+            &parse_file_references(r"C:12").unwrap(),
+            &[FileReferenceRoot::Workspace],
+            &SetProbe {
+                existing: [(FileReferenceRoot::Workspace, r"C:12".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plain.reference.path, r"C:12");
+        assert_eq!(plain.reference.line, None);
+        assert_eq!(plain.interpretation, FileReferenceInterpretation::Plain);
+
+        for (input, expected_column) in [(r"C:12:3", None), (r"C:12:3:4", Some(4))] {
             let resolved = resolve_candidates(
-                &candidates,
+                &parse_file_references(input).unwrap(),
                 &[FileReferenceRoot::Workspace],
                 &SetProbe {
-                    existing: [(FileReferenceRoot::Workspace, drive_relative.to_string())]
+                    existing: [(FileReferenceRoot::Workspace, r"C:12".to_string())]
                         .into_iter()
                         .collect(),
                 },
             )
             .unwrap();
 
-            assert_eq!(resolved.reference.path, drive_relative);
-            assert_eq!(resolved.reference.line, None);
-            assert_eq!(resolved.interpretation, FileReferenceInterpretation::Plain);
+            assert_eq!(resolved.reference.path, r"C:12");
+            assert_eq!(resolved.reference.line, Some(3));
+            assert_eq!(resolved.reference.column, expected_column);
+            assert_eq!(
+                resolved.interpretation,
+                FileReferenceInterpretation::SourceReference
+            );
         }
+
+        let ambiguous = resolve_candidates(
+            &parse_file_references(r"C:12:3").unwrap(),
+            &[FileReferenceRoot::Workspace],
+            &SetProbe {
+                existing: [
+                    (FileReferenceRoot::Workspace, r"C:12:3".to_string()),
+                    (FileReferenceRoot::Workspace, r"C:12".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(ambiguous.code, "invalid_path_reference");
+        assert_eq!(
+            ambiguous.candidates.as_ref(),
+            &["literal_path".to_string(), "source_reference".to_string()]
+        );
     }
 
     struct SetProbe {

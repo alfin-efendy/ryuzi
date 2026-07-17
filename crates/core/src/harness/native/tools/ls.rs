@@ -20,11 +20,20 @@ fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
 }
 
 fn normalize_ls_input(ctx: &ToolInputCtx<'_>, input: Value) -> Result<NormalizedInput, ToolError> {
-    let Some(path) = input.get("path").and_then(Value::as_str) else {
-        return Ok(NormalizedInput::unchanged(input));
+    let path_was_omitted = input.get("path").is_none();
+    let path = match input.get("path") {
+        Some(path) => path
+            .as_str()
+            .ok_or_else(|| ToolError::caller("invalid_path_reference", "Invalid file path"))?
+            .to_string(),
+        None => ".".to_string(),
     };
-    let target = resolve_workspace_reference(ctx, path)?;
-    normalize_resolved_path(input, &target)
+    let target = resolve_workspace_reference(ctx, &path)?;
+    let mut normalized = normalize_resolved_path(input, &target)?;
+    if path_was_omitted {
+        normalized.normalized = true;
+    }
+    Ok(normalized)
 }
 
 fn prepare_ls_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
@@ -109,6 +118,54 @@ mod tests {
         let out = Ls.execute(&ctx, json!({"path": "."})).await.unwrap();
         assert!(!out.is_error);
         assert_eq!(out.for_model, "adir/\nb.txt");
+    }
+
+    #[tokio::test]
+    async fn omitted_path_defaults_to_workspace_root_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("root.txt"), "").unwrap();
+        let ctx = ctx_at(dir.path()).await;
+        let input_ctx = ToolInputCtx {
+            work_dir: &ctx.work_dir,
+            attachments_dir: None,
+            extra_skill_dirs: &[],
+        };
+
+        let normalized = Ls.normalize_input(&input_ctx, json!({})).unwrap();
+        assert_eq!(normalized.value, json!({"path": "."}));
+        assert!(normalized.normalized);
+        assert!(normalized.pinned_file_reference().is_some());
+
+        let out = Ls.execute(&ctx, json!({})).await.unwrap();
+        assert!(!out.is_error, "{}", out.for_model);
+        assert_eq!(out.for_model, "root.txt");
+    }
+
+    #[tokio::test]
+    async fn workspace_skills_directory_is_listed_by_relative_and_pinned_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_like_dir = dir.path().join("skills/demo");
+        std::fs::create_dir_all(&skill_like_dir).unwrap();
+        std::fs::write(skill_like_dir.join("item.txt"), "").unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+
+        let relative = Ls
+            .execute(&ctx, json!({"path": "skills/demo"}))
+            .await
+            .unwrap();
+        assert!(!relative.is_error, "{}", relative.for_model);
+        assert_eq!(relative.for_model, "item.txt");
+
+        let normalized = Ls
+            .normalize_input(
+                &input_context(&ctx),
+                json!({"path": skill_like_dir.to_string_lossy()}),
+            )
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+        let absolute = Ls.execute(&ctx, normalized.value).await.unwrap();
+        assert!(!absolute.is_error, "{}", absolute.for_model);
+        assert_eq!(absolute.for_model, "item.txt");
     }
 
     #[tokio::test]

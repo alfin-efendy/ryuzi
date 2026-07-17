@@ -440,6 +440,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_absolute_attachment_under_skills_is_readable() {
+        let work = tempfile::tempdir().unwrap();
+        let attach = tempfile::tempdir().unwrap();
+        let file = attach.path().join("skills/demo/notes.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "attachment under skills\n").unwrap();
+        let mut ctx = ctx_at(work.path()).await;
+        ctx.attachments_dir = Some(attach.path().to_path_buf());
+
+        let normalized = Read
+            .normalize_input(&input_ctx(&ctx), json!({"path": file.to_string_lossy()}))
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+        let out = Read.execute(&ctx, normalized.value).await.unwrap();
+
+        assert!(!out.is_error, "{}", out.for_model);
+        assert!(out.for_model.contains("attachment under skills"));
+    }
+
+    #[tokio::test]
     async fn non_attachment_escapes_stay_rejected() {
         let work = tempfile::tempdir().unwrap();
         let attach = tempfile::tempdir().unwrap();

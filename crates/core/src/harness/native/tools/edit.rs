@@ -433,6 +433,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_skills_files_are_edited_by_relative_and_pinned_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_like_dir = dir.path().join("skills/demo");
+        std::fs::create_dir_all(&skill_like_dir).unwrap();
+        let relative_file = skill_like_dir.join("relative.txt");
+        let absolute_file = skill_like_dir.join("absolute.txt");
+        std::fs::write(&relative_file, "old relative\n").unwrap();
+        std::fs::write(&absolute_file, "old absolute\n").unwrap();
+        let mut ctx = ctx_at(dir.path()).await;
+
+        let relative = Edit
+            .execute(
+                &ctx,
+                json!({
+                    "path": "skills/demo/relative.txt",
+                    "old_string": "old relative",
+                    "new_string": "new relative"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!relative.is_error, "{}", relative.for_model);
+        assert_eq!(
+            std::fs::read_to_string(&relative_file).unwrap(),
+            "new relative\n"
+        );
+
+        let normalized = Edit
+            .normalize_input(
+                &input_context(&ctx),
+                json!({
+                    "path": absolute_file.to_string_lossy(),
+                    "old_string": "old absolute",
+                    "new_string": "new absolute"
+                }),
+            )
+            .unwrap();
+        ctx.pinned_file_reference = normalized.pinned_file_reference().cloned();
+        let absolute = Edit.execute(&ctx, normalized.value).await.unwrap();
+        assert!(!absolute.is_error, "{}", absolute.for_model);
+        assert_eq!(
+            std::fs::read_to_string(&absolute_file).unwrap(),
+            "new absolute\n"
+        );
+    }
+
+    #[tokio::test]
     async fn disappeared_pinned_literal_never_switches_to_source_edit() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes"), "old\n").unwrap();

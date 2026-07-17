@@ -9130,6 +9130,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_ls_without_path_defaults_to_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("root.txt"), "").unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["ls".into()]);
+        let mut profile = direct_profile();
+        profile.supports_strict_function_schema = false;
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            profile,
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = RunToolPlan::FrozenV2(compiled);
+
+        let result = dispatch_call_against_plan(&deps, &plan, "root-ls", "ls", json!({})).await;
+        assert_eq!(result["is_error"], false, "{result}");
+        assert!(result_text(&result).contains("root.txt"), "{result}");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let tool_row = rows
+            .iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("root-ls"))
+            .unwrap();
+        assert_eq!(tool_row.payload["input"], json!({"path": "."}));
+    }
+
+    #[tokio::test]
     async fn v2_pinned_read_rejects_workspace_to_attachment_substitution() {
         let work = tempfile::tempdir().unwrap();
         let attachments = tempfile::tempdir().unwrap();
