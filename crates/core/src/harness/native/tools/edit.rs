@@ -1,12 +1,36 @@
 //! `edit` — exact-string replacement within a worktree file, with a diff.
 
-use super::{jail, truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
+use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
+use crate::harness::native::file_reference::{
+    normalize_resolved_path, resolve_workspace_reference,
+};
+use crate::harness::native::tool_contract::{NormalizedInput, ToolError, ToolInputCtx};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 use similar::TextDiff;
 
 pub struct Edit;
+
+fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
+    ToolInputCtx {
+        work_dir: &ctx.work_dir,
+        attachments_dir: None,
+        extra_skill_dirs: &[],
+    }
+}
+
+fn normalize_edit_input(
+    ctx: &ToolInputCtx<'_>,
+    input: Value,
+) -> Result<NormalizedInput, ToolError> {
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::caller("invalid_path_reference", "File path is required"))?;
+    let target = resolve_workspace_reference(ctx, path)?;
+    normalize_resolved_path(input, &target)
+}
 
 /// Build a literal pattern that permits bare-LF input to match either LF or
 /// CRLF. Explicit CRLF input remains a literal CRLF sequence.
@@ -85,11 +109,22 @@ impl Tool for Edit {
     fn kind(&self) -> &'static str {
         "edit"
     }
+    fn normalize_input(
+        &self,
+        ctx: &ToolInputCtx<'_>,
+        input: Value,
+    ) -> Result<NormalizedInput, ToolError> {
+        normalize_edit_input(ctx, input)
+    }
     fn permission(&self, input: &Value) -> PermissionSpec {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         PermissionSpec::new("edit", format!("edit {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
+        let input = match normalize_edit_input(&input_context(ctx), input) {
+            Ok(input) => input.value,
+            Err(error) => return Ok(ToolOutput::from_error(error)),
+        };
         let path = input
             .get("path")
             .and_then(|v| v.as_str())
@@ -107,11 +142,11 @@ impl Tool for Edit {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let resolved = match jail(&ctx.work_dir, path) {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+        let target = match resolve_workspace_reference(&input_context(ctx), path) {
+            Ok(target) => target,
+            Err(error) => return Ok(ToolOutput::from_error(error)),
         };
-        let content = match tokio::fs::read_to_string(&resolved).await {
+        let content = match tokio::fs::read_to_string(&target.resolved_path).await {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(format!("edit: {path}: {e}"))),
         };
@@ -129,17 +164,18 @@ impl Tool for Edit {
         }
         let replacement = replacement_for_file(new, &content);
         let updated = replace_matches(&pattern, &content, &replacement, replace_all);
-        if let Err(e) = tokio::fs::write(&resolved, &updated).await {
+        if let Err(e) = tokio::fs::write(&target.resolved_path, &updated).await {
             return Ok(ToolOutput::error(format!("edit: {path}: {e}")));
         }
         let diff = TextDiff::from_lines(&content, &updated)
             .unified_diff()
             .header(path, path)
             .to_string();
-        let fmt_note = match crate::harness::native::format::maybe_format(&resolved).await {
-            Some(fmt) => format!(" (formatted with {fmt})"),
-            None => String::new(),
-        };
+        let fmt_note =
+            match crate::harness::native::format::maybe_format(&target.resolved_path).await {
+                Some(fmt) => format!(" (formatted with {fmt})"),
+                None => String::new(),
+            };
         Ok(ToolOutput::ok(truncate(
             &format!("edited {path}{fmt_note}\n{diff}"),
             &ctx.caps,
@@ -151,6 +187,7 @@ impl Tool for Edit {
 mod tests {
     use super::super::testutil::ctx_at;
     use super::*;
+    use crate::harness::native::tool_contract::ToolInputCtx;
 
     #[tokio::test]
     async fn replaces_unique_string_and_returns_diff() {
@@ -343,5 +380,41 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn location_metadata_never_selects_an_edit_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "old\nold\n").unwrap();
+        let ctx = ctx_at(dir.path()).await;
+        let input_ctx = ToolInputCtx {
+            work_dir: &ctx.work_dir,
+            attachments_dir: None,
+            extra_skill_dirs: &[],
+        };
+
+        let normalized = Edit
+            .normalize_input(
+                &input_ctx,
+                json!({
+                    "path": "f.txt:2:1",
+                    "old_string": "old",
+                    "new_string": "new"
+                }),
+            )
+            .unwrap();
+        assert_eq!(normalized.value["path"], "f.txt");
+        assert!(normalized.value.get("occurrence").is_none());
+        let metadata = serde_json::to_value(normalized.metadata()).unwrap();
+        assert_eq!(metadata[0]["value"]["line"], 2);
+        assert_eq!(metadata[0]["value"]["column"], 1);
+
+        let out = Edit.execute(&ctx, normalized.value).await.unwrap();
+        assert!(out.is_error);
+        assert!(out.for_model.contains("occurs 2 times"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "old\nold\n"
+        );
     }
 }

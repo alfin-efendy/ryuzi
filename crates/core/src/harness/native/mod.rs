@@ -17,6 +17,7 @@ pub mod context;
 pub mod context_manager;
 pub mod cost;
 pub mod delegation;
+pub mod file_reference;
 pub mod format;
 pub mod hooks;
 pub mod iteration_budget;

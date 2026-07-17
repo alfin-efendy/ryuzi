@@ -17,6 +17,7 @@ const MAX_TOOL_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_TOOL_RESULT_LABEL_BYTES: usize = 128;
 const MAX_TOOL_RESULT_CURSOR_BYTES: usize = 256;
 const MAX_TOOL_METADATA_TOKEN_BYTES: usize = 32;
+const MAX_FILE_REFERENCE_PATH_BYTES: usize = 512;
 const INVALID_TOOL_METADATA_TOKEN: &str = "Tool metadata token is invalid";
 const INVALID_TOOL_METADATA_ENTRY: &str = "Tool metadata entry is invalid";
 const TOOL_METADATA_LIMIT: &str = "tool metadata exceeds the bounded fact limit";
@@ -402,6 +403,8 @@ fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
         "unsupported_open_object_schema" => "Tool input schema is not supported",
         "tool_contract_too_large" => "Tool contract exceeds a safety limit",
         "path_kind_mismatch" => "Path kind does not match the tool contract",
+        "invalid_path_reference" => "File path reference is invalid",
+        "conflicting_file_location" => "File location conflicts with explicit arguments",
         "tool_not_in_plan" => "Tool is not part of this run's frozen facade",
         "invalid_persisted_tool_plan" => "The frozen tool plan is invalid",
         "capability_unavailable" => "Tool is currently unavailable",
@@ -456,9 +459,9 @@ fn stable_field_error_message(message: &str) -> String {
 
 fn stable_error_candidate(candidate: &str) -> String {
     match candidate {
-        "attachments" | "contact_support" | "directory" | "file" | "missing" | "other"
-        | "request_permission" | "retry" | "revise_input" | "skill_directory" | "wait"
-        | "workspace" => candidate.to_string(),
+        "attachments" | "contact_support" | "directory" | "file" | "literal_path" | "missing"
+        | "other" | "request_permission" | "retry" | "revise_input" | "skill_directory"
+        | "source_reference" | "wait" | "workspace" => candidate.to_string(),
         _ => "other".to_string(),
     }
 }
@@ -645,6 +648,82 @@ pub enum ToolMetadataToken {
     Native,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileReferenceMetadata {
+    input_path: String,
+    resolved_path: String,
+    line: Option<u32>,
+    column: Option<u32>,
+    normalized: bool,
+}
+
+impl FileReferenceMetadata {
+    pub(crate) fn new(
+        input_path: &str,
+        resolved_path: &str,
+        line: Option<u32>,
+        column: Option<u32>,
+        normalized: bool,
+    ) -> Self {
+        Self {
+            input_path: safe_logical_path(input_path),
+            resolved_path: safe_logical_path(resolved_path),
+            line,
+            column,
+            normalized,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FileReferenceMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawFileReferenceMetadata {
+            input_path: String,
+            resolved_path: String,
+            line: Option<u32>,
+            column: Option<u32>,
+            normalized: bool,
+        }
+
+        let raw = RawFileReferenceMetadata::deserialize(deserializer)?;
+        if raw.input_path.is_empty()
+            || raw.resolved_path.is_empty()
+            || raw.input_path.len() > MAX_FILE_REFERENCE_PATH_BYTES
+            || raw.resolved_path.len() > MAX_FILE_REFERENCE_PATH_BYTES
+            || raw.line == Some(0)
+            || raw.column == Some(0)
+        {
+            return Err(serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY));
+        }
+        Ok(Self::new(
+            &raw.input_path,
+            &raw.resolved_path,
+            raw.line,
+            raw.column,
+            raw.normalized,
+        ))
+    }
+}
+
+fn safe_logical_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let unc_absolute = path.starts_with(r"\\") || path.starts_with("//");
+    if Path::new(path).is_absolute() || windows_absolute || unc_absolute {
+        "absolute_path".to_string()
+    } else {
+        truncate_utf8_bytes(path, MAX_FILE_REFERENCE_PATH_BYTES)
+    }
+}
+
 impl ToolMetadataToken {
     pub fn parse(value: &str) -> Result<Self, ToolError> {
         if value.len() > MAX_TOOL_METADATA_TOKEN_BYTES || !value.is_ascii() {
@@ -699,6 +778,7 @@ impl<'de> Deserialize<'de> for ToolMetadataToken {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ToolMetadataEntry {
+    FileReference(FileReferenceMetadata),
     WorkspaceResolution(ToolMetadataToken),
     AttachmentResolution(ToolMetadataToken),
     SkillResolution(ToolMetadataToken),
@@ -712,6 +792,7 @@ pub enum ToolMetadataEntry {
 
 #[derive(Debug, Clone, Copy)]
 enum ToolMetadataKind {
+    FileReference,
     WorkspaceResolution,
     AttachmentResolution,
     SkillResolution,
@@ -746,6 +827,7 @@ impl<'de> Deserialize<'de> for ToolMetadataKind {
                 }
                 match value {
                     "workspace_resolution" => Ok(ToolMetadataKind::WorkspaceResolution),
+                    "file_reference" => Ok(ToolMetadataKind::FileReference),
                     "attachment_resolution" => Ok(ToolMetadataKind::AttachmentResolution),
                     "skill_resolution" => Ok(ToolMetadataKind::SkillResolution),
                     "coercion" => Ok(ToolMetadataKind::Coercion),
@@ -767,6 +849,7 @@ enum PendingMetadataValue {
     Token(ToolMetadataToken),
     Count(u64),
     Flag(bool),
+    FileReference(FileReferenceMetadata),
 }
 
 impl<'de> Deserialize<'de> for PendingMetadataValue {
@@ -776,7 +859,7 @@ impl<'de> Deserialize<'de> for PendingMetadataValue {
     {
         struct ValueVisitor;
 
-        impl serde::de::Visitor<'_> for ValueVisitor {
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
             type Value = PendingMetadataValue;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -813,6 +896,16 @@ impl<'de> Deserialize<'de> for PendingMetadataValue {
                 E: serde::de::Error,
             {
                 Ok(PendingMetadataValue::Flag(value))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                FileReferenceMetadata::deserialize(serde::de::value::MapAccessDeserializer::new(
+                    map,
+                ))
+                .map(PendingMetadataValue::FileReference)
             }
         }
 
@@ -898,6 +991,10 @@ impl<'de> Deserialize<'de> for ToolMetadataEntry {
                 let value =
                     value.ok_or_else(|| serde::de::Error::custom(INVALID_TOOL_METADATA_ENTRY))?;
                 match (kind, value) {
+                    (
+                        ToolMetadataKind::FileReference,
+                        PendingMetadataValue::FileReference(value),
+                    ) => Ok(ToolMetadataEntry::FileReference(value)),
                     (ToolMetadataKind::WorkspaceResolution, PendingMetadataValue::Token(value)) => {
                         Ok(ToolMetadataEntry::WorkspaceResolution(value))
                     }
@@ -937,6 +1034,7 @@ impl<'de> Deserialize<'de> for ToolMetadataEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ToolMetadataKey {
+    FileReference,
     WorkspaceResolution,
     AttachmentResolution,
     SkillResolution,
@@ -951,6 +1049,7 @@ enum ToolMetadataKey {
 impl ToolMetadataEntry {
     fn key(&self) -> ToolMetadataKey {
         match self {
+            Self::FileReference(_) => ToolMetadataKey::FileReference,
             Self::WorkspaceResolution(_) => ToolMetadataKey::WorkspaceResolution,
             Self::AttachmentResolution(_) => ToolMetadataKey::AttachmentResolution,
             Self::SkillResolution(_) => ToolMetadataKey::SkillResolution,
@@ -1590,11 +1689,11 @@ pub(crate) fn explicit_open_object_schema(schema: &Value) -> bool {
 mod tests {
     use super::{
         compile_canonical_schema, compile_openai_strict_schema, explicit_open_object_schema,
-        FacadePriority, NormalizedInput, PreflightMeta, ResourceScopeHint, ToolDescriptor,
-        ToolEffect, ToolError, ToolErrorCategory, ToolErrorStrategy, ToolFieldError, ToolMetadata,
-        ToolMetadataEntry, ToolMetadataToken, ToolResultEnvelope, ToolResultMeta,
-        MAX_TOOL_ERROR_CANDIDATES, MAX_TOOL_ERROR_FIELD_ERRORS, MAX_TOOL_METADATA_ENTRIES,
-        MAX_TOOL_SCHEMA_BYTES,
+        FacadePriority, FileReferenceMetadata, NormalizedInput, PreflightMeta, ResourceScopeHint,
+        ToolDescriptor, ToolEffect, ToolError, ToolErrorCategory, ToolErrorStrategy,
+        ToolFieldError, ToolMetadata, ToolMetadataEntry, ToolMetadataToken, ToolResultEnvelope,
+        ToolResultMeta, MAX_FILE_REFERENCE_PATH_BYTES, MAX_TOOL_ERROR_CANDIDATES,
+        MAX_TOOL_ERROR_FIELD_ERRORS, MAX_TOOL_METADATA_ENTRIES, MAX_TOOL_SCHEMA_BYTES,
     };
     use serde_json::json;
 
@@ -2098,6 +2197,49 @@ mod tests {
             assert_eq!(error.code, "invalid_tool_metadata_token");
             assert!(!error.message.contains(rejected));
         }
+    }
+
+    #[test]
+    fn file_reference_metadata_is_bounded_redacted_and_round_trips() {
+        let metadata = ToolMetadataEntry::FileReference(FileReferenceMetadata::new(
+            r"C:\Users\private\repo\notes.rs:12",
+            r"C:\Users\private\repo\notes.rs",
+            Some(12),
+            None,
+            true,
+        ));
+        let serialized = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(serialized["kind"], "file_reference");
+        assert_eq!(serialized["value"]["input_path"], "absolute_path");
+        assert_eq!(serialized["value"]["resolved_path"], "absolute_path");
+        assert!(!serialized.to_string().contains("private"));
+
+        let round_trip: ToolMetadataEntry = serde_json::from_value(serialized).unwrap();
+        assert_eq!(round_trip, metadata);
+
+        let overlong = "x".repeat(MAX_FILE_REFERENCE_PATH_BYTES + 1);
+        assert!(serde_json::from_value::<ToolMetadataEntry>(json!({
+            "kind": "file_reference",
+            "value": {
+                "input_path": overlong,
+                "resolved_path": "notes.rs",
+                "line": 1,
+                "column": null,
+                "normalized": true
+            }
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ToolMetadataEntry>(json!({
+            "kind": "file_reference",
+            "value": {
+                "input_path": "notes.rs:0",
+                "resolved_path": "notes.rs",
+                "line": 0,
+                "column": null,
+                "normalized": true
+            }
+        }))
+        .is_err());
     }
 
     #[test]

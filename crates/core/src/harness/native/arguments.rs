@@ -573,10 +573,11 @@ fn resolve_local_ref<'a>(schema: &'a Value, root: &'a Value) -> Result<&'a Value
 mod tests {
     use super::*;
     use crate::harness::native::tool_contract::{
-        compile_openai_strict_schema, NormalizedInput, ToolDescriptor, ToolErrorCategory,
-        ToolInputCtx,
+        compile_canonical_schema, compile_openai_strict_schema, NormalizedInput, ToolDescriptor,
+        ToolErrorCategory, ToolInputCtx,
     };
     use crate::harness::native::tool_plan::PlannedTool;
+    use crate::harness::native::tools::read::Read;
     use crate::harness::native::tools::{PermissionSpec, Tool, ToolCtx, ToolOutput};
     use async_trait::async_trait;
     use serde_json::json;
@@ -650,6 +651,24 @@ mod tests {
             strict,
             contract_hash: "frozen".into(),
         }
+    }
+
+    #[test]
+    fn file_reference_normalization_passes_final_canonical_revalidation() {
+        let tool = Arc::new(Read);
+        let canonical_schema = compile_canonical_schema(tool.input_schema());
+        let planned = planned(canonical_schema, false);
+        let validated = validate(
+            r#"{"path":"missing.rs:12"}"#,
+            json!({"path": "missing.rs:12"}),
+            &planned,
+            tool,
+        )
+        .unwrap();
+
+        assert_eq!(validated.input["path"], "missing.rs");
+        assert_eq!(validated.input["offset"], 12);
+        assert!(!validated.normalization.is_empty());
     }
 
     fn validate(
