@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,8 @@ pub const MAX_TOOL_METADATA_ENTRIES: usize = 8;
 pub const MAX_TOOL_ERROR_FIELD_ERRORS: usize = 8;
 pub const MAX_TOOL_ERROR_CANDIDATES: usize = 8;
 const MAX_FILE_TOOL_ERROR_CANDIDATES: usize = 5;
+pub const MAX_TOOL_ERROR_LINE_CANDIDATES: usize = 5;
+pub const MAX_TOOL_ERROR_LINE_PREVIEW_CHARS: usize = 240;
 const MAX_TOOL_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_TOOL_RESULT_LABEL_BYTES: usize = 128;
 const MAX_TOOL_RESULT_CURSOR_BYTES: usize = 256;
@@ -225,6 +228,7 @@ pub struct ToolError {
 pub enum ToolErrorCandidate {
     Token(String),
     File { path: String, kind: String },
+    Line { line: u64, preview: String },
 }
 
 impl From<String> for ToolErrorCandidate {
@@ -341,6 +345,24 @@ impl ToolError {
         self
     }
 
+    pub fn with_line_candidate(mut self, line: usize, preview: impl AsRef<str>) -> Self {
+        let line_candidate_count = self
+            .candidates
+            .iter()
+            .filter(|candidate| matches!(candidate, ToolErrorCandidate::Line { .. }))
+            .count();
+        if line > 0
+            && self.candidates.len() < MAX_TOOL_ERROR_CANDIDATES
+            && line_candidate_count < MAX_TOOL_ERROR_LINE_CANDIDATES
+        {
+            self.candidates.push(ToolErrorCandidate::Line {
+                line: line as u64,
+                preview: stable_line_candidate_preview(preview.as_ref()),
+            });
+        }
+        self
+    }
+
     pub fn public_message(&self) -> String {
         public_error_message(self.category, &stable_error_code(&self.code))
     }
@@ -365,12 +387,13 @@ impl Serialize for ToolError {
             })
             .collect::<Vec<_>>();
         let mut file_candidate_count = 0;
+        let mut line_candidate_count = 0;
         let candidates = self
             .candidates
             .iter()
             .take(MAX_TOOL_ERROR_CANDIDATES)
-            .filter_map(|candidate| {
-                if matches!(candidate, ToolErrorCandidate::File { .. }) {
+            .filter_map(|candidate| match candidate {
+                ToolErrorCandidate::File { .. } => {
                     if file_candidate_count >= MAX_FILE_TOOL_ERROR_CANDIDATES {
                         return None;
                     }
@@ -379,9 +402,18 @@ impl Serialize for ToolError {
                         file_candidate_count += 1;
                     }
                     stable
-                } else {
-                    stable_error_candidate_value(candidate)
                 }
+                ToolErrorCandidate::Line { .. } => {
+                    if line_candidate_count >= MAX_TOOL_ERROR_LINE_CANDIDATES {
+                        return None;
+                    }
+                    let stable = stable_error_candidate_value(candidate);
+                    if stable.is_some() {
+                        line_candidate_count += 1;
+                    }
+                    stable
+                }
+                ToolErrorCandidate::Token(_) => stable_error_candidate_value(candidate),
             })
             .collect::<Vec<_>>();
         let mut stable = json!({
@@ -441,7 +473,14 @@ impl<'de> Deserialize<'de> for ToolError {
             match candidate {
                 Value::String(token) => error = error.with_candidate(token),
                 Value::Object(candidate) => {
-                    if let (Some(path), Some(kind)) = (
+                    if let (Some(line), Some(preview)) = (
+                        candidate.get("line").and_then(Value::as_u64),
+                        candidate.get("preview").and_then(Value::as_str),
+                    ) {
+                        if let Ok(line) = usize::try_from(line) {
+                            error = error.with_line_candidate(line, preview);
+                        }
+                    } else if let (Some(path), Some(kind)) = (
                         candidate.get("path").and_then(Value::as_str),
                         candidate.get("kind").and_then(Value::as_str),
                     ) {
@@ -490,6 +529,9 @@ fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
         "path_not_found" => "Path was not found",
         "path_unavailable" => "Path is unavailable",
         "file_precondition_changed" => "File target changed after preflight",
+        "edit_ambiguous" => "Edit match is ambiguous",
+        "edit_match_not_found" => "Edit match was not found",
+        "edit_precondition_changed" => "Edit precondition changed after approval",
         "invalid_path_reference" => "File path reference is invalid",
         "conflicting_file_location" => "File location conflicts with explicit arguments",
         "tool_not_in_plan" => "Tool is not part of this run's frozen facade",
@@ -560,7 +602,26 @@ fn stable_error_candidate_value(candidate: &ToolErrorCandidate) -> Option<Value>
             "path": stable_file_candidate_path(path)?,
             "kind": stable_file_candidate_kind(kind)?,
         })),
+        ToolErrorCandidate::Line { line, preview } if *line > 0 => Some(json!({
+            "line": line,
+            "preview": stable_line_candidate_preview(preview),
+        })),
+        ToolErrorCandidate::Line { .. } => None,
     }
+}
+
+fn stable_line_candidate_preview(preview: &str) -> String {
+    preview
+        .chars()
+        .take(MAX_TOOL_ERROR_LINE_PREVIEW_CHARS)
+        .map(|character| {
+            if character == '\t' || !character.is_control() {
+                character
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect()
 }
 
 fn stable_file_candidate_kind(kind: &str) -> Option<&'static str> {
@@ -599,6 +660,9 @@ fn stable_file_candidate_path(path: &str) -> Option<String> {
 
 fn typed_error_details(value: &Value) -> Option<Value> {
     let object = value.as_object()?;
+    if let Some(match_count) = object.get("match_count").and_then(Value::as_u64) {
+        return Some(json!({"match_count": match_count}));
+    }
     if let Some(reason) = object.get("reason").and_then(Value::as_str) {
         let reason = match reason {
             "explicit_additional_properties" | "schema_compilation_failed" => reason,
@@ -1407,6 +1471,8 @@ pub struct PreflightMeta {
     metadata: ToolMetadata,
     #[serde(skip)]
     prepared_file_target: Option<super::file_reference::PreflightFileTarget>,
+    #[serde(skip)]
+    edit_content_digest: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for PreflightMeta {
@@ -1417,6 +1483,10 @@ impl std::fmt::Debug for PreflightMeta {
             .field(
                 "has_prepared_file_target",
                 &self.prepared_file_target.is_some(),
+            )
+            .field(
+                "has_edit_content_digest",
+                &self.edit_content_digest.is_some(),
             )
             .finish()
     }
@@ -1451,6 +1521,53 @@ impl PreflightMeta {
         }
         self.prepared_file_target = Some(target);
         Ok(self)
+    }
+
+    pub(crate) fn with_edit_content_precondition(
+        mut self,
+        content: &str,
+    ) -> Result<Self, ToolError> {
+        if self.edit_content_digest.is_some() || self.prepared_file_target.is_none() {
+            return Err(ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "Tool preflight has invalid private execution state",
+            ));
+        }
+        self.edit_content_digest = Some(Sha256::digest(content.as_bytes()).into());
+        Ok(self)
+    }
+
+    pub(crate) async fn recheck_before_snapshot(
+        &self,
+        context: &ToolInputCtx<'_>,
+    ) -> Result<(), ToolError> {
+        let Some(expected_digest) = self.edit_content_digest else {
+            return Ok(());
+        };
+        let prepared = self.prepared_file_target.as_ref().ok_or_else(|| {
+            ToolError::precondition(
+                "invalid_persisted_tool_plan",
+                "Tool preflight has invalid private execution state",
+            )
+        })?;
+        let changed = || {
+            ToolError::new(
+                ToolErrorCategory::Conflict,
+                "edit_precondition_changed",
+                "Edit precondition changed after approval",
+            )
+            .with_strategy(ToolErrorStrategy::ReviseInput)
+        };
+        let resolved = super::file_reference::recheck_preflight_file_target(context, prepared)
+            .await
+            .map_err(|_| changed())?;
+        let content = tokio::fs::read(&resolved.resolved_path)
+            .await
+            .map_err(|_| changed())?;
+        if <[u8; 32]>::from(Sha256::digest(&content)) != expected_digest {
+            return Err(changed());
+        }
+        Ok(())
     }
 
     pub(crate) fn into_parts(
@@ -2893,6 +3010,79 @@ mod tests {
         );
         assert!(candidates.contains(&json!("retry")));
         assert!(candidates.contains(&json!("wait")));
+    }
+
+    #[test]
+    fn line_error_candidate_cap_and_preview_bound_hold_across_trust_boundary() {
+        let long_preview = "é".repeat(300);
+        let mut built = ToolError::precondition("edit_ambiguous", "ambiguous");
+        for index in 0..8 {
+            built = built.with_line_candidate(index + 1, &long_preview);
+        }
+        let serialized = serde_json::to_value(built).unwrap();
+        let candidates = serialized["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 5);
+        assert!(candidates
+            .iter()
+            .all(|candidate| { candidate["preview"].as_str().unwrap().chars().count() == 240 }));
+
+        let direct = ToolError {
+            category: ToolErrorCategory::Precondition,
+            code: "edit_ambiguous".into(),
+            message: "untrusted".into(),
+            retryable: false,
+            strategy: None,
+            field_errors: Box::default(),
+            candidates: Box::new(
+                (0..8)
+                    .map(|index| ToolErrorCandidate::Line {
+                        line: index + 1,
+                        preview: long_preview.clone(),
+                    })
+                    .collect(),
+            ),
+            details: None,
+        };
+        let serialized = serde_json::to_value(direct).unwrap();
+        assert_eq!(serialized["candidates"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            serialized["candidates"][0]["preview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            240
+        );
+
+        let decoded: ToolError = serde_json::from_value(json!({
+            "category": "precondition",
+            "code": "edit_ambiguous",
+            "candidates": (0..8).map(|index| json!({
+                "line": index + 1,
+                "preview": long_preview,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(decoded).unwrap();
+        assert_eq!(serialized["candidates"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            serialized["candidates"][0]["preview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            240
+        );
+    }
+
+    #[test]
+    fn edit_match_count_is_an_allowlisted_bounded_detail() {
+        let error = ToolError::precondition("edit_ambiguous", "ambiguous")
+            .with_details(json!({"match_count": 7}));
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["details"],
+            json!({"match_count": 7})
+        );
     }
 
     #[test]

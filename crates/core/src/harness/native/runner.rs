@@ -20,7 +20,7 @@ use super::llm::LlmStream;
 use super::permission::{evaluate, PermDecision};
 use super::steer::SteerBuffer;
 use super::tool_contract::{
-    truncate_utf8_bytes, ToolError, ToolErrorCategory, ToolInputCtx, ToolMetadata,
+    truncate_utf8_bytes, PreflightMeta, ToolError, ToolErrorCategory, ToolInputCtx, ToolMetadata,
     ToolMetadataEntry, ToolResultEnvelope, ToolResultMeta,
 };
 use super::tool_plan::{self, CompiledSessionToolPlan, PlannedTool};
@@ -2748,10 +2748,8 @@ async fn run_tool_call(
         validated,
         preflight,
     };
-    let PreparedToolCall {
-        validated,
-        preflight,
-    } = prepared;
+    let (validated, preflight) = prepared.into_parts();
+    let prepared_preflight = preflight.clone();
     let (preflight_metadata, preflight_file_target) = preflight.into_parts();
     execute_tool_call(
         deps,
@@ -2768,6 +2766,7 @@ async fn run_tool_call(
         &trace_id,
         Some(validated.normalization),
         Some(preflight_metadata),
+        Some(prepared_preflight),
         spawn,
         cancel,
     )
@@ -2831,6 +2830,7 @@ async fn execute_tool_call(
     trace_id: &str,
     normalization: Option<ToolMetadata>,
     preflight: Option<ToolMetadata>,
+    prepared_preflight: Option<PreflightMeta>,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
 ) -> Value {
@@ -2933,6 +2933,37 @@ async fn execute_tool_call(
         )
         .await
         .provider_result;
+    }
+
+    if let Some(prepared_preflight) = prepared_preflight.as_ref() {
+        let input_context = ToolInputCtx {
+            work_dir: &deps.work_dir,
+            attachments_dir: deps.attachments_dir.as_deref(),
+            extra_skill_dirs: &deps.extra_skill_dirs,
+        };
+        if let Err(error) = prepared_preflight
+            .recheck_before_snapshot(&input_context)
+            .await
+        {
+            let legacy_text = error.public_message();
+            return complete_tool_call(
+                deps,
+                tool_call_id,
+                ToolCompletionContext {
+                    version,
+                    planned,
+                    tool_name,
+                    tool_kind,
+                    trace_id,
+                    duration_ms: 0,
+                    normalization,
+                    preflight,
+                },
+                ToolCompletionOutcome::Error { error, legacy_text },
+            )
+            .await
+            .provider_result;
+        }
     }
 
     if matches!(tool_kind, "edit" | "execute") && tool_name != "revert" {
@@ -3094,6 +3125,7 @@ async fn run_legacy_tool_call(
         None,
         tool_kind,
         &trace_id,
+        None,
         None,
         None,
         spawn,
@@ -5157,6 +5189,24 @@ mod tests {
         deps.native_tools_version = NativeToolsVersion::V2;
         deps.native_tool_runtime_surfaces = RuntimeToolSurfaces::direct_only();
         deps.native_tool_override_mode = None;
+    }
+
+    fn commit_snapshot_fixture(dir: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "native-tools@example.test"],
+            vec!["config", "user.name", "Native Tools Tests"],
+            vec!["config", "core.autocrlf", "false"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        }
     }
 
     #[async_trait]
@@ -8440,6 +8490,200 @@ mod tests {
         assert!(!serde_json::to_string(&(turns, rows))
             .unwrap()
             .contains("candidate-secret"));
+    }
+
+    #[tokio::test]
+    async fn v2_edit_post_approval_race_has_no_snapshot_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old still unique\n").unwrap();
+        commit_snapshot_fixture(dir.path());
+
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-race", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"old","new_string":"new","replace_all":null}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.set_perm_mode(PermMode::Default);
+        enable_v2(&mut deps);
+        let mut events = deps.events.subscribe();
+        let approvals = deps.approvals.clone();
+        let raced = "prefix old still unique\n";
+        let raced_target = target.clone();
+        let approval = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let CoreEvent::ApprovalRequested {
+                        run_id, request_id, ..
+                    } = events.recv().await.unwrap()
+                    {
+                        std::fs::write(&raced_target, raced).unwrap();
+                        assert!(approvals.resolve_bool(
+                            &crate::approval::ApprovalKey::new(run_id, request_id),
+                            true
+                        ));
+                        break;
+                    }
+                }
+            })
+            .await
+        });
+        run_turn(
+            &deps,
+            TurnPrompt::text("edit it", "edit it"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let approval_result = approval.await.unwrap();
+        if approval_result.is_err() {
+            let turns = deps
+                .store
+                .list_provider_turns(&deps.session_pk)
+                .await
+                .unwrap();
+            panic!(
+                "edit must reach approval after successful preflight: {}",
+                serde_json::to_string(&turns).unwrap()
+            );
+        }
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), raced);
+        assert!(deps.snapshots.lock().await.is_empty());
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "edit_precondition_changed");
+    }
+
+    #[tokio::test]
+    async fn v2_edit_ambiguity_precedes_hooks_approval_snapshot_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        let before = "fn first() { target(); }\n\nfn second() { target(); }\n";
+        std::fs::write(&target, before).unwrap();
+        commit_snapshot_fixture(dir.path());
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-ambiguous", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"target();","new_string":"replacement();","replace_all":null}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.set_perm_mode(PermMode::Default);
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        enable_v2(&mut deps);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_turn(
+                &deps,
+                TurnPrompt::text("edit it", "edit it"),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("ambiguous edit must reject before approval")
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+        assert!(hook_calls.calls.lock().unwrap().is_empty());
+        assert!(!deps.approvals.has_pending());
+        assert!(deps.snapshots.lock().await.is_empty());
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "edit_ambiguous");
+        assert_eq!(envelope["error"]["details"]["match_count"], 2);
+        assert_eq!(
+            envelope["error"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate["line"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_edit_replace_all_preserves_crlf_diff_and_snapshot_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "old\r\nold\r\n").unwrap();
+        commit_snapshot_fixture(dir.path());
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "edit-replace-all", "edit"),
+                input_json_delta(
+                    0,
+                    r#"{"path":"f.txt","old_string":"old\n","new_string":"new\n","replace_all":true}"#,
+                ),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("edit all", "edit all"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\r\nnew\r\n");
+        assert_eq!(deps.snapshots.lock().await.len(), 1);
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["ok"], true);
+        let text = envelope["data"].as_str().unwrap();
+        assert!(text.contains("edited f.txt"));
+        assert!(text.contains("-old"));
+        assert!(text.contains("+new"));
     }
 
     #[cfg(any(unix, windows))]

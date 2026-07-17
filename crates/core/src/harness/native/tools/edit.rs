@@ -2,9 +2,14 @@
 
 use super::{truncate, PermissionSpec, Tool, ToolCtx, ToolOutput};
 use crate::harness::native::file_reference::{
-    normalize_resolved_path, resolve_pinned_workspace_reference, resolve_workspace_reference,
+    normalize_resolved_path, path_unavailable, preflight_file_target,
+    recheck_preflight_file_target, resolve_pinned_workspace_reference, resolve_workspace_reference,
+    ExpectedFileKind,
 };
-use crate::harness::native::tool_contract::{NormalizedInput, ToolError, ToolInputCtx};
+use crate::harness::native::tool_contract::{
+    NormalizedInput, PreflightMeta, ToolError, ToolErrorStrategy, ToolInputCtx,
+    MAX_TOOL_ERROR_LINE_CANDIDATES, MAX_TOOL_ERROR_LINE_PREVIEW_CHARS,
+};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -12,6 +17,9 @@ use similar::TextDiff;
 use std::path::PathBuf;
 
 pub struct Edit;
+
+const MIN_NO_MATCH_SIMILARITY_PERCENT: usize = 75;
+const MIN_SUGGESTION_PATTERN_CHARS: usize = 4;
 
 fn input_context(ctx: &ToolCtx) -> ToolInputCtx<'_> {
     ToolInputCtx {
@@ -33,8 +41,24 @@ fn normalize_edit_input(
     normalize_resolved_path(input, &target)
 }
 
-fn prepare_edit_execution(ctx: &ToolCtx, input: Value) -> Result<(Value, PathBuf), ToolError> {
+async fn prepare_edit_execution(
+    ctx: &ToolCtx,
+    input: Value,
+) -> Result<(Value, PathBuf), ToolError> {
     let input_ctx = input_context(ctx);
+    if let Some(target) = ctx.preflight_file_target.as_ref() {
+        let resolved = recheck_preflight_file_target(&input_ctx, target)
+            .await
+            .map_err(|_| {
+                ToolError::new(
+                    crate::harness::native::tool_contract::ToolErrorCategory::Conflict,
+                    "edit_precondition_changed",
+                    "Edit precondition changed after approval",
+                )
+                .with_strategy(ToolErrorStrategy::ReviseInput)
+            })?;
+        return Ok((input, resolved.resolved_path));
+    }
     if let Some(target) = ctx.pinned_file_reference.as_ref() {
         return resolve_pinned_workspace_reference(&input_ctx, target)
             .map(|resolved| (input, resolved));
@@ -64,6 +88,162 @@ fn newline_tolerant_pattern(text: &str) -> Regex {
         }
     }
     Regex::new(&pattern).expect("escaped text is valid regex")
+}
+
+fn line_starts(content: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(content.lines().count() + 1);
+    starts.push(0);
+    starts.extend(
+        content
+            .bytes()
+            .enumerate()
+            .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+    );
+    starts
+}
+
+fn line_for_offset(starts: &[usize], offset: usize) -> usize {
+    starts.partition_point(|start| *start <= offset).max(1)
+}
+
+fn bounded_line_preview(content: &str, starts: &[usize], offset: usize) -> String {
+    let line_index = line_for_offset(starts, offset) - 1;
+    let start = starts[line_index];
+    let mut end = starts
+        .get(line_index + 1)
+        .map_or(content.len(), |next| next.saturating_sub(1));
+    if content.as_bytes().get(end.wrapping_sub(1)) == Some(&b'\r') {
+        end -= 1;
+    }
+    content[start..end]
+        .chars()
+        .take(MAX_TOOL_ERROR_LINE_PREVIEW_CHARS)
+        .collect()
+}
+
+fn match_candidates(content: &str, pattern: &Regex) -> Vec<(usize, String)> {
+    let starts = line_starts(content);
+    pattern
+        .find_iter(content)
+        .take(MAX_TOOL_ERROR_LINE_CANDIDATES)
+        .map(|matched| {
+            (
+                line_for_offset(&starts, matched.start()),
+                bounded_line_preview(content, &starts, matched.start()),
+            )
+        })
+        .collect()
+}
+
+fn substring_edit_distance(pattern: &[char], text: &[char]) -> usize {
+    let mut previous = vec![0; text.len() + 1];
+    let mut current = vec![0; text.len() + 1];
+    for (pattern_index, pattern_char) in pattern.iter().enumerate() {
+        current[0] = pattern_index + 1;
+        for (text_index, text_char) in text.iter().enumerate() {
+            current[text_index + 1] = (previous[text_index + 1] + 1)
+                .min(current[text_index] + 1)
+                .min(previous[text_index] + usize::from(pattern_char != text_char));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous.into_iter().min().unwrap_or(pattern.len())
+}
+
+struct SimilarLine {
+    line: usize,
+    preview: String,
+    edits: usize,
+    pattern_len: usize,
+}
+
+fn no_match_candidates(content: &str, old: &str) -> Vec<(usize, String)> {
+    let patterns = old
+        .split('\n')
+        .map(|line| line.trim_end_matches('\r').trim())
+        .filter_map(|line| {
+            let pattern = line
+                .chars()
+                .take(MAX_TOOL_ERROR_LINE_PREVIEW_CHARS)
+                .collect::<Vec<_>>();
+            (pattern.len() >= MIN_SUGGESTION_PATTERN_CHARS).then_some(pattern)
+        })
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let starts = line_starts(content);
+    let mut candidates = starts
+        .iter()
+        .enumerate()
+        .filter_map(|(line_index, offset)| {
+            let preview = bounded_line_preview(content, &starts, *offset);
+            let text = preview.trim().chars().collect::<Vec<_>>();
+            if text.is_empty() {
+                return None;
+            }
+            let (edits, pattern_len) = patterns
+                .iter()
+                .map(|pattern| (substring_edit_distance(pattern, &text), pattern.len()))
+                .min_by(|left, right| {
+                    (left.0 * right.1)
+                        .cmp(&(right.0 * left.1))
+                        .then_with(|| right.1.cmp(&left.1))
+                })?;
+            // At least 75% local character similarity is required. Below that
+            // threshold a line is advisory guessing rather than a useful retry.
+            (edits * 100 <= pattern_len * (100 - MIN_NO_MATCH_SIMILARITY_PERCENT)).then_some(
+                SimilarLine {
+                    line: line_index + 1,
+                    preview,
+                    edits,
+                    pattern_len,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        (left.edits * right.pattern_len)
+            .cmp(&(right.edits * left.pattern_len))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    candidates
+        .into_iter()
+        .take(MAX_TOOL_ERROR_LINE_CANDIDATES)
+        .map(|candidate| (candidate.line, candidate.preview))
+        .collect()
+}
+
+fn validate_edit_match(input: &Value, content: &str) -> Result<(), ToolError> {
+    let old = input
+        .get("old_string")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::caller("invalid_arguments", "Tool arguments are invalid"))?;
+    let replace_all = input
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let pattern = newline_tolerant_pattern(old);
+    let count = pattern.find_iter(content).count();
+    if count == 0 {
+        let mut error = ToolError::precondition("edit_match_not_found", "Edit match was not found")
+            .with_strategy(ToolErrorStrategy::ReviseInput);
+        for (line, preview) in no_match_candidates(content, old) {
+            error = error.with_line_candidate(line, preview);
+        }
+        return Err(error);
+    }
+    if count > 1 && !replace_all {
+        let mut error = ToolError::precondition("edit_ambiguous", "Edit match is ambiguous")
+            .with_strategy(ToolErrorStrategy::ReviseInput)
+            .with_details(json!({"match_count": count}));
+        for (line, preview) in match_candidates(content, &pattern) {
+            error = error.with_line_candidate(line, preview);
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn replacement_for_file(text: &str, content: &str) -> String {
@@ -132,12 +312,30 @@ impl Tool for Edit {
     ) -> Result<NormalizedInput, ToolError> {
         normalize_edit_input(ctx, input)
     }
+    async fn preflight(
+        &self,
+        ctx: &ToolInputCtx<'_>,
+        input: &Value,
+        pinned_file_reference: Option<&crate::harness::native::file_reference::PinnedFileTarget>,
+    ) -> Result<PreflightMeta, ToolError> {
+        let target = pinned_file_reference.ok_or_else(|| {
+            ToolError::precondition("invalid_path_reference", "File target is not pinned")
+        })?;
+        let prepared = preflight_file_target(ctx, target, ExpectedFileKind::File).await?;
+        let content = tokio::fs::read_to_string(&prepared.target.resolved_path)
+            .await
+            .map_err(|error| path_unavailable(&error))?;
+        validate_edit_match(input, &content)?;
+        PreflightMeta::default()
+            .with_prepared_file_target(prepared)?
+            .with_edit_content_precondition(&content)
+    }
     fn permission(&self, input: &Value) -> PermissionSpec {
         let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
         PermissionSpec::new("edit", format!("edit {path}"))
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
-        let (input, resolved_path) = match prepare_edit_execution(ctx, input) {
+        let (input, resolved_path) = match prepare_edit_execution(ctx, input).await {
             Ok(prepared) => prepared,
             Err(error) => return Ok(ToolOutput::from_error(error)),
         };
@@ -202,6 +400,133 @@ mod tests {
         FileReference, FileReferenceInterpretation, FileReferenceRoot, ResolvedFileTarget,
     };
     use crate::harness::native::tool_contract::ToolInputCtx;
+
+    async fn edit_preflight_error(
+        dir: &tempfile::TempDir,
+        content: &str,
+        input: Value,
+    ) -> (ToolCtx, ToolError) {
+        std::fs::write(dir.path().join("f.txt"), content).unwrap();
+        let ctx = ctx_at(dir.path()).await;
+        let normalized = Edit.normalize_input(&input_context(&ctx), input).unwrap();
+        let error = Edit
+            .preflight(
+                &input_context(&ctx),
+                &normalized.value,
+                normalized.pinned_file_reference(),
+            )
+            .await
+            .unwrap_err();
+        (ctx, error)
+    }
+
+    fn serialized_line_candidates(error: &ToolError) -> Vec<Value> {
+        serde_json::to_value(error).unwrap()["candidates"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn ambiguous_edit_returns_lines_and_does_not_mutate_or_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "fn first() { target(); }\n\nfn second() { target(); }\n";
+        let (ctx, error) = edit_preflight_error(
+            &dir,
+            before,
+            json!({
+                "path": "f.txt",
+                "old_string": "target();",
+                "new_string": "replacement();"
+            }),
+        )
+        .await;
+
+        assert_eq!(error.code, "edit_ambiguous");
+        assert_eq!(
+            serde_json::to_value(&error).unwrap()["details"]["match_count"],
+            2
+        );
+        assert_eq!(
+            serialized_line_candidates(&error)
+                .iter()
+                .map(|candidate| candidate["line"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            before
+        );
+        assert!(ctx.snapshots.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_edit_crlf_lines_and_previews_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{} target();", "é".repeat(300));
+        let before = (0..7).map(|_| format!("{line}\r\n")).collect::<String>();
+        let (_ctx, error) = edit_preflight_error(
+            &dir,
+            &before,
+            json!({
+                "path": "f.txt",
+                "old_string": "target();",
+                "new_string": "replacement();"
+            }),
+        )
+        .await;
+
+        assert_eq!(error.code, "edit_ambiguous");
+        let candidates = serialized_line_candidates(&error);
+        assert_eq!(candidates.len(), 5);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate["line"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert!(candidates
+            .iter()
+            .all(|candidate| { candidate["preview"].as_str().unwrap().chars().count() == 240 }));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_no_match_candidates_are_confidence_bounded() {
+        let close_dir = tempfile::tempdir().unwrap();
+        let (_ctx, close_error) = edit_preflight_error(
+            &close_dir,
+            "let total = calculate_value();\n",
+            json!({
+                "path": "f.txt",
+                "old_string": "let total = calculate_values();",
+                "new_string": "replacement"
+            }),
+        )
+        .await;
+        assert_eq!(close_error.code, "edit_match_not_found");
+        assert_eq!(serialized_line_candidates(&close_error).len(), 1);
+        assert_eq!(serialized_line_candidates(&close_error)[0]["line"], 1);
+
+        let unrelated_dir = tempfile::tempdir().unwrap();
+        let (_ctx, unrelated_error) = edit_preflight_error(
+            &unrelated_dir,
+            "fn unrelated() { return 42; }\n",
+            json!({
+                "path": "f.txt",
+                "old_string": "delete_all_customer_records();",
+                "new_string": "replacement"
+            }),
+        )
+        .await;
+        assert_eq!(unrelated_error.code, "edit_match_not_found");
+        assert!(serialized_line_candidates(&unrelated_error).is_empty());
+    }
 
     #[tokio::test]
     async fn replaces_unique_string_and_returns_diff() {

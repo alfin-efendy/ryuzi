@@ -166,6 +166,12 @@ pub struct PreparedToolCall {
     pub preflight: PreflightMeta,
 }
 
+impl PreparedToolCall {
+    pub fn into_parts(self) -> (ValidatedToolCall, PreflightMeta) {
+        (self.validated, self.preflight)
+    }
+}
+
 pub struct RejectedToolCall {
     pub wire: WireToolCall,
     pub canonical_name: Option<String>,
