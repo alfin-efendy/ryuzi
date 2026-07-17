@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod api;
 pub mod approval;
+pub mod artifacts;
 pub mod attachments;
 pub mod automation;
 pub mod background_rail;

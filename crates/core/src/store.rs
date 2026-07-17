@@ -1,3 +1,7 @@
+use crate::artifacts::{
+    ArtifactAccessRow, ArtifactCreator, ArtifactListRow, ArtifactRecord, ArtifactReference,
+    ArtifactStatus,
+};
 use crate::domain::{
     AgentIdentitySnapshot, AgentRun, AgentRunKind, AgentRunStatus, Message, NewAgentRun,
     NewMessage, NewProviderTurn, PermMode, Project, ProviderTurn, QueuedSessionPrompt, Session,
@@ -1392,6 +1396,59 @@ fn migrations() -> Migrations<'static> {
         // same provider tool_call_id, so remove it after the ownership schema
         // is in place. The scoped update query keeps writes unambiguous.
         M::up("DROP INDEX IF EXISTS idx_messages_tool_call;"),
+        // 42: task artifact persistence schema. Artifacts are content
+        // produced during a session (by the user or an agent run) and can be
+        // shared into other sessions via artifact_references. Deliberately no
+        // FOREIGN KEY / ON DELETE CASCADE here: artifacts and their
+        // references must survive independently of session or agent-run
+        // deletion, so ownership is tracked by plain TEXT id columns instead.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS artifacts (\
+               id TEXT PRIMARY KEY,\
+               source_session_pk TEXT NOT NULL,\
+               source_message_seq INTEGER,\
+               source_run_id TEXT,\
+               creator TEXT NOT NULL CHECK(creator IN ('user','agent')),\
+               creator_id TEXT,\
+               name TEXT NOT NULL,\
+               description TEXT,\
+               content_type TEXT,\
+               size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),\
+               sha256 TEXT NOT NULL,\
+               storage_key TEXT NOT NULL,\
+               status TEXT NOT NULL CHECK(status IN ('available','source-archived','deleted')),\
+               created_at INTEGER NOT NULL,\
+               deleted_at INTEGER\
+             );\
+             CREATE INDEX IF NOT EXISTS artifacts_source_session_idx \
+               ON artifacts(source_session_pk, created_at);\
+             CREATE TABLE IF NOT EXISTS artifact_references (\
+               id TEXT PRIMARY KEY,\
+               artifact_id TEXT NOT NULL,\
+               target_session_pk TEXT NOT NULL,\
+               shared_from_session_pk TEXT NOT NULL,\
+               shared_by TEXT,\
+               parent_reference_id TEXT,\
+               created_at INTEGER NOT NULL,\
+               UNIQUE(artifact_id, target_session_pk)\
+             );\
+             CREATE INDEX IF NOT EXISTS artifact_references_target_idx \
+               ON artifact_references(target_session_pk, created_at);\
+             CREATE INDEX IF NOT EXISTS artifact_references_artifact_idx \
+               ON artifact_references(artifact_id);\
+             CREATE TABLE IF NOT EXISTS artifact_storage_jobs (\
+               id TEXT PRIMARY KEY,\
+               status TEXT NOT NULL,\
+               source_root TEXT NOT NULL,\
+               target_root TEXT NOT NULL,\
+               total_count INTEGER NOT NULL DEFAULT 0 CHECK(total_count >= 0),\
+               completed_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_count >= 0),\
+               current_artifact_id TEXT,\
+               error TEXT,\
+               created_at INTEGER NOT NULL,\
+               updated_at INTEGER NOT NULL\
+             );",
+        ),
     ])
 }
 
@@ -4819,6 +4876,243 @@ impl Store {
             .await?;
         Ok(rows_affected == 1)
     }
+
+    /// Persist a newly produced task artifact. `size_bytes` is stored as a
+    /// SQLite INTEGER (signed 64-bit); a `u64` value that does not fit in
+    /// `i64` is rejected before the write is attempted.
+    pub async fn insert_artifact(&self, artifact: &ArtifactRecord) -> anyhow::Result<()> {
+        let size_bytes = i64::try_from(artifact.size_bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "artifact size_bytes {} exceeds representable range",
+                artifact.size_bytes
+            )
+        })?;
+        let artifact = artifact.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO artifacts(id,source_session_pk,source_message_seq,source_run_id,\
+                 creator,creator_id,name,description,content_type,size_bytes,sha256,\
+                 storage_key,status,created_at,deleted_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    artifact.id,
+                    artifact.source_session_pk,
+                    artifact.source_message_seq,
+                    artifact.source_run_id,
+                    artifact.creator.as_db(),
+                    artifact.creator_id,
+                    artifact.name,
+                    artifact.description,
+                    artifact.content_type,
+                    size_bytes,
+                    artifact.sha256,
+                    artifact.storage_key,
+                    artifact.status.as_db(),
+                    artifact.created_at,
+                    artifact.deleted_at,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Share an artifact into another session's scope. The
+    /// `UNIQUE(artifact_id, target_session_pk)` index rejects a second
+    /// reference of the same artifact into the same session.
+    pub async fn insert_artifact_reference(
+        &self,
+        reference: &ArtifactReference,
+    ) -> anyhow::Result<()> {
+        let reference = reference.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO artifact_references(id,artifact_id,target_session_pk,\
+                 shared_from_session_pk,shared_by,parent_reference_id,created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    reference.id,
+                    reference.artifact_id,
+                    reference.target_session_pk,
+                    reference.shared_from_session_pk,
+                    reference.shared_by,
+                    reference.parent_reference_id,
+                    reference.created_at,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn artifact_by_id(&self, id: &str) -> anyhow::Result<Option<ArtifactRecord>> {
+        let id = id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!("SELECT {ARTIFACT_COLS} FROM artifacts WHERE id=?1"),
+                params![id],
+                row_to_artifact,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// List a session's artifacts: rows the session originated (`reference`
+    /// is `None`) plus artifacts shared into the session via a reference
+    /// (`reference` is `Some`). An artifact never appears twice even if it
+    /// was both originated by and (re-)shared into the same session.
+    pub async fn artifacts_for_session(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<Vec<ArtifactListRow>> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut rows = Vec::new();
+            {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {ARTIFACT_COLS} FROM artifacts \
+                     WHERE source_session_pk=?1 ORDER BY created_at"
+                ))?;
+                for artifact in stmt.query_map(params![session_pk], row_to_artifact)? {
+                    rows.push(ArtifactListRow {
+                        artifact: artifact?,
+                        reference: None,
+                    });
+                }
+            }
+            {
+                let mut stmt = c.prepare(
+                    "SELECT a.id,a.source_session_pk,a.source_message_seq,a.source_run_id,\
+                     a.creator,a.creator_id,a.name,a.description,a.content_type,a.size_bytes,\
+                     a.sha256,a.storage_key,a.status,a.created_at,a.deleted_at,\
+                     r.id,r.artifact_id,r.target_session_pk,r.shared_from_session_pk,\
+                     r.shared_by,r.parent_reference_id,r.created_at \
+                     FROM artifact_references r JOIN artifacts a ON a.id = r.artifact_id \
+                     WHERE r.target_session_pk=?1 AND a.source_session_pk <> ?1 \
+                     ORDER BY r.created_at",
+                )?;
+                for row in stmt.query_map(params![session_pk], row_to_artifact_and_reference)? {
+                    let (artifact, reference) = row?;
+                    rows.push(ArtifactListRow {
+                        artifact,
+                        reference: Some(reference),
+                    });
+                }
+            }
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Resolve an artifact id or reference id against a caller's session
+    /// scope. `artifact_or_reference_id` is first tried as an original
+    /// artifact id owned by `session_pk`; if that fails to match, it is
+    /// tried as a reference id whose `target_session_pk` is `session_pk`.
+    /// Returns `None` if neither scope grants access.
+    pub async fn reference_for_session(
+        &self,
+        artifact_or_reference_id: &str,
+        session_pk: &str,
+    ) -> anyhow::Result<Option<ArtifactAccessRow>> {
+        let id = artifact_or_reference_id.to_string();
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            let original = c
+                .query_row(
+                    &format!("SELECT {ARTIFACT_COLS} FROM artifacts WHERE id=?1 AND source_session_pk=?2"),
+                    params![id, session_pk],
+                    row_to_artifact,
+                )
+                .optional()?;
+            if let Some(artifact) = original {
+                return Ok(Some(ArtifactAccessRow {
+                    artifact,
+                    reference: None,
+                }));
+            }
+            let joined = c
+                .query_row(
+                    "SELECT a.id,a.source_session_pk,a.source_message_seq,a.source_run_id,\
+                     a.creator,a.creator_id,a.name,a.description,a.content_type,a.size_bytes,\
+                     a.sha256,a.storage_key,a.status,a.created_at,a.deleted_at,\
+                     r.id,r.artifact_id,r.target_session_pk,r.shared_from_session_pk,\
+                     r.shared_by,r.parent_reference_id,r.created_at \
+                     FROM artifact_references r JOIN artifacts a ON a.id = r.artifact_id \
+                     WHERE r.id=?1 AND r.target_session_pk=?2",
+                    params![id, session_pk],
+                    row_to_artifact_and_reference,
+                )
+                .optional()?;
+            Ok(joined.map(|(artifact, reference)| ArtifactAccessRow {
+                artifact,
+                reference: Some(reference),
+            }))
+        })
+        .await
+    }
+
+    /// Mark every non-deleted artifact originated by `source_session_pk` as
+    /// deleted, stamping `deleted_at`, and return the updated rows. Intended
+    /// for use when a session (and thus its content root) is destroyed.
+    pub async fn mark_source_artifacts_deleted(
+        &self,
+        source_session_pk: &str,
+        deleted_at: i64,
+    ) -> anyhow::Result<Vec<ArtifactRecord>> {
+        let source_session_pk = source_session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "UPDATE artifacts SET status='deleted', deleted_at=?2 \
+                 WHERE source_session_pk=?1 AND status <> 'deleted' \
+                 RETURNING {ARTIFACT_COLS}"
+            ))?;
+            let rows = stmt
+                .query_map(params![source_session_pk, deleted_at], row_to_artifact)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+}
+
+const ARTIFACT_COLS: &str = "id,source_session_pk,source_message_seq,source_run_id,creator,\
+    creator_id,name,description,content_type,size_bytes,sha256,storage_key,status,created_at,\
+    deleted_at";
+
+fn row_to_artifact(r: &Row) -> rusqlite::Result<ArtifactRecord> {
+    let size_bytes: i64 = r.get(9)?;
+    Ok(ArtifactRecord {
+        id: r.get(0)?,
+        source_session_pk: r.get(1)?,
+        source_message_seq: r.get(2)?,
+        source_run_id: r.get(3)?,
+        creator: ArtifactCreator::from_db(&r.get::<_, String>(4)?)?,
+        creator_id: r.get(5)?,
+        name: r.get(6)?,
+        description: r.get(7)?,
+        content_type: r.get(8)?,
+        size_bytes: u64::try_from(size_bytes).map_err(to_sql_json_error)?,
+        sha256: r.get(10)?,
+        storage_key: r.get(11)?,
+        status: ArtifactStatus::from_db(&r.get::<_, String>(12)?)?,
+        created_at: r.get(13)?,
+        deleted_at: r.get(14)?,
+    })
+}
+
+fn row_to_artifact_and_reference(r: &Row) -> rusqlite::Result<(ArtifactRecord, ArtifactReference)> {
+    let artifact = row_to_artifact(r)?;
+    let reference = ArtifactReference {
+        id: r.get(15)?,
+        artifact_id: r.get(16)?,
+        target_session_pk: r.get(17)?,
+        shared_from_session_pk: r.get(18)?,
+        shared_by: r.get(19)?,
+        parent_reference_id: r.get(20)?,
+        created_at: r.get(21)?,
+    };
+    Ok((artifact, reference))
 }
 
 const AGENT_RUN_COLS: &str =
@@ -5232,7 +5526,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -5295,7 +5589,7 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
 
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
@@ -5303,7 +5597,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 41);
+        assert_eq!(reopened_version, 42);
     }
 
     #[tokio::test]
@@ -5324,7 +5618,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -5368,7 +5662,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 41);
+        assert_eq!(user_version, 42);
     }
 
     #[tokio::test]
@@ -7225,7 +7519,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 41, "forward migration must land at v41");
+        assert_eq!(user_version, 42, "forward migration must land at v42");
     }
 
     #[tokio::test]
@@ -7858,19 +8152,20 @@ mod tests {
         // IF NOT EXISTS; 35 session_prompt_queue; 36 automation hooks/runs/
         // attempts; 37 session_automation_origins plus compatibility queue
         // repair; 38 session ownership and agent runs; 39 agentic cleanup;
-        // 40 durable dispatch linkage — all convergent,
-        // existence-guarded, or CREATE TABLE IF NOT EXISTS)
+        // 40 durable dispatch linkage; 41 removes session-wide tool-call
+        // uniqueness; 42 artifacts/artifact_references/artifact_storage_jobs —
+        // all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 41
-        // defined, wind back twenty-nine.
+        // this test starts failing its assertions). With migrations through 42
+        // defined, wind back thirty.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 29)
+            c.pragma_update(None, "user_version", v - 30)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -7926,9 +8221,9 @@ mod tests {
     #[tokio::test]
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
-        // wind user_version back fifteen, and reopen so 21 (and the tail
-        // migrations 22–41) replay against it. Back TWENTY-ONE: the fully
-        // migrated tail is now v41, so rewinding to v20 is what makes
+        // wind user_version back, and reopen so 21 (and the tail
+        // migrations 22–42) replay against it. Back TWENTY-TWO: the fully
+        // migrated tail is now v42, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
@@ -7937,7 +8232,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 21)
+            c.pragma_update(None, "user_version", v - 22)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -8070,7 +8365,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 41, "forward migration must land at v41");
+        assert_eq!(uv, 42, "forward migration must land at v42");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -8096,7 +8391,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 41, "forward migration must land at v41");
+        assert_eq!(uv, 42, "forward migration must land at v42");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
@@ -9486,5 +9781,170 @@ mod tests {
             .consume_pairing_code("code-hash-2", now)
             .await
             .unwrap());
+    }
+
+    fn sample_artifact(
+        id: &str,
+        source_session_pk: &str,
+        status: ArtifactStatus,
+    ) -> ArtifactRecord {
+        ArtifactRecord {
+            id: id.into(),
+            source_session_pk: source_session_pk.into(),
+            source_message_seq: Some(1),
+            source_run_id: Some("run-1".into()),
+            creator: ArtifactCreator::Agent,
+            creator_id: Some("ada".into()),
+            name: "report.md".into(),
+            description: Some("summary".into()),
+            content_type: Some("text/markdown".into()),
+            size_bytes: 42,
+            sha256: "deadbeef".into(),
+            storage_key: format!("{id}/report.md"),
+            status,
+            created_at: 1_700_000_000_000,
+            deleted_at: None,
+        }
+    }
+
+    fn sample_reference(
+        id: &str,
+        artifact_id: &str,
+        target_session_pk: &str,
+        shared_from_session_pk: &str,
+    ) -> ArtifactReference {
+        ArtifactReference {
+            id: id.into(),
+            artifact_id: artifact_id.into(),
+            target_session_pk: target_session_pk.into(),
+            shared_from_session_pk: shared_from_session_pk.into(),
+            shared_by: Some("ada".into()),
+            parent_reference_id: None,
+            created_at: 1_700_000_000_100,
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_store_inserts_and_reads_artifact() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let artifact = sample_artifact("art-1", "s1", ArtifactStatus::Available);
+
+        store.insert_artifact(&artifact).await.unwrap();
+
+        let fetched = store.artifact_by_id("art-1").await.unwrap();
+        assert_eq!(fetched, Some(artifact));
+    }
+
+    #[tokio::test]
+    async fn artifact_store_rejects_duplicate_reference_target() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let artifact = sample_artifact("art-1", "s1", ArtifactStatus::Available);
+        store.insert_artifact(&artifact).await.unwrap();
+
+        let first = sample_reference("ref-1", "art-1", "s2", "s1");
+        store.insert_artifact_reference(&first).await.unwrap();
+
+        // Same artifact + same target session, different reference id: the
+        // UNIQUE(artifact_id, target_session_pk) index must reject this.
+        let duplicate = sample_reference("ref-2", "art-1", "s2", "s1");
+        let err = store.insert_artifact_reference(&duplicate).await;
+        assert!(err.is_err(), "duplicate reference target must be rejected");
+    }
+
+    #[tokio::test]
+    async fn artifact_store_lists_source_and_received_reference() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let artifact = sample_artifact("art-1", "s1", ArtifactStatus::Available);
+        store.insert_artifact(&artifact).await.unwrap();
+        let reference = sample_reference("ref-1", "art-1", "s2", "s1");
+        store.insert_artifact_reference(&reference).await.unwrap();
+
+        let s1_rows = store.artifacts_for_session("s1").await.unwrap();
+        assert_eq!(s1_rows.len(), 1);
+        assert_eq!(s1_rows[0].artifact, artifact);
+        assert_eq!(s1_rows[0].reference, None);
+
+        let s2_rows = store.artifacts_for_session("s2").await.unwrap();
+        assert_eq!(s2_rows.len(), 1);
+        assert_eq!(s2_rows[0].artifact, artifact);
+        assert_eq!(s2_rows[0].reference, Some(reference));
+    }
+
+    #[tokio::test]
+    async fn artifact_store_scopes_reference_access_to_session() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let artifact = sample_artifact("art-1", "s1", ArtifactStatus::Available);
+        store.insert_artifact(&artifact).await.unwrap();
+        let reference = sample_reference("ref-1", "art-1", "s2", "s1");
+        store.insert_artifact_reference(&reference).await.unwrap();
+
+        // s1 (the originating session) resolves the original artifact id.
+        let via_s1 = store.reference_for_session("art-1", "s1").await.unwrap();
+        assert_eq!(
+            via_s1,
+            Some(ArtifactAccessRow {
+                artifact: artifact.clone(),
+                reference: None,
+            })
+        );
+
+        // s2 cannot resolve the original artifact id directly...
+        let s2_by_original = store.reference_for_session("art-1", "s2").await.unwrap();
+        assert_eq!(s2_by_original, None);
+
+        // ...but can resolve it via its own reference id.
+        let s2_by_reference = store.reference_for_session("ref-1", "s2").await.unwrap();
+        assert_eq!(
+            s2_by_reference,
+            Some(ArtifactAccessRow {
+                artifact: artifact.clone(),
+                reference: Some(reference),
+            })
+        );
+
+        // s3 has no reference and no origination, so neither id resolves.
+        let s3_by_original = store.reference_for_session("art-1", "s3").await.unwrap();
+        assert_eq!(s3_by_original, None);
+        let s3_by_reference = store.reference_for_session("ref-1", "s3").await.unwrap();
+        assert_eq!(s3_by_reference, None);
+    }
+
+    #[tokio::test]
+    async fn artifact_store_marks_source_artifacts_deleted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let active = sample_artifact("art-active", "s1", ArtifactStatus::Available);
+        let archived = sample_artifact("art-archived", "s1", ArtifactStatus::SourceArchived);
+        store.insert_artifact(&active).await.unwrap();
+        store.insert_artifact(&archived).await.unwrap();
+
+        let deleted_at = 1_700_000_500_000_i64;
+        let mut deleted = store
+            .mark_source_artifacts_deleted("s1", deleted_at)
+            .await
+            .unwrap();
+        deleted.sort_by(|a, b| a.id.cmp(&b.id));
+
+        assert_eq!(deleted.len(), 2);
+        for record in &deleted {
+            assert_eq!(record.status, ArtifactStatus::Deleted);
+            assert_eq!(record.deleted_at, Some(deleted_at));
+        }
+
+        let refetched = store.artifact_by_id("art-active").await.unwrap().unwrap();
+        assert_eq!(refetched.status, ArtifactStatus::Deleted);
+        assert_eq!(refetched.deleted_at, Some(deleted_at));
+
+        // Every artifact originated by s1 is already deleted, so a second
+        // call finds nothing left to mark.
+        let repeated = store
+            .mark_source_artifacts_deleted("s1", deleted_at + 1)
+            .await
+            .unwrap();
+        assert!(repeated.is_empty());
     }
 }
