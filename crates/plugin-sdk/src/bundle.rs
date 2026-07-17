@@ -68,8 +68,8 @@ pub struct PluginPermissions {
 /// One outbound-network allowlist entry: a bare lowercase hostname
 /// (`api.github.com`) or a `*.`-prefixed wildcard hostname
 /// (`*.github.com`). No scheme, path, port, IP literal, bare `*`, or
-/// uppercase — see [`is_valid_network_host`] for the exact grammar enforced
-/// by [`PluginBundleManifest::validate`].
+/// uppercase — see the host-validation logic exercised by
+/// [`PluginBundleManifest::validate`] for the exact grammar enforced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NetworkPermission(pub String);
