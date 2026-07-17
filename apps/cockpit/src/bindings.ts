@@ -757,7 +757,7 @@ async gitDiff(runnerId: string | null, sessionPk: string) : Promise<Result<strin
     else return { status: "error", error: e  as any };
 }
 },
-async searchFiles(runnerId: string | null, projectId: string, query: string) : Promise<Result<string[], CmdError>> {
+async searchFiles(runnerId: string | null, projectId: string, query: string) : Promise<Result<SearchEntryInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("search_files", { runnerId, projectId, query }) };
 } catch (e) {
@@ -2412,6 +2412,12 @@ export type QuotaWindowInfo = { label: string; used: number; total: number; rema
 export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
+/**
+ * One workspace search hit for the unified `@` context picker: a
+ * root-relative, forward-slash path plus whether it names a directory.
+ * Serialized camelCase for the Tauri binding (`{ path, dir }`).
+ */
+export type SearchEntryInfo = { path: string; dir: boolean }
 export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
 export type SelectableModelKind = "concrete" | "namedRoute"
 export type Session = { sessionPk: string;
