@@ -381,11 +381,6 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
-    let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-        opts.config_root,
-        Arc::clone(&store),
-    )
-    .await?;
     // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
     // install has runnable models (and the `free` route below has candidates)
     // without any "Add account" step. Idempotent + respects user deletion.
@@ -398,10 +393,21 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // `&'static` descriptor so the router resolves its family. Must run before
     // `ensure_default_routes` so any custom-targeted route resolves at boot.
     crate::llm_router::custom::load_and_register_all(&store).await?;
-    // Default durable profiles target the `free` route. Create it only after
-    // persistence has materialized the profiles and after connections are
-    // available; a fresh daemon with none remains intentionally unconfigured.
+    // Default durable profiles target the `free` route, so it must exist before
+    // the registry below loads: the registry validates every profile exactly
+    // once, at load, and caches the verdict in `AgentSnapshot`. Creating the
+    // route afterwards left a fresh install's default agent permanently stamped
+    // "route `free` does not exist or is not executable" until the next restart.
+    // Needs connections, which the seeding above provides; a fresh daemon with
+    // none remains intentionally unconfigured.
     crate::agents::bootstrap::ensure_default_routes(&store).await?;
+    // Agents last: everything they validate against (connections, the `free`
+    // route) now exists.
+    let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+        opts.config_root,
+        Arc::clone(&store),
+    )
+    .await?;
     // Refine the `free` route in the background: probe the MiMo/OpenCode free
     // models and keep only the ones that answer, leaving the synchronous
     // first-concrete baseline in place if none do. Non-blocking; boot proceeds.
@@ -470,7 +476,21 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
             let value = settings.get(field.key).await?.unwrap_or_default();
             config.insert(field.key.to_string(), serde_json::Value::String(value));
         }
-        let gw = factory.create(&serde_json::Value::Object(config))?;
+        // A gateway that cannot be built from its settings is a configuration
+        // gap, not an engine fault — skip it (like the two cases above) rather
+        // than failing the whole daemon. A fresh install seeds
+        // `enabled_gateways = "discord"` with no token, so making this fatal
+        // meant a clean machine could never boot the engine at all: the daemon
+        // exited, and Cockpit's `setup()` panicked before showing its window.
+        // The gateway stays enabled in settings and starts on the next boot
+        // once its fields are filled in.
+        let gw = match factory.create(&serde_json::Value::Object(config)) {
+            Ok(gw) => gw,
+            Err(e) => {
+                eprintln!("[ryuzi] gateway {id} is enabled but could not start: {e} — skipping");
+                continue;
+            }
+        };
         gateways.push(gw);
     }
 
@@ -1281,6 +1301,19 @@ mod tests {
         }
     }
 
+    /// Stands in for a real factory that cannot build from the configuration
+    /// it was given — e.g. the Discord factory with a blank `discord.token`,
+    /// which is exactly what a fresh install has. Kept feature-independent:
+    /// `cargo test -p ryuzi-core` (what CI runs) builds without the `discord`
+    /// feature, so `discord::factory_entries()` is empty here and the real
+    /// factory cannot be used to cover this.
+    struct UnconfiguredGatewayFactory;
+    impl GatewayFactory for UnconfiguredGatewayFactory {
+        fn create(&self, _config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
+            anyhow::bail!("discord gateway requires a non-empty discord.token");
+        }
+    }
+
     struct StaticGatewayFactory {
         gateway: Arc<FakeGateway>,
     }
@@ -1304,6 +1337,78 @@ mod tests {
             runs.len(),
             expected,
             "gateway status transition did not produce the expected number of runs"
+        );
+    }
+
+    /// Fresh install: the default agents ship targeting the `free` route, and
+    /// `build_daemon` is what creates that route (`ensure_default_routes`, off
+    /// the seeded free connections). The agent registry caches each profile's
+    /// validation into `AgentSnapshot { executable, validation }` ONCE, when it
+    /// loads — so if it loads before the route exists, every default agent is
+    /// permanently stamped "route `free` does not exist or is not executable"
+    /// for the rest of the process, even though the route appears milliseconds
+    /// later. The user sees a red "Invalid" agent on first launch that fixes
+    /// itself only after a restart.
+    #[tokio::test]
+    async fn fresh_install_default_agents_are_executable_on_the_first_boot() {
+        let (_guard, db_path) = temp_db_path();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+
+        let snapshot = daemon.agents.snapshot().await;
+        assert!(!snapshot.agents.is_empty(), "fresh install seeds an agent");
+        for agent in &snapshot.agents {
+            assert!(
+                agent.validation.is_empty(),
+                "agent `{}` invalid on first boot: {:?}",
+                agent.profile.id,
+                agent.validation
+            );
+            assert!(
+                agent.executable,
+                "agent `{}` not executable",
+                agent.profile.id
+            );
+        }
+    }
+
+    /// Fresh install: `Store::open` seeds `enabled_gateways = "discord"` (a
+    /// runner-era default) while `discord.token` is unset, so the factory
+    /// cannot build the gateway. That is a configuration gap, not an engine
+    /// fault: the daemon must still boot with the gateway skipped. When this
+    /// failed the build instead, the engine daemon exited, and Cockpit's
+    /// `setup()` panicked on `.expect("engine daemon unreachable")` before the
+    /// window was ever shown — a fresh install just silently did nothing.
+    ///
+    /// No settings are written here on purpose; the seed alone reproduces it.
+    #[tokio::test]
+    async fn build_daemon_skips_an_enabled_gateway_its_factory_cannot_build() {
+        let (_guard, db_path) = temp_db_path();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![(
+                "discord".to_string(),
+                Arc::new(UnconfiguredGatewayFactory) as Arc<dyn GatewayFactory>,
+            )],
+            harness_factory: None,
+        })
+        .await
+        .expect("a fresh install must boot even though the seeded gateway is unconfigured");
+
+        assert!(
+            daemon.gateways.is_empty(),
+            "an unbuildable gateway must be skipped, not wired"
         );
     }
 

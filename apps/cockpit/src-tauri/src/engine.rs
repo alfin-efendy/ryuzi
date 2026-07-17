@@ -277,13 +277,27 @@ async fn try_attach(dir: &std::path::Path) -> Option<EngineClient> {
     }
 }
 
+/// Open `<dir>/daemon.log` for append, creating the state dir if missing.
+///
+/// The `create_dir_all` is load-bearing on a fresh install: `dir` is
+/// `paths::state_dir()`, which nothing has created yet (the installer does
+/// not, and the daemon's own `Store::open` cannot run until it has been
+/// spawned — which is what this log file is for). `File::create` does not
+/// create parent directories, so without this the very first thing Cockpit
+/// does on a clean machine fails with NotFound, the daemon never spawns, and
+/// `setup()` dies before the window is ever shown.
+fn open_daemon_log(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::File::options()
+        .append(true)
+        .create(true)
+        .open(dir.join("daemon.log"))
+}
+
 fn spawn_engine_daemon(dir: &std::path::Path) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
-    let log = std::fs::File::options()
-        .append(true)
-        .create(true)
-        .open(dir.join("daemon.log"))?;
+    let log = open_daemon_log(dir)?;
     let log2 = log.try_clone()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--engine-daemon")
@@ -551,6 +565,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.message, "attachment not found");
+    }
+
+    /// Fresh install: `paths::state_dir()` does not exist yet, and opening the
+    /// daemon log is the FIRST thing Cockpit does there — before the daemon it
+    /// would spawn (and that daemon's `Store::open`) can create the directory.
+    /// Without the `create_dir_all`, this returns NotFound, `connect_or_spawn`
+    /// bails, and `lib.rs`'s `setup()` panics on
+    /// `.expect("engine daemon unreachable")` while the window is still
+    /// `visible: false` — the app exits (code 101) having shown nothing at all.
+    ///
+    /// Windows note: see `pinned_client_and_new_pinned_construct_without_panicking`
+    /// below — `cargo test -p ryuzi-cockpit` can't run locally (tauri#13419),
+    /// so `cargo check --tests -p ryuzi-cockpit` is the local evidence here.
+    #[test]
+    fn open_daemon_log_creates_the_state_dir_when_it_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("ryuzi");
+        assert!(!fresh.exists(), "precondition: state dir must be missing");
+
+        let _log = open_daemon_log(&fresh).expect("open the log in a not-yet-created state dir");
+
+        assert!(fresh.join("daemon.log").exists(), "daemon.log not created");
     }
 
     #[tokio::test]
