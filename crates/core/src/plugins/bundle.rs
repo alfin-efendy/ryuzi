@@ -64,6 +64,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
@@ -226,7 +227,9 @@ pub fn installed_bundle_root() -> PathBuf {
 pub struct ComponentBundleInstaller {
     root: PathBuf,
     store: Store,
+    #[cfg(test)]
     fail_before_pointer: AtomicBool,
+    #[cfg(test)]
     fail_after_pointer_replacement: AtomicBool,
 }
 
@@ -235,18 +238,22 @@ impl ComponentBundleInstaller {
         Self {
             root,
             store,
+            #[cfg(test)]
             fail_before_pointer: AtomicBool::new(false),
+            #[cfg(test)]
             fail_after_pointer_replacement: AtomicBool::new(false),
         }
     }
 
     /// Test seam for exercising the pre-pointer failure boundary.
-    pub fn fail_before_pointer_replacement(&self) {
+    #[cfg(test)]
+    pub(crate) fn fail_before_pointer_replacement(&self) {
         self.fail_before_pointer.store(true, Ordering::SeqCst);
     }
 
     /// Test seam for exercising an activation failure after the pointer changes.
-    pub fn fail_after_pointer_replacement(&self) {
+    #[cfg(test)]
+    pub(crate) fn fail_after_pointer_replacement(&self) {
         self.fail_after_pointer_replacement
             .store(true, Ordering::SeqCst);
     }
@@ -269,6 +276,7 @@ impl ComponentBundleInstaller {
 
         let pointer = plugin_root.join("current");
         let previous = std::fs::read_to_string(&pointer).ok();
+        #[cfg(test)]
         if self.fail_before_pointer.swap(false, Ordering::SeqCst) {
             let _ = std::fs::remove_dir_all(&version_root);
             bail!("injected failure before active pointer replacement");
@@ -299,6 +307,7 @@ impl ComponentBundleInstaller {
             revocation_reason: None,
         };
         let result = async {
+            #[cfg(test)]
             if self
                 .fail_after_pointer_replacement
                 .swap(false, Ordering::SeqCst)
@@ -313,13 +322,12 @@ impl ComponentBundleInstaller {
         }
         .await;
         if let Err(error) = result {
-            return match restore_pointer(&pointer, previous.as_deref()) {
-                Ok(()) => Err(error),
-                Err(restoration_error) => Err(anyhow::anyhow!(
-                    "activation failed: {error}; restoring active bundle pointer {} failed: {restoration_error}",
-                    pointer.display()
-                )),
-            };
+            return Err(cleanup_failed_activation(
+                &pointer,
+                previous.as_deref(),
+                &version_root,
+                error,
+            ));
         }
         Ok(ComponentPluginReleaseRecord {
             active: true,
@@ -340,6 +348,41 @@ fn restore_pointer(path: &Path, previous: Option<&str>) -> Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         },
+    }
+}
+
+/// Rolls back a bundle activation that failed after the version directory was
+/// moved into place and the active pointer was rewritten: restores the
+/// pointer to its previous value (or removes it if there was none) and
+/// removes the just-moved version directory, since it was freshly renamed by
+/// this invocation and never became the active, ledgered release. Never
+/// touches any other version directory. Returns an error that preserves
+/// `activation_error` and appends any pointer-restore and/or version-removal
+/// failures; if cleanup fully succeeds, returns `activation_error` unchanged.
+fn cleanup_failed_activation(
+    pointer: &Path,
+    previous: Option<&str>,
+    version_root: &Path,
+    activation_error: anyhow::Error,
+) -> anyhow::Error {
+    let pointer_result = restore_pointer(pointer, previous);
+    let removal_result = std::fs::remove_dir_all(version_root);
+
+    match (pointer_result, removal_result) {
+        (Ok(()), Ok(())) => activation_error,
+        (Err(pointer_error), Ok(())) => anyhow::anyhow!(
+            "activation failed: {activation_error}; restoring active bundle pointer {} failed: {pointer_error}",
+            pointer.display()
+        ),
+        (Ok(()), Err(removal_error)) => anyhow::anyhow!(
+            "activation failed: {activation_error}; removing moved bundle {} failed: {removal_error}",
+            version_root.display()
+        ),
+        (Err(pointer_error), Err(removal_error)) => anyhow::anyhow!(
+            "activation failed: {activation_error}; restoring active bundle pointer {} failed: {pointer_error}; removing moved bundle {} failed: {removal_error}",
+            pointer.display(),
+            version_root.display()
+        ),
     }
 }
 
@@ -739,6 +782,62 @@ component = "acme_connector.wasm"
                 .unwrap()
                 .version,
             "0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_activation_after_pointer_removes_version_and_retry_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+
+        let first_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(first_staging.path(), &signing_key(), KEY_ID, "0.1.0");
+        installer
+            .install_verified(verify_bundle(first_staging.path(), &trusted_keys()).unwrap())
+            .await
+            .unwrap();
+
+        let failing_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(failing_staging.path(), &signing_key(), KEY_ID, "0.1.1");
+        installer.fail_after_pointer_replacement();
+        let verified = verify_bundle(failing_staging.path(), &trusted_keys()).unwrap();
+        assert!(installer.install_verified(verified).await.is_err());
+
+        let plugin_root = root.path().join("acme-connector");
+        assert_eq!(
+            fs::read_to_string(plugin_root.join("current")).unwrap(),
+            "0.1.0"
+        );
+        assert_eq!(
+            store
+                .active_component_release("acme-connector")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            "0.1.0"
+        );
+        assert!(!plugin_root.join("0.1.1").exists());
+
+        let retry_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(retry_staging.path(), &signing_key(), KEY_ID, "0.1.1");
+        let verified = verify_bundle(retry_staging.path(), &trusted_keys()).unwrap();
+        installer.install_verified(verified).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(plugin_root.join("current")).unwrap(),
+            "0.1.1"
+        );
+        assert_eq!(
+            store
+                .active_component_release("acme-connector")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            "0.1.1"
         );
     }
 
