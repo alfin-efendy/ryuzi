@@ -8290,7 +8290,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 30)
+            c.pragma_update(None, "user_version", v - 31)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -8357,7 +8357,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 22)
+            c.pragma_update(None, "user_version", v - 23)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
