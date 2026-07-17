@@ -199,6 +199,7 @@ const setConnectionEnabled = mock((_runnerId: string, _id: string, enabled: bool
   Promise.resolve({ status: "ok" as const, data: [{ ...connection, enabled }, secondConnection] }),
 );
 const removeConnection = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [secondConnection] }));
+const removeCustomProvider = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [] }));
 const reconnectOauth = mock((_runnerId: string, _id: string) => Promise.resolve({ status: "ok" as const, data: [claudeConnection] }));
 const resetCodexCredit = mock(
   (_runnerId: string, _id: string): Promise<Result<CodexResetCreditResult, CmdError>> =>
@@ -247,6 +248,7 @@ mock.module("@/bindings", () => ({
     renameConnection,
     setConnectionEnabled,
     removeConnection,
+    removeCustomProvider,
     reconnectOauth,
     resetCodexCredit,
     moveConnection: () => Promise.resolve({ status: "ok", data: [secondConnection, connection] }),
@@ -534,6 +536,45 @@ test("provider detail shows accounts for the selected provider", async () => {
   expect(screen.getByText("Usage")).toBeTruthy();
   expect(screen.getAllByText("Models").length).toBeGreaterThan(0);
   expect(screen.getByText("gpt-4.1")).toBeTruthy();
+  // A built-in provider offers no custom-provider removal affordance.
+  expect(screen.queryByRole("button", { name: "Remove custom provider" })).toBeNull();
+});
+
+test("custom provider detail exposes a destructive remove that confirms, calls the engine, and returns to Models", async () => {
+  removeCustomProvider.mockClear();
+  const customEntry: CatalogEntry = {
+    id: "custom-gw",
+    name: "My Gateway",
+    family: "custom-gw",
+    color: "#8b8b8b",
+    initial: "M",
+    category: "api_key",
+    format: "openai",
+    requiresBaseUrl: true,
+    models: [],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  };
+  useConnections.setState({
+    catalog: [customEntry],
+    customProviders: [{ id: "custom-gw", name: "My Gateway", format: "openai", color: "#8b8b8b", initial: "M", createdAt: 0 }],
+    connections: [],
+    installedProviders: ["custom-gw"],
+    loaded: true,
+  });
+  render(<ProviderDetailView provider="custom-gw" />);
+
+  const trigger = await screen.findByRole("button", { name: "Remove custom provider" });
+  fireEvent.click(trigger);
+  const dialog = screen.getByRole("dialog", { name: "Remove custom provider?" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Remove provider" }));
+
+  await waitFor(() => expect(removeCustomProvider).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-gw"));
+  await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "models" }));
+  await act(async () => {
+    await Promise.resolve();
+  });
 });
 
 test("provider detail reads dynamic effort metadata from the agent store", async () => {

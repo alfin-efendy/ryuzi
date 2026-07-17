@@ -6,10 +6,10 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use crate::llm_router::installed;
 use crate::llm_router::registry::{
     self, ApiFormat, AuthScheme, ProviderCategory, ProviderDescriptor,
 };
+use crate::llm_router::{connections, installed};
 use crate::store::Store;
 
 const SETTING_KEY: &str = "custom_providers";
@@ -176,6 +176,15 @@ pub async fn remove_custom_provider(
     persist(store, &providers).await?;
     unregister(id);
     installed::uninstall_provider(store, id).await?;
+    // Delete the provider's connection rows too, so removing a custom provider
+    // never leaves orphaned credentials behind. A custom provider is its own
+    // family head (family == id) with no sub-members, so every connection it
+    // owns carries `provider == id`.
+    for conn in connections::list_connections(store).await? {
+        if conn.provider == id {
+            connections::remove_connection(store, &conn.id).await?;
+        }
+    }
     Ok(providers)
 }
 
@@ -235,5 +244,51 @@ mod tests {
         remove_custom_provider(&store, &id).await.unwrap();
         assert!(registry::descriptor(&id).is_none());
         assert!(list_custom_providers(&store).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_the_providers_connection_rows() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let list = add_custom_provider(&store, "Gate").await.unwrap();
+        let id = list[0].id.clone();
+        // Attach a connection to the custom provider.
+        connections::add_connection(
+            &store,
+            connections::ConnectionRow {
+                id: crate::paths::new_id(),
+                provider: id.clone(),
+                auth_type: "api_key".into(),
+                label: "Gate key".into(),
+                priority: 0,
+                enabled: true,
+                data: connections::ConnectionData::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            connections::list_connections(&store)
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.provider == id),
+            "connection was created"
+        );
+
+        remove_custom_provider(&store, &id).await.unwrap();
+
+        // Descriptor gone AND no orphaned connection rows survive.
+        assert!(registry::descriptor(&id).is_none());
+        assert!(
+            connections::list_connections(&store)
+                .await
+                .unwrap()
+                .iter()
+                .all(|c| c.provider != id),
+            "removing a custom provider deletes its connection rows"
+        );
     }
 }
