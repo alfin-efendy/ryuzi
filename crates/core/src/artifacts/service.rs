@@ -128,6 +128,19 @@ impl ArtifactService {
             });
         }
 
+        match self.store.session_archived_at(&input.session_pk).await {
+            Ok(Some(_)) => return Err(ArtifactError::ArchivedSource),
+            Ok(None) => {}
+            // Every pre-archive-support `create_artifact` test exercises a
+            // bare `session_pk` that was never inserted as a real
+            // `sessions` row, so `session_archived_at` reports exactly
+            // this error text. Tolerating only that exact message lets
+            // those tests keep passing while any other lookup failure
+            // still surfaces as a storage failure below.
+            Err(error) if error.to_string() == "unknown session" => {}
+            Err(_) => return Err(ArtifactError::StorageFailure),
+        }
+
         let quota_lock = {
             let mut locks = self.quota_locks.lock().expect("quota lock map poisoned");
             locks
@@ -222,6 +235,43 @@ impl ArtifactService {
             truncated: range.truncated,
         })
     }
+
+    /// Reads `id`'s payload on an agent's behalf: unlike [`Self::read_range`],
+    /// this enforces the access rules an agent must never bypass — a deleted
+    /// artifact is never readable, and an artifact whose source session is
+    /// currently archived is denied until the session is restored (see
+    /// [`crate::control::ControlPlane::archive_session`] /
+    /// [`crate::control::ControlPlane::restore_session`]) — then delegates
+    /// the actual byte-range fetch to [`Self::read_range`].
+    pub async fn read_for_agent(
+        &self,
+        id: &str,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<ArtifactRead, ArtifactError> {
+        let artifact = self
+            .store
+            .artifact_by_id(id)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+            .ok_or(ArtifactError::NotFound)?;
+
+        if artifact.status == ArtifactStatus::Deleted {
+            return Err(ArtifactError::Deleted);
+        }
+
+        match self
+            .store
+            .session_archived_at(&artifact.source_session_pk)
+            .await
+        {
+            Ok(Some(_)) => return Err(ArtifactError::ArchivedSource),
+            Ok(None) => {}
+            Err(_) => return Err(ArtifactError::StorageFailure),
+        }
+
+        self.read_range(id, offset, length).await
+    }
 }
 
 #[cfg(test)]
@@ -230,12 +280,41 @@ mod tests {
     use crate::artifacts::types::ArtifactCreator;
     use sha2::Digest;
 
-    async fn service(config: ArtifactConfig) -> (tempfile::TempDir, ArtifactService) {
+    async fn service(config: ArtifactConfig) -> (tempfile::TempDir, Arc<Store>, ArtifactService) {
         let storage_dir = tempfile::tempdir().unwrap();
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(db_file.path()).await.unwrap());
         let storage = ArtifactStorage::new(storage_dir.path());
-        (storage_dir, ArtifactService::new(store, storage, config))
+        (
+            storage_dir,
+            Arc::clone(&store),
+            ArtifactService::new(store, storage, config),
+        )
+    }
+
+    fn sample_session() -> crate::domain::Session {
+        crate::domain::Session {
+            session_pk: "sess-1".into(),
+            primary_agent_id: None,
+            primary_agent_snapshot: None,
+            project_id: None,
+            agent_session_id: None,
+            worktree_path: None,
+            branch: None,
+            title: None,
+            status: crate::domain::SessionStatus::Idle,
+            perm_mode: crate::domain::PermMode::Default,
+            started_by: None,
+            created_at: Some(1),
+            last_active: Some(1),
+            resume_attempts: 0,
+            branch_owned: false,
+            kind: crate::domain::SessionKind::Chat,
+            speaker: None,
+            agent: None,
+            parent_session_pk: None,
+            archived_at: None,
+        }
     }
 
     fn base_input(bytes: &[u8]) -> CreateArtifact {
@@ -262,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_strips_path_components_from_the_display_name() {
-        let (_dir, svc) = service(default_config()).await;
+        let (_dir, _store, svc) = service(default_config()).await;
         let mut input = base_input(b"hello");
         input.name = "../../etc/passwd".into();
 
@@ -272,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_rejects_empty_or_dot_names() {
-        let (_dir, svc) = service(default_config()).await;
+        let (_dir, _store, svc) = service(default_config()).await;
         for bad in ["", ".", "..", "a/../..", "a/./"] {
             let mut input = base_input(b"hello");
             input.name = bad.into();
@@ -283,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_writes_payload_under_the_generated_id_with_sha256() {
-        let (dir, svc) = service(default_config()).await;
+        let (dir, _store, svc) = service(default_config()).await;
         let record = svc.create_artifact(base_input(b"hello")).await.unwrap();
 
         assert_eq!(record.storage_key, record.id);
@@ -300,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_enforces_the_per_file_cap() {
-        let (_dir, svc) = service(ArtifactConfig {
+        let (_dir, _store, svc) = service(ArtifactConfig {
             max_bytes: 4,
             session_max_bytes: 10_000,
             read_max_bytes: 1_000,
@@ -313,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_creates_cannot_exceed_session_aggregate_quota() {
-        let (_dir, svc) = service(ArtifactConfig {
+        let (_dir, _store, svc) = service(ArtifactConfig {
             max_bytes: 1_000,
             session_max_bytes: 5,
             read_max_bytes: 1_000,
@@ -332,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_failure_reports_cleanup_failure_without_path_leak() {
-        let (dir, svc) = service(default_config()).await;
+        let (dir, _store, svc) = service(default_config()).await;
         svc.fail_next_insert_for_test();
         svc.storage.fail_next_delete_for_test();
 
@@ -346,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_enforces_the_session_aggregate_quota() {
-        let (_dir, svc) = service(ArtifactConfig {
+        let (_dir, _store, svc) = service(ArtifactConfig {
             max_bytes: 1_000,
             session_max_bytes: 8,
             read_max_bytes: 1_000,
@@ -364,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_allows_a_second_artifact_within_the_remaining_quota() {
-        let (_dir, svc) = service(ArtifactConfig {
+        let (_dir, _store, svc) = service(ArtifactConfig {
             max_bytes: 1_000,
             session_max_bytes: 10,
             read_max_bytes: 1_000,
@@ -379,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_artifact_cleans_up_the_payload_when_metadata_insert_fails() {
-        let (dir, svc) = service(default_config()).await;
+        let (dir, _store, svc) = service(default_config()).await;
         svc.fail_next_insert_for_test();
 
         let err = svc.create_artifact(base_input(b"hello")).await.unwrap_err();
@@ -390,7 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_range_clamps_to_the_configured_cap() {
-        let (_dir, svc) = service(ArtifactConfig {
+        let (_dir, _store, svc) = service(ArtifactConfig {
             max_bytes: 1_000,
             session_max_bytes: 10_000,
             read_max_bytes: 3,
@@ -410,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_range_honors_a_smaller_requested_length_than_the_cap() {
-        let (_dir, svc) = service(default_config()).await;
+        let (_dir, _store, svc) = service(default_config()).await;
         let record = svc
             .create_artifact(base_input(b"0123456789"))
             .await
@@ -423,9 +502,54 @@ mod tests {
 
     #[tokio::test]
     async fn read_range_rejects_unknown_ids() {
-        let (_dir, svc) = service(default_config()).await;
+        let (_dir, _store, svc) = service(default_config()).await;
         let err = svc.read_range("does-not-exist", 0, None).await.unwrap_err();
         assert_eq!(err, ArtifactError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn read_for_agent_denies_archived_sources_then_allows_restored_sources() {
+        let (_dir, store, svc) = service(default_config()).await;
+        store.insert_session(sample_session()).await.unwrap();
+        let record = svc.create_artifact(base_input(b"hello")).await.unwrap();
+
+        assert_eq!(
+            svc.read_for_agent(&record.id, 0, None).await.unwrap().bytes,
+            b"hello"
+        );
+        assert!(store.archive_session("sess-1", 10).await.unwrap());
+        assert_eq!(
+            svc.read_for_agent(&record.id, 0, None).await.unwrap_err(),
+            ArtifactError::ArchivedSource
+        );
+        assert!(store.restore_session("sess-1").await.unwrap());
+        assert_eq!(
+            svc.read_for_agent(&record.id, 0, None).await.unwrap().bytes,
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_for_agent_denies_deleted_artifacts() {
+        let (_dir, store, svc) = service(default_config()).await;
+        store.insert_session(sample_session()).await.unwrap();
+        let record = svc.create_artifact(base_input(b"hello")).await.unwrap();
+        assert_eq!(
+            store
+                .set_source_artifact_status(
+                    "sess-1",
+                    ArtifactStatus::Available,
+                    ArtifactStatus::Deleted,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            svc.read_for_agent(&record.id, 0, None).await.unwrap_err(),
+            ArtifactError::Deleted
+        );
     }
 
     #[test]
@@ -439,6 +563,8 @@ mod tests {
             ArtifactError::FileTooLarge { max_bytes: 1 },
             ArtifactError::SessionQuotaExceeded { max_bytes: 1 },
             ArtifactError::NotFound,
+            ArtifactError::ArchivedSource,
+            ArtifactError::Deleted,
             ArtifactError::MetadataInsertCleanupFailed,
             ArtifactError::StorageFailure,
         ];

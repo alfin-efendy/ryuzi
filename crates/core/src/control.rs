@@ -161,6 +161,12 @@ pub struct ControlPlane {
     /// Shared Plan 2 persistence graph, injected at construction and immutable
     /// for the lifetime of the control plane.
     agent_persistence: crate::agents::bootstrap::AgentPersistenceHandles,
+    /// Task-artifact metadata + payload service. Byte caps
+    /// (`max_bytes`/`session_max_bytes`/`read_max_bytes`) are fixed at
+    /// construction here rather than read from `SettingsStore`, so every
+    /// `ControlPlane` in a process enforces stable, deterministic quotas —
+    /// see [`Self::new_full`].
+    artifacts: Arc<crate::artifacts::ArtifactService>,
 }
 
 impl ControlPlane {
@@ -227,6 +233,22 @@ impl ControlPlane {
         // explicitly after construction; no test path ever does. See that
         // method's doc comment.
 
+        // Fixed artifact byte caps — deliberately NOT read from
+        // `SettingsStore` here (a settings read at construction time would
+        // make every `test_cp()`-style caller depend on settings rows
+        // existing, and would let the caps drift silently between restarts).
+        // Callers that need operator-configured caps build their own
+        // `ArtifactService` from `settings::fields` and swap it in later.
+        let artifacts = Arc::new(crate::artifacts::ArtifactService::new(
+            Arc::clone(&store),
+            crate::artifacts::ArtifactStorage::new(crate::paths::state_dir().join("artifacts")),
+            crate::artifacts::ArtifactConfig {
+                max_bytes: 26_214_400,
+                session_max_bytes: 262_144_000,
+                read_max_bytes: 50_000,
+            },
+        ));
+
         Arc::new(ControlPlane {
             store,
             automation: Dispatcher::new(),
@@ -245,6 +267,7 @@ impl ControlPlane {
             plugins_restart_required: std::sync::atomic::AtomicBool::new(false),
             extension_host: Arc::new(ExtensionHost::new()),
             agent_persistence: persistence.handles(),
+            artifacts,
         })
     }
 
@@ -337,6 +360,13 @@ impl ControlPlane {
     /// command layer. Returns a borrow; callers that need ownership clone.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
+    }
+
+    /// The task-artifact service (metadata + payload), fixed at construction
+    /// (see [`Self::new_full`]). Returns a borrow; callers that need
+    /// ownership clone.
+    pub fn artifacts(&self) -> &Arc<crate::artifacts::ArtifactService> {
+        &self.artifacts
     }
 
     /// The shared background-delegation registry (capacity + cancellation).
@@ -904,6 +934,47 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown project: {project_id}"))?;
         self.store.set_session_project(session_pk, project_id).await
+    }
+
+    /// Archive `session_pk`: stamps its archive timestamp and, if that
+    /// succeeded, flips every one of its still-`Available` source artifacts
+    /// to `SourceArchived` — after which [`crate::artifacts::ArtifactService::read_for_agent`]
+    /// denies agent reads of them until the session is restored. Returns
+    /// `false` (a no-op) if the session was already archived or does not
+    /// exist; [`Store::archive_session`] is the sole idempotency guard.
+    pub async fn archive_session(&self, session_pk: &str) -> anyhow::Result<bool> {
+        let archived = self
+            .store
+            .archive_session(session_pk, crate::paths::now_ms())
+            .await?;
+        if archived {
+            self.store
+                .set_source_artifact_status(
+                    session_pk,
+                    crate::artifacts::ArtifactStatus::Available,
+                    crate::artifacts::ArtifactStatus::SourceArchived,
+                )
+                .await?;
+        }
+        Ok(archived)
+    }
+
+    /// Restore a previously archived `session_pk`: clears its archive
+    /// timestamp and, if that succeeded, flips every one of its
+    /// `SourceArchived` source artifacts back to `Available`. Returns
+    /// `false` (a no-op) if the session was not archived or does not exist.
+    pub async fn restore_session(&self, session_pk: &str) -> anyhow::Result<bool> {
+        let restored = self.store.restore_session(session_pk).await?;
+        if restored {
+            self.store
+                .set_source_artifact_status(
+                    session_pk,
+                    crate::artifacts::ArtifactStatus::SourceArchived,
+                    crate::artifacts::ArtifactStatus::Available,
+                )
+                .await?;
+        }
+        Ok(restored)
     }
 
     /// Build the curated app-control facade (spec §9.1) for a top-level

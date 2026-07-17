@@ -33,6 +33,12 @@ pub enum ArtifactError {
     /// No artifact (or, at the storage layer, no payload file) exists for
     /// the requested id / storage key.
     NotFound,
+    /// The artifact's source session is currently archived, so agent reads
+    /// are denied until the session is restored (see
+    /// [`crate::artifacts::ArtifactService::read_for_agent`]).
+    ArchivedSource,
+    /// The artifact has been deleted and is no longer readable.
+    Deleted,
     /// The metadata insert failed and cleanup of the payload also failed.
     /// The payload is an actionable orphan for a later cleanup pass.
     MetadataInsertCleanupFailed,
@@ -54,6 +60,10 @@ impl std::fmt::Display for ArtifactError {
                 "session artifact storage quota of {max_bytes} bytes would be exceeded"
             ),
             Self::NotFound => write!(f, "artifact not found"),
+            Self::ArchivedSource => {
+                write!(f, "artifact's source session is archived")
+            }
+            Self::Deleted => write!(f, "artifact has been deleted"),
             Self::MetadataInsertCleanupFailed => write!(
                 f,
                 "artifact metadata insert failed and payload cleanup failed; orphan requires cleanup"
