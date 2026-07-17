@@ -5,6 +5,12 @@ import { LOCAL_RUNNER } from "@/lib/session-key";
 
 const addConnection = mock((): Promise<Result<ConnectionInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const connectOauth = mock((): Promise<Result<ConnectionInfo[], CmdError>> => new Promise(() => {}));
+const setCustomProviderFormat = mock((_runnerId: string, id: string, format: string) =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: [{ id, name: "Custom Test", format, color: "#8b8b8b", initial: "C", createdAt: 0 }],
+  }),
+);
 const listRuntimes = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const listSelectableModels = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const listAgents = mock(() =>
@@ -27,7 +33,7 @@ const listenOauthAuthorizeUrl = mock((cb: (event: { payload: { provider: string;
 });
 
 mock.module("@/bindings", () => ({
-  commands: { addConnection, connectOauth, listRuntimes, listSelectableModels, listAgents, projectRuntimeInfo },
+  commands: { addConnection, connectOauth, setCustomProviderFormat, listRuntimes, listSelectableModels, listAgents, projectRuntimeInfo },
   events: { oauthAuthorizeUrlMsg: { listen: listenOauthAuthorizeUrl } },
 }));
 
@@ -155,6 +161,7 @@ beforeEach(() => {
   });
   addConnection.mockClear();
   connectOauth.mockClear();
+  setCustomProviderFormat.mockClear();
   listenOauthAuthorizeUrl.mockClear();
   oauthAuthorizeUrlListener = null;
 });
@@ -291,6 +298,35 @@ test("single-member custom family requires a base URL before it can be submitted
   await screen.findByText("Add account");
   expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Local router", "sk-test-123", "http://127.0.0.1:4000/v1");
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("custom family offers the OpenAI/Anthropic compatibility choice and persists it before adding", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="custom-test" />);
+  const group = screen.getByRole("radiogroup", { name: /compatibility/i });
+  expect(within(group).getByRole("radio", { name: /openai-compatible/i })).toBeTruthy();
+  expect(within(group).getByRole("radio", { name: /anthropic-compatible/i })).toBeTruthy();
+  fireEvent.click(within(group).getByRole("radio", { name: /anthropic-compatible/i }));
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test" } });
+  fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  // Anthropic chosen → format persisted before the connection is created.
+  expect(setCustomProviderFormat).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "anthropic");
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Custom Test", "sk-test", "http://127.0.0.1:4000/v1");
+  expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("custom family with the default OpenAI choice does not re-persist the format", async () => {
+  const onClose = mock(() => {});
+  render(<AddConnectionModal open onClose={onClose} family="custom-test" />);
+  fireEvent.change(screen.getByLabelText("API Key"), { target: { value: "sk-test" } });
+  fireEvent.change(screen.getByLabelText("Base URL"), { target: { value: "http://127.0.0.1:4000/v1" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add account" }));
+  await screen.findByText("Add account");
+  // OpenAI is already the provider's format → no redundant set call.
+  expect(setCustomProviderFormat).not.toHaveBeenCalled();
+  expect(addConnection).toHaveBeenCalledWith(LOCAL_RUNNER, "custom-test", "Custom Test", "sk-test", "http://127.0.0.1:4000/v1");
 });
 
 test("account methods are Choice Cards without category chips", () => {

@@ -65,13 +65,26 @@ function authMethodLabel(entry: CatalogEntry): string {
 }
 
 export function AddConnectionModal({ open, onClose, family }: { open: boolean; onClose: () => void; family: string }) {
-  const { catalog, add, connectOauth, addFree, startKiroDevice, awaitKiroDevice, importKiro, startDeviceFlow, awaitDeviceFlow } =
-    useConnections();
+  const {
+    catalog,
+    add,
+    connectOauth,
+    addFree,
+    setCustomProviderFormat,
+    startKiroDevice,
+    awaitKiroDevice,
+    importKiro,
+    startDeviceFlow,
+    awaitDeviceFlow,
+  } = useConnections();
   const members = useMemo(() => catalog.filter((entry) => entry.family === family), [catalog, family]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  // OpenAI-/Anthropic-compatible choice for custom providers (chosen per
+  // account and persisted onto the provider before the connection is added).
+  const [compat, setCompat] = useState<"openai" | "anthropic">("openai");
   const [saving, setSaving] = useState(false);
   const [oauthWaiting, setOauthWaiting] = useState(false);
   const [oauthAuthorizeUrl, setOauthAuthorizeUrl] = useState("");
@@ -97,6 +110,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
       // initial base URL; MiMo's Token Plan defaults to its sgp region host.
       const defaultMember = members.find((entry) => entry.category === "api_key") ?? members[0] ?? null;
       setBaseUrl(defaultMember?.id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
+      setCompat((defaultMember?.format as "openai" | "anthropic") ?? "openai");
       setSaving(false);
       setOauthWaiting(false);
       setOauthAuthorizeUrl("");
@@ -152,6 +166,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
   };
 
   const flow = selected ? signInFlow(selected) : null;
+  const isCustom = selected?.id.startsWith("custom-") ?? false;
   const baseUrlMissing = flow === "apiKey" && !!selected?.requiresBaseUrl && baseUrl.trim().length === 0;
   const canSubmit = !!selected && !saving && !baseUrlMissing;
   const shortCommitBusy = saving && (flow === "apiKey" || flow === "free");
@@ -161,6 +176,7 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     operationRef.current += 1;
     setSelectedId(id);
     setBaseUrl(id === "mimo" ? MIMO_REGIONS[0].baseUrl : "");
+    setCompat((members.find((entry) => entry.id === id)?.format as "openai" | "anthropic") ?? "openai");
     setSaving(false);
     setOauthWaiting(false);
     setOauthAuthorizeUrl("");
@@ -173,6 +189,11 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
     const target = selected;
     const operation = beginOperation();
     setSaving(true);
+    // Persist the OpenAI-/Anthropic-compatible choice onto the custom provider
+    // (re-registers its wire format/auth) before the connection is added.
+    if (isCustom && compat !== target.format) {
+      await setCustomProviderFormat(target.id, compat);
+    }
     const ok = await add(target.id, label.trim() || target.name, apiKey, baseUrl.trim() || null);
     if (!operationIsCurrent(operation)) return;
     setSaving(false);
@@ -349,6 +370,17 @@ export function AddConnectionModal({ open, onClose, family }: { open: boolean; o
             </FormField>
             {flow === "apiKey" && (
               <>
+                {isCustom && (
+                  <RadioGroup
+                    aria-label="Compatibility"
+                    value={compat}
+                    onValueChange={(value) => setCompat(value as "openai" | "anthropic")}
+                    className="grid-cols-2"
+                  >
+                    <ChoiceCard value="openai" title="OpenAI-compatible" description="/chat/completions, Bearer key" />
+                    <ChoiceCard value="anthropic" title="Anthropic-compatible" description="/messages, x-api-key" />
+                  </RadioGroup>
+                )}
                 {KEY_SOURCE_HINTS[selected.id] && <p className="text-xs text-muted-foreground">{KEY_SOURCE_HINTS[selected.id]}</p>}
                 <FormField label="API Key">
                   <Input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="sk-..." />

@@ -214,6 +214,7 @@ mock.module("@/bindings", () => ({
     endpointStatus: () => Promise.resolve({ status: "ok", data: status }),
     listEndpointKeys: () => Promise.resolve({ status: "ok", data: keys }),
     listProviderCatalog: () => Promise.resolve({ status: "ok", data: catalog }),
+    listCustomProviders: () => Promise.resolve({ status: "ok", data: [] }),
     listConnections: () => Promise.resolve({ status: "ok", data: [connection, secondConnection] }),
     listInstalledProviders: () => Promise.resolve({ status: "ok", data: ["openai", "anthropic"] }),
     listModelRoutes: () => Promise.resolve({ status: "ok", data: routes }),
@@ -334,6 +335,43 @@ test("provider list has no global Add connection button", async () => {
 
   await screen.findByRole("button", { name: "OpenAI 2 accounts 2 models" });
   expect(screen.queryByRole("button", { name: /add connection/i })).toBeNull();
+});
+
+test("a user custom provider renders its own installed row", async () => {
+  useConnections.setState({
+    catalog: [
+      {
+        id: "custom-my-gw",
+        name: "My Gateway",
+        family: "custom-my-gw",
+        color: "#8b8b8b",
+        initial: "M",
+        category: "api_key",
+        format: "openai",
+        requiresBaseUrl: true,
+        models: [],
+        freeTier: false,
+        riskNotice: false,
+        usesDeviceGrant: false,
+      },
+    ],
+    customProviders: [{ id: "custom-my-gw", name: "My Gateway", format: "openai", color: "#8b8b8b", initial: "M", createdAt: 0 }],
+    connections: [],
+    installedProviders: ["custom-my-gw"],
+    loaded: true,
+  });
+  render(<ModelsView />);
+
+  expect(await screen.findByRole("button", { name: /My Gateway/ })).toBeTruthy();
+});
+
+test("the Add Custom Provider button opens the name popup", async () => {
+  useConnections.setState({ catalog: [], customProviders: [], connections: [], installedProviders: [], loaded: true });
+  render(<ModelsView />);
+
+  const button = await screen.findByRole("button", { name: "Add custom provider" });
+  fireEvent.click(button);
+  expect(await screen.findByLabelText("Provider name")).toBeTruthy();
 });
 
 test("providers tab groups anthropic + anthropic-oauth accounts into one Anthropic row", async () => {

@@ -4,6 +4,7 @@ import {
   commands,
   type CatalogEntry,
   type ConnectionInfo,
+  type CustomProvider,
   type DeviceFlowInfo,
   type ManualStartInfo,
   type TestResult,
@@ -55,8 +56,34 @@ import { useStore } from "./store";
 //     `connectOauth`/`reconnectOauth` for them against a remote `runnerId`
 //     without solving that first.
 
+// A user-defined custom provider is its own family head: an API-key,
+// base-URL-required catalog row whose wire format is chosen at Add Account.
+function customToCatalogEntry(cp: CustomProvider): CatalogEntry {
+  return {
+    id: cp.id,
+    name: cp.name,
+    family: cp.id,
+    color: cp.color,
+    initial: cp.initial,
+    category: "api_key",
+    format: cp.format,
+    requiresBaseUrl: true,
+    models: [],
+    freeTier: false,
+    riskNotice: false,
+    usesDeviceGrant: false,
+  };
+}
+
+// Rebuild the merged catalog: the static provider catalog (which no longer
+// carries any `custom-*` rows) plus one row per user custom provider.
+function mergeCustomIntoCatalog(base: CatalogEntry[], custom: CustomProvider[]): CatalogEntry[] {
+  return [...base.filter((entry) => !entry.id.startsWith("custom-")), ...custom.map(customToCatalogEntry)];
+}
+
 type ConnectionsState = {
   catalog: CatalogEntry[];
+  customProviders: CustomProvider[];
   connections: ConnectionInfo[];
   loaded: boolean;
   hydrate: () => Promise<void>;
@@ -81,6 +108,9 @@ type ConnectionsState = {
   installedProviders: string[];
   installProvider: (family: string) => Promise<boolean>;
   uninstallProvider: (family: string) => Promise<boolean>;
+  addCustomProvider: (name: string) => Promise<boolean>;
+  setCustomProviderFormat: (id: string, format: "openai" | "anthropic") => Promise<boolean>;
+  removeCustomProvider: (id: string) => Promise<boolean>;
   startKiroDevice: () => Promise<DeviceFlowInfo | null>;
   awaitKiroDevice: (label: string, flowId: string) => Promise<boolean>;
   importKiro: (label: string) => Promise<boolean>;
@@ -117,17 +147,21 @@ async function runAccountAction(
 
 export const useConnections = create<ConnectionsState>((set) => ({
   catalog: [],
+  customProviders: [],
   connections: [],
   installedProviders: [],
   loaded: false,
 
   hydrate: async () => {
-    const [cat, conns, installed] = await Promise.all([
+    const [cat, custom, conns, installed] = await Promise.all([
       commands.listProviderCatalog(),
+      commands.listCustomProviders(LOCAL_RUNNER),
       commands.listConnections(LOCAL_RUNNER),
       commands.listInstalledProviders(LOCAL_RUNNER),
     ]);
-    if (cat.status === "ok") set({ catalog: cat.data });
+    const customProviders = custom.status === "ok" ? custom.data : [];
+    set({ customProviders });
+    if (cat.status === "ok") set({ catalog: mergeCustomIntoCatalog(cat.data, customProviders) });
     if (conns.status === "ok") set({ connections: conns.data });
     if (installed.status === "ok") set({ installedProviders: installed.data });
     set({ loaded: true });
@@ -173,6 +207,40 @@ export const useConnections = create<ConnectionsState>((set) => ({
       return false;
     }
     set({ installedProviders: res.data });
+    return true;
+  },
+  addCustomProvider: async (name) => {
+    const res = await commands.addCustomProvider(LOCAL_RUNNER, name);
+    if (res.status === "error") {
+      toast.error(`Add custom provider failed: ${res.error.message}`);
+      return false;
+    }
+    set((state) => ({ customProviders: res.data, catalog: mergeCustomIntoCatalog(state.catalog, res.data) }));
+    // The engine auto-installs a newly created custom provider; refresh the
+    // installed set so its row appears in the Models list.
+    const installed = await commands.listInstalledProviders(LOCAL_RUNNER);
+    if (installed.status === "ok") set({ installedProviders: installed.data });
+    return true;
+  },
+  setCustomProviderFormat: async (id, format) => {
+    const res = await commands.setCustomProviderFormat(LOCAL_RUNNER, id, format);
+    if (res.status === "error") {
+      toast.error(`Update custom provider failed: ${res.error.message}`);
+      return false;
+    }
+    set((state) => ({ customProviders: res.data, catalog: mergeCustomIntoCatalog(state.catalog, res.data) }));
+    return true;
+  },
+  removeCustomProvider: async (id) => {
+    const res = await commands.removeCustomProvider(LOCAL_RUNNER, id);
+    if (res.status === "error") {
+      toast.error(`Remove custom provider failed: ${res.error.message}`);
+      return false;
+    }
+    set((state) => ({ customProviders: res.data, catalog: mergeCustomIntoCatalog(state.catalog, res.data) }));
+    // Removal uninstalls it on the engine; refresh the installed set.
+    const installed = await commands.listInstalledProviders(LOCAL_RUNNER);
+    if (installed.status === "ok") set({ installedProviders: installed.data });
     return true;
   },
   startKiroDevice: async () => {
