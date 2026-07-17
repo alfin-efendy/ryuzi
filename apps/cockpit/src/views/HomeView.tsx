@@ -160,7 +160,16 @@ export function HomeView() {
     let cancelled = false;
     const t = setTimeout(() => {
       void commands.searchFiles(LOCAL_RUNNER, projectId, contextQueryText).then((res) => {
-        if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
+        if (!cancelled) {
+          setContextHits(
+            res.status === "ok"
+              ? res.data
+                  .filter((entry) => !entry.dir)
+                  .map((entry) => entry.path)
+                  .slice(0, 6)
+              : [],
+          );
+        }
       });
     }, 120);
     return () => {

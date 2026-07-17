@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AgentSummaryInfo, CmdError, CommandInfo, OpenTarget, Project, Result, Session } from "@/bindings";
+import type { AgentSummaryInfo, CmdError, CommandInfo, OpenTarget, Project, Result, SearchEntryInfo, Session } from "@/bindings";
 import { LOCAL_RUNNER, refKey, sessKey } from "@/lib/session-key";
 import { useNative } from "@/store-native";
 
@@ -54,7 +54,7 @@ const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data
 const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Project[] }));
 const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
 const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
-const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as string[] }));
+const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as SearchEntryInfo[] }));
 const getChildRuns = mock(() =>
   Promise.resolve({
     status: "ok" as const,

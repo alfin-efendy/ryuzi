@@ -10,6 +10,7 @@ import type {
   Project,
   ProjectRuntimeInfo,
   Result,
+  SearchEntryInfo,
   Session,
 } from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
@@ -21,7 +22,7 @@ const listBranches = mock(
 const nativeCommands = mock(
   (_runnerId: string, _projectId: string): Promise<Result<CommandInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }),
 );
-const searchFiles = mock((): Promise<Result<string[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
+const searchFiles = mock((): Promise<Result<SearchEntryInfo[], CmdError>> => Promise.resolve({ status: "ok", data: [] }));
 const runtimeInfo: ProjectRuntimeInfo = {
   projectId: "p1",
   model: null,

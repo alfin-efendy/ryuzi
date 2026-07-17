@@ -95,7 +95,14 @@ export function TitleBar() {
     let cancelled = false;
     const t = setTimeout(() => {
       void commands.searchFiles(LOCAL_RUNNER, searchProject.projectId, q).then((res) => {
-        if (!cancelled && res.status === "ok") setProjectFileHits(res.data.slice(0, 6));
+        if (!cancelled && res.status === "ok") {
+          setProjectFileHits(
+            res.data
+              .filter((entry) => !entry.dir)
+              .map((entry) => entry.path)
+              .slice(0, 6),
+          );
+        }
       });
     }, 250);
     return () => {
