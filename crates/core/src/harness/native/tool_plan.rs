@@ -383,11 +383,53 @@ pub async fn freeze_plan(
 
 pub fn contract_hash_for_registered(
     registered: &RegisteredTool,
-    capability_profile: &ToolCapabilityProfile,
+    planned: &PlannedTool,
+    plan_body: &SessionToolPlanBody,
 ) -> Result<String, ToolPlanError> {
-    let (wire_schema, strict) = selected_wire_schema(registered, capability_profile);
+    if !registered.v2_schema_eligible
+        || registered.descriptor.canonical_name != planned.canonical_name
+    {
+        return Err(ToolPlanError::unavailable(
+            "registered tool is not compatible with the frozen facade",
+        ));
+    }
+    let dialect = plan_body
+        .strict_schema_dialect
+        .unwrap_or(StrictSchemaDialect::LegacyV1);
+    let strict_schema = compile_strict_schema(&registered.canonical_schema, dialect);
+    let strict =
+        plan_body.capability_profile.supports_strict_function_schema && strict_schema.is_ok();
+    let wire_schema = if strict {
+        strict_schema.expect("strict eligibility was checked above")
+    } else {
+        registered.canonical_schema.clone()
+    };
     let mut descriptor = registered.descriptor.clone();
     descriptor.input_schema = registered.canonical_schema.clone();
+    if plan_body.strict_schema_dialect.is_none() {
+        let legacy_groups = legacy_policy_group_members(&plan_body.canonical_tools)
+            .map_err(ToolPlanError::unavailable)?;
+        let expected_groups = legacy_groups
+            .iter()
+            .filter(|(_, members)| members.binary_search(&planned.canonical_name).is_ok())
+            .collect::<Vec<_>>();
+        if !expected_groups.is_empty()
+            && (descriptor.policy_groups.len() != expected_groups.len()
+                || expected_groups.iter().any(|(alias, members)| {
+                    descriptor
+                        .policy_groups
+                        .iter()
+                        .filter(|group| group.alias == **alias && group.members == **members)
+                        .count()
+                        != 1
+                }))
+        {
+            return Err(ToolPlanError::unavailable(
+                "registered policy group does not match the frozen legacy group",
+            ));
+        }
+        descriptor.policy_groups.clear();
+    }
     planned_contract_hash(
         &descriptor,
         &registered.canonical_schema,
@@ -531,8 +573,12 @@ fn validate_body(body: &SessionToolPlanBody) -> Result<(), ToolPlanError> {
             ));
         }
     }
-    let derived_policy_aliases =
-        derive_policy_aliases(&body.canonical_tools).map_err(ToolPlanError::invalid_persisted)?;
+    let derived_policy_aliases = if body.strict_schema_dialect.is_none() {
+        derive_legacy_policy_aliases(&body.canonical_tools)
+    } else {
+        derive_policy_aliases(&body.canonical_tools)
+    }
+    .map_err(ToolPlanError::invalid_persisted)?;
     if body.policy_aliases != derived_policy_aliases {
         return Err(ToolPlanError::invalid_persisted(
             "stored policy aliases do not match planned descriptors",
@@ -598,6 +644,71 @@ fn derive_policy_aliases(
         aliases.insert(alias, target);
     }
     Ok(aliases)
+}
+
+fn derive_legacy_policy_aliases(
+    planned_tools: &[PlannedTool],
+) -> Result<BTreeMap<String, PolicyAliasTarget>, &'static str> {
+    let targets = legacy_policy_alias_targets(planned_tools)?;
+    let mut aliases = BTreeMap::new();
+    for (alias, planned) in targets {
+        let target = match planned.as_slice() {
+            [one] => PolicyAliasTarget::Canonical(one.canonical_name.clone()),
+            _ => PolicyAliasTarget::Canonical(alias.clone()),
+        };
+        aliases.insert(alias, target);
+    }
+    Ok(aliases)
+}
+
+fn legacy_policy_group_members(
+    planned_tools: &[PlannedTool],
+) -> Result<BTreeMap<String, Vec<String>>, &'static str> {
+    Ok(legacy_policy_alias_targets(planned_tools)?
+        .into_iter()
+        .filter_map(|(alias, planned)| {
+            (planned.len() > 1).then(|| {
+                (
+                    alias,
+                    planned
+                        .into_iter()
+                        .map(|tool| tool.canonical_name.clone())
+                        .collect(),
+                )
+            })
+        })
+        .collect())
+}
+
+fn legacy_policy_alias_targets(
+    planned_tools: &[PlannedTool],
+) -> Result<BTreeMap<String, Vec<&PlannedTool>>, &'static str> {
+    let canonical_names = planned_tools
+        .iter()
+        .map(|tool| tool.canonical_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut targets = BTreeMap::<String, Vec<&PlannedTool>>::new();
+    for planned in planned_tools {
+        if !planned.descriptor.policy_groups.is_empty() {
+            return Err("legacy tool descriptors contain policy group metadata");
+        }
+        let mut declared_aliases = BTreeSet::new();
+        for alias in &planned.descriptor.policy_aliases {
+            if alias.is_empty() || !declared_aliases.insert(alias.as_str()) {
+                return Err("legacy tool policy alias declaration is invalid");
+            }
+            if canonical_names.contains(alias.as_str()) && alias != &planned.canonical_name {
+                return Err("tool policy alias conflicts with a canonical tool name");
+            }
+            targets.entry(alias.clone()).or_default().push(planned);
+        }
+    }
+    for planned in targets.values() {
+        if !is_sorted_unique(planned.iter().map(|tool| tool.canonical_name.as_str())) {
+            return Err("legacy tool policy group members are not deterministic");
+        }
+    }
+    Ok(targets)
 }
 
 fn is_sorted_unique<'a>(values: impl Iterator<Item = &'a str>) -> bool {
@@ -693,6 +804,48 @@ fn planned_contract_hash(
     });
     let canonical = canonical_json(&contract)?;
     Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+#[cfg(test)]
+pub(crate) fn prior_format_fixture_body(
+    candidate: &CompiledSessionToolPlan,
+) -> SessionToolPlanBody {
+    let mut body = candidate.plan.body.clone();
+    body.strict_schema_dialect = None;
+    for (alias, target) in &mut body.policy_aliases {
+        if matches!(target, PolicyAliasTarget::Group(_)) {
+            *target = PolicyAliasTarget::Canonical(alias.clone());
+        }
+    }
+    for planned in &mut body.canonical_tools {
+        planned.descriptor.policy_groups.clear();
+        let strict_schema =
+            compile_strict_schema(&planned.canonical_schema, StrictSchemaDialect::LegacyV1);
+        planned.strict =
+            body.capability_profile.supports_strict_function_schema && strict_schema.is_ok();
+        planned.wire_schema = if planned.strict {
+            strict_schema.expect("legacy strict eligibility was checked above")
+        } else {
+            planned.canonical_schema.clone()
+        };
+        planned.contract_hash = planned_contract_hash(
+            &planned.descriptor,
+            &planned.canonical_schema,
+            &planned.wire_schema,
+            planned.strict,
+        )
+        .expect("fixture contract must be hashable");
+    }
+    body.visible_definitions = body
+        .canonical_tools
+        .iter()
+        .map(|planned| definition_from_planned(planned, &body.capability_profile))
+        .collect();
+    body.limits.estimated_schema_tokens = serde_json::to_vec(&body.visible_definitions)
+        .expect("fixture definitions must serialize")
+        .len()
+        .div_ceil(4) as u32;
+    body
 }
 
 fn definition_name(definition: &Value) -> &str {
@@ -1225,10 +1378,18 @@ mod tests {
         let (_tmp, store) = store_with_run().await;
         freeze_plan(&store, "plan-run", &aliased).await.unwrap();
         let loaded = load_plan(&store, "plan-run").await.unwrap().unwrap();
+        assert_eq!(loaded, aliased);
         assert_eq!(
             loaded.plan.body.policy_aliases,
             aliased.plan.body.policy_aliases
         );
+        for planned in loaded.canonical_tools.values() {
+            let registered = registry.registered(&planned.canonical_name).unwrap();
+            assert_eq!(
+                contract_hash_for_registered(&registered, planned, &loaded.plan.body).unwrap(),
+                planned.contract_hash
+            );
+        }
     }
 
     async fn store_with_run() -> (tempfile::NamedTempFile, Store) {
@@ -1380,6 +1541,53 @@ mod tests {
             loaded.canonical_tools["memory_add"].wire_schema,
             loaded.canonical_tools["memory_add"].canonical_schema
         );
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_grouped_memory_plan_loads_true_prior_format() {
+        let registry = ToolRegistry::builtin();
+        let candidate = compile_candidate(
+            &registry,
+            &ToolFilter::Only(vec!["memory".into()]),
+            profile(16_000),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_tmp, store) = store_with_run().await;
+        freeze_plan(&store, "plan-run", &candidate).await.unwrap();
+
+        let legacy_body = prior_format_fixture_body(&candidate);
+        assert_eq!(legacy_body.strict_schema_dialect, None);
+        assert_eq!(
+            legacy_body.policy_aliases["memory"],
+            PolicyAliasTarget::Canonical("memory".into())
+        );
+        assert_eq!(
+            legacy_body
+                .canonical_tools
+                .iter()
+                .map(|planned| planned.canonical_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "memory_add",
+                "memory_batch",
+                "memory_remove",
+                "memory_replace"
+            ]
+        );
+        assert!(legacy_body
+            .canonical_tools
+            .iter()
+            .all(|planned| !planned.strict && planned.descriptor.policy_groups.is_empty()));
+        let prior_plan = SessionToolPlan::from_body(legacy_body.clone()).unwrap();
+        assert!(!prior_plan.canonical_json.contains("policy_groups"));
+        replace_stored_body(&store, legacy_body).await;
+
+        let loaded = load_plan(&store, "plan-run").await.unwrap().unwrap();
+        assert_eq!(loaded.plan.canonical_json, prior_plan.canonical_json);
+        assert_eq!(loaded.plan.plan_hash, prior_plan.plan_hash);
+        assert_eq!(loaded.plan.body.policy_aliases["memory"], "memory".into());
     }
 
     #[tokio::test]

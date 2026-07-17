@@ -286,10 +286,8 @@ fn validate_v2_batch(
                     )),
                 });
             };
-            let current_hash = tool_plan::contract_hash_for_registered(
-                &registered,
-                &plan.plan.body.capability_profile,
-            );
+            let current_hash =
+                tool_plan::contract_hash_for_registered(&registered, planned, &plan.plan.body);
             if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
                 wire.discard_arguments();
                 return V2BatchCall::Rejected(RejectedToolCall {
@@ -2682,10 +2680,8 @@ async fn run_tool_call(
             .await;
         }
     };
-    let current_hash = tool_plan::contract_hash_for_registered(
-        &available.registered,
-        &plan.plan.body.capability_profile,
-    );
+    let current_hash =
+        tool_plan::contract_hash_for_registered(&available.registered, planned, &plan.plan.body);
     if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
         return complete_validated_v2_error(
             deps,
@@ -4596,6 +4592,13 @@ mod tests {
         effects: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    struct PolicyGroupContractTool {
+        name: String,
+        alias: String,
+        typed_members: Option<Vec<String>>,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
     #[derive(Default)]
     struct GatewayCounters {
         normalize: std::sync::atomic::AtomicUsize,
@@ -4832,6 +4835,25 @@ mod tests {
         }
     }
 
+    impl PolicyGroupContractTool {
+        fn new(
+            name: &str,
+            alias: &str,
+            typed_members: Option<Vec<String>>,
+        ) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    name: name.into(),
+                    alias: alias.into(),
+                    typed_members,
+                    effects: effects.clone(),
+                }),
+                effects,
+            )
+        }
+    }
+
     #[async_trait]
     impl crate::harness::native::tools::Tool for ContractTool {
         fn name(&self) -> &str {
@@ -4879,6 +4901,64 @@ mod tests {
 
         fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
             crate::harness::native::tools::PermissionSpec::new("contract-test", "contract test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for PolicyGroupContractTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "policy group contract fixture"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            let mut descriptor = ToolDescriptor::conservative(
+                self.name(),
+                self.description(),
+                self.input_schema(),
+                self.kind(),
+            );
+            descriptor.policy_aliases = vec![self.alias.clone()];
+            if let Some(members) = &self.typed_members {
+                descriptor.policy_groups =
+                    vec![crate::harness::native::tool_contract::ToolPolicyGroup {
+                        alias: self.alias.clone(),
+                        members: members.clone(),
+                    }];
+            }
+            descriptor
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new(
+                "policy-group-test",
+                "policy group test",
+            )
         }
 
         async fn execute(
@@ -8724,6 +8804,120 @@ mod tests {
 
     async fn dispatch_against_plan(deps: &RunnerDeps, plan: &RunToolPlan, name: &str) -> Value {
         dispatch_input_against_plan(deps, plan, name, json!({})).await
+    }
+
+    #[tokio::test]
+    async fn prior_format_grouped_memory_plan_loads_and_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        deps.memory = Some(Arc::new(
+            crate::harness::native::memory::MemoryStore::for_agent(
+                deps.agent_knowledge.clone(),
+                "legacy-group-dispatch",
+                None,
+            )
+            .unwrap(),
+        ));
+        let filter = super::super::agents::ToolFilter::Only(vec!["memory".into()]);
+        deps.agent.tools = filter.clone();
+        let candidate = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let legacy_body = crate::harness::native::tool_plan::prior_format_fixture_body(&candidate);
+        let legacy_plan =
+            crate::harness::native::tool_plan::SessionToolPlan::from_body(legacy_body).unwrap();
+        crate::harness::native::tool_plan::freeze_plan(&deps.store, &deps.run_id, &legacy_plan)
+            .await
+            .unwrap();
+        let loaded = crate::harness::native::tool_plan::load_plan(&deps.store, &deps.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let frozen = RunToolPlan::FrozenV2(loaded);
+
+        let result = dispatch_input_against_plan(
+            &deps,
+            &frozen,
+            "memory_add",
+            json!({"scope":"global", "text":"legacy grouped dispatch"}),
+        )
+        .await;
+
+        assert!(
+            !result_text(&result).contains("capability_unavailable"),
+            "legacy frozen contract must dispatch through the current typed group: {result}"
+        );
+        assert_eq!(
+            deps.memory
+                .as_ref()
+                .unwrap()
+                .load(crate::harness::native::memory::MemoryScope::Global)
+                .await
+                .unwrap(),
+            ["legacy grouped dispatch"]
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_unrelated_legacy_group_loads_but_never_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let alias = "forged_legacy_group";
+        let members: Vec<String> =
+            vec!["forged_legacy_first".into(), "forged_legacy_second".into()];
+        let (frozen_first, _) =
+            PolicyGroupContractTool::new(&members[0], alias, Some(members.clone()));
+        let (frozen_second, _) =
+            PolicyGroupContractTool::new(&members[1], alias, Some(members.clone()));
+        let frozen_registry = ToolRegistry::with_extra(vec![frozen_first, frozen_second]);
+        let filter = super::super::agents::ToolFilter::Only(vec![alias.into()]);
+        let candidate = crate::harness::native::tool_plan::compile_candidate(
+            &frozen_registry,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let legacy_body = crate::harness::native::tool_plan::prior_format_fixture_body(&candidate);
+        let legacy_plan =
+            crate::harness::native::tool_plan::SessionToolPlan::from_body(legacy_body).unwrap();
+        crate::harness::native::tool_plan::freeze_plan(&deps.store, &deps.run_id, &legacy_plan)
+            .await
+            .unwrap();
+        let loaded = crate::harness::native::tool_plan::load_plan(&deps.store, &deps.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.plan.body.policy_aliases[alias],
+            crate::harness::native::tool_plan::PolicyAliasTarget::Canonical(alias.into())
+        );
+        let frozen = RunToolPlan::FrozenV2(loaded);
+
+        let (current_first, first_effects) = PolicyGroupContractTool::new(&members[0], alias, None);
+        let (current_second, second_effects) =
+            PolicyGroupContractTool::new(&members[1], alias, None);
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![
+            current_first,
+            current_second,
+        ]));
+        deps.agent.tools = filter;
+
+        let result = dispatch_against_plan(&deps, &frozen, &members[0]).await;
+
+        assert!(result_text(&result).contains("capability_unavailable"));
+        assert_eq!(first_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(second_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
