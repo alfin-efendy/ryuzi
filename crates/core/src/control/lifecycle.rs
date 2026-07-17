@@ -244,6 +244,7 @@ impl ControlPlane {
             parent_session_pk: worker
                 .as_ref()
                 .and_then(|worker| worker.home_session_pk.clone()),
+            archived_at: None,
         };
         let model_override = model_override.filter(|model| !model.trim().is_empty());
         let (resolved_model, resolved_effort) = model_override

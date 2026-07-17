@@ -5338,6 +5338,7 @@ fn row_to_session(r: &Row) -> rusqlite::Result<Session> {
         speaker: r.get(14)?,
         agent: r.get(15)?,
         parent_session_pk: r.get(16)?,
+        archived_at: None,
     })
 }
 
@@ -5838,6 +5839,7 @@ mod tests {
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         }
     }
 
@@ -6455,6 +6457,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -8512,6 +8515,7 @@ mod tests {
             speaker: None,
             agent: None,
             parent_session_pk: parent.map(str::to_string),
+            archived_at: None,
         }
     }
 
@@ -9104,6 +9108,7 @@ mod tests {
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         };
         store
             .insert_session(mk("idle-1", crate::domain::SessionStatus::Idle))
@@ -9186,6 +9191,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -9653,6 +9659,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -9725,6 +9732,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();

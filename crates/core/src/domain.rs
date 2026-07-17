@@ -243,6 +243,7 @@ pub struct Session {
     pub agent: Option<String>,
     /// The session this one was spawned from (`Worker`/`Review` lineage).
     pub parent_session_pk: Option<String>,
+    pub archived_at: Option<i64>,
 }
 
 /// An immutable identity captured when an agent becomes the primary owner of a session.

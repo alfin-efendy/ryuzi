@@ -654,6 +654,7 @@ async fn recent_sessions_filter_by_stable_owner_and_sort_by_last_activity_with_a
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -1542,6 +1543,7 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -1626,6 +1628,7 @@ async fn agent_session_continuation_rejects_non_executable_owners_before_user_me
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -1674,6 +1677,7 @@ async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime()
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -2356,6 +2360,7 @@ async fn seed_session(
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -3974,6 +3979,7 @@ async fn resume_session_resumes_a_chat_session() {
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -4267,6 +4273,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         speaker: None,
         agent: None,
         parent_session_pk: None,
+        archived_at: None,
     };
     store.insert_session(session).await.unwrap();
     let root = cp
