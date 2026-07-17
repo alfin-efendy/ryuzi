@@ -55,6 +55,38 @@ const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [
 const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
 const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as string[] }));
+const getChildRuns = mock(() =>
+  Promise.resolve({
+    status: "ok" as const,
+    data: {
+      rootRunId: "root-run",
+      runs: [
+        {
+          runId: "child-run",
+          sessionPk: "s1",
+          parentRunId: "root-run",
+          retryOf: null,
+          sourceToolCallId: "dispatch-1",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "worker",
+          executingAgentNameSnapshot: "Researcher",
+          agentKind: "subagent" as const,
+          task: "Inspect hydrated dispatch",
+          status: "completed" as const,
+          startedAt: 1,
+          finishedAt: 2,
+          toolCount: 1,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: "Hydrated result",
+          error: null,
+        },
+      ],
+    },
+  }),
+);
+const getChildTranscript = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
   commands: {
@@ -73,6 +105,8 @@ mock.module("@/bindings", () => ({
     listSessions,
     listGateways,
     searchFiles,
+    getChildRuns,
+    getChildTranscript,
   },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
@@ -108,6 +142,7 @@ const { useStore } = await import("@/store");
 const { useNav } = await import("@/store-nav");
 const { useAgents } = await import("@/store-agents");
 const { useConnections } = await import("@/store-connections");
+const { useDelegation } = await import("@/store-delegation");
 const realSend = useStore.getState().send;
 
 type Deferred<T> = {
@@ -217,6 +252,8 @@ beforeEach(() => {
   listSessions.mockClear();
   listGateways.mockClear();
   searchFiles.mockClear();
+  getChildRuns.mockClear();
+  getChildTranscript.mockClear();
 });
 
 afterEach(() => {
@@ -235,6 +272,160 @@ afterEach(() => {
   useAgents.setState({ registry: null, models: [] });
   useConnections.setState({ loaded: false, catalog: [], connections: [] });
   useNative.setState({ commandsByProject: {}, queuedBySession: {} });
+  useDelegation.setState({
+    bySession: {},
+    rootRunBySession: {},
+    rosterStateBySession: {},
+    transcriptByRun: {},
+    transcriptStateByRun: {},
+    seenRunsByDispatch: {},
+    selectedBySession: {},
+  });
+});
+
+test("hydrates the delegation roster on session mount and gives main transcript cards the durable root owner", async () => {
+  seed(LOCAL_RUNNER);
+  useStore.setState({
+    transcripts: {
+      [sessKey(LOCAL_RUNNER, "s1")]: [
+        {
+          seq: 1,
+          role: "assistant",
+          blockType: "tool_call",
+          text: "",
+          toolCallId: "dispatch-1",
+          toolStatus: "completed",
+          toolKind: "task",
+          toolName: "task",
+          toolOutput: "ordinary output",
+          createdAt: 1,
+          attachments: [],
+          toolPath: null,
+          toolInput: { prompt: "Inspect" },
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+        },
+      ],
+    },
+  });
+
+  render(<SessionView />);
+
+  await waitFor(() => expect(getChildRuns).toHaveBeenCalledWith(LOCAL_RUNNER, "s1"));
+  expect(await screen.findByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
+  expect(screen.getByText("Hydrated result")).toBeTruthy();
+});
+
+test("resolves each primary turn dispatch against that row's durable owner", async () => {
+  seed(LOCAL_RUNNER);
+  getChildRuns.mockResolvedValueOnce({
+    status: "ok" as const,
+    data: {
+      rootRunId: "first-primary",
+      runs: [
+        {
+          runId: "first-child",
+          sessionPk: "s1",
+          parentRunId: "first-primary",
+          retryOf: null,
+          sourceToolCallId: "first-dispatch",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "researcher",
+          executingAgentNameSnapshot: "Researcher",
+          agentKind: "subagent" as const,
+          task: "Inspect the first turn",
+          status: "completed" as const,
+          startedAt: 1,
+          finishedAt: 2,
+          toolCount: 1,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: "First turn result",
+          error: null,
+        },
+        {
+          runId: "second-child",
+          sessionPk: "s1",
+          parentRunId: "second-primary",
+          retryOf: null,
+          sourceToolCallId: "second-dispatch",
+          dispatchIndex: 0,
+          primaryAgentId: "primary",
+          executingAgentId: "verifier",
+          executingAgentNameSnapshot: "Verifier",
+          agentKind: "subagent" as const,
+          task: "Verify the later turn",
+          status: "completed" as const,
+          startedAt: 3,
+          finishedAt: 4,
+          toolCount: 1,
+          resolvedModel: null,
+          resolvedEffort: null,
+          result: "Second turn result",
+          error: null,
+        },
+      ],
+    },
+  });
+  useStore.setState({
+    transcripts: {
+      [sessKey(LOCAL_RUNNER, "s1")]: [
+        {
+          seq: 1,
+          role: "assistant",
+          blockType: "tool_call",
+          text: "",
+          ownerRunId: "first-primary",
+          toolCallId: "first-dispatch",
+          toolStatus: "completed",
+          toolKind: "task",
+          toolName: "task",
+          toolOutput: "first ordinary output",
+          createdAt: 1,
+          attachments: [],
+          toolPath: null,
+          toolInput: { prompt: "Inspect" },
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+          toolDispatchFailures: [],
+        },
+        {
+          seq: 2,
+          role: "assistant",
+          blockType: "tool_call",
+          text: "",
+          ownerRunId: "second-primary",
+          toolCallId: "second-dispatch",
+          toolStatus: "completed",
+          toolKind: "other",
+          toolName: "delegate_agent",
+          toolOutput: "second ordinary output",
+          createdAt: 3,
+          attachments: [],
+          toolPath: null,
+          toolInput: { task: "Verify" },
+          toolDurationMs: null,
+          toolExitCode: null,
+          toolSummary: null,
+          toolSubagent: null,
+          toolDispatchFailures: [],
+        },
+      ],
+    },
+  });
+
+  render(<SessionView />);
+
+  expect(await screen.findByRole("button", { name: /Open Researcher agent run/i })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /Open Verifier agent run/i })).toBeTruthy();
+  expect(screen.getByText("First turn result")).toBeTruthy();
+  expect(screen.getByText("Second turn result")).toBeTruthy();
+  expect(screen.queryByText("second ordinary output")).toBeNull();
 });
 
 test("only suggests each effective slash command from the catalog", async () => {

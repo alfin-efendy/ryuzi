@@ -1513,12 +1513,36 @@ impl RunnerMainAgentSpawner {
         let background = request.background;
         let context = request.context.clone();
         let root_run_id = self.deps.root_run_id.clone();
+        let requested_agent_id = request.target_agent_id.clone();
+        // Reserve capacity before queueing a background child. Queueing first
+        // used to create a durable child and immediately cancel it on
+        // rejection, leaving a linked terminal card that hid the parent
+        // tool's useful capacity error.
+        let reservation = if background {
+            let cap =
+                crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await;
+            match self.deps.background.try_reserve(cap, &self.deps.session_pk) {
+                Some(reservation) => Some(reservation),
+                None => {
+                    return MainDelegationResult {
+                        run_id: String::new(),
+                        agent_id: requested_agent_id,
+                        status: SubtaskStatus::Error,
+                        report: format!(
+                            "Async delegation capacity reached ({cap} running). Run this task synchronously."
+                        ),
+                    };
+                }
+            }
+        } else {
+            None
+        };
         let child_run = match self.deps.delegation.queue_main(request).await {
             Ok(child) => child,
             Err(error) => {
                 return MainDelegationResult {
                     run_id: String::new(),
-                    agent_id: String::new(),
+                    agent_id: requested_agent_id,
                     status: SubtaskStatus::Error,
                     report: error.to_string(),
                 };
@@ -1527,24 +1551,7 @@ impl RunnerMainAgentSpawner {
         let run_id = child_run.run.run_id.clone();
         let agent_id = child_run.run.executing_agent_id.clone().unwrap_or_default();
         if background {
-            let cap =
-                crate::settings::usize_setting(&self.deps.store, "max_concurrent_runs", 3).await;
-            let Some(reservation) = self.deps.background.try_reserve(cap, &self.deps.session_pk)
-            else {
-                let _ = self
-                    .deps
-                    .delegation
-                    .cancel_child(&self.deps.session_pk, &run_id)
-                    .await;
-                return MainDelegationResult {
-                    run_id,
-                    agent_id,
-                    status: SubtaskStatus::Error,
-                    report: format!(
-                        "Async delegation capacity reached ({cap} running). Run this task synchronously."
-                    ),
-                };
-            };
+            let reservation = reservation.expect("background delegation reserved before queueing");
             let worker = Self {
                 deps: self.deps.clone(),
             };
@@ -1817,6 +1824,7 @@ impl RunnerSpawner {
     /// status, never a panic or batch abort.
     async fn run_child(
         &self,
+        source_tool_call_id: &str,
         index: usize,
         spec: SubtaskSpec,
         _cancel: CancellationToken,
@@ -1836,6 +1844,10 @@ impl RunnerSpawner {
                 task: spec.prompt.clone(),
                 context: None,
                 background: false,
+                dispatch: Some(crate::delegation::AgentDispatchLink {
+                    source_tool_call_id: source_tool_call_id.to_string(),
+                    dispatch_index: i64::try_from(index).expect("subtask index fits i64"),
+                }),
             })
             .await
         {
@@ -2070,11 +2082,17 @@ pub(crate) fn dispatch_retry_subagent(deps: RunnerDeps, child: RunHandle) -> any
 
 #[async_trait]
 impl SubagentSpawner for RunnerSpawner {
-    async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult> {
+    async fn run_many(
+        &self,
+        source_tool_call_id: &str,
+        specs: Vec<SubtaskSpec>,
+    ) -> Vec<SubtaskResult> {
         let sem = Arc::new(tokio::sync::Semaphore::new(self.concurrency().await));
-        let futures = specs.into_iter().enumerate().map(|(index, spec)| {
+        let dispatches = specs.into_iter().enumerate().collect::<Vec<_>>();
+        let futures = dispatches.into_iter().map(|(index, spec)| {
             let sem = sem.clone();
             let cancel = self.cancel.child_token();
+            let source_tool_call_id = source_tool_call_id.to_string();
             async move {
                 let _permit = sem.acquire().await;
                 if cancel.is_cancelled() {
@@ -2085,7 +2103,8 @@ impl SubagentSpawner for RunnerSpawner {
                         report: "interrupted before start".into(),
                     };
                 }
-                self.run_child(index, spec, cancel).await
+                self.run_child(&source_tool_call_id, index, spec, cancel)
+                    .await
             }
         });
         let mut results = futures::future::join_all(futures).await;
@@ -2102,7 +2121,11 @@ impl SubagentSpawner for RunnerSpawner {
             .collect()
     }
 
-    async fn run_background(&self, spec: SubtaskSpec) -> BackgroundDispatch {
+    async fn run_background(
+        &self,
+        source_tool_call_id: &str,
+        spec: SubtaskSpec,
+    ) -> BackgroundDispatch {
         // Background delegation is a top-level capability only; a nested
         // (delegated) spawner must not fan out detached workers.
         if self.depth != 0 {
@@ -2138,6 +2161,10 @@ impl SubagentSpawner for RunnerSpawner {
                 task: spec.prompt.clone(),
                 context: None,
                 background: true,
+                dispatch: Some(crate::delegation::AgentDispatchLink {
+                    source_tool_call_id: source_tool_call_id.to_string(),
+                    dispatch_index: 0,
+                }),
             })
             .await
         {
@@ -2532,23 +2559,31 @@ async fn finish_tool_row_with_display(
     }
     match deps
         .store
-        .update_tool_call(&deps.session_pk, tool_call_id, Some(status), &patch)
+        .update_run_tool_call(
+            &deps.run_id,
+            &deps.session_pk,
+            tool_call_id,
+            Some(status),
+            &patch,
+        )
         .await
     {
         Ok((seq, payload, tool_kind)) => {
-            let _ = deps.events.send(CoreEvent::Message {
-                session_pk: deps.session_pk.clone(),
-                seq,
-                role: "assistant".into(),
-                block_type: "tool_call".into(),
-                payload,
-                tool_call_id: Some(tool_call_id.to_string()),
-                status: Some(status.to_string()),
-                tool_kind,
-                speaker: None,
-            });
+            let _ = deps.events.send(run_message_event(
+                deps,
+                MessageEventFields {
+                    seq,
+                    role: "assistant".into(),
+                    block_type: "tool_call".into(),
+                    payload,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    status: Some(status.to_string()),
+                    tool_kind,
+                    speaker: None,
+                },
+            ));
         }
-        Err(e) => tracing::warn!("native: update_tool_call({tool_call_id}) failed: {e}"),
+        Err(e) => tracing::warn!("native: update_run_tool_call({tool_call_id}) failed: {e}"),
     }
 }
 
@@ -2592,7 +2627,50 @@ async fn flush_text(deps: &RunnerDeps, buf: &mut String, emit_display: bool) {
     }
 }
 
-/// Persist a message row and broadcast the matching `CoreEvent::Message`.
+struct MessageEventFields {
+    seq: i64,
+    role: String,
+    block_type: String,
+    payload: Value,
+    tool_call_id: Option<String>,
+    status: Option<String>,
+    tool_kind: Option<String>,
+    speaker: Option<String>,
+}
+
+/// Build a live event from already-persisted row data, keeping root and child
+/// transcript delivery disjoint for both inserts and terminal tool updates.
+fn run_message_event(deps: &RunnerDeps, message: MessageEventFields) -> CoreEvent {
+    if deps.run_id == deps.root_run_id {
+        CoreEvent::Message {
+            session_pk: deps.session_pk.clone(),
+            seq: message.seq,
+            run_id: Some(deps.run_id.clone()),
+            role: message.role,
+            block_type: message.block_type,
+            payload: message.payload,
+            tool_call_id: message.tool_call_id,
+            status: message.status,
+            tool_kind: message.tool_kind,
+            speaker: message.speaker,
+        }
+    } else {
+        CoreEvent::AgentRunMessage {
+            session_pk: deps.session_pk.clone(),
+            run_id: deps.run_id.clone(),
+            seq: message.seq,
+            role: message.role,
+            block_type: message.block_type,
+            payload: message.payload,
+            tool_call_id: message.tool_call_id,
+            status: message.status,
+            tool_kind: message.tool_kind,
+            speaker: message.speaker,
+        }
+    }
+}
+
+/// Persist a message row and broadcast the matching root or child event.
 async fn emit_row(
     deps: &RunnerDeps,
     role: &str,
@@ -2614,17 +2692,19 @@ async fn emit_row(
     };
     match deps.store.insert_run_message(&deps.run_id, msg).await {
         Ok(seq) => {
-            let _ = deps.events.send(CoreEvent::Message {
-                session_pk: deps.session_pk.clone(),
-                seq,
-                role: role.to_string(),
-                block_type: block_type.to_string(),
-                payload,
-                tool_call_id,
-                status,
-                tool_kind,
-                speaker: None,
-            });
+            let _ = deps.events.send(run_message_event(
+                deps,
+                MessageEventFields {
+                    seq,
+                    role: role.to_string(),
+                    block_type: block_type.to_string(),
+                    payload,
+                    tool_call_id,
+                    status,
+                    tool_kind,
+                    speaker: None,
+                },
+            ));
             true
         }
         Err(e) => {
@@ -2648,6 +2728,7 @@ async fn observe_route_selection(
             let _ = deps.events.send(CoreEvent::Message {
                 session_pk: message.session_pk,
                 seq: message.seq,
+                run_id: message.run_id,
                 role: message.role,
                 block_type: message.block_type,
                 payload: message.payload,
@@ -3128,6 +3209,50 @@ mod tests {
         }
     }
 
+    /// A three-child LLM double that holds each child at a shared start gate,
+    /// then lets the test release completions in a chosen order.
+    struct CompletionGatedLlm {
+        start: Arc<tokio::sync::Barrier>,
+        release: [Arc<tokio::sync::Notify>; 3],
+    }
+
+    impl CompletionGatedLlm {
+        fn new() -> Self {
+            Self {
+                // Three concurrent children plus the test coordinator.
+                start: Arc::new(tokio::sync::Barrier::new(4)),
+                release: std::array::from_fn(|_| Arc::new(tokio::sync::Notify::new())),
+            }
+        }
+
+        fn release(&self, index: usize) {
+            self.release[index].notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl LlmStream for CompletionGatedLlm {
+        async fn stream(&self, request: LlmRequest) -> anyhow::Result<RoutedStream> {
+            let body = request.body.to_string();
+            let index = (0..3)
+                .find(|index| body.contains(&format!("job {index}")))
+                .expect("each gated child prompt identifies its input index");
+            self.start.wait().await;
+            self.release[index].notified().await;
+
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            for event in final_turn(&format!("completed job {index}")) {
+                tx.send(Ok(event))
+                    .await
+                    .expect("the bounded scripted stream accepts its final events");
+            }
+            Ok(RoutedStream {
+                selection: test_route_selection(),
+                events: rx,
+            })
+        }
+    }
+
     #[async_trait]
     impl crate::harness::native::mcp_client::McpCaller for StaticMcpCaller {
         async fn call(
@@ -3388,6 +3513,145 @@ mod tests {
         )
         .unwrap()
         .agent_tools;
+    }
+
+    async fn child_deps_for_event_test(deps: &RunnerDeps) -> RunnerDeps {
+        use crate::domain::{AgentRunKind, AgentRunStatus, NewAgentRun};
+
+        let run_id = format!("{}-child", deps.run_id);
+        deps.store
+            .insert_agent_run(NewAgentRun {
+                run_id: run_id.clone(),
+                session_pk: deps.session_pk.clone(),
+                parent_run_id: Some(deps.run_id.clone()),
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: deps.primary_agent.profile.id.clone(),
+                executing_agent_id: Some(deps.primary_agent.profile.id.clone()),
+                executing_agent_name_snapshot: deps.primary_agent.profile.name.clone(),
+                agent_kind: AgentRunKind::Subagent,
+                task: "event ownership".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+        let mut child = deps.clone();
+        child.run_id = run_id;
+        child
+    }
+
+    #[tokio::test]
+    async fn child_rows_emit_agent_run_message_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        let child = child_deps_for_event_test(&deps).await;
+        let mut events = child.events.subscribe();
+
+        assert!(
+            emit_row(
+                &child,
+                "assistant",
+                "tool_call",
+                json!({ "name": "Bash", "input": { "command": "echo child" } }),
+                Some("child-tool".into()),
+                Some("in_progress".into()),
+                Some("execute".into()),
+            )
+            .await
+        );
+        finish_tool_row(&child, "child-tool", "child done", false).await;
+
+        let broadcast = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(broadcast.len(), 2);
+        assert!(broadcast.iter().all(|event| matches!(
+            event,
+            CoreEvent::AgentRunMessage { run_id, tool_call_id, .. }
+                if run_id == &child.run_id && tool_call_id.as_deref() == Some("child-tool")
+        )));
+        assert!(
+            !broadcast
+                .iter()
+                .any(|event| matches!(event, CoreEvent::Message { .. })),
+            "child-owned rows must never reach the primary message event"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_rows_emit_message_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps_at(dir.path(), Arc::new(ScriptedLlm::new(vec![]))).await;
+        let mut events = deps.events.subscribe();
+
+        assert!(
+            emit_row(
+                &deps,
+                "assistant",
+                "tool_call",
+                json!({ "name": "Bash", "input": { "command": "echo root" } }),
+                Some("root-tool".into()),
+                Some("in_progress".into()),
+                Some("execute".into()),
+            )
+            .await
+        );
+        finish_tool_row(&deps, "root-tool", "root done", false).await;
+
+        let broadcast = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(broadcast.len(), 2);
+        assert!(broadcast.iter().all(|event| matches!(
+            event,
+            CoreEvent::Message { tool_call_id, .. }
+                if tool_call_id.as_deref() == Some("root-tool")
+        )));
+        assert!(
+            !broadcast
+                .iter()
+                .any(|event| matches!(event, CoreEvent::AgentRunMessage { .. })),
+            "root-owned rows must never reach the child run event"
+        );
+    }
+
+    async fn create_main_delegate_target(
+        registry: &crate::agents::registry::AgentRegistry,
+        name: &str,
+    ) -> String {
+        use crate::agents::types::{
+            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+        };
+
+        registry
+            .create(AgentMutationInput {
+                name: name.to_string(),
+                description: format!("{name} delegated target"),
+                avatar: AgentAvatar {
+                    color: "violet".into(),
+                },
+                model: AgentModel::Concrete {
+                    name: "anthropic/target-model".into(),
+                    effort: None,
+                },
+                permissions: AgentPermissions {
+                    mode: PermMode::BypassPermissions,
+                    rules: Vec::new(),
+                },
+                skills: Vec::new(),
+                tools: AgentTools {
+                    native: Vec::new(),
+                    plugins: Vec::new(),
+                    apps: Vec::new(),
+                },
+                loop_settings: AgentLoop {
+                    max_turns: 1,
+                    max_tool_rounds: 1,
+                },
+            })
+            .await
+            .unwrap()
+            .profile
+            .id
     }
 
     /// Feature C1a: a real tool call (the bash tool, actually executed —
@@ -5104,7 +5368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_tool_spawns_subagent_and_returns_its_report() {
+    async fn dispatch_link_task_foreground_persists_tool_identity() {
         let dir = tempfile::tempdir().unwrap();
         // Parent turn: call the `task` tool delegating to `explore`.
         let parent = vec![
@@ -5161,6 +5425,299 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "all set"));
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].source_tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(children[0].dispatch_index, Some(0));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_delegate_agent_foreground_batch_persists_tool_identity_and_input_order()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) = deps_with_executable_profile_registry(
+            dir.path(),
+            Arc::new(ScriptedLlm::new(vec![])),
+            store,
+        )
+        .await;
+        let reviewer = create_main_delegate_target(&registry, "Reviewer").await;
+        let tester = create_main_delegate_target(&registry, "Tester").await;
+        let input = json!({
+            "delegations": [
+                {"agent_id": reviewer, "task": "audit the auth changes"},
+                {"agent_id": tester, "task": "run the focused tests"}
+            ]
+        })
+        .to_string();
+        let parent = vec![
+            tool_use_start(0, "delegate-foreground-batch-call", "delegate_agent"),
+            input_json_delta(0, &input),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        deps.llm = Arc::new(ScriptedLlm::new(vec![
+            parent,
+            final_turn("delegated child complete"),
+            final_turn("delegated child complete"),
+            final_turn("parent complete"),
+        ]));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate the audit", "delegate the audit"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|child| child.agent_kind == crate::domain::AgentRunKind::MainDelegate)
+            .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.dispatch_index);
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| (
+                    child.source_tool_call_id.as_deref(),
+                    child.dispatch_index,
+                    child.task.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some("delegate-foreground-batch-call"),
+                    Some(0),
+                    "audit the auth changes",
+                ),
+                (
+                    Some("delegate-foreground-batch-call"),
+                    Some(1),
+                    "run the focused tests",
+                ),
+            ]
+        );
+        assert!(children
+            .iter()
+            .all(|child| child.status == crate::domain::AgentRunStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_delegate_agent_background_persists_tool_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) = deps_with_executable_profile_registry(
+            dir.path(),
+            Arc::new(ScriptedLlm::new(vec![])),
+            store,
+        )
+        .await;
+        let reviewer = create_main_delegate_target(&registry, "Background reviewer").await;
+        let input = json!({
+            "agent_id": reviewer,
+            "task": "review the async job",
+            "background": true,
+        })
+        .to_string();
+        let parent = vec![
+            tool_use_start(0, "delegate-background-call", "delegate_agent"),
+            input_json_delta(0, &input),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        // The parent continuation and detached child may race to take these
+        // final text-only turns; either ordering is valid for this linkage test.
+        deps.llm = Arc::new(ScriptedLlm::new(vec![
+            parent,
+            final_turn("done"),
+            final_turn("done"),
+        ]));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate in background", "delegate in background"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|child| child.agent_kind == crate::domain::AgentRunKind::MainDelegate)
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            (
+                children[0].source_tool_call_id.as_deref(),
+                children[0].dispatch_index,
+                children[0].task.as_str(),
+            ),
+            (
+                Some("delegate-background-call"),
+                Some(0),
+                "review the async job",
+            )
+        );
+        let tool_row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("delegate-background-call"))
+            .expect("the background delegate_agent tool call is terminal");
+        assert_eq!(tool_row.status.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_background_delegate_capacity_rejection_leaves_no_child_and_records_tool_error(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let (mut deps, registry) = deps_with_executable_profile_registry(
+            dir.path(),
+            Arc::new(ScriptedLlm::new(vec![])),
+            store,
+        )
+        .await;
+        let reviewer = create_main_delegate_target(&registry, "Capacity reviewer").await;
+        deps.store
+            .set_setting(crate::domain::WriteOrigin::User, "max_concurrent_runs", "1")
+            .await
+            .unwrap();
+        let _held = deps
+            .background
+            .try_reserve(1, &deps.session_pk)
+            .expect("the test must exhaust the only background slot");
+        let input = json!({
+            "agent_id": reviewer,
+            "task": "review the async job",
+            "background": true,
+        })
+        .to_string();
+        let parent = vec![
+            tool_use_start(0, "delegate-capacity-call", "delegate_agent"),
+            input_json_delta(0, &input),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        deps.llm = Arc::new(ScriptedLlm::new(vec![parent, final_turn("handled")]));
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("delegate in background", "delegate in background"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap();
+        assert!(
+            children
+                .iter()
+                .all(|child| child.source_tool_call_id.as_deref() != Some("delegate-capacity-call")),
+            "a rejected background dispatch must not persist a cancelled linked child"
+        );
+        let tool_row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("delegate-capacity-call"))
+            .expect("the parent delegate_agent tool row is persisted");
+        assert_eq!(tool_row.status.as_deref(), Some("failed"));
+        assert!(tool_row.payload["output"]
+            .as_str()
+            .expect("tool output")
+            .contains("Async delegation capacity reached"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_link_admission_failure_leaves_no_child_and_records_tool_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = vec![
+            tool_use_start(0, "capacity-tool-call", "task"),
+            input_json_delta(
+                0,
+                r#"{"subagent_type":"explore","prompt":"must not be admitted"}"#,
+            ),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let parent_end = vec![
+            text_delta("handled"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![parent, parent_end]));
+        let deps = deps_at(dir.path(), llm).await;
+        for index in 0..crate::delegation::MAX_ACTIVE_CHILD_RUNS {
+            deps.delegation
+                .queue_subagent(SubagentRunRequest {
+                    parent_run_id: deps.run_id.clone(),
+                    subagent_type: "explore".into(),
+                    task: format!("existing-{index}"),
+                    context: None,
+                    background: false,
+                    dispatch: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("dispatch", "dispatch"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let children = deps
+            .store
+            .list_descendant_agent_runs(&deps.run_id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), crate::delegation::MAX_ACTIVE_CHILD_RUNS);
+        assert!(children
+            .iter()
+            .all(|child| child.source_tool_call_id.as_deref() != Some("capacity-tool-call")));
+        let row = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.tool_call_id.as_deref() == Some("capacity-tool-call"))
+            .expect("the terminal task tool row is persisted");
+        assert_eq!(row.status.as_deref(), Some("failed"));
+        assert!(row.payload["output"]
+            .as_str()
+            .expect("tool output")
+            .contains("active child run limit"));
     }
 
     #[test]
@@ -5616,22 +6173,126 @@ mod tests {
             parent_run_id: deps.run_id.clone(),
         };
         let results = spawner
-            .run_many(vec![
-                SubtaskSpec {
-                    agent_type: "explore".into(),
-                    prompt: "first".into(),
-                },
-                SubtaskSpec {
-                    agent_type: "explore".into(),
-                    prompt: "second".into(),
-                },
-            ])
+            .run_many(
+                "test-tool-call",
+                vec![
+                    SubtaskSpec {
+                        agent_type: "explore".into(),
+                        prompt: "first".into(),
+                    },
+                    SubtaskSpec {
+                        agent_type: "explore".into(),
+                        prompt: "second".into(),
+                    },
+                ],
+            )
             .await;
         assert_eq!(results.len(), 2);
         assert_eq!((results[0].index, results[1].index), (0, 1));
         assert!(results.iter().all(|r| r.status == SubtaskStatus::Completed));
         assert_eq!(results[0].report, "report A");
         assert_eq!(results[1].report, "report B");
+    }
+
+    #[tokio::test]
+    async fn run_many_persists_input_indices_when_children_finish_in_reverse_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(CompletionGatedLlm::new());
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        let root_run_id = deps.run_id.clone();
+        deps.store
+            .set_setting(crate::domain::WriteOrigin::User, "max_concurrent_runs", "3")
+            .await
+            .unwrap();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: CancellationToken::new(),
+            depth: 0,
+            parent_run_id: root_run_id.clone(),
+        };
+        let worker = tokio::spawn(async move {
+            spawner
+                .run_many(
+                    "reverse-completion-tool-call",
+                    (0..3)
+                        .map(|index| SubtaskSpec {
+                            agent_type: "explore".into(),
+                            prompt: format!("job {index}"),
+                        })
+                        .collect(),
+                )
+                .await
+        });
+
+        // All three children have been admitted and reached their stream
+        // gates. Release exactly one at a time to force terminalization 2→1→0.
+        llm.start.wait().await;
+        for index in [2, 1, 0] {
+            llm.release(index);
+            for _ in 0..200 {
+                if deps
+                    .store
+                    .list_descendant_agent_runs(&root_run_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|child| {
+                        child.dispatch_index
+                            == Some(i64::try_from(index).expect("test index fits i64"))
+                            && child.status == crate::domain::AgentRunStatus::Completed
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                deps.store
+                    .list_descendant_agent_runs(&root_run_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|child| {
+                        child.dispatch_index
+                            == Some(i64::try_from(index).expect("test index fits i64"))
+                            && child.status == crate::domain::AgentRunStatus::Completed
+                    }),
+                "child {index} must complete before releasing the next gate"
+            );
+        }
+        let results = worker.await.unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let mut children = deps
+            .store
+            .list_descendant_agent_runs(&root_run_id)
+            .await
+            .unwrap();
+        children.sort_by_key(|child| child.dispatch_index);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.dispatch_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        assert!(children
+            .iter()
+            .all(|child| child.source_tool_call_id.as_deref()
+                == Some("reverse-completion-tool-call")));
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.task.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job 0", "job 1", "job 2"]
+        );
     }
 
     #[tokio::test]
@@ -5655,13 +6316,13 @@ mod tests {
             cancel: CancellationToken::new(),
             depth: 0,
         };
-        let specs = (0..3)
+        let specs: Vec<SubtaskSpec> = (0..3)
             .map(|i| SubtaskSpec {
                 agent_type: "explore".into(),
                 prompt: format!("job {i}"),
             })
             .collect();
-        let results = spawner.run_many(specs).await;
+        let results = spawner.run_many("test-tool-call", specs).await;
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| r.status == SubtaskStatus::Completed));
         assert_eq!(
@@ -5687,16 +6348,19 @@ mod tests {
             depth: 0,
         };
         let results = spawner
-            .run_many(vec![
-                SubtaskSpec {
-                    agent_type: "no-such-agent".into(),
-                    prompt: "x".into(),
-                },
-                SubtaskSpec {
-                    agent_type: "explore".into(),
-                    prompt: "y".into(),
-                },
-            ])
+            .run_many(
+                "test-tool-call",
+                vec![
+                    SubtaskSpec {
+                        agent_type: "no-such-agent".into(),
+                        prompt: "x".into(),
+                    },
+                    SubtaskSpec {
+                        agent_type: "explore".into(),
+                        prompt: "y".into(),
+                    },
+                ],
+            )
             .await;
         assert_eq!(results[0].status, SubtaskStatus::Error);
         assert!(results[0].report.contains("unknown sub-agent"));
@@ -5720,16 +6384,19 @@ mod tests {
             depth: 0,
         };
         let results = spawner
-            .run_many(vec![
-                SubtaskSpec {
-                    agent_type: "explore".into(),
-                    prompt: "a".into(),
-                },
-                SubtaskSpec {
-                    agent_type: "explore".into(),
-                    prompt: "b".into(),
-                },
-            ])
+            .run_many(
+                "test-tool-call",
+                vec![
+                    SubtaskSpec {
+                        agent_type: "explore".into(),
+                        prompt: "a".into(),
+                    },
+                    SubtaskSpec {
+                        agent_type: "explore".into(),
+                        prompt: "b".into(),
+                    },
+                ],
+            )
             .await;
         assert_eq!(results.len(), 2);
         assert!(results
@@ -5792,10 +6459,13 @@ mod tests {
         };
 
         let result = spawner
-            .run_many(vec![SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "try to read the parent attachment".into(),
-            }])
+            .run_many(
+                "test-tool-call",
+                vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "try to read the parent attachment".into(),
+                }],
+            )
             .await;
 
         assert_eq!(result[0].status, SubtaskStatus::Completed);
@@ -6429,10 +7099,13 @@ mod tests {
         // Fill the one slot with a manual reservation.
         let _held = deps.background.try_reserve(1, &deps.session_pk).unwrap();
         let out = spawner
-            .run_background(SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "do it".into(),
-            })
+            .run_background(
+                "test-tool-call",
+                SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "do it".into(),
+                },
+            )
             .await;
         match out {
             BackgroundDispatch::Rejected { note } => {
@@ -6460,10 +7133,13 @@ mod tests {
             parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
-            .run_background(SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "do it".into(),
-            })
+            .run_background(
+                "test-tool-call",
+                SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "do it".into(),
+                },
+            )
             .await;
         match out {
             BackgroundDispatch::Rejected { note } => {
@@ -6534,6 +7210,7 @@ mod tests {
                 task: "delegate audit".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -6554,10 +7231,13 @@ mod tests {
             parent_run_id: parent.run.run_id,
         };
         let out = spawner
-            .run_background(SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "audit auth".into(),
-            })
+            .run_background(
+                "test-tool-call",
+                SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "audit auth".into(),
+                },
+            )
             .await;
         let id = match out {
             BackgroundDispatch::Dispatched { id } => id,
@@ -6625,6 +7305,7 @@ mod tests {
                 task: "wait for cancellation".into(),
                 context: None,
                 background: true,
+                dispatch: None,
             })
             .await;
         assert_eq!(
@@ -6705,6 +7386,7 @@ mod tests {
                 task: "finish in the background".into(),
                 context: None,
                 background: true,
+                dispatch: None,
             })
             .await;
 
@@ -6832,6 +7514,7 @@ mod tests {
                 task: "delegate in the background".into(),
                 context: None,
                 background: true,
+                dispatch: None,
             })
             .await;
         assert_eq!(main.status, SubtaskStatus::Completed);
@@ -6841,10 +7524,13 @@ mod tests {
             depth: 0,
             parent_run_id: second_root.clone(),
         }
-        .run_background(SubtaskSpec {
-            agent_type: "general".into(),
-            prompt: "task in the background".into(),
-        })
+        .run_background(
+            "test-tool-call",
+            SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "task in the background".into(),
+            },
+        )
         .await;
         assert!(matches!(task, BackgroundDispatch::Dispatched { .. }));
 
@@ -6909,6 +7595,7 @@ mod tests {
                 task: "explicit mention".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -6920,6 +7607,7 @@ mod tests {
                 task: "nested task".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -6965,10 +7653,13 @@ mod tests {
             depth: 0,
             parent_run_id: nested_retry.run.run_id,
         }
-        .run_background(SubtaskSpec {
-            agent_type: "general".into(),
-            prompt: "retry in the background".into(),
-        })
+        .run_background(
+            "test-tool-call",
+            SubtaskSpec {
+                agent_type: "general".into(),
+                prompt: "retry in the background".into(),
+            },
+        )
         .await;
         assert!(matches!(dispatched, BackgroundDispatch::Dispatched { .. }));
 
@@ -7159,6 +7850,7 @@ mod tests {
                 task: "inspect the target profile".into(),
                 context: Some("only inspect authentication files".into()),
                 background: false,
+                dispatch: None,
             })
             .await;
 
@@ -7178,8 +7870,8 @@ mod tests {
             Some("anthropic/target-model")
         );
         assert_eq!(
-            child.tool_count, 3,
-            "only target-owned, schema-admitted tool calls are counted; the facade-gated app attempt is rejected before admission"
+            child.tool_count, 4,
+            "all known, target-authorized tool calls are counted, including the recorded app facade failure"
         );
         let bodies = llm.bodies.lock().unwrap().clone();
         assert_eq!(
@@ -7333,6 +8025,7 @@ mod tests {
                 task: "retry only this target task".into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap();
@@ -7461,10 +8154,13 @@ mod tests {
             parent_run_id: deps.run_id.clone(),
         };
         let child = spawner
-            .run_many(vec![SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "run the child tool".into(),
-            }])
+            .run_many(
+                "test-tool-call",
+                vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "run the child tool".into(),
+                }],
+            )
             .await;
         assert_eq!(child[0].status, SubtaskStatus::Error);
         let first_child = deps
@@ -7550,10 +8246,13 @@ mod tests {
         };
         let worker = tokio::spawn(async move {
             spawner
-                .run_many(vec![SubtaskSpec {
-                    agent_type: "general".into(),
-                    prompt: "block until cancelled".into(),
-                }])
+                .run_many(
+                    "test-tool-call",
+                    vec![SubtaskSpec {
+                        agent_type: "general".into(),
+                        prompt: "block until cancelled".into(),
+                    }],
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
@@ -7663,10 +8362,13 @@ mod tests {
         };
 
         let result = spawner
-            .run_many(vec![SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "inspect".into(),
-            }])
+            .run_many(
+                "test-tool-call",
+                vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "inspect".into(),
+                }],
+            )
             .await;
 
         assert_eq!(result[0].status, SubtaskStatus::Completed);
@@ -7708,10 +8410,13 @@ mod tests {
             parent_run_id: deps.run_id.clone(),
         };
         let results = spawner
-            .run_many(vec![SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "inspect the workspace".into(),
-            }])
+            .run_many(
+                "test-tool-call",
+                vec![SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "inspect the workspace".into(),
+                }],
+            )
             .await;
 
         assert_eq!(results.len(), 1);
@@ -7752,12 +8457,21 @@ mod tests {
             parent_run_id: deps.run_id.clone(),
         };
         let out = spawner
-            .run_background(SubtaskSpec {
-                agent_type: "general".into(),
-                prompt: "audit auth".into(),
-            })
+            .run_background(
+                "test-tool-call",
+                SubtaskSpec {
+                    agent_type: "general".into(),
+                    prompt: "audit auth".into(),
+                },
+            )
             .await;
-        assert!(matches!(out, BackgroundDispatch::Dispatched { .. }));
+        let id = match out {
+            BackgroundDispatch::Dispatched { id } => id,
+            BackgroundDispatch::Rejected { note } => panic!("expected dispatch: {note}"),
+        };
+        let child = deps.store.get_agent_run(&id).await.unwrap().unwrap();
+        assert_eq!(child.source_tool_call_id.as_deref(), Some("test-tool-call"));
+        assert_eq!(child.dispatch_index, Some(0));
         // Single-threaded test runtime: the detached worker cannot have run
         // any code yet (no `.await` has yielded since `run_background`
         // returned), so this cancellation always lands before the worker

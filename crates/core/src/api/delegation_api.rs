@@ -1,7 +1,7 @@
 //! Child-run RPC boundary: scoped reads and lifecycle controls for Cockpit.
 
 use super::{ok, params, ApiError};
-use crate::domain::AgentRun;
+use crate::domain::{AgentRun, AgentRunRosterInfo};
 use crate::serve::ApiState;
 use serde::Deserialize;
 use serde_json::Value;
@@ -34,6 +34,13 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 .store()
                 .list_session_agent_runs(&a.session_pk)
                 .await?;
+            let root_run_id = runs
+                .iter()
+                .find(|run| {
+                    run.parent_run_id.is_none()
+                        && run.agent_kind == crate::domain::AgentRunKind::Primary
+                })
+                .map(|run| run.run_id.clone());
             runs.retain(|run| run.parent_run_id.is_some());
             runs.sort_by(|left, right| {
                 let rank = |run: &AgentRun| match run.status {
@@ -48,7 +55,7 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                         .cmp(&left.finished_at.unwrap_or(i64::MIN))
                 })
             });
-            ok(runs)
+            ok(AgentRunRosterInfo { root_run_id, runs })
         }
         "get_child_transcript" => {
             let a: RunP = params(p)?;
@@ -215,6 +222,7 @@ mod tests {
                 task: task.into(),
                 context: None,
                 background: false,
+                dispatch: None,
             })
             .await
             .unwrap()
@@ -261,10 +269,11 @@ mod tests {
             .unwrap();
         let queued = subagent(&s, &root.run.run_id, "queued").await;
 
-        let runs = dispatch(&s, "get_child_runs", json!({ "session_pk": "s" }))
+        let roster = dispatch(&s, "get_child_runs", json!({ "session_pk": "s" }))
             .await
             .unwrap();
-        let run_ids = runs
+        assert_eq!(roster["rootRunId"], root.run.run_id);
+        let run_ids = roster["runs"]
             .as_array()
             .unwrap()
             .iter()
@@ -281,6 +290,22 @@ mod tests {
             ]
         );
         assert!(!run_ids.contains(&root.run.run_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn child_runs_return_null_root_for_legacy_sessions() {
+        let s = tests_support::state_with_agents().await;
+        s.cp.store()
+            .insert_session(session("legacy"))
+            .await
+            .unwrap();
+
+        let roster = dispatch(&s, "get_child_runs", json!({ "session_pk": "legacy" }))
+            .await
+            .unwrap();
+
+        assert!(roster["rootRunId"].is_null());
+        assert_eq!(roster["runs"], json!([]));
     }
 
     #[tokio::test]
@@ -391,6 +416,7 @@ mod tests {
                     task: "retry main delegate".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();
@@ -575,6 +601,7 @@ mod tests {
                     task: "delegated".into(),
                     context: None,
                     background: false,
+                    dispatch: None,
                 })
                 .await
                 .unwrap();
@@ -657,6 +684,8 @@ mod tests {
                     session_pk: "s".into(),
                     parent_run_id: None,
                     retry_of: None,
+                    source_tool_call_id: None,
+                    dispatch_index: None,
                     primary_agent_id: "ryuzi".into(),
                     executing_agent_id: Some("ryuzi".into()),
                     executing_agent_name_snapshot: "Ryuzi".into(),
@@ -675,6 +704,8 @@ mod tests {
                     session_pk: "s".into(),
                     parent_run_id: Some(root_run.run_id),
                     retry_of: None,
+                    source_tool_call_id: None,
+                    dispatch_index: None,
                     primary_agent_id: "ryuzi".into(),
                     executing_agent_id: Some("ryuzi".into()),
                     executing_agent_name_snapshot: "Ryuzi".into(),

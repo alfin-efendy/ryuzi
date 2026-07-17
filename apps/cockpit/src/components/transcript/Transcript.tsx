@@ -168,6 +168,7 @@ export function Transcript({
   agentName,
   agentColor,
   running,
+  ownerRunId,
   children,
   approvalRunId,
 }: {
@@ -177,6 +178,7 @@ export function Transcript({
   agentName: string;
   agentColor: string;
   running: boolean;
+  ownerRunId: string | null;
   children?: ReactNode;
   approvalRunId?: string;
 }) {
@@ -287,7 +289,18 @@ export function Transcript({
                 case "thought":
                   return <ThoughtBlock key={g.key} markdown={g.markdown} streaming={streamingTail} />;
                 case "activity":
-                  return <ActivityCluster key={g.key} items={g.items} live={running} fold={running} liveTail={streamingTail} />;
+                  return (
+                    <ActivityCluster
+                      key={g.key}
+                      items={g.items}
+                      live={running}
+                      fold={running}
+                      liveTail={streamingTail}
+                      runnerId={runnerId}
+                      sessionPk={sessionPk}
+                      ownerRunId={ownerRunId}
+                    />
+                  );
                 case "error":
                   return <ErrorRow key={g.key} text={g.text} />;
                 case "notice":
@@ -295,7 +308,13 @@ export function Transcript({
                 case "summary":
                   return (
                     <div key={g.key} className="flex flex-col gap-1.5">
-                      <TurnSummary groups={g.groups} durationMs={g.durationMs} />
+                      <TurnSummary
+                        groups={g.groups}
+                        durationMs={g.durationMs}
+                        runnerId={runnerId}
+                        sessionPk={sessionPk}
+                        ownerRunId={ownerRunId}
+                      />
                       <FileChangeCards runnerId={runnerId} sessionPk={sessionPk} cards={g.editCards} />
                     </div>
                   );

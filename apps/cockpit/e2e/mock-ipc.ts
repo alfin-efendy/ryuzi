@@ -3,8 +3,10 @@ import type {
   AgentDetailInfo,
   AgentRegistryInfo,
   AgentRun,
+  AgentRunRosterInfo,
   AgentSummaryInfo,
   ConnectionInfo,
+  CoreEvent,
   Message,
   ModelRouteTargetCapability,
   Session,
@@ -383,6 +385,13 @@ const AGENT_DETAILS: Record<string, AgentDetailInfo> = {
   reviewer: REVIEWER_DETAIL,
 };
 
+const EMPTY_AGENT_RUN_ROSTER: AgentRunRosterInfo = { rootRunId: null, runs: [] };
+type ChildRunMockState = {
+  agentRunRoster: AgentRunRosterInfo;
+  childMessages: Record<string, Message[]>;
+  retryChildMessages: Record<string, Message[]>;
+};
+export type MockIPCOverrides = Record<string, unknown> & Partial<ChildRunMockState>;
 /** One active main-delegate run (Ryuzi → Reviewer) and one completed subagent
  * run, returned by `get_child_runs` for the delegation/child-transcript
  * journey. Subagents are ephemeral runtime workers with no agent profile
@@ -393,6 +402,8 @@ export const DELEGATE_ACTIVE_RUN = {
   sessionPk: CHAT_SESSION.sessionPk,
   parentRunId: null,
   retryOf: null,
+  sourceToolCallId: null,
+  dispatchIndex: null,
   primaryAgentId: "ryuzi",
   executingAgentId: "reviewer",
   executingAgentNameSnapshot: "Reviewer",
@@ -413,6 +424,8 @@ export const DELEGATE_DONE_RUN = {
   sessionPk: CHAT_SESSION.sessionPk,
   parentRunId: null,
   retryOf: null,
+  sourceToolCallId: null,
+  dispatchIndex: null,
   primaryAgentId: "ryuzi",
   executingAgentId: null,
   executingAgentNameSnapshot: "Subagent worker",
@@ -526,10 +539,13 @@ export const ROUTE_TARGET_CAPABILITIES = [
 ] satisfies ModelRouteTargetCapability[];
 
 /** Tauri command → resolved value (Result-typed commands get the raw data). */
-const FIXTURES: Record<string, unknown> = {
+const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   list_projects: [PROJECT],
   list_sessions: [],
   list_messages: [],
+  agentRunRoster: EMPTY_AGENT_RUN_ROSTER,
+  childMessages: {} as Record<string, Message[]>,
+  retryChildMessages: {} as Record<string, Message[]>,
   list_agents: AGENT_REGISTRY,
   refresh_agents: [],
   list_providers: [],
@@ -596,7 +612,7 @@ const FIXTURES: Record<string, unknown> = {
  * missing Tauri bridge. `plugin:*` invokes (event listen, window show)
  * resolve to null. Every call is recorded on `window.__mockCalls`.
  */
-export async function installMockIPC(page: Page, overrides: Record<string, unknown> = {}): Promise<void> {
+export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {}): Promise<void> {
   await page.addInitScript(
     (fixtures) => {
       const calls: Array<{ cmd: string; args: unknown }> = [];
@@ -628,18 +644,6 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         "orch_answer_block",
         "orch_steer",
       ]);
-      type MockMessage = {
-        sessionPk: string;
-        seq: number;
-        role: string;
-        blockType: string;
-        payload: { text: string };
-        toolCallId: null;
-        status: null;
-        toolKind: null;
-        createdAt: number;
-        speaker: null;
-      };
       type RouteIdentity = {
         resolvedProviderId: string;
         resolvedFamily: string;
@@ -656,7 +660,9 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
       };
       type DurableState = {
         sessions: (typeof SESSION)[];
-        messages: MockMessage[];
+        messages: Message[];
+        agentRunRoster: AgentRunRosterInfo;
+        childMessages: Record<string, Message[]>;
         route: RouteIdentity | null;
         routeRequests: number;
         modelRoutes: Array<{
@@ -677,12 +683,18 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             // Seeds pre-existing history (e.g. legacy/deleted-owner
             // transcripts) — most fixtures start empty and grow only via
             // observeRoute's route-switch notices.
-            messages: (fixtures.list_messages as MockMessage[] | undefined) ?? [],
+            messages: (fixtures.list_messages as Message[] | undefined) ?? [],
+            agentRunRoster: (fixtures.agentRunRoster as AgentRunRosterInfo | undefined) ?? EMPTY_AGENT_RUN_ROSTER,
+            childMessages: (fixtures.childMessages as Record<string, Message[]> | undefined) ?? {},
             route: null,
             routeRequests: 0,
             modelRoutes: fixtures.list_model_routes as DurableState["modelRoutes"],
           };
+      durable.agentRunRoster ??= (fixtures.agentRunRoster as AgentRunRosterInfo | undefined) ?? EMPTY_AGENT_RUN_ROSTER;
+      durable.childMessages ??= (fixtures.childMessages as Record<string, Message[]> | undefined) ?? {};
       let sessions = durable.sessions;
+      let agentRunRoster = durable.agentRunRoster;
+      let childMessages = durable.childMessages;
       let connections = fixtures.list_connections as ConnectionInfo[];
       let modelRoutes = durable.modelRoutes;
       const quotaAttempts = new Map<string, number>();
@@ -725,6 +737,8 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
 
       const persist = () => {
         durable.sessions = sessions;
+        durable.agentRunRoster = agentRunRoster;
+        durable.childMessages = childMessages;
         durable.modelRoutes = modelRoutes;
         localStorage.setItem(storageKey, JSON.stringify(durable));
       };
@@ -740,6 +754,54 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
           const callback = (window as unknown as Record<string, (payload: unknown) => void>)[`_${handler}`];
           callback?.({ event: "core-event-msg", id: 0, payload: { runnerId: "local", event } });
         }
+      };
+
+      const appendChildMessage = (runId: string, message: Message) => {
+        const rows = childMessages[runId] ?? [];
+        const index = message.toolCallId
+          ? rows.findIndex((row) => row.toolCallId === message.toolCallId)
+          : rows.findIndex((row) => row.seq === message.seq);
+        const next = rows.slice();
+        if (index >= 0) next[index] = message;
+        else next.push(message);
+        childMessages = { ...childMessages, [runId]: next.sort((left, right) => left.seq - right.seq) };
+      };
+
+      type MockCoreEventInput = {
+        event: CoreEvent;
+        roster?: AgentRunRosterInfo;
+        childMessage?: { runId: string; message: Message };
+      };
+
+      w.__emitMockCoreEvent = (input: MockCoreEventInput) => {
+        if (input.roster) agentRunRoster = input.roster;
+        if (input.childMessage) appendChildMessage(input.childMessage.runId, input.childMessage.message);
+        persist();
+        emitCoreEvent(input.event as unknown as Record<string, unknown>);
+      };
+
+      const createRetryRun = (args: unknown): AgentRun => {
+        const { runId } = args as { runId: string };
+        const previous = agentRunRoster.runs.find((run) => run.runId === runId);
+        if (!previous) throw new Error(`Unknown child run: ${runId}`);
+        const retried: AgentRun = {
+          ...previous,
+          runId: `${previous.runId}-retry`,
+          retryOf: previous.runId,
+          status: "queued",
+          startedAt: null,
+          finishedAt: null,
+          toolCount: 0,
+          result: null,
+          error: null,
+        };
+        agentRunRoster = { ...agentRunRoster, runs: [...agentRunRoster.runs, retried] };
+        childMessages = {
+          ...childMessages,
+          [retried.runId]: fixtures.retryChildMessages?.[previous.runId] ?? childMessages[retried.runId] ?? [],
+        };
+        persist();
+        return retried;
       };
 
       const observeRoute = (sessionPk: string) => {
@@ -798,7 +860,7 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
         }
 
         if (text) {
-          const message: MockMessage = {
+          const message: Message = {
             sessionPk,
             seq: durable.messages.length + 1,
             role: "system",
@@ -854,6 +916,12 @@ export async function installMockIPC(page: Page, overrides: Record<string, unkno
             const { sessionPk } = args as { sessionPk: string };
             return Promise.resolve(durable.messages.filter((message) => message.sessionPk === sessionPk));
           }
+          if (cmd === "get_child_runs") return Promise.resolve(agentRunRoster);
+          if (cmd === "get_child_transcript") {
+            const { runId } = args as { runId: string };
+            return Promise.resolve(childMessages[runId] ?? []);
+          }
+          if (cmd === "retry_child_run") return Promise.resolve(createRetryRun(args));
           if (cmd === "get_agent") {
             const { agentId } = args as { agentId: string };
             const details = fixtures.agent_details as Record<string, unknown>;

@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import type { AgentMention } from "../src/bindings";
+import type { AgentMention, AgentRun, AgentRunRosterInfo, CoreEvent, Message } from "../src/bindings";
 import {
   ACCOUNT_CATALOG,
   ACCOUNT_CONNECTIONS,
@@ -15,9 +15,30 @@ import {
   PROVIDER_FAMILY_ROUTE_SELECTIONS,
   REGISTRY_WITHOUT_REVIEWER,
   REVIEWER_CHILD_TRANSCRIPT,
+  SESSION,
 } from "./mock-ipc";
 
 test.beforeEach(async ({ page }, testInfo) => {
+  const dispatchOverrides = testInfo.title.startsWith("agent dispatch:")
+    ? {
+        list_sessions: [dispatchSession],
+        list_messages: [dispatchToolRow()],
+        agentRunRoster: roster([
+          childRun(testInfo.title.includes("retry") ? { status: "failed", error: "The fixture worker timed out.", finishedAt: 3_000 } : {}),
+        ]),
+        childMessages: testInfo.title.includes("retry")
+          ? {
+              [childRunId]: [
+                {
+                  ...childTextRow(),
+                  payload: { text: "The first attempt exceeded its timeout." },
+                },
+              ],
+            }
+          : { [childRunId]: [] },
+        retryChildMessages: testInfo.title.includes("retry") ? { [childRunId]: [retryChildTextRow()] } : {},
+      }
+    : {};
   const accountOverrides = testInfo.title.startsWith("accounts:")
     ? {
         list_provider_catalog: ACCOUNT_CATALOG,
@@ -28,8 +49,8 @@ test.beforeEach(async ({ page }, testInfo) => {
     : {};
   const delegationOverrides = testInfo.title.startsWith("delegation:")
     ? {
-        get_child_runs: [DELEGATE_ACTIVE_RUN, DELEGATE_DONE_RUN],
-        get_child_transcript: REVIEWER_CHILD_TRANSCRIPT,
+        agentRunRoster: { rootRunId: null, runs: [DELEGATE_ACTIVE_RUN, DELEGATE_DONE_RUN] },
+        childMessages: { [DELEGATE_ACTIVE_RUN.runId]: REVIEWER_CHILD_TRANSCRIPT },
         list_messages: [DELEGATION_PARENT_MESSAGE],
       }
     : {};
@@ -45,6 +66,7 @@ test.beforeEach(async ({ page }, testInfo) => {
       ? { route_selections: PROVIDER_FAMILY_ROUTE_SELECTIONS }
       : {}),
     ...accountOverrides,
+    ...dispatchOverrides,
     ...delegationOverrides,
     ...historyOverrides,
   });
@@ -59,6 +81,254 @@ async function selectDemoProject(page: import("@playwright/test").Page) {
   await page.getByRole("combobox", { name: "Project" }).click();
   await page.getByRole("option", { name: /demo/ }).click();
 }
+
+const dispatchSession = { ...SESSION, sessionPk: "dispatch-session", title: "Dispatch lifecycle", status: "running" as const };
+const rootRunId = "primary-dispatch-run";
+const dispatchToolCallId = "dispatch-tool-call";
+const childRunId = "release-scout-run";
+const retryRunId = `${childRunId}-retry`;
+const childPreviewText = "Child found the release script.";
+const retryTranscriptText = "The replacement attempt is checking the release checklist from the beginning.";
+const terminalResult = "Release checklist is ready for review.";
+
+function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
+  return {
+    runId: childRunId,
+    sessionPk: dispatchSession.sessionPk,
+    parentRunId: rootRunId,
+    retryOf: null,
+    sourceToolCallId: dispatchToolCallId,
+    dispatchIndex: 0,
+    primaryAgentId: "ryuzi",
+    executingAgentId: "release-scout",
+    executingAgentNameSnapshot: "Release Scout",
+    agentKind: "subagent",
+    task: "Inspect the release checklist",
+    status: "queued",
+    startedAt: null,
+    finishedAt: null,
+    toolCount: 0,
+    resolvedModel: "fixture/model-alpha",
+    resolvedEffort: "medium",
+    result: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+function dispatchToolRow(): Message {
+  return {
+    sessionPk: dispatchSession.sessionPk,
+    seq: 1,
+    role: "assistant",
+    blockType: "tool_call",
+    payload: { name: "task", input: { prompt: "Inspect the release checklist" } },
+    toolCallId: dispatchToolCallId,
+    status: "in_progress",
+    toolKind: "task",
+    createdAt: 1_000,
+    speaker: null,
+  };
+}
+
+function roster(runs: AgentRun[]): AgentRunRosterInfo {
+  return { rootRunId, runs };
+}
+
+function childToolRow(): Message {
+  return {
+    sessionPk: dispatchSession.sessionPk,
+    seq: 1,
+    role: "assistant",
+    blockType: "tool_call",
+    payload: { name: "read", input: { path: "package.json" } },
+    toolCallId: "release-scout-read-package",
+    status: "completed",
+    toolKind: "read",
+    createdAt: 2_000,
+    speaker: null,
+  };
+}
+
+function childTextRow(): Message {
+  return {
+    sessionPk: dispatchSession.sessionPk,
+    seq: 2,
+    role: "assistant",
+    blockType: "text",
+    payload: { text: childPreviewText },
+    toolCallId: null,
+    status: null,
+    toolKind: null,
+    createdAt: 2_100,
+    speaker: null,
+  };
+}
+
+function retryChildTextRow(): Message {
+  return {
+    ...childTextRow(),
+    seq: 1,
+    payload: { text: retryTranscriptText },
+    createdAt: 2_200,
+  };
+}
+
+type MockCoreEventInput = {
+  event: CoreEvent;
+  roster?: AgentRunRosterInfo;
+  childMessage?: { runId: string; message: Message };
+};
+
+async function emitMockCoreEvent(page: import("@playwright/test").Page, input: MockCoreEventInput): Promise<void> {
+  await page.evaluate((payload) => {
+    (window as unknown as { __emitMockCoreEvent: (input: MockCoreEventInput) => void }).__emitMockCoreEvent(payload);
+  }, input);
+}
+
+function selectedAgentRunDetail(page: import("@playwright/test").Page) {
+  return page.getByRole("button", { name: "Back to Agents" }).locator("xpath=../..");
+}
+
+test("agent dispatch: lifecycle cards hydrate, stream, complete, and reload", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+
+  const card = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText("Queued");
+  await expect(page.getByText("task", { exact: true })).toHaveCount(0);
+
+  const runningRun = childRun({ status: "running", startedAt: 2_000 });
+  await emitMockCoreEvent(page, {
+    roster: roster([runningRun]),
+    event: {
+      kind: "agentRunChanged",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      parent_run_id: rootRunId,
+      status: "running",
+    },
+  });
+  await expect(card).toContainText("Running");
+
+  await emitMockCoreEvent(page, {
+    childMessage: { runId: childRunId, message: childToolRow() },
+    event: {
+      kind: "agentRunMessage",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      seq: 1,
+      role: "assistant",
+      block_type: "tool_call",
+      payload: childToolRow().payload,
+      tool_call_id: childToolRow().toolCallId,
+      status: childToolRow().status,
+      tool_kind: childToolRow().toolKind,
+      speaker: null,
+    },
+  });
+  await emitMockCoreEvent(page, {
+    childMessage: { runId: childRunId, message: childTextRow() },
+    event: {
+      kind: "agentRunMessage",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      seq: 2,
+      role: "assistant",
+      block_type: "text",
+      payload: childTextRow().payload,
+      tool_call_id: null,
+      status: null,
+      tool_kind: null,
+      speaker: null,
+    },
+  });
+
+  await expect(card).toContainText("read · package.json");
+  await expect(card).toContainText(childPreviewText);
+  await expect(page.getByText("read", { exact: true })).toHaveCount(0);
+
+  await card.click();
+  await expect(page.getByTestId("right-panel-header").getByRole("button", { name: "Agents" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back to Agents" })).toBeVisible();
+  await page.getByRole("button", { name: "See 1 step" }).click();
+  await expect(page.getByText("read", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("package.json", { exact: true })).toHaveCount(1);
+  await expect(page.getByText(childPreviewText, { exact: true })).toHaveCount(2);
+
+  const completedRun = childRun({ status: "completed", startedAt: 2_000, finishedAt: 4_000, result: terminalResult, toolCount: 1 });
+  await emitMockCoreEvent(page, {
+    roster: roster([completedRun]),
+    event: {
+      kind: "agentRunChanged",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      parent_run_id: rootRunId,
+      status: "completed",
+    },
+  });
+  await expect(card).toContainText(terminalResult);
+
+  await page.reload();
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+  const rehydratedCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(rehydratedCard).toHaveCount(1);
+  await expect(rehydratedCard).toContainText("Completed");
+  await expect(rehydratedCard).toContainText(terminalResult);
+  await rehydratedCard.click();
+  await expect(page.getByText(terminalResult, { exact: true }).last()).toBeVisible();
+  await expect(page.getByText(childPreviewText, { exact: true }).last()).toBeVisible();
+});
+
+test("agent dispatch: retry keeps one card slot and both durable attempts", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+
+  const initialCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(initialCard).toHaveCount(1);
+  await initialCard.click();
+  await expect(page.getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
+  await page.getByRole("button", { name: "Retry" }).click();
+
+  const retryCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(retryCard).toHaveCount(1);
+  await expect(retryCard).toContainText("Queued");
+  await expect(retryCard).toContainText("Retry 2");
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "retry_child_run").at(-1)?.args)
+    .toMatchObject({
+      runId: childRunId,
+    });
+
+  await page.reload();
+  await page.getByText("Dispatch lifecycle", { exact: true }).click();
+  const rehydratedCard = page.getByRole("button", { name: "Open Release Scout agent run" });
+  await expect(rehydratedCard).toHaveCount(1);
+  await expect(rehydratedCard).toContainText("Queued");
+  await expect(rehydratedCard).toContainText("Retry 2");
+  await rehydratedCard.click();
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await expect(page.getByText("Done (1)", { exact: true })).toBeVisible();
+  await expect(page.getByText("Active (1)", { exact: true })).toBeVisible();
+  const activeRoster = page.getByText("Active (1)", { exact: true }).locator("xpath=..");
+  const doneRoster = page.getByText("Done (1)", { exact: true }).locator("xpath=..");
+  await expect(activeRoster.getByText("Release Scout", { exact: true })).toHaveCount(1);
+  await expect(doneRoster.getByText("Release Scout", { exact: true })).toHaveCount(1);
+  await activeRoster.getByText("Release Scout", { exact: true }).click();
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await doneRoster.getByText("Release Scout", { exact: true }).click();
+  await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
+  await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(0);
+  await expect
+    .poll(async () => (await mockCalls(page)).filter((call) => call.cmd === "get_child_transcript").map((call) => call.args?.runId))
+    .toEqual(expect.arrayContaining([childRunId, retryRunId]));
+});
 
 test("boots to Home with the project loaded", async ({ page }) => {
   await page.goto("/");

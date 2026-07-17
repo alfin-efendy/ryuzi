@@ -2,7 +2,10 @@
 
 use crate::engine_manager::EngineManager;
 use crate::error::CmdError;
-use ryuzi_core::{domain::AgentRun, Message};
+use ryuzi_core::{
+    domain::{AgentRun, AgentRunRosterInfo},
+    Message,
+};
 use std::sync::Arc;
 use tauri::State;
 
@@ -15,7 +18,7 @@ pub async fn get_child_runs(
     engine: Engine<'_>,
     runner_id: Option<String>,
     session_pk: String,
-) -> R<Vec<AgentRun>> {
+) -> R<AgentRunRosterInfo> {
     engine
         .client(runner_id.as_deref().unwrap_or("local"))?
         .rpc(

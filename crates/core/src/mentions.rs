@@ -475,6 +475,8 @@ mod tests {
             session_pk: "session".into(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: primary,
             executing_agent_id: Some("primary".into()),
             executing_agent_name_snapshot: "Primary".into(),

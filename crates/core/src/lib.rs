@@ -42,9 +42,6 @@ pub mod update;
 pub mod workspace;
 pub mod worktree;
 
-#[cfg(test)]
-mod agentic_upgrade_compat;
-
 pub use connector::{Connector, ConnectorCtx, ConnectorFactory, ConnectorRegistry};
 pub use control::{ControlPlane, ProvisionProjectRequest, ProvisionSettings};
 pub use domain::{

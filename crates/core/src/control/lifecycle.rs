@@ -260,6 +260,8 @@ impl ControlPlane {
             session_pk: session_pk.clone(),
             parent_run_id: None,
             retry_of: None,
+            source_tool_call_id: None,
+            dispatch_index: None,
             primary_agent_id: identity.id.clone(),
             executing_agent_id: Some(identity.id.clone()),
             executing_agent_name_snapshot: identity.name.clone(),
@@ -915,6 +917,7 @@ impl ControlPlane {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: session_pk.to_string(),
                 seq,
+                run_id: None,
                 role: "system".to_string(),
                 block_type: "status".to_string(),
                 payload,
@@ -935,6 +938,7 @@ impl ControlPlane {
             let _ = self.events.send(CoreEvent::Message {
                 session_pk: session_pk.to_string(),
                 seq,
+                run_id: None,
                 role: "system".to_string(),
                 block_type: "error".to_string(),
                 payload,
@@ -1812,6 +1816,7 @@ impl ControlPlane {
                                 task,
                                 context: None,
                                 background: false,
+                                dispatch: None,
                             })
                             .await;
                         (agent_id, agent_name, queued)

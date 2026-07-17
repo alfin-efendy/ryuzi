@@ -149,18 +149,30 @@ pub trait SubagentSpawner: Send + Sync {
     /// `max_concurrent_runs` setting) and return one result per spec, ordered
     /// by index. Individual failures land in their entry — the batch itself
     /// never fails.
-    async fn run_many(&self, specs: Vec<SubtaskSpec>) -> Vec<SubtaskResult>;
+    async fn run_many(
+        &self,
+        source_tool_call_id: &str,
+        specs: Vec<SubtaskSpec>,
+    ) -> Vec<SubtaskResult>;
     /// Names of agents that may be spawned (for the tool description/errors).
     fn available(&self) -> Vec<String>;
 
     /// Run one `agent_type` on `prompt` to completion and return its final
     /// text — the single-task view over [`Self::run_many`].
-    async fn run(&self, agent_type: &str, prompt: &str) -> anyhow::Result<String> {
+    async fn run(
+        &self,
+        source_tool_call_id: &str,
+        agent_type: &str,
+        prompt: &str,
+    ) -> anyhow::Result<String> {
         let mut results = self
-            .run_many(vec![SubtaskSpec {
-                agent_type: agent_type.to_string(),
-                prompt: prompt.to_string(),
-            }])
+            .run_many(
+                source_tool_call_id,
+                vec![SubtaskSpec {
+                    agent_type: agent_type.to_string(),
+                    prompt: prompt.to_string(),
+                }],
+            )
             .await;
         let r = results
             .pop()
@@ -175,7 +187,11 @@ pub trait SubagentSpawner: Send + Sync {
     /// Dispatch one subtask to run in the BACKGROUND (does not block the
     /// parent turn); its result re-enters the parent chat via the rail. The
     /// default rejects — only the top-level runner spawner supports it.
-    async fn run_background(&self, _spec: SubtaskSpec) -> BackgroundDispatch {
+    async fn run_background(
+        &self,
+        _source_tool_call_id: &str,
+        _spec: SubtaskSpec,
+    ) -> BackgroundDispatch {
         BackgroundDispatch::Rejected {
             note: "background delegation is not available for this agent".to_string(),
         }
