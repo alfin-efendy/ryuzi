@@ -368,7 +368,7 @@ fn stable_error_code(code: &str) -> String {
 
 fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
     let message = match code {
-        "invalid_input" => "Tool input is invalid",
+        "invalid_input" | "invalid_arguments" => "Tool input is invalid",
         "bad_argument" => "Bad argument",
         "invalid_tool_metadata_token" => INVALID_TOOL_METADATA_TOKEN,
         "duplicate_tool_metadata" => "Tool metadata contains a duplicate fact",
@@ -381,6 +381,7 @@ fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
         "tool_contract_too_large" => "Tool contract exceeds a safety limit",
         "path_kind_mismatch" => "Path kind does not match the tool contract",
         "tool_not_in_plan" => "Tool is not part of this run's frozen facade",
+        "invalid_persisted_tool_plan" => "The frozen tool plan is invalid",
         "capability_unavailable" => "Tool is currently unavailable",
         "permission_denied" => "Tool call was denied",
         "hook_denied" => "Tool call was denied by a policy hook",
@@ -401,15 +402,34 @@ fn public_error_message(category: ToolErrorCategory, code: &str) -> String {
 }
 
 fn stable_field_name(field: &str) -> String {
-    match field {
-        "arguments" | "command" | "content" | "cursor" | "id" | "input" | "name" | "path"
-        | "prompt" | "query" | "url" | "value" => field.to_string(),
-        _ => "field".to_string(),
+    let is_pointer = field.starts_with('/')
+        && field.len() <= 256
+        && field.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'~' | b'_' | b'-' | b'.')
+        });
+    if is_pointer {
+        field.to_string()
+    } else {
+        match field {
+            "arguments" | "command" | "content" | "cursor" | "id" | "input" | "name" | "path"
+            | "prompt" | "query" | "url" | "value" => field.to_string(),
+            _ => "field".to_string(),
+        }
     }
 }
 
-fn stable_field_error_message(_message: &str) -> String {
-    "Invalid field value".to_string()
+fn stable_field_error_message(message: &str) -> String {
+    match message {
+        "Missing required field"
+        | "Wrong type"
+        | "Disallowed option"
+        | "Array too short"
+        | "Array too long"
+        | "Unexpected field"
+        | "Ambiguous union"
+        | "Schema constraint failed" => message.to_string(),
+        _ => "Invalid field value".to_string(),
+    }
 }
 
 fn stable_error_candidate(candidate: &str) -> String {

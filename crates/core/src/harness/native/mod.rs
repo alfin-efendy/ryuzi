@@ -9,6 +9,7 @@
 //! See `docs/design/2026-07-05-native-agent-runtime-design.md`.
 
 pub mod agents;
+pub mod arguments;
 pub mod background;
 pub mod capabilities;
 pub mod commands;

@@ -3,6 +3,10 @@
 //! the [`CoreEvent`] surface the rest of the engine consumes.
 
 use super::agents::{Agent, AgentRegistry};
+use super::arguments::{
+    ArgumentGateway, PreparedToolCall, RejectedToolCall, ValidatedToolCall, WireToolCall,
+    MAX_RAW_ARGUMENT_BYTES,
+};
 use super::capabilities::{
     CapabilityInputs, CapabilityResolver, NativeToolsVersion, RuntimeToolSurfaces,
     ToolCapabilityProfile, ToolInteractionMode,
@@ -261,6 +265,34 @@ enum RunToolPlan {
     FrozenV2(CompiledSessionToolPlan),
 }
 
+enum V2BatchCall {
+    Validated(ValidatedToolCall),
+    Rejected(RejectedToolCall),
+}
+
+impl V2BatchCall {
+    fn id(&self) -> &str {
+        match self {
+            Self::Validated(call) => &call.wire.id,
+            Self::Rejected(call) => &call.wire.id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Validated(call) => &call.wire.name,
+            Self::Rejected(call) => &call.wire.name,
+        }
+    }
+
+    fn ledger_input(&self) -> Value {
+        match self {
+            Self::Validated(call) => call.input.clone(),
+            Self::Rejected(_) => json!({"_ryuzi_invalid_arguments": true}),
+        }
+    }
+}
+
 impl RunToolPlan {
     fn visible_definitions(&self) -> Option<&[Value]> {
         match self {
@@ -283,6 +315,86 @@ impl RunToolPlan {
             Self::V1 => NativeToolsVersion::V1,
             Self::CandidateV2(_) | Self::FrozenV2(_) => NativeToolsVersion::V2,
         }
+    }
+}
+
+fn validate_v2_batch(
+    deps: &RunnerDeps,
+    plan: &CompiledSessionToolPlan,
+    tool_calls: Vec<ToolAccum>,
+) -> Vec<V2BatchCall> {
+    let input_context = ToolInputCtx {
+        work_dir: &deps.work_dir,
+        attachments_dir: deps.attachments_dir.as_deref(),
+        extra_skill_dirs: &deps.extra_skill_dirs,
+    };
+    tool_calls
+        .into_iter()
+        .map(|tool_call| {
+            let mut wire = tool_call.wire_call();
+            let Some(planned) = plan.canonical_tools.get(&wire.name) else {
+                wire.discard_arguments();
+                return V2BatchCall::Rejected(RejectedToolCall {
+                    wire,
+                    canonical_name: None,
+                    error: Box::new(ToolError::precondition(
+                        "tool_not_in_plan",
+                        "Tool is not part of this run's frozen facade",
+                    )),
+                });
+            };
+            let Some(registered) = deps.tools.registered(&wire.name) else {
+                wire.discard_arguments();
+                return V2BatchCall::Rejected(RejectedToolCall {
+                    wire,
+                    canonical_name: Some(planned.canonical_name.clone()),
+                    error: Box::new(ToolError::precondition(
+                        "capability_unavailable",
+                        "Tool is missing from the current registry",
+                    )),
+                });
+            };
+            match ArgumentGateway::validate(wire, planned, registered.tool.clone(), &input_context)
+            {
+                Ok(validated) => {
+                    if let Some(repair) = validated.repair {
+                        record_native_tool_argument_repair(&deps.telemetry, repair.metric_label());
+                    }
+                    record_normalization_repairs(&deps.telemetry, &validated.normalization);
+                    V2BatchCall::Validated(validated)
+                }
+                Err(rejected) => V2BatchCall::Rejected(rejected),
+            }
+        })
+        .collect()
+}
+
+fn record_normalization_repairs(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    metadata: &ToolMetadata,
+) {
+    for entry in metadata.entries() {
+        let repair_kind = match entry {
+            ToolMetadataEntry::Coercion(token) => match token {
+                super::tool_contract::ToolMetadataToken::LosslessInteger => "lossless_integer",
+                super::tool_contract::ToolMetadataToken::LosslessBoolean => "lossless_boolean",
+                _ => "other",
+            },
+            ToolMetadataEntry::WorkspaceResolution(_)
+            | ToolMetadataEntry::AttachmentResolution(_)
+            | ToolMetadataEntry::SkillResolution(_) => "path_resolution",
+            _ => continue,
+        };
+        record_native_tool_argument_repair(telemetry, repair_kind);
+    }
+}
+
+fn record_tool_nudge(deps: &RunnerDeps, tool_name: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if tool_name == "skill_manage" {
+        deps.nudge.skill_iters.store(0, Relaxed);
+    } else {
+        deps.nudge.skill_iters.fetch_add(1, Relaxed);
     }
 }
 
@@ -1356,6 +1468,7 @@ async fn drive(
                                         .to_string(),
                                     start_input: block.get("input").cloned().unwrap_or(json!({})),
                                     input_json: String::new(),
+                                    input_overflowed: false,
                                 },
                             );
                         }
@@ -1365,7 +1478,7 @@ async fn drive(
                         partial_json,
                     } => {
                         if let Some(t) = turn.tools.get_mut(&index) {
-                            t.input_json.push_str(&partial_json);
+                            t.push_input_delta(&partial_json);
                         }
                     }
                     MessageStreamEvent::MessageDelta {
@@ -1416,13 +1529,31 @@ async fn drive(
                 content.push(json!({ "type": "text", "text": turn.text }));
             }
             let tool_calls: Vec<ToolAccum> = turn.tools.into_values().collect();
-            for t in &tool_calls {
-                content.push(json!({
-                    "type": "tool_use",
-                    "id": t.id,
-                    "name": t.name,
-                    "input": t.parsed_input(),
-                }));
+            let (legacy_calls, v2_calls) = match &run_tool_plan {
+                RunToolPlan::V1 => (Some(tool_calls), None),
+                RunToolPlan::CandidateV2(plan) | RunToolPlan::FrozenV2(plan) => {
+                    (None, Some(validate_v2_batch(deps, plan, tool_calls)))
+                }
+            };
+            if let Some(calls) = &legacy_calls {
+                for call in calls {
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.legacy_input(),
+                    }));
+                }
+            }
+            if let Some(calls) = &v2_calls {
+                for call in calls {
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": call.id(),
+                        "name": call.name(),
+                        "input": call.ledger_input(),
+                    }));
+                }
             }
             if content.is_empty() {
                 // An assistant turn must exist for valid role alternation, but an
@@ -1433,7 +1564,9 @@ async fn drive(
             }
             cm.append_assistant(json!(content)).await?;
 
-            if tool_calls.is_empty() {
+            let tool_calls_empty = legacy_calls.as_ref().is_none_or(Vec::is_empty)
+                && v2_calls.as_ref().is_none_or(Vec::is_empty);
+            if tool_calls_empty {
                 // The model answered in plain text with no tool call — normally
                 // end_turn. But a steer that landed during this round must not be
                 // dropped: the only other drain site rides the tool-result batch
@@ -1461,41 +1594,52 @@ async fn drive(
 
             // Execute each tool call, collecting tool_result blocks.
             let mut results: Vec<Value> = Vec::new();
-            for (i, t) in tool_calls.iter().enumerate() {
-                if cancel.is_cancelled() {
-                    if run_tool_plan.version() == NativeToolsVersion::V2 {
-                        for rest in &tool_calls[i..] {
-                            results.push(
-                                complete_queued_v2_cancellation(
-                                    deps,
-                                    rest,
-                                    &display,
-                                    &run_tool_plan,
-                                )
-                                .await,
-                            );
-                        }
-                    } else {
-                        for rest in &tool_calls[i..] {
+            if let Some(calls) = legacy_calls {
+                for (index, call) in calls.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        for rest in &calls[index..] {
                             results.push(tool_result(&rest.id, "Interrupted by user", true));
                         }
+                        break;
                     }
-                    break;
+                    results.push(
+                        run_legacy_tool_call(deps, agent, call, &display, &spawn, cancel).await,
+                    );
+                    record_tool_nudge(deps, &call.name);
                 }
-                results.push(
-                    run_tool_call(deps, agent, t, &display, &spawn, cancel, &run_tool_plan).await,
-                );
-                // "Tool iterations since last skill_manage" (§7.2): every
-                // dispatched tool other than `skill_manage` advances the
-                // skill-nudge counter; `skill_manage` itself resets it — the
-                // agent just acted on the skill signal, so the pressure that
-                // built up is spent. Shared across sub-agents (same `Arc`),
-                // mirroring `user_turns` — see `NudgeState`'s doc comment.
-                use std::sync::atomic::Ordering::Relaxed;
-                if t.name == "skill_manage" {
-                    deps.nudge.skill_iters.store(0, Relaxed);
-                } else {
-                    deps.nudge.skill_iters.fetch_add(1, Relaxed);
+            }
+            if let Some(calls) = v2_calls {
+                for call in calls {
+                    let name = call.name().to_string();
+                    let result = match call {
+                        V2BatchCall::Validated(validated) if cancel.is_cancelled() => {
+                            complete_queued_v2_cancellation(
+                                deps,
+                                validated,
+                                &display,
+                                &run_tool_plan,
+                            )
+                            .await
+                        }
+                        V2BatchCall::Validated(validated) => {
+                            run_tool_call(
+                                deps,
+                                agent,
+                                validated,
+                                &display,
+                                &spawn,
+                                cancel,
+                                &run_tool_plan,
+                            )
+                            .await
+                        }
+                        V2BatchCall::Rejected(rejected) => {
+                            complete_rejected_v2_call(deps, rejected, &display, &run_tool_plan)
+                                .await
+                        }
+                    };
+                    results.push(result);
+                    record_tool_nudge(deps, &name);
                 }
             }
             cm.append_tool_results(results).await?;
@@ -2660,332 +2804,249 @@ impl SubagentSpawner for RunnerSpawner {
 async fn run_tool_call(
     deps: &RunnerDeps,
     agent: &Agent,
-    t: &ToolAccum,
+    validated: ValidatedToolCall,
     display: &DisplayMode,
     spawn: &Option<Arc<dyn SubagentSpawner>>,
     cancel: &CancellationToken,
     run_tool_plan: &RunToolPlan,
 ) -> Value {
     let trace_id = uuid::Uuid::new_v4().simple().to_string();
-    let fallback_input = t.parsed_input();
-    let (tool, planned) = match run_tool_plan {
-        RunToolPlan::V1 => {
-            if t.name == LOAD_TOOLS_NAME {
-                return handle_load_tools(deps, agent, t, display).await;
-            }
-            let Some(tool) = deps.tools.get(&t.name) else {
-                let msg = format!("unknown tool `{}`", t.name);
-                insert_tool_row(deps, t, &fallback_input, "unknown", display.subagent()).await;
-                return complete_tool_call(
-                    deps,
-                    &t.id,
-                    ToolCompletionContext {
-                        version: NativeToolsVersion::V1,
-                        planned: None,
-                        tool_name: &t.name,
-                        tool_kind: "other",
-                        trace_id: &trace_id,
-                        duration_ms: 0,
-                        normalization: None,
-                        preflight: None,
-                    },
-                    ToolCompletionOutcome::Error {
-                        error: ToolError::precondition("tool_not_found", "Tool was not found"),
-                        legacy_text: msg,
-                    },
-                )
-                .await
-                .provider_result;
-            };
-            (tool, None)
-        }
-        RunToolPlan::CandidateV2(_) => {
-            return reject_v2_tool_call(
+    let planned = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) => plan.canonical_tools.get(&validated.canonical_name),
+        RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => None,
+    };
+    let Some(planned) = planned else {
+        return complete_validated_v2_error(
+            deps,
+            validated,
+            display,
+            None,
+            "unknown",
+            &trace_id,
+            ToolError::precondition("capability_unavailable", "The V2 tool facade is not frozen"),
+        )
+        .await;
+    };
+    let tool_kind = planned.descriptor.kind.as_str();
+    let plan = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) => plan,
+        RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => unreachable!(),
+    };
+    let unavailable = |message: &str| ToolError::precondition("capability_unavailable", message);
+    let available = match deps.tools.available(&validated.canonical_name).await {
+        Ok(Some(available)) => available,
+        Ok(None) => {
+            return complete_validated_v2_error(
                 deps,
-                t,
-                &fallback_input,
+                validated,
                 display,
-                ToolError::precondition(
-                    "capability_unavailable",
-                    "The V2 tool facade is not frozen",
-                ),
-                v2_completion_context(None, &t.name, "unknown", &trace_id),
+                Some(planned),
+                tool_kind,
+                &trace_id,
+                unavailable("Tool is missing from the current registry"),
             )
             .await;
         }
-        RunToolPlan::FrozenV2(plan) => {
-            let Some(planned) = plan.canonical_tools.get(&t.name) else {
-                return reject_v2_tool_call(
-                    deps,
-                    t,
-                    &fallback_input,
-                    display,
-                    ToolError::precondition(
-                        "tool_not_in_plan",
-                        "Tool is not part of this run's frozen facade",
-                    ),
-                    v2_completion_context(None, &t.name, "unknown", &trace_id),
-                )
-                .await;
-            };
-            let unavailable =
-                |message: String| ToolError::precondition("capability_unavailable", message);
-            let available = match deps.tools.available(&t.name).await {
-                Ok(Some(available)) => available,
-                Ok(None) => {
-                    return reject_v2_tool_call(
-                        deps,
-                        t,
-                        &fallback_input,
-                        display,
-                        unavailable("Tool is missing from the current registry".to_string()),
-                        v2_completion_context(
-                            Some(planned),
-                            &t.name,
-                            &planned.descriptor.kind,
-                            &trace_id,
-                        ),
-                    )
-                    .await;
-                }
-                Err(_error) => {
-                    return reject_v2_tool_call(
-                        deps,
-                        t,
-                        &fallback_input,
-                        display,
-                        unavailable("Tool is currently unavailable".to_string()),
-                        v2_completion_context(
-                            Some(planned),
-                            &t.name,
-                            &planned.descriptor.kind,
-                            &trace_id,
-                        ),
-                    )
-                    .await;
-                }
-            };
-            let current_hash = tool_plan::contract_hash_for_registered(
-                &available.registered,
-                &plan.plan.body.capability_profile,
-            );
-            if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
-                return reject_v2_tool_call(
-                    deps,
-                    t,
-                    &fallback_input,
-                    display,
-                    unavailable("Tool no longer matches its frozen contract".to_string()),
-                    v2_completion_context(
-                        Some(planned),
-                        &t.name,
-                        &planned.descriptor.kind,
-                        &trace_id,
-                    ),
-                )
-                .await;
-            }
-            (available.registered.tool.clone(), Some(planned))
-        }
-    };
-    let version = run_tool_plan.version();
-    let tool_kind = planned
-        .map(|planned| planned.descriptor.kind.as_str())
-        .unwrap_or_else(|| tool.kind());
-    // Enforce the agent's tool allow-list.
-    // A normal V2 plan was already filtered against the run's agent policy at
-    // compile time. Review forks intentionally advertise the parent's wider
-    // captured facade, so their live whitelist remains an additional gate.
-    let enforce_live_filter =
-        matches!(run_tool_plan, RunToolPlan::V1) || deps.review_tool_defs.is_some();
-    if enforce_live_filter && !agent.tools.allows(&t.name) {
-        let msg = format!(
-            "tool `{}` is not permitted for the `{}` agent",
-            t.name, agent.name
-        );
-        insert_tool_row(deps, t, &fallback_input, tool_kind, display.subagent()).await;
-        return complete_tool_call(
-            deps,
-            &t.id,
-            ToolCompletionContext {
-                version,
-                planned,
-                tool_name: &t.name,
+        Err(_) => {
+            return complete_validated_v2_error(
+                deps,
+                validated,
+                display,
+                Some(planned),
                 tool_kind,
-                trace_id: &trace_id,
-                duration_ms: 0,
-                normalization: None,
-                preflight: None,
-            },
-            ToolCompletionOutcome::Error {
-                error: ToolError::new(
-                    ToolErrorCategory::Permission,
-                    "permission_denied",
-                    "Tool is not permitted for this agent",
-                ),
-                legacy_text: msg,
-            },
-        )
-        .await
-        .provider_result;
-    }
-    if insert_tool_row(deps, t, &fallback_input, tool_kind, display.subagent()).await {
-        if let Err(error) = deps
-            .store
-            .increment_agent_run_tool_count(&deps.run_id)
-            .await
-        {
-            tracing::warn!(
-                "native: increment_agent_run_tool_count({}) failed: {error}",
-                deps.run_id
-            );
+                &trace_id,
+                unavailable("Tool is currently unavailable"),
+            )
+            .await;
         }
-    }
-
-    let (input, normalization, preflight) = if version == NativeToolsVersion::V2 {
-        let input = match t.parsed_input_checked() {
-            Ok(input) => input,
-            Err(error) => {
-                return complete_tool_call(
-                    deps,
-                    &t.id,
-                    ToolCompletionContext {
-                        version,
-                        planned,
-                        tool_name: &t.name,
-                        tool_kind,
-                        trace_id: &trace_id,
-                        duration_ms: 0,
-                        normalization: None,
-                        preflight: None,
-                    },
-                    ToolCompletionOutcome::Error {
-                        legacy_text: error.message.clone(),
-                        error,
-                    },
-                )
-                .await
-                .provider_result;
-            }
-        };
-        let input_context = ToolInputCtx {
-            work_dir: &deps.work_dir,
-            attachments_dir: deps.attachments_dir.as_deref(),
-            extra_skill_dirs: &deps.extra_skill_dirs,
-        };
-        let normalized = match tool.normalize_input(&input_context, input) {
-            Ok(normalized) => normalized,
-            Err(error) => {
-                return complete_tool_call(
-                    deps,
-                    &t.id,
-                    ToolCompletionContext {
-                        version,
-                        planned,
-                        tool_name: &t.name,
-                        tool_kind,
-                        trace_id: &trace_id,
-                        duration_ms: 0,
-                        normalization: None,
-                        preflight: None,
-                    },
-                    ToolCompletionOutcome::Error {
-                        legacy_text: error.message.clone(),
-                        error,
-                    },
-                )
-                .await
-                .provider_result;
-            }
-        };
-        if normalized.normalized {
-            let mut emitted = false;
-            for entry in normalized.metadata().entries() {
-                let repair_kind = match entry {
-                    ToolMetadataEntry::Coercion(token) => match token {
-                        super::tool_contract::ToolMetadataToken::LosslessInteger => {
-                            "lossless_integer"
-                        }
-                        super::tool_contract::ToolMetadataToken::LosslessBoolean => {
-                            "lossless_boolean"
-                        }
-                        _ => "other",
-                    },
-                    ToolMetadataEntry::WorkspaceResolution(_)
-                    | ToolMetadataEntry::AttachmentResolution(_)
-                    | ToolMetadataEntry::SkillResolution(_) => "path_resolution",
-                    _ => continue,
-                };
-                record_native_tool_argument_repair(&deps.telemetry, repair_kind);
-                emitted = true;
-            }
-            if !emitted {
-                record_native_tool_argument_repair(&deps.telemetry, "json_repair");
-            }
-        }
-        let preflight = match tool.preflight(&input_context, &normalized.value).await {
-            Ok(preflight) => preflight,
-            Err(error) => {
-                return complete_tool_call(
-                    deps,
-                    &t.id,
-                    ToolCompletionContext {
-                        version,
-                        planned,
-                        tool_name: &t.name,
-                        tool_kind,
-                        trace_id: &trace_id,
-                        duration_ms: 0,
-                        normalization: Some(normalized.metadata().clone()),
-                        preflight: None,
-                    },
-                    ToolCompletionOutcome::Error {
-                        legacy_text: error.message.clone(),
-                        error,
-                    },
-                )
-                .await
-                .provider_result;
-            }
-        };
-        let normalization = normalized.metadata().clone();
-        (
-            normalized.value,
-            Some(normalization),
-            Some(preflight.metadata().clone()),
-        )
-    } else {
-        (fallback_input, None, None)
     };
+    let current_hash = tool_plan::contract_hash_for_registered(
+        &available.registered,
+        &plan.plan.body.capability_profile,
+    );
+    if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
+        return complete_validated_v2_error(
+            deps,
+            validated,
+            display,
+            Some(planned),
+            tool_kind,
+            &trace_id,
+            unavailable("Tool no longer matches its frozen contract"),
+        )
+        .await;
+    }
+    if deps.review_tool_defs.is_some() && !agent.tools.allows(&validated.canonical_name) {
+        return complete_validated_v2_error(
+            deps,
+            validated,
+            display,
+            Some(planned),
+            tool_kind,
+            &trace_id,
+            ToolError::new(
+                ToolErrorCategory::Permission,
+                "permission_denied",
+                "Tool is not permitted for this agent",
+            ),
+        )
+        .await;
+    }
 
-    // Plugin hooks: a `tool.before` hook (script or extension) may deny the
-    // call — see `hooks::fire_hook`'s combine contract.
+    if insert_tool_row_parts(
+        deps,
+        &validated.wire.id,
+        &validated.wire.name,
+        &validated.input,
+        tool_kind,
+        display.subagent(),
+    )
+    .await
+    {
+        increment_tool_count(deps).await;
+    }
+    let input_context = ToolInputCtx {
+        work_dir: &deps.work_dir,
+        attachments_dir: deps.attachments_dir.as_deref(),
+        extra_skill_dirs: &deps.extra_skill_dirs,
+    };
+    let preflight = match validated
+        .tool
+        .preflight(&input_context, &validated.input)
+        .await
+    {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            return complete_tool_call(
+                deps,
+                &validated.wire.id,
+                ToolCompletionContext {
+                    version: NativeToolsVersion::V2,
+                    planned: Some(planned),
+                    tool_name: &validated.wire.name,
+                    tool_kind,
+                    trace_id: &trace_id,
+                    duration_ms: 0,
+                    normalization: Some(validated.normalization),
+                    preflight: None,
+                },
+                ToolCompletionOutcome::Error {
+                    legacy_text: error.message.clone(),
+                    error,
+                },
+            )
+            .await
+            .provider_result;
+        }
+    };
+    let prepared = PreparedToolCall {
+        validated,
+        preflight,
+    };
+    let PreparedToolCall {
+        validated,
+        preflight,
+    } = prepared;
+    execute_tool_call(
+        deps,
+        agent,
+        &validated.wire.id,
+        &validated.wire.name,
+        validated.tool,
+        validated.input,
+        NativeToolsVersion::V2,
+        Some(planned),
+        tool_kind,
+        &trace_id,
+        Some(validated.normalization),
+        Some(preflight.metadata().clone()),
+        spawn,
+        cancel,
+    )
+    .await
+}
+
+async fn complete_validated_v2_error(
+    deps: &RunnerDeps,
+    validated: ValidatedToolCall,
+    display: &DisplayMode,
+    planned: Option<&PlannedTool>,
+    tool_kind: &str,
+    trace_id: &str,
+    error: ToolError,
+) -> Value {
+    insert_tool_row_parts(
+        deps,
+        &validated.wire.id,
+        &validated.wire.name,
+        &validated.input,
+        tool_kind,
+        display.subagent(),
+    )
+    .await;
+    let legacy_text = format!("{}: {}", error.code, error.message);
+    complete_tool_call(
+        deps,
+        &validated.wire.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V2,
+            planned,
+            tool_name: &validated.wire.name,
+            tool_kind,
+            trace_id,
+            duration_ms: 0,
+            normalization: Some(validated.normalization),
+            preflight: None,
+        },
+        ToolCompletionOutcome::Error { error, legacy_text },
+    )
+    .await
+    .provider_result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_call(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    tool_call_id: &str,
+    tool_name: &str,
+    tool: Arc<dyn super::tools::Tool>,
+    input: Value,
+    version: NativeToolsVersion,
+    planned: Option<&PlannedTool>,
+    tool_kind: &str,
+    trace_id: &str,
+    normalization: Option<ToolMetadata>,
+    preflight: Option<ToolMetadata>,
+    spawn: &Option<Arc<dyn SubagentSpawner>>,
+    cancel: &CancellationToken,
+) -> Value {
     let hook = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
         super::hooks::HookEvent::ToolBefore,
-        &json!({ "tool": t.name, "input": input }),
+        &json!({ "tool": tool_name, "input": input }),
     )
     .await;
     crate::automation::dispatch_lifecycle_observation(
         deps.automation_events.clone(),
         crate::automation::TriggerKind::ToolBefore,
         deps.session_pk.clone(),
-        json!({ "tool": t.name, "input": input }),
+        json!({ "tool": tool_name, "input": input }),
     );
     if !hook.allowed {
-        let msg = hook
+        let message = hook
             .message
             .unwrap_or_else(|| "blocked by plugin hook".to_string());
         return complete_tool_call(
             deps,
-            &t.id,
+            tool_call_id,
             ToolCompletionContext {
                 version,
                 planned,
-                tool_name: &t.name,
+                tool_name,
                 tool_kind,
-                trace_id: &trace_id,
+                trace_id,
                 duration_ms: 0,
                 normalization,
                 preflight,
@@ -2996,14 +3057,13 @@ async fn run_tool_call(
                     "hook_denied",
                     "Tool call was denied by a policy hook",
                 ),
-                legacy_text: msg,
+                legacy_text: message,
             },
         )
         .await
         .provider_result;
     }
 
-    // Permission gate. Read the mode fresh so a mid-session change applies.
     let perm_mode = deps.current_perm_mode();
     let spec = tool.permission(&input);
     let gate = super::permission::PermGate {
@@ -3016,18 +3076,14 @@ async fn run_tool_call(
         run_id: &deps.run_id,
         requesting_agent_id: &deps.primary_agent.profile.id,
         requesting_agent_name: &agent.name,
-        tool_call_id: &t.id,
+        tool_call_id,
         approvals: &deps.approvals,
         events: &deps.events,
         cancel,
     };
     let decision = evaluate(&spec, &input, &gate).await;
     if decision == PermDecision::Deny {
-        // Plan mode denies mutations outright (no prompt) — tell the model why
-        // so it plans instead of retrying, rather than showing "Denied by user".
-        let msg = if cancel.is_cancelled() {
-            // Stopped while gated/parked: pair the tool_use with an
-            // interrupted tool_result, not a user denial.
+        let message = if cancel.is_cancelled() {
             "Interrupted by user"
         } else if perm_mode == PermMode::Plan && !matches!(tool_kind, "read") {
             "Plan mode is read-only: file edits and shell commands are disabled. \
@@ -3036,11 +3092,7 @@ async fn run_tool_call(
             "Denied by user"
         };
         let error = if cancel.is_cancelled() {
-            ToolError::new(
-                ToolErrorCategory::Cancelled,
-                "cancelled",
-                "Tool call was cancelled",
-            )
+            cancelled_tool_error()
         } else {
             ToolError::new(
                 ToolErrorCategory::Permission,
@@ -3050,37 +3102,32 @@ async fn run_tool_call(
         };
         return complete_tool_call(
             deps,
-            &t.id,
+            tool_call_id,
             ToolCompletionContext {
                 version,
                 planned,
-                tool_name: &t.name,
+                tool_name,
                 tool_kind,
-                trace_id: &trace_id,
+                trace_id,
                 duration_ms: 0,
                 normalization,
                 preflight,
             },
             ToolCompletionOutcome::Error {
                 error,
-                legacy_text: msg.to_string(),
+                legacy_text: message.to_string(),
             },
         )
         .await
         .provider_result;
     }
 
-    // Snapshot the worktree before a mutating tool runs, so `revert` can undo
-    // it. `revert` itself must not snapshot (it would capture the change it is
-    // about to undo).
-    if matches!(tool_kind, "edit" | "execute") && t.name != "revert" {
+    if matches!(tool_kind, "edit" | "execute") && tool_name != "revert" {
         if let Some(sha) = super::snapshot::take(&deps.work_dir).await {
             deps.snapshots.lock().await.push(sha);
         }
     }
 
-    // Execute. Timed from here — after the permission gate — so a long human
-    // approval wait never inflates the card's duration badge.
     let started = std::time::Instant::now();
     let ctx = ToolCtx {
         session_pk: deps.session_pk.clone(),
@@ -3095,7 +3142,7 @@ async fn run_tool_call(
         main_agent_spawn: Some(Arc::new(RunnerMainAgentSpawner { deps: deps.clone() })),
         memory: deps.memory.clone(),
         snapshots: deps.snapshots.clone(),
-        tool_call_id: t.id.clone(),
+        tool_call_id: tool_call_id.to_string(),
         interaction: Some(Arc::new(super::tools::Interaction {
             approvals: deps.approvals.clone(),
             events: deps.events.clone(),
@@ -3109,8 +3156,6 @@ async fn run_tool_call(
         write_origin: deps.write_origin,
         viewed_skills: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
-    // Keep a copy for the `tool.after` payload below — `execute` consumes
-    // `input` by value.
     let hook_input = input.clone();
     let execution = tool.execute(&ctx, input).await;
     let duration_ms = elapsed_ms(started);
@@ -3127,13 +3172,13 @@ async fn run_tool_call(
     };
     let completed = complete_tool_call(
         deps,
-        &t.id,
+        tool_call_id,
         ToolCompletionContext {
             version,
             planned,
-            tool_name: &t.name,
+            tool_name,
             tool_kind,
-            trace_id: &trace_id,
+            trace_id,
             duration_ms,
             normalization,
             preflight,
@@ -3141,50 +3186,137 @@ async fn run_tool_call(
         outcome,
     )
     .await;
-    // Observational: never gates, result ignored. Fires for both Ok and Err
-    // outcomes now that the `ToolOutput` (or its error) has resolved.
-    fire_tool_after_observation(deps, &t.name, hook_input, completed.hook_summary).await;
+    fire_tool_after_observation(deps, tool_name, hook_input, completed.hook_summary).await;
     completed.provider_result
 }
 
+async fn run_legacy_tool_call(
+    deps: &RunnerDeps,
+    agent: &Agent,
+    tool_call: &ToolAccum,
+    display: &DisplayMode,
+    spawn: &Option<Arc<dyn SubagentSpawner>>,
+    cancel: &CancellationToken,
+) -> Value {
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let input = tool_call.legacy_input();
+    if tool_call.name == LOAD_TOOLS_NAME {
+        return handle_load_tools(deps, agent, tool_call, display).await;
+    }
+    let Some(tool) = deps.tools.get(&tool_call.name) else {
+        let message = format!("unknown tool `{}`", tool_call.name);
+        insert_tool_row(deps, tool_call, &input, "unknown", display.subagent()).await;
+        return complete_tool_call(
+            deps,
+            &tool_call.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V1,
+                planned: None,
+                tool_name: &tool_call.name,
+                tool_kind: "other",
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::precondition("tool_not_found", "Tool was not found"),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
+    };
+    let tool_kind = tool.kind();
+    if !agent.tools.allows(&tool_call.name) {
+        let message = format!(
+            "tool `{}` is not permitted for the `{}` agent",
+            tool_call.name, agent.name
+        );
+        insert_tool_row(deps, tool_call, &input, tool_kind, display.subagent()).await;
+        return complete_tool_call(
+            deps,
+            &tool_call.id,
+            ToolCompletionContext {
+                version: NativeToolsVersion::V1,
+                planned: None,
+                tool_name: &tool_call.name,
+                tool_kind,
+                trace_id: &trace_id,
+                duration_ms: 0,
+                normalization: None,
+                preflight: None,
+            },
+            ToolCompletionOutcome::Error {
+                error: ToolError::new(
+                    ToolErrorCategory::Permission,
+                    "permission_denied",
+                    "Tool is not permitted for this agent",
+                ),
+                legacy_text: message,
+            },
+        )
+        .await
+        .provider_result;
+    }
+    if insert_tool_row(deps, tool_call, &input, tool_kind, display.subagent()).await {
+        increment_tool_count(deps).await;
+    }
+    execute_tool_call(
+        deps,
+        agent,
+        &tool_call.id,
+        &tool_call.name,
+        tool,
+        input,
+        NativeToolsVersion::V1,
+        None,
+        tool_kind,
+        &trace_id,
+        None,
+        None,
+        spawn,
+        cancel,
+    )
+    .await
+}
 async fn complete_queued_v2_cancellation(
     deps: &RunnerDeps,
-    t: &ToolAccum,
+    validated: ValidatedToolCall,
     display: &DisplayMode,
     run_tool_plan: &RunToolPlan,
 ) -> Value {
     let planned = match run_tool_plan {
-        RunToolPlan::FrozenV2(plan) => plan.canonical_tools.get(&t.name),
+        RunToolPlan::FrozenV2(plan) => plan.canonical_tools.get(&validated.canonical_name),
         RunToolPlan::V1 | RunToolPlan::CandidateV2(_) => None,
     };
     let tool_kind = planned
         .map(|planned| planned.descriptor.kind.as_str())
         .unwrap_or("other");
-    let input = t.parsed_input();
-    if insert_tool_row(deps, t, &input, tool_kind, display.subagent()).await {
-        if let Err(error) = deps
-            .store
-            .increment_agent_run_tool_count(&deps.run_id)
-            .await
-        {
-            tracing::warn!(
-                "native: increment_agent_run_tool_count({}) failed: {error}",
-                deps.run_id
-            );
-        }
+    if insert_tool_row_parts(
+        deps,
+        &validated.wire.id,
+        &validated.wire.name,
+        &validated.input,
+        tool_kind,
+        display.subagent(),
+    )
+    .await
+    {
+        increment_tool_count(deps).await;
     }
     let trace_id = uuid::Uuid::new_v4().simple().to_string();
     let completed = complete_tool_call(
         deps,
-        &t.id,
+        &validated.wire.id,
         ToolCompletionContext {
             version: NativeToolsVersion::V2,
             planned,
-            tool_name: &t.name,
+            tool_name: &validated.wire.name,
             tool_kind,
             trace_id: &trace_id,
             duration_ms: 0,
-            normalization: None,
+            normalization: Some(validated.normalization),
             preflight: None,
         },
         ToolCompletionOutcome::Error {
@@ -3193,8 +3325,64 @@ async fn complete_queued_v2_cancellation(
         },
     )
     .await;
-    fire_tool_after_observation(deps, &t.name, input, completed.hook_summary).await;
+    fire_tool_after_observation(
+        deps,
+        &validated.wire.name,
+        validated.input,
+        completed.hook_summary,
+    )
+    .await;
     completed.provider_result
+}
+
+async fn complete_rejected_v2_call(
+    deps: &RunnerDeps,
+    rejected: RejectedToolCall,
+    display: &DisplayMode,
+    run_tool_plan: &RunToolPlan,
+) -> Value {
+    let planned = match run_tool_plan {
+        RunToolPlan::FrozenV2(plan) | RunToolPlan::CandidateV2(plan) => rejected
+            .canonical_name
+            .as_deref()
+            .and_then(|name| plan.canonical_tools.get(name)),
+        RunToolPlan::V1 => None,
+    };
+    let tool_kind = planned
+        .map(|planned| planned.descriptor.kind.as_str())
+        .unwrap_or("other");
+    let marker = json!({"_ryuzi_invalid_arguments": true});
+    insert_tool_row_parts(
+        deps,
+        &rejected.wire.id,
+        &rejected.wire.name,
+        &marker,
+        tool_kind,
+        display.subagent(),
+    )
+    .await;
+    let trace_id = uuid::Uuid::new_v4().simple().to_string();
+    let legacy_text = format!("{}: {}", rejected.error.code, rejected.error.message);
+    complete_tool_call(
+        deps,
+        &rejected.wire.id,
+        ToolCompletionContext {
+            version: NativeToolsVersion::V2,
+            planned,
+            tool_name: &rejected.wire.name,
+            tool_kind,
+            trace_id: &trace_id,
+            duration_ms: 0,
+            normalization: None,
+            preflight: None,
+        },
+        ToolCompletionOutcome::Error {
+            error: *rejected.error,
+            legacy_text,
+        },
+    )
+    .await
+    .provider_result
 }
 
 fn cancelled_tool_error() -> ToolError {
@@ -3227,44 +3415,6 @@ async fn fire_tool_after_observation(
     );
 }
 
-async fn reject_v2_tool_call(
-    deps: &RunnerDeps,
-    t: &ToolAccum,
-    input: &Value,
-    display: &DisplayMode,
-    error: ToolError,
-    context: ToolCompletionContext<'_>,
-) -> Value {
-    insert_tool_row(deps, t, input, context.tool_kind, display.subagent()).await;
-    let legacy_text = format!("{}: {}", error.code, error.message);
-    complete_tool_call(
-        deps,
-        &t.id,
-        context,
-        ToolCompletionOutcome::Error { error, legacy_text },
-    )
-    .await
-    .provider_result
-}
-
-fn v2_completion_context<'a>(
-    planned: Option<&'a PlannedTool>,
-    tool_name: &'a str,
-    tool_kind: &'a str,
-    trace_id: &'a str,
-) -> ToolCompletionContext<'a> {
-    ToolCompletionContext {
-        version: NativeToolsVersion::V2,
-        planned,
-        tool_name,
-        tool_kind,
-        trace_id,
-        duration_ms: 0,
-        normalization: None,
-        preflight: None,
-    }
-}
-
 /// Handle the synthetic `load_tools` meta-call: activate the requested deferred
 /// tools into `deps.activated_tools` so they are advertised from the next
 /// provider turn. Validated against the tools this agent may actually load
@@ -3276,13 +3426,33 @@ async fn handle_load_tools(
     t: &ToolAccum,
     display: &DisplayMode,
 ) -> Value {
-    let input = t.parsed_input();
+    let input = t.legacy_input();
     insert_tool_row(deps, t, &input, "other", display.subagent()).await;
 
     let Some(activated) = deps.activated_tools.as_ref() else {
         let msg = "load_tools is not available in this session";
         return complete_v1_load_tools(deps, t, ToolOutput::error(msg)).await;
     };
+
+    let load_tools_schema = json!({
+        "type": "object",
+        "properties": {
+            "names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1
+            }
+        },
+        "required": ["names"],
+        "additionalProperties": false
+    });
+    if match jsonschema::validator_for(&load_tools_schema) {
+        Ok(validator) => !validator.is_valid(&input),
+        Err(_) => true,
+    } {
+        let message = "No tool names given. Provide the exact tool names to load, taken from the load_tools description.";
+        return complete_v1_load_tools(deps, t, ToolOutput::error(message)).await;
+    }
 
     let loadable: std::collections::BTreeSet<String> = deps
         .tools
@@ -3377,7 +3547,18 @@ async fn insert_tool_row(
     kind: &str,
     subagent: Option<&str>,
 ) -> bool {
-    let mut payload = json!({ "name": t.name, "input": input });
+    insert_tool_row_parts(deps, &t.id, &t.name, input, kind, subagent).await
+}
+
+async fn insert_tool_row_parts(
+    deps: &RunnerDeps,
+    id: &str,
+    name: &str,
+    input: &Value,
+    kind: &str,
+    subagent: Option<&str>,
+) -> bool {
+    let mut payload = json!({ "name": name, "input": input });
     if let Some(label) = subagent {
         payload["subagent"] = json!(label);
     }
@@ -3386,11 +3567,24 @@ async fn insert_tool_row(
         "assistant",
         "tool_call",
         payload,
-        Some(t.id.clone()),
+        Some(id.to_string()),
         Some("in_progress".to_string()),
         Some(kind.to_string()),
     )
     .await
+}
+
+async fn increment_tool_count(deps: &RunnerDeps) {
+    if let Err(error) = deps
+        .store
+        .increment_agent_run_tool_count(&deps.run_id)
+        .await
+    {
+        tracing::warn!(
+            "native: increment_agent_run_tool_count({}) failed: {error}",
+            deps.run_id
+        );
+    }
 }
 
 struct ToolCompletionContext<'a> {
@@ -3689,7 +3883,13 @@ pub(crate) fn record_native_tool_argument_repair(
     repair_kind: &str,
 ) {
     let repair_kind = match repair_kind {
-        "json_repair" | "lossless_integer" | "lossless_boolean" | "path_resolution" => repair_kind,
+        "json_repair"
+        | "trailing_comma"
+        | "missing_closing_delimiter"
+        | "trailing_comma_and_missing_closing_delimiter"
+        | "lossless_integer"
+        | "lossless_boolean"
+        | "path_resolution" => repair_kind,
         _ => "other",
     };
     telemetry.count(
@@ -4209,24 +4409,42 @@ struct ToolAccum {
     name: String,
     start_input: Value,
     input_json: String,
+    input_overflowed: bool,
 }
 
 impl ToolAccum {
-    /// The tool input: the streamed `input_json` if present, else the object
-    /// carried on the `content_block_start`.
-    fn parsed_input(&self) -> Value {
+    fn legacy_input(&self) -> Value {
         if self.input_json.trim().is_empty() {
             return self.start_input.clone();
         }
         serde_json::from_str(&self.input_json).unwrap_or_else(|_| self.start_input.clone())
     }
 
-    fn parsed_input_checked(&self) -> Result<Value, ToolError> {
-        if self.input_json.trim().is_empty() {
-            return Ok(self.start_input.clone());
+    fn wire_call(self) -> WireToolCall {
+        WireToolCall::from_owned(
+            self.id,
+            self.name,
+            self.start_input,
+            self.input_json,
+            self.input_overflowed,
+        )
+    }
+
+    fn push_input_delta(&mut self, partial: &str) {
+        if self.input_overflowed {
+            return;
         }
-        serde_json::from_str(&self.input_json)
-            .map_err(|_| ToolError::caller("invalid_input", "Tool input is not valid JSON"))
+        let remaining = MAX_RAW_ARGUMENT_BYTES.saturating_sub(self.input_json.len());
+        if partial.len() <= remaining {
+            self.input_json.push_str(partial);
+            return;
+        }
+        let mut boundary = remaining.min(partial.len());
+        while boundary > 0 && !partial.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        self.input_json.push_str(&partial[..boundary]);
+        self.input_overflowed = true;
     }
 }
 
@@ -4504,6 +4722,99 @@ mod tests {
         effects: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[derive(Default)]
+    struct GatewayCounters {
+        normalize: std::sync::atomic::AtomicUsize,
+        preflight: std::sync::atomic::AtomicUsize,
+        permission: std::sync::atomic::AtomicUsize,
+        execute: std::sync::atomic::AtomicUsize,
+    }
+
+    struct GatewayTool {
+        name: String,
+        schema: Value,
+        counters: Arc<GatewayCounters>,
+        shared_state: Arc<std::sync::atomic::AtomicUsize>,
+        expected_preflight_state: Option<usize>,
+        state_after_execute: Option<usize>,
+        file_after_execute: Option<std::path::PathBuf>,
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for GatewayTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "argument gateway test tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            self.schema.clone()
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn normalize_input(
+            &self,
+            _ctx: &ToolInputCtx<'_>,
+            input: Value,
+        ) -> Result<super::super::tool_contract::NormalizedInput, ToolError> {
+            self.counters
+                .normalize
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::super::tool_contract::NormalizedInput::unchanged(
+                input,
+            ))
+        }
+
+        async fn preflight(
+            &self,
+            _ctx: &ToolInputCtx<'_>,
+            _input: &Value,
+        ) -> Result<super::super::tool_contract::PreflightMeta, ToolError> {
+            self.counters
+                .preflight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(expected) = self.expected_preflight_state {
+                assert_eq!(
+                    self.shared_state.load(std::sync::atomic::Ordering::SeqCst),
+                    expected,
+                    "preflight must observe state left by the preceding sibling"
+                );
+            }
+            Ok(super::super::tool_contract::PreflightMeta::default())
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            self.counters
+                .permission
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::harness::native::tools::PermissionSpec::new("gateway-test", "gateway test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.counters
+                .execute
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(state) = self.state_after_execute {
+                self.shared_state
+                    .store(state, std::sync::atomic::Ordering::SeqCst);
+            }
+            if let Some(path) = &self.file_after_execute {
+                std::fs::write(path, "handler-ran")?;
+            }
+            Ok(crate::harness::native::tools::ToolOutput::ok("executed"))
+        }
+    }
+
     impl ContractTool {
         fn available(
             name: &str,
@@ -4617,6 +4928,32 @@ mod tests {
             capability_schema_version:
                 crate::harness::native::capabilities::CAPABILITY_SCHEMA_VERSION,
         }
+    }
+
+    fn gateway_path_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+
+    fn gateway_tool(
+        name: &str,
+        schema: Value,
+        counters: Arc<GatewayCounters>,
+        shared_state: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<GatewayTool> {
+        Arc::new(GatewayTool {
+            name: name.into(),
+            schema,
+            counters,
+            shared_state,
+            expected_preflight_state: None,
+            state_after_execute: None,
+            file_after_execute: None,
+        })
     }
 
     fn enable_v2(deps: &mut RunnerDeps) {
@@ -7422,6 +7759,375 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_arguments_have_no_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let would_write = dir.path().join("handler-ran.txt");
+        let counters = Arc::new(GatewayCounters::default());
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tool = GatewayTool {
+            name: "gateway_invalid".into(),
+            schema: gateway_path_schema(),
+            counters: counters.clone(),
+            shared_state: state,
+            expected_preflight_state: None,
+            state_after_execute: None,
+            file_after_execute: Some(would_write.clone()),
+        };
+        tool.state_after_execute = Some(1);
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "invalid-1", "gateway_invalid"),
+                input_json_delta(0, r#"{"path":"private-token","unexpected":"raw-secret"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let hook_calls = Arc::new(RecordingExtensionEvents::default());
+        deps.extension_events = Some(hook_calls.clone());
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(tool)]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_invalid".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.normalize.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.preflight.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(hook_calls.calls.lock().unwrap().is_empty());
+        assert!(deps.snapshots.lock().await.is_empty());
+        assert!(!would_write.exists());
+
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let tool_use = turns
+            .iter()
+            .find(|turn| turn.role == "assistant" && turn.payload[0]["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(
+            tool_use.payload[0]["input"],
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        let result_turn = turns
+            .iter()
+            .find(|turn| turn.role == "user" && turn.payload[0]["type"] == "tool_result")
+            .unwrap();
+        let envelope: Value =
+            serde_json::from_str(result_turn.payload[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["code"], "invalid_arguments");
+
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let tool_row = rows
+            .iter()
+            .find(|message| message.block_type == "tool_call")
+            .unwrap();
+        assert_eq!(
+            tool_row.payload["input"],
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        let persisted = serde_json::to_string(&(turns, rows)).unwrap();
+        assert!(!persisted.contains("private-token"));
+        assert!(!persisted.contains("raw-secret"));
+    }
+
+    #[tokio::test]
+    async fn mixed_valid_and_invalid_tool_calls_keep_ledger_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = gateway_tool(
+            "gateway_mixed",
+            gateway_path_schema(),
+            counters.clone(),
+            state,
+        );
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "mixed-1", "gateway_mixed"),
+                input_json_delta(0, r#"{"path":"a"}"#),
+                tool_use_start(1, "mixed-2", "gateway_mixed"),
+                input_json_delta(1, r#"{"path":2}"#),
+                tool_use_start(2, "mixed-3", "gateway_mixed"),
+                input_json_delta(2, r#"{"path":"c"}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_mixed".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let tool_use = turns
+            .iter()
+            .find(|turn| {
+                turn.role == "assistant"
+                    && turn
+                        .payload
+                        .as_array()
+                        .is_some_and(|payload| payload.len() == 3)
+            })
+            .unwrap();
+        assert_eq!(tool_use.payload[0]["id"], "mixed-1");
+        assert_eq!(tool_use.payload[1]["id"], "mixed-2");
+        assert_eq!(tool_use.payload[2]["id"], "mixed-3");
+        assert_eq!(
+            tool_use.payload[1]["input"],
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        let results = turns
+            .iter()
+            .find(|turn| {
+                turn.role == "user"
+                    && turn
+                        .payload
+                        .as_array()
+                        .is_some_and(|payload| payload.len() == 3)
+            })
+            .unwrap();
+        let ids = results
+            .payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["tool_use_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["mixed-1", "mixed-2", "mixed-3"]);
+        let middle: Value =
+            serde_json::from_str(results.payload[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(middle["error"]["code"], "invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn v2_preflight_is_just_in_time_after_earlier_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_counters = Arc::new(GatewayCounters::default());
+        let second_counters = Arc::new(GatewayCounters::default());
+        let schema = json!({
+            "type":"object",
+            "properties":{},
+            "additionalProperties":false
+        });
+        let first = Arc::new(GatewayTool {
+            name: "gateway_first".into(),
+            schema: schema.clone(),
+            counters: first_counters.clone(),
+            shared_state: state.clone(),
+            expected_preflight_state: Some(0),
+            state_after_execute: Some(1),
+            file_after_execute: None,
+        });
+        let second = Arc::new(GatewayTool {
+            name: "gateway_second".into(),
+            schema,
+            counters: second_counters.clone(),
+            shared_state: state.clone(),
+            expected_preflight_state: Some(1),
+            state_after_execute: None,
+            file_after_execute: None,
+        });
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "dependent-1", "gateway_first"),
+                input_json_delta(0, "{}"),
+                tool_use_start(1, "dependent-2", "gateway_second"),
+                input_json_delta(1, "{}"),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![first, second]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec![
+            "gateway_first".into(),
+            "gateway_second".into(),
+        ]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            first_counters
+                .preflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            second_counters
+                .preflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            second_counters
+                .execute
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_argument_repair_metric_contains_only_fixed_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = gateway_tool(
+            "gateway_repair",
+            gateway_path_schema(),
+            counters,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "repair-1", "gateway_repair"),
+                input_json_delta(0, r#"{"path":"private/path.txt",}"#),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_repair".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let rendered = lines.lock().unwrap().join("\n");
+        assert!(rendered.contains("native.tool.argument_repair"));
+        assert!(rendered.contains("\"repair_kind\":\"trailing_comma\""));
+        assert!(!rendered.contains("private/path.txt"));
+        assert!(!rendered.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn v2_oversized_stream_arguments_are_never_persisted_or_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = gateway_tool(
+            "gateway_oversized",
+            gateway_path_schema(),
+            counters.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let prefix = r#"{"path":"secret-over-cap-"#;
+        let suffix = r#""}"#;
+        let raw = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(MAX_RAW_ARGUMENT_BYTES + 1 - prefix.len() - suffix.len())
+        );
+        assert_eq!(raw.len(), MAX_RAW_ARGUMENT_BYTES + 1);
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "oversized-1", "gateway_oversized"),
+                input_json_delta(0, &raw),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["gateway_oversized".into()]);
+        enable_v2(&mut deps);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.execute.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let turns = deps
+            .store
+            .list_provider_turns(&deps.session_pk)
+            .await
+            .unwrap();
+        let rows = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        let observed = format!(
+            "{}\n{}",
+            serde_json::to_string(&(turns, rows)).unwrap(),
+            lines.lock().unwrap().join("\n")
+        );
+        assert!(!observed.contains("secret-over-cap"));
+        assert!(observed.contains("invalid_arguments"));
+    }
+
+    #[tokio::test]
     async fn v2_equal_typed_profiles_ignore_opaque_model_identity() {
         async fn facade(model: &str) -> Vec<Value> {
             let dir = tempfile::tempdir().unwrap();
@@ -7573,21 +8279,40 @@ mod tests {
     }
 
     async fn dispatch_against_plan(deps: &RunnerDeps, plan: &RunToolPlan, name: &str) -> Value {
-        run_tool_call(
+        let compiled = match plan {
+            RunToolPlan::FrozenV2(compiled) | RunToolPlan::CandidateV2(compiled) => compiled,
+            RunToolPlan::V1 => panic!("V2 dispatch helper requires a V2 plan"),
+        };
+        let call = validate_v2_batch(
             deps,
-            &deps.agent,
-            &ToolAccum {
+            compiled,
+            vec![ToolAccum {
                 id: format!("call-{name}"),
                 name: name.into(),
                 start_input: json!({}),
                 input_json: String::new(),
-            },
-            &DisplayMode::Silent,
-            &None,
-            &CancellationToken::new(),
-            plan,
+                input_overflowed: false,
+            }],
         )
-        .await
+        .pop()
+        .unwrap();
+        match call {
+            V2BatchCall::Validated(validated) => {
+                run_tool_call(
+                    deps,
+                    &deps.agent,
+                    validated,
+                    &DisplayMode::Silent,
+                    &None,
+                    &CancellationToken::new(),
+                    plan,
+                )
+                .await
+            }
+            V2BatchCall::Rejected(rejected) => {
+                complete_rejected_v2_call(deps, rejected, &DisplayMode::Silent, plan).await
+            }
+        }
     }
 
     #[tokio::test]
@@ -10382,8 +11107,9 @@ mod tests {
             name: "read".into(),
             start_input: json!({}),
             input_json: String::new(),
+            input_overflowed: false,
         };
-        let input = tool.parsed_input();
+        let input = tool.legacy_input();
         assert!(insert_tool_row(&deps, &tool, &input, "read", None).await);
 
         let planned = result_test_planned_tool("read", 10);
@@ -10554,8 +11280,9 @@ mod tests {
             name: "read".into(),
             start_input: json!({}),
             input_json: String::new(),
+            input_overflowed: false,
         };
-        assert!(insert_tool_row(&deps, &tool, &tool.parsed_input(), "read", None).await);
+        assert!(insert_tool_row(&deps, &tool, &tool.legacy_input(), "read", None).await);
         let planned = result_test_planned_tool("read", 200_000);
         let completed = complete_tool_call(
             &deps,
@@ -10602,8 +11329,9 @@ mod tests {
             name: "read".into(),
             start_input: json!({}),
             input_json: String::new(),
+            input_overflowed: false,
         };
-        assert!(insert_tool_row(&deps, &tool, &tool.parsed_input(), "read", None).await);
+        assert!(insert_tool_row(&deps, &tool, &tool.legacy_input(), "read", None).await);
         let mut error =
             ToolError::precondition("capability_unavailable", "Tool is currently unavailable")
                 .with_details(json!({
@@ -10725,12 +11453,13 @@ mod tests {
             name: "bash".into(),
             start_input: json!({}),
             input_json: String::new(),
+            input_overflowed: false,
         };
         assert!(
             insert_tool_row(
                 &deps,
                 &error_call,
-                &error_call.parsed_input(),
+                &error_call.legacy_input(),
                 "execute",
                 None,
             )
