@@ -381,11 +381,6 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// the empty/non-empty `otel_endpoint` behavior).
 pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
-    let persistence = crate::agents::bootstrap::initialize_agent_persistence(
-        opts.config_root,
-        Arc::clone(&store),
-    )
-    .await?;
     // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
     // install has runnable models (and the `free` route below has candidates)
     // without any "Add account" step. Idempotent + respects user deletion.
@@ -398,10 +393,21 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // `&'static` descriptor so the router resolves its family. Must run before
     // `ensure_default_routes` so any custom-targeted route resolves at boot.
     crate::llm_router::custom::load_and_register_all(&store).await?;
-    // Default durable profiles target the `free` route. Create it only after
-    // persistence has materialized the profiles and after connections are
-    // available; a fresh daemon with none remains intentionally unconfigured.
+    // Default durable profiles target the `free` route, so it must exist before
+    // the registry below loads: the registry validates every profile exactly
+    // once, at load, and caches the verdict in `AgentSnapshot`. Creating the
+    // route afterwards left a fresh install's default agent permanently stamped
+    // "route `free` does not exist or is not executable" until the next restart.
+    // Needs connections, which the seeding above provides; a fresh daemon with
+    // none remains intentionally unconfigured.
     crate::agents::bootstrap::ensure_default_routes(&store).await?;
+    // Agents last: everything they validate against (connections, the `free`
+    // route) now exists.
+    let persistence = crate::agents::bootstrap::initialize_agent_persistence(
+        opts.config_root,
+        Arc::clone(&store),
+    )
+    .await?;
     // Refine the `free` route in the background: probe the MiMo/OpenCode free
     // models and keep only the ones that answer, leaving the synchronous
     // first-concrete baseline in place if none do. Non-blocking; boot proceeds.
@@ -1332,6 +1338,46 @@ mod tests {
             expected,
             "gateway status transition did not produce the expected number of runs"
         );
+    }
+
+    /// Fresh install: the default agents ship targeting the `free` route, and
+    /// `build_daemon` is what creates that route (`ensure_default_routes`, off
+    /// the seeded free connections). The agent registry caches each profile's
+    /// validation into `AgentSnapshot { executable, validation }` ONCE, when it
+    /// loads — so if it loads before the route exists, every default agent is
+    /// permanently stamped "route `free` does not exist or is not executable"
+    /// for the rest of the process, even though the route appears milliseconds
+    /// later. The user sees a red "Invalid" agent on first launch that fixes
+    /// itself only after a restart.
+    #[tokio::test]
+    async fn fresh_install_default_agents_are_executable_on_the_first_boot() {
+        let (_guard, db_path) = temp_db_path();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+        })
+        .await
+        .unwrap();
+
+        let snapshot = daemon.agents.snapshot().await;
+        assert!(!snapshot.agents.is_empty(), "fresh install seeds an agent");
+        for agent in &snapshot.agents {
+            assert!(
+                agent.validation.is_empty(),
+                "agent `{}` invalid on first boot: {:?}",
+                agent.profile.id,
+                agent.validation
+            );
+            assert!(
+                agent.executable,
+                "agent `{}` not executable",
+                agent.profile.id
+            );
+        }
     }
 
     /// Fresh install: `Store::open` seeds `enabled_gateways = "discord"` (a
