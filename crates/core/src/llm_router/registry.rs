@@ -2,6 +2,9 @@
 //! Ported from 9router (MIT, (c) 2024-2026 decolua and contributors) —
 //! concept and provider list from open-sse/providers/registry/.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 /// Wire format the provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFormat {
@@ -775,8 +778,44 @@ pub const CATALOG: &[ProviderDescriptor] = &[
     },
 ];
 
+/// Runtime cache of user-defined custom providers, each leaked to `&'static`
+/// so `descriptor` can return it like a built-in. Keyed by provider id.
+static CUSTOM_DESCRIPTORS: OnceLock<Mutex<HashMap<String, &'static ProviderDescriptor>>> =
+    OnceLock::new();
+
+fn custom_cache() -> &'static Mutex<HashMap<String, &'static ProviderDescriptor>> {
+    CUSTOM_DESCRIPTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Insert (or replace) a leaked custom descriptor into the cache.
+pub fn register_custom_descriptor(desc: &'static ProviderDescriptor) {
+    custom_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(desc.id.to_string(), desc);
+}
+
+/// Drop a custom descriptor from the cache. The leaked allocation is not
+/// reclaimed, but the id becomes unresolvable.
+pub fn unregister_custom_descriptor(id: &str) {
+    custom_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(id);
+}
+
+/// Resolve a provider id to its descriptor. Checks the static `CATALOG` first
+/// (no lock, keeping the routing hot path lock-free for built-ins), then the
+/// leaked custom-provider cache on a miss.
 pub fn descriptor(id: &str) -> Option<&'static ProviderDescriptor> {
-    CATALOG.iter().find(|d| d.id == id)
+    if let Some(d) = CATALOG.iter().find(|d| d.id == id) {
+        return Some(d);
+    }
+    custom_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .copied()
 }
 
 pub fn family_of(id: &str) -> Option<&'static str> {

@@ -672,6 +672,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sanitize_accepts_a_registered_custom_provider_target() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let list = crate::llm_router::custom::add_custom_provider(&store, "Router X")
+            .await
+            .unwrap();
+        let id = list[0].id.clone();
+        // A route targeting the custom family head must save without error.
+        let saved = save_model_route(
+            &store,
+            ModelRouteInfo {
+                id: String::new(),
+                name: "cx".into(),
+                enabled: true,
+                strategy: ModelRouteStrategy::Fallback,
+                targets: vec![ModelRouteTarget {
+                    provider: id.clone(),
+                    model: "gpt-x".into(),
+                    effort: None,
+                }],
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await;
+        assert!(saved.is_ok(), "custom target rejected: {saved:?}");
+    }
+
     #[test]
     fn parses_one_terminal_legacy_openai_effort_suffix_after_review() {
         for (model, expected) in [

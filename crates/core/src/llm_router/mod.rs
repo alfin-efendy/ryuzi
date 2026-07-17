@@ -6,6 +6,7 @@ pub mod claude_cloak;
 pub mod client;
 pub mod codex;
 pub mod connections;
+pub mod custom;
 pub mod installed;
 pub mod keys;
 pub mod kiro;
