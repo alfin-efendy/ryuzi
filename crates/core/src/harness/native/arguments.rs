@@ -404,9 +404,10 @@ fn fixed_validation_error(
         Kind::MaxItems { .. } | Kind::AdditionalItems { .. } => {
             ("array_too_long", "Array too long")
         }
-        Kind::AnyOf { .. } | Kind::OneOfMultipleValid { .. } | Kind::OneOfNotValid { .. } => {
-            ("ambiguous_union", "Ambiguous union")
+        Kind::AnyOf { .. } | Kind::OneOfNotValid { .. } => {
+            ("no_matching_union", "Schema constraint failed")
         }
+        Kind::OneOfMultipleValid { .. } => ("ambiguous_union", "Ambiguous union"),
         _ => ("schema_constraint", "Schema constraint failed"),
     }
 }
@@ -443,14 +444,23 @@ fn remove_optional_null_sentinels(
         .or_else(|| object_schema.get("oneOf"))
         .and_then(Value::as_array)
     {
-        let matching = branches
-            .iter()
-            .filter(|branch| {
-                jsonschema::validator_for(branch).is_ok_and(|validator| validator.is_valid(input))
-            })
-            .collect::<Vec<_>>();
+        let mut matching = Vec::new();
+        for branch in branches {
+            let mut candidate = input.clone();
+            match remove_optional_null_sentinels(&mut candidate, branch, root_schema) {
+                Ok(()) if branch_accepts_candidate(branch, root_schema, &candidate)? => {
+                    matching.push(candidate);
+                }
+                Ok(()) => {}
+                Err(error) if error.code == "invalid_arguments" => {}
+                Err(error) => return Err(error),
+            }
+        }
         return match matching.as_slice() {
-            [branch] => remove_optional_null_sentinels(input, branch, root_schema),
+            [candidate] => {
+                *input = candidate.clone();
+                Ok(())
+            }
             [] => Ok(()),
             _ => Err(invalid_arguments().with_field_error(ToolFieldError::new(
                 "/",
@@ -492,6 +502,32 @@ fn remove_optional_null_sentinels(
         }
     }
     Ok(())
+}
+
+fn branch_accepts_candidate(
+    branch: &Value,
+    root_schema: &Value,
+    candidate: &Value,
+) -> Result<bool, ToolError> {
+    let mut rooted_branch = branch.clone();
+    if let (Some(branch_object), Some(root_object)) =
+        (rooted_branch.as_object_mut(), root_schema.as_object())
+    {
+        for keyword in ["$schema", "$defs", "definitions"] {
+            if !branch_object.contains_key(keyword) {
+                if let Some(value) = root_object.get(keyword) {
+                    branch_object.insert(keyword.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    let validator = jsonschema::validator_for(&rooted_branch).map_err(|_| {
+        ToolError::precondition(
+            "invalid_persisted_tool_plan",
+            "The frozen tool schema is invalid",
+        )
+    })?;
+    Ok(validator.is_valid(candidate))
 }
 
 fn resolve_local_ref<'a>(schema: &'a Value, root: &'a Value) -> Result<&'a Value, ToolError> {
@@ -579,6 +615,10 @@ mod tests {
         } else {
             canonical_schema.clone()
         };
+        planned_with_wire(canonical_schema, wire_schema, strict)
+    }
+
+    fn planned_with_wire(canonical_schema: Value, wire_schema: Value, strict: bool) -> PlannedTool {
         PlannedTool {
             canonical_name: "schema_test".into(),
             descriptor: ToolDescriptor::conservative(
@@ -852,6 +892,166 @@ mod tests {
                 .code,
             "invalid_arguments"
         );
+    }
+
+    #[test]
+    fn strict_discriminator_union_strips_optional_null_in_the_selected_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "choice": {"oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "a"},
+                            "note": {"type": "string"}
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "b"},
+                            "count": {"type": "integer"}
+                        },
+                        "required": ["kind"],
+                        "additionalProperties": false
+                    }
+                ]}
+            },
+            "required": ["choice"],
+            "additionalProperties": false
+        });
+        let plan = planned(schema.clone(), true);
+        let tool: Arc<dyn Tool> = Arc::new(SchemaTool {
+            schema,
+            invalidating_normalization: false,
+        });
+
+        let valid = validate(
+            r#"{"choice":{"kind":"a","note":null}}"#,
+            json!({}),
+            &plan,
+            tool,
+        )
+        .unwrap();
+
+        assert_eq!(valid.input, json!({"choice":{"kind":"a"}}));
+    }
+
+    #[test]
+    fn strict_union_branch_local_refs_resolve_against_the_frozen_root() {
+        let schema = json!({
+            "$defs": {
+                "branch_a": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "a"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                },
+                "branch_b": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "b"},
+                        "count": {"type": "integer"}
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {
+                "choice": {"oneOf": [
+                    {"$ref": "#/$defs/branch_a"},
+                    {"$ref": "#/$defs/branch_b"}
+                ]}
+            },
+            "required": ["choice"],
+            "additionalProperties": false
+        });
+        let wire_schema = json!({
+            "$defs": {
+                "branch_a": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"enum": ["a"]},
+                        "note": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                    },
+                    "required": ["kind", "note"],
+                    "additionalProperties": false
+                },
+                "branch_b": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"enum": ["b"]},
+                        "count": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                    },
+                    "required": ["kind", "count"],
+                    "additionalProperties": false
+                }
+            },
+            "type": "object",
+            "properties": {
+                "choice": {"anyOf": [
+                    {"$ref": "#/$defs/branch_a"},
+                    {"$ref": "#/$defs/branch_b"}
+                ]}
+            },
+            "required": ["choice"],
+            "additionalProperties": false
+        });
+        let plan = planned_with_wire(schema.clone(), wire_schema, true);
+        let tool: Arc<dyn Tool> = Arc::new(SchemaTool {
+            schema,
+            invalidating_normalization: false,
+        });
+
+        let valid = validate(
+            r#"{"choice":{"kind":"a","note":null}}"#,
+            json!({}),
+            &plan,
+            tool,
+        )
+        .unwrap();
+
+        assert_eq!(valid.input, json!({"choice":{"kind":"a"}}));
+    }
+
+    #[test]
+    fn zero_match_any_of_is_not_reported_as_ambiguous() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {"anyOf": [
+                    {"type": "string"},
+                    {"type": "integer"}
+                ]}
+            },
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        let plan = planned(schema.clone(), false);
+        let tool: Arc<dyn Tool> = Arc::new(SchemaTool {
+            schema,
+            invalidating_normalization: false,
+        });
+
+        let error = validate(r#"{"value":true}"#, json!({}), &plan, tool)
+            .unwrap_err()
+            .error;
+
+        assert!(error
+            .field_errors
+            .iter()
+            .any(|field| field.code == "no_matching_union"));
+        assert!(error
+            .field_errors
+            .iter()
+            .all(|field| field.code != "ambiguous_union"));
     }
 
     #[test]

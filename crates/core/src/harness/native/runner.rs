@@ -354,15 +354,24 @@ fn validate_v2_batch(
                     )),
                 });
             };
+            let current_hash = tool_plan::contract_hash_for_registered(
+                &registered,
+                &plan.plan.body.capability_profile,
+            );
+            if current_hash.as_deref() != Ok(planned.contract_hash.as_str()) {
+                wire.discard_arguments();
+                return V2BatchCall::Rejected(RejectedToolCall {
+                    wire,
+                    canonical_name: Some(planned.canonical_name.clone()),
+                    error: Box::new(ToolError::precondition(
+                        "capability_unavailable",
+                        "Tool no longer matches its frozen contract",
+                    )),
+                });
+            }
             match ArgumentGateway::validate(wire, planned, registered.tool.clone(), &input_context)
             {
-                Ok(validated) => {
-                    if let Some(repair) = validated.repair {
-                        record_native_tool_argument_repair(&deps.telemetry, repair.metric_label());
-                    }
-                    record_normalization_repairs(&deps.telemetry, &validated.normalization);
-                    V2BatchCall::Validated(validated)
-                }
+                Ok(validated) => V2BatchCall::Validated(validated),
                 Err(rejected) => V2BatchCall::Rejected(rejected),
             }
         })
@@ -387,6 +396,34 @@ fn record_normalization_repairs(
         };
         record_native_tool_argument_repair(telemetry, repair_kind);
     }
+}
+
+fn record_v2_batch_metrics(
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+    calls: &[V2BatchCall],
+) {
+    for call in calls {
+        let V2BatchCall::Validated(validated) = call else {
+            continue;
+        };
+        if let Some(repair) = validated.repair {
+            record_native_tool_argument_repair(telemetry, repair.metric_label());
+        }
+        record_normalization_repairs(telemetry, &validated.normalization);
+    }
+}
+
+async fn append_assistant_and_record_v2_metrics(
+    cm: &mut ContextManager,
+    content: Value,
+    calls: Option<&[V2BatchCall]>,
+    telemetry: &Arc<dyn crate::telemetry::Telemetry>,
+) -> anyhow::Result<()> {
+    cm.append_assistant(content).await?;
+    if let Some(calls) = calls {
+        record_v2_batch_metrics(telemetry, calls);
+    }
+    Ok(())
 }
 
 fn record_tool_nudge(deps: &RunnerDeps, tool_name: &str) {
@@ -1478,7 +1515,7 @@ async fn drive(
                         partial_json,
                     } => {
                         if let Some(t) = turn.tools.get_mut(&index) {
-                            t.push_input_delta(&partial_json);
+                            t.push_input_delta(&partial_json, run_tool_plan.version());
                         }
                     }
                     MessageStreamEvent::MessageDelta {
@@ -1562,7 +1599,13 @@ async fn drive(
                 // poisons the whole session. Use a non-empty sentinel instead.
                 content.push(json!({ "type": "text", "text": "(no output)" }));
             }
-            cm.append_assistant(json!(content)).await?;
+            append_assistant_and_record_v2_metrics(
+                cm,
+                json!(content),
+                v2_calls.as_deref(),
+                &deps.telemetry,
+            )
+            .await?;
 
             let tool_calls_empty = legacy_calls.as_ref().is_none_or(Vec::is_empty)
                 && v2_calls.as_ref().is_none_or(Vec::is_empty);
@@ -3325,13 +3368,6 @@ async fn complete_queued_v2_cancellation(
         },
     )
     .await;
-    fire_tool_after_observation(
-        deps,
-        &validated.wire.name,
-        validated.input,
-        completed.hook_summary,
-    )
-    .await;
     completed.provider_result
 }
 
@@ -4430,7 +4466,11 @@ impl ToolAccum {
         )
     }
 
-    fn push_input_delta(&mut self, partial: &str) {
+    fn push_input_delta(&mut self, partial: &str, version: NativeToolsVersion) {
+        if version == NativeToolsVersion::V1 {
+            self.input_json.push_str(partial);
+            return;
+        }
         if self.input_overflowed {
             return;
         }
@@ -4738,6 +4778,110 @@ mod tests {
         expected_preflight_state: Option<usize>,
         state_after_execute: Option<usize>,
         file_after_execute: Option<std::path::PathBuf>,
+    }
+
+    struct StatefulContractNormalizer {
+        name: String,
+        description: String,
+        rewrite: bool,
+        normalizations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct CapturingV1InputTool {
+        received: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for CapturingV1InputTool {
+        fn name(&self) -> &str {
+            "v1_large_input_spy"
+        }
+
+        fn description(&self) -> &str {
+            "Captures a large legacy argument object."
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("v1-large", "v1 large input")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            self.received.lock().unwrap().push(input);
+            Ok(crate::harness::native::tools::ToolOutput::ok("captured"))
+        }
+    }
+
+    #[async_trait]
+    impl crate::harness::native::tools::Tool for StatefulContractNormalizer {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "additionalProperties": false
+            })
+        }
+
+        fn kind(&self) -> &'static str {
+            "other"
+        }
+
+        fn normalize_input(
+            &self,
+            _ctx: &ToolInputCtx<'_>,
+            mut input: Value,
+        ) -> Result<super::super::tool_contract::NormalizedInput, ToolError> {
+            self.normalizations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.rewrite {
+                input["path"] = json!("rewritten-by-changed-contract");
+                super::super::tool_contract::NormalizedInput::changed(input).with_metadata(
+                    ToolMetadataEntry::Coercion(
+                        super::super::tool_contract::ToolMetadataToken::LosslessBoolean,
+                    ),
+                )
+            } else {
+                Ok(super::super::tool_contract::NormalizedInput::unchanged(
+                    input,
+                ))
+            }
+        }
+
+        fn permission(&self, _input: &Value) -> crate::harness::native::tools::PermissionSpec {
+            crate::harness::native::tools::PermissionSpec::new("contract-test", "contract test")
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &crate::harness::native::tools::ToolCtx,
+            _input: Value,
+        ) -> anyhow::Result<crate::harness::native::tools::ToolOutput> {
+            unreachable!("changed contracts must be rejected during batch validation")
+        }
     }
 
     #[async_trait]
@@ -5372,6 +5516,10 @@ mod tests {
         release: std::sync::Arc<tokio::sync::Semaphore>,
     }
 
+    struct RecordingAutomationSink {
+        observed: tokio::sync::mpsc::UnboundedSender<(crate::automation::TriggerKind, Value)>,
+    }
+
     #[async_trait::async_trait]
     impl crate::automation::AutomationEventSink for BlockingAutomationSink {
         async fn observe_lifecycle(
@@ -5386,6 +5534,18 @@ mod tests {
                 .acquire()
                 .await
                 .expect("test semaphore stays open");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::automation::AutomationEventSink for RecordingAutomationSink {
+        async fn observe_lifecycle(
+            &self,
+            trigger: crate::automation::TriggerKind,
+            _session_pk: String,
+            data: Value,
+        ) {
+            let _ = self.observed.send((trigger, data));
         }
     }
 
@@ -7759,6 +7919,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_large_streamed_arguments_reach_the_handler_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "v".repeat(MAX_RAW_ARGUMENT_BYTES + 1024);
+        let input = json!({"content": content});
+        let streamed = serde_json::to_string(&input).unwrap();
+        assert!(streamed.len() > MAX_RAW_ARGUMENT_BYTES);
+        let llm = Arc::new(V2RecordingLlm::new(vec![
+            vec![
+                tool_use_start(0, "v1-large-call", "v1_large_input_spy"),
+                input_json_delta(0, &streamed),
+                message_delta("tool_use"),
+                message_stop(),
+            ],
+            final_turn("done"),
+        ]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(
+            CapturingV1InputTool {
+                received: received.clone(),
+            },
+        )]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["v1_large_input_spy".into()]);
+        assert_eq!(deps.native_tools_version, NativeToolsVersion::V1);
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let captured = received.lock().unwrap();
+        assert_eq!(captured.as_slice(), &[input]);
+        assert_eq!(
+            captured[0]["content"].as_str().unwrap().as_bytes(),
+            content.as_bytes()
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_arguments_have_no_side_effects() {
         let dir = tempfile::tempdir().unwrap();
         let would_write = dir.path().join("handler-ran.txt");
@@ -8064,6 +8267,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_batch_validation_emits_no_telemetry_before_ledger_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(GatewayCounters::default());
+        let tool = gateway_tool(
+            "gateway_metric_order",
+            gateway_path_schema(),
+            counters,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools =
+            super::super::agents::ToolFilter::Only(vec!["gateway_metric_order".into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let calls = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "metric-order-call".into(),
+                name: "gateway_metric_order".into(),
+                start_input: json!({}),
+                input_json: r#"{"path":"private/path.txt",}"#.into(),
+                input_overflowed: false,
+            }],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "batch validation must remain side-effect free before ledger append"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_metrics_emit_only_after_successful_assistant_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let normalizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool: Arc<dyn crate::harness::native::tools::Tool> =
+            Arc::new(StatefulContractNormalizer {
+                name: "telemetry_commit".into(),
+                description: "stable contract".into(),
+                rewrite: true,
+                normalizations,
+            });
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        deps.telemetry = Arc::new(crate::telemetry::ConsoleTelemetry::with_sink(
+            move |line| captured.lock().unwrap().push(line.to_string()),
+            || 0,
+        ));
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![tool]));
+        deps.agent.tools = super::super::agents::ToolFilter::Only(vec!["telemetry_commit".into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &deps.tools,
+            &deps.agent.tools,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+        let calls = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "telemetry-commit-call".into(),
+                name: "telemetry_commit".into(),
+                start_input: json!({}),
+                input_json: r#"{"path":"private/path.txt",}"#.into(),
+                input_overflowed: false,
+            }],
+        );
+        assert!(lines.lock().unwrap().is_empty());
+        let content = json!([{
+            "type": "tool_use",
+            "id": calls[0].id(),
+            "name": calls[0].name(),
+            "input": calls[0].ledger_input(),
+        }]);
+        let cfg = ContextConfig::with_meta(deps.meta.clone())
+            .with_native_tools_version(NativeToolsVersion::V2);
+        let mut failing_cm = ContextManager::load(deps.store.clone(), &deps.session_pk, cfg)
+            .await
+            .unwrap();
+        deps.store
+            .with_conn(|connection| connection.execute_batch("DROP TABLE provider_turns"))
+            .await
+            .unwrap();
+
+        assert!(append_assistant_and_record_v2_metrics(
+            &mut failing_cm,
+            content.clone(),
+            Some(&calls),
+            &deps.telemetry,
+        )
+        .await
+        .is_err());
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "failed assistant append must not leave repair metrics"
+        );
+
+        let mut successful_cm = ContextManager::ephemeral(
+            "telemetry-success",
+            ContextConfig::with_meta(deps.meta.clone())
+                .with_native_tools_version(NativeToolsVersion::V2),
+        );
+        append_assistant_and_record_v2_metrics(
+            &mut successful_cm,
+            content,
+            Some(&calls),
+            &deps.telemetry,
+        )
+        .await
+        .unwrap();
+        let rendered = lines.lock().unwrap().join("\n");
+        assert!(rendered.contains("\"repair_kind\":\"trailing_comma\""));
+        assert!(rendered.contains("\"repair_kind\":\"lossless_boolean\""));
+        assert!(!rendered.contains("private/path.txt"));
+    }
+
+    #[tokio::test]
     async fn v2_oversized_stream_arguments_are_never_persisted_or_observed() {
         let dir = tempfile::tempdir().unwrap();
         let counters = Arc::new(GatewayCounters::default());
@@ -8355,6 +8696,75 @@ mod tests {
         let changed = dispatch_against_plan(&deps, &frozen, name).await;
         assert!(result_text(&changed).contains("capability_unavailable"));
         assert_eq!(changed_effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v2_changed_contract_never_normalizes_or_rewrites_the_ledger_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(V2RecordingLlm::new(vec![]));
+        let mut deps = deps_at(dir.path(), llm).await;
+        enable_v2(&mut deps);
+        let name = "stateful_contract";
+        let frozen_normalizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frozen_tool: Arc<dyn crate::harness::native::tools::Tool> =
+            Arc::new(StatefulContractNormalizer {
+                name: name.into(),
+                description: "frozen contract".into(),
+                rewrite: false,
+                normalizations: frozen_normalizations,
+            });
+        let frozen_registry = ToolRegistry::with_extra(vec![frozen_tool]);
+        let filter = super::super::agents::ToolFilter::Only(vec![name.into()]);
+        let compiled = crate::harness::native::tool_plan::compile_candidate(
+            &frozen_registry,
+            &filter,
+            direct_profile(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let changed_normalizations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let changed_tool: Arc<dyn crate::harness::native::tools::Tool> =
+            Arc::new(StatefulContractNormalizer {
+                name: name.into(),
+                description: "changed contract".into(),
+                rewrite: true,
+                normalizations: changed_normalizations.clone(),
+            });
+        deps.tools = Arc::new(ToolRegistry::with_extra(vec![changed_tool]));
+
+        let call = validate_v2_batch(
+            &deps,
+            &compiled,
+            vec![ToolAccum {
+                id: "changed-call".into(),
+                name: name.into(),
+                start_input: json!({}),
+                input_json: r#"{"path":"original"}"#.into(),
+                input_overflowed: false,
+            }],
+        )
+        .pop()
+        .unwrap();
+
+        assert_eq!(
+            changed_normalizations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mismatched current contract must not run its normalizer"
+        );
+        assert_eq!(
+            call.ledger_input(),
+            json!({"_ryuzi_invalid_arguments": true})
+        );
+        match call {
+            V2BatchCall::Rejected(rejected) => {
+                assert_eq!(rejected.error.code, "capability_unavailable");
+            }
+            V2BatchCall::Validated(validated) => {
+                panic!("changed contract leaked normalized input/metadata: {validated:?}")
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -10798,8 +11208,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let started = Arc::new(tokio::sync::Notify::new());
         let first_effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (never_run, sibling_effects) =
-            ContractTool::available("never_run", "must stay queued after cancellation");
+        let sibling_counters = Arc::new(GatewayCounters::default());
+        let never_run = gateway_tool(
+            "never_run",
+            json!({"type": "object", "additionalProperties": false}),
+            sibling_counters.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
         let tool_turn = vec![
             tool_use_start(0, "cancel-running", "cancel_aware"),
             input_json_delta(0, "{}"),
@@ -10827,6 +11242,11 @@ mod tests {
         ));
         let extension_events = Arc::new(RecordingExtensionEvents::default());
         deps.extension_events = Some(extension_events.clone());
+        let (automation_tx, mut automation_rx) = tokio::sync::mpsc::unbounded_channel();
+        let automation_events = Arc::new(RecordingAutomationSink {
+            observed: automation_tx,
+        });
+        deps.automation_events = Some(automation_events.clone());
         let cancel = CancellationToken::new();
         let running = {
             let deps = deps.clone();
@@ -10857,7 +11277,23 @@ mod tests {
             "the in-flight handler observes cancellation exactly once"
         );
         assert_eq!(
-            sibling_effects.load(std::sync::atomic::Ordering::SeqCst),
+            sibling_counters
+                .preflight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued sibling must never preflight"
+        );
+        assert_eq!(
+            sibling_counters
+                .permission
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the queued sibling must never enter permission or approval handling"
+        );
+        assert_eq!(
+            sibling_counters
+                .execute
+                .load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the queued sibling must never execute"
         );
@@ -10888,18 +11324,47 @@ mod tests {
                 .expect("persisted cancellation stays structured");
             assert_eq!(envelope["error"]["code"], "cancelled");
         }
-        let after_calls = extension_events
-            .calls
-            .lock()
-            .unwrap()
+        let hook_calls = extension_events.calls.lock().unwrap().clone();
+        assert!(hook_calls
+            .iter()
+            .all(|(_, payload)| payload["tool"] != "never_run"));
+        let after_calls = hook_calls
             .iter()
             .filter(|(event, _)| *event == crate::harness::native::hooks::HookEvent::ToolAfter)
-            .map(|(_, payload)| payload.clone())
+            .map(|(_, payload)| payload)
             .collect::<Vec<_>>();
-        assert_eq!(after_calls.len(), 2);
+        assert_eq!(after_calls.len(), 1);
         assert!(after_calls.iter().all(|payload| {
             payload["result"]["ok"] == false && payload["result"]["code"] == "cancelled"
         }));
+        crate::automation::dispatch_lifecycle_observation(
+            Some(automation_events),
+            crate::automation::TriggerKind::SessionEnd,
+            deps.session_pk.clone(),
+            json!({"test_barrier": true}),
+        );
+        let mut automation_calls = Vec::new();
+        loop {
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(5), automation_rx.recv())
+                    .await
+                    .expect("automation observations must drain through the test barrier")
+                    .expect("the recording automation sink must stay open");
+            let is_barrier = observed.0 == crate::automation::TriggerKind::SessionEnd
+                && observed.1["test_barrier"] == true;
+            automation_calls.push(observed);
+            if is_barrier {
+                break;
+            }
+        }
+        assert!(automation_calls.iter().all(|(trigger, payload)| {
+            !matches!(
+                trigger,
+                crate::automation::TriggerKind::ToolBefore
+                    | crate::automation::TriggerKind::ToolAfter
+            ) || payload["tool"] != "never_run"
+        }));
+        assert!(deps.snapshots.lock().await.is_empty());
         let telemetry = telemetry_lines.lock().unwrap().join("\n");
         assert_eq!(telemetry.matches("native.tool.call").count(), 2);
         assert!(!telemetry.contains("bearer-secret"));
