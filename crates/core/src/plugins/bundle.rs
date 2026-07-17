@@ -227,6 +227,7 @@ pub struct ComponentBundleInstaller {
     root: PathBuf,
     store: Store,
     fail_before_pointer: AtomicBool,
+    fail_after_pointer_replacement: AtomicBool,
 }
 
 impl ComponentBundleInstaller {
@@ -235,12 +236,19 @@ impl ComponentBundleInstaller {
             root,
             store,
             fail_before_pointer: AtomicBool::new(false),
+            fail_after_pointer_replacement: AtomicBool::new(false),
         }
     }
 
     /// Test seam for exercising the pre-pointer failure boundary.
     pub fn fail_before_pointer_replacement(&self) {
         self.fail_before_pointer.store(true, Ordering::SeqCst);
+    }
+
+    /// Test seam for exercising an activation failure after the pointer changes.
+    pub fn fail_after_pointer_replacement(&self) {
+        self.fail_after_pointer_replacement
+            .store(true, Ordering::SeqCst);
     }
 
     pub async fn install_verified(
@@ -265,7 +273,19 @@ impl ComponentBundleInstaller {
             let _ = std::fs::remove_dir_all(&version_root);
             bail!("injected failure before active pointer replacement");
         }
-        write_atomic(&pointer, bundle.release.version.as_bytes())?;
+        if let Err(error) = write_atomic(&pointer, bundle.release.version.as_bytes()) {
+            return Err(match std::fs::remove_dir_all(&version_root) {
+                Ok(()) => error.context(format!(
+                    "writing active bundle pointer {}",
+                    pointer.display()
+                )),
+                Err(cleanup_error) => anyhow::anyhow!(
+                    "writing active bundle pointer {} failed: {error}; removing moved bundle {} failed: {cleanup_error}",
+                    pointer.display(),
+                    version_root.display(),
+                ),
+            });
+        }
 
         let record = ComponentPluginReleaseRecord {
             plugin_id: bundle.release.id.clone(),
@@ -279,6 +299,12 @@ impl ComponentBundleInstaller {
             revocation_reason: None,
         };
         let result = async {
+            if self
+                .fail_after_pointer_replacement
+                .swap(false, Ordering::SeqCst)
+            {
+                bail!("injected failure after active pointer replacement");
+            }
             self.store.upsert_component_release(&record).await?;
             self.store
                 .set_active_component_release(&record.plugin_id, &record.version)
@@ -287,8 +313,13 @@ impl ComponentBundleInstaller {
         }
         .await;
         if let Err(error) = result {
-            restore_pointer(&pointer, previous.as_deref())?;
-            return Err(error);
+            return match restore_pointer(&pointer, previous.as_deref()) {
+                Ok(()) => Err(error),
+                Err(restoration_error) => Err(anyhow::anyhow!(
+                    "activation failed: {error}; restoring active bundle pointer {} failed: {restoration_error}",
+                    pointer.display()
+                )),
+            };
         }
         Ok(ComponentPluginReleaseRecord {
             active: true,
@@ -315,8 +346,11 @@ fn restore_pointer(path: &Path, previous: Option<&str>) -> Result<()> {
 /// Discover only bundles whose pointer, release ledger row, and on-disk
 /// metadata agree. Invalid entries are rejected rather than guessed.
 pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<InstalledBundle>> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing bundle root {}", root.display()))?;
     let mut found = Vec::new();
-    let entries = match std::fs::read_dir(root) {
+    let entries = match std::fs::read_dir(&canonical_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
         Err(error) => return Err(error.into()),
@@ -325,6 +359,15 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
         let plugin_root = entry?.path();
         if !plugin_root.is_dir() {
             continue;
+        }
+        let canonical_plugin_root = plugin_root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing plugin root {}", plugin_root.display()))?;
+        if !canonical_plugin_root.starts_with(&canonical_root) {
+            bail!(
+                "plugin root escapes bundle root for {}",
+                plugin_root.display()
+            );
         }
         let plugin_id = plugin_root
             .file_name()
@@ -341,6 +384,17 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
         if !version_root.is_dir() {
             bail!("active bundle path is missing for {plugin_id}");
         }
+        let canonical_version_root = version_root.canonicalize().with_context(|| {
+            format!(
+                "canonicalizing active bundle path {}",
+                version_root.display()
+            )
+        })?;
+        if !canonical_version_root.starts_with(&canonical_plugin_root)
+            || !canonical_version_root.starts_with(&canonical_root)
+        {
+            bail!("active bundle path escapes install root for {plugin_id}");
+        }
         let record = store
             .active_component_release(plugin_id)
             .await?
@@ -349,9 +403,10 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
             bail!("active pointer and release ledger mismatch for {plugin_id}");
         }
         let manifest = PluginBundleManifest::from_toml(&std::fs::read_to_string(
-            version_root.join("ryuzi-plugin.toml"),
+            canonical_version_root.join("ryuzi-plugin.toml"),
         )?)?;
-        let release = PluginRelease::from_json(&std::fs::read(version_root.join("release.json"))?)?;
+        let release =
+            PluginRelease::from_json(&std::fs::read(canonical_version_root.join("release.json"))?)?;
         if manifest.id != plugin_id
             || manifest.version != version
             || release.id != plugin_id
@@ -360,18 +415,28 @@ pub async fn load_active_bundles(root: &Path, store: &Store) -> Result<Vec<Insta
         {
             bail!("active bundle metadata mismatch for {plugin_id}");
         }
-        let component_path = version_root.join(&manifest.component);
-        let canonical_root = version_root.canonicalize()?;
-        let component_path = component_path.canonicalize()?;
-        if !component_path.starts_with(canonical_root) {
+        let component_path = canonical_version_root.join(&manifest.component);
+        let canonical_component = component_path.canonicalize()?;
+        if !canonical_component.starts_with(&canonical_version_root) {
             bail!("active component escapes bundle root");
+        }
+        let component_bytes = std::fs::read(&canonical_component).with_context(|| {
+            format!("reading active component {}", canonical_component.display())
+        })?;
+        let actual_hash = format!("{:x}", Sha256::digest(&component_bytes));
+        if actual_hash != release.component_sha256 {
+            bail!(
+                "active component hash mismatch: expected {}, got {}",
+                release.component_sha256,
+                actual_hash
+            );
         }
         found.push(InstalledBundle {
             manifest,
             release,
             release_record: record,
-            root: version_root,
-            component_path,
+            root: canonical_version_root,
+            component_path: canonical_component,
         });
     }
     Ok(found)
@@ -435,17 +500,31 @@ component = "acme_connector.wasm"
     /// release.json, plugin.sig) and returns its path plus the component
     /// bytes actually written (so tampering tests can diverge from it).
     fn write_valid_bundle(dir: &Path, key: &SigningKey, key_id: &str) {
+        write_valid_bundle_version(dir, key, key_id, "0.1.0");
+    }
+
+    fn write_valid_bundle_version(dir: &Path, key: &SigningKey, key_id: &str, version: &str) {
+        write_valid_bundle_for_plugin(dir, key, key_id, "acme-connector", version);
+    }
+
+    fn write_valid_bundle_for_plugin(
+        dir: &Path,
+        key: &SigningKey,
+        key_id: &str,
+        plugin_id: &str,
+        version: &str,
+    ) {
         let component_bytes = b"fake wasm component bytes".to_vec();
         fs::write(dir.join("acme_connector.wasm"), &component_bytes).unwrap();
 
         let component_sha256 = format!("{:x}", Sha256::digest(&component_bytes));
         fs::write(
             dir.join("ryuzi-plugin.toml"),
-            manifest_toml("acme-connector", "0.1.0"),
+            manifest_toml(plugin_id, version),
         )
         .unwrap();
 
-        let release_bytes = release_json("acme-connector", "0.1.0", &component_sha256);
+        let release_bytes = release_json(plugin_id, version, &component_sha256);
         fs::write(dir.join("release.json"), &release_bytes).unwrap();
 
         let signature = key.sign(&release_bytes);
@@ -460,6 +539,251 @@ component = "acme_connector.wasm"
         .unwrap();
     }
 
+    fn component_release_record(version: &str, sha256: &str) -> ComponentPluginReleaseRecord {
+        component_release_record_for_plugin("acme-connector", version, sha256)
+    }
+
+    fn component_release_record_for_plugin(
+        plugin_id: &str,
+        version: &str,
+        sha256: &str,
+    ) -> ComponentPluginReleaseRecord {
+        ComponentPluginReleaseRecord {
+            plugin_id: plugin_id.into(),
+            version: version.into(),
+            source_url: format!("https://registry.example.com/{version}"),
+            sha256: sha256.into(),
+            signing_key_id: KEY_ID.into(),
+            installed_at: crate::paths::now_ms(),
+            active: false,
+            revoked: false,
+            revocation_reason: None,
+        }
+    }
+
+    fn valid_component_hash() -> String {
+        format!("{:x}", Sha256::digest(b"fake wasm component bytes"))
+    }
+
+    #[cfg(unix)]
+    fn create_directory_reparse_point(link: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_reparse_point(link: &Path, target: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 link path")
+                })?,
+                target.to_str().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 target path")
+                })?,
+            ])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mklink /J exited with {status}"
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn installing_second_valid_version_replaces_pointer_and_active_release() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+
+        let first_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(first_staging.path(), &signing_key(), KEY_ID, "0.1.0");
+        installer
+            .install_verified(verify_bundle(first_staging.path(), &trusted_keys()).unwrap())
+            .await
+            .unwrap();
+
+        let second_staging = tempfile::tempdir().unwrap();
+        write_valid_bundle_version(second_staging.path(), &signing_key(), KEY_ID, "0.1.1");
+        installer
+            .install_verified(verify_bundle(second_staging.path(), &trusted_keys()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.path().join("acme-connector/current")).unwrap(),
+            "0.1.1"
+        );
+        assert_eq!(
+            store
+                .active_component_release("acme-connector")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            "0.1.1"
+        );
+        let bundles = load_active_bundles(root.path(), &store).await.unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].release.version, "0.1.1");
+    }
+
+    #[tokio::test]
+    async fn loader_rejects_pointer_and_database_active_version_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let plugin_root = root.path().join("acme-connector");
+        fs::create_dir_all(&plugin_root).unwrap();
+        for version in ["0.1.0", "0.1.1"] {
+            let version_root = plugin_root.join(version);
+            fs::create_dir_all(&version_root).unwrap();
+            write_valid_bundle_version(&version_root, &signing_key(), KEY_ID, version);
+            store
+                .upsert_component_release(&component_release_record(
+                    version,
+                    &valid_component_hash(),
+                ))
+                .await
+                .unwrap();
+        }
+        store
+            .set_active_component_release("acme-connector", "0.1.1")
+            .await
+            .unwrap();
+        fs::write(plugin_root.join("current"), "0.1.0").unwrap();
+
+        let err = load_active_bundles(root.path(), &store)
+            .await
+            .expect_err("the pointer and database must identify the same active version");
+        assert!(
+            err.to_string()
+                .contains("pointer and release ledger mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loader_rejects_mutated_installed_component_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        write_valid_bundle(staging.path(), &signing_key(), KEY_ID);
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        installer
+            .install_verified(verify_bundle(staging.path(), &trusted_keys()).unwrap())
+            .await
+            .unwrap();
+
+        fs::write(
+            root.path().join("acme-connector/0.1.0/acme_connector.wasm"),
+            b"mutated after installation",
+        )
+        .unwrap();
+
+        let err = load_active_bundles(root.path(), &store)
+            .await
+            .expect_err("mutating an installed component must invalidate the active bundle");
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_activation_after_pointer_restores_pointer_and_database_state() {
+        let root = tempfile::tempdir().unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        let plugin_root = root.path().join("acme-connector");
+        fs::create_dir_all(&plugin_root).unwrap();
+        fs::write(plugin_root.join("current"), "0.0.1").unwrap();
+        store
+            .upsert_component_release(&component_release_record("0.0.1", "old"))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("acme-connector", "0.0.1")
+            .await
+            .unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        write_valid_bundle(staging.path(), &signing_key(), KEY_ID);
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        installer.fail_after_pointer_replacement();
+
+        let err = installer
+            .install_verified(verify_bundle(staging.path(), &trusted_keys()).unwrap())
+            .await
+            .expect_err("injected activation failure must abort installation");
+        assert!(
+            err.to_string()
+                .contains("injected failure after active pointer replacement"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(plugin_root.join("current")).unwrap(),
+            "0.0.1"
+        );
+        assert_eq!(
+            store
+                .active_component_release("acme-connector")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            "0.0.1"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn loader_rejects_version_reparse_point_outside_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_version = outside.path().join("0.1.0");
+        fs::create_dir_all(&outside_version).unwrap();
+        write_valid_bundle_for_plugin(&outside_version, &signing_key(), KEY_ID, "github", "0.1.0");
+
+        let plugin_root = root.path().join("github");
+        fs::create_dir_all(&plugin_root).unwrap();
+        fs::write(plugin_root.join("current"), "0.1.0").unwrap();
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(db.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release_record_for_plugin(
+                "github",
+                "0.1.0",
+                &valid_component_hash(),
+            ))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        if let Err(error) =
+            create_directory_reparse_point(&plugin_root.join("0.1.0"), &outside_version)
+        {
+            eprintln!("skipping reparse-point test: {error}");
+            return;
+        }
+
+        let err = load_active_bundles(root.path(), &store)
+            .await
+            .expect_err("a version reparse point escaping the install root must be rejected");
+        assert!(
+            err.to_string().contains("outside") || err.to_string().contains("escapes"),
+            "unexpected error: {err}"
+        );
+    }
     #[tokio::test]
     async fn installs_verified_bundle_and_discovers_it() {
         let root = tempfile::tempdir().unwrap();
