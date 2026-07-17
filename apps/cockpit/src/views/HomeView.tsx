@@ -148,7 +148,13 @@ export function HomeView() {
     () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", primaryAgentId, mentions),
     [registry?.agents, mentionQuery?.query, primaryAgentId, mentions],
   );
-  const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
+  const contextQuery = useMemo(() => {
+    const activeContext = activeContextQuery(draft, mentionCaret);
+    if (activeContext && activeContext.query.length > 0 && (activeContext.query.includes("/") || activeContext.query.includes("."))) {
+      return activeContext;
+    }
+    return null;
+  }, [draft, mentionCaret]);
   const contextQueryText = contextQuery?.query ?? null;
   const mentionMenuOpen = mentionQuery !== null && contextQuery === null && slashQuery === null && mentionMatches.length > 0;
 
@@ -179,7 +185,7 @@ export function HomeView() {
   }, [projectId, contextQueryText]);
 
   const pickContext = (path: string) => {
-    updateDraft((cur) => replaceActiveContextToken(cur, path));
+    updateDraft((cur) => replaceActiveContextToken(cur, mentionCaret, path));
     setContextRefs((cur) => uniqueContextRefs([...cur, path]));
     setContextHits([]);
   };

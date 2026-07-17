@@ -460,6 +460,25 @@ test("textarea Escape closes the agent mention popup", () => {
   expect(screen.queryByRole("menu")).toBeNull();
 });
 
+test("choosing a context hit at a nonzero caret preserves text typed after it", async () => {
+  searchFiles.mockImplementationOnce(() =>
+    Promise.resolve({ status: "ok" as const, data: [{ path: "src/views/HomeView.tsx", dir: false }] }),
+  );
+  render(<HomeView />);
+
+  const composer = screen.getByPlaceholderText("Do anything") as HTMLTextAreaElement;
+  // The `@src/vi` token ends at caret 7; " and done" trails after it. Only
+  // `mentionCaret` (not the string length) tells activeContextQuery/
+  // replaceActiveContextToken where the active token actually ends.
+  fireEvent.change(composer, { target: { value: "@src/vi and done", selectionStart: 7 } });
+
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "src/vi"));
+  const hit = await screen.findByText("src/views/HomeView.tsx");
+  fireEvent.click(hit);
+
+  expect(composer.value).toBe("@src/views/HomeView.tsx  and done");
+});
+
 test("plain agent @ mentions open the agent menu instead of searching context", () => {
   useAgents.setState({
     registry: {

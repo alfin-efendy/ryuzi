@@ -65,7 +65,11 @@ const DEFAULT_SEARCH_ENTRIES: SearchEntryInfo[] = [
   { path: "src/session", dir: true },
   { path: "src/views/SessionView.tsx", dir: false },
 ];
-const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: DEFAULT_SEARCH_ENTRIES }));
+const searchFiles = mock<
+  (
+    ...args: Parameters<typeof import("@/bindings").commands["searchFiles"]>
+  ) => ReturnType<typeof import("@/bindings").commands["searchFiles"]>
+>(() => Promise.resolve({ status: "ok" as const, data: DEFAULT_SEARCH_ENTRIES }));
 const getChildRuns = mock(() =>
   Promise.resolve({
     status: "ok" as const,
