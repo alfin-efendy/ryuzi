@@ -1461,6 +1461,8 @@ pub struct Store {
     #[cfg(test)]
     session_prompt_claim_recovery_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    fail_next_insert_artifact: std::sync::atomic::AtomicBool,
 }
 
 impl Clone for Store {
@@ -1477,6 +1479,11 @@ impl Clone for Store {
             #[cfg(test)]
             fail_next_session_prompt_claim_recovery: std::sync::atomic::AtomicBool::new(
                 self.fail_next_session_prompt_claim_recovery
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            #[cfg(test)]
+            fail_next_insert_artifact: std::sync::atomic::AtomicBool::new(
+                self.fail_next_insert_artifact
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         }
@@ -1880,6 +1887,8 @@ impl Store {
             fail_next_session_prompt_claim_recovery: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             session_prompt_claim_recovery_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_insert_artifact: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -4881,6 +4890,14 @@ impl Store {
     /// SQLite INTEGER (signed 64-bit); a `u64` value that does not fit in
     /// `i64` is rejected before the write is attempted.
     pub async fn insert_artifact(&self, artifact: &ArtifactRecord) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_insert_artifact
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected artifact insert failure");
+        }
+
         let size_bytes = i64::try_from(artifact.size_bytes).map_err(|_| {
             anyhow::anyhow!(
                 "artifact size_bytes {} exceeds representable range",
@@ -4915,6 +4932,12 @@ impl Store {
             .map(|_| ())
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_insert_artifact_for_test(&self) {
+        self.fail_next_insert_artifact
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Share an artifact into another session's scope. The
@@ -5050,6 +5073,24 @@ impl Store {
             }))
         })
         .await
+    }
+
+    /// Sum of `size_bytes` across every non-deleted artifact originated by
+    /// `source_session_pk`. Used to enforce the `artifact_session_max_bytes`
+    /// quota before persisting a new artifact's payload.
+    pub async fn sum_active_artifact_bytes(&self, source_session_pk: &str) -> anyhow::Result<u64> {
+        let source_session_pk = source_session_pk.to_string();
+        let total: i64 = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts \
+                     WHERE source_session_pk=?1 AND status <> 'deleted'",
+                    params![source_session_pk],
+                    |r| r.get(0),
+                )
+            })
+            .await?;
+        Ok(u64::try_from(total).unwrap_or(0))
     }
 
     /// Mark every non-deleted artifact originated by `source_session_pk` as
