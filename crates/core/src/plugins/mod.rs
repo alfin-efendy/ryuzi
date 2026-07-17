@@ -20,6 +20,7 @@
 //! catalog in one call.
 
 pub mod builtin;
+pub mod bundle;
 pub mod catalog;
 pub mod catalog_feed_key;
 pub mod declarative;
