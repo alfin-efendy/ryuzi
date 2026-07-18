@@ -23,6 +23,7 @@ import { TranscriptFileContext } from "@/components/transcript/TranscriptFileCon
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
+import { ArtifactPanel } from "@/components/artifacts/ArtifactPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { QueuedMessages } from "@/components/session/QueuedMessages";
 import { startVoiceDictation } from "@/lib/voice";
@@ -433,6 +434,8 @@ export function SessionView() {
               </Transcript>
             </TranscriptFileContext.Provider>
           </div>
+
+          <ArtifactPanel runnerId={runnerId} sessionPk={session.sessionPk} refreshKey={rows.length} />
 
           {/* Session composer */}
           <div className="shrink-0 px-6 pb-4 pt-3">
