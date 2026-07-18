@@ -2,7 +2,9 @@ pub mod service;
 pub mod storage;
 pub mod types;
 
-pub use service::{ArtifactConfig, ArtifactRead, ArtifactService, CreateArtifact};
+pub use service::{
+    ingest_saved_attachments, ArtifactConfig, ArtifactRead, ArtifactService, CreateArtifact,
+};
 pub use storage::{ArtifactError, ArtifactStorage, ReadRange};
 pub use types::{
     ArtifactAccessRow, ArtifactCreator, ArtifactListRow, ArtifactRecord, ArtifactReference,

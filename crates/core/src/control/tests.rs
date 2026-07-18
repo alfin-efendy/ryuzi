@@ -4792,6 +4792,49 @@ async fn attachments_manifest_is_appended_to_the_prompt_the_harness_receives() {
 
 #[tokio::test]
 #[serial]
+async fn archived_control_plane_attachment_ingestion_returns_error_without_artifact() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) =
+        fake_control_plane_with_fetcher(Arc::new(FakeAttachmentFetcher::new([]))).await;
+    seed_project(&store, "project-1").await;
+    seed_session(
+        &store,
+        "session-1",
+        "project-1",
+        SessionStatus::Idle,
+        None,
+        0,
+    )
+    .await;
+    store.archive_session("session-1", now_ms()).await.unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("archived-source.txt");
+    tokio::fs::write(&path, b"must not ingest").await.unwrap();
+
+    let error = cp
+        .ingest_session_attachments(
+            "session-1",
+            9,
+            &[crate::attachments::SavedAttachment {
+                path,
+                name: "archived.txt".into(),
+                content_type: Some("text/plain".into()),
+                size: 14,
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, crate::artifacts::ArtifactError::ArchivedSource);
+    assert!(store
+        .artifacts_for_session("session-1")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+#[serial]
 async fn attachment_max_count_zero_disables_attachments() {
     let _guard = StateDirGuard::new();
     let fetcher = Arc::new(FakeAttachmentFetcher::new([(

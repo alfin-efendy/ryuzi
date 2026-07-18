@@ -80,6 +80,48 @@ pub struct ArtifactService {
     quota_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
+/// Materialize saved user attachments as durable user-created artifacts.
+///
+/// The source session must exist and be live. Files are read only after that
+/// validation and any failure is returned through the path-free artifact error
+/// surface so callers can safely show it to users.
+pub async fn ingest_saved_attachments(
+    store: &Store,
+    artifacts: &ArtifactService,
+    session_pk: &str,
+    message_seq: i64,
+    saved: &[crate::attachments::SavedAttachment],
+) -> Result<(), ArtifactError> {
+    let session = store
+        .get_session(session_pk)
+        .await
+        .map_err(|_| ArtifactError::StorageFailure)?
+        .ok_or(ArtifactError::StorageFailure)?;
+    if session.archived_at.is_some() {
+        return Err(ArtifactError::ArchivedSource);
+    }
+
+    for attachment in saved {
+        let bytes = tokio::fs::read(&attachment.path)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?;
+        artifacts
+            .create_artifact(CreateArtifact {
+                session_pk: session_pk.to_string(),
+                source_message_seq: Some(message_seq),
+                source_run_id: None,
+                creator: ArtifactCreator::User,
+                creator_id: None,
+                name: attachment.name.clone(),
+                description: None,
+                content_type: attachment.content_type.clone(),
+                bytes,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 impl ArtifactService {
     pub fn new(store: Arc<Store>, storage: ArtifactStorage, config: ArtifactConfig) -> Self {
         Self {
@@ -340,6 +382,76 @@ mod tests {
             session_max_bytes: 10_000,
             read_max_bytes: 1_000,
         }
+    }
+
+    #[tokio::test]
+    async fn ingest_saved_attachments_creates_user_artifacts_with_message_provenance() {
+        let (dir, store, svc) = service(default_config()).await;
+        store.insert_session(sample_session()).await.unwrap();
+        let attachment_path = dir.path().join("source-note.txt");
+        tokio::fs::write(&attachment_path, b"attachment bytes")
+            .await
+            .unwrap();
+
+        ingest_saved_attachments(
+            &store,
+            &svc,
+            "sess-1",
+            7,
+            &[crate::attachments::SavedAttachment {
+                path: attachment_path,
+                name: "original-note.txt".into(),
+                content_type: Some("text/plain".into()),
+                size: 16,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let artifacts = store.artifacts_for_session("sess-1").await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        let record = &artifacts[0].artifact;
+        assert_eq!(record.name, "original-note.txt");
+        assert_eq!(record.source_session_pk, "sess-1");
+        assert_eq!(record.source_message_seq, Some(7));
+        assert_eq!(record.creator, ArtifactCreator::User);
+        assert_eq!(
+            svc.read_range(&record.id, 0, None).await.unwrap().bytes,
+            b"attachment bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_saved_attachments_rejects_archived_sessions_without_an_artifact() {
+        let (dir, store, svc) = service(default_config()).await;
+        store.insert_session(sample_session()).await.unwrap();
+        store.archive_session("sess-1", 2).await.unwrap();
+        let attachment_path = dir.path().join("archived.txt");
+        tokio::fs::write(&attachment_path, b"archived")
+            .await
+            .unwrap();
+
+        let error = ingest_saved_attachments(
+            &store,
+            &svc,
+            "sess-1",
+            7,
+            &[crate::attachments::SavedAttachment {
+                path: attachment_path,
+                name: "archived.txt".into(),
+                content_type: Some("text/plain".into()),
+                size: 8,
+            }],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("archived"));
+        assert!(store
+            .artifacts_for_session("sess-1")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
