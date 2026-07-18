@@ -764,16 +764,17 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
 
+        let primary_config = primary_turn.config()?;
+        let run_id = primary_turn.run_id.clone();
+
         // Reserve the session as Running for the lifetime of this turn so the
         // sidebar spinner shows and the composer offers Stop. Atomic Idle→Running
         // only (mirrors `claim_next_session_prompt_if_idle`), so a concurrent stop
-        // (Interrupted) is never clobbered. The cold-resume failure branch below
-        // rolls this back via `demote_if_running`, and the normal turn end demotes
-        // it in `spawn_prompt`.
+        // (Interrupted) is never clobbered. Any early exit before a turn is
+        // actually spawned demotes it back (cold-resume failure below; the
+        // dispatch_turn coordinator error paths); the normal turn end demotes it
+        // in `spawn_prompt`.
         let _ = self.store.promote_if_idle(session_pk, now_ms()).await;
-
-        let primary_config = primary_turn.config()?;
-        let run_id = primary_turn.run_id.clone();
 
         // A session still in background startup has no live handle yet, and its
         // FIRST prompt hasn't been driven. Cold-resuming now would spawn a
@@ -1806,6 +1807,7 @@ impl ControlPlane {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             if me.delegation.mark_running(&run_id).await.is_err() {
+                let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 return;
             }
             let queued =
@@ -1873,9 +1875,11 @@ impl ControlPlane {
             .await;
             if let Some(error) = outcomes.into_iter().find_map(Result::err) {
                 let _ = me.delegation.fail(&run_id, &error.to_string()).await;
+                let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 return;
             }
             if coordinator_cancelled(&me.store, &session_pk, &run_id).await {
+                let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 return;
             }
             let context = match coordinator_context_from_run(&me.store, &session_pk, &run_id).await
@@ -1884,6 +1888,7 @@ impl ControlPlane {
                 Err(error) => {
                     let message = error.to_string();
                     let _ = me.delegation.fail(&run_id, &message).await;
+                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                     return;
                 }
             };
