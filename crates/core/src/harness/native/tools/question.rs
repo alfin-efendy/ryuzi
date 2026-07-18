@@ -244,6 +244,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stays_pending_until_the_user_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
+        let mut asked =
+            tokio::spawn(
+                async move { AskUserQuestion.execute(&ctx, valid_input()).await.unwrap() },
+            );
+
+        let (run_id, request_id) = match rx.recv().await.unwrap() {
+            CoreEvent::ApprovalRequested {
+                run_id, request_id, ..
+            } => (run_id, request_id),
+            other => panic!("unexpected event {other:?}"),
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut asked)
+                .await
+                .is_err(),
+            "askuserquestion must remain pending until the user responds"
+        );
+
+        hub.resolve(
+            &crate::approval::ApprovalKey::new(&run_id, &request_id),
+            ApprovalResponse {
+                decision: ApprovalDecision::AllowOnce,
+                scope: None,
+                payload: Some(json!({"answers": {"Which DB?": ["SQLite"]}})),
+            },
+        );
+        let out = asked.await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.for_model.contains("SQLite"));
+    }
+
+    #[tokio::test]
     async fn cancel_decision_is_reported_as_no_interactive_surface() {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;

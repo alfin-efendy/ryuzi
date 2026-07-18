@@ -1744,7 +1744,6 @@ const SUBAGENT_BLOCKLIST: &[&str] = &[
     "todoread",
     "app_jobs",
     "app_projects",
-    "clarify",
 ];
 /// Cap on one delegated child's model-visible report (protects the parent's
 /// context from runaway child output).
@@ -2240,7 +2239,7 @@ impl RunnerSpawner {
         source_tool_call_id: &str,
         index: usize,
         spec: SubtaskSpec,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> SubtaskResult {
         let result = |status, report| SubtaskResult {
             index,
@@ -2267,8 +2266,24 @@ impl RunnerSpawner {
             Ok(child) => child,
             Err(error) => return result(SubtaskStatus::Error, error.to_string()),
         };
-        self.run_queued_child(index, spec, child_run.cancel.clone(), child_run)
-            .await
+        // Link the turn's cancellation onto this foreground child's independent
+        // run token, so a session stop (which trips the turn token via
+        // `handle.cancel()`) tears the child down — not only an explicit
+        // `cancel_descendants_of_root`. The linker is aborted once the child
+        // settles so it never outlives the turn.
+        let link = {
+            let turn_cancel = cancel.clone();
+            let run_cancel = child_run.cancel.clone();
+            tokio::spawn(async move {
+                turn_cancel.cancelled().await;
+                run_cancel.cancel();
+            })
+        };
+        let outcome = self
+            .run_queued_child(index, spec, child_run.cancel.clone(), child_run)
+            .await;
+        link.abort();
+        outcome
     }
 
     /// Execute a child after its durable run has been admitted. The same path
@@ -3915,7 +3930,6 @@ fn is_builtin_metric_tool(tool_name: &str) -> bool {
             | "askuserquestion"
             | "app_jobs"
             | "app_projects"
-            | "clarify"
             | LOAD_TOOLS_NAME
     )
 }
@@ -12648,6 +12662,79 @@ mod tests {
                 .iter()
                 .all(|row| row.tool_call_id.as_deref() != Some("must-not-run")),
             "the cancellation token stops the loop before a subsequent tool side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn tripping_the_turn_token_stops_a_foreground_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocking_turn = vec![
+            tool_use_start(0, "blocking-call", "blocking"),
+            input_json_delta(0, "{}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let next_tool_turn = vec![
+            tool_use_start(0, "must-not-run", "bash"),
+            input_json_delta(0, r#"{"command":"echo side-effect"}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![blocking_turn, next_tool_turn]));
+        let deps = deps_at(dir.path(), llm).await;
+        let deps = {
+            let mut deps = deps;
+            deps.tools = Arc::new(ToolRegistry::with_extra(vec![Arc::new(BlockingTool {
+                started: started.clone(),
+                release: release.clone(),
+                effects: effects.clone(),
+            })]));
+            deps
+        };
+        let root = deps.run_id.clone();
+        // The turn token: a session stop trips exactly this.
+        let turn_cancel = CancellationToken::new();
+        let spawner = RunnerSpawner {
+            deps: deps.clone(),
+            cancel: turn_cancel.clone(),
+            depth: 0,
+            parent_run_id: root,
+        };
+        let worker = tokio::spawn(async move {
+            spawner
+                .run_many(
+                    "test-tool-call",
+                    vec![SubtaskSpec {
+                        agent_type: "general".into(),
+                        prompt: "block until cancelled".into(),
+                    }],
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("the child entered its blocking tool");
+
+        // Trip the TURN token (what handle.cancel() does) — the child must stop.
+        turn_cancel.cancel();
+        release.notify_one();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("tripping the turn token must settle the child worker")
+            .unwrap();
+
+        assert_eq!(results[0].status, SubtaskStatus::Interrupted);
+        assert!(
+            deps.store
+                .list_messages(&deps.session_pk)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.tool_call_id.as_deref() != Some("must-not-run")),
+            "the turn token must stop the loop before the next tool side effect"
         );
     }
 

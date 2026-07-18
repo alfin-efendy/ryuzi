@@ -2483,6 +2483,27 @@ impl Store {
         .await
     }
 
+    /// Atomically promote `Idle → Running` only if the current status is still
+    /// `Idle`. A session already `Interrupted`/`Ended`/`Running` is left
+    /// untouched, so a concurrent stop is never clobbered back into `Running`.
+    /// The inverse of [`Self::demote_if_running`].
+    pub async fn promote_if_idle(&self, pk: &str, last_active: i64) -> anyhow::Result<bool> {
+        let pk = pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE sessions SET status=?2, last_active=?3 WHERE session_pk=?1 AND status=?4",
+                params![
+                    pk,
+                    SessionStatus::Running.as_str(),
+                    last_active,
+                    SessionStatus::Idle.as_str()
+                ],
+            )
+            .map(|changed| changed > 0)
+        })
+        .await
+    }
+
     /// Backfill the workspace columns once background startup has prepared
     /// the git workspace (session-first start returns a provisional row).
     pub async fn update_session_workspace(
@@ -7178,6 +7199,38 @@ mod tests {
 
         assert_eq!(store.list_sessions(Some("p1")).await.unwrap().len(), 1);
         assert_eq!(store.list_sessions(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn promote_if_idle_only_promotes_from_idle() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store.insert_session(sample_session()).await.unwrap(); // starts Running
+
+        // Not idle → no-op, returns false.
+        assert!(!store.promote_if_idle("s1", 10).await.unwrap());
+
+        // Idle → Running, returns true.
+        store
+            .update_status("s1", SessionStatus::Idle, None)
+            .await
+            .unwrap();
+        assert!(store.promote_if_idle("s1", 20).await.unwrap());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().status,
+            SessionStatus::Running
+        );
+
+        // Interrupted is never clobbered back into Running.
+        store
+            .update_status("s1", SessionStatus::Interrupted, None)
+            .await
+            .unwrap();
+        assert!(!store.promote_if_idle("s1", 30).await.unwrap());
+        assert_eq!(
+            store.get_session("s1").await.unwrap().unwrap().status,
+            SessionStatus::Interrupted
+        );
     }
 
     #[tokio::test]
