@@ -96,6 +96,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 serial_test.workspace = true
+wasmtime.workspace = true
 # `test-util` (for `#[tokio::test(start_paused = true)]`, used by the
 # extension host's timeout test — `plugins::extension::proc::tests`) is
 # additive to `[dependencies]`'s own `tokio` feature set and only active
