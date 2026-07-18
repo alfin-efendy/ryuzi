@@ -159,7 +159,7 @@ function OrganizeMenu({
 }
 
 export function Sidebar() {
-  const { projects, sessions, setFocused, focusedSession, selectProject, end } = useStore();
+  const { projects, sessions, setFocused, focusedSession, selectProject } = useStore();
   const pendingCount = useStore((s) => s.pendingApprovals.length);
   const {
     pinned,
@@ -213,27 +213,18 @@ export function Sidebar() {
     setProjectOrdering("manual");
   };
 
-  // Archive = real teardown: end the session (interrupt + stop the agent,
-  // kill its terminals, remove the worktree and its ryuzi/* branch), then
-  // hide the row. Work that teardown would destroy — uncommitted changes OR
-  // commits that exist only on the session branch — gets a confirmation.
-  // The row is archived ONLY when the backend teardown succeeded.
+  // Archive preserves the durable session and its artifacts for retention;
+  // backend state is authoritative while the local map remains an immediate
+  // visibility cache until the next session refresh.
   const finishArchive = async (s: UiSession) => {
     setArchivingPk(s.sessionPk);
     try {
-      // Shells opened for this session hold their cwd inside the worktree;
-      // kill them first or the directory removal fails on Windows. Terminals
-      // are always local Cockpit-process PTYs (never runner-scoped).
-      await commands.termCloseSession(s.sessionPk);
-      const ok = await end(s.runnerId, s.sessionPk);
-      if (!ok) return; // end() already toasted; leave the row visible
+      const result = await commands.archiveSession(s.runnerId, s.sessionPk);
+      if (result.status === "error") {
+        return;
+      }
       setArchived(sessionKey(s), true);
       if (isSession(s, focusedSession)) setFocused(null);
-      // Drop the JS-side terminal cache only now — after teardown succeeded and
-      // the drawer has unmounted (setFocused(null)). Emptying the tabs earlier
-      // would let the drawer's auto-spawn open a fresh PTY into the worktree
-      // being removed. termCloseSession already emitted the exit events, so on
-      // the failure path above we intentionally leave the cache alone.
       useTerms.getState().disposeSession(s.runnerId, s.sessionPk);
     } finally {
       setArchivingPk(null);
@@ -316,14 +307,22 @@ export function Sidebar() {
       isActive: view.kind === "session" && isSession(s, focusedSession),
       isPinned: !!pinned[key],
       unread: isUnreadVisible(s, readAt, focusedSession),
-      isArchived: !!archived[key],
+      isArchived: s.archivedAt !== null || !!archived[key],
       hasTail: opts.hasTail,
       showGuide: opts.showGuide,
       archiveDisabled: archivingPk === s.sessionPk,
       runnerLabel: runnerLabel(s.runnerId),
       onOpen: () => openSession(s),
       onTogglePin: () => togglePin(key),
-      onToggleArchive: () => (archived[key] ? setArchived(key, false) : void archiveSession(s)),
+      onToggleArchive: () => {
+        if (s.archivedAt !== null || archived[key]) {
+          void commands.restoreSession(s.runnerId, s.sessionPk).then((result) => {
+            if (result.status === "ok") setArchived(key, false);
+          });
+        } else {
+          void archiveSession(s);
+        }
+      },
     };
   };
 
