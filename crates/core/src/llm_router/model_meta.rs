@@ -8,6 +8,12 @@ use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Tokens held back from the usable window for the model's generated output,
+/// so a prompt that fits the input budget doesn't overflow once the response
+/// is appended. Capped so a large-output model doesn't over-reserve. Mirrors
+/// opencode's overflow.ts (usable = context - reserved output).
+const OUTPUT_RESERVE_CAP: u64 = 20_000;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelMeta {
     pub context_window: u64,
@@ -49,13 +55,17 @@ pub const FALLBACK: ModelMeta = ModelMeta {
 };
 
 impl ModelMeta {
-    /// 95% of the raw window — headroom for the response (spec §5).
     pub fn usable_window(&self) -> u64 {
-        self.context_window * 95 / 100
+        let reserved = self.max_output_tokens.min(OUTPUT_RESERVE_CAP);
+        self.context_window
+            .saturating_sub(reserved)
+            .max(self.context_window / 2)
     }
-    /// The auto-compact threshold at `percent` (settings default 90).
+    /// The auto-compact threshold at `percent` (settings default 90) — a
+    /// fraction of the *usable* input budget, so proactive compaction fires
+    /// below the hard ceiling with room for one more exchange.
     pub fn auto_compact_limit(&self, percent: u64) -> u64 {
-        self.context_window * percent.min(95) / 100
+        self.usable_window() * percent.min(95) / 100
     }
     /// USD for one request's four disjoint token buckets. Anthropic reports
     /// non-cached input, cache-read, and cache-creation separately, each at
@@ -678,8 +688,10 @@ mod tests {
             context_window: 100_000,
             ..FALLBACK
         };
-        assert_eq!(m.usable_window(), 95_000);
-        assert_eq!(m.auto_compact_limit(90), 90_000);
+        // 100k context, 8_192 max output: reserve 8_192 -> usable 91_808;
+        // proactive threshold = 90% of usable.
+        assert_eq!(m.usable_window(), 91_808);
+        assert_eq!(m.auto_compact_limit(90), 82_627);
     }
 
     #[test]

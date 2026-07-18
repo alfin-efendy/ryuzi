@@ -6850,7 +6850,7 @@ mod tests {
 
     fn tiny_meta() -> crate::llm_router::model_meta::ModelMeta {
         crate::llm_router::model_meta::ModelMeta {
-            context_window: 400, // tiny: threshold 360, usable 380
+            context_window: 400, // tiny: reserve floors usable to 200, threshold 180
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
