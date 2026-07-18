@@ -14,6 +14,14 @@ import { Button } from "@ryuzi/ui";
 const activeStatuses = new Set(["queued", "running"]);
 const retryableStatuses = new Set(["failed", "cancelled", "interrupted"]);
 
+/** Isolated so the 1 Hz tick re-renders only this duration text, not AgentRunDetail's rows/Transcript. */
+function RunHeaderDuration({ run, active }: { run: AgentRun; active: boolean }) {
+  const now = useNow(active);
+  const duration = formatAgentRunDuration(run, now);
+  if (!duration) return null;
+  return <span>{duration}</span>;
+}
+
 export function AgentRunDetail({
   runnerId,
   sessionPk,
@@ -46,8 +54,6 @@ export function AgentRunDetail({
     ),
   );
   const active = activeStatuses.has(run.status);
-  const now = useNow(active);
-  const duration = formatAgentRunDuration(run, now);
   const status = agentRunStatusPresentation(run.status);
   const usage = useStore((s) => s.contextUsage[sessKey(runnerId, sessionPk)]);
 
@@ -73,7 +79,7 @@ export function AgentRunDetail({
           <span>
             {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
           </span>
-          {duration && <span>{duration}</span>}
+          <RunHeaderDuration run={run} active={active} />
           {run.resolvedModel && <span>{run.resolvedModel}</span>}
           {run.resolvedEffort && <span>{run.resolvedEffort}</span>}
           {usage && (
