@@ -54,7 +54,7 @@ export function AgentRunDetail({
   );
   const active = activeStatuses.has(run.status);
   const status = agentRunStatusPresentation(run.status);
-  const live = useStore((s) => s.runContextUsage[delegationRunKey(runnerId, sessionPk, run.runId)]);
+  const live = useStore((s) => s.runContextUsage[transcriptKey]);
   const usage =
     live ??
     (run.contextPercentLeft != null
