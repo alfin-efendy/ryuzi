@@ -11,7 +11,11 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
 
-pub(crate) const HANDLES: &[&str] = &["list_session_artifacts", "fetch_artifact"];
+pub(crate) const HANDLES: &[&str] = &[
+    "list_session_artifacts",
+    "fetch_artifact",
+    "run_artifact_retention",
+];
 
 #[derive(Deserialize)]
 struct SessionPk {
@@ -25,6 +29,13 @@ struct FetchArtifactP {
     artifact_id: String,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RunRetentionP {
+    now_ms: Option<i64>,
+    retention_days: Option<i64>,
+}
+
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     match method {
         "list_session_artifacts" => {
@@ -34,6 +45,15 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "fetch_artifact" => {
             let a: FetchArtifactP = params(p)?;
             ok(fetch_artifact(state, &a.session_pk, &a.artifact_id).await?)
+        }
+        "run_artifact_retention" => {
+            let a: RunRetentionP = params(p)?;
+            ok(run_artifact_retention(
+                state,
+                a.now_ms.unwrap_or_else(crate::paths::now_ms),
+                a.retention_days.unwrap_or(30),
+            )
+            .await?)
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
@@ -78,6 +98,19 @@ async fn fetch_artifact(
         content_type: access.artifact.content_type,
         data_base64: base64::engine::general_purpose::STANDARD.encode(read.bytes),
     })
+}
+
+async fn run_artifact_retention(
+    state: &ApiState,
+    now_ms: i64,
+    retention_days: i64,
+) -> Result<usize, ApiError> {
+    state
+        .cp
+        .artifacts()
+        .purge_expired_archives(now_ms, retention_days)
+        .await
+        .map_err(map_read_error)
 }
 
 fn map_read_error(error: ArtifactError) -> ApiError {
