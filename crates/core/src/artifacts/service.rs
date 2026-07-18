@@ -740,6 +740,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_full_bypasses_the_agent_output_cap_for_human_downloads() {
+        let (_dir, _store, svc) = service(ArtifactConfig {
+            max_bytes: 1_000,
+            session_max_bytes: 10_000,
+            read_max_bytes: 3,
+        })
+        .await;
+        let record = svc
+            .create_artifact(base_input(b"0123456789"))
+            .await
+            .unwrap();
+
+        let read = svc.read_full(&record.id).await.unwrap();
+        assert_eq!(read.bytes, b"0123456789");
+        assert!(!read.truncated);
+    }
+
+    #[tokio::test]
     async fn read_range_clamps_to_the_configured_cap() {
         let (_dir, _store, svc) = service(ArtifactConfig {
             max_bytes: 1_000,
