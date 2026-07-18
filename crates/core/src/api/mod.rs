@@ -5,6 +5,7 @@
 
 pub mod agent_api;
 pub mod apps_api;
+pub mod artifacts_api;
 pub mod audit;
 pub mod automation_api;
 pub mod connections_api;
@@ -162,6 +163,7 @@ pub async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value,
         m if extension_status_api::HANDLES.contains(&m) => {
             extension_status_api::dispatch(state, m, p).await
         }
+        m if artifacts_api::HANDLES.contains(&m) => artifacts_api::dispatch(state, m, p).await,
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }

@@ -654,6 +654,7 @@ async fn recent_sessions_filter_by_stable_owner_and_sort_by_last_activity_with_a
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -1552,6 +1553,7 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -1637,6 +1639,7 @@ async fn agent_session_continuation_rejects_non_executable_owners_before_user_me
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -1685,6 +1688,7 @@ async fn control_plane_owns_the_injected_agent_registry_and_delegation_runtime()
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -2367,6 +2371,7 @@ async fn seed_session(
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -4052,6 +4057,7 @@ async fn resume_session_resumes_a_chat_session() {
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await
         .unwrap();
@@ -4345,6 +4351,7 @@ async fn non_git_startup_cancelled_before_it_begins_never_starts_the_harness() {
         speaker: None,
         agent: None,
         parent_session_pk: None,
+        archived_at: None,
     };
     store.insert_session(session).await.unwrap();
     let root = cp
@@ -4859,6 +4866,49 @@ async fn attachments_manifest_is_appended_to_the_prompt_the_harness_receives() {
         user_row.payload["text"], "please review",
         "the persisted user row must be the raw prompt only, not manifest-decorated"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn archived_control_plane_attachment_ingestion_returns_error_without_artifact() {
+    let _guard = StateDirGuard::new();
+    let (cp, store, _prompts, _db_guard) =
+        fake_control_plane_with_fetcher(Arc::new(FakeAttachmentFetcher::new([]))).await;
+    seed_project(&store, "project-1").await;
+    seed_session(
+        &store,
+        "session-1",
+        "project-1",
+        SessionStatus::Idle,
+        None,
+        0,
+    )
+    .await;
+    store.archive_session("session-1", now_ms()).await.unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("archived-source.txt");
+    tokio::fs::write(&path, b"must not ingest").await.unwrap();
+
+    let error = cp
+        .ingest_session_attachments(
+            "session-1",
+            9,
+            &[crate::attachments::SavedAttachment {
+                path,
+                name: "archived.txt".into(),
+                content_type: Some("text/plain".into()),
+                size: 14,
+            }],
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, crate::artifacts::ArtifactError::ArchivedSource);
+    assert!(store
+        .artifacts_for_session("session-1")
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

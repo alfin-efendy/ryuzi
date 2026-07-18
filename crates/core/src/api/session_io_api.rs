@@ -140,6 +140,7 @@ async fn apply_import(
         speaker: None,
         agent: None,
         parent_session_pk: None,
+        archived_at: None,
     };
     store.insert_session(session.clone()).await?;
     for m in export.messages {
@@ -312,6 +313,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -396,6 +398,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();

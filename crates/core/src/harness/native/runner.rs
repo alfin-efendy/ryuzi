@@ -107,6 +107,8 @@ pub struct RunnerDeps {
     pub work_dir: PathBuf,
     /// Session attachments folder (second read root for the `read` tool).
     pub attachments_dir: Option<PathBuf>,
+    /// Task-artifact service shared with the control plane.
+    pub artifacts: Arc<crate::artifacts::ArtifactService>,
     /// Plugin-bundled skill directories folded in beside the worktree/global
     /// ones (see `crate::plugins::PluginHost::enabled_skill_dirs`).
     pub extra_skill_dirs: Vec<PathBuf>,
@@ -566,7 +568,7 @@ pub async fn run_turn(
     }
 
     // 1. Persist + broadcast the user's message (raw display text).
-    emit_row(
+    let user_seq = emit_row_with_seq(
         deps,
         "user",
         "text",
@@ -576,6 +578,28 @@ pub async fn run_turn(
         None,
     )
     .await;
+    if let (Some(message_seq), false) = (user_seq, prompt.saved_attachments.is_empty()) {
+        if let Err(error) = crate::artifacts::ingest_saved_attachments(
+            &deps.store,
+            &deps.artifacts,
+            &deps.session_pk,
+            message_seq,
+            &prompt.saved_attachments,
+        )
+        .await
+        {
+            emit_row(
+                deps,
+                "system",
+                "notice",
+                json!({ "text": format!("Could not save one or more attachments as artifacts: {error}") }),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+    }
 
     // Complete per-turn configuration snapshot: re-read the project's pinned
     // model/effort, configured and provider defaults, eligible surfaces, and
@@ -1868,6 +1892,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         kind: deps.kind,
         work_dir: deps.work_dir.clone(),
         attachments_dir: None,
+        artifacts: deps.artifacts.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         extension_events: deps.extension_events.clone(),
         model,
@@ -3091,6 +3116,7 @@ async fn execute_tool_call(
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        artifacts: deps.artifacts.clone(),
         pinned_file_reference,
         preflight_file_target,
         edit_precondition: prepared_edit_precondition,
@@ -4153,6 +4179,30 @@ async fn emit_row(
     status: Option<String>,
     tool_kind: Option<String>,
 ) -> bool {
+    emit_row_with_seq(
+        deps,
+        role,
+        block_type,
+        payload,
+        tool_call_id,
+        status,
+        tool_kind,
+    )
+    .await
+    .is_some()
+}
+
+/// Persist a message row, broadcast its event, and return the actual session
+/// sequence when insertion succeeds.
+async fn emit_row_with_seq(
+    deps: &RunnerDeps,
+    role: &str,
+    block_type: &str,
+    payload: Value,
+    tool_call_id: Option<String>,
+    status: Option<String>,
+    tool_kind: Option<String>,
+) -> Option<i64> {
     let msg = NewMessage {
         session_pk: deps.session_pk.clone(),
         role: role.to_string(),
@@ -4178,11 +4228,11 @@ async fn emit_row(
                     speaker: None,
                 },
             ));
-            true
+            Some(seq)
         }
         Err(e) => {
             tracing::warn!("native[{NATIVE_ID}]: insert_message failed: {e}");
-            false
+            None
         }
     }
 }
@@ -5671,6 +5721,15 @@ mod tests {
             kind: SessionKind::Chat,
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
+            artifacts: Arc::new(crate::artifacts::ArtifactService::new(
+                store.clone(),
+                crate::artifacts::ArtifactStorage::new(dir.join("artifacts")),
+                crate::artifacts::ArtifactConfig {
+                    max_bytes: 26_214_400,
+                    session_max_bytes: 262_144_000,
+                    read_max_bytes: 50_000,
+                },
+            )),
             extra_skill_dirs: vec![],
             extension_events: None,
             // bypassPermissions so the scripted bash tool runs without a prompt.
@@ -5742,6 +5801,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();
@@ -11043,6 +11103,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_attachments_become_user_artifacts_after_the_user_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("done")]));
+        let deps = deps_at(dir.path(), llm).await;
+        let attachment_path = dir.path().join("source.txt");
+        tokio::fs::write(&attachment_path, b"saved attachment")
+            .await
+            .unwrap();
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                saved_attachments: vec![crate::attachments::SavedAttachment {
+                    path: attachment_path,
+                    name: "report.txt".into(),
+                    content_type: Some("text/plain".into()),
+                    size: 16,
+                }],
+                ..TurnPrompt::text("please inspect", "please inspect")
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let user = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.role == "user")
+            .unwrap();
+        let rows = deps
+            .store
+            .artifacts_for_session(&deps.session_pk)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let artifact = &rows[0].artifact;
+        assert_eq!(artifact.name, "report.txt");
+        assert_eq!(artifact.source_session_pk, deps.session_pk);
+        assert_eq!(artifact.source_message_seq, Some(user.seq));
+        assert_eq!(
+            deps.artifacts
+                .read_range(&artifact.id, 0, None)
+                .await
+                .unwrap()
+                .bytes,
+            b"saved attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_attachment_ingestion_failure_emits_path_free_notice_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let llm = Arc::new(ScriptedLlm::new(vec![final_turn("done")]));
+        let deps = deps_at(dir.path(), llm).await;
+        let missing_path = dir.path().join("private-name.txt");
+
+        run_turn(
+            &deps,
+            TurnPrompt {
+                saved_attachments: vec![crate::attachments::SavedAttachment {
+                    path: missing_path,
+                    name: "report.txt".into(),
+                    content_type: Some("text/plain".into()),
+                    size: 16,
+                }],
+                ..TurnPrompt::text("please inspect", "please inspect")
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let notices = deps
+            .store
+            .list_messages(&deps.session_pk)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "system" && message.block_type == "notice")
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        let notice = notices[0].payload["text"].as_str().unwrap();
+        assert!(!notice.contains("private-name.txt"));
+        assert!(!notice.contains("report.txt"));
+        assert!(notice.contains("Could not save one or more attachments as artifacts"));
+    }
+
+    #[tokio::test]
     async fn generates_a_title_for_a_fresh_session() {
         let dir = tempfile::tempdir().unwrap();
         // Turn 0: the actual reply. Turn 1: the title generation.
@@ -11592,6 +11744,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();

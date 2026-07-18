@@ -2616,6 +2616,7 @@ mod tests {
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         };
         s.cp.store().insert_session(chat.clone()).await.unwrap();
         s.cp.store()

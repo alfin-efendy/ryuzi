@@ -415,6 +415,7 @@ impl Harness for NativeHarness {
                 attachments_dir: (!ctx.isolated_target)
                     .then_some(ctx.attachments_dir)
                     .flatten(),
+                artifacts: ctx.artifacts,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 extension_events: ctx.extension_events,
                 model,
@@ -738,6 +739,7 @@ mod tests {
                     speaker: None,
                     agent: None,
                     parent_session_pk: None,
+                    archived_at: None,
                 })
                 .await
                 .unwrap();
@@ -772,7 +774,16 @@ mod tests {
             kind: crate::domain::SessionKind::Chat,
             agent: None,
             isolated_target: false,
-            work_dir,
+            work_dir: work_dir.clone(),
+            artifacts: Arc::new(crate::artifacts::ArtifactService::new(
+                store.clone(),
+                crate::artifacts::ArtifactStorage::new(work_dir.join("artifacts")),
+                crate::artifacts::ArtifactConfig {
+                    max_bytes: 26_214_400,
+                    session_max_bytes: 262_144_000,
+                    read_max_bytes: 50_000,
+                },
+            )),
             attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,
             model: Some("test/model".into()),
@@ -1657,6 +1668,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();

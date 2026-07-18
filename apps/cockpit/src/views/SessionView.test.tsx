@@ -51,6 +51,8 @@ const projectRuntimeInfo = mock(() =>
 // `commands` through this same live binding, so an absent `fetchAttachment`
 // here would break ITS attachment-preview test instead of ours.
 const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data: { dataBase64: "", contentType: null } }));
+const listSessionArtifacts = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const fetchArtifact = mock(() => Promise.resolve({ status: "ok" as const, data: { name: "artifact", contentType: null, dataBase64: "" } }));
 const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Project[] }));
 const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
 const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
@@ -116,6 +118,8 @@ mock.module("@/bindings", () => ({
     removeSessionMessage: async () => ({ status: "ok" as const, data: true }),
     projectRuntimeInfo,
     fetchAttachment,
+    listSessionArtifacts,
+    fetchArtifact,
     listProjects,
     listSessions,
     listGateways,

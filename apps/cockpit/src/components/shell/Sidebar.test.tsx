@@ -4,10 +4,12 @@ import type { Project } from "@/bindings";
 import { LOCAL_RUNNER, sessKey, type UiSession } from "@/lib/session-key";
 
 const worktreeDirty = mock(async () => ({ status: "ok" as const, data: { dirty: true, unmergedCommits: 0 } }));
+const archiveSession = mock(async () => ({ status: "ok" as const, data: true }));
+const restoreSession = mock(async () => ({ status: "ok" as const, data: true }));
 const termCloseSession = mock(async () => ({ status: "ok" as const, data: null }));
 
 mock.module("@/bindings", () => ({
-  commands: { worktreeDirty, termCloseSession },
+  commands: { worktreeDirty, archiveSession, restoreSession, termCloseSession },
   events: {},
 }));
 
@@ -56,6 +58,8 @@ const endSession = mock((_runnerId: string, _sessionPk: string): Promise<boolean
 
 beforeEach(() => {
   worktreeDirty.mockClear();
+  archiveSession.mockClear();
+  restoreSession.mockClear();
   termCloseSession.mockClear();
   endSession.mockClear();
   useStore.setState({
@@ -117,11 +121,11 @@ test("archive confirmation preserves the consequences and initially focuses Canc
 });
 
 test("busy archive locks every dismissal path until teardown settles", async () => {
-  let resolveClose: ((result: { status: "ok"; data: null }) => void) | undefined;
-  termCloseSession.mockImplementationOnce(
+  let resolveArchive: ((result: { status: "ok"; data: true }) => void) | undefined;
+  archiveSession.mockImplementationOnce(
     () =>
       new Promise((resolve) => {
-        resolveClose = resolve;
+        resolveArchive = resolve;
       }),
   );
   await openArchiveConfirmation();
@@ -141,11 +145,11 @@ test("busy archive locks every dismissal path until teardown settles", async () 
   fireEvent.keyDown(document, { key: "Escape" });
   fireEvent.click(document.querySelector('[data-slot="modal-backdrop"]') as HTMLElement);
   expect(screen.getByRole("dialog", { name: "Archive session?" })).toBeTruthy();
-  expect(termCloseSession).toHaveBeenCalledTimes(1);
+  expect(archiveSession).toHaveBeenCalledTimes(1);
 
-  await act(async () => resolveClose?.({ status: "ok", data: null }));
+  await act(async () => resolveArchive?.({ status: "ok", data: true }));
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Archive session?" })).toBeNull());
-  expect(endSession).toHaveBeenCalledWith(LOCAL_RUNNER, "s1");
+  expect(useUi.getState().archived[sessKey(LOCAL_RUNNER, "s1")]).toBe(true);
 });
 
 function sessionFixture(pk: string, lastActive: number): UiSession {

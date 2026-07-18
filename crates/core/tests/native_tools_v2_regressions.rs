@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use ryuzi_core::agents::bootstrap::{default_ryuzi_profile, AgentPersistence};
 use ryuzi_core::agents::types::{AgentModel, AgentSnapshot};
 use ryuzi_core::approval::ApprovalHub;
+use ryuzi_core::artifacts::{ArtifactConfig, ArtifactService, ArtifactStorage};
 use ryuzi_core::domain::{PermMode, Session, SessionKind, SessionStatus, WriteOrigin};
 use ryuzi_core::harness::native::background::BackgroundRegistry;
 use ryuzi_core::harness::native::capabilities::{
@@ -189,6 +190,7 @@ async fn fixture_context(
             speaker: None,
             agent: None,
             parent_session_pk: None,
+            archived_at: None,
         })
         .await?;
     let persistence = AgentPersistence::temporary(store.clone()).await?;
@@ -230,6 +232,15 @@ async fn fixture_context(
             agent: None,
             isolated_target: false,
             work_dir: work_dir.to_path_buf(),
+            artifacts: Arc::new(ArtifactService::new(
+                store.clone(),
+                ArtifactStorage::new(work_dir.join("artifacts")),
+                ArtifactConfig {
+                    max_bytes: 26_214_400,
+                    session_max_bytes: 262_144_000,
+                    read_max_bytes: 50_000,
+                },
+            )),
             attachments_dir: None,
             perm_mode: PermMode::BypassPermissions,
             model: Some(requested_model.into()),

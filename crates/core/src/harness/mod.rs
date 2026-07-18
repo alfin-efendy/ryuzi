@@ -1,4 +1,5 @@
 use crate::approval::ApprovalHub;
+use crate::attachments::SavedAttachment;
 use crate::domain::{CoreEvent, McpServerSpec, PermMode, Principal, SessionKind};
 use crate::store::Store;
 use async_trait::async_trait;
@@ -41,7 +42,8 @@ pub struct SessionCtx {
     /// the root session's Task1 message map.
     pub isolated_target: bool,
     pub work_dir: PathBuf,
-    /// The session's attachment folder (`…/.harness-attachments/{session_pk}`)
+    /// Task-artifact service used after user transcript persistence.
+    pub artifacts: Arc<crate::artifacts::ArtifactService>,
     /// — a second read root the native runtime's `read` tool tries when the
     /// worktree jail rejects a path. `None` when the harness doesn't
     /// materialize attachments to disk (or in bare test contexts).
@@ -143,6 +145,9 @@ pub struct TurnPrompt {
     /// Display metadata persisted on the user transcript row —
     /// `[{name, path, contentType, size}]` per saved attachment.
     pub attachments: Vec<serde_json::Value>,
+    /// Successfully materialized files that should become durable user artifacts
+    /// after the native runner persists the transcript row.
+    pub saved_attachments: Vec<SavedAttachment>,
     /// Force this turn's subtask runtime metadata (see the native runner's
     /// `TurnOptions`), overriding whatever a resolved slash command would
     /// otherwise set. `None` preserves ordinary slash-command resolution —
@@ -294,6 +299,15 @@ mod tests {
             agent: None,
             isolated_target: false,
             work_dir: PathBuf::from("/tmp"),
+            artifacts: Arc::new(crate::artifacts::ArtifactService::new(
+                store.clone(),
+                crate::artifacts::ArtifactStorage::new(std::env::temp_dir().join("artifacts")),
+                crate::artifacts::ArtifactConfig {
+                    max_bytes: 26_214_400,
+                    session_max_bytes: 262_144_000,
+                    read_max_bytes: 50_000,
+                },
+            )),
             attachments_dir: None,
             perm_mode: PermMode::Default,
             model: None,

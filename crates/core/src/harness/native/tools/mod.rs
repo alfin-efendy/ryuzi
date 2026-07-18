@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod app_jobs;
 pub mod app_projects;
+pub mod artifact;
 pub mod bash;
 pub mod delegate;
 pub mod edit;
@@ -339,6 +340,7 @@ pub struct ToolCtx {
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), consulted by the
     /// `skill` tool alongside `work_dir`'s own skill dirs.
     pub extra_skill_dirs: Vec<PathBuf>,
+    pub artifacts: Arc<crate::artifacts::ArtifactService>,
     pub(crate) pinned_file_reference:
         Option<crate::harness::native::file_reference::PinnedFileTarget>,
     pub(crate) preflight_file_target:
@@ -710,6 +712,9 @@ impl ToolRegistry {
     fn builtin_list() -> Vec<Arc<dyn Tool>> {
         vec![
             Arc::new(read::Read),
+            Arc::new(artifact::ReadArtifact),
+            Arc::new(artifact::WriteArtifact),
+            Arc::new(artifact::ShareArtifact),
             Arc::new(ls::Ls),
             Arc::new(write::Write),
             Arc::new(edit::Edit),
@@ -1134,12 +1139,23 @@ pub(crate) mod testutil {
     pub async fn ctx_at(dir: &Path) -> ToolCtx {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let storage = crate::artifacts::ArtifactStorage::new(dir.join("artifacts"));
+        let artifacts = Arc::new(crate::artifacts::ArtifactService::new(
+            store.clone(),
+            storage,
+            crate::artifacts::ArtifactConfig {
+                max_bytes: 26_214_400,
+                session_max_bytes: 262_144_000,
+                read_max_bytes: 50_000,
+            },
+        ));
         ToolCtx {
             session_pk: "test-session".into(),
             run_id: "test-run".into(),
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
+            artifacts,
             pinned_file_reference: None,
             preflight_file_target: None,
             edit_precondition: None,
@@ -1520,6 +1536,9 @@ mod tests {
         let reg = ToolRegistry::builtin();
         for name in [
             "read",
+            "read_artifact",
+            "write_artifact",
+            "share_artifact",
             "ls",
             "write",
             "edit",
@@ -1545,7 +1564,7 @@ mod tests {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 22);
+        assert_eq!(defs.len(), 25);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));

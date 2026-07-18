@@ -245,6 +245,45 @@ pub static GLOBAL_FIELDS: &[ConfigField] = &[
         help: "Native tool facade for newly started native sessions",
         ..BASE
     },
+    ConfigField {
+        key: "artifact_root",
+        label: "Artifact storage root",
+        help: "Directory task artifact payloads are stored under (blank = default data-dir/artifacts)",
+        example: Some("/data/ryuzi/artifacts"),
+        ..BASE
+    },
+    ConfigField {
+        key: "artifact_max_bytes",
+        label: "Artifact max bytes",
+        field_type: FieldType::Int,
+        default: Some("26214400"),
+        help: "Max size per stored artifact, in bytes (default 25 MiB)",
+        ..BASE
+    },
+    ConfigField {
+        key: "artifact_session_max_bytes",
+        label: "Artifact session quota (bytes)",
+        field_type: FieldType::Int,
+        default: Some("262144000"),
+        help: "Max total bytes of artifacts a single source session may persist (default 250 MiB)",
+        ..BASE
+    },
+    ConfigField {
+        key: "artifact_read_max_bytes",
+        label: "Artifact read cap (bytes)",
+        field_type: FieldType::Int,
+        default: Some("50000"),
+        help: "Max bytes returned by a single artifact read (larger reads are truncated)",
+        ..BASE
+    },
+    ConfigField {
+        key: "artifact_retention_days",
+        label: "Artifact retention (days)",
+        field_type: FieldType::Int,
+        default: Some("30"),
+        help: "Days a deleted-source artifact's payload is kept before permanent removal",
+        ..BASE
+    },
 ];
 
 #[cfg(test)]
@@ -252,16 +291,16 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_30_keys_and_correct_flags() {
+    fn schema_has_35_keys_and_correct_flags() {
         let fields = all_fields();
-        assert_eq!(fields.len(), 30); // 27 global + 3 discord
+        assert_eq!(fields.len(), 35); // 32 global + 3 discord
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
-        // list order: 27 globals first, then 3 discord fields
+        // list order: 32 globals first, then 3 discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
         assert!(keys.contains(&"approval_timeout_ms"));
         assert_eq!(
-            &keys[27..],
+            &keys[32..],
             &["discord.token", "discord.app_id", "discord.guild_id"]
         );
         // the only required global is workdir_root; all 3 discord fields required; token is the only secret
@@ -296,6 +335,23 @@ mod tests {
         assert_eq!(
             find_field("context.tool_output_max_bytes").unwrap().default,
             Some("10000")
+        );
+        assert_eq!(find_field("artifact_root").unwrap().default, None);
+        assert_eq!(
+            find_field("artifact_max_bytes").unwrap().default,
+            Some("26214400")
+        );
+        assert_eq!(
+            find_field("artifact_session_max_bytes").unwrap().default,
+            Some("262144000")
+        );
+        assert_eq!(
+            find_field("artifact_read_max_bytes").unwrap().default,
+            Some("50000")
+        );
+        assert_eq!(
+            find_field("artifact_retention_days").unwrap().default,
+            Some("30")
         );
     }
 

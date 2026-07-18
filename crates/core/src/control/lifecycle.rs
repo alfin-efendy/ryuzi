@@ -255,6 +255,7 @@ impl ControlPlane {
             parent_session_pk: worker
                 .as_ref()
                 .and_then(|worker| worker.home_session_pk.clone()),
+            archived_at: None,
         };
         let model_override = model_override.filter(|model| !model.trim().is_empty());
         let (resolved_model, resolved_effort) = model_override
@@ -617,6 +618,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                saved_attachments: prepared.saved,
                 force_subtask: prompt.force_subtask,
             },
             resolved_mentions,
@@ -886,6 +888,7 @@ impl ControlPlane {
                     display: prompt.display,
                     blocks: prepared.image_blocks,
                     attachments: prepared.attachments_meta,
+                    saved_attachments: prepared.saved,
                     force_subtask: prompt.force_subtask,
                 },
                 Some(resolved_mentions),
@@ -900,6 +903,7 @@ impl ControlPlane {
                     display: prompt.display,
                     blocks: prepared.image_blocks,
                     attachments: prepared.attachments_meta,
+                    saved_attachments: prepared.saved,
                     force_subtask: prompt.force_subtask,
                 },
             );
@@ -1192,6 +1196,7 @@ impl ControlPlane {
                 display: prompt.display,
                 blocks: prepared.image_blocks,
                 attachments: prepared.attachments_meta,
+                saved_attachments: prepared.saved,
                 force_subtask: prompt.force_subtask,
             },
             resolved_mentions,
@@ -1654,6 +1659,7 @@ impl ControlPlane {
             agent,
             isolated_target,
             work_dir: work_dir.to_path_buf(),
+            artifacts: self.artifacts.clone(),
             // Explicit-mention children are one-shot isolated harnesses: they
             // share the parent session id for durable run rows, but never its
             // attachment read root. Normal primary and retry starts retain it.

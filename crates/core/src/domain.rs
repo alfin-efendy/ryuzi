@@ -243,6 +243,9 @@ pub struct Session {
     pub agent: Option<String>,
     /// The session this one was spawned from (`Worker`/`Review` lineage).
     pub parent_session_pk: Option<String>,
+    #[serde(default)]
+    #[specta(optional)]
+    pub archived_at: Option<i64>,
 }
 
 /// An immutable identity captured when an agent becomes the primary owner of a session.
@@ -639,6 +642,8 @@ pub struct Message {
     pub seq: i64,
     /// The durable agent-run owner when this row was emitted by a run. Rows
     /// created outside a run (for example startup notices) remain unowned.
+    #[serde(default)]
+    #[specta(optional)]
     pub run_id: Option<String>,
     pub role: String,       // user | assistant | system
     pub block_type: String, // text | thought | tool_call | plan | status | error
@@ -754,6 +759,8 @@ pub enum CoreEvent {
         /// The primary run that owns this row, when applicable. This lets
         /// consumers resolve a tool row against its own turn rather than a
         /// session-wide root selected by position.
+        #[serde(default)]
+        #[specta(optional)]
         run_id: Option<String>,
         role: String,
         block_type: String,

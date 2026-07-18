@@ -2,7 +2,9 @@
 //! downloaded-attachment manifest into the outgoing prompt.
 
 use super::ControlPlane;
-use crate::attachments::{build_manifest, materialize_attachments, MaterializeOpts};
+use crate::attachments::{
+    build_manifest, materialize_attachments, MaterializeOpts, SavedAttachment,
+};
 use crate::domain::{AttachmentRef, QueuedSessionPrompt};
 use crate::settings::{expand_home, SettingsStore};
 use std::path::PathBuf;
@@ -15,6 +17,7 @@ pub(super) struct PreparedPrompt {
     pub agent: String,
     pub image_blocks: Vec<serde_json::Value>,
     pub attachments_meta: Vec<serde_json::Value>,
+    pub saved: Vec<SavedAttachment>,
 }
 
 impl PreparedPrompt {
@@ -23,12 +26,30 @@ impl PreparedPrompt {
             agent,
             image_blocks: Vec::new(),
             attachments_meta: Vec::new(),
+            saved: Vec::new(),
         }
     }
 }
 
 impl ControlPlane {
-    /// `{expand_home(workdir_root)}/.harness-attachments` — the root all
+    /// Materialize saved session attachments into durable artifacts. This
+    /// lower-level bridge intentionally keeps filesystem failures path-free.
+    pub async fn ingest_session_attachments(
+        &self,
+        session_pk: &str,
+        message_seq: i64,
+        saved: &[crate::attachments::SavedAttachment],
+    ) -> Result<(), crate::artifacts::ArtifactError> {
+        crate::artifacts::ingest_saved_attachments(
+            &self.store,
+            &self.artifacts,
+            session_pk,
+            message_seq,
+            saved,
+        )
+        .await
+    }
+
     /// per-session attachment dirs (and the paste staging area) live under.
     /// Public: the cockpit shell scopes the asset protocol to it and stages
     /// pasted files into `{root}/staging/`.
@@ -171,6 +192,7 @@ impl ControlPlane {
             agent,
             image_blocks,
             attachments_meta,
+            saved: result.saved,
         }
     }
 }

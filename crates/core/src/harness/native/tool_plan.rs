@@ -1511,6 +1511,7 @@ mod tests {
                 speaker: None,
                 agent: None,
                 parent_session_pk: None,
+                archived_at: None,
             })
             .await
             .unwrap();

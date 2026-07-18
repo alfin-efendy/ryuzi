@@ -6,7 +6,15 @@ import { toast } from "sonner";
 import { commands } from "@/bindings";
 import { AuditCard } from "@/components/AuditCard";
 import { LOCAL_RUNNER } from "@/lib/session-key";
-import { PROJECTS_ROOT_KEY, WORKTREE_DIR_KEY } from "@/constants";
+import {
+  PROJECTS_ROOT_KEY,
+  WORKTREE_DIR_KEY,
+  ARTIFACT_MAX_BYTES_KEY,
+  ARTIFACT_READ_MAX_BYTES_KEY,
+  ARTIFACT_RETENTION_DAYS_KEY,
+  ARTIFACT_ROOT_KEY,
+  ARTIFACT_SESSION_MAX_BYTES_KEY,
+} from "@/constants";
 import { diffLineStyle, type DiffLine } from "@/lib/diff";
 import { ensurePermission } from "@/lib/notify";
 import { useUi } from "@/store-ui";
@@ -246,6 +254,36 @@ export function SettingsView() {
     if (res.status === "error") toast.error("Couldn't save worktree folder: " + res.error.message);
   };
 
+  const [artifactValues, setArtifactValues] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const keys = [
+      ARTIFACT_ROOT_KEY,
+      ARTIFACT_MAX_BYTES_KEY,
+      ARTIFACT_SESSION_MAX_BYTES_KEY,
+      ARTIFACT_READ_MAX_BYTES_KEY,
+      ARTIFACT_RETENTION_DAYS_KEY,
+    ];
+    void Promise.all(keys.map(async (key) => [key, await commands.getSetting(LOCAL_RUNNER, key)] as const)).then((entries) => {
+      setArtifactValues(Object.fromEntries(entries.map(([key, result]) => [key, result.status === "ok" ? (result.data ?? "") : ""])));
+    });
+  }, []);
+
+  const saveArtifactValue = async (key: string, value: string) => {
+    if (key !== ARTIFACT_ROOT_KEY && (!/^\d+$/.test(value) || Number(value) < 0)) {
+      toast.error("Artifact limits must be whole non-negative numbers.");
+      return;
+    }
+    const result = await commands.setSetting(LOCAL_RUNNER, key, value);
+    if (result.status === "error") toast.error("Couldn't save artifact setting: " + result.error.message);
+  };
+
+  const pickArtifactRoot = async () => {
+    const dir = await commands.pickDirectory();
+    if (!dir) return;
+    setArtifactValues((values) => ({ ...values, [ARTIFACT_ROOT_KEY]: dir }));
+    await saveArtifactValue(ARTIFACT_ROOT_KEY, dir);
+  };
+
   return (
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-7">
       <div className="mx-auto max-w-[640px]">
@@ -328,6 +366,40 @@ export function SettingsView() {
               Browse
             </Button>
           </div>
+        </Card>
+
+        <Card className="mt-3">
+          <div className="flex items-center gap-3.5 px-[18px] py-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">Artifact storage</div>
+              <div className="mt-0.5 truncate text-[12.5px] text-muted-foreground">
+                {artifactValues[ARTIFACT_ROOT_KEY] || "Default app-data artifacts folder."}
+              </div>
+            </div>
+            <Button variant="outline" onClick={() => void pickArtifactRoot()}>
+              Browse
+            </Button>
+          </div>
+        </Card>
+
+        <Card className="mt-3">
+          {[
+            [ARTIFACT_MAX_BYTES_KEY, "Max artifact bytes"],
+            [ARTIFACT_SESSION_MAX_BYTES_KEY, "Session artifact quota bytes"],
+            [ARTIFACT_READ_MAX_BYTES_KEY, "Artifact read response bytes"],
+            [ARTIFACT_RETENTION_DAYS_KEY, "Archive retention days"],
+          ].map(([key, label]) => (
+            <CardRow key={key}>
+              <span className="flex-1 text-[13px] font-medium">{label}</span>
+              <Input
+                value={artifactValues[key] ?? ""}
+                inputMode="numeric"
+                className="w-36"
+                onChange={(e) => setArtifactValues((values) => ({ ...values, [key]: e.target.value }))}
+                onBlur={(e) => void saveArtifactValue(key, e.target.value)}
+              />
+            </CardRow>
+          ))}
         </Card>
 
         <AuditCard />

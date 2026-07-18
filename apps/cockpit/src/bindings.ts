@@ -101,6 +101,22 @@ async endSession(runnerId: string | null, sessionPk: string) : Promise<Result<nu
     else return { status: "error", error: e  as any };
 }
 },
+async archiveSession(runnerId: string | null, sessionPk: string) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("archive_session", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async restoreSession(runnerId: string | null, sessionPk: string) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restore_session", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listToolPolicies(runnerId: string | null) : Promise<Result<ToolPolicyRow[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_tool_policies", { runnerId }) };
@@ -165,6 +181,22 @@ async readLocalMedia(path: string) : Promise<Result<MediaFile, CmdError>> {
 async fetchAttachment(runnerId: string | null, rel: string) : Promise<Result<MediaFile, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("fetch_attachment", { runnerId, rel }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listSessionArtifacts(runnerId: string | null, sessionPk: string) : Promise<Result<ArtifactInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_session_artifacts", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async fetchArtifact(runnerId: string | null, sessionPk: string, artifactId: string) : Promise<Result<ArtifactFileInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_artifact", { runnerId, sessionPk, artifactId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1896,6 +1928,14 @@ export type ApprovalScope =
  * Persisted to the project's `tool_policies` row.
  */
 "project"
+export type ArtifactFileInfo = { name: string; contentType: string | null; dataBase64: string }
+/**
+ * One row of a session's artifact listing (`artifacts_api::list_session_artifacts`):
+ * either an artifact the session originated (`reference_id` and its sibling
+ * reference fields are `None`) or one shared into the session via a
+ * reference (all three are `Some`).
+ */
+export type ArtifactInfo = { id: string; sourceSessionPk: string; referenceId: string | null; sharedFromSessionPk: string | null; parentReferenceId: string | null; status: string; name: string; contentType: string | null; sizeBytes: number; creator: string; createdAt: number; sha256: string }
 /**
  * One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
  */
@@ -2495,7 +2535,7 @@ agent: string | null;
 /**
  * The session this one was spawned from (`Worker`/`Review` lineage).
  */
-parentSessionPk: string | null }
+parentSessionPk: string | null; archivedAt?: number | null }
 /**
  * What a session represents. `Project` is the pre-Phase-2 default (bound to
  * a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds

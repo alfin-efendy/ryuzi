@@ -1499,6 +1499,35 @@ pub struct AgentLearningInfo {
     pub curator_history: Vec<CuratorHistorySnapshotInfo>,
 }
 
+/// One row of a session's artifact listing (`artifacts_api::list_session_artifacts`):
+/// either an artifact the session originated (`reference_id` and its sibling
+/// reference fields are `None`) or one shared into the session via a
+/// reference (all three are `Some`).
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactInfo {
+    pub id: String,
+    pub source_session_pk: String,
+    pub reference_id: Option<String>,
+    pub shared_from_session_pk: Option<String>,
+    pub parent_reference_id: Option<String>,
+    pub status: String,
+    pub name: String,
+    pub content_type: Option<String>,
+    pub size_bytes: u64,
+    pub creator: String,
+    pub created_at: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactFileInfo {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub data_base64: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
