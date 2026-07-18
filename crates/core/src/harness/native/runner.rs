@@ -1173,6 +1173,20 @@ async fn drive(
             text
         }
     };
+    // Append the profile's personality/tone as a distinct, clearly delimited
+    // section onto the assembled system prompt. Only primary and delegated
+    // main-agent turns carry `identity_prompt` (set in
+    // `adapt_primary_profile`); ephemeral `task`-tool sub-agents are built
+    // from `AgentRegistry` entries, which never populate this field, so this
+    // section never leaks a parent's personality into a sub-agent's prompt.
+    // Applied after the match above so both the custom-prompt branch
+    // (`agent.prompt = Some(..)`) and the assembled-sections branch
+    // (`agent.prompt = None`) get the identity section without losing the
+    // base/memory/skills content already folded into `system`.
+    let system = match &agent.identity_prompt {
+        Some(identity) => format!("{system}\n\n## Agent personality\n\n{identity}"),
+        None => system,
+    };
     let system = with_delegation_catalog(system, &deps.delegation_catalog);
     // V1 uses the current activation-aware registry view; V2 uses the exact
     // immutable definitions compiled for this run.
@@ -5439,6 +5453,7 @@ mod tests {
                     name: "anthropic/model-b".into(),
                     effort: Some("high".into()),
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::Default,
                     rules: vec![],
@@ -5565,6 +5580,7 @@ mod tests {
         let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
             registry.clone(),
+            None,
             events.clone(),
         );
         let mut deps = RunnerDeps {
@@ -5789,6 +5805,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: None,
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),
@@ -10753,6 +10770,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn personality_prompt_reaches_primary_system_but_not_subagents() {
+        use crate::agents::personality::{AgentPersonality, PersonalityPreset};
+        use crate::agents::types::AgentSnapshot;
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        // Parent calls task -> child explore runs -> parent closes.
+        let parent = vec![
+            tool_use_start(0, "c1", "task"),
+            input_json_delta(0, "{\"subagent_type\":\"explore\",\"prompt\":\"look\"}"),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let sub = vec![
+            text_delta("found"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let parent_end = vec![
+            text_delta("done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![parent, sub, parent_end]));
+        let mut deps = deps_at(dir.path(), llm.clone()).await;
+
+        // Switch the primary profile to the technical personality preset and
+        // re-derive `deps.agent` (mirrors how `adapt_primary_profile` runs on
+        // every real turn) so its `identity_prompt` picks up the change.
+        let mut profile = deps.primary_agent.profile.clone();
+        profile.personality = AgentPersonality::new(PersonalityPreset::Technical, None).unwrap();
+        deps.primary_agent = Arc::new(AgentSnapshot {
+            profile,
+            executable: deps.primary_agent.executable,
+            validation: deps.primary_agent.validation.clone(),
+        });
+        deps.agent = crate::harness::native::primary_turn_config_with_tools(
+            deps.primary_agent.clone(),
+            deps.run_id.clone(),
+            deps.root_run_id.clone(),
+            &deps.tools.names(),
+        )
+        .unwrap()
+        .agent_tools;
+
+        run_turn(
+            &deps,
+            TurnPrompt::text("go", "go"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let bodies = llm.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3);
+        // The primary agent's system prompt carries the identity section
+        // (stable marker) and the technical preset's baked-in prompt text.
+        let parent_sys = bodies[0]["system"].as_str().unwrap();
+        assert!(parent_sys.contains("## Agent personality"));
+        assert!(parent_sys.contains(PersonalityPreset::Technical.prompt()));
+        // The `task`-spawned sub-agent never carries the parent's (or any
+        // profile's) personality — neither the marker nor the preset text.
+        let child_sys = bodies[1]["system"].as_str().unwrap();
+        assert!(!child_sys.contains("## Agent personality"));
+        assert!(!child_sys.contains(PersonalityPreset::Technical.prompt()));
+        // The parent's continuation after the sub-agent returns keeps it.
+        assert!(bodies[2]["system"]
+            .as_str()
+            .unwrap()
+            .contains("## Agent personality"));
+    }
+
+    #[tokio::test]
     async fn generates_a_title_for_a_fresh_session() {
         let dir = tempfile::tempdir().unwrap();
         // Turn 0: the actual reply. Turn 1: the title generation.
@@ -11431,6 +11520,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: None,
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),
@@ -11534,6 +11624,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: None,
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),
@@ -11615,6 +11706,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: None,
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),
@@ -11744,6 +11836,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: None,
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),
@@ -11825,6 +11918,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: None,
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),
@@ -11982,6 +12076,7 @@ mod tests {
                     name: "anthropic/parent-model".into(),
                     effort: Some("low".into()),
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: vec![PermissionRule {
@@ -12015,6 +12110,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: Some("high".into()),
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: vec![PermissionRule {
@@ -12237,6 +12333,7 @@ mod tests {
                     name: "anthropic/target-model".into(),
                     effort: Some("high".into()),
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: AgentPermissions {
                     mode: PermMode::BypassPermissions,
                     rules: Vec::new(),

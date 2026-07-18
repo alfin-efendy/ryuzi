@@ -279,6 +279,7 @@ mod tests {
         let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
             persistence.registry,
+            None,
             events.clone(),
         );
         SessionCtx {

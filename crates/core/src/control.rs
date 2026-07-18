@@ -212,6 +212,7 @@ impl ControlPlane {
         let delegation = crate::delegation::DelegationRuntime::new(
             Arc::clone(&store),
             Arc::clone(&registry),
+            Some(Arc::new(registries.plugins.clone())),
             events.clone(),
         );
 

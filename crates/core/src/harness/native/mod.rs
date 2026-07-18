@@ -122,6 +122,7 @@ fn adapt_primary_profile(
             description: profile.description.clone(),
             mode: agents::AgentMode::Primary,
             prompt: None,
+            identity_prompt: Some(profile.personality.prompt()?.to_owned()),
             tools,
             permission_rules: profile.permissions.rules.clone(),
             can_delegate: false,
@@ -753,6 +754,7 @@ mod tests {
         let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
             persistence.registry.clone(),
+            None,
             events.clone(),
         );
         let run = delegation

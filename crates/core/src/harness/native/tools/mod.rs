@@ -615,6 +615,14 @@ impl ToolRegistry {
         self.legacy_tools.keys().cloned().collect()
     }
 
+    /// All built-in tools keyed by their legacy model-visible name, used to
+    /// construct the agent configuration catalog without a duplicated list.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &RegisteredTool)> {
+        self.legacy_tools
+            .iter()
+            .map(|(name, registered)| (name.as_str(), registered.as_ref()))
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

@@ -67,6 +67,7 @@ fn make_builder() -> Builder<tauri::Wry> {
             delegation_cmd::retry_child_run,
             agent_cmd::list_selectable_models,
             agent_cmd::list_agents,
+            agent_cmd::get_agent_configuration_catalog,
             agent_cmd::get_agent,
             agent_cmd::create_agent,
             agent_cmd::update_agent,

@@ -206,6 +206,7 @@ async fn fixture_context(
     let delegation = ryuzi_core::delegation::DelegationRuntime::new(
         store.clone(),
         persistence.registry.clone(),
+        None,
         events.clone(),
     );
     let run = delegation

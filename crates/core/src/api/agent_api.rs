@@ -3,19 +3,21 @@
 //! selectable-model list consumed by agent detail and composer model pickers.
 
 use super::{ok, params, ApiError};
+use crate::agents::catalog::AgentConfigurationCatalog;
 use crate::agents::knowledge::AgentLearningSnapshot;
 use crate::agents::learning_queue::{LearningEventPayload, RollbackEvent};
 use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
+use crate::agents::personality::{AgentPersonality, PersonalityPreset};
 use crate::agents::types::{
     AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissionMode, AgentPermissions,
     AgentRegistrySnapshot, AgentSnapshot, AgentTools, PermissionDecision, PermissionRule,
 };
 use crate::api::types::{
-    AgentDetailInfo, AgentLearningInfo, AgentModelInfo, AgentMutationInfo, AgentRecoveryInfo,
-    AgentRegistryInfo, AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo,
-    CuratorHistorySnapshotInfo, CuratorStateInfo, InvalidKnowledgeConceptInfo,
-    JourneyMilestoneInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo, LearningReviewInfo,
-    PermissionRuleInfo, SessionRuntimeInfo,
+    AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
+    AgentMutationInfo, AgentPersonalityInfo, AgentRecoveryInfo, AgentRegistryInfo,
+    AgentSkillUsageInfo, AgentSummaryInfo, AgentValidationInfo, CuratorHistorySnapshotInfo,
+    CuratorStateInfo, InvalidKnowledgeConceptInfo, JourneyMilestoneInfo, KnowledgeConceptInfo,
+    KnowledgeConceptMutationInfo, LearningReviewInfo, PermissionRuleInfo, SessionRuntimeInfo,
 };
 use crate::llm_router::model_effort::{
     self, EffectiveEffortSource, ModelDefaultSource, ModelPreferenceKey, ProjectRuntimeInfo,
@@ -53,6 +55,7 @@ pub(crate) const HANDLES: &[&str] = &[
     "replace_agent_concept_raw",
     "delete_invalid_agent_concept",
     "rollback_agent_learning",
+    "get_agent_configuration_catalog",
 ];
 
 #[derive(Deserialize)]
@@ -241,6 +244,39 @@ fn clean_references(field: &str, values: Vec<String>) -> Result<Vec<String>, Api
         .collect()
 }
 
+fn parse_personality_preset(value: &str) -> Result<PersonalityPreset, ApiError> {
+    serde_json::from_value::<PersonalityPreset>(Value::String(value.trim().to_owned())).map_err(
+        |_| {
+            ApiError::bad_request(format!(
+                "unknown personality preset `{value}` (expected helpful, concise, technical, creative, teacher, philosopher, kawaii, catgirl, pirate, shakespeare, surfer, noir, uwu, hype, or custom)"
+            ))
+        },
+    )
+}
+
+fn personality_preset_string(preset: PersonalityPreset) -> String {
+    match serde_json::to_value(preset) {
+        Ok(Value::String(value)) => value,
+        _ => "helpful".to_owned(),
+    }
+}
+
+fn parse_personality(info: AgentPersonalityInfo) -> Result<AgentPersonality, ApiError> {
+    let preset = parse_personality_preset(&info.preset)?;
+    let custom = info
+        .custom
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    AgentPersonality::new(preset, custom).map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+fn personality_info(personality: &AgentPersonality) -> AgentPersonalityInfo {
+    AgentPersonalityInfo {
+        preset: personality_preset_string(personality.preset),
+        custom: personality.custom.clone(),
+    }
+}
+
 impl TryFrom<AgentMutationInfo> for AgentMutationInput {
     type Error = ApiError;
 
@@ -292,6 +328,7 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
                 color: info.avatar_color.trim().to_owned(),
             },
             model: info.model.try_into()?,
+            personality: parse_personality(info.personality)?,
             permissions: AgentPermissions { mode, rules },
             skills: clean_references("skills", info.skills)?,
             tools: AgentTools {
@@ -311,6 +348,7 @@ fn summary_info(
     snapshot: &AgentSnapshot,
     registry: &AgentRegistrySnapshot,
     knowledge_count: u32,
+    catalog: &AgentConfigurationCatalog,
 ) -> AgentSummaryInfo {
     let profile = &snapshot.profile;
     let tool_count = profile
@@ -321,6 +359,11 @@ fn summary_info(
         .chain(&profile.tools.apps)
         .collect::<std::collections::HashSet<_>>()
         .len() as u32;
+    let mut merged_validation = snapshot.validation.clone();
+    merged_validation.extend(AgentConfigurationCatalog::validate_profile_references(
+        &snapshot.profile,
+        catalog,
+    ));
     AgentSummaryInfo {
         id: profile.id.clone(),
         name: profile.name.clone(),
@@ -331,9 +374,8 @@ fn summary_info(
         skill_count: profile.skills.len() as u32,
         tool_count,
         knowledge_count,
-        executable: snapshot.executable,
-        validation: snapshot
-            .validation
+        executable: merged_validation.is_empty(),
+        validation: merged_validation
             .iter()
             .map(|issue| AgentValidationInfo {
                 field: issue.field.clone(),
@@ -411,11 +453,12 @@ async fn detail_info(
     state: &ApiState,
     snapshot: AgentSnapshot,
     registry: &AgentRegistrySnapshot,
+    catalog: &AgentConfigurationCatalog,
 ) -> Result<AgentDetailInfo, ApiError> {
     let knowledge = knowledge_count(state, &snapshot.profile.id).await?;
     let model_info = agent_model_info(state, &snapshot.profile.model).await?;
     Ok(detail_info_from_enrichment(
-        snapshot, registry, knowledge, model_info,
+        snapshot, registry, knowledge, model_info, catalog,
     ))
 }
 
@@ -423,6 +466,7 @@ async fn post_commit_detail_info(
     state: &ApiState,
     snapshot: AgentSnapshot,
     registry: &AgentRegistrySnapshot,
+    catalog: &AgentConfigurationCatalog,
 ) -> AgentDetailInfo {
     let agent_id = snapshot.profile.id.as_str();
     let knowledge = match knowledge_count(state, agent_id).await {
@@ -449,7 +493,7 @@ async fn post_commit_detail_info(
             None
         }
     };
-    detail_info_from_enrichment(snapshot, registry, knowledge, model_info)
+    detail_info_from_enrichment(snapshot, registry, knowledge, model_info, catalog)
 }
 
 fn detail_info_from_enrichment(
@@ -457,8 +501,9 @@ fn detail_info_from_enrichment(
     registry: &AgentRegistrySnapshot,
     knowledge: u32,
     model_info: Option<crate::llm_router::model_effort::SelectableModelInfo>,
+    catalog: &AgentConfigurationCatalog,
 ) -> AgentDetailInfo {
-    let summary = summary_info(&snapshot, registry, knowledge);
+    let summary = summary_info(&snapshot, registry, knowledge, catalog);
     let profile = snapshot.profile;
     let rules = profile
         .permissions
@@ -481,12 +526,14 @@ fn detail_info_from_enrichment(
         max_turns: profile.loop_settings.max_turns,
         max_tool_rounds: profile.loop_settings.max_tool_rounds,
         model_info,
+        personality: personality_info(&profile.personality),
     }
 }
 
 fn registry_info_from_counts(
     snapshot: AgentRegistrySnapshot,
     knowledge_counts: &std::collections::HashMap<String, u32>,
+    catalog: &AgentConfigurationCatalog,
 ) -> AgentRegistryInfo {
     let agents = snapshot
         .agents
@@ -499,6 +546,7 @@ fn registry_info_from_counts(
                     .get(&agent.profile.id)
                     .copied()
                     .unwrap_or_default(),
+                catalog,
             )
         })
         .collect();
@@ -520,6 +568,7 @@ fn registry_info_from_counts(
 async fn registry_info(
     state: &ApiState,
     snapshot: AgentRegistrySnapshot,
+    catalog: &AgentConfigurationCatalog,
 ) -> Result<AgentRegistryInfo, ApiError> {
     let mut counts = std::collections::HashMap::with_capacity(snapshot.agents.len());
     for agent in &snapshot.agents {
@@ -528,12 +577,13 @@ async fn registry_info(
             knowledge_count(state, &agent.profile.id).await?,
         );
     }
-    Ok(registry_info_from_counts(snapshot, &counts))
+    Ok(registry_info_from_counts(snapshot, &counts, catalog))
 }
 
 async fn post_commit_registry_info(
     state: &ApiState,
     snapshot: AgentRegistrySnapshot,
+    catalog: &AgentConfigurationCatalog,
 ) -> AgentRegistryInfo {
     let mut counts = std::collections::HashMap::with_capacity(snapshot.agents.len());
     for agent in &snapshot.agents {
@@ -551,7 +601,7 @@ async fn post_commit_registry_info(
             }
         }
     }
-    registry_info_from_counts(snapshot, &counts)
+    registry_info_from_counts(snapshot, &counts, catalog)
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {
@@ -960,6 +1010,17 @@ async fn agent_learning_info(
     ))
 }
 
+/// Build the agent configuration catalog: native tools from the built-in
+/// [`ToolRegistry`], installed skills from
+/// [`crate::skills_install::list_installed_skills`], one plugin-tool entry
+/// per enabled plugin from [`crate::plugins::PluginHost::list`], and one app
+/// entry per configured MCP server from [`crate::mcp::list_servers`].
+async fn agent_configuration_catalog(
+    state: &ApiState,
+) -> anyhow::Result<AgentConfigurationCatalog> {
+    crate::agents::catalog::build_live_catalog(state.cp.store(), state.cp.plugins()).await
+}
+
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
     let cp = &state.cp;
     match method {
@@ -1081,7 +1142,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         "list_agents" => {
             let snapshot = state.agents.snapshot().await;
-            ok(registry_info(state, snapshot).await?)
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(registry_info(state, snapshot, &catalog).await?)
         }
         "get_agent" => {
             let a: AgentIdP = params(p)?;
@@ -1093,41 +1155,67 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 .find(|agent| agent.profile.id == agent_id)
                 .cloned()
                 .ok_or_else(|| ApiError::not_found(format!("unknown agent: {agent_id}")))?;
-            ok(detail_info(state, snapshot, &registry).await?)
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(detail_info(state, snapshot, &registry, &catalog).await?)
         }
         "create_agent" => {
             let a: CreateAgentP = params(p)?;
             let input: AgentMutationInput = a.input.try_into()?;
+            let catalog = agent_configuration_catalog(state).await?;
+            let issues = AgentConfigurationCatalog::validate_mutation_references(&input, &catalog);
+            if !issues.is_empty() {
+                return Err(ApiError::bad_request(
+                    issues
+                        .into_iter()
+                        .map(|issue| format!("{}: {}", issue.field, issue.message))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
             let snapshot = state.agents.create(input).await?;
             let registry = state.agents.snapshot().await;
-            ok(post_commit_detail_info(state, snapshot, &registry).await)
+            ok(post_commit_detail_info(state, snapshot, &registry, &catalog).await)
         }
         "update_agent" => {
             let a: UpdateAgentP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let input: AgentMutationInput = a.input.try_into()?;
+            let catalog = agent_configuration_catalog(state).await?;
+            let issues = AgentConfigurationCatalog::validate_mutation_references(&input, &catalog);
+            if !issues.is_empty() {
+                return Err(ApiError::bad_request(
+                    issues
+                        .into_iter()
+                        .map(|issue| format!("{}: {}", issue.field, issue.message))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
             let snapshot = state.agents.update(&agent_id, input).await?;
             let registry = state.agents.snapshot().await;
-            ok(post_commit_detail_info(state, snapshot, &registry).await)
+            ok(post_commit_detail_info(state, snapshot, &registry, &catalog).await)
         }
         "duplicate_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let snapshot = state.agents.duplicate(&agent_id).await?;
             let registry = state.agents.snapshot().await;
-            ok(post_commit_detail_info(state, snapshot, &registry).await)
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(post_commit_detail_info(state, snapshot, &registry, &catalog).await)
         }
         "delete_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let snapshot = state.agents.delete(&agent_id).await?;
-            ok(post_commit_registry_info(state, snapshot).await)
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(post_commit_registry_info(state, snapshot, &catalog).await)
         }
         "set_default_agent" => {
             let a: AgentIdP = params(p)?;
             let agent_id = a.agent_id.trim().to_string();
             let snapshot = state.agents.set_default(&agent_id).await?;
-            ok(post_commit_registry_info(state, snapshot).await)
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(post_commit_registry_info(state, snapshot, &catalog).await)
         }
         "get_subagent_model" => {
             let snapshot = state.agents.snapshot().await;
@@ -1137,7 +1225,8 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: UpdateSubagentModelP = params(p)?;
             let model: AgentModel = a.model.try_into()?;
             let snapshot = state.agents.set_subagent_model(model).await?;
-            ok(post_commit_registry_info(state, snapshot).await)
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(post_commit_registry_info(state, snapshot, &catalog).await)
         }
         "get_agent_learning" => {
             let a: AgentIdP = params(p)?;
@@ -1240,13 +1329,23 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 .map_err(knowledge_api_error)?;
             ok(agent_learning_info(state, &agent_id).await?)
         }
+        "get_agent_configuration_catalog" => {
+            let catalog = agent_configuration_catalog(state).await?;
+            ok(AgentConfigurationCatalogInfo::from(catalog))
+        }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::agents::catalog::AgentConfigurationCatalog;
+    use crate::agents::personality::PersonalityPreset;
+    use crate::agents::types::{
+        AgentMutationInput, AgentProfile, AgentRegistrySnapshot, AgentSnapshot,
+    };
     use crate::agents::yaml::parse_agent_profile_document;
+    use crate::api::types::AgentPersonalityInfo;
     use crate::api::{
         dispatch,
         tests_support::{state, state_with_agents},
@@ -1254,6 +1353,53 @@ mod tests {
     use crate::domain::{PermMode, Project};
     use crate::llm_router::connections;
     use serde_json::{json, Value};
+    use std::sync::{Mutex, MutexGuard};
+
+    static INSTALLED_SKILL_ENV: Mutex<()> = Mutex::new(());
+
+    struct InstalledSkillGuard {
+        _temp_dir: tempfile::TempDir,
+        previous_config_root: Option<std::ffi::OsString>,
+        _env_guard: MutexGuard<'static, ()>,
+    }
+
+    impl InstalledSkillGuard {
+        fn new() -> Self {
+            let env_guard = INSTALLED_SKILL_ENV
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let temp_dir = tempfile::tempdir().unwrap();
+            let skill_dir = temp_dir.path().join("skills/requesting-code-review");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: requesting-code-review\ndescription: test\n---\nbody",
+            )
+            .unwrap();
+            std::fs::write(
+                skill_dir.join(".ryuzi-skill.json"),
+                r#"{"source":"test","plugin_id":null,"installed_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+
+            let previous_config_root = std::env::var_os("RYUZI_TEST_CONFIG_ROOT");
+            std::env::set_var("RYUZI_TEST_CONFIG_ROOT", temp_dir.path());
+            Self {
+                _temp_dir: temp_dir,
+                previous_config_root,
+                _env_guard: env_guard,
+            }
+        }
+    }
+
+    impl Drop for InstalledSkillGuard {
+        fn drop(&mut self) {
+            match self.previous_config_root.take() {
+                Some(value) => std::env::set_var("RYUZI_TEST_CONFIG_ROOT", value),
+                None => std::env::remove_var("RYUZI_TEST_CONFIG_ROOT"),
+            }
+        }
+    }
 
     fn reviewer_input(name: &str) -> Value {
         json!({
@@ -1261,6 +1407,7 @@ mod tests {
             "description": "Reviews implementation quality and regressions.",
             "avatarColor": "violet",
             "model": {"kind":"route","route":"free"},
+            "personality": {"preset": "helpful", "custom": null},
             "permissionMode": "ask",
             "permissionRules": [],
             "skills": ["requesting-code-review"],
@@ -1272,8 +1419,84 @@ mod tests {
         })
     }
 
+    fn fixture_mutation() -> super::AgentMutationInfo {
+        serde_json::from_value(reviewer_input("Reviewer")).unwrap()
+    }
+
+    fn fixture_profile(preset: crate::agents::personality::PersonalityPreset) -> AgentProfile {
+        let mut profile = crate::agents::bootstrap::default_ryuzi_profile("ryuzi".into());
+        profile.personality = crate::agents::personality::AgentPersonality::new(preset, None)
+            .expect("preset personality is always valid");
+        profile
+    }
+
+    fn fixture_snapshot_with(
+        preset: crate::agents::personality::PersonalityPreset,
+    ) -> AgentSnapshot {
+        AgentSnapshot {
+            profile: fixture_profile(preset),
+            executable: true,
+            validation: Vec::new(),
+        }
+    }
+
+    fn fixture_registry() -> AgentRegistrySnapshot {
+        AgentRegistrySnapshot {
+            agents: Vec::new(),
+            default_agent_id: "ryuzi".into(),
+            recovery: Vec::new(),
+            subagent_model: crate::agents::types::AgentModel::Route {
+                route: "free".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn agent_mutation_rejects_blank_custom_personality() {
+        let mut input = fixture_mutation();
+        input.personality = AgentPersonalityInfo {
+            preset: "custom".into(),
+            custom: Some(" ".into()),
+        };
+        let error = AgentMutationInput::try_from(input).unwrap_err();
+        assert_eq!(error.status, 400);
+    }
+
+    #[test]
+    fn detail_includes_personality() {
+        let detail = super::detail_info_from_enrichment(
+            fixture_snapshot_with(PersonalityPreset::Technical),
+            &fixture_registry(),
+            0,
+            None,
+            &AgentConfigurationCatalog::default(),
+        );
+        assert_eq!(detail.personality.preset, "technical");
+    }
+
+    #[test]
+    fn summary_info_marks_unavailable_native_tool_as_not_executable() {
+        let mut snapshot = fixture_snapshot_with(PersonalityPreset::Helpful);
+        snapshot.profile.tools.native = vec!["missing".to_string()];
+
+        let summary = super::summary_info(
+            &snapshot,
+            &fixture_registry(),
+            0,
+            &AgentConfigurationCatalog::default(),
+        );
+
+        assert!(!summary.executable);
+        assert!(summary
+            .validation
+            .iter()
+            .any(|issue| issue.field == "tools.native"));
+    }
+
     #[tokio::test]
+    #[serial_test::serial]
     async fn update_agent_preserves_profile_extensions_through_rpc() {
+        let _skill_guard = InstalledSkillGuard::new();
         let mut s = state_with_agents().await;
         let agent_id = s.agents.default_agent_id().await;
         let profile_path = s
@@ -1317,7 +1540,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn post_commit_knowledge_failures_do_not_invert_agent_mutations() {
+        let _skill_guard = InstalledSkillGuard::new();
         let s = state_with_agents().await;
 
         let created = super::with_post_commit_enrichment_failure(
@@ -1402,7 +1627,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn post_commit_model_failures_degrade_concrete_mutation_details() {
+        let _skill_guard = InstalledSkillGuard::new();
         use crate::llm_router::connections::{self, ConnectionData, ConnectionRow};
 
         let s = state_with_agents().await;
@@ -1503,7 +1730,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn agent_crud_and_duplicate_are_visible_through_rpc() {
+        let _skill_guard = InstalledSkillGuard::new();
         let s = state_with_agents().await;
         let created = dispatch(
             &s,
@@ -1542,7 +1771,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_agent_returns_full_detail() {
+        let _skill_guard = InstalledSkillGuard::new();
         let s = state_with_agents().await;
         let created = dispatch(
             &s,
@@ -1639,7 +1870,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn default_routes_allow_agent_and_subagent_model_changes() {
+        let _skill_guard = InstalledSkillGuard::new();
         let s = state().await;
         connections::add_connection(
             s.cp.store(),
@@ -1848,7 +2081,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn knowledge_crud_is_scoped_by_agent_id() {
+        let _skill_guard = InstalledSkillGuard::new();
         let s = state_with_agents().await;
         let a = dispatch(&s, "list_agents", json!({})).await.unwrap()["agents"][0]["id"]
             .as_str()
@@ -2204,7 +2439,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn create_agent_rejects_unknown_native_tool_without_mutating_registry() {
+        let _skill_guard = InstalledSkillGuard::new();
+        let s = state_with_agents().await;
+        let before = s.agents.snapshot().await;
+
+        let mut input = reviewer_input("Unknown Native Tool Reviewer");
+        input["nativeTools"] = json!(["missing"]);
+        let error = dispatch(&s, "create_agent", json!({"input": input}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, 400);
+        let after = s.agents.snapshot().await;
+        assert_eq!(after.agents.len(), before.agents.len());
+        assert!(!after
+            .agents
+            .iter()
+            .any(|agent| agent.profile.name == "Unknown Native Tool Reviewer"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn set_default_marks_exactly_one_agent() {
+        let _skill_guard = InstalledSkillGuard::new();
         let s = state_with_agents().await;
         let created = dispatch(
             &s,
@@ -2396,5 +2655,63 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.status, 400);
         }
+    }
+
+    #[tokio::test]
+    async fn get_agent_configuration_catalog_marks_bash_command_scoped() {
+        let s = state().await;
+
+        let catalog = dispatch(&s, "get_agent_configuration_catalog", json!({}))
+            .await
+            .unwrap();
+
+        let native_tools = catalog["nativeTools"].as_array().unwrap();
+        let bash = native_tools
+            .iter()
+            .find(|entry| entry["id"] == "bash")
+            .expect("bash entry present in native tools catalog");
+        assert_eq!(bash["commandScoped"], true);
+    }
+
+    #[tokio::test]
+    async fn get_agent_configuration_catalog_includes_seeded_app() {
+        use crate::mcp::{self, McpServerRow};
+
+        let s = state().await;
+        mcp::upsert_server(
+            s.cp.store(),
+            McpServerRow {
+                id: "seeded-app".into(),
+                name: "Seeded App".into(),
+                kind: "MCP server".into(),
+                color: "#8B8B8B".into(),
+                description: "Seeded for catalog test.".into(),
+                transport: "stdio".into(),
+                command: Some("seeded-app".into()),
+                args: vec![],
+                env: vec![],
+                url: None,
+                scope: "global".into(),
+                scope_gateways: vec![],
+                version: None,
+                publisher: None,
+                status: "unknown".into(),
+                status_detail: None,
+                auth_kind: "none".into(),
+                auth_detail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let catalog = dispatch(&s, "get_agent_configuration_catalog", json!({}))
+            .await
+            .unwrap();
+
+        let apps = catalog["apps"].as_array().unwrap();
+        assert!(
+            apps.iter().any(|entry| entry["id"] == "seeded-app"),
+            "seeded app must appear in the apps catalog"
+        );
     }
 }

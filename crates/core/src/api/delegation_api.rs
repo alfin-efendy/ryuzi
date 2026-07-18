@@ -389,6 +389,7 @@ mod tests {
                 model: crate::agents::types::AgentModel::Route {
                     route: "free".into(),
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
                     mode: PermMode::Default,
                     rules: Vec::new(),
@@ -576,6 +577,7 @@ mod tests {
                 model: crate::agents::types::AgentModel::Route {
                     route: "free".into(),
                 },
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
                     mode: PermMode::Default,
                     rules: Vec::new(),

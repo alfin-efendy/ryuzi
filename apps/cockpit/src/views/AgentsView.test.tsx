@@ -71,6 +71,7 @@ function detail(input: AgentMutationInfo): AgentDetailInfo {
     maxTurns: input.maxTurns,
     maxToolRounds: input.maxToolRounds,
     modelInfo: null,
+    personality: { preset: "helpful", custom: null },
   };
 }
 
@@ -172,6 +173,7 @@ test("create modal sends the complete initial mutation and opens the new detail"
       description: "Designs system boundaries.",
       avatarColor: "violet",
       model: route("free"),
+      personality: { preset: "helpful", custom: null },
       permissionMode: "ask",
       permissionRules: [],
       skills: [],
