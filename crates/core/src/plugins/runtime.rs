@@ -15,6 +15,15 @@ use wasmtime::{
     Config, Engine, Store,
 };
 
+const HTTP_IMPORT: &str = "ryuzi:http/http@0.1.0";
+const ALLOWED_EXPORTS: &[&str] = &[
+    "lifecycle",
+    "ryuzi:gateway/gateway@0.1.0",
+    "ryuzi:connector/connector@0.1.0",
+    "ryuzi:provider/provider@0.1.0",
+    "ryuzi:hooks/hooks@0.1.0",
+];
+
 /// Default resource budget a plugin runtime may consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -58,6 +67,7 @@ pub enum PluginRuntimeError {
     ComponentRead(String),
     MalformedComponent(String),
     DeniedImport { name: String, reason: String },
+    DeniedExport { name: String, reason: String },
     InstantiationFailed(String),
     FuelExhausted(String),
 }
@@ -72,6 +82,9 @@ impl fmt::Display for PluginRuntimeError {
             Self::MalformedComponent(message) => write!(f, "malformed component: {message}"),
             Self::DeniedImport { name, reason } => {
                 write!(f, "component import `{name}` is denied: {reason}")
+            }
+            Self::DeniedExport { name, reason } => {
+                write!(f, "component export `{name}` is denied: {reason}")
             }
             Self::InstantiationFailed(message) => {
                 write!(f, "component instantiation failed: {message}")
@@ -110,11 +123,11 @@ impl ComponentRuntime {
         let component = Component::new(&self.engine, bytes)
             .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
         for (name, _) in component.component_type().imports(&self.engine) {
-            let network_is_authorized = name == "ryuzi:http/http@0.1.0"
+            let network_is_authorized = name == HTTP_IMPORT
                 && !manifest.permissions.network.is_empty()
                 && policy.allow_network;
             if !network_is_authorized {
-                let reason = if name == "ryuzi:http/http@0.1.0" {
+                let reason = if name == HTTP_IMPORT {
                     "network requires a manifest allowlist and host policy approval".to_string()
                 } else {
                     "no host capability is enabled by this runtime slice".to_string()
@@ -122,6 +135,14 @@ impl ComponentRuntime {
                 return Err(PluginRuntimeError::DeniedImport {
                     name: name.to_string(),
                     reason,
+                });
+            }
+        }
+        for (name, _) in component.component_type().exports(&self.engine) {
+            if !ALLOWED_EXPORTS.contains(&name) {
+                return Err(PluginRuntimeError::DeniedExport {
+                    name: name.to_string(),
+                    reason: "not declared by the ryuzi:plugin@0.1.0 world".to_string(),
                 });
             }
         }
@@ -261,6 +282,19 @@ mod tests {
             .expect("an import-free installed component should instantiate");
     }
 
+    fn component_with_export(name: &str) -> String {
+        format!(
+            r#"(component
+                (component $inner
+                    (type $t string)
+                    (export "t" (type $t))
+                )
+                (instance $i (instantiate $inner))
+                (export "{name}" (instance $i))
+            )"#
+        )
+    }
+
     #[test]
     fn default_resource_limits_are_conservative() {
         assert_eq!(
@@ -272,6 +306,34 @@ mod tests {
                 max_concurrency: 4,
             }
         );
+    }
+
+    #[test]
+    fn unknown_component_export_is_denied() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let result = runtime.validate_component_bytes(
+            &manifest(vec![]),
+            component_with_export("acme:evil/thing@0.1.0").as_bytes(),
+            &HostPolicy::deny_all(),
+        );
+        let Err(error) = result else {
+            panic!("undeclared export must not validate");
+        };
+        assert!(
+            matches!(error, PluginRuntimeError::DeniedExport { name, .. } if name == "acme:evil/thing@0.1.0")
+        );
+    }
+
+    #[test]
+    fn lifecycle_component_export_is_allowed() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime
+            .validate_component_bytes(
+                &manifest(vec![]),
+                component_with_export("lifecycle").as_bytes(),
+                &HostPolicy::deny_all(),
+            )
+            .expect("lifecycle export is part of the plugin world");
     }
 
     #[test]
