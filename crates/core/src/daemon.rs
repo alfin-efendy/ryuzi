@@ -1872,7 +1872,7 @@ mod tests {
             requesting_agent_id: "agent-question".into(),
             requesting_agent_name: "Agent Question".into(),
             request_id: "req-question".into(),
-            tool: "clarify".into(),
+            tool: "askuserquestion".into(),
             summary: "Choose one".into(),
             approval_kind: crate::domain::ApprovalKind::Question,
             input: serde_json::json!({}),

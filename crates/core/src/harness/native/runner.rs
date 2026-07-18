@@ -1730,7 +1730,6 @@ const SUBAGENT_BLOCKLIST: &[&str] = &[
     "todoread",
     "app_jobs",
     "app_projects",
-    "clarify",
 ];
 /// Cap on one delegated child's model-visible report (protects the parent's
 /// context from runaway child output).
@@ -3901,7 +3900,6 @@ fn is_builtin_metric_tool(tool_name: &str) -> bool {
             | "askuserquestion"
             | "app_jobs"
             | "app_projects"
-            | "clarify"
             | LOAD_TOOLS_NAME
     )
 }

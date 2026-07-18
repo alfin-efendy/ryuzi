@@ -30,7 +30,6 @@ use tokio_util::sync::CancellationToken;
 pub mod app_jobs;
 pub mod app_projects;
 pub mod bash;
-pub mod clarify;
 pub mod delegate;
 pub mod edit;
 pub mod extension;
@@ -264,7 +263,7 @@ pub trait AppControl: Send + Sync {
 
 /// The app-control tool names — added to the sub-agent blocklist and never
 /// advertised to delegated children (spec §9.1).
-pub const APP_TOOLS: &[&str] = &["app_jobs", "app_projects", "clarify"];
+pub const APP_TOOLS: &[&str] = &["app_jobs", "app_projects"];
 
 /// Channel bundle for tools whose EXECUTION is a user interaction
 /// (`exitplanmode`, `askuserquestion`): they emit their own
@@ -728,7 +727,6 @@ impl ToolRegistry {
             Arc::new(question::AskUserQuestion),
             Arc::new(app_jobs::AppJobs),
             Arc::new(app_projects::AppProjects),
-            Arc::new(clarify::Clarify),
         ]
     }
 
@@ -1535,12 +1533,11 @@ mod tests {
             "askuserquestion",
             "app_jobs",
             "app_projects",
-            "clarify",
         ] {
             assert!(reg.get(name).is_some(), "missing tool {name}");
         }
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 23);
+        assert_eq!(defs.len(), 22);
         assert!(defs.iter().all(|d| d.get("name").is_some()
             && d.get("description").is_some()
             && d.get("input_schema").is_some()));
