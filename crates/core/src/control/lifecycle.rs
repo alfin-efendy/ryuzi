@@ -713,8 +713,8 @@ impl ControlPlane {
     }
 
     /// Deliver a queue row whose claim already promoted the session to Running.
-    /// It creates exactly one Plan4 primary run and does not repeat the
-    /// ordinary continuation's status reservation.
+    /// It creates exactly one Plan4 primary run; the shared continuation helper's
+    /// `promote_if_idle` no-ops here because the claim already reserved `Running`.
     async fn continue_reserved_session_with_prompt(
         self: &Arc<Self>,
         session_pk: &str,
