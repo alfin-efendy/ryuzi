@@ -216,7 +216,7 @@ pub struct SlotConflict {
 /// rule `add` itself uses for duplicate ids), and `slot_conflicts` records
 /// every later claimant for an already-owned slot instead of silently
 /// dropping it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PluginHost {
     order: Vec<Arc<CorePlugin>>,
     by_id: HashMap<String, usize>,

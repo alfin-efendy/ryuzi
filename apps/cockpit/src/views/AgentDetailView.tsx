@@ -6,6 +6,7 @@ import { AgentAdvancedTab } from "@/components/agents/AgentAdvancedTab";
 import { AgentLearningTab } from "@/components/agents/AgentLearningTab";
 import { AgentModelTab } from "@/components/agents/AgentModelTab";
 import { AgentPermissionsTab } from "@/components/agents/AgentPermissionsTab";
+import { AgentPersonalityCard } from "@/components/agents/AgentPersonalityCard";
 import { AgentSkillsToolsTab } from "@/components/agents/AgentSkillsToolsTab";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { useStore } from "@/store";
@@ -107,43 +108,46 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
           </SettingsCard>
         ) : null}
         {tab === "overview" ? (
-          <div className="grid grid-cols-3 gap-3">
-            <SettingsCard className="px-[18px] py-4">
-              <span className="block text-[11px] text-muted-foreground">Knowledge</span>
-              <strong className="mt-1 block text-[13px]">{metric(summary.knowledgeCount, "readable concept", "readable concepts")}</strong>
-            </SettingsCard>
-            <SettingsCard className="px-[18px] py-4">
-              <span className="block text-[11px] text-muted-foreground">Skills</span>
-              <strong className="mt-1 block text-[13px]">{metric(summary.skillCount, "enabled skill", "enabled skills")}</strong>
-            </SettingsCard>
-            <SettingsCard className="px-[18px] py-4">
-              <span className="block text-[11px] text-muted-foreground">Tools</span>
-              <strong className="mt-1 block text-[13px]">{metric(summary.toolCount, "enabled tool", "enabled tools")}</strong>
-            </SettingsCard>
-            <SettingsCard className="col-span-3 px-[18px] py-4">
-              <SettingsCardTitle>Recent sessions</SettingsCardTitle>
-              {recentSessions.length === 0 ? (
-                <p className="mb-0 mt-3 text-xs text-muted-foreground">No owned sessions yet.</p>
-              ) : (
-                <div className="mt-3 divide-y divide-border">
-                  {recentSessions.map((session) => (
-                    <Button
-                      key={session.sessionPk}
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => {
-                        setFocused({ runnerId: LOCAL_RUNNER, pk: session.sessionPk });
-                        nav.navigate({ kind: "session" });
-                      }}
-                      className="h-auto w-full justify-between gap-3 rounded-none px-0 py-2 text-left"
-                    >
-                      <span className="min-w-0 truncate font-medium">{session.title || "Untitled session"}</span>
-                      <span className="shrink-0 text-muted-foreground">{session.status}</span>
-                    </Button>
-                  ))}
-                </div>
-              )}
-            </SettingsCard>
+          <div className="flex flex-col gap-3">
+            <AgentPersonalityCard detail={detail} />
+            <div className="grid grid-cols-3 gap-3">
+              <SettingsCard className="px-[18px] py-4">
+                <span className="block text-[11px] text-muted-foreground">Knowledge</span>
+                <strong className="mt-1 block text-[13px]">{metric(summary.knowledgeCount, "readable concept", "readable concepts")}</strong>
+              </SettingsCard>
+              <SettingsCard className="px-[18px] py-4">
+                <span className="block text-[11px] text-muted-foreground">Skills</span>
+                <strong className="mt-1 block text-[13px]">{metric(summary.skillCount, "enabled skill", "enabled skills")}</strong>
+              </SettingsCard>
+              <SettingsCard className="px-[18px] py-4">
+                <span className="block text-[11px] text-muted-foreground">Tools</span>
+                <strong className="mt-1 block text-[13px]">{metric(summary.toolCount, "enabled tool", "enabled tools")}</strong>
+              </SettingsCard>
+              <SettingsCard className="col-span-3 px-[18px] py-4">
+                <SettingsCardTitle>Recent sessions</SettingsCardTitle>
+                {recentSessions.length === 0 ? (
+                  <p className="mb-0 mt-3 text-xs text-muted-foreground">No owned sessions yet.</p>
+                ) : (
+                  <div className="mt-3 divide-y divide-border">
+                    {recentSessions.map((session) => (
+                      <Button
+                        key={session.sessionPk}
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setFocused({ runnerId: LOCAL_RUNNER, pk: session.sessionPk });
+                          nav.navigate({ kind: "session" });
+                        }}
+                        className="h-auto w-full justify-between gap-3 rounded-none px-0 py-2 text-left"
+                      >
+                        <span className="min-w-0 truncate font-medium">{session.title || "Untitled session"}</span>
+                        <span className="shrink-0 text-muted-foreground">{session.status}</span>
+                      </Button>
+                    ))}
+                  </div>
+                )}
+              </SettingsCard>
+            </div>
           </div>
         ) : null}
         {tab === "model" ? <AgentModelTab detail={detail} /> : null}

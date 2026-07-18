@@ -315,6 +315,14 @@ async listAgents(runnerId: string | null) : Promise<Result<AgentRegistryInfo, Cm
     else return { status: "error", error: e  as any };
 }
 },
+async getAgentConfigurationCatalog(runnerId: string | null) : Promise<Result<AgentConfigurationCatalogInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_configuration_catalog", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentDetailInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_agent", { runnerId, agentId }) };
@@ -1796,7 +1804,13 @@ transport: string; command: string | null; args: string[];
  */
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
-export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null }
+/**
+ * The full set of configuration options (skills, native tools, plugin
+ * tools, apps) offered when building or editing an agent profile — see
+ * [`crate::agents::catalog::AgentConfigurationCatalog`].
+ */
+export type AgentConfigurationCatalogInfo = { skills: CatalogEntryInfo[]; nativeTools: CatalogEntryInfo[]; pluginTools: CatalogEntryInfo[]; apps: CatalogEntryInfo[] }
+export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
 /**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
@@ -1817,7 +1831,14 @@ export type AgentModelInfo = { kind: "concrete"; name: string; effort: string | 
  * fields (`id`, counts, `executable`, `validation`, `is_default`) are
  * deliberately absent so the client can't submit them.
  */
-export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number }
+export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number }
+/**
+ * An agent's personality selection: a preset name (matching
+ * [`crate::agents::personality::PersonalityPreset`]'s `snake_case` variants,
+ * e.g. `"technical"` or `"custom"`) plus optional custom text that only
+ * applies when `preset` is `"custom"`.
+ */
+export type AgentPersonalityInfo = { preset: string; custom: string | null }
 /**
  * One startup-recovery note surfaced to the UI (for example a quarantined
  * agent file that failed to parse and was set aside).
@@ -1916,6 +1937,12 @@ export type CatalogEntry = { id: string; name: string;
  * provider card; the entry whose id == family is the display head.
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
+/**
+ * One selectable option in the agent configuration catalog (a skill,
+ * native tool, plugin tool, or app) — see
+ * [`crate::agents::catalog::CatalogEntry`].
+ */
+export type CatalogEntryInfo = { id: string; label: string; description: string; available: boolean; commandScoped: boolean }
 /**
  * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
  * `catalog_feed_state` row plus counts from the cached

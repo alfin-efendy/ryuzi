@@ -12,8 +12,8 @@ use std::sync::Arc;
 use tauri::State;
 
 use ryuzi_core::api::types::{
-    AgentDetailInfo, AgentLearningInfo, AgentModelInfo, AgentMutationInfo, AgentRegistryInfo,
-    KnowledgeConceptInfo, KnowledgeConceptMutationInfo,
+    AgentConfigurationCatalogInfo, AgentDetailInfo, AgentLearningInfo, AgentModelInfo,
+    AgentMutationInfo, AgentRegistryInfo, KnowledgeConceptInfo, KnowledgeConceptMutationInfo,
 };
 
 // Re-exported by name for a complete, documented DTO surface; specta still
@@ -97,6 +97,18 @@ pub async fn list_agents(engine: Engine<'_>, runner_id: Option<String>) -> R<Age
     engine
         .client(runner_id.as_deref().unwrap_or("local"))?
         .rpc("list_agents", serde_json::json!({}))
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_agent_configuration_catalog(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<AgentConfigurationCatalogInfo> {
+    engine
+        .client(runner_id.as_deref().unwrap_or("local"))?
+        .rpc("get_agent_configuration_catalog", serde_json::json!({}))
         .await
 }
 
@@ -351,7 +363,7 @@ pub async fn list_selectable_models(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryuzi_core::api::types::AgentModelInfo;
+    use ryuzi_core::api::types::{AgentModelInfo, AgentPersonalityInfo};
 
     fn fixture_mutation() -> AgentMutationInfo {
         AgentMutationInfo {
@@ -360,6 +372,10 @@ mod tests {
             avatar_color: "violet".to_owned(),
             model: AgentModelInfo::Route {
                 route: "free".to_owned(),
+            },
+            personality: AgentPersonalityInfo {
+                preset: "helpful".to_owned(),
+                custom: None,
             },
             permission_mode: "ask".to_owned(),
             permission_rules: Vec::new(),

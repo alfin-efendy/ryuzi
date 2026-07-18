@@ -71,6 +71,7 @@ function detail(input: AgentMutationInfo): AgentDetailInfo {
     maxTurns: input.maxTurns,
     maxToolRounds: input.maxToolRounds,
     modelInfo: null,
+    personality: { preset: "helpful", custom: null },
   };
 }
 

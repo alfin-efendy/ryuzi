@@ -1051,6 +1051,7 @@ fn recover_minimal_profile(raw: &str, directory_id: &str) -> Option<AgentProfile
             name: "invalid/missing".into(),
             effort: None,
         },
+        personality: crate::agents::personality::AgentPersonality::default_profile(),
         permissions: AgentPermissions {
             mode: crate::PermMode::Default,
             rules: Vec::new(),
@@ -1140,6 +1141,7 @@ fn profile_from_input(id: AgentId, input: AgentMutationInput) -> AgentProfile {
         description: input.description,
         avatar: input.avatar,
         model: input.model,
+        personality: input.personality,
         permissions: input.permissions,
         skills: input.skills,
         tools: input.tools,
@@ -1394,6 +1396,7 @@ mod tests {
                 name: "anthropic/claude-opus-4-8".into(),
                 effort: Some("high".into()),
             },
+            personality: crate::agents::personality::AgentPersonality::default_profile(),
             permissions: AgentPermissions {
                 mode: crate::PermMode::Default,
                 rules: Vec::new(),
@@ -2104,6 +2107,7 @@ mod tests {
                 name: "anthropic/claude-opus-4-8".into(),
                 effort: Some("high".into()),
             },
+            personality: crate::agents::personality::AgentPersonality::default_profile(),
             permissions: AgentPermissions {
                 mode: crate::PermMode::Default,
                 rules: Vec::new(),
@@ -2144,6 +2148,7 @@ mod tests {
                 name: "anthropic/claude-opus-4-8".into(),
                 effort: Some("high".into()),
             },
+            personality: crate::agents::personality::AgentPersonality::default_profile(),
             permissions: AgentPermissions {
                 mode: crate::PermMode::Default,
                 rules: Vec::new(),

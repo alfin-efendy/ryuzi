@@ -1,8 +1,10 @@
 pub mod bootstrap;
+pub mod catalog;
 pub(crate) mod free_route;
 pub mod knowledge;
 pub mod learning_queue;
 pub mod okf;
+pub mod personality;
 pub mod registry;
 pub mod transaction;
 pub mod types;

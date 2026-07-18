@@ -5,6 +5,7 @@ import type {
   AgentLearningInfo,
   AgentMutationInfo,
   AgentRegistryInfo,
+  AgentConfigurationCatalogInfo,
   CmdError,
   Result,
   SelectableModelInfo,
@@ -16,6 +17,18 @@ const getAgent = mock(async (_runner: string | null, id: string) => ({
   status: "ok" as const,
   data: detail({ summary: { ...detail().summary, id, name: id === "ryuzi" ? "Ryuzi" : "Reviewer", isDefault: id === "ryuzi" } }),
 }));
+const agentConfigurationCatalog: AgentConfigurationCatalogInfo = {
+  skills: [{ id: "requesting-code-review", label: "Requesting code review", description: "Review guidance", available: true, commandScoped: false }],
+  nativeTools: [
+    { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false },
+    { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false },
+    { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true },
+  ],
+  pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false }],
+  apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false }],
+};
+
+const getAgentConfigurationCatalog = mock(async () => ({ status: "ok" as const, data: agentConfigurationCatalog }));
 const listApps = mock(async () => ({ status: "ok" as const, data: [] }));
 const updateAgent = mock(async (_runner: string | null, _id: string, input: AgentMutationInfo) => ({
   status: "ok" as const,
@@ -39,7 +52,16 @@ const listAgentSessions = mock(async (_runner: string | null, _agentId: string, 
 const listMessages = mock(async (_runner: string | null, _sessionPk: string) => ({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { deleteAgent, duplicateAgent, getAgent, listAgentSessions, listApps, listMessages, updateAgent },
+  commands: {
+    deleteAgent,
+    duplicateAgent,
+    getAgent,
+    getAgentConfigurationCatalog,
+    listAgentSessions,
+    listApps,
+    listMessages,
+    updateAgent,
+  },
   events: {},
 }));
 
@@ -47,6 +69,7 @@ const { AgentDetailView } = await import("./AgentDetailView");
 const { useStore } = await import("@/store");
 const { useAgents } = await import("@/store-agents");
 const { useApps } = await import("@/store-apps");
+const { useAgentConfigurationCatalog } = await import("@/store-agent-catalog");
 const { useLearning } = await import("@/store-learning");
 const { useNav } = await import("@/store-nav");
 
@@ -131,6 +154,7 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
     maxTurns: 50,
     maxToolRounds: 100,
     modelInfo: routeInfo,
+    personality: { preset: "helpful", custom: null },
     ...overrides,
   };
 }
@@ -168,6 +192,8 @@ function seed(value = detail()) {
 beforeEach(() => {
   listAgentSessions.mockClear();
   listAgentSessions.mockResolvedValue({ status: "ok", data: [] });
+  getAgentConfigurationCatalog.mockClear();
+  useAgentConfigurationCatalog.setState({ catalog: null, loading: false, error: null });
   deleteAgent.mockClear();
   duplicateAgent.mockClear();
   listApps.mockClear();
@@ -284,11 +310,13 @@ test("concrete model renders resolver-supported effort values and route has no e
   expect(screen.queryByRole("combobox", { name: "Agent effort" })).toBeNull();
 });
 
-test("explicit permission rule editing persists typed rules", async () => {
+test("explicit permission rule editing persists catalog-selected tools", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
   fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Rule tool ID" }), { target: { value: "bash" } });
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Rule tool" }).hasAttribute("disabled")).toBe(false));
+  fireEvent.click(screen.getByRole("combobox", { name: "Rule tool" }));
+  fireEvent.click(await screen.findByRole("option", { name: /^Bash/ }));
   fireEvent.click(screen.getByRole("combobox", { name: "Rule decision" }));
   fireEvent.click(await screen.findByRole("option", { name: "Allow" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Command prefix" }), { target: { value: "cargo test" } });
@@ -304,29 +332,23 @@ test("explicit permission rule editing persists typed rules", async () => {
   );
 });
 
-test("permission rules preserve unknown stable tool IDs and allow editing them", async () => {
+test("permission rules keep unknown stable tool IDs unavailable until removed", async () => {
   seed(detail({ permissionRules: [{ id: "custom-rule", tool: "plugin__acme__deploy", decision: "deny", commandPrefix: null }] }));
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Permissions" }));
-  const toolId = screen.getByRole("textbox", { name: "Rule tool ID" });
-  expect((toolId as HTMLInputElement).value).toBe("plugin__acme__deploy");
-  fireEvent.change(toolId, { target: { value: "mcp__github__create_issue" } });
+  await waitFor(() => expect(screen.getByText("Unavailable")).toBeTruthy());
+  expect(screen.queryByRole("textbox", { name: "Rule tool ID" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Remove unavailable rule plugin__acme__deploy" }));
+  await waitFor(() => expect(screen.queryByText("Unavailable")).toBeNull());
+  expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
   await waitFor(() =>
-    expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", {
-      name: "Reviewer",
-      description: "Reviews implementation quality.",
-      avatarColor: "violet",
-      model: { kind: "route", route: "free" },
-      permissionMode: "ask",
-      permissionRules: [{ id: "custom-rule", tool: "mcp__github__create_issue", decision: "deny", commandPrefix: null }],
-      skills: ["requesting-code-review"],
-      nativeTools: ["read", "grep", "bash"],
-      pluginTools: [],
-      apps: [],
-      maxTurns: 50,
-      maxToolRounds: 100,
-    }),
+    expect(updateAgent).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "reviewer",
+      expect.objectContaining({ permissionRules: [] }),
+    ),
   );
 });
 
@@ -350,6 +372,7 @@ test("model transitions preserve supported effort, clear unsupported effort, and
       description: "Reviews implementation quality.",
       avatarColor: "violet",
       model: { kind: "concrete", name: miniInfo.requestValue, effort: null },
+      personality: { preset: "helpful", custom: null },
       permissionMode: "ask",
       permissionRules: [],
       skills: ["requesting-code-review"],
@@ -388,10 +411,11 @@ test("changing agent resets the local tab to Overview", async () => {
   expect(screen.queryByText("Explicit rules")).toBeNull();
 });
 
-test("Skills & Tools and Advanced tabs render their owned settings", () => {
+test("Skills & Tools and Advanced tabs render their owned settings", async () => {
   render(<AgentDetailView agentId="reviewer" />);
   fireEvent.click(screen.getByRole("button", { name: "Skills & Tools" }));
-  expect(screen.getByRole("textbox", { name: "Skill ID" })).toBeTruthy();
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy());
+  expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Save skills and tools" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
   expect(screen.getByRole("textbox", { name: "Max turns" })).toBeTruthy();

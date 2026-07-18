@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
+use crate::agents::personality::AgentPersonality;
 use crate::PermMode;
 
 pub type AgentId = String;
@@ -103,6 +104,7 @@ pub struct AgentProfile {
     pub description: String,
     pub avatar: AgentAvatar,
     pub model: AgentModel,
+    pub personality: AgentPersonality,
     pub permissions: AgentPermissions,
     pub skills: Vec<String>,
     pub tools: AgentTools,
@@ -148,6 +150,7 @@ pub struct AgentMutationInput {
     pub description: String,
     pub avatar: AgentAvatar,
     pub model: AgentModel,
+    pub personality: AgentPersonality,
     pub permissions: AgentPermissions,
     pub skills: Vec<String>,
     pub tools: AgentTools,
