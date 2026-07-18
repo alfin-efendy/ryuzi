@@ -54,6 +54,8 @@ impl HostPolicy {
 
 #[derive(Debug)]
 pub enum PluginRuntimeError {
+    EngineInitialization(String),
+    ComponentRead(String),
     MalformedComponent(String),
     DeniedImport { name: String, reason: String },
     InstantiationFailed(String),
@@ -62,6 +64,10 @@ pub enum PluginRuntimeError {
 impl fmt::Display for PluginRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EngineInitialization(message) => {
+                write!(f, "component engine failed to initialize: {message}")
+            }
+            Self::ComponentRead(message) => write!(f, "failed to read component: {message}"),
             Self::MalformedComponent(message) => write!(f, "malformed component: {message}"),
             Self::DeniedImport { name, reason } => {
                 write!(f, "component import `{name}` is denied: {reason}")
@@ -87,7 +93,7 @@ impl ComponentRuntime {
         config.consume_fuel(true);
         config.epoch_interruption(true);
         let engine = Engine::new(&config)
-            .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
+            .map_err(|error| PluginRuntimeError::EngineInitialization(error.to_string()))?;
         Ok(Self { engine })
     }
 
@@ -121,7 +127,7 @@ impl ComponentRuntime {
     /// Validates the component staged by a signed bundle under deny-all policy.
     pub fn validate_component(&self, bundle: &VerifiedBundle) -> Result<(), PluginRuntimeError> {
         let bytes = std::fs::read(bundle.staging_dir.join(&bundle.manifest.component))
-            .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
+            .map_err(|error| PluginRuntimeError::ComponentRead(error.to_string()))?;
         self.validate_component_bytes(&bundle.manifest, &bytes, &HostPolicy::deny_all())
             .map(|_| ())
     }
@@ -152,7 +158,7 @@ impl ComponentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryuzi_plugin_sdk::{NetworkPermission, PluginLifecycle, PluginPermissions};
+    use ryuzi_plugin_sdk::{NetworkPermission, PluginLifecycle, PluginPermissions, PluginRelease};
 
     fn manifest(network: Vec<&str>) -> PluginBundleManifest {
         PluginBundleManifest {
@@ -171,6 +177,21 @@ mod tests {
                     .collect(),
             },
             oauth: vec![],
+        }
+    }
+
+    /// A `PluginRelease` whose fields are usable directly by tests that only
+    /// exercise [`ComponentRuntime::validate_component`] (which reads the
+    /// manifest, not the release, off a [`VerifiedBundle`]).
+    fn release() -> PluginRelease {
+        PluginRelease {
+            id: "acme".to_string(),
+            version: "0.1.0".to_string(),
+            wit_api: "0.1.0".to_string(),
+            component_url: "https://example.invalid/acme/plugin.wasm".to_string(),
+            component_sha256: "0".repeat(64),
+            size_bytes: None,
+            published_at: None,
         }
     }
 
@@ -222,6 +243,55 @@ mod tests {
         };
         assert!(
             matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == "ryuzi:http/http@0.1.0")
+        );
+    }
+
+    /// The public entrypoint `validate_component` reads the component off a
+    /// [`VerifiedBundle`]'s staging directory rather than taking raw bytes —
+    /// exercise that file-reading path directly, not just the
+    /// bytes-in/bytes-out helper the other tests above use.
+    #[test]
+    fn validate_component_accepts_a_verified_bundle_staging_a_valid_component() {
+        let staging_dir = tempfile::tempdir().expect("tempdir should create");
+        std::fs::write(staging_dir.path().join("plugin.wasm"), b"(component)")
+            .expect("writing staged component should succeed");
+        let bundle = VerifiedBundle {
+            manifest: manifest(vec![]),
+            release: release(),
+            signing_key_id: "any-key-id".to_string(),
+            staging_dir: staging_dir.path().to_path_buf(),
+        };
+
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime
+            .validate_component(&bundle)
+            .expect("a valid staged component must validate under deny-all policy");
+    }
+
+    /// A missing staged component file is an I/O failure to read it, not a
+    /// malformed-bytes failure — `validate_component` must surface the
+    /// dedicated `ComponentRead` variant, distinct from `MalformedComponent`
+    /// (reserved for bytes that fail to parse as a component).
+    #[test]
+    fn validate_component_reports_component_read_when_staging_dir_lacks_component() {
+        let staging_dir = tempfile::tempdir().expect("tempdir should create");
+        // Deliberately do not write `plugin.wasm` into the staging dir.
+        let bundle = VerifiedBundle {
+            manifest: manifest(vec![]),
+            release: release(),
+            signing_key_id: "any-key-id".to_string(),
+            staging_dir: staging_dir.path().to_path_buf(),
+        };
+
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let result = runtime.validate_component(&bundle);
+
+        let Err(error) = result else {
+            panic!("a staging dir missing the component must not validate");
+        };
+        assert!(
+            matches!(error, PluginRuntimeError::ComponentRead(_)),
+            "expected ComponentRead, got {error:?}"
         );
     }
 }
