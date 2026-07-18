@@ -519,6 +519,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // The daemon is the single always-on engine host for cron scheduling. The scheduler's
     // job_last_fired anchor is single-host-only — never spawn a second one.
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
+    spawn_artifact_retention(Arc::clone(&cp), Arc::clone(&store));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
@@ -545,6 +546,34 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         rail_handle,
         learning_handle,
     })
+}
+
+/// Run artifact retention periodically from the sole daemon host. The first
+/// tick runs immediately so a restart also resumes cleanup after a previous
+/// interruption; later ticks are hourly. Failures are retryable and never
+/// prevent the daemon from serving sessions.
+fn spawn_artifact_retention(cp: Arc<ControlPlane>, store: Arc<Store>) {
+    tokio::spawn(async move {
+        let settings = SettingsStore::new(store);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            let retention_days = settings
+                .get("artifact_retention_days")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(30);
+            if let Err(error) = cp
+                .artifacts()
+                .purge_expired_archives(crate::paths::now_ms(), retention_days)
+                .await
+            {
+                tracing::warn!("artifact retention cleanup failed: {error}");
+            }
+        }
+    });
 }
 
 /// Per-gateway queue bound between the broadcast receiver and its sole
