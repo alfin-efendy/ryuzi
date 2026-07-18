@@ -16,8 +16,11 @@ use wasmtime::{
 };
 
 const HTTP_IMPORT: &str = "ryuzi:http/http@0.1.0";
+const TYPES_IMPORT: &str = "ryuzi:plugin/types@0.1.0";
+const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 const ALLOWED_EXPORTS: &[&str] = &[
     "lifecycle",
+    LIFECYCLE_EXPORT,
     "ryuzi:gateway/gateway@0.1.0",
     "ryuzi:connector/connector@0.1.0",
     "ryuzi:provider/provider@0.1.0",
@@ -123,10 +126,12 @@ impl ComponentRuntime {
         let component = Component::new(&self.engine, bytes)
             .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
         for (name, _) in component.component_type().imports(&self.engine) {
+            let is_wasi_baseline = name.starts_with("wasi:");
             let network_is_authorized = name == HTTP_IMPORT
                 && !manifest.permissions.network.is_empty()
                 && policy.allow_network;
-            if !network_is_authorized {
+            let types_is_authorized = name == TYPES_IMPORT;
+            if !is_wasi_baseline && !types_is_authorized && !network_is_authorized {
                 let reason = if name == HTTP_IMPORT {
                     "network requires a manifest allowlist and host policy approval".to_string()
                 } else {
@@ -246,6 +251,80 @@ mod tests {
         }
     }
 
+    fn fixture_artifact(name: &str) -> std::path::PathBuf {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        root.join("tests")
+            .join("fixtures")
+            .join(name)
+            .join("target")
+            .join("wasm32-wasip2")
+            .join("release")
+            .join(match name {
+                "component-noop" => "ryuzi_component_noop_fixture.wasm",
+                "component-http-import" => "ryuzi_component_http_fixture.wasm",
+                _ => panic!("unknown fixture {name}"),
+            })
+    }
+
+    fn build_fixture_components() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-components.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("fixture build script should start");
+        assert!(
+            status.success(),
+            "fixture build script failed with {status}"
+        );
+    }
+
+    #[test]
+    fn real_fixture_components_expose_expected_wit_contracts() {
+        build_fixture_components();
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let noop = Component::from_file(&runtime.engine, fixture_artifact("component-noop"))
+            .expect("noop fixture component should parse");
+        let noop_imports: Vec<_> = noop
+            .component_type()
+            .imports(&runtime.engine)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let noop_exports: Vec<_> = noop
+            .component_type()
+            .exports(&runtime.engine)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(noop_exports.iter().any(|name| name == LIFECYCLE_EXPORT));
+        assert!(!noop_imports.iter().any(|name| name == HTTP_IMPORT));
+        runtime
+            .validate_component_bytes(
+                &manifest(vec![]),
+                &std::fs::read(fixture_artifact("component-noop")).unwrap(),
+                &HostPolicy::deny_all(),
+            )
+            .expect("noop fixture should validate with WASI and types baseline imports");
+
+        let http = Component::from_file(&runtime.engine, fixture_artifact("component-http-import"))
+            .expect("HTTP fixture component should parse");
+        let http_imports: Vec<_> = http
+            .component_type()
+            .imports(&runtime.engine)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(http_imports.iter().any(|name| name == HTTP_IMPORT));
+        let result = runtime.validate_component_bytes(
+            &manifest(vec![]),
+            &std::fs::read(fixture_artifact("component-http-import")).unwrap(),
+            &HostPolicy::deny_all(),
+        );
+        assert!(
+            matches!(result, Err(PluginRuntimeError::DeniedImport { name, .. }) if name == HTTP_IMPORT)
+        );
+    }
     fn component_release() -> ComponentPluginReleaseRecord {
         ComponentPluginReleaseRecord {
             plugin_id: "acme".to_string(),

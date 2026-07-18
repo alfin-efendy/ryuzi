@@ -1,0 +1,7 @@
+package fixture:http-import@0.1.0;
+
+world http-import {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:http/http@0.1.0;
+  export ryuzi:plugin/lifecycle@0.1.0;
+}
