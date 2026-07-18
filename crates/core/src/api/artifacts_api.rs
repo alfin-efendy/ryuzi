@@ -4,17 +4,25 @@
 //! `Store::artifacts_for_session` rows to the wire DTO.
 
 use super::{ok, params, ApiError};
-use crate::api::types::ArtifactInfo;
-use crate::artifacts::ArtifactListRow;
+use crate::api::types::{ArtifactFileInfo, ArtifactInfo};
+use crate::artifacts::{ArtifactError, ArtifactListRow, ArtifactStatus};
 use crate::serve::ApiState;
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
 
-pub(crate) const HANDLES: &[&str] = &["list_session_artifacts"];
+pub(crate) const HANDLES: &[&str] = &["list_session_artifacts", "fetch_artifact"];
 
 #[derive(Deserialize)]
 struct SessionPk {
     session_pk: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchArtifactP {
+    session_pk: String,
+    artifact_id: String,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
@@ -22,6 +30,10 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         "list_session_artifacts" => {
             let a: SessionPk = params(p)?;
             ok(list_session_artifacts(state, &a.session_pk).await?)
+        }
+        "fetch_artifact" => {
+            let a: FetchArtifactP = params(p)?;
+            ok(fetch_artifact(state, &a.session_pk, &a.artifact_id).await?)
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
@@ -33,6 +45,51 @@ async fn list_session_artifacts(
 ) -> anyhow::Result<Vec<ArtifactInfo>> {
     let rows = state.cp.store().artifacts_for_session(session_pk).await?;
     Ok(rows.into_iter().map(artifact_info).collect())
+}
+
+async fn fetch_artifact(
+    state: &ApiState,
+    session_pk: &str,
+    artifact_id: &str,
+) -> Result<ArtifactFileInfo, ApiError> {
+    let access = state
+        .cp
+        .store()
+        .reference_for_session(artifact_id, session_pk)
+        .await
+        .map_err(|_| ApiError::not_found("artifact not found"))?
+        .ok_or_else(|| ApiError::not_found("artifact not found"))?;
+    if access.artifact.status == ArtifactStatus::Deleted {
+        return Err(ApiError::not_found("artifact not found"));
+    }
+    let read = state
+        .cp
+        .artifacts()
+        .read_range(&access.artifact.id, 0, Some(access.artifact.size_bytes))
+        .await
+        .map_err(map_read_error)?;
+    if read.truncated {
+        return Err(ApiError::conflict(
+            "artifact exceeds the download read limit",
+        ));
+    }
+    Ok(ArtifactFileInfo {
+        name: access.artifact.name,
+        content_type: access.artifact.content_type,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(read.bytes),
+    })
+}
+
+fn map_read_error(error: ArtifactError) -> ApiError {
+    match error {
+        ArtifactError::NotFound | ArtifactError::Deleted | ArtifactError::AccessDenied => {
+            ApiError::not_found("artifact not found")
+        }
+        _ => ApiError {
+            status: 500,
+            message: "artifact download failed".into(),
+        },
+    }
 }
 
 fn artifact_info(row: ArtifactListRow) -> ArtifactInfo {
