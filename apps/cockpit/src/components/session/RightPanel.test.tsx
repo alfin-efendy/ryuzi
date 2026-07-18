@@ -64,6 +64,9 @@ function childRun({ sourceToolCallId = null, dispatchIndex = null, ...overrides 
     resolvedEffort: null,
     result: "Child findings",
     error: null,
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }

@@ -1512,7 +1512,11 @@ async fn drive(
             }
             flush_text(deps, &mut text_buf, display.text()).await;
             cm.commit_response();
-            emit_context_usage(deps, cm, display.text()).await;
+            match &display {
+                DisplayMode::Full => emit_context_usage(deps, cm, true).await,
+                DisplayMode::ToolsOnly { .. } => emit_run_context_usage(deps, cm).await,
+                DisplayMode::Silent => {}
+            }
             if !turn.text.is_empty() {
                 final_text = turn.text.clone();
             }
@@ -4287,6 +4291,35 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         .await
     {
         tracing::warn!("native: upsert_session_context failed: {e}");
+    }
+}
+
+/// Broadcast a child run's ephemeral context usage AND persist it onto the
+/// agent_runs row, so the sub-agent's ring updates live and survives a
+/// re-open / daemon restart. Unlike `emit_context_usage`, it NEVER accumulates
+/// cost or writes `session_context` — the session tally stays main-agent-only,
+/// preserving the single cost-accumulation-site invariant.
+async fn emit_run_context_usage(deps: &RunnerDeps, cm: &ContextManager) {
+    let st = cm.status();
+    let _ = deps.events.send(CoreEvent::AgentRunContextUsage {
+        session_pk: deps.session_pk.clone(),
+        run_id: deps.run_id.clone(),
+        active_tokens: st.active_tokens,
+        context_window: st.context_window,
+        usable_window: st.usable_window,
+        percent_left: st.percent_left,
+    });
+    if let Err(e) = deps
+        .store
+        .update_agent_run_context_usage(
+            &deps.run_id,
+            st.active_tokens,
+            st.usable_window,
+            st.percent_left,
+        )
+        .await
+    {
+        tracing::warn!("native: update_agent_run_context_usage failed: {e}");
     }
 }
 
@@ -7192,6 +7225,82 @@ mod tests {
             Some(12_000),
             "cache_creation must be surfaced on the event"
         );
+    }
+
+    #[tokio::test]
+    async fn tools_only_drive_emits_run_scoped_usage_and_leaves_session_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let turn = vec![
+            message_start_with_usage(5_000, 1_000),
+            text_delta("child done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(ScriptedLlm::new(vec![turn]));
+        let deps = deps_at(dir.path(), llm).await;
+        let mut rx = deps.events.subscribe();
+        let mut cm = ContextManager::ephemeral(
+            &deps.session_pk,
+            ContextConfig::with_meta(deps.meta.clone()),
+        );
+        cm.append_user(json!([{ "type": "text", "text": "child task" }]))
+            .await
+            .unwrap();
+
+        drive(
+            &deps,
+            &deps.agent.clone(),
+            &mut cm,
+            &CancellationToken::new(),
+            None,
+            DisplayMode::ToolsOnly {
+                label: "general".into(),
+            },
+            &IterationBudget::new(1),
+        )
+        .await
+        .unwrap();
+
+        let mut saw_run = None;
+        let mut saw_session = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                CoreEvent::AgentRunContextUsage {
+                    run_id,
+                    active_tokens,
+                    ..
+                } => {
+                    saw_run = Some((run_id, active_tokens));
+                }
+                CoreEvent::ContextUsage { .. } => saw_session = true,
+                _ => {}
+            }
+        }
+        let (run_id, active) = saw_run.expect("a run-scoped AgentRunContextUsage event");
+        assert_eq!(run_id, deps.run_id);
+        assert!(
+            active >= 6_000,
+            "input+cache+output committed, got {active}"
+        );
+        assert!(
+            !saw_session,
+            "a ToolsOnly loop must not emit a session ContextUsage"
+        );
+        // Persisted onto the run row.
+        let row = deps
+            .store
+            .get_agent_run(&deps.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.context_percent_left, Some(cm.status().percent_left));
+        // Session cost/context tally must be untouched by the run-scoped path.
+        assert!(deps
+            .store
+            .get_session_context(&deps.session_pk)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

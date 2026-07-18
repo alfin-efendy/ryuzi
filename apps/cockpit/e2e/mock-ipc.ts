@@ -419,6 +419,9 @@ export const DELEGATE_ACTIVE_RUN = {
   resolvedEffort: "high",
   result: null,
   error: null,
+  contextActiveTokens: null,
+  contextUsableWindow: null,
+  contextPercentLeft: null,
 } satisfies AgentRun;
 
 export const DELEGATE_DONE_RUN = {
@@ -441,6 +444,9 @@ export const DELEGATE_DONE_RUN = {
   resolvedEffort: null,
   result: "All tests passed.",
   error: null,
+  contextActiveTokens: null,
+  contextUsableWindow: null,
+  contextPercentLeft: null,
 } satisfies AgentRun;
 
 export const REVIEWER_CHILD_TRANSCRIPT = [

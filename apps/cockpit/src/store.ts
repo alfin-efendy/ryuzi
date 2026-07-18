@@ -16,7 +16,7 @@ import {
   type ProjectRuntimeInfo,
 } from "./bindings";
 import { basename } from "./lib/paths";
-import { useDelegation } from "./store-delegation";
+import { delegationRunKey, useDelegation } from "./store-delegation";
 import { useNative } from "./store-native";
 import { useAgents } from "./store-agents";
 import { useUi } from "./store-ui";
@@ -74,6 +74,10 @@ type State = {
       outputTokens: number;
     }
   >;
+  /** Per-run context-window usage for child runs, from `agentRunContextUsage`.
+   *  Keyed by delegationRunKey(runnerId, sessionPk, runId). Distinct from the
+   *  session-level `contextUsage` (the main agent's). */
+  runContextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
   projectRuntimeById: Record<string, ProjectRuntimeInfo>;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
@@ -146,6 +150,7 @@ export const useStore = create<State>((set, get) => ({
   lastSeq: {},
   loaded: {},
   contextUsage: {},
+  runContextUsage: {},
   projectRuntimeById: {},
   sessionCost: {},
 
@@ -262,6 +267,17 @@ export const useStore = create<State>((set, get) => ({
                 cacheReadTokens: e.cache_read_tokens,
                 cacheCreationTokens: e.cache_creation_tokens,
                 outputTokens: e.output_tokens,
+              },
+            },
+          };
+        case "agentRunContextUsage":
+          return {
+            runContextUsage: {
+              ...st.runContextUsage,
+              [delegationRunKey(runnerId, e.session_pk, e.run_id)]: {
+                activeTokens: e.active_tokens,
+                usableWindow: e.usable_window,
+                percentLeft: e.percent_left,
               },
             },
           };

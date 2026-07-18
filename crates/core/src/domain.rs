@@ -355,6 +355,9 @@ pub struct AgentRun {
     pub resolved_effort: Option<String>,
     pub result: Option<String>,
     pub error: Option<String>,
+    pub context_active_tokens: Option<u64>,
+    pub context_usable_window: Option<u64>,
+    pub context_percent_left: Option<u8>,
 }
 
 /// The session's primary run, if it has one, plus its sorted child runs.
@@ -847,6 +850,19 @@ pub enum CoreEvent {
         cache_creation_tokens: u64,
         output_tokens: u64,
     },
+    /// Per-response context usage for ONE child run (ephemeral task sub-agent
+    /// or delegated main agent). Run-scoped sibling of `ContextUsage`; carries
+    /// NO cost buckets — cost stays session-scoped and main-agent-only. Like
+    /// `ContextUsage`, its own fields stay snake_case; the enum-level
+    /// `rename_all = "camelCase"` only renames the `kind` tag.
+    AgentRunContextUsage {
+        session_pk: String,
+        run_id: String,
+        active_tokens: u64,
+        context_window: u64,
+        usable_window: u64,
+        percent_left: u8,
+    },
     /// The native runtime compacted a session's history
     /// (trigger: pre_turn|mid_turn|manual).
     ContextCompacted {
@@ -1012,6 +1028,23 @@ mod tests {
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "contextCompacted");
         assert_eq!(j["window_number"], 2);
+    }
+
+    #[test]
+    fn agent_run_context_usage_serializes_run_scoped() {
+        let e = CoreEvent::AgentRunContextUsage {
+            session_pk: "s1".into(),
+            run_id: "r1".into(),
+            active_tokens: 1_000,
+            context_window: 200_000,
+            usable_window: 190_000,
+            percent_left: 88,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["kind"], "agentRunContextUsage");
+        assert_eq!(j["session_pk"], "s1");
+        assert_eq!(j["run_id"], "r1");
+        assert_eq!(j["percent_left"], 88);
     }
 
     #[test]

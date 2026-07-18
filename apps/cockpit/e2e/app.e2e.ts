@@ -112,6 +112,9 @@ function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
     resolvedEffort: "medium",
     result: null,
     error: null,
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }

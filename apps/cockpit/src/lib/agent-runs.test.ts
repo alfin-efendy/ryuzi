@@ -23,6 +23,9 @@ function run(overrides: Partial<AgentRun> = {}): AgentRun {
     resolvedEffort: "high",
     result: null,
     error: null,
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }
