@@ -48,17 +48,16 @@ impl Tool for ReadArtifact {
         };
         let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let length = input.get("length").and_then(Value::as_u64);
-        let access = match ctx
+        if let Err(error) = ctx
             .artifacts
             .resolve_agent_access(&ctx.session_pk, artifact_id)
             .await
         {
-            Ok(access) => access,
-            Err(error) => return Ok(ToolOutput::error(error.to_string())),
-        };
+            return Ok(ToolOutput::error(error.to_string()));
+        }
         let read = match ctx
             .artifacts
-            .read_for_agent(&access.artifact.id, offset, length)
+            .read_for_agent(&ctx.session_pk, artifact_id, offset, length)
             .await
         {
             Ok(read) => read,

@@ -426,32 +426,25 @@ impl ArtifactService {
     /// the actual byte-range fetch to [`Self::read_range`].
     pub async fn read_for_agent(
         &self,
+        session_pk: &str,
         id: &str,
         offset: u64,
         length: Option<u64>,
     ) -> Result<ArtifactRead, ArtifactError> {
-        let artifact = self
-            .store
-            .artifact_by_id(id)
-            .await
-            .map_err(|_| ArtifactError::StorageFailure)?
-            .ok_or(ArtifactError::NotFound)?;
-
+        let access =
+            self.resolve_agent_access(session_pk, id)
+                .await
+                .map_err(|error| match error {
+                    ArtifactError::InactiveSession => ArtifactError::ArchivedSource,
+                    ArtifactError::SourceDeleted => ArtifactError::Deleted,
+                    other => other,
+                })?;
+        let artifact = access.artifact;
         if artifact.status == ArtifactStatus::Deleted {
             return Err(ArtifactError::Deleted);
         }
 
-        match self
-            .store
-            .session_archived_at(&artifact.source_session_pk)
-            .await
-        {
-            Ok(Some(_)) => return Err(ArtifactError::ArchivedSource),
-            Ok(None) => {}
-            Err(_) => return Err(ArtifactError::StorageFailure),
-        }
-
-        self.read_range(id, offset, length).await
+        self.read_range(&artifact.id, offset, length).await
     }
 }
 
@@ -843,17 +836,25 @@ mod tests {
         let record = svc.create_artifact(base_input(b"hello")).await.unwrap();
 
         assert_eq!(
-            svc.read_for_agent(&record.id, 0, None).await.unwrap().bytes,
+            svc.read_for_agent("sess-1", &record.id, 0, None)
+                .await
+                .unwrap()
+                .bytes,
             b"hello"
         );
         assert!(store.archive_session("sess-1", 10).await.unwrap());
         assert_eq!(
-            svc.read_for_agent(&record.id, 0, None).await.unwrap_err(),
+            svc.read_for_agent("sess-1", &record.id, 0, None)
+                .await
+                .unwrap_err(),
             ArtifactError::ArchivedSource
         );
         assert!(store.restore_session("sess-1").await.unwrap());
         assert_eq!(
-            svc.read_for_agent(&record.id, 0, None).await.unwrap().bytes,
+            svc.read_for_agent("sess-1", &record.id, 0, None)
+                .await
+                .unwrap()
+                .bytes,
             b"hello"
         );
     }
@@ -876,7 +877,9 @@ mod tests {
         );
 
         assert_eq!(
-            svc.read_for_agent(&record.id, 0, None).await.unwrap_err(),
+            svc.read_for_agent("sess-1", &record.id, 0, None)
+                .await
+                .unwrap_err(),
             ArtifactError::Deleted
         );
     }
