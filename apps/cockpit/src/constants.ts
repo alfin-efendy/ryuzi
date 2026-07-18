@@ -10,6 +10,11 @@ export const PROJECTS_ROOT_KEY = "projects_root";
 // mechanism as PROJECTS_ROOT_KEY — empty/unset falls back to the engine's
 // default app-data location.
 export const WORKTREE_DIR_KEY = "worktree_dir";
+export const ARTIFACT_ROOT_KEY = "artifact_root";
+export const ARTIFACT_MAX_BYTES_KEY = "artifact_max_bytes";
+export const ARTIFACT_SESSION_MAX_BYTES_KEY = "artifact_session_max_bytes";
+export const ARTIFACT_READ_MAX_BYTES_KEY = "artifact_read_max_bytes";
+export const ARTIFACT_RETENTION_DAYS_KEY = "artifact_retention_days";
 
 export type GatewayFsMode = "full" | "projects" | "read";
 

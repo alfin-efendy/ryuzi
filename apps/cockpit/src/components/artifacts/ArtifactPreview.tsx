@@ -34,26 +34,48 @@ export function ArtifactPreview({ runnerId, sessionPk, artifact, onClose }: Prop
       if (result.status === "ok") setFile(result.data);
       else setError(result.error.message);
     });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [artifact.id, runnerId, sessionPk]);
 
   const body = () => {
     if (error) return <p className="text-sm text-destructive">{error}</p>;
     if (!file) return <p className="text-sm text-muted-foreground">Loading artifact…</p>;
-    if (isImage(file.contentType)) return <img src={`data:${file.contentType};base64,${file.dataBase64}`} alt={file.name} className="max-h-[65vh] max-w-full object-contain" />;
+    if (isImage(file.contentType))
+      return (
+        <img
+          src={`data:${file.contentType};base64,${file.dataBase64}`}
+          alt={file.name}
+          className="max-h-[65vh] max-w-full object-contain"
+        />
+      );
     if (isText(file.contentType, file.name)) {
       const text = new TextDecoder().decode(Uint8Array.from(atob(file.dataBase64), (char) => char.charCodeAt(0)));
       return <pre className="max-h-[60vh] overflow-auto rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{text}</pre>;
     }
-    return <p className="text-sm text-muted-foreground">Preview is unavailable for this file type. Download it to open with another application.</p>;
+    return (
+      <p className="text-sm text-muted-foreground">
+        Preview is unavailable for this file type. Download it to open with another application.
+      </p>
+    );
   };
 
-  return <Modal onClose={onClose} width={760}>
-    <ModalHeader title={artifact.name} />
-    <ModalBody>{body()}</ModalBody>
-    <ModalFooter>
-      <Button variant="outline" onClick={onClose}>Close</Button>
-      {file ? <Button onClick={() => download(file)}><Download aria-hidden size={14} />Download</Button> : null}
-    </ModalFooter>
-  </Modal>;
+  return (
+    <Modal onClose={onClose} width={760}>
+      <ModalHeader title={artifact.name} />
+      <ModalBody>{body()}</ModalBody>
+      <ModalFooter>
+        <Button variant="outline" onClick={onClose}>
+          Close
+        </Button>
+        {file ? (
+          <Button onClick={() => download(file)}>
+            <Download aria-hidden size={14} />
+            Download
+          </Button>
+        ) : null}
+      </ModalFooter>
+    </Modal>
+  );
 }
