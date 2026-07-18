@@ -59,6 +59,7 @@ pub enum PluginRuntimeError {
     MalformedComponent(String),
     DeniedImport { name: String, reason: String },
     InstantiationFailed(String),
+    FuelExhausted(String),
 }
 
 impl fmt::Display for PluginRuntimeError {
@@ -74,6 +75,9 @@ impl fmt::Display for PluginRuntimeError {
             }
             Self::InstantiationFailed(message) => {
                 write!(f, "component instantiation failed: {message}")
+            }
+            Self::FuelExhausted(message) => {
+                write!(f, "component exhausted its fuel budget: {message}")
             }
         }
     }
@@ -153,11 +157,37 @@ impl ComponentRuntime {
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
         Ok(())
     }
+
+    #[cfg(test)]
+    fn execute_core_module_with_fuel(
+        &self,
+        wat: &str,
+        fuel: u64,
+    ) -> Result<(), PluginRuntimeError> {
+        let module = wasmtime::Module::new(&self.engine, wat)
+            .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(fuel)
+            .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+        store.set_epoch_deadline(1);
+        let linker = wasmtime::Linker::<()>::new(&self.engine);
+        linker
+            .instantiate(&mut store, &module)
+            .map(|_| ())
+            .map_err(|error| match error.downcast_ref::<wasmtime::Trap>() {
+                Some(wasmtime::Trap::OutOfFuel) => {
+                    PluginRuntimeError::FuelExhausted(error.to_string())
+                }
+                _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::ComponentPluginReleaseRecord;
     use ryuzi_plugin_sdk::{NetworkPermission, PluginLifecycle, PluginPermissions, PluginRelease};
 
     fn manifest(network: Vec<&str>) -> PluginBundleManifest {
@@ -195,6 +225,42 @@ mod tests {
         }
     }
 
+    fn component_release() -> ComponentPluginReleaseRecord {
+        ComponentPluginReleaseRecord {
+            plugin_id: "acme".to_string(),
+            version: "0.1.0".to_string(),
+            source_url: "https://example.invalid/acme/plugin.wasm".to_string(),
+            sha256: "0".repeat(64),
+            signing_key_id: "test".to_string(),
+            installed_at: 0,
+            active: true,
+            revoked: false,
+            revocation_reason: None,
+        }
+    }
+
+    fn installed_bundle(dir: &std::path::Path) -> InstalledBundle {
+        let component_path = dir.join("plugin.wasm");
+        std::fs::write(&component_path, b"(component)").expect("writing component should succeed");
+        InstalledBundle {
+            manifest: manifest(vec![]),
+            release: release(),
+            release_record: component_release(),
+            root: dir.to_path_buf(),
+            component_path,
+        }
+    }
+
+    #[tokio::test]
+    async fn instantiate_succeeds_for_an_installed_component_under_deny_all() {
+        let dir = tempfile::tempdir().expect("tempdir should create");
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime
+            .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all())
+            .await
+            .expect("an import-free installed component should instantiate");
+    }
+
     #[test]
     fn default_resource_limits_are_conservative() {
         assert_eq!(
@@ -206,6 +272,15 @@ mod tests {
                 max_concurrency: 4,
             }
         );
+    }
+
+    #[test]
+    fn core_module_execution_reports_fuel_exhaustion() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let error = runtime
+            .execute_core_module_with_fuel("(module (func (loop br 0)) (start 0))", 100)
+            .expect_err("infinite loop must exhaust fuel");
+        assert!(matches!(error, PluginRuntimeError::FuelExhausted(_)));
     }
 
     #[test]
