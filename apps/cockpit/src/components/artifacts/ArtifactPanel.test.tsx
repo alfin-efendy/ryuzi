@@ -1,7 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-const listSessionArtifacts = mock(() =>
+const listSessionArtifacts = mock<() => Promise<any>>(() =>
   Promise.resolve({
     status: "ok" as const,
     data: [
