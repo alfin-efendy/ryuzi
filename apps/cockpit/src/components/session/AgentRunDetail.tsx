@@ -1,13 +1,26 @@
 import { ArrowLeft, Bot, Copy, RotateCw, Square, Waypoints } from "lucide-react";
 import type { AgentRun } from "@/bindings";
 import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
+import { useNow } from "@/hooks/useNow";
 import { messageToRow } from "@/lib/transcript";
 import { useDelegation, delegationRunKey } from "@/store-delegation";
 import { Transcript } from "@/components/transcript/Transcript";
+import { Markdown } from "@/components/transcript/Markdown";
+import { ContextRing } from "./ContextRing";
+import { useStore } from "@/store";
+import { sessKey } from "@/lib/session-key";
 import { Button } from "@ryuzi/ui";
 
 const activeStatuses = new Set(["queued", "running"]);
 const retryableStatuses = new Set(["failed", "cancelled", "interrupted"]);
+
+/** Isolated so the 1 Hz tick re-renders only this duration text, not AgentRunDetail's rows/Transcript. */
+function RunHeaderDuration({ run, active }: { run: AgentRun; active: boolean }) {
+  const now = useNow(active);
+  const duration = formatAgentRunDuration(run, now);
+  if (!duration) return null;
+  return <span>{duration}</span>;
+}
 
 export function AgentRunDetail({
   runnerId,
@@ -41,8 +54,8 @@ export function AgentRunDetail({
     ),
   );
   const active = activeStatuses.has(run.status);
-  const duration = formatAgentRunDuration(run);
   const status = agentRunStatusPresentation(run.status);
+  const usage = useStore((s) => s.contextUsage[sessKey(runnerId, sessionPk)]);
 
   return (
     <div className="min-h-0 flex flex-1 flex-col">
@@ -66,9 +79,17 @@ export function AgentRunDetail({
           <span>
             {run.toolCount} {run.toolCount === 1 ? "tool" : "tools"}
           </span>
-          {duration && <span>{duration}</span>}
+          <RunHeaderDuration run={run} active={active} />
           {run.resolvedModel && <span>{run.resolvedModel}</span>}
           {run.resolvedEffort && <span>{run.resolvedEffort}</span>}
+          {usage && (
+            <span
+              className="inline-flex items-center"
+              title={`Session context: ~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
+            >
+              <ContextRing percentLeft={usage.percentLeft} />
+            </span>
+          )}
         </div>
         {active && (
           <Button variant="ghost" size="sm" onClick={() => void stop(runnerId, sessionPk, run.runId)} className="text-destructive">
@@ -98,7 +119,9 @@ export function AgentRunDetail({
                   <Copy aria-hidden size={12} /> Copy
                 </Button>
               </div>
-              <p className="mb-0 whitespace-pre-wrap text-[12.5px]">{run.result}</p>
+              <div className="text-[12.5px]">
+                <Markdown text={run.result} />
+              </div>
             </div>
           )}
           <Button variant="ghost" size="sm" onClick={onRelatedChanges} className="mt-2 -ml-2 text-muted-foreground">

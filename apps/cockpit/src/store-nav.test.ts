@@ -209,3 +209,10 @@ test("consumePendingPrimaryAgentId is a one-shot handoff", () => {
   expect(useNav.getState().pendingPrimaryAgentId).toBeNull();
   expect(useNav.getState().consumePendingPrimaryAgentId()).toBeNull();
 });
+
+test("setPendingPrimaryAgent stores the id without navigating", () => {
+  useNav.setState({ history: { back: [], current: { kind: "home" }, forward: [] }, pendingPrimaryAgentId: null });
+  useNav.getState().setPendingPrimaryAgent("reviewer");
+  expect(useNav.getState().pendingPrimaryAgentId).toBe("reviewer");
+  expect(useNav.getState().history.current).toEqual({ kind: "home" });
+});

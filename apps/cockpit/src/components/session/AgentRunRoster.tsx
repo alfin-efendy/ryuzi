@@ -1,6 +1,7 @@
 import { Bot, CircleAlert, Clock3 } from "lucide-react";
 import type { AgentRun } from "@/bindings";
 import { formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
+import { useNow } from "@/hooks/useNow";
 import { useDelegation, delegationSessionKey } from "@/store-delegation";
 import { Button } from "@ryuzi/ui";
 
@@ -21,7 +22,8 @@ function retryAttemptNumber(run: AgentRun, byId: Map<string, AgentRun>): number 
 }
 
 function RunCard({ run, retryAttempt, onSelect }: { run: AgentRun; retryAttempt: number; onSelect: () => void }) {
-  const duration = formatAgentRunDuration(run);
+  const now = useNow(activeStatuses.has(run.status));
+  const duration = formatAgentRunDuration(run, now);
   return (
     <Button variant="ghost" onClick={onSelect} className="h-auto w-full justify-start rounded-md px-3 py-2 text-left hover:bg-accent">
       <Bot aria-hidden size={14} className="mt-0.5 shrink-0 text-muted-foreground" />

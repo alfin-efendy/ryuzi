@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
+import { ArrowUp, Bot, ChevronDown, FileText, FolderOpen, GitBranch, Mic, Paperclip, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, Combobox, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Switch, Textarea } from "@ryuzi/ui";
 import { commands, type AgentSummaryInfo, type BranchList } from "@/bindings";
@@ -442,6 +442,25 @@ export function HomeView() {
                       label="Worktree"
                     />
                   </div>
+                }
+              />
+            )}
+            {registry && registry.agents.some((a) => a.executable) && (
+              <Combobox
+                aria-label="Agent"
+                options={registry.agents.filter((a) => a.executable).map((a) => ({ value: a.id, label: a.name }))}
+                value={primaryAgentId ?? ""}
+                onValueChange={(id) => {
+                  localStorage.setItem(LAST_PRIMARY_AGENT_KEY, id);
+                  nav.setPendingPrimaryAgent(id);
+                }}
+                placeholder="Agent"
+                trigger={
+                  <Button variant="ghost" size="sm" className="gap-[7px] font-medium text-muted-foreground">
+                    <Bot aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+                    {registry.agents.find((a) => a.id === primaryAgentId)?.name ?? "Agent"}
+                    <ChevronDown aria-hidden size={11} strokeWidth={2} className="size-[11px]" />
+                  </Button>
                 }
               />
             )}
