@@ -32,6 +32,7 @@ import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer"
 import { TodoPanel } from "@/components/session/TodoPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { QueuedMessages } from "@/components/session/QueuedMessages";
+import { SessionCostPanel } from "@/components/session/SessionCostPanel";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -573,6 +574,7 @@ export function SessionView() {
                   <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
                 </Button>
                 <div className="flex-1" />
+                <SessionCostPanel runnerId={runnerId} sessionPk={session.sessionPk} />
                 <Button
                   variant="ghost"
                   size="icon-sm"
