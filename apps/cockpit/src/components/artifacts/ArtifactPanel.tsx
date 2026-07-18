@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Download, Eye, FileText, Link2 } from "lucide-react";
 import { Badge, Button, SettingsCard } from "@ryuzi/ui";
 import { commands, type ArtifactFileInfo, type ArtifactInfo } from "@/bindings";
@@ -33,21 +33,32 @@ export function ArtifactPanel({ runnerId, sessionPk, refreshKey }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactInfo | null>(null);
 
-  const load = () =>
+  const load = useCallback(() => {
+    if (!commands.listSessionArtifacts) return;
     void commands.listSessionArtifacts(runnerId, sessionPk).then((result) => {
       if (result.status === "ok") {
         setItems(result.data);
         setError(null);
       } else setError(result.error.message);
     });
+  }, [runnerId, sessionPk]);
 
-  useEffect(load, [runnerId, sessionPk, refreshKey]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
-  const download = (artifact: ArtifactInfo) =>
+  useEffect(() => {
+    if (refreshKey === undefined) return;
+    load();
+  }, [load, refreshKey]);
+
+  const download = (artifact: ArtifactInfo) => {
+    if (!commands.fetchArtifact) return;
     void commands.fetchArtifact(runnerId, sessionPk, artifact.id).then((result) => {
       if (result.status === "ok") save(result.data);
       else setError(result.error.message);
     });
+  };
 
   return (
     <SettingsCard className="mx-4 mb-3 shrink-0 overflow-hidden">

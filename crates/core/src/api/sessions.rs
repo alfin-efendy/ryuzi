@@ -305,9 +305,8 @@ async fn archive_or_restore_session(
         .get_session(session_pk)
         .await?
         .ok_or_else(|| ApiError::not_found("session not found"))
-        .map(|session| {
+        .inspect(|_| {
             let _ = changed;
-            session
         })
 }
 

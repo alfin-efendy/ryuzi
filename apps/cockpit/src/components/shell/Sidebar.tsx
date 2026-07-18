@@ -307,7 +307,7 @@ export function Sidebar() {
       isActive: view.kind === "session" && isSession(s, focusedSession),
       isPinned: !!pinned[key],
       unread: isUnreadVisible(s, readAt, focusedSession),
-      isArchived: s.archivedAt !== null || !!archived[key],
+      isArchived: s.archivedAt != null || !!archived[key],
       hasTail: opts.hasTail,
       showGuide: opts.showGuide,
       archiveDisabled: archivingPk === s.sessionPk,
@@ -315,7 +315,7 @@ export function Sidebar() {
       onOpen: () => openSession(s),
       onTogglePin: () => togglePin(key),
       onToggleArchive: () => {
-        if (s.archivedAt !== null || archived[key]) {
+        if (s.archivedAt != null || archived[key]) {
           void commands.restoreSession(s.runnerId, s.sessionPk).then((result) => {
             if (result.status === "ok") setArchived(key, false);
           });

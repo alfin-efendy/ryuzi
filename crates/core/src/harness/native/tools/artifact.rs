@@ -5,12 +5,11 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-fn required<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolOutput> {
+fn required<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ToolOutput::error(format!("{key} is required")))
 }
 
 pub struct ReadArtifact;
@@ -43,8 +42,8 @@ impl Tool for ReadArtifact {
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
         let artifact_id = match required(&input, "artifactId") {
-            Ok(value) => value,
-            Err(out) => return Ok(out),
+            Some(value) => value,
+            None => return Ok(ToolOutput::error("artifactId is required")),
         };
         let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let length = input.get("length").and_then(Value::as_u64);
@@ -104,8 +103,8 @@ impl Tool for WriteArtifact {
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
         let name = match required(&input, "name") {
-            Ok(value) => value.to_string(),
-            Err(out) => return Ok(out),
+            Some(value) => value.to_string(),
+            None => return Ok(ToolOutput::error("name is required")),
         };
         let text = input.get("text").and_then(Value::as_str);
         let data_base64 = input.get("dataBase64").and_then(Value::as_str);
@@ -184,12 +183,12 @@ impl Tool for ShareArtifact {
     }
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> anyhow::Result<ToolOutput> {
         let artifact_id = match required(&input, "artifactId") {
-            Ok(value) => value,
-            Err(out) => return Ok(out),
+            Some(value) => value,
+            None => return Ok(ToolOutput::error("artifactId is required")),
         };
         let target = match required(&input, "targetSessionPk") {
-            Ok(value) => value,
-            Err(out) => return Ok(out),
+            Some(value) => value,
+            None => return Ok(ToolOutput::error("targetSessionPk is required")),
         };
         let actor = ctx
             .interaction

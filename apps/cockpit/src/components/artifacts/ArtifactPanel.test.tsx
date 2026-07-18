@@ -26,7 +26,7 @@ const fetchArtifact = mock(() =>
   Promise.resolve({ status: "ok" as const, data: { name: "report.md", contentType: "text/markdown", dataBase64: "aGVsbG8=" } }),
 );
 
-mock.module("@/bindings", () => ({ commands: { listSessionArtifacts, fetchArtifact } }));
+mock.module("@/bindings", () => ({ commands: { listSessionArtifacts, fetchArtifact }, events: {} }));
 const { ArtifactPanel } = await import("./ArtifactPanel");
 
 afterEach(() => {
