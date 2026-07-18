@@ -101,6 +101,22 @@ async endSession(runnerId: string | null, sessionPk: string) : Promise<Result<nu
     else return { status: "error", error: e  as any };
 }
 },
+async archiveSession(runnerId: string | null, sessionPk: string) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("archive_session", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async restoreSession(runnerId: string | null, sessionPk: string) : Promise<Result<Session, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restore_session", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async listToolPolicies(runnerId: string | null) : Promise<Result<ToolPolicyRow[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_tool_policies", { runnerId }) };

@@ -34,6 +34,8 @@ pub(crate) const HANDLES: &[&str] = &[
     "steer",
     "stop_session",
     "end_session",
+    "archive_session",
+    "restore_session",
     "list_messages",
     "stage_attachment",
     "attachments_root",
@@ -258,6 +260,14 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
             let a: SessionPkP = params(p)?;
             ok(cp.end_session(&a.session_pk).await?)
         }
+        "archive_session" => {
+            let a: SessionPkP = params(p)?;
+            ok(archive_or_restore_session(cp, &a.session_pk, true).await?)
+        }
+        "restore_session" => {
+            let a: SessionPkP = params(p)?;
+            ok(archive_or_restore_session(cp, &a.session_pk, false).await?)
+        }
         "list_messages" => {
             let a: SessionPkP = params(p)?;
             ok(cp.list_messages(&a.session_pk).await?)
@@ -279,6 +289,26 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
         }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
+}
+
+async fn archive_or_restore_session(
+    cp: &ControlPlane,
+    session_pk: &str,
+    archive: bool,
+) -> Result<Session, ApiError> {
+    let changed = if archive {
+        cp.archive_session(session_pk).await?
+    } else {
+        cp.restore_session(session_pk).await?
+    };
+    cp.store()
+        .get_session(session_pk)
+        .await?
+        .ok_or_else(|| ApiError::not_found("session not found"))
+        .map(|session| {
+            let _ = changed;
+            session
+        })
 }
 
 async fn attachment_refs_from_paths(paths: &[String]) -> Result<Vec<AttachmentRef>, ApiError> {

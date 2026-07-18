@@ -42,6 +42,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::steer_session,
             commands::stop_session,
             commands::end_session,
+            commands::archive_session,
+            commands::restore_session,
             commands::list_tool_policies,
             commands::delete_tool_policy,
             commands::resolve_approval,

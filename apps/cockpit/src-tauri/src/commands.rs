@@ -410,6 +410,38 @@ pub async fn end_session(
 
 #[tauri::command]
 #[specta::specta]
+pub async fn archive_session(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<Session> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "archive_session",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_session(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    session_pk: String,
+) -> R<Session> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "restore_session",
+            serde_json::json!({ "session_pk": session_pk }),
+        )
+        .await
+}
+
+#[tauri::command]
+#[specta::specta]
 pub async fn list_tool_policies(
     engine: Engine<'_>,
     runner_id: Option<String>,
