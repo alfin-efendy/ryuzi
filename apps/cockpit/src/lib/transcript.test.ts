@@ -11,6 +11,7 @@ import {
   messageToRow,
   partitionActivity,
   toolCardHeader,
+  toolCommand,
   toolInputSummary,
   turnDurationMs,
   type ActivityItem,
@@ -746,4 +747,12 @@ test("sub-agent tool rows carry their subagent label through to activity items",
 test("parent tool rows have no subagent label", () => {
   const r = messageToRow(6, "assistant", "tool_call", { name: "bash", input: {} }, "tc-2", "completed", "execute", null);
   expect(r.toolSubagent).toBeNull();
+});
+
+test("toolCommand extracts a shell command, else null", () => {
+  expect(toolCommand({ command: "npm run build" })).toBe("npm run build");
+  expect(toolCommand({ command: "  " })).toBeNull();
+  expect(toolCommand({ pattern: "x" })).toBeNull();
+  expect(toolCommand(null)).toBeNull();
+  expect(toolCommand("nope")).toBeNull();
 });

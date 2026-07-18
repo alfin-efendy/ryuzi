@@ -407,6 +407,13 @@ export function toolInputSummary(input: unknown, path: string | null): string | 
   return headerLine(JSON.stringify(i));
 }
 
+/** Raw shell command from a tool input, for rendering in the execute card's
+ *  BODY (kept out of the header). Null when the input carries no command. */
+export function toolCommand(input: unknown): string | null {
+  const i = (input && typeof input === "object" && !Array.isArray(input) ? input : {}) as Record<string, unknown>;
+  return typeof i.command === "string" && i.command.trim() ? i.command : null;
+}
+
 /**
  * Header parts for a tool card. `summary` display extras (todo/task/memory)
  * win over the derived input summary. ACP rows use the adapter's human title
