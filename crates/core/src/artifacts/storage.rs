@@ -39,6 +39,12 @@ pub enum ArtifactError {
     ArchivedSource,
     /// The artifact has been deleted and is no longer readable.
     Deleted,
+    /// The caller has no ownership or reference path to the requested artifact.
+    AccessDenied,
+    /// A caller or share target session is missing or archived.
+    InactiveSession,
+    /// The source payload was permanently deleted after retention.
+    SourceDeleted,
     /// The metadata insert failed and cleanup of the payload also failed.
     /// The payload is an actionable orphan for a later cleanup pass.
     MetadataInsertCleanupFailed,
@@ -64,6 +70,9 @@ impl std::fmt::Display for ArtifactError {
                 write!(f, "artifact's source session is archived")
             }
             Self::Deleted => write!(f, "artifact has been deleted"),
+            Self::AccessDenied => write!(f, "artifact access is denied"),
+            Self::InactiveSession => write!(f, "artifact session is inactive"),
+            Self::SourceDeleted => write!(f, "artifact source has been deleted"),
             Self::MetadataInsertCleanupFailed => write!(
                 f,
                 "artifact metadata insert failed and payload cleanup failed; orphan requires cleanup"

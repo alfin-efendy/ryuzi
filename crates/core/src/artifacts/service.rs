@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::artifacts::storage::{ArtifactError, ArtifactStorage};
-use crate::artifacts::types::{ArtifactCreator, ArtifactRecord, ArtifactStatus};
+use crate::artifacts::types::{
+    ArtifactAccessRow, ArtifactCreator, ArtifactRecord, ArtifactReference, ArtifactStatus,
+};
 use crate::paths::{new_id, now_ms};
 use crate::store::Store;
 
@@ -279,6 +281,140 @@ impl ArtifactService {
             total_bytes: range.total_bytes,
             truncated: range.truncated,
         })
+    }
+
+    pub async fn share(
+        &self,
+        caller_session_pk: &str,
+        artifact_or_reference_id: &str,
+        target_session_pk: &str,
+        actor: Option<&str>,
+    ) -> Result<ArtifactReference, ArtifactError> {
+        self.active_session(caller_session_pk).await?;
+        self.active_session(target_session_pk).await?;
+        let access = self
+            .store
+            .reference_for_session(artifact_or_reference_id, caller_session_pk)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+            .ok_or(ArtifactError::AccessDenied)?;
+        match access.artifact.status {
+            ArtifactStatus::Available => {}
+            ArtifactStatus::SourceArchived => return Err(ArtifactError::ArchivedSource),
+            ArtifactStatus::Deleted => return Err(ArtifactError::Deleted),
+        }
+        self.active_session(&access.artifact.source_session_pk)
+            .await?;
+
+        if let Some(existing) = self
+            .store
+            .find_artifact_reference(&access.artifact.id, target_session_pk)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+        {
+            return Ok(existing);
+        }
+
+        let reference = ArtifactReference {
+            id: new_id(),
+            artifact_id: access.artifact.id,
+            target_session_pk: target_session_pk.to_string(),
+            shared_from_session_pk: caller_session_pk.to_string(),
+            shared_by: actor.map(str::to_string),
+            parent_reference_id: access.reference.map(|reference| reference.id),
+            created_at: now_ms(),
+        };
+        if self
+            .store
+            .insert_artifact_reference(&reference)
+            .await
+            .is_ok()
+        {
+            return Ok(reference);
+        }
+        self.store
+            .find_artifact_reference(&reference.artifact_id, target_session_pk)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+            .ok_or(ArtifactError::StorageFailure)
+    }
+
+    pub async fn resolve_agent_access(
+        &self,
+        session_pk: &str,
+        artifact_or_reference_id: &str,
+    ) -> Result<ArtifactAccessRow, ArtifactError> {
+        self.active_session(session_pk).await?;
+        let access = self
+            .store
+            .reference_for_session(artifact_or_reference_id, session_pk)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+            .ok_or(ArtifactError::AccessDenied)?;
+        match access.artifact.status {
+            ArtifactStatus::Available => {}
+            ArtifactStatus::SourceArchived => return Err(ArtifactError::ArchivedSource),
+            ArtifactStatus::Deleted => return Err(ArtifactError::SourceDeleted),
+        }
+        self.active_session(&access.artifact.source_session_pk)
+            .await
+            .map_err(|error| match error {
+                ArtifactError::InactiveSession => ArtifactError::ArchivedSource,
+                other => other,
+            })?;
+        Ok(access)
+    }
+
+    pub async fn purge_expired_archives(
+        &self,
+        now_ms: i64,
+        retention_days: i64,
+    ) -> Result<usize, ArtifactError> {
+        let sessions = self
+            .store
+            .archived_sessions_past_retention(now_ms, retention_days)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?;
+        let mut purged = 0;
+        for session_pk in sessions {
+            let artifacts = self
+                .store
+                .list_source_artifacts(&session_pk)
+                .await
+                .map_err(|_| ArtifactError::StorageFailure)?;
+            for artifact in artifacts
+                .iter()
+                .filter(|artifact| artifact.status != ArtifactStatus::Deleted)
+            {
+                self.storage.delete(&artifact.storage_key).await?;
+            }
+            self.store
+                .mark_source_artifacts_deleted(&session_pk, now_ms)
+                .await
+                .map_err(|_| ArtifactError::StorageFailure)?;
+            if self
+                .store
+                .delete_session_after_artifact_purge(&session_pk)
+                .await
+                .map_err(|_| ArtifactError::StorageFailure)?
+            {
+                purged += 1;
+            }
+        }
+        Ok(purged)
+    }
+
+    async fn active_session(&self, session_pk: &str) -> Result<(), ArtifactError> {
+        let session = self
+            .store
+            .get_session(session_pk)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+            .ok_or(ArtifactError::InactiveSession)?;
+        if session.archived_at.is_some() {
+            return Err(ArtifactError::InactiveSession);
+        }
+        Ok(())
     }
 
     /// Reads `id`'s payload on an agent's behalf: unlike [`Self::read_range`],
@@ -632,6 +768,72 @@ mod tests {
             svc.create_artifact(base_input(b"hello")).await.unwrap_err(),
             ArtifactError::ArchivedSource
         );
+    }
+
+    fn session_with_id(id: &str) -> crate::domain::Session {
+        let mut session = sample_session();
+        session.session_pk = id.to_string();
+        session
+    }
+
+    #[tokio::test]
+    async fn share_is_idempotent_and_preserves_reference_chain() {
+        let (_dir, store, svc) = service(default_config()).await;
+        for id in ["sess-1", "sess-2", "sess-3"] {
+            store.insert_session(session_with_id(id)).await.unwrap();
+        }
+        let artifact = svc.create_artifact(base_input(b"hello")).await.unwrap();
+        let first = svc
+            .share("sess-1", &artifact.id, "sess-2", Some("ada"))
+            .await
+            .unwrap();
+        let duplicate = svc
+            .share("sess-1", &artifact.id, "sess-2", Some("ada"))
+            .await
+            .unwrap();
+        assert_eq!(first, duplicate);
+        let second = svc
+            .share("sess-2", &first.id, "sess-3", Some("bea"))
+            .await
+            .unwrap();
+        assert_eq!(second.artifact_id, artifact.id);
+        assert_eq!(second.shared_from_session_pk, "sess-2");
+        assert_eq!(second.parent_reference_id, Some(first.id));
+        assert!(svc.resolve_agent_access("sess-3", &second.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_denies_references_and_retention_deletes_source_payload() {
+        let (dir, store, svc) = service(default_config()).await;
+        for id in ["sess-1", "sess-2"] {
+            store.insert_session(session_with_id(id)).await.unwrap();
+        }
+        let artifact = svc.create_artifact(base_input(b"hello")).await.unwrap();
+        let reference = svc
+            .share("sess-1", &artifact.id, "sess-2", None)
+            .await
+            .unwrap();
+        assert!(store.archive_session("sess-1", 1_000).await.unwrap());
+        assert_eq!(
+            svc.resolve_agent_access("sess-2", &reference.id)
+                .await
+                .unwrap_err(),
+            ArtifactError::ArchivedSource
+        );
+        assert!(store.restore_session("sess-1").await.unwrap());
+        assert!(svc
+            .resolve_agent_access("sess-2", &reference.id)
+            .await
+            .is_ok());
+        assert!(store.archive_session("sess-1", 1_000).await.unwrap());
+
+        assert_eq!(svc.purge_expired_archives(1_000, 0).await.unwrap(), 1);
+        assert!(!dir.path().join(&artifact.storage_key).exists());
+        assert!(store.get_session("sess-1").await.unwrap().is_none());
+        let listed = store.artifacts_for_session("sess-2").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].artifact.status, ArtifactStatus::Deleted);
+        assert_eq!(svc.purge_expired_archives(1_000, 0).await.unwrap(), 0);
     }
 
     #[tokio::test]
