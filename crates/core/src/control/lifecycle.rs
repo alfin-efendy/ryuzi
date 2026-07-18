@@ -78,9 +78,11 @@ async fn validate_executable_primary(
             .into_iter()
             .map(|issue| issue.message),
         );
-        let details_suffix = (!details.is_empty())
-            .then(|| format!(": {}", details.join("; ")))
-            .unwrap_or_default();
+        let details_suffix = if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", details.join("; "))
+        };
         anyhow::bail!(
             "primary agent `{}` is not executable{}",
             agent.profile.id,

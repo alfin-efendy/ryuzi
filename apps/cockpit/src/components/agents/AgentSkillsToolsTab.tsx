@@ -112,12 +112,14 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
     return (
       <SettingsCard>
         <div className="px-[18px] py-4 text-xs text-muted-foreground" role={catalogError ? "alert" : undefined}>
-          {catalogLoading ? "Loading skills and tools…" : catalogError ? `Couldn't load skills and tools: ${catalogError}` : "Loading skills and tools…"}
+          {catalogLoading
+            ? "Loading skills and tools…"
+            : catalogError
+              ? `Couldn't load skills and tools: ${catalogError}`
+              : "Loading skills and tools…"}
         </div>
         <div className="flex justify-end border-t border-border px-[18px] py-3">
-          <Button disabled>
-            Save skills and tools
-          </Button>
+          <Button disabled>Save skills and tools</Button>
         </div>
       </SettingsCard>
     );
@@ -125,14 +127,7 @@ export function AgentSkillsToolsTab({ detail }: { detail: AgentDetailInfo }) {
 
   return (
     <div className="flex flex-col gap-3">
-      <CatalogIdGroup
-        title="Skills"
-        singular="skill"
-        values={skills}
-        catalog={catalog?.skills}
-        saving={saving}
-        onChange={setSkills}
-      />
+      <CatalogIdGroup title="Skills" singular="skill" values={skills} catalog={catalog?.skills} saving={saving} onChange={setSkills} />
       <CatalogIdGroup
         title="Native tools"
         singular="native tool"

@@ -18,7 +18,15 @@ const getAgent = mock(async (_runner: string | null, id: string) => ({
   data: detail({ summary: { ...detail().summary, id, name: id === "ryuzi" ? "Ryuzi" : "Reviewer", isDefault: id === "ryuzi" } }),
 }));
 const agentConfigurationCatalog: AgentConfigurationCatalogInfo = {
-  skills: [{ id: "requesting-code-review", label: "Requesting code review", description: "Review guidance", available: true, commandScoped: false }],
+  skills: [
+    {
+      id: "requesting-code-review",
+      label: "Requesting code review",
+      description: "Review guidance",
+      available: true,
+      commandScoped: false,
+    },
+  ],
   nativeTools: [
     { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false },
     { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false },
@@ -343,13 +351,7 @@ test("permission rules keep unknown stable tool IDs unavailable until removed", 
   await waitFor(() => expect(screen.queryByText("Unavailable")).toBeNull());
   expect(screen.getByRole("button", { name: "Save permissions" }).hasAttribute("disabled")).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Save permissions" }));
-  await waitFor(() =>
-    expect(updateAgent).toHaveBeenCalledWith(
-      LOCAL_RUNNER,
-      "reviewer",
-      expect.objectContaining({ permissionRules: [] }),
-    ),
-  );
+  await waitFor(() => expect(updateAgent).toHaveBeenCalledWith(LOCAL_RUNNER, "reviewer", expect.objectContaining({ permissionRules: [] })));
 });
 
 test("model transitions preserve supported effort, clear unsupported effort, and save a complete mutation", async () => {

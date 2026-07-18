@@ -173,6 +173,7 @@ test("create modal sends the complete initial mutation and opens the new detail"
       description: "Designs system boundaries.",
       avatarColor: "violet",
       model: route("free"),
+      personality: { preset: "helpful", custom: null },
       permissionMode: "ask",
       permissionRules: [],
       skills: [],

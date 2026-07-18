@@ -7,8 +7,20 @@ const getAgentConfigurationCatalog = mock(async () => ({
   status: "ok" as const,
   data: {
     skills: [
-      { id: "requesting-code-review", label: "Requesting code review", description: "Review guidance", available: true, commandScoped: false },
-      { id: "systematic-debugging", label: "Systematic debugging", description: "Debugging guidance", available: true, commandScoped: false },
+      {
+        id: "requesting-code-review",
+        label: "Requesting code review",
+        description: "Review guidance",
+        available: true,
+        commandScoped: false,
+      },
+      {
+        id: "systematic-debugging",
+        label: "Systematic debugging",
+        description: "Debugging guidance",
+        available: true,
+        commandScoped: false,
+      },
       { id: "another-skill", label: "Another skill", description: "Another skill", available: true, commandScoped: false },
     ],
     nativeTools: [
@@ -103,12 +115,15 @@ test("capability selections save a complete mutation with catalog IDs", async ()
   await choose("App catalog", "GitHub");
   fireEvent.click(screen.getByRole("button", { name: "Save skills and tools" }));
 
-  expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({
-    skills: ["requesting-code-review", "systematic-debugging"],
-    nativeTools: ["read", "grep", "bash", "glob"],
-    pluginTools: ["github"],
-    apps: ["github"],
-  }));
+  expect(updateAgent).toHaveBeenCalledWith(
+    "reviewer",
+    expect.objectContaining({
+      skills: ["requesting-code-review", "systematic-debugging"],
+      nativeTools: ["read", "grep", "bash", "glob"],
+      pluginTools: ["github"],
+      apps: ["github"],
+    }),
+  );
 });
 
 test("catalog options exclude selected IDs and removals are explicit", async () => {
@@ -124,11 +139,7 @@ test("catalog options exclude selected IDs and removals are explicit", async () 
 });
 
 test("an unavailable saved native tool remains visible and disables Save", async () => {
-  render(
-    <AgentSkillsToolsTab
-      detail={{ ...reviewerDetail, nativeTools: ["read", "retired-native-tool"] }}
-    />,
-  );
+  render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, nativeTools: ["read", "retired-native-tool"] }} />);
 
   await waitFor(() => expect(screen.getByText("retired-native-tool")).toBeTruthy());
   expect(screen.getByText("Unavailable")).toBeTruthy();

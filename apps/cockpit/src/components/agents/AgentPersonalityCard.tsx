@@ -1,5 +1,14 @@
 import { useEffect, useState } from "react";
-import { Button, Combobox, type ComboboxGroup, type ComboboxOption, SettingsCard, SettingsCardRow, SettingsCardTitle, Textarea } from "@ryuzi/ui";
+import {
+  Button,
+  Combobox,
+  type ComboboxGroup,
+  type ComboboxOption,
+  SettingsCard,
+  SettingsCardRow,
+  SettingsCardTitle,
+  Textarea,
+} from "@ryuzi/ui";
 import type { AgentDetailInfo, AgentPersonalityInfo } from "@/bindings";
 import { useAgents } from "@/store-agents";
 import { mutationFromDetail } from "./agentMutation";
@@ -8,15 +17,31 @@ import { mutationFromDetail } from "./agentMutation";
 // and baked-in prompt text: a closed set of professional + expressive
 // presets, plus `custom` for free-form user text.
 const PROFESSIONAL_PRESETS: ComboboxOption[] = [
-  { value: "helpful", label: "Helpful", description: "You are a helpful, direct assistant. Prioritize clarity, accuracy, and being genuinely useful." },
-  { value: "concise", label: "Concise", description: "You are concise. Prefer short, information-dense answers over padding or repetition." },
+  {
+    value: "helpful",
+    label: "Helpful",
+    description: "You are a helpful, direct assistant. Prioritize clarity, accuracy, and being genuinely useful.",
+  },
+  {
+    value: "concise",
+    label: "Concise",
+    description: "You are concise. Prefer short, information-dense answers over padding or repetition.",
+  },
   {
     value: "technical",
     label: "Technical",
     description: "You are a technical expert. Use precise terminology, cite specifics, and favor rigor over hand-waving.",
   },
-  { value: "creative", label: "Creative", description: "You are imaginative and expressive. Bring fresh framing, vivid language, and original ideas." },
-  { value: "teacher", label: "Teacher", description: "You are a patient teacher. Explain reasoning step by step and check for understanding." },
+  {
+    value: "creative",
+    label: "Creative",
+    description: "You are imaginative and expressive. Bring fresh framing, vivid language, and original ideas.",
+  },
+  {
+    value: "teacher",
+    label: "Teacher",
+    description: "You are a patient teacher. Explain reasoning step by step and check for understanding.",
+  },
   {
     value: "philosopher",
     label: "Philosopher",
@@ -33,15 +58,25 @@ const EXPRESSIVE_PRESETS: ComboboxOption[] = [
   {
     value: "catgirl",
     label: "Catgirl",
-    description: "You are a playful catgirl persona: energetic, affectionate, and sprinkled with cat-like flourishes, while staying helpful.",
+    description:
+      "You are a playful catgirl persona: energetic, affectionate, and sprinkled with cat-like flourishes, while staying helpful.",
   },
-  { value: "pirate", label: "Pirate", description: "You are a swashbuckling pirate. Speak with pirate slang and flair while staying helpful and accurate." },
+  {
+    value: "pirate",
+    label: "Pirate",
+    description: "You are a swashbuckling pirate. Speak with pirate slang and flair while staying helpful and accurate.",
+  },
   {
     value: "shakespeare",
     label: "Shakespeare",
-    description: "You speak in the style of Shakespearean English: archaic diction and dramatic flourish, while staying helpful and accurate.",
+    description:
+      "You speak in the style of Shakespearean English: archaic diction and dramatic flourish, while staying helpful and accurate.",
   },
-  { value: "surfer", label: "Surfer", description: "You are a laid-back surfer. Speak casually and chill, while staying helpful and accurate." },
+  {
+    value: "surfer",
+    label: "Surfer",
+    description: "You are a laid-back surfer. Speak casually and chill, while staying helpful and accurate.",
+  },
   {
     value: "noir",
     label: "Noir",

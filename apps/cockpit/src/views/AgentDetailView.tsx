@@ -113,7 +113,9 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
             <div className="grid grid-cols-3 gap-3">
               <SettingsCard className="px-[18px] py-4">
                 <span className="block text-[11px] text-muted-foreground">Knowledge</span>
-                <strong className="mt-1 block text-[13px]">{metric(summary.knowledgeCount, "readable concept", "readable concepts")}</strong>
+                <strong className="mt-1 block text-[13px]">
+                  {metric(summary.knowledgeCount, "readable concept", "readable concepts")}
+                </strong>
               </SettingsCard>
               <SettingsCard className="px-[18px] py-4">
                 <span className="block text-[11px] text-muted-foreground">Skills</span>

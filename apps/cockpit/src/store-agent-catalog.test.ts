@@ -7,7 +7,9 @@ const catalog: AgentConfigurationCatalogInfo = {
   pluginTools: [],
   apps: [],
 };
-const getAgentConfigurationCatalog = mock(async (): Promise<Result<AgentConfigurationCatalogInfo, CmdError>> => ({ status: "ok", data: catalog }));
+const getAgentConfigurationCatalog = mock(
+  async (): Promise<Result<AgentConfigurationCatalogInfo, CmdError>> => ({ status: "ok", data: catalog }),
+);
 mock.module("./bindings", () => ({ commands: { getAgentConfigurationCatalog } }));
 
 const { useAgentConfigurationCatalog } = await import("./store-agent-catalog");

@@ -363,6 +363,7 @@ export const RYUZI_DETAIL = {
   maxTurns: 40,
   maxToolRounds: 12,
   modelInfo: null,
+  personality: { preset: "helpful", custom: null },
 } satisfies AgentDetailInfo;
 
 export const REVIEWER_DETAIL = {
@@ -375,6 +376,7 @@ export const REVIEWER_DETAIL = {
   maxTurns: 40,
   maxToolRounds: 12,
   modelInfo: null,
+  personality: { preset: "helpful", custom: null },
 } satisfies AgentDetailInfo;
 
 /** `get_agent` is dispatched dynamically by `agentId` (see installMockIPC's

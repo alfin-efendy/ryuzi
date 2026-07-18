@@ -58,12 +58,7 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
 
   const hasInvalidRule = rules.some((rule) => {
     const entry = entryById.get(rule.tool);
-    return (
-      rule.tool.trim() === "" ||
-      catalog === null ||
-      entry === undefined ||
-      duplicateKeys.has(ruleKey(rule))
-    );
+    return rule.tool.trim() === "" || catalog === null || entry === undefined || duplicateKeys.has(ruleKey(rule));
   });
 
   return (
@@ -110,9 +105,7 @@ export function AgentPermissionsTab({ detail }: { detail: AgentDetailInfo }) {
                 description: tool.description || tool.id,
                 mono: true,
               })),
-              ...(unavailable
-                ? [{ value: rule.tool, label: "Unavailable", description: rule.tool, mono: true, invalid: true }]
-                : []),
+              ...(unavailable ? [{ value: rule.tool, label: "Unavailable", description: rule.tool, mono: true, invalid: true }] : []),
             ];
 
             return (
