@@ -55,6 +55,8 @@ pub const FALLBACK: ModelMeta = ModelMeta {
 };
 
 impl ModelMeta {
+    /// Input token budget: the context window minus reserved output headroom,
+    /// floored at half the window. See [`OUTPUT_RESERVE_CAP`].
     pub fn usable_window(&self) -> u64 {
         let reserved = self.max_output_tokens.min(OUTPUT_RESERVE_CAP);
         self.context_window

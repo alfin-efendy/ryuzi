@@ -1291,8 +1291,8 @@ async fn drive(
                                     "notice",
                                     json!({ "text": format!(
                                         "Compaction failed and history exceeds the context \
-                                         window ({e}). Session stopped — start a new session \
-                                         or reduce input."
+                                         window ({e}). Session stopped — send another message \
+                                         to retry, or start a new session."
                                     ) }),
                                     None,
                                     None,
