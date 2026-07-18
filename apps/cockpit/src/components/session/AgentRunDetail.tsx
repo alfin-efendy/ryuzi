@@ -1,6 +1,7 @@
 import { ArrowLeft, Bot, Copy, RotateCw, Square, Waypoints } from "lucide-react";
 import type { AgentRun } from "@/bindings";
 import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
+import { useNow } from "@/hooks/useNow";
 import { messageToRow } from "@/lib/transcript";
 import { useDelegation, delegationRunKey } from "@/store-delegation";
 import { Transcript } from "@/components/transcript/Transcript";
@@ -41,7 +42,8 @@ export function AgentRunDetail({
     ),
   );
   const active = activeStatuses.has(run.status);
-  const duration = formatAgentRunDuration(run);
+  const now = useNow(active);
+  const duration = formatAgentRunDuration(run, now);
   const status = agentRunStatusPresentation(run.status);
 
   return (
