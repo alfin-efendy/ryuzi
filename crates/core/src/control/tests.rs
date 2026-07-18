@@ -3430,6 +3430,61 @@ async fn continue_cold_resumes_when_handle_absent() {
 
 #[tokio::test]
 #[serial]
+async fn continue_promotes_the_session_to_running() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    // Blocking harness: a turn stays in-flight until cancelled, so we can
+    // observe the session's status while a turn is running.
+    let cp = test_control_plane(store, registries_with(true, counters.clone())).await;
+    let store = cp.store().clone();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    // Start a session; its first (blocking) turn parks a live handle.
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    let handle = wait_for_running_handle(&cp, &session.session_pk).await;
+
+    // Settle the first turn back to Idle (cancel → send_prompt returns Ok →
+    // the completion arm demotes Running→Idle), then drop the live handle so
+    // the continue takes the cold-resume path onto a fresh, uncancelled handle.
+    handle.cancel().await.unwrap();
+    let mut s = store.get_session(&session.session_pk).await.unwrap().unwrap();
+    for _ in 0..400 {
+        if s.status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s = store.get_session(&session.session_pk).await.unwrap().unwrap();
+    }
+    assert_eq!(s.status, SessionStatus::Idle, "first turn must settle to Idle");
+    cp.running.lock().unwrap().remove(&session.session_pk);
+
+    // Continue: the promotion is synchronous, and the fresh turn blocks — so
+    // the session is observably Running once continue_session returns.
+    cp.continue_session(&session.session_pk, "second", &[])
+        .await
+        .unwrap();
+    let status = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    assert_eq!(
+        status,
+        SessionStatus::Running,
+        "continue must reserve the session as Running for the turn"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn steer_session_reaches_the_live_handle_without_starting_a_new_turn() {
     let _guard = StateDirGuard::new();
     let db = tempfile::NamedTempFile::new().unwrap();

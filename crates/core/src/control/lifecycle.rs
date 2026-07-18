@@ -764,6 +764,14 @@ impl ControlPlane {
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown session: {session_pk}"))?;
 
+        // Reserve the session as Running for the lifetime of this turn so the
+        // sidebar spinner shows and the composer offers Stop. Atomic Idle→Running
+        // only (mirrors `claim_next_session_prompt_if_idle`), so a concurrent stop
+        // (Interrupted) is never clobbered. The cold-resume failure branch below
+        // rolls this back via `demote_if_running`, and the normal turn end demotes
+        // it in `spawn_prompt`.
+        let _ = self.store.promote_if_idle(session_pk, now_ms()).await;
+
         let primary_config = primary_turn.config()?;
         let run_id = primary_turn.run_id.clone();
 
