@@ -2380,6 +2380,7 @@ async fn run_tool_call(
         work_dir: deps.work_dir.clone(),
         attachments_dir: deps.attachments_dir.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
+        artifacts: deps.artifacts.clone(),
         store: deps.store.clone(),
         cancel: cancel.clone(),
         caps: OutputCaps::default(),

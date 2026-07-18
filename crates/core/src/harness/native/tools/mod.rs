@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod app_jobs;
 pub mod app_projects;
+pub mod artifact;
 pub mod bash;
 pub mod clarify;
 pub mod delegate;
@@ -330,6 +331,7 @@ pub struct ToolCtx {
     /// `crate::plugins::PluginHost::enabled_skill_dirs`), consulted by the
     /// `skill` tool alongside `work_dir`'s own skill dirs.
     pub extra_skill_dirs: Vec<PathBuf>,
+    pub artifacts: Arc<crate::artifacts::ArtifactService>,
     pub store: Arc<Store>,
     pub cancel: CancellationToken,
     pub caps: OutputCaps,
@@ -462,6 +464,9 @@ impl ToolRegistry {
     pub fn builtin() -> Self {
         let list: Vec<Arc<dyn Tool>> = vec![
             Arc::new(read::Read),
+            Arc::new(artifact::ReadArtifact),
+            Arc::new(artifact::WriteArtifact),
+            Arc::new(artifact::ShareArtifact),
             Arc::new(ls::Ls),
             Arc::new(write::Write),
             Arc::new(edit::Edit),
@@ -658,12 +663,23 @@ pub(crate) mod testutil {
     pub async fn ctx_at(dir: &Path) -> ToolCtx {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let storage = crate::artifacts::ArtifactStorage::new(dir.join("artifacts"));
+        let artifacts = Arc::new(crate::artifacts::ArtifactService::new(
+            store.clone(),
+            storage,
+            crate::artifacts::ArtifactConfig {
+                max_bytes: 26_214_400,
+                session_max_bytes: 262_144_000,
+                read_max_bytes: 50_000,
+            },
+        ));
         ToolCtx {
             session_pk: "test-session".into(),
             run_id: "test-run".into(),
             work_dir: dir.to_path_buf(),
             attachments_dir: None,
             extra_skill_dirs: vec![],
+            artifacts,
             store,
             cancel: CancellationToken::new(),
             caps: OutputCaps::default(),
