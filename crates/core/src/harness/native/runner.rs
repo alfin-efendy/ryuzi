@@ -1276,15 +1276,43 @@ async fn drive(
                 {
                     Ok(outcome) => emit_compaction(deps, trigger, &outcome, display.text()).await,
                     Err(e) => {
-                        tracing::warn!("native: compaction failed, continuing uncompacted: {e}");
+                        tracing::warn!("native: compaction failed: {e}");
+                        let st = cm.status();
+                        if st.active_tokens >= st.usable_window {
+                            // History still exceeds the hard window and
+                            // compaction could not reduce it. Sending the next
+                            // request would deterministically overflow and loop
+                            // ("send another message" -> overflow -> repeat).
+                            // Stop the turn cleanly with a terminal notice.
+                            if display.text() {
+                                emit_row(
+                                    deps,
+                                    "system",
+                                    "notice",
+                                    json!({ "text": format!(
+                                        "Compaction failed and history exceeds the context \
+                                         window ({e}). Session stopped — send another message \
+                                         to retry, or start a new session."
+                                    ) }),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            }
+                            return Ok(final_text);
+                        }
+                        // Below the hard ceiling (e.g. a transient failure while
+                        // only at the proactive threshold): keep the existing
+                        // best-effort behavior and continue with full history.
                         if display.text() {
                             emit_row(
                                 deps,
                                 "system",
                                 "notice",
                                 json!({ "text": format!(
-                                "Compaction failed ({e}); continuing with full history."
-                            ) }),
+                                    "Compaction failed ({e}); continuing with full history."
+                                ) }),
                                 None,
                                 None,
                                 None,
@@ -6822,7 +6850,7 @@ mod tests {
 
     fn tiny_meta() -> crate::llm_router::model_meta::ModelMeta {
         crate::llm_router::model_meta::ModelMeta {
-            context_window: 400, // tiny: threshold 360, usable 380
+            context_window: 400, // tiny: reserve floors usable to 200, threshold 180
             max_output_tokens: 8_192,
             supports_prompt_cache: false,
             supports_reasoning: false,
@@ -7301,6 +7329,56 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.block_type == "text" && m.payload["text"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_over_hard_limit_stops_instead_of_looping() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 overflows -> mark_full persists the full-window total.
+        let overflow = vec![error_event(
+            "prompt is too long: 500000 tokens > 400000 maximum",
+        )];
+        // Turn 2's pre-turn compaction summarize call fails with a NON-overflow
+        // error, so compact() returns Err immediately (no drop-oldest retry).
+        let summarize_fails = vec![error_event("upstream 503 service unavailable")];
+        // Only two scripted turns: if the fix is absent, drive would "continue
+        // with full history" and request a THIRD (unscripted) turn, erroring.
+        let llm = Arc::new(ScriptedLlm::new(vec![overflow, summarize_fails]));
+        let deps = deps_at(dir.path(), llm).await;
+
+        // Turn 1: overflow surfaces as an error and seeds the full-window total.
+        let err = run_turn(&deps, TurnPrompt::text("x", "x"), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("context"));
+
+        // Turn 2: compaction fails; history is still over the hard window, so
+        // drive must STOP cleanly (Ok) with a terminal notice — not loop.
+        run_turn(
+            &deps,
+            TurnPrompt::text("next", "next"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("failed compaction over the hard limit must stop cleanly, not error/loop");
+
+        assert!(
+            deps.store
+                .latest_context_checkpoint("s1")
+                .await
+                .unwrap()
+                .is_none(),
+            "compaction failed, so no checkpoint was written"
+        );
+        let msgs = deps.store.list_messages("s1").await.unwrap();
+        assert!(
+            msgs.iter().any(|m| m.block_type == "notice"
+                && m.payload["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Session stopped")),
+            "a terminal 'Session stopped' notice must be emitted"
+        );
     }
 
     #[tokio::test]

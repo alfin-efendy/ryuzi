@@ -474,7 +474,10 @@ mod tests {
         cm.observe_message_start(&json!({"usage":{"input_tokens":89_000}}));
         cm.observe_message_delta(2_000, None, None, None);
         cm.commit_response();
-        assert!(cm.status().needs_compaction, "91k >= 90% of 100k");
+        assert!(
+            cm.status().needs_compaction,
+            "91k exceeds the calibrated limit (82,627 = 90% of usable 91,808)"
+        );
         cm.mark_full();
         assert_eq!(cm.status().percent_left, 0);
     }
@@ -495,7 +498,10 @@ mod tests {
         // A seed above the current estimate (the overflow-resume case) wins.
         cm.seed_active_tokens(90_000);
         assert_eq!(cm.status().active_tokens, 90_000);
-        assert!(cm.status().needs_compaction, "90k >= 90% of 100k");
+        assert!(
+            cm.status().needs_compaction,
+            "90k exceeds the calibrated limit (82,627 = 90% of usable 91,808)"
+        );
     }
 
     #[tokio::test]
