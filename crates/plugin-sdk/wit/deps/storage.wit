@@ -1,0 +1,18 @@
+package ryuzi:storage@0.1.0;
+
+interface storage {
+  record stored-value {
+    key: string,
+    value: list<u8>,
+  }
+
+  variant storage-error {
+    not-found,
+    denied,
+    failed(string),
+  }
+
+  get: func(key: string) -> result<stored-value, storage-error>;
+  put: func(value: stored-value) -> result<stored-value, storage-error>;
+  delete: func(key: string) -> result<bool, storage-error>;
+}

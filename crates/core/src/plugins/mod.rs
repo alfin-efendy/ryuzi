@@ -30,6 +30,7 @@ pub mod host;
 pub mod oauth;
 pub mod providers;
 pub mod remote_catalog;
+pub mod wit;
 
 use crate::settings::{csv, SettingsStore};
 use crate::store::Store;

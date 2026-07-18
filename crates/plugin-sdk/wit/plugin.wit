@@ -1,0 +1,42 @@
+package ryuzi:plugin@0.1.0;
+
+interface types {
+  variant plugin-error {
+    invalid(string),
+    unavailable,
+    failed(string),
+  }
+
+  record health-status {
+    healthy: bool,
+    message: string,
+  }
+
+  record lifecycle-state {
+    initialized: bool,
+    version: string,
+  }
+}
+
+interface lifecycle {
+  use types.{health-status, lifecycle-state, plugin-error};
+
+  init: func() -> result<lifecycle-state, plugin-error>;
+  health: func() -> result<health-status, plugin-error>;
+  migrate: func(from-version: string) -> result<lifecycle-state, plugin-error>;
+  shutdown: func() -> result<lifecycle-state, plugin-error>;
+}
+
+world plugin {
+  import host: ryuzi:host/host@0.1.0;
+  import settings: ryuzi:settings/settings@0.1.0;
+  import storage: ryuzi:storage/storage@0.1.0;
+  import http: ryuzi:http/http@0.1.0;
+  import oauth: ryuzi:oauth/oauth@0.1.0;
+
+  export lifecycle;
+  export ryuzi:gateway/gateway@0.1.0;
+  export ryuzi:connector/connector@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+  export ryuzi:hooks/hooks@0.1.0;
+}

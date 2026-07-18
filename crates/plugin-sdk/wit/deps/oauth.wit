@@ -1,0 +1,33 @@
+package ryuzi:oauth@0.1.0;
+
+interface oauth {
+  record authorization-request {
+    provider: string,
+    scopes: list<string>,
+    redirect-uri: string,
+    state: string,
+  }
+
+  record authorization {
+    url: string,
+    state: string,
+  }
+
+  record token {
+    access-token: string,
+    token-type: string,
+    refresh-token: option<string>,
+    expires-in: option<u64>,
+  }
+
+  variant oauth-error {
+    invalid-request(string),
+    denied,
+    expired,
+    failed(string),
+  }
+
+  authorize: func(request: authorization-request) -> result<authorization, oauth-error>;
+  exchange: func(code: string, verifier: string) -> result<token, oauth-error>;
+  refresh: func(refresh-token: string) -> result<token, oauth-error>;
+}

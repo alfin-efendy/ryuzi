@@ -1,0 +1,48 @@
+package ryuzi:connector@0.1.0;
+
+interface connector {
+  record tool-parameter {
+    name: string,
+    value-type: string,
+    required: bool,
+  }
+
+  record tool-definition {
+    name: string,
+    description: string,
+    parameters: list<tool-parameter>,
+  }
+
+  variant tool-value {
+    text(string),
+    integer(s64),
+    decimal(f64),
+    boolean(bool),
+  }
+
+  record tool-argument {
+    name: string,
+    value: tool-value,
+  }
+
+  record tool-call {
+    call-id: string,
+    name: string,
+    arguments: list<tool-argument>,
+  }
+
+  record tool-result {
+    call-id: string,
+    values: list<tool-value>,
+  }
+
+  variant connector-error {
+    not-found,
+    invalid-call(string),
+    unavailable,
+    failed(string),
+  }
+
+  list-tools: func() -> result<list<tool-definition>, connector-error>;
+  invoke: func(call: tool-call) -> result<tool-result, connector-error>;
+}

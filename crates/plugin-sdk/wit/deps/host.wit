@@ -1,0 +1,23 @@
+package ryuzi:host@0.1.0;
+
+interface host {
+  record plugin-info {
+    id: string,
+    version: string,
+  }
+
+  record host-capabilities {
+    network: bool,
+    filesystem: bool,
+    secrets: bool,
+  }
+
+  variant host-error {
+    unavailable,
+    denied,
+    failed(string),
+  }
+
+  get-plugin-info: func() -> result<plugin-info, host-error>;
+  capabilities: func() -> result<host-capabilities, host-error>;
+}
