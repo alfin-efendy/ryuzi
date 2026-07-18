@@ -176,6 +176,8 @@ type NavState = {
   openAgentChat: (agentId: string) => void;
   /** Return the pending primary agent id and clear it (one-shot handoff). */
   consumePendingPrimaryAgentId: () => string | null;
+  /** Set the pending primary agent without navigating (Home composer's agent picker). */
+  setPendingPrimaryAgent: (agentId: string) => void;
 };
 
 export const useNav = create<NavState>((set, get) => ({
@@ -262,4 +264,5 @@ export const useNav = create<NavState>((set, get) => ({
     if (id !== null) set({ pendingPrimaryAgentId: null });
     return id;
   },
+  setPendingPrimaryAgent: (agentId) => set({ pendingPrimaryAgentId: agentId }),
 }));
