@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.7.0](https://github.com/alfin-efendy/ryuzi/compare/v0.6.0...v0.7.0) (2026-07-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* replace the CLI product with the headless runner (Phase 1 of remote-runner) ([#111](https://github.com/alfin-efendy/ryuzi/issues/111))
+
+### Features
+
+* add agentic session ownership and delegation ([#133](https://github.com/alfin-efendy/ryuzi/issues/133)) ([435c935](https://github.com/alfin-efendy/ryuzi/commit/435c935d9149f1ff19b956f9c1ac1968ead8802a))
+* **core:** add provider-agnostic native tools v2 ([e27c7b9](https://github.com/alfin-efendy/ryuzi/commit/e27c7b927c33b9452c467701a0fb67d082e4c63b))
+* **core:** remote plugin catalog — signed feed, version-gated override, blocked denylist ([#113](https://github.com/alfin-efendy/ryuzi/issues/113)) ([7535362](https://github.com/alfin-efendy/ryuzi/commit/7535362b430fed728d3731f2e22309dddec5cbda))
+* enhance agent management and per-agent learning ([#122](https://github.com/alfin-efendy/ryuzi/issues/122)) ([b128241](https://github.com/alfin-efendy/ryuzi/commit/b12824165a82e8ffb8dc062d1e972b9d9e6c6fbb))
+* plugin extension surface (Track C) + extension runtime / code plugins (Track D) ([#116](https://github.com/alfin-efendy/ryuzi/issues/116)) ([8d90c8b](https://github.com/alfin-efendy/ryuzi/commit/8d90c8b47e38f3138fe0d7ea52acd154228d5485))
+* remote runner — TLS pairing, Cockpit multi-runner, remote UX (Phases 2–4) ([#117](https://github.com/alfin-efendy/ryuzi/issues/117)) ([e59a2e7](https://github.com/alfin-efendy/ryuzi/commit/e59a2e73fe0d642cfa1bd4a3bf61fa242339c8bb))
+* replace the CLI product with the headless runner (Phase 1 of remote-runner) ([#111](https://github.com/alfin-efendy/ryuzi/issues/111)) ([d100b78](https://github.com/alfin-efendy/ryuzi/commit/d100b785e0a7749f1f0cefcf7cf677bbc4839c83))
+
+
+### Bug Fixes
+
+* **daemon:** ensure state directory creation for fresh installs to prevent NotFound errors ([364f6b9](https://github.com/alfin-efendy/ryuzi/commit/364f6b9767490d7a7b94fe65c5173f110b038ed9))
+* durable session queue and Cockpit session UX ([#128](https://github.com/alfin-efendy/ryuzi/issues/128)) ([0670146](https://github.com/alfin-efendy/ryuzi/commit/06701468b1634697b59fdb4ac3d41b3addd25b2f))
+
 ## [Unreleased]
 
 

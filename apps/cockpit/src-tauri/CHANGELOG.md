@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.4.0](https://github.com/alfin-efendy/ryuzi/compare/cockpit-v0.3.0...cockpit-v0.4.0) (2026-07-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cockpit:** remove legacy agent controls
+* replace the CLI product with the headless runner (Phase 1 of remote-runner) ([#111](https://github.com/alfin-efendy/ryuzi/issues/111))
+* native-only — remove the runtime concept ([#105](https://github.com/alfin-efendy/ryuzi/issues/105))
+
+### Features
+
+* add agentic session ownership and delegation ([#133](https://github.com/alfin-efendy/ryuzi/issues/133)) ([435c935](https://github.com/alfin-efendy/ryuzi/commit/435c935d9149f1ff19b956f9c1ac1968ead8802a))
+* add session task artifacts ([3aa8b8f](https://github.com/alfin-efendy/ryuzi/commit/3aa8b8f49a192ca82d0a0431732c1c8d51d3a5ff))
+* **agents:** add structured agent profiles ([03fc660](https://github.com/alfin-efendy/ryuzi/commit/03fc660f27e2fa783258ca164f5fd477d74fc870))
+* **agents:** add structured agent profiles ([57a3976](https://github.com/alfin-efendy/ryuzi/commit/57a397615504a9557c9b1735ffddd0effdd0aef7))
+* **automations:** add Automations hub with Scheduler, Hooks, and Commands tabs ([#131](https://github.com/alfin-efendy/ryuzi/issues/131)) ([b4d0f50](https://github.com/alfin-efendy/ryuzi/commit/b4d0f50f5bc71496cd95439cdcbb84169a8ce72a))
+* **cockpit:** add install/uninstall/list installed-provider Tauri commands ([2e83939](https://github.com/alfin-efendy/ryuzi/commit/2e83939b20e68b34eae4312a5b6cf13ef6ef99a3))
+* **cockpit:** chat & UI enhancement batch ([#95](https://github.com/alfin-efendy/ryuzi/issues/95)) ([510572b](https://github.com/alfin-efendy/ryuzi/commit/510572ba17e93e3b37c90ead3edaeb026b1c8a54))
+* **cockpit:** chat enhancement batch 3 — floating plan panel, auto-continue, per-session permissions, attachment fixes, scroll polish ([#100](https://github.com/alfin-efendy/ryuzi/issues/100)) ([ab18930](https://github.com/alfin-efendy/ryuzi/commit/ab18930dc408e1040f1eaacca069a06397cffe58))
+* **cockpit:** custom-provider RPCs and Tauri commands ([4129676](https://github.com/alfin-efendy/ryuzi/commit/412967684a19a4cc49a299780719e753c2331a09))
+* **cockpit:** enhance model and account management ([#110](https://github.com/alfin-efendy/ryuzi/issues/110)) ([54c19dd](https://github.com/alfin-efendy/ryuzi/commit/54c19dd6de8af839913e8df972e30caaa771cc1f))
+* **cockpit:** expose artifact commands ([93ae657](https://github.com/alfin-efendy/ryuzi/commit/93ae6570385678698b000f405344d4906a318a6f))
+* **cockpit:** expose rooted child run events ([f38d237](https://github.com/alfin-efendy/ryuzi/commit/f38d237d55a96e785d6eb5adbb65a15c82e8e93e))
+* **cockpit:** persist session archive state ([8f435a5](https://github.com/alfin-efendy/ryuzi/commit/8f435a5633c2a60040dc5d468ca7a5e10eb636d1))
+* **cockpit:** Phase 4 session mgmt — notifications, message queue, pin-reorder, sub-agent roster ([#103](https://github.com/alfin-efendy/ryuzi/issues/103)) ([06b3246](https://github.com/alfin-efendy/ryuzi/commit/06b32462b63b63cfc9bafc03a4a3b8fca9d9eb68))
+* **cockpit:** plugin install wizard — seamless OAuth (RFC 8414 + DCR + loopback callback), registry removal, provenance-gated skill packs ([#92](https://github.com/alfin-efendy/ryuzi/issues/92)) ([c2396c2](https://github.com/alfin-efendy/ryuzi/commit/c2396c2a0ae6ce541a933d830ab08d4433c2b993))
+* **cockpit:** render linked agent dispatch cards ([ec6dfe6](https://github.com/alfin-efendy/ryuzi/commit/ec6dfe60291ccda2611d8a9d2154502a02a11e5d))
+* **cockpit:** return typed workspace search entries ([9c9445e](https://github.com/alfin-efendy/ryuzi/commit/9c9445e1467e250b5016b17617eae7d6e57853dc))
+* **cockpit:** unified plugins catalog — two-tab Installed | Browse with providers, Discord & skills ([#96](https://github.com/alfin-efendy/ryuzi/issues/96)) ([a140c2d](https://github.com/alfin-efendy/ryuzi/commit/a140c2d048f24e0312c2453325a4b0db2b689fee))
+* **cockpit:** unify at-command context picker ([08968c3](https://github.com/alfin-efendy/ryuzi/commit/08968c38568534e058f580c3297018950a1a612c))
+* configure route target effort ([#127](https://github.com/alfin-efendy/ryuzi/issues/127)) ([8835e89](https://github.com/alfin-efendy/ryuzi/commit/8835e89df81a1ee8d1eb9a98ebb3237fdb87c838))
+* **core+cockpit:** Phase 1 — daemon as single engine host + control API, Cockpit thin client ([#98](https://github.com/alfin-efendy/ryuzi/issues/98)) ([d82b7e4](https://github.com/alfin-efendy/ryuzi/commit/d82b7e425e735749c810dfa694cf41ad5712ba6d))
+* **core:** remote plugin catalog — signed feed, version-gated override, blocked denylist ([#113](https://github.com/alfin-efendy/ryuzi/issues/113)) ([7535362](https://github.com/alfin-efendy/ryuzi/commit/7535362b430fed728d3731f2e22309dddec5cbda))
+* enhance agent management and per-agent learning ([#122](https://github.com/alfin-efendy/ryuzi/issues/122)) ([b128241](https://github.com/alfin-efendy/ryuzi/commit/b12824165a82e8ffb8dc062d1e972b9d9e6c6fbb))
+* Hermes-parity Phases 4–6 — self-learning, group-chat orchestration, app-control ([#119](https://github.com/alfin-efendy/ryuzi/issues/119)) ([84b503f](https://github.com/alfin-efendy/ryuzi/commit/84b503f067f2874cfcfc9d7cef8c551cd5dfe18d))
+* **models:** free-first Models overhaul — install gating, subscriptions, custom providers, usage-chart fix ([b9a0910](https://github.com/alfin-efendy/ryuzi/commit/b9a0910078b38fa9fd531eaff8e230657673242b))
+* multi-mode approvals, don't-ask-again scopes, and cross-session Inbox ([#94](https://github.com/alfin-efendy/ryuzi/issues/94)) ([18e4c92](https://github.com/alfin-efendy/ryuzi/commit/18e4c924db58fa992169df2640e7b48178d0877e))
+* native-only — remove the runtime concept ([#105](https://github.com/alfin-efendy/ryuzi/issues/105)) ([2e83415](https://github.com/alfin-efendy/ryuzi/commit/2e834152a6050cac1b49753928642c998ac8cbe4))
+* plugin distribution hardening (install ledger, atomic install, trust gate, doctor) ([#104](https://github.com/alfin-efendy/ryuzi/issues/104)) ([566ece6](https://github.com/alfin-efendy/ryuzi/commit/566ece63efa69512bdd551e03bfed30b447a3e17))
+* plugin extension surface (Track C) + extension runtime / code plugins (Track D) ([#116](https://github.com/alfin-efendy/ryuzi/issues/116)) ([8d90c8b](https://github.com/alfin-efendy/ryuzi/commit/8d90c8b47e38f3138fe0d7ea52acd154228d5485))
+* remote runner — TLS pairing, Cockpit multi-runner, remote UX (Phases 2–4) ([#117](https://github.com/alfin-efendy/ryuzi/issues/117)) ([e59a2e7](https://github.com/alfin-efendy/ryuzi/commit/e59a2e73fe0d642cfa1bd4a3bf61fa242339c8bb))
+* replace the CLI product with the headless runner (Phase 1 of remote-runner) ([#111](https://github.com/alfin-efendy/ryuzi/issues/111)) ([d100b78](https://github.com/alfin-efendy/ryuzi/commit/d100b785e0a7749f1f0cefcf7cf677bbc4839c83))
+
+
+### Bug Fixes
+
+* **daemon:** ensure state directory creation for fresh installs to prevent NotFound errors ([364f6b9](https://github.com/alfin-efendy/ryuzi/commit/364f6b9767490d7a7b94fe65c5173f110b038ed9))
+* durable session queue and Cockpit session UX ([#128](https://github.com/alfin-efendy/ryuzi/issues/128)) ([0670146](https://github.com/alfin-efendy/ryuzi/commit/06701468b1634697b59fdb4ac3d41b3addd25b2f))
+* **models:** probe unification (Kiro/MiMo/OpenAI), hide-invalid in all pickers, shared ModelPicker ([#86](https://github.com/alfin-efendy/ryuzi/issues/86)) ([05ac5d5](https://github.com/alfin-efendy/ryuzi/commit/05ac5d5fae8902ffa8d56b1f5337b168ec12be05))
+
+
+### Code Refactoring
+
+* **cockpit:** remove legacy agent controls ([f523591](https://github.com/alfin-efendy/ryuzi/commit/f523591b2403327539a965ee5c35daab296337de))
+
 ## [Unreleased]
 
 
