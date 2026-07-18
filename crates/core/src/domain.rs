@@ -355,6 +355,9 @@ pub struct AgentRun {
     pub resolved_effort: Option<String>,
     pub result: Option<String>,
     pub error: Option<String>,
+    pub context_active_tokens: Option<u64>,
+    pub context_usable_window: Option<u64>,
+    pub context_percent_left: Option<u8>,
 }
 
 /// The session's primary run, if it has one, plus its sorted child runs.

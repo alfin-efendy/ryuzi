@@ -587,7 +587,7 @@ fn migrations() -> Migrations<'static> {
         // branch name was engine-generated, so teardown may delete it.
         // Hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the column (e.g. the
-        // rewind-and-replay in `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_43_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1082,7 +1082,7 @@ fn migrations() -> Migrations<'static> {
         // root's accumulated steer note. All additive columns — plain ALTERs,
         // hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so replaying
         // this migration on a DB that already has the columns (e.g. the
-        // rewind-and-replay in `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
+        // rewind-and-replay in `migrations_13_to_43_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error. The orch_tasks block is also
         // guarded on the table's existence because migration 39 removes it.
@@ -1145,7 +1145,7 @@ fn migrations() -> Migrations<'static> {
         // ALTERs, hook-guarded (SQLite has no ADD COLUMN IF NOT EXISTS) so
         // replaying this migration on a DB that already has the columns
         // (e.g. the rewind-and-replay in
-        // `migrations_13_to_42_replay_is_idempotent_and_converges_native_only`,
+        // `migrations_13_to_43_replay_is_idempotent_and_converges_native_only`,
         // which re-runs every migration appended after 13) is a no-op
         // instead of a "duplicate column" error.
         M::up_with_hook("", |tx: &rusqlite::Transaction| {
@@ -1453,6 +1453,28 @@ fn migrations() -> Migrations<'static> {
                      SELECT session_pk, 'v1', COALESCE(created_at, 0) FROM sessions",
                     [],
                 )?;
+            }
+            Ok(())
+        }),
+        // 43: per-child-run context-window snapshot, so a sub-agent's context
+        // ring reflects its own ephemeral usage (live event + this durable
+        // fallback). Guards keep the migration convergent for the replay test
+        // and already-migrated databases.
+        M::up_with_hook("", |tx: &rusqlite::Transaction<'_>| {
+            for column in [
+                "context_active_tokens",
+                "context_usable_window",
+                "context_percent_left",
+            ] {
+                let exists = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('agent_runs') WHERE name=?1")?
+                    .exists([column])?;
+                if !exists {
+                    tx.execute(
+                        &format!("ALTER TABLE agent_runs ADD COLUMN {column} INTEGER"),
+                        [],
+                    )?;
+                }
             }
             Ok(())
         }),
@@ -4974,6 +4996,32 @@ impl Store {
         .await
     }
 
+    /// Snapshot a child run's ephemeral context usage onto its row. Used only
+    /// by the run-scoped emit path — never touches session cost/context.
+    pub async fn update_agent_run_context_usage(
+        &self,
+        run_id: &str,
+        active_tokens: u64,
+        usable_window: u64,
+        percent_left: u8,
+    ) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE agent_runs SET context_active_tokens=?1, context_usable_window=?2, \
+                 context_percent_left=?3 WHERE run_id=?4",
+                params![
+                    active_tokens as i64,
+                    usable_window as i64,
+                    percent_left as i64,
+                    run_id
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn interrupt_incomplete_agent_runs(
         &self,
         reason: &str,
@@ -5064,7 +5112,7 @@ impl Store {
 }
 
 const AGENT_RUN_COLS: &str =
-    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error";
+    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error,context_active_tokens,context_usable_window,context_percent_left";
 
 fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
     let tool_count: i64 = r.get(14)?;
@@ -5088,6 +5136,9 @@ fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
         resolved_effort: r.get(16)?,
         result: r.get(17)?,
         error: r.get(18)?,
+        context_active_tokens: r.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+        context_usable_window: r.get::<_, Option<i64>>(20)?.map(|v| v as u64),
+        context_percent_left: r.get::<_, Option<i64>>(21)?.map(|v| v as u8),
     })
 }
 
@@ -5474,7 +5525,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -5723,7 +5774,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
         assert!(columns.iter().any(|column| column == "source_tool_call_id"));
         assert!(columns.iter().any(|column| column == "dispatch_index"));
         assert!(has_dispatch_index);
@@ -5790,7 +5841,7 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
 
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
@@ -5798,7 +5849,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 42);
+        assert_eq!(reopened_version, 43);
     }
 
     #[tokio::test]
@@ -5819,7 +5870,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -5863,7 +5914,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 42);
+        assert_eq!(user_version, 43);
     }
 
     #[tokio::test]
@@ -7752,7 +7803,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 42, "forward migration must land at v42");
+        assert_eq!(user_version, 43, "forward migration must land at v43");
     }
 
     #[tokio::test]
@@ -8143,6 +8194,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_run_context_usage_round_trips_on_the_row() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO sessions(session_pk,status,perm_mode,kind,branch_owned,resume_attempts) \
+                     VALUES ('s1','idle','default','chat',0,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let run = store
+            .insert_primary_agent_run(NewAgentRun {
+                run_id: "r1".into(),
+                session_pk: "s1".into(),
+                parent_run_id: None,
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: "lead".into(),
+                executing_agent_id: Some("lead".into()),
+                executing_agent_name_snapshot: "Lead".into(),
+                agent_kind: AgentRunKind::Primary,
+                task: "root".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(run.context_percent_left, None);
+
+        store
+            .update_agent_run_context_usage("r1", 4_000, 120_000, 60)
+            .await
+            .unwrap();
+
+        let reloaded = store.get_agent_run("r1").await.unwrap().unwrap();
+        assert_eq!(reloaded.context_active_tokens, Some(4_000));
+        assert_eq!(reloaded.context_usable_window, Some(120_000));
+        assert_eq!(reloaded.context_percent_left, Some(60));
+    }
+
+    #[tokio::test]
     async fn retry_requires_inherited_dispatch_linkage_and_rejects_branches() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
@@ -8360,7 +8458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_42_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_43_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -8386,26 +8484,26 @@ mod tests {
         // attempts; 37 session_automation_origins plus compatibility queue
         // repair; 38 session ownership and agent runs; 39 agentic cleanup;
         // 40 durable dispatch linkage; 41 scoped tool-call ownership; 42
-        // immutable native tool versions/plans plus history convergence — all
-        // convergent,
+        // immutable native tool versions/plans plus history convergence; 43
+        // per-run context-window snapshot columns — all convergent,
         // existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 42
-        // defined, wind back thirty.
+        // this test starts failing its assertions). With migrations through 43
+        // defined, wind back thirty-one.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 30)
+            c.pragma_update(None, "user_version", v - 31)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v42 here, so `harness` was
+                    // The DB is fully migrated to v43 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -8456,8 +8554,8 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
-        // 22–42) replay against it. Back TWENTY-TWO: the fully migrated tail
-        // is now v42, so rewinding to v20 is what makes
+        // 22–43) replay against it. Back TWENTY-THREE: the fully migrated tail
+        // is now v43, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
@@ -8466,7 +8564,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 22)
+            c.pragma_update(None, "user_version", v - 23)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -8599,7 +8697,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 42, "forward migration must land at v42");
+        assert_eq!(uv, 43, "forward migration must land at v43");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -8625,7 +8723,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 42, "forward migration must land at v42");
+        assert_eq!(uv, 43, "forward migration must land at v43");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
