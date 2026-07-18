@@ -2190,10 +2190,13 @@ impl ControlPlane {
             .filter(|run| run.parent_run_id.is_none() && run.status.is_active())
             .collect::<Vec<_>>();
         for root in roots {
-            let _ = self
+            if let Err(error) = self
                 .delegation
                 .cancel_descendants_of_root(session_pk, &root.run_id)
-                .await;
+                .await
+            {
+                tracing::warn!(%error, run_id = %root.run_id, "stop_session: failed to cancel descendants");
+            }
             let _ = self
                 .delegation
                 .interrupt(&root.run_id, "session stopped")
