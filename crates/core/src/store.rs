@@ -5173,6 +5173,89 @@ impl Store {
         .await
     }
 
+    pub async fn find_artifact_reference(
+        &self,
+        artifact_id: &str,
+        target_session_pk: &str,
+    ) -> anyhow::Result<Option<ArtifactReference>> {
+        let artifact_id = artifact_id.to_string();
+        let target_session_pk = target_session_pk.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT id,artifact_id,target_session_pk,shared_from_session_pk,shared_by,parent_reference_id,created_at \
+                 FROM artifact_references WHERE artifact_id=?1 AND target_session_pk=?2",
+                params![artifact_id, target_session_pk],
+                |r| {
+                    Ok(ArtifactReference {
+                        id: r.get(0)?,
+                        artifact_id: r.get(1)?,
+                        target_session_pk: r.get(2)?,
+                        shared_from_session_pk: r.get(3)?,
+                        shared_by: r.get(4)?,
+                        parent_reference_id: r.get(5)?,
+                        created_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn list_source_artifacts(
+        &self,
+        source_session_pk: &str,
+    ) -> anyhow::Result<Vec<ArtifactRecord>> {
+        let source_session_pk = source_session_pk.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {ARTIFACT_COLS} FROM artifacts WHERE source_session_pk=?1 ORDER BY created_at,id"
+            ))?;
+            let rows = stmt
+                .query_map(params![source_session_pk], row_to_artifact)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn archived_sessions_past_retention(
+        &self,
+        now_ms: i64,
+        retention_days: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let retention_ms = retention_days.max(0).saturating_mul(86_400_000);
+        let cutoff = now_ms.saturating_sub(retention_ms);
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT session_pk FROM sessions \
+                 WHERE archived_at IS NOT NULL AND archived_at <= ?1 ORDER BY archived_at,session_pk",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn delete_session_after_artifact_purge(
+        &self,
+        session_pk: &str,
+    ) -> anyhow::Result<bool> {
+        let session_pk = session_pk.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM sessions WHERE session_pk=?1 AND NOT EXISTS (\
+                   SELECT 1 FROM artifacts WHERE source_session_pk=?1 AND status <> 'deleted'\
+                 )",
+                params![session_pk],
+            )
+            .map(|count| count == 1)
+        })
+        .await
+    }
+
     /// Mark every non-deleted artifact originated by `source_session_pk` as
     /// deleted, stamping `deleted_at`, and return the updated rows. Intended
     /// for use when a session (and thus its content root) is destroyed.
@@ -9979,6 +10062,56 @@ mod tests {
 
         let err = store.session_archived_at("missing").await.unwrap_err();
         assert_eq!(err.to_string(), "unknown session");
+    }
+
+    #[tokio::test]
+    async fn artifact_retention_queries_find_references_sources_and_only_purged_sessions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let source = sample_session();
+        let mut target = sample_session();
+        target.session_pk = "s2".into();
+        store.insert_session(source).await.unwrap();
+        store.insert_session(target).await.unwrap();
+        store
+            .insert_artifact(&sample_artifact("art-1", "s1", ArtifactStatus::Available))
+            .await
+            .unwrap();
+        let reference = sample_reference("ref-1", "art-1", "s2", "s1");
+        store.insert_artifact_reference(&reference).await.unwrap();
+
+        assert_eq!(
+            store.find_artifact_reference("art-1", "s2").await.unwrap(),
+            Some(reference)
+        );
+        assert_eq!(store.list_source_artifacts("s1").await.unwrap().len(), 1);
+
+        assert!(store.archive_session("s1", 1_000).await.unwrap());
+        assert_eq!(
+            store
+                .archived_sessions_past_retention(1_000 + 86_400_000, 1)
+                .await
+                .unwrap(),
+            vec!["s1"]
+        );
+        assert!(!store
+            .delete_session_after_artifact_purge("s1")
+            .await
+            .unwrap());
+        store
+            .mark_source_artifacts_deleted("s1", 2_000)
+            .await
+            .unwrap();
+        assert!(store
+            .delete_session_after_artifact_purge("s1")
+            .await
+            .unwrap());
+        assert!(store.get_session("s1").await.unwrap().is_none());
+        assert!(store
+            .find_artifact_reference("art-1", "s2")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
