@@ -30,6 +30,9 @@ function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Pa
     resolvedEffort: "high",
     result: null,
     error: null,
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }

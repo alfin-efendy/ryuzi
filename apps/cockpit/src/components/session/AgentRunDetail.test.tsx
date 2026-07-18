@@ -9,6 +9,7 @@ mock.module("@/bindings", () => ({ commands: { cancelChildRun, retryChildRun, ge
 
 import { useDelegation, delegationRunKey, delegationSessionKey } from "@/store-delegation";
 import { useStore } from "@/store";
+import { sessKey } from "@/lib/session-key";
 
 const { AgentRunDetail } = await import("./AgentRunDetail");
 
@@ -33,6 +34,9 @@ function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Pa
     resolvedEffort: "high",
     result: "Final findings",
     error: "tool failed",
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }
@@ -261,4 +265,45 @@ test("active runs expose Stop while failed runs expose Retry", () => {
 
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
   expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+});
+
+test("ring reflects the run's own context usage, not the session's", () => {
+  useStore.setState({
+    contextUsage: {
+      [sessKey("local", "s1")]: {
+        activeTokens: 9,
+        usableWindow: 10,
+        percentLeft: 5,
+        contextWindow: 10,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        outputTokens: 0,
+      },
+    },
+    runContextUsage: { [delegationRunKey("local", "s1", "run-1")]: { activeTokens: 4000, usableWindow: 120000, percentLeft: 60 } },
+  });
+  render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
+  // Ring shows USED = 100 - percentLeft. Run usage (60 left → 40% used), never the session's (5 left → 95%).
+  expect(screen.getByText("40%")).toBeTruthy();
+  expect(screen.queryByText("95%")).toBeNull();
+  expect(screen.getByTitle(/Sub-agent context/)).toBeTruthy();
+});
+
+test("ring falls back to the persisted row usage when there is no live event", () => {
+  useStore.setState({ contextUsage: {}, runContextUsage: {} });
+  render(
+    <AgentRunDetail
+      runnerId="local"
+      sessionPk="s1"
+      run={run({ contextActiveTokens: 7000, contextUsableWindow: 100000, contextPercentLeft: 70 })}
+      onRelatedChanges={() => {}}
+    />,
+  );
+  expect(screen.getByText("30%")).toBeTruthy();
+});
+
+test("ring is hidden when the run has no usage yet", () => {
+  useStore.setState({ contextUsage: {}, runContextUsage: {} });
+  render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run({ contextPercentLeft: null })} onRelatedChanges={() => {}} />);
+  expect(screen.queryByTitle(/Sub-agent context/)).toBeNull();
 });

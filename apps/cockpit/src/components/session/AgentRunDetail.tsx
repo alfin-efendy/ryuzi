@@ -8,7 +8,6 @@ import { Transcript } from "@/components/transcript/Transcript";
 import { Markdown } from "@/components/transcript/Markdown";
 import { ContextRing } from "./ContextRing";
 import { useStore } from "@/store";
-import { sessKey } from "@/lib/session-key";
 import { Button } from "@ryuzi/ui";
 
 const activeStatuses = new Set(["queued", "running"]);
@@ -55,7 +54,16 @@ export function AgentRunDetail({
   );
   const active = activeStatuses.has(run.status);
   const status = agentRunStatusPresentation(run.status);
-  const usage = useStore((s) => s.contextUsage[sessKey(runnerId, sessionPk)]);
+  const live = useStore((s) => s.runContextUsage[delegationRunKey(runnerId, sessionPk, run.runId)]);
+  const usage =
+    live ??
+    (run.contextPercentLeft != null
+      ? {
+          activeTokens: run.contextActiveTokens ?? 0,
+          usableWindow: run.contextUsableWindow ?? 0,
+          percentLeft: run.contextPercentLeft,
+        }
+      : undefined);
 
   return (
     <div className="min-h-0 flex flex-1 flex-col">
@@ -85,7 +93,7 @@ export function AgentRunDetail({
           {usage && (
             <span
               className="inline-flex items-center"
-              title={`Session context: ~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
+              title={`Sub-agent context: ~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
             >
               <ContextRing percentLeft={usage.percentLeft} />
             </span>
