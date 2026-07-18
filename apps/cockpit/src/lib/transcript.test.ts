@@ -6,6 +6,7 @@ import {
   formatToolDuration,
   formatTurnDuration,
   groupRows,
+  liveTurnStartMs,
   mergeToolRow,
   messageToRow,
   partitionActivity,
@@ -310,7 +311,34 @@ test("completed turn collapses thought+activity into one summary, text stays vis
   expect(blocks.map((b) => b.type)).toEqual(["user", "summary", "agent"]);
   const summary = blocks[1] as Extract<(typeof blocks)[number], { type: "summary" }>;
   expect(summary.groups.map((g) => g.type)).toEqual(["thought", "activity"]);
-  expect(summary.durationMs).toBe(36000);
+  expect(summary.durationMs).toBe(35000);
+});
+
+test("summaries in one turn get their own per-segment durations", () => {
+  const rows: Row[] = [
+    row({ seq: 1, role: "user", blockType: "text", text: "go", createdAt: 1000 }),
+    row({ seq: 2, blockType: "tool_call", toolCallId: "a", toolName: "read", toolKind: "read", toolStatus: "completed", createdAt: 2000 }),
+    row({ seq: 3, role: "assistant", blockType: "text", text: "mid", createdAt: 5000 }),
+    row({ seq: 4, blockType: "tool_call", toolCallId: "b", toolName: "edit", toolKind: "edit", toolStatus: "completed", createdAt: 9000 }),
+    row({ seq: 5, role: "assistant", blockType: "text", text: "end", createdAt: 14000 }),
+  ];
+  const blocks = buildTranscript(rows, false);
+  expect(blocks.map((b) => b.type)).toEqual(["user", "summary", "agent", "summary", "agent"]);
+  const sums = blocks.filter((b) => b.type === "summary") as Extract<TurnBlock, { type: "summary" }>[];
+  // seg 1: read@2000 → agent "mid"@5000 = 3000; seg 2: edit@9000 → agent "end"@14000 = 5000
+  expect(sums.map((s) => s.durationMs)).toEqual([3000, 5000]);
+});
+
+test("liveTurnStartMs returns the last user row's createdAt", () => {
+  expect(
+    liveTurnStartMs([
+      row({ seq: 1, role: "user", blockType: "text", text: "a", createdAt: 100 }),
+      row({ seq: 2, role: "assistant", blockType: "text", text: "x", createdAt: 200 }),
+      row({ seq: 3, role: "user", blockType: "text", text: "b", createdAt: 300 }),
+      row({ seq: 4, blockType: "tool_call", toolCallId: "t", toolName: "read", toolStatus: "in_progress", createdAt: 400 }),
+    ]),
+  ).toBe(300);
+  expect(liveTurnStartMs([])).toBeNull();
 });
 
 test("completed turns retain dispatch activity outside collapsed ordinary work", () => {

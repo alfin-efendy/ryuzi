@@ -365,6 +365,17 @@ export function turnDurationMs(turnRows: Row[]): number | null {
   return start !== null && end !== null && end >= start ? end - start : null;
 }
 
+/** Start time of the in-progress turn — the last user row's createdAt, since a
+ *  live turn begins at the user's message. Null when unknown (no timestamped
+ *  user row yet). Drives the live "Working…" elapsed counter. */
+export function liveTurnStartMs(rows: Row[]): number | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i]!;
+    if (r.role === "user" && r.createdAt !== null) return r.createdAt;
+  }
+  return null;
+}
+
 /** "36s" under a minute, then "3m 59s". Null → "". */
 export function formatTurnDuration(ms: number | null): string {
   if (ms === null) return "";
@@ -475,6 +486,18 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
     // Absolute row offset keeps transient (seq 0) fallback keys globally unique
     // even though each turn slice is grouped independently.
     const groups = splitDispatchActivity(groupRows(turnRows, rowOffset));
+    // Recover each group's start time: a group's key IS its first row's key
+    // (`s{seq}` or `i{index+offset}`), so map that key back to the row's
+    // createdAt. Lets a collapsed segment be timed by its OWN span instead of
+    // borrowing the whole turn's duration (which made every summary in a turn
+    // read identically). Uses the same key scheme as groupRows/keyOf, and the
+    // pre-increment rowOffset so the indices line up.
+    const startByKey = new Map<string, number | null>();
+    turnRows.forEach((r, i) => {
+      const k = r.seq > 0 ? `s${r.seq}` : `i${i + rowOffset}`;
+      if (!startByKey.has(k)) startByKey.set(k, r.createdAt);
+    });
+    const turnEndAt = turnRows[turnRows.length - 1]?.createdAt ?? null;
     rowOffset += turnRows.length;
     const live = running && t === turns.length - 1;
     if (live) {
@@ -484,14 +507,19 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
     const agentGroups = groups.filter((g) => g.type === "agent");
     const lastAgent = agentGroups[agentGroups.length - 1];
     let collapsible: Group[] = [];
-    const flushCollapsible = () => {
+    // A segment runs from its first collapsed group's start to wherever the
+    // next visible block begins (the breaking group), or the turn's last row
+    // for the trailing segment.
+    const flushCollapsible = (endAt: number | null) => {
       if (collapsible.length === 0) return;
       const first = collapsible[0]!;
+      const startAt = startByKey.get(first.key) ?? null;
+      const durationMs = startAt !== null && endAt !== null && endAt >= startAt ? endAt - startAt : null;
       out.push({
         type: "summary",
         key: `sum-${first.key}`,
         groups: collapsible,
-        durationMs: turnDurationMs(turnRows),
+        durationMs,
         editCards: editCardsForGroups(collapsible),
       });
       collapsible = [];
@@ -501,14 +529,14 @@ export function buildTranscript(rows: Row[], running: boolean): TurnBlock[] {
         collapsible.push(g);
         continue;
       }
-      flushCollapsible();
+      flushCollapsible(startByKey.get(g.key) ?? null);
       if (g === lastAgent && g.type === "agent") {
         out.push({ ...g, turnEnd: true });
       } else {
         out.push(g);
       }
     }
-    flushCollapsible();
+    flushCollapsible(turnEndAt);
   });
   return out;
 }
