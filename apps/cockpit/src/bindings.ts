@@ -170,6 +170,22 @@ async fetchAttachment(runnerId: string | null, rel: string) : Promise<Result<Med
     else return { status: "error", error: e  as any };
 }
 },
+async listSessionArtifacts(runnerId: string | null, sessionPk: string) : Promise<Result<ArtifactInfo[], CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_session_artifacts", { runnerId, sessionPk }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async fetchArtifact(runnerId: string | null, sessionPk: string, artifactId: string) : Promise<Result<ArtifactFileInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_artifact", { runnerId, sessionPk, artifactId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async pickDirectory() : Promise<string | null> {
     return await TAURI_INVOKE("pick_directory");
 },
@@ -1875,6 +1891,14 @@ export type ApprovalScope =
  * Persisted to the project's `tool_policies` row.
  */
 "project"
+export type ArtifactFileInfo = { name: string; contentType: string | null; dataBase64: string }
+/**
+ * One row of a session's artifact listing (`artifacts_api::list_session_artifacts`):
+ * either an artifact the session originated (`reference_id` and its sibling
+ * reference fields are `None`) or one shared into the session via a
+ * reference (all three are `Some`).
+ */
+export type ArtifactInfo = { id: string; sourceSessionPk: string; referenceId: string | null; sharedFromSessionPk: string | null; parentReferenceId: string | null; status: string; name: string; contentType: string | null; sizeBytes: number; creator: string; createdAt: number; sha256: string }
 /**
  * One app-control audit entry, surfaced in Cockpit's Settings → Audit feed.
  */
@@ -1950,7 +1974,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
 /**
  * A durable transcript row owned by a non-primary agent run.
  */
@@ -2160,7 +2184,12 @@ export type MediaFile = { dataBase64: string; contentType: string | null }
 /**
  * A persisted transcript entry, one row per native-runtime event block.
  */
-export type Message = { sessionPk: string; seq: number; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
+export type Message = { sessionPk: string; seq: number;
+/**
+ * The durable agent-run owner when this row was emitted by a run. Rows
+ * created outside a run (for example startup notices) remain unowned.
+ */
+runId: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
  * Legacy group-chat attribution retained so existing databases and event
  * payloads remain readable. New message constructors leave it unset.
@@ -2449,7 +2478,7 @@ agent: string | null;
 /**
  * The session this one was spawned from (`Worker`/`Review` lineage).
  */
-parentSessionPk: string | null }
+parentSessionPk: string | null; archivedAt: number | null }
 /**
  * What a session represents. `Project` is the pre-Phase-2 default (bound to
  * a project workdir); `Chat`, `Worker`, and `Review` are chat-first kinds

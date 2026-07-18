@@ -1,6 +1,7 @@
 mod accent;
 mod agent_cmd;
 mod apps_cmd;
+mod artifacts_cmd;
 mod audit_cmd;
 mod automation_cmd;
 mod backdrop;
@@ -47,6 +48,8 @@ fn make_builder() -> Builder<tauri::Wry> {
             commands::stage_attachment,
             commands::read_local_media,
             commands::fetch_attachment,
+            artifacts_cmd::list_session_artifacts,
+            artifacts_cmd::fetch_artifact,
             commands::pick_directory,
             commands::pick_files,
             commands::backdrop_capability,
