@@ -243,6 +243,34 @@ impl ArtifactService {
         Ok(record)
     }
 
+    /// Reads a complete artifact for an authenticated human download. Artifact
+    /// writes already enforce the per-file cap, so this deliberately bypasses
+    /// the smaller agent tool-output cap used by [`Self::read_range`].
+    pub async fn read_full(&self, id: &str) -> Result<ArtifactRead, ArtifactError> {
+        let artifact = self
+            .store
+            .artifact_by_id(id)
+            .await
+            .map_err(|_| ArtifactError::StorageFailure)?
+            .ok_or(ArtifactError::NotFound)?;
+        let range = self
+            .storage
+            .read_range(
+                &artifact.storage_key,
+                0,
+                artifact.size_bytes,
+                artifact.size_bytes,
+            )
+            .await?;
+        Ok(ArtifactRead {
+            artifact,
+            bytes: range.bytes,
+            offset: 0,
+            total_bytes: range.total_bytes,
+            truncated: range.truncated,
+        })
+    }
+
     /// Reads up to `length` bytes (or up to the configured read cap when
     /// `length` is `None`) starting at `offset` from `id`'s stored payload.
     /// Looks the artifact up by id only — no archive/access-scope check is

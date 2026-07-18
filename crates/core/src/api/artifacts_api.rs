@@ -85,7 +85,7 @@ async fn fetch_artifact(
     let read = state
         .cp
         .artifacts()
-        .read_range(&access.artifact.id, 0, Some(access.artifact.size_bytes))
+        .read_full(&access.artifact.id)
         .await
         .map_err(map_read_error)?;
     if read.truncated {

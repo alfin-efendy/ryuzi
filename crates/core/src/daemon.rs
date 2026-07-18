@@ -111,6 +111,8 @@ pub struct Daemon {
     /// tracked for the same reason as `rail_handle`. It claims pending queue
     /// rows and applies them to the owning agent's OKF bundle.
     learning_handle: JoinHandle<()>,
+    /// Periodic source-session artifact retention cleanup.
+    artifact_retention_handle: JoinHandle<()>,
 }
 
 impl Daemon {
@@ -164,6 +166,7 @@ impl Daemon {
                     self.scheduler_handle.abort();
                     self.rail_handle.abort();
                     self.learning_handle.abort();
+                    self.artifact_retention_handle.abort();
                 }
                 self.abort_gateway_status_listeners();
                 return Err(e);
@@ -219,6 +222,7 @@ impl Daemon {
         self.scheduler_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
+        self.artifact_retention_handle.abort();
         self.abort_gateway_status_listeners();
         self.router_server.stop().await;
     }
@@ -286,6 +290,7 @@ impl Daemon {
         self.scheduler_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
+        self.artifact_retention_handle.abort();
         self.router_server.stop().await;
         // Track D: gracefully stop every spawned extension subprocess. Safe
         // even when nothing was ever spawned (every test daemon, or a real
@@ -310,6 +315,7 @@ impl Drop for Daemon {
         self.scheduler_handle.abort();
         self.rail_handle.abort();
         self.learning_handle.abort();
+        self.artifact_retention_handle.abort();
     }
 }
 
@@ -519,7 +525,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // The daemon is the single always-on engine host for cron scheduling. The scheduler's
     // job_last_fired anchor is single-host-only — never spawn a second one.
     let scheduler_handle = crate::scheduler::spawn_runner(Arc::clone(&cp));
-    spawn_artifact_retention(Arc::clone(&cp), Arc::clone(&store));
+    let artifact_retention_handle = spawn_artifact_retention(Arc::clone(&cp), Arc::clone(&store));
     let rail_handle = crate::background_rail::spawn_runner(Arc::clone(&cp));
     let learning_handle = crate::learning::spawn_runner(Arc::clone(&persistence.learning));
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
@@ -545,6 +551,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         scheduler_handle,
         rail_handle,
         learning_handle,
+        artifact_retention_handle,
     })
 }
 
@@ -552,7 +559,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
 /// tick runs immediately so a restart also resumes cleanup after a previous
 /// interruption; later ticks are hourly. Failures are retryable and never
 /// prevent the daemon from serving sessions.
-fn spawn_artifact_retention(cp: Arc<ControlPlane>, store: Arc<Store>) {
+fn spawn_artifact_retention(cp: Arc<ControlPlane>, store: Arc<Store>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let settings = SettingsStore::new(store);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
@@ -573,7 +580,7 @@ fn spawn_artifact_retention(cp: Arc<ControlPlane>, store: Arc<Store>) {
                 tracing::warn!("artifact retention cleanup failed: {error}");
             }
         }
-    });
+    })
 }
 
 /// Per-gateway queue bound between the broadcast receiver and its sole
@@ -1035,6 +1042,7 @@ mod tests {
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
         }
     }
@@ -2206,6 +2214,7 @@ mod tests {
             scheduler_handle,
             rail_handle,
             learning_handle,
+            artifact_retention_handle: tokio::spawn(async {}),
         };
 
         let err = daemon.start().await.unwrap_err();
@@ -2783,6 +2792,7 @@ mod tests {
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
         };
 
@@ -2970,6 +2980,7 @@ mod tests {
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
         });
 
@@ -3099,6 +3110,7 @@ mod tests {
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
         });
 
@@ -3201,6 +3213,7 @@ mod tests {
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
         });
 
@@ -3357,6 +3370,7 @@ mod tests {
             scheduler_handle: tokio::spawn(async {}),
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
+            artifact_retention_handle: tokio::spawn(async {}),
         };
 
         daemon.start().await.unwrap();
@@ -3457,6 +3471,7 @@ mod tests {
             scheduler_handle,
             rail_handle,
             learning_handle,
+            artifact_retention_handle: tokio::spawn(async {}),
         };
 
         daemon.stop().await;
