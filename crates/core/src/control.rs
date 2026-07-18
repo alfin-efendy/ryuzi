@@ -233,19 +233,43 @@ impl ControlPlane {
         // explicitly after construction; no test path ever does. See that
         // method's doc comment.
 
-        // Fixed artifact byte caps — deliberately NOT read from
-        // `SettingsStore` here (a settings read at construction time would
-        // make every `test_cp()`-style caller depend on settings rows
-        // existing, and would let the caps drift silently between restarts).
-        // Callers that need operator-configured caps build their own
-        // `ArtifactService` from `settings::fields` and swap it in later.
+        let artifact_settings = SettingsStore::new(Arc::clone(&store));
+        let artifact_root = artifact_settings
+            .get("artifact_root")
+            .await
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| crate::settings::expand_home(&value))
+            .unwrap_or_else(|| crate::paths::state_dir().join("artifacts"));
+        let artifact_max_bytes = artifact_settings
+            .get("artifact_max_bytes")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(26_214_400);
+        let artifact_session_max_bytes = artifact_settings
+            .get("artifact_session_max_bytes")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(262_144_000);
+        let artifact_read_max_bytes = artifact_settings
+            .get("artifact_read_max_bytes")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(50_000);
         let artifacts = Arc::new(crate::artifacts::ArtifactService::new(
             Arc::clone(&store),
-            crate::artifacts::ArtifactStorage::new(crate::paths::state_dir().join("artifacts")),
+            crate::artifacts::ArtifactStorage::new(artifact_root),
             crate::artifacts::ArtifactConfig {
-                max_bytes: 26_214_400,
-                session_max_bytes: 262_144_000,
-                read_max_bytes: 50_000,
+                max_bytes: artifact_max_bytes,
+                session_max_bytes: artifact_session_max_bytes,
+                read_max_bytes: artifact_read_max_bytes,
             },
         ));
 
