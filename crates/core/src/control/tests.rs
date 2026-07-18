@@ -730,7 +730,12 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
                     mode: crate::domain::PermMode::AcceptEdits,
                     rules: vec![],
                 },
-                skills: vec!["release".into()],
+                // Skills must resolve in the live catalog for the primary to
+                // stay executable (validate_executable_primary now checks all
+                // four reference kinds); no skills are installed in this test,
+                // so leave it empty. The skills→allowed_skills mapping itself is
+                // covered by the adapter unit tests in harness/native/mod.rs.
+                skills: vec![],
                 tools: crate::agents::types::AgentTools {
                     native: vec!["read".into()],
                     plugins: vec![],
@@ -784,10 +789,7 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
             primary_turns[0].agent.profile.permissions.mode,
             crate::domain::PermMode::AcceptEdits
         );
-        assert_eq!(
-            primary_turns[0].allowed_skills,
-            Some(vec!["release".into()])
-        );
+        assert_eq!(primary_turns[0].allowed_skills, None);
         assert!(primary_turns[0].agent_tools.tools.allows("read"));
         assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
         assert_eq!(primary_turns[0].run_id, run_id);
@@ -1419,7 +1421,7 @@ async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run(
         )
         .await
         .expect_err("native-incompatible primary must be rejected before persistence");
-    assert!(error.to_string().contains("plugin tools"));
+    assert!(error.to_string().contains("plugin tool"));
     assert!(store.list_sessions(None).await.unwrap().is_empty());
     let run_count: i64 = store
         .with_conn(|connection| {
@@ -1496,7 +1498,7 @@ async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persis
         )
         .await
         .expect_err("native-incompatible primary must be rejected before a continuation mutates");
-    assert!(error.to_string().contains("plugin tools"));
+    assert!(error.to_string().contains("plugin tool"));
     assert_eq!(
         store
             .list_session_agent_runs(&session.session_pk)
@@ -1580,7 +1582,7 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
         .resume_session("resume-invalid-primary", "test")
         .await
         .expect_err("native-incompatible primary must be rejected before resume mutations");
-    assert!(error.to_string().contains("plugin tools"));
+    assert!(error.to_string().contains("plugin tool"));
     let stored = store
         .get_session("resume-invalid-primary")
         .await
