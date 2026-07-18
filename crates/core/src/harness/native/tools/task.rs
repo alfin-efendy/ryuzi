@@ -207,6 +207,7 @@ impl Tool for Task {
                         "summary": format!("{total} sub-agents: {ok} ok, {} failed", total - ok)
                     })),
                     is_error: false,
+                    structured_error: None,
                 })
             }
         }

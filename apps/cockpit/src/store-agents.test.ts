@@ -63,6 +63,7 @@ function detailOf(s: AgentSummaryInfo): AgentDetailInfo {
     maxTurns: 40,
     maxToolRounds: 80,
     modelInfo: null,
+    personality: { preset: "helpful", custom: null },
   };
 }
 
@@ -74,6 +75,7 @@ function reviewerInput(): AgentMutationInfo {
     description: "",
     avatarColor: "#7C5CFF",
     model: route("free"),
+    personality: { preset: "helpful", custom: null },
     permissionMode: "ask",
     permissionRules: [],
     skills: [],

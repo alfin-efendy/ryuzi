@@ -152,6 +152,7 @@ impl Tool for Bash {
             model_blocks: None,
             display: exit_display(output.status.code()),
             is_error,
+            structured_error: None,
         })
     }
 }

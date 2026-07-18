@@ -1,14 +1,42 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AgentDetailInfo, AgentMutationInfo, AppInfo } from "@/bindings";
+import type { AgentDetailInfo, AgentMutationInfo } from "@/bindings";
+import { useAgentConfigurationCatalog } from "@/store-agent-catalog";
 
-const listApps = mock(async () => ({ status: "ok" as const, data: [github] }));
-mock.module("@/bindings", () => ({ commands: { listApps }, events: {} }));
+const getAgentConfigurationCatalog = mock(async () => ({
+  status: "ok" as const,
+  data: {
+    skills: [
+      {
+        id: "requesting-code-review",
+        label: "Requesting code review",
+        description: "Review guidance",
+        available: true,
+        commandScoped: false,
+      },
+      {
+        id: "systematic-debugging",
+        label: "Systematic debugging",
+        description: "Debugging guidance",
+        available: true,
+        commandScoped: false,
+      },
+      { id: "another-skill", label: "Another skill", description: "Another skill", available: true, commandScoped: false },
+    ],
+    nativeTools: [
+      { id: "read", label: "Read", description: "Read files", available: true, commandScoped: false },
+      { id: "grep", label: "Grep", description: "Search files", available: true, commandScoped: false },
+      { id: "bash", label: "Bash", description: "Run commands", available: true, commandScoped: true },
+      { id: "glob", label: "Glob", description: "Find files", available: true, commandScoped: false },
+    ],
+    pluginTools: [{ id: "github", label: "GitHub", description: "GitHub tools", available: true, commandScoped: false }],
+    apps: [{ id: "github", label: "GitHub", description: "GitHub MCP", available: true, commandScoped: false }],
+  },
+}));
+mock.module("@/bindings", () => ({ commands: { getAgentConfigurationCatalog }, events: {} }));
 
 const { AgentSkillsToolsTab } = await import("./AgentSkillsToolsTab");
 const { useAgents } = await import("@/store-agents");
-const { useApps } = await import("@/store-apps");
-const { usePlugins } = await import("@/store-plugins");
 
 const updateAgent = mock(async (_agentId: string, _input: AgentMutationInfo) => true);
 
@@ -35,109 +63,94 @@ const reviewerDetail: AgentDetailInfo = {
   maxTurns: 50,
   maxToolRounds: 100,
   modelInfo: null,
+  personality: { preset: "helpful", custom: null },
 };
-
-const github = {
-  id: "github",
-  name: "GitHub",
-  desc: "GitHub MCP",
-  kind: "mcp",
-  initial: "G",
-  color: "blue",
-  transport: "stdio",
-  command: null,
-  args: [],
-  url: null,
-  scope: "global",
-  scopeGateways: [],
-  status: "ready",
-  statusDetail: null,
-  version: null,
-  publisher: null,
-  authKind: "none",
-  authDetail: null,
-  tools: [],
-  agentAccess: [],
-} satisfies AppInfo;
 
 beforeEach(() => {
   updateAgent.mockClear();
-  listApps.mockClear();
+  getAgentConfigurationCatalog.mockClear();
   useAgents.setState({ saving: false, update: updateAgent });
-  useApps.setState({ apps: [github], loaded: true });
-  usePlugins.setState({ plugins: [], loaded: true });
+  useAgentConfigurationCatalog.setState({ catalog: null, loading: false, error: null });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  useAgentConfigurationCatalog.setState({ catalog: null, loading: false, error: null });
+});
 
-test("a fresh store hydrates the app catalog once and resolves configured app IDs", async () => {
-  useApps.setState({ apps: [], loaded: false, hydrating: false });
+async function choose(catalogLabel: string, option: string) {
+  await waitFor(() => expect(screen.getByRole("combobox", { name: catalogLabel }).hasAttribute("disabled")).toBe(false));
+  fireEvent.click(screen.getByRole("combobox", { name: catalogLabel }));
+  await screen.findByRole("listbox");
+  fireEvent.click(screen.getByRole("option", { name: new RegExp(option) }));
+  await waitFor(() => expect(screen.getByRole("combobox", { name: catalogLabel }).getAttribute("aria-expanded")).toBe("false"));
+}
 
+test("loads the configuration catalog and resolves configured app IDs", async () => {
   render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, apps: ["github"] }} />);
 
   await waitFor(() => expect(screen.getByText("GitHub")).toBeTruthy());
   expect(screen.queryByText("Unavailable")).toBeNull();
-  expect(listApps).toHaveBeenCalledTimes(1);
-  expect(listApps).toHaveBeenCalledWith("local");
+  expect(getAgentConfigurationCatalog).toHaveBeenCalledTimes(1);
+  expect(getAgentConfigurationCatalog).toHaveBeenCalledWith("local");
 });
 
-test("capability switches save a complete mutation with stable IDs in separate lists", () => {
+test("catalog selection has no free-text Stable ID placeholders", async () => {
   render(<AgentSkillsToolsTab detail={reviewerDetail} />);
-  fireEvent.change(screen.getByRole("textbox", { name: "Skill ID" }), { target: { value: " systematic-debugging " } });
-  fireEvent.click(screen.getByRole("button", { name: "Add skill" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Native tool ID" }), { target: { value: "glob" } });
-  fireEvent.click(screen.getByRole("button", { name: "Add native tool" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Plugin tool ID" }), { target: { value: "github.search" } });
-  fireEvent.click(screen.getByRole("button", { name: "Add plugin tool" }));
-  fireEvent.click(screen.getByRole("switch", { name: "Enable app github" }));
+
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy());
+  expect(screen.queryByPlaceholderText(/Stable .* ID/)).toBeNull();
+  await choose("Skill catalog", "Systematic debugging");
+  await choose("Native tool catalog", "Glob");
+  await choose("Plugin tool catalog", "GitHub");
+  await waitFor(() => expect(screen.getByText("systematic-debugging")).toBeTruthy());
+  expect(screen.getByText("glob")).toBeTruthy();
+  expect(screen.getAllByText("github").length).toBeGreaterThan(0);
+});
+
+test("capability selections save a complete mutation with catalog IDs", async () => {
+  render(<AgentSkillsToolsTab detail={reviewerDetail} />);
+  await choose("Skill catalog", "Systematic debugging");
+  await choose("Native tool catalog", "Glob");
+  await choose("Plugin tool catalog", "GitHub");
+  await choose("App catalog", "GitHub");
   fireEvent.click(screen.getByRole("button", { name: "Save skills and tools" }));
-  expect(updateAgent).toHaveBeenCalledWith("reviewer", {
-    name: "Reviewer",
-    description: "Reviews implementation quality.",
-    avatarColor: "violet",
-    model: { kind: "route", route: "free" },
-    permissionMode: "ask",
-    permissionRules: [],
-    skills: ["requesting-code-review", "systematic-debugging"],
-    nativeTools: ["read", "grep", "bash", "glob"],
-    pluginTools: ["github.search"],
-    apps: ["github"],
-    maxTurns: 50,
-    maxToolRounds: 100,
-  });
+
+  expect(updateAgent).toHaveBeenCalledWith(
+    "reviewer",
+    expect.objectContaining({
+      skills: ["requesting-code-review", "systematic-debugging"],
+      nativeTools: ["read", "grep", "bash", "glob"],
+      pluginTools: ["github"],
+      apps: ["github"],
+    }),
+  );
 });
 
-test("blank and duplicate IDs are rejected while removals are explicit", () => {
+test("catalog options exclude selected IDs and removals are explicit", async () => {
   render(<AgentSkillsToolsTab detail={reviewerDetail} />);
-  const input = screen.getByRole("textbox", { name: "Skill ID" });
-  fireEvent.change(input, { target: { value: "   " } });
-  expect(screen.getByRole("button", { name: "Add skill" }).hasAttribute("disabled")).toBe(true);
-  fireEvent.change(input, { target: { value: "requesting-code-review" } });
-  expect(screen.getByRole("button", { name: "Add skill" }).hasAttribute("disabled")).toBe(true);
-  expect(screen.getByText("requesting-code-review")).toBeTruthy();
+  await choose("Skill catalog", "Systematic debugging");
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "Skill catalog" }).hasAttribute("disabled")).toBe(false));
+  fireEvent.click(screen.getByRole("combobox", { name: "Skill catalog" }));
+  await waitFor(() => expect(screen.getByRole("listbox")).toBeTruthy());
+  expect(screen.queryByRole("option", { name: /Systematic debugging/ })).toBeNull();
+  fireEvent.keyDown(screen.getByRole("listbox"), { key: "Escape" });
   fireEvent.click(screen.getByRole("button", { name: "Remove skill requesting-code-review" }));
   expect(screen.queryByText("requesting-code-review")).toBeNull();
 });
 
-test("unknown stable IDs and plugin tools remain ordered until explicitly removed", () => {
-  render(
-    <AgentSkillsToolsTab
-      detail={{
-        ...reviewerDetail,
-        skills: ["retired-skill", "requesting-code-review"],
-        pluginTools: ["retired.tool", "github.search"],
-        apps: ["retired-app", "github"],
-      }}
-    />,
-  );
-  const rows = screen.getByTestId("agent-app-rows");
-  expect(rows.textContent).toContain("retired-appUnavailableGitHub");
-  fireEvent.click(screen.getByRole("button", { name: "Save skills and tools" }));
-  expect(updateAgent).toHaveBeenCalledWith(
-    "reviewer",
-    expect.objectContaining({
-      skills: ["retired-skill", "requesting-code-review"],
-      pluginTools: ["retired.tool", "github.search"],
-      apps: ["retired-app", "github"],
-    }),
-  );
+test("an unavailable saved native tool remains visible and disables Save", async () => {
+  render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, nativeTools: ["read", "retired-native-tool"] }} />);
+
+  await waitFor(() => expect(screen.getByText("retired-native-tool")).toBeTruthy());
+  expect(screen.getByText("Unavailable")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Save skills and tools" }).hasAttribute("disabled")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Remove unavailable native tool retired-native-tool" }));
+  expect(screen.queryByText("retired-native-tool")).toBeNull();
+});
+
+test("missing saved apps remain removable and disable Save", async () => {
+  render(<AgentSkillsToolsTab detail={{ ...reviewerDetail, apps: ["retired-app"] }} />);
+  await waitFor(() => expect(screen.getByTestId("agent-app-rows").textContent).toContain("retired-app"));
+  expect(screen.getByRole("button", { name: "Save skills and tools" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "Remove unavailable app retired-app" })).toBeTruthy();
 });

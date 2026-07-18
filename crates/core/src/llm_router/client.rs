@@ -28,6 +28,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[cfg(test)]
+use crate::harness::native::capabilities::CapabilityResolutionError;
+use crate::harness::native::capabilities::TransportToolCapabilities;
+
 /// Everything the upstream path needs, decoupled from axum. Cheap to clone
 /// (an `Arc<Store>`, a `reqwest::Client` which is internally reference
 /// counted, and a small `Option<String>`).
@@ -81,6 +85,12 @@ struct AnnotatedRouteTarget {
 
 type ProviderOrderCache =
     std::collections::HashMap<(String, String, Vec<String>), (Vec<String>, RouteSelectionReason)>;
+
+#[derive(Clone, Copy)]
+enum RouteOrderMode {
+    Advance,
+    Peek,
+}
 
 pub async fn route_model(store: &Store, requested: &str) -> anyhow::Result<Option<RouteTarget>> {
     Ok(route_models_for_body(store, requested, None)
@@ -137,6 +147,56 @@ pub async fn route_models_for_anthropic_messages(
     )
 }
 
+/// Read the adapter-level tool envelope for every target the current routing
+/// rules may try before content is delivered. This is deliberately a peek:
+/// it never advances model-route or provider-account round-robin cursors.
+pub async fn route_tool_capabilities(
+    store: &Store,
+    requested: &str,
+) -> anyhow::Result<TransportToolCapabilities> {
+    let mut provider_order_cache = ProviderOrderCache::new();
+    let initial = route_models_for_body_matching_with_cache(
+        store,
+        requested,
+        None,
+        anthropic_messages_target_allowed,
+        &mut provider_order_cache,
+        RouteOrderMode::Peek,
+    )
+    .await?;
+    if initial.is_empty() {
+        return TransportToolCapabilities::intersection(std::iter::empty())
+            .map_err(anyhow::Error::from);
+    }
+    let attempted = initial
+        .iter()
+        .map(|annotated| {
+            (
+                annotated.target.conn.id.clone(),
+                annotated.target.upstream_model.clone(),
+            )
+        })
+        .collect();
+    let mut targets = initial;
+    targets.extend(
+        route_continuation_targets(
+            store,
+            requested,
+            &attempted,
+            &mut provider_order_cache,
+            capabilities::ToolTransportRequirements::default(),
+            RouteOrderMode::Peek,
+        )
+        .await?,
+    );
+    TransportToolCapabilities::intersection(
+        targets
+            .into_iter()
+            .map(|annotated| target_tool_capabilities(&annotated.target)),
+    )
+    .map_err(anyhow::Error::from)
+}
+
 async fn route_models_for_body_matching(
     store: &Store,
     requested: &str,
@@ -150,6 +210,7 @@ async fn route_models_for_body_matching(
         body,
         target_allowed,
         &mut provider_order_cache,
+        RouteOrderMode::Advance,
     )
     .await
 }
@@ -160,18 +221,32 @@ async fn route_models_for_body_matching_with_cache(
     body: Option<&Value>,
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
     provider_order_cache: &mut ProviderOrderCache,
+    order_mode: RouteOrderMode,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let conns = connections::list_connections(store).await?;
     let enabled: Vec<_> = conns.into_iter().filter(|c| c.enabled).collect();
     let required = body
         .map(capabilities::required_capabilities_from_body)
         .unwrap_or_default();
+    let tool_requirements = body
+        .map(capabilities::tool_transport_requirements_from_body)
+        .unwrap_or_default();
     let route_list = routes::list_model_routes(store).await?;
     if let Some(route) = routes::route_by_name(&route_list, requested) {
-        let targets = prefer_capable_indexed_targets(
-            routes::ordered_indexed_targets(store, route).await?,
-            required,
-        );
+        let indexed_targets = match order_mode {
+            RouteOrderMode::Advance => routes::ordered_indexed_targets(store, route).await?,
+            RouteOrderMode::Peek => route
+                .targets
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, target)| routes::IndexedModelRouteTarget {
+                    original_index: index as u32,
+                    target,
+                })
+                .collect(),
+        };
+        let targets = prefer_capable_indexed_targets(indexed_targets, required);
         let mut out = Vec::new();
         let route_reason = if route.targets.len() <= 1 {
             RouteSelectionReason::Initial
@@ -189,6 +264,7 @@ async fn route_models_for_body_matching_with_cache(
                 target_allowed,
                 route_reason.clone(),
                 provider_order_cache,
+                order_mode,
             )
             .await?
             {
@@ -207,7 +283,10 @@ async fn route_models_for_body_matching_with_cache(
                 out.push(annotated);
             }
         }
-        return Ok(normalize_single_reason(out));
+        return Ok(filter_tool_compatible(
+            normalize_single_reason(out),
+            tool_requirements,
+        ));
     }
     if let Some((prov, model)) = requested.split_once('/') {
         let candidates: Vec<_> = enabled
@@ -225,9 +304,15 @@ async fn route_models_for_body_matching_with_cache(
             })
             .collect();
         let mut out = Vec::new();
-        for (conn, reason) in
-            ordered_provider_connections(store, prov, model, candidates, provider_order_cache)
-                .await?
+        for (conn, reason) in ordered_provider_connections(
+            store,
+            prov,
+            model,
+            candidates,
+            provider_order_cache,
+            order_mode,
+        )
+        .await?
         {
             if let Some(desc) = registry::descriptor(&conn.provider) {
                 let Some(upstream_model) =
@@ -246,7 +331,10 @@ async fn route_models_for_body_matching_with_cache(
                 });
             }
         }
-        return Ok(normalize_single_reason(out));
+        return Ok(filter_tool_compatible(
+            normalize_single_reason(out),
+            tool_requirements,
+        ));
     }
     // Bare model: first (highest-priority) connection listing it.
     let mut provider_order = Vec::<String>::new();
@@ -276,6 +364,7 @@ async fn route_models_for_body_matching_with_cache(
             requested,
             candidates,
             provider_order_cache,
+            order_mode,
         )
         .await?
         {
@@ -295,7 +384,27 @@ async fn route_models_for_body_matching_with_cache(
             }
         }
     }
-    Ok(normalize_single_reason(out))
+    Ok(filter_tool_compatible(
+        normalize_single_reason(out),
+        tool_requirements,
+    ))
+}
+
+fn filter_tool_compatible(
+    targets: Vec<AnnotatedRouteTarget>,
+    requirements: capabilities::ToolTransportRequirements,
+) -> Vec<AnnotatedRouteTarget> {
+    targets
+        .into_iter()
+        .filter(|target| requirements.satisfied_by(target_tool_capabilities(&target.target)))
+        .collect()
+}
+
+fn target_tool_capabilities(target: &RouteTarget) -> TransportToolCapabilities {
+    target
+        .desc
+        .tool_transport
+        .capabilities_for_endpoint(connections::endpoint_source(&target.conn))
 }
 
 fn combine_order_reason(
@@ -341,6 +450,7 @@ async fn expanded_route_targets(
     target_allowed: fn(&connections::ConnectionRow, &ProviderDescriptor) -> bool,
     route_reason: RouteSelectionReason,
     provider_order_cache: &mut ProviderOrderCache,
+    order_mode: RouteOrderMode,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let mut candidates = Vec::new();
     for conn in enabled {
@@ -361,6 +471,7 @@ async fn expanded_route_targets(
         &target.model,
         candidates,
         provider_order_cache,
+        order_mode,
     )
     .await?;
     Ok(ordered
@@ -398,6 +509,8 @@ async fn route_continuation_targets(
     requested: &str,
     attempted: &std::collections::HashSet<(String, String)>,
     provider_order_cache: &mut ProviderOrderCache,
+    tool_requirements: capabilities::ToolTransportRequirements,
+    order_mode: RouteOrderMode,
 ) -> anyhow::Result<Vec<AnnotatedRouteTarget>> {
     let Some((family, model)) = requested.split_once('/') else {
         return Ok(Vec::new());
@@ -424,6 +537,7 @@ async fn route_continuation_targets(
             anthropic_messages_target_allowed,
             RouteSelectionReason::Ordered,
             provider_order_cache,
+            order_mode,
         )
         .await?
         {
@@ -437,7 +551,7 @@ async fn route_continuation_targets(
             out.push(annotated);
         }
     }
-    Ok(out)
+    Ok(filter_tool_compatible(out, tool_requirements))
 }
 
 fn route_target_has_candidate(
@@ -532,6 +646,7 @@ async fn ordered_provider_connections(
     scope: &str,
     candidates: Vec<connections::ConnectionRow>,
     provider_order_cache: &mut ProviderOrderCache,
+    order_mode: RouteOrderMode,
 ) -> anyhow::Result<Vec<(connections::ConnectionRow, RouteSelectionReason)>> {
     if candidates.len() <= 1 {
         return Ok(candidates
@@ -547,9 +662,18 @@ async fn ordered_provider_connections(
     let (ordered_ids, reason) = if let Some(cached) = provider_order_cache.get(&cache_key) {
         cached.clone()
     } else {
-        let (ordered_ids, strategy) =
-            routes::ordered_provider_connection_ids_with_strategy(store, provider, scope, &ids)
-                .await?;
+        let (ordered_ids, strategy) = match order_mode {
+            RouteOrderMode::Advance => {
+                routes::ordered_provider_connection_ids_with_strategy(store, provider, scope, &ids)
+                    .await?
+            }
+            RouteOrderMode::Peek => (
+                routes::peek_provider_connection_ids(store, provider, scope, &ids).await?,
+                routes::provider_account_route(store, provider)
+                    .await?
+                    .strategy,
+            ),
+        };
         let reason = if strategy == routes::ModelRouteStrategy::RoundRobin {
             RouteSelectionReason::RoundRobin
         } else {
@@ -1854,15 +1978,20 @@ pub async fn anthropic_messages_stream(
     effort_policy: &model_effort::TurnEffortPolicy,
 ) -> anyhow::Result<RoutedStream> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
+    let tool_requirements = capabilities::tool_transport_requirements_from_body(&body);
     let mut provider_order_cache = ProviderOrderCache::new();
-    let targets = route_models_for_body_matching_with_cache(
-        &ctx.store,
-        &requested,
-        None,
-        anthropic_messages_target_allowed,
-        &mut provider_order_cache,
-    )
-    .await?;
+    let targets = filter_tool_compatible(
+        route_models_for_body_matching_with_cache(
+            &ctx.store,
+            &requested,
+            None,
+            anthropic_messages_target_allowed,
+            &mut provider_order_cache,
+            RouteOrderMode::Advance,
+        )
+        .await?,
+        tool_requirements,
+    );
     if targets.is_empty() {
         anyhow::bail!("no enabled connection serves model '{requested}'");
     }
@@ -1885,6 +2014,8 @@ pub async fn anthropic_messages_stream(
                     &requested,
                     &attempted,
                     &mut provider_order_cache,
+                    tool_requirements,
+                    RouteOrderMode::Advance,
                 )
                 .await?,
             );
@@ -2120,15 +2251,20 @@ pub async fn anthropic_messages_stream(
 /// Non-streaming sibling: returns the full Anthropic message `Value`.
 pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Result<Value> {
     let requested = body["model"].as_str().unwrap_or("").to_string();
+    let tool_requirements = capabilities::tool_transport_requirements_from_body(&body);
     let mut provider_order_cache = ProviderOrderCache::new();
-    let targets = route_models_for_body_matching_with_cache(
-        &ctx.store,
-        &requested,
-        None,
-        anthropic_messages_target_allowed,
-        &mut provider_order_cache,
+    let targets = filter_tool_compatible(
+        route_models_for_body_matching_with_cache(
+            &ctx.store,
+            &requested,
+            None,
+            anthropic_messages_target_allowed,
+            &mut provider_order_cache,
+            RouteOrderMode::Advance,
+        )
+        .await?,
+        tool_requirements,
     )
-    .await?
     .into_iter()
     .map(|annotated| annotated.target)
     .collect::<Vec<_>>();
@@ -2155,6 +2291,8 @@ pub async fn anthropic_messages(ctx: &UpstreamCtx, body: Value) -> anyhow::Resul
                     &requested,
                     &attempted,
                     &mut provider_order_cache,
+                    tool_requirements,
+                    RouteOrderMode::Advance,
                 )
                 .await?
                 .into_iter()
@@ -4942,6 +5080,553 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(named[0].route_target_key.as_ref().unwrap().target_index, 0);
+    }
+
+    #[tokio::test]
+    async fn route_tool_capabilities_are_adapter_facts_not_model_name_inference() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "openai",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["opaque-alpha".into(), "opaque-beta".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let alpha = route_tool_capabilities(&ctx.store, "openai/opaque-alpha")
+            .await
+            .unwrap();
+        let beta = route_tool_capabilities(&ctx.store, "openai/opaque-beta")
+            .await
+            .unwrap();
+
+        assert_eq!(alpha, beta);
+        assert_eq!(
+            alpha.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+        assert!(alpha.supports_strict_function_schema);
+    }
+
+    #[tokio::test]
+    async fn route_tool_capabilities_report_a_typed_error_for_an_empty_target_set() {
+        let ctx = test_ctx().await;
+
+        let error = route_tool_capabilities(&ctx.store, "opaque-missing")
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<CapabilityResolutionError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn openai_base_url_override_is_a_conservative_compatible_endpoint() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "override",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    base_url_override: Some("https://compatible.example/v1".into()),
+                    models_override: Some(vec!["opaque-override".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "openai/opaque-override")
+            .await
+            .unwrap();
+
+        assert!(capabilities.supports_function_tools);
+        assert!(!capabilities.supports_custom_freeform_tools);
+        assert!(!capabilities.supports_strict_function_schema);
+        assert!(!capabilities.supports_tool_output_schema);
+    }
+
+    #[tokio::test]
+    async fn strict_tools_reject_an_openai_base_url_override() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "override",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    base_url_override: Some("https://compatible.example/v1".into()),
+                    models_override: Some(vec!["opaque-override".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let frozen_request = json!({
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "strict": true,
+                "parameters": {"type": "object"}
+            }}]
+        });
+
+        let targets =
+            route_models_for_body(&ctx.store, "openai/opaque-override", Some(&frozen_request))
+                .await
+                .unwrap();
+
+        assert!(targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pinned_route_without_an_initial_target_does_not_peek_at_continuation() {
+        let ctx = test_ctx().await;
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "fallback",
+                "anthropic",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["reachable-fallback".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "unreachable-pinned-start".into(),
+                name: "unreachable-pinned-start".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "missing-initial".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "reachable-fallback".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = route_tool_capabilities(&ctx.store, "openai/missing-initial")
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<CapabilityResolutionError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn route_tool_capabilities_intersect_fallbacks_without_advancing_order() {
+        let ctx = test_ctx().await;
+        let custom_id =
+            crate::llm_router::custom::add_custom_provider(&ctx.store, "Capability Fallback")
+                .await
+                .unwrap()[0]
+                .id
+                .clone();
+        for id in ["openai-1", "openai-2"] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    "openai",
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        models_override: Some(vec!["opaque-primary".into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "custom",
+                &custom_id,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    base_url_override: Some("http://127.0.0.1:9/v1".into()),
+                    models_override: Some(vec!["opaque-fallback".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_provider_account_route(
+            &ctx.store,
+            "openai",
+            routes::ModelRouteStrategy::RoundRobin,
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "mixed-route".into(),
+                name: "mixed".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::RoundRobin,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "opaque-primary".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: custom_id,
+                        model: "opaque-fallback".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "mixed").await.unwrap();
+        assert!(!capabilities.supports_strict_function_schema);
+        assert_eq!(
+            capabilities.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+
+        let routed = route_models_for_anthropic_messages(&ctx.store, "mixed")
+            .await
+            .unwrap();
+        assert_eq!(routed[0].conn.id, "openai-1");
+        assert_eq!(routed[0].route_target_key.as_ref().unwrap().target_index, 0);
+    }
+
+    #[tokio::test]
+    async fn dynamic_free_route_intersects_and_filters_declared_transport_facts() {
+        let ctx = test_ctx().await;
+        for (id, provider, model) in [
+            ("mimo-free-account", "mimo-free", "mimo-auto"),
+            ("opencode-free-account", "opencode-free", "grok-code"),
+        ] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    provider,
+                    "free",
+                    ConnectionData {
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "dynamic-free-route".into(),
+                name: "free".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "mimo-free".into(),
+                        model: "mimo-auto".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "opencode-free".into(),
+                        model: "grok-code".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let capabilities = route_tool_capabilities(&ctx.store, "free").await.unwrap();
+        assert_eq!(
+            capabilities.wire_protocol,
+            crate::harness::native::capabilities::WireProtocol::OpenAiChat
+        );
+        assert!(capabilities.supports_function_tools);
+        assert!(!capabilities.supports_strict_function_schema);
+
+        let strict_request = json!({"tools": [{"type": "function", "function": {
+            "name": "lookup",
+            "strict": true,
+            "parameters": {"type": "object"}
+        }}]});
+        assert!(
+            route_models_for_body(&ctx.store, "free", Some(&strict_request))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_tool_requirements_hard_filter_incompatible_route_targets() {
+        let ctx = test_ctx().await;
+        let custom_id =
+            crate::llm_router::custom::add_custom_provider(&ctx.store, "Strict Incompatible")
+                .await
+                .unwrap()[0]
+                .id
+                .clone();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "custom",
+                &custom_id,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    base_url_override: Some("http://127.0.0.1:9/v1".into()),
+                    models_override: Some(vec!["opaque-custom".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "official",
+                "openai",
+                "api_key",
+                ConnectionData {
+                    api_key: Some("key".into()),
+                    models_override: Some(vec!["opaque-official".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "strict-route".into(),
+                name: "strict".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: custom_id,
+                        model: "opaque-custom".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "opaque-official".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let frozen_request = json!({
+            "model": "strict",
+            "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "strict": true,
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
+
+        let targets = route_models_for_body(&ctx.store, "strict", Some(&frozen_request))
+            .await
+            .unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].conn.id, "official");
+    }
+
+    #[tokio::test]
+    async fn custom_and_output_requirements_keep_only_openai_responses_retry_targets() {
+        let ctx = test_ctx().await;
+        for (id, provider, auth_type, access_token) in [
+            ("chat", "openai", "api_key", None),
+            ("responses", "openai-oauth", "oauth", Some("token")),
+        ] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    provider,
+                    auth_type,
+                    ConnectionData {
+                        api_key: (provider == "openai").then(|| "key".into()),
+                        access_token: access_token.map(str::to_string),
+                        models_override: Some(vec!["opaque-tools".into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "responses-tools".into(),
+                name: "responses-tools".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![routes::ModelRouteTarget {
+                    provider: "openai".into(),
+                    model: "opaque-tools".into(),
+                    effort: None,
+                }],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let custom = json!({"tools": [{"type": "custom", "custom": {"name": "shell"}}]});
+        let output = json!({"tools": [{"type": "function", "function": {
+            "name": "lookup",
+            "output_schema": {"type": "string"}
+        }}]});
+        for request in [&custom, &output] {
+            let targets = route_models_for_body(&ctx.store, "responses-tools", Some(request))
+                .await
+                .unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].conn.id, "responses");
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_queue_rejects_strict_custom_and_output_for_an_override_endpoint() {
+        let ctx = test_ctx().await;
+        for (id, provider, model, base_url_override) in [
+            ("initial", "anthropic", "start", None),
+            (
+                "fallback",
+                "openai",
+                "fallback",
+                Some("https://compatible.example/v1"),
+            ),
+        ] {
+            connections::add_connection(
+                &ctx.store,
+                mk_conn(
+                    id,
+                    provider,
+                    "api_key",
+                    ConnectionData {
+                        api_key: Some("key".into()),
+                        base_url_override: base_url_override.map(str::to_string),
+                        models_override: Some(vec![model.into()]),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        routes::save_model_route(
+            &ctx.store,
+            routes::ModelRouteInfo {
+                id: "continuation-requirements".into(),
+                name: "continuation-requirements".into(),
+                enabled: true,
+                strategy: routes::ModelRouteStrategy::Fallback,
+                targets: vec![
+                    routes::ModelRouteTarget {
+                        provider: "anthropic".into(),
+                        model: "start".into(),
+                        effort: None,
+                    },
+                    routes::ModelRouteTarget {
+                        provider: "openai".into(),
+                        model: "fallback".into(),
+                        effort: None,
+                    },
+                ],
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let attempted = std::collections::HashSet::from([("initial".into(), "start".into())]);
+
+        for requirements in [
+            capabilities::ToolTransportRequirements {
+                strict_function_schema: true,
+                ..Default::default()
+            },
+            capabilities::ToolTransportRequirements {
+                custom_freeform_tools: true,
+                ..Default::default()
+            },
+            capabilities::ToolTransportRequirements {
+                tool_output_schema: true,
+                ..Default::default()
+            },
+        ] {
+            let mut order_cache = ProviderOrderCache::new();
+            let targets = route_continuation_targets(
+                &ctx.store,
+                "anthropic/start",
+                &attempted,
+                &mut order_cache,
+                requirements,
+                RouteOrderMode::Advance,
+            )
+            .await
+            .unwrap();
+            assert!(targets.is_empty(), "requirements: {requirements:?}");
+        }
     }
 
     #[tokio::test]

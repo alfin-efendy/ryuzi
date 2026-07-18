@@ -1286,6 +1286,17 @@ pub struct AgentRecoveryInfo {
     pub message: String,
 }
 
+/// An agent's personality selection: a preset name (matching
+/// [`crate::agents::personality::PersonalityPreset`]'s `snake_case` variants,
+/// e.g. `"technical"` or `"custom"`) plus optional custom text that only
+/// applies when `preset` is `"custom"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPersonalityInfo {
+    pub preset: String,
+    pub custom: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSummaryInfo {
@@ -1315,6 +1326,7 @@ pub struct AgentDetailInfo {
     pub max_turns: u32,
     pub max_tool_rounds: u32,
     pub model_info: Option<SelectableModelInfo>,
+    pub personality: AgentPersonalityInfo,
 }
 
 /// Everything a create/update mutation may set on an agent. Server-derived
@@ -1327,6 +1339,7 @@ pub struct AgentMutationInfo {
     pub description: String,
     pub avatar_color: String,
     pub model: AgentModelInfo,
+    pub personality: AgentPersonalityInfo,
     pub permission_mode: String,
     pub permission_rules: Vec<PermissionRuleInfo>,
     pub skills: Vec<String>,
@@ -1344,6 +1357,54 @@ pub struct AgentRegistryInfo {
     pub default_agent_id: String,
     pub recovery: Vec<AgentRecoveryInfo>,
     pub subagent_model: AgentModelInfo,
+}
+
+/// One selectable option in the agent configuration catalog (a skill,
+/// native tool, plugin tool, or app) — see
+/// [`crate::agents::catalog::CatalogEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogEntryInfo {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub available: bool,
+    pub command_scoped: bool,
+}
+
+impl From<crate::agents::catalog::CatalogEntry> for CatalogEntryInfo {
+    fn from(entry: crate::agents::catalog::CatalogEntry) -> Self {
+        CatalogEntryInfo {
+            id: entry.id,
+            label: entry.label,
+            description: entry.description,
+            available: entry.available,
+            command_scoped: entry.command_scoped,
+        }
+    }
+}
+
+/// The full set of configuration options (skills, native tools, plugin
+/// tools, apps) offered when building or editing an agent profile — see
+/// [`crate::agents::catalog::AgentConfigurationCatalog`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigurationCatalogInfo {
+    pub skills: Vec<CatalogEntryInfo>,
+    pub native_tools: Vec<CatalogEntryInfo>,
+    pub plugin_tools: Vec<CatalogEntryInfo>,
+    pub apps: Vec<CatalogEntryInfo>,
+}
+
+impl From<crate::agents::catalog::AgentConfigurationCatalog> for AgentConfigurationCatalogInfo {
+    fn from(catalog: crate::agents::catalog::AgentConfigurationCatalog) -> Self {
+        AgentConfigurationCatalogInfo {
+            skills: catalog.skills.into_iter().map(Into::into).collect(),
+            native_tools: catalog.native_tools.into_iter().map(Into::into).collect(),
+            plugin_tools: catalog.plugin_tools.into_iter().map(Into::into).collect(),
+            apps: catalog.apps.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// One knowledge concept as stored in the agent's OKF tree. `timestamp` is

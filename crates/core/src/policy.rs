@@ -11,13 +11,11 @@ const SAFE_TOOLS: &[&str] = &[
     // never needs to ask — and they must work inside Plan mode.
     "ExitPlanMode",
     "AskUserQuestion",
-    // App-control reads + clarify (Phase 6): reads are side-effect-free and
-    // Plan-safe; `clarify` blocks on the user's answer, so its execution IS
-    // the prompt (like AskUserQuestion). App-control *writes* stay off this
-    // list so they prompt in Default and can persist an allowAlways grant.
+    // App-control reads (Phase 6): reads are side-effect-free and Plan-safe.
+    // App-control *writes* stay off this list so they prompt in Default and
+    // can persist an allowAlways grant.
     "jobs.read",
     "projects.read",
-    "clarify",
 ];
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
@@ -234,18 +232,18 @@ mod tests {
     }
 
     #[test]
-    fn app_read_and_clarify_keys_auto_allow_writes_prompt() {
-        // Reads + clarify auto-allow in Default AND survive Plan mode.
-        for tool in ["jobs.read", "projects.read", "clarify"] {
+    fn app_read_keys_auto_allow_writes_prompt() {
+        // Reads auto-allow in Default AND survive Plan mode.
+        for tool in ["jobs.read", "projects.read"] {
             assert_eq!(
                 decide_tool_permission(PermMode::Default, None, tool),
                 PolicyOutcome::AutoAllow,
-                "read/clarify key {tool} must auto-allow"
+                "read key {tool} must auto-allow"
             );
             assert_eq!(
                 decide_tool_permission(PermMode::Plan, None, tool),
                 PolicyOutcome::AutoAllow,
-                "read/clarify key {tool} must be Plan-safe"
+                "read key {tool} must be Plan-safe"
             );
         }
         // Writes prompt in Default.

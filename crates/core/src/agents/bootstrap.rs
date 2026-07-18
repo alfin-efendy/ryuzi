@@ -156,6 +156,7 @@ pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
         model: AgentModel::Route {
             route: "free".into(),
         },
+        personality: crate::agents::personality::AgentPersonality::default_profile(),
         permissions: AgentPermissions {
             mode: crate::PermMode::Default,
             rules: Vec::new(),
@@ -1060,6 +1061,10 @@ mod tests {
         assert_eq!(agent.profile.loop_settings.max_turns, 50);
         assert_eq!(agent.profile.loop_settings.max_tool_rounds, 100);
         assert_eq!(
+            agent.profile.personality,
+            crate::agents::personality::AgentPersonality::default_profile()
+        );
+        assert_eq!(
             snapshot.subagent_model,
             AgentModel::Route {
                 route: "free".into()
@@ -1171,6 +1176,15 @@ mod tests {
                 Err(error) => error.to_string(),
             };
         assert!(error.contains("unsupported agent persistence schema"));
+    }
+
+    #[test]
+    fn default_ryuzi_profile_uses_default_personality() {
+        let profile = default_ryuzi_profile("ryuzi".into());
+        assert_eq!(
+            profile.personality,
+            crate::agents::personality::AgentPersonality::default_profile()
+        );
     }
 
     #[tokio::test]

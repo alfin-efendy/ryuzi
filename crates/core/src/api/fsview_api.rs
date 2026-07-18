@@ -6,6 +6,7 @@
 use super::{ok, params, ApiError};
 use crate::control::ControlPlane;
 use crate::fsview;
+pub use crate::fsview::SearchEntryInfo;
 use crate::serve::ApiState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -335,7 +336,7 @@ async fn search_files(
     cp: &ControlPlane,
     project_id: &str,
     query: &str,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<Vec<SearchEntryInfo>, ApiError> {
     let project = cp
         .store()
         .get_project(project_id)
@@ -343,7 +344,7 @@ async fn search_files(
         .ok_or_else(|| ApiError::not_found(format!("unknown project: {project_id}")))?;
     let root = PathBuf::from(project.workdir);
     let query = query.to_string();
-    let hits = tokio::task::spawn_blocking(move || fsview::search_files(&root, &query, 50))
+    let hits = tokio::task::spawn_blocking(move || fsview::search_entries(&root, &query, 50))
         .await
         .map_err(|e| ApiError {
             status: 500,

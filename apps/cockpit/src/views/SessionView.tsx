@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, FileText, GitBranch, Mic, PanelBottom, PanelRight, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button, MenuPanel, MenuPanelItem as MenuItem, MenuPanelSection as MenuSectionLabel, Textarea } from "@ryuzi/ui";
-import { commands, type AgentSummaryInfo, type TurnInput } from "@/bindings";
+import { commands, type SearchEntryInfo, type TurnInput } from "@/bindings";
 import { useStore, type ChatOptions } from "@/store";
 import { LOCAL_RUNNER, isSession, refKey } from "@/lib/session-key";
 import { useNav } from "@/store-nav";
@@ -13,9 +13,16 @@ import { delegationSessionKey, useDelegation } from "@/store-delegation";
 import { statusMeta } from "@/lib/status";
 import { projectLabel } from "@/lib/sidebar";
 import { sessionIsReadOnly, sessionPrimaryLabel } from "@/lib/session-primary";
-import { activeAgentMentionQuery, insertAgentMention, matchMentionAgents, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
-import { AgentMentionMenu } from "@/components/composer/AgentMentionMenu";
-import { activeContextQuery, replaceActiveContextToken, uniqueContextRefs } from "@/lib/composer-context";
+import { insertAgentMention, updateMentionDraft, type MentionDraft } from "@/lib/mentions";
+import { ContextPickerMenu } from "@/components/composer/ContextPickerMenu";
+import {
+  activeContextQuery,
+  contextPickerGroups,
+  flattenContextPickerGroups,
+  replaceActiveContextToken,
+  uniqueContextRefs,
+  type ContextPickerItem,
+} from "@/lib/composer-context";
 import { ApprovalCard } from "@/components/approval/ApprovalCard";
 import { StatusDot } from "@/components/common/bits";
 import { Transcript } from "@/components/transcript/Transcript";
@@ -26,6 +33,7 @@ import { TodoPanel } from "@/components/session/TodoPanel";
 import { ArtifactPanel } from "@/components/artifacts/ArtifactPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { QueuedMessages } from "@/components/session/QueuedMessages";
+import { SessionCostPanel } from "@/components/session/SessionCostPanel";
 import { startVoiceDictation } from "@/lib/voice";
 import { useComposerAttachments } from "@/components/composer/useComposerAttachments";
 import { AttachmentChips } from "@/components/composer/AttachmentChips";
@@ -80,8 +88,10 @@ export function SessionView() {
     },
     [draftKey, setMentions],
   );
-  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
-  const [contextHits, setContextHits] = useState<string[]>([]);
+  const [pickerIndex, setPickerIndex] = useState(0);
+  const [contextEntries, setContextEntries] = useState<SearchEntryInfo[]>([]);
+  const [dismissedSignature, setDismissedSignature] = useState<string | null>(null);
+  const searchSerialRef = useRef(0);
   const [listening, setListening] = useState(false);
   const submitInFlight = useRef(false);
   const [submitting, setSubmitting] = useState(false);
@@ -164,9 +174,10 @@ export function SessionView() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset transient composer state when the focused session changes
   useEffect(() => {
     setMentionCaret(0);
-    setMentionActiveIndex(0);
+    setPickerIndex(0);
     setContextRefs([]);
-    setContextHits([]);
+    setContextEntries([]);
+    setDismissedSignature(null);
   }, [draftKey]);
 
   const slashQuery = useMemo(() => {
@@ -181,28 +192,51 @@ export function SessionView() {
       .filter((c) => c.name.toLowerCase().startsWith(slashQuery))
       .slice(0, 6);
   }, [nativeCommands, slashQuery]);
-  const mentionQuery = useMemo(() => activeAgentMentionQuery(draft, mentionCaret), [draft, mentionCaret]);
-  const mentionMatches = useMemo(
-    () => matchMentionAgents(registry?.agents ?? [], mentionQuery?.query ?? "", session?.primaryAgentId ?? null, mentions),
-    [registry?.agents, mentionQuery?.query, session?.primaryAgentId, mentions],
-  );
-  const contextQuery = useMemo(() => activeContextQuery(draft), [draft]);
+  const contextQuery = useMemo(() => activeContextQuery(draft, mentionCaret), [draft, mentionCaret]);
   const contextQueryText = contextQuery?.query ?? null;
-  const mentionMenuOpen = mentionQuery !== null && contextQuery === null && slashQuery === null && mentionMatches.length > 0;
+  const contextPickerContextGroups = useMemo(
+    () =>
+      contextQuery === null
+        ? []
+        : contextPickerGroups({
+            query: contextQuery.query,
+            project: project ?? null,
+            agents: registry?.agents ?? [],
+            primaryAgentId: session?.primaryAgentId ?? null,
+            entries: contextEntries,
+          }),
+    [contextQuery, project, registry?.agents, session?.primaryAgentId, contextEntries],
+  );
+  const contextPickerItems = useMemo(() => flattenContextPickerGroups(contextPickerContextGroups), [contextPickerContextGroups]);
+  const contextSignature = contextQuery ? `${draftKey}:${contextQuery.start}` : null;
+  const pickerOpen =
+    contextQuery !== null && slashQuery === null && contextPickerItems.length > 0 && contextSignature !== dismissedSignature;
+  // Mirrors `pickerOpen` but for the zero-match case — renders a compact
+  // "No matches." hint instead of the full ContextPickerMenu. Deliberately
+  // excluded from the textarea's onKeyDown handling: with no items to pick,
+  // Enter must fall through to the normal submit path instead of being
+  // intercepted.
+  const noContextMatches =
+    contextQuery !== null && slashQuery === null && contextPickerItems.length === 0 && contextSignature !== dismissedSignature;
 
+  // Debounced workspace search — fires for every active `@` token including
+  // an empty query (an empty query still matches Project/Agents/all entries
+  // via `contextPickerGroups`). `searchSerialRef` discards a stale response
+  // that resolves after a newer query superseded it, instead of relying on
+  // an effect-scoped `cancelled` flag.
   useEffect(() => {
     if (!projectId || contextQueryText === null) {
-      setContextHits([]);
+      setContextEntries([]);
       return;
     }
-    let cancelled = false;
+    const serial = ++searchSerialRef.current;
     const t = setTimeout(() => {
       void commands.searchFiles(LOCAL_RUNNER, projectId, contextQueryText).then((res) => {
-        if (!cancelled) setContextHits(res.status === "ok" ? res.data.slice(0, 6) : []);
+        if (searchSerialRef.current !== serial) return;
+        setContextEntries(res.status === "ok" ? res.data : []);
       });
     }, 120);
     return () => {
-      cancelled = true;
       clearTimeout(t);
     };
   }, [projectId, contextQueryText]);
@@ -310,22 +344,26 @@ export function SessionView() {
       });
   };
 
-  const pickContext = (path: string) => {
-    updateDraft((cur) => replaceActiveContextToken(cur, path));
-    setContextRefs((cur) => uniqueContextRefs([...cur, path]));
-    setContextHits([]);
+  const pickContextItem = (item: ContextPickerItem) => {
+    if (item.kind === "agent") {
+      const next = insertAgentMention({ text: draft, mentions }, mentionCaret, item.agent);
+      updateDraft(next);
+      setMentionCaret(next.text.length);
+    } else if (item.kind === "workspace") {
+      updateDraft((cur) => replaceActiveContextToken(cur, mentionCaret, item.path));
+      setContextRefs((cur) => uniqueContextRefs([...cur, item.path]));
+    } else {
+      updateDraft((cur) => replaceActiveContextToken(cur, mentionCaret, projectName));
+    }
+    setContextEntries([]);
+    setPickerIndex(0);
+    setDismissedSignature(null);
   };
 
-  const pickMention = (agent: AgentSummaryInfo) => {
-    const next = insertAgentMention({ text: draft, mentions }, mentionCaret, agent);
-    updateDraft(next);
-    setMentionCaret(next.text.length);
-    setMentionActiveIndex(0);
-  };
-
-  const dismissMentionMenu = () => {
-    setMentionCaret(0);
-    setMentionActiveIndex(0);
+  const dismissContextPicker = () => {
+    setDismissedSignature(contextSignature);
+    setPickerIndex(0);
+    setContextEntries([]);
   };
 
   const toggleVoice = () => {
@@ -460,22 +498,23 @@ export function SessionView() {
                   historyRef.current = HISTORY_IDLE;
                   updateDraft(e.target.value);
                   setMentionCaret(e.target.selectionStart);
-                  setMentionActiveIndex(0);
+                  setPickerIndex(0);
+                  setDismissedSignature(null);
                 }}
                 onSelect={(e) => setMentionCaret(e.currentTarget.selectionStart)}
                 onKeyDown={(e) => {
-                  if (e.key === "Escape" && mentionMenuOpen) {
+                  if (e.key === "Escape" && pickerOpen) {
                     e.preventDefault();
-                    dismissMentionMenu();
+                    dismissContextPicker();
                     return;
                   }
-                  if (mentionMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
+                  if (pickerOpen && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
                     const delta = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
                     e.preventDefault();
-                    if (delta) setMentionActiveIndex((index) => (index + delta + mentionMatches.length) % mentionMatches.length);
+                    if (delta) setPickerIndex((index) => (index + delta + contextPickerItems.length) % contextPickerItems.length);
                     else {
-                      const agent = mentionMatches[mentionActiveIndex];
-                      if (agent) pickMention(agent);
+                      const item = contextPickerItems[pickerIndex];
+                      if (item) pickContextItem(item);
                     }
                     return;
                   }
@@ -486,7 +525,7 @@ export function SessionView() {
                   }
                   if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
                     const dir = e.key === "ArrowUp" ? ("up" as const) : ("down" as const);
-                    const popupOpen = slashMatches.length > 0 || contextHits.length > 0 || mentionMenuOpen;
+                    const popupOpen = slashMatches.length > 0 || pickerOpen;
                     const el = e.currentTarget;
                     if (!shouldNavigateHistory(dir, draft, el.selectionStart ?? 0, el.selectionEnd ?? 0, popupOpen)) return;
                     const step = stepHistory(dir, history, historyRef.current, draft);
@@ -501,14 +540,18 @@ export function SessionView() {
                 placeholder={composeReadOnly ? composeReadOnlyReason : running ? "Enter to queue" : "Ask for follow-up changes"}
                 className="max-h-[40vh] min-h-0 resize-none overflow-y-auto border-none bg-transparent px-4 pb-0.5 pt-[13px] text-[13.5px] leading-normal text-foreground focus-visible:ring-0 md:text-[13.5px] dark:bg-transparent"
               />
-              {mentionMenuOpen && (
-                <AgentMentionMenu
-                  agents={mentionMatches}
-                  activeIndex={mentionActiveIndex}
-                  onActiveIndexChange={setMentionActiveIndex}
-                  onPick={pickMention}
-                  onClose={dismissMentionMenu}
+              {pickerOpen && (
+                <ContextPickerMenu
+                  groups={contextPickerContextGroups}
+                  activeIndex={pickerIndex}
+                  onPick={pickContextItem}
+                  onClose={dismissContextPicker}
                 />
+              )}
+              {noContextMatches && (
+                <MenuPanel onClose={dismissContextPicker} className="bottom-full left-2.5 z-50 mb-1.5 w-[200px] p-2.5">
+                  <span className="text-[12px] text-muted-foreground">No matches.</span>
+                </MenuPanel>
               )}
               {slashMatches.length > 0 && (
                 <MenuPanel onClose={() => undefined} className="bottom-full left-2.5 z-50 mb-1.5 w-[320px]">
@@ -521,17 +564,7 @@ export function SessionView() {
                   ))}
                 </MenuPanel>
               )}
-              {contextHits.length > 0 && (
-                <MenuPanel onClose={() => setContextHits([])} className="bottom-full left-2.5 z-50 mb-1.5 w-[360px]">
-                  <MenuSectionLabel>Context</MenuSectionLabel>
-                  {contextHits.map((path) => (
-                    <MenuItem key={path} onClick={() => pickContext(path)} className="font-medium">
-                      <FileText aria-hidden size={13} strokeWidth={2} className="size-[13px] text-muted-foreground" />
-                      <span className="min-w-0 flex-1 truncate">{path}</span>
-                    </MenuItem>
-                  ))}
-                </MenuPanel>
-              )}
+
               <div className="relative flex items-center gap-1.5 px-2.5 pb-2.5 pt-1.5">
                 <Button
                   variant="ghost"
@@ -544,6 +577,7 @@ export function SessionView() {
                   <Paperclip aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
                 </Button>
                 <div className="flex-1" />
+                <SessionCostPanel runnerId={runnerId} sessionPk={session.sessionPk} />
                 <Button
                   variant="ghost"
                   size="icon-sm"

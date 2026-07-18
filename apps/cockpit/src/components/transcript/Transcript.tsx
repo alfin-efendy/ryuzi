@@ -2,7 +2,8 @@ import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "reac
 import { AudioLines, ChevronDown, Paperclip } from "lucide-react";
 import { commands } from "@/bindings";
 import { useStore } from "@/store";
-import { buildTranscript, closeDanglingFence, type Row, type RowAttachment } from "@/lib/transcript";
+import { buildTranscript, closeDanglingFence, formatTurnDuration, liveTurnStartMs, type Row, type RowAttachment } from "@/lib/transcript";
+import { useNow } from "@/hooks/useNow";
 import { mediaKindForContentType } from "@/lib/attachments";
 import { distanceFromBottom, isStuck, pinningInterrupted, showScrollFab } from "@/lib/scroll";
 import { StatusDot } from "@/components/common/bits";
@@ -152,11 +153,18 @@ const AgentTurn = memo(function AgentTurn({
   );
 });
 
-function WorkingPulse({ color }: { color: string }) {
+/** Isolated so the 1 Hz tick re-renders only the counter, not the transcript. */
+function LiveElapsed({ startedAt }: { startedAt: number }) {
+  const now = useNow(true);
+  return <span className="tabular-nums">{formatTurnDuration(Math.max(0, now - startedAt))}</span>;
+}
+
+function WorkingPulse({ color, startedAt }: { color: string; startedAt: number | null }) {
   return (
     <div className="flex items-center gap-2 text-[12.5px] text-muted-foreground">
       <span className="h-2 w-2 rounded-full" style={{ background: color, animation: "relay-pulse 1.2s ease-in-out infinite" }} />
-      Working…
+      <span>Working…</span>
+      {startedAt !== null && <LiveElapsed startedAt={startedAt} />}
     </div>
   );
 }
@@ -198,6 +206,7 @@ export function Transcript({
   const [lightbox, setLightbox] = useState<string | null>(null);
 
   const groups = useMemo(() => buildTranscript(rows, running), [rows, running]);
+  const liveStart = useMemo(() => (running ? liveTurnStartMs(rows) : null), [running, rows]);
   const pendingApprovals = useStore((state) => state.pendingApprovals);
   const approvals = useMemo(
     () =>
@@ -322,7 +331,7 @@ export function Transcript({
                   return null;
               }
             })}
-            {running && <WorkingPulse color={agentColor} />}
+            {running && <WorkingPulse color={agentColor} startedAt={liveStart} />}
             {approvals.map((approval, index) => (
               <div key={`${approval.runnerId}:${approval.runId}:${approval.requestId}`} className="px-4 pb-2">
                 <ApprovalCard approval={approval} hotkey={index === approvals.length - 1} />

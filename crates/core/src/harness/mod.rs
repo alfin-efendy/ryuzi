@@ -103,6 +103,9 @@ pub struct SessionCtx {
     pub learning_queue: Arc<crate::agents::learning_queue::LearningQueue>,
     /// Persistence handle (transcript rows, agent_session_id updates).
     pub store: Arc<Store>,
+    /// Process telemetry seam supplied by the control plane. Native tool
+    /// metrics use only fixed, low-cardinality labels.
+    pub telemetry: Arc<dyn crate::telemetry::Telemetry>,
     /// Curated app-control facade (spec §9.1), built by the control plane
     /// only for a top-level interactive session (`kind` is `Project` or
     /// `Chat`). `None` for worker/review sessions and any bare test context —
@@ -281,6 +284,7 @@ mod tests {
         let delegation = crate::delegation::DelegationRuntime::new(
             store.clone(),
             persistence.registry,
+            None,
             events.clone(),
         );
         SessionCtx {
@@ -321,6 +325,7 @@ mod tests {
             agent_knowledge: knowledge,
             learning_queue,
             store,
+            telemetry: Arc::new(crate::telemetry::NoopTelemetry),
             app_control: None,
         }
     }

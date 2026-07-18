@@ -617,6 +617,10 @@ function RouteForm({
   );
 }
 
+function formatContextWindow(tokens: number): string {
+  return tokens >= 1_000_000 ? `${tokens / 1_000_000}M` : `${tokens / 1_000}K`;
+}
+
 function RouteTargetPill({ target, catalog }: { target: ModelRouteTarget; catalog: CatalogEntry[] }) {
   const head = catalog.find((entry) => entry.id === target.provider);
   const effortLabel = target.effort ? `${target.effort.charAt(0).toUpperCase()}${target.effort.slice(1)} override` : null;
@@ -634,11 +638,13 @@ function RouteTargetPill({ target, catalog }: { target: ModelRouteTarget; catalo
 function RouteCard({
   route,
   catalog,
+  targetCapabilities,
   onEdit,
   onDelete,
 }: {
   route: ModelRouteInfo;
   catalog: CatalogEntry[];
+  targetCapabilities: ModelRouteTargetCapability[];
   onEdit: () => void;
   onDelete: (trigger: HTMLButtonElement) => void;
 }) {
@@ -656,6 +662,15 @@ function RouteCard({
             <span className="truncate font-mono text-sm font-semibold text-foreground">{route.name}</span>
             <Pill variant={route.enabled ? "primary" : "secondary"}>{route.enabled ? "Enabled" : "Disabled"}</Pill>
             <span className="text-xs text-muted-foreground">{strategyLabel(route.strategy)}</span>
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {route.targets
+              .map((target) => {
+                const capability = capabilityForTarget(targetCapabilities, target);
+                return capability ? `${target.model}: ${formatContextWindow(capability.contextWindow)} context` : null;
+              })
+              .filter((metadata): metadata is string => metadata !== null)
+              .join(" · ")}
           </div>
           <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
             {route.targets.map((target, index) => (
@@ -732,6 +747,7 @@ function RouteTab() {
           key={route.id}
           route={route}
           catalog={catalog}
+          targetCapabilities={targetCapabilities}
           onEdit={() => setEditing(route)}
           onDelete={(trigger) => setDeleteTarget({ route, trigger })}
         />

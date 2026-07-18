@@ -347,6 +347,14 @@ async listAgents(runnerId: string | null) : Promise<Result<AgentRegistryInfo, Cm
     else return { status: "error", error: e  as any };
 }
 },
+async getAgentConfigurationCatalog(runnerId: string | null) : Promise<Result<AgentConfigurationCatalogInfo, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_agent_configuration_catalog", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getAgent(runnerId: string | null, agentId: string) : Promise<Result<AgentDetailInfo, CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_agent", { runnerId, agentId }) };
@@ -789,7 +797,7 @@ async gitDiff(runnerId: string | null, sessionPk: string) : Promise<Result<strin
     else return { status: "error", error: e  as any };
 }
 },
-async searchFiles(runnerId: string | null, projectId: string, query: string) : Promise<Result<string[], CmdError>> {
+async searchFiles(runnerId: string | null, projectId: string, query: string) : Promise<Result<SearchEntryInfo[], CmdError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("search_files", { runnerId, projectId, query }) };
 } catch (e) {
@@ -1828,7 +1836,13 @@ transport: string; command: string | null; args: string[];
  */
 env: string[]; url: string | null; version: string | null; publisher: string | null; color: string | null }
 export type AgentAccessInfo = { agentId: string; allowed: boolean }
-export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null }
+/**
+ * The full set of configuration options (skills, native tools, plugin
+ * tools, apps) offered when building or editing an agent profile — see
+ * [`crate::agents::catalog::AgentConfigurationCatalog`].
+ */
+export type AgentConfigurationCatalogInfo = { skills: CatalogEntryInfo[]; nativeTools: CatalogEntryInfo[]; pluginTools: CatalogEntryInfo[]; apps: CatalogEntryInfo[] }
+export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
 /**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
@@ -1849,14 +1863,21 @@ export type AgentModelInfo = { kind: "concrete"; name: string; effort: string | 
  * fields (`id`, counts, `executable`, `validation`, `is_default`) are
  * deliberately absent so the client can't submit them.
  */
-export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number }
+export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number }
+/**
+ * An agent's personality selection: a preset name (matching
+ * [`crate::agents::personality::PersonalityPreset`]'s `snake_case` variants,
+ * e.g. `"technical"` or `"custom"`) plus optional custom text that only
+ * applies when `preset` is `"custom"`.
+ */
+export type AgentPersonalityInfo = { preset: string; custom: string | null }
 /**
  * One startup-recovery note surfaced to the UI (for example a quarantined
  * agent file that failed to parse and was set aside).
  */
 export type AgentRecoveryInfo = { code: string; message: string }
 export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
-export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null }
+export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null; contextActiveTokens: number | null; contextUsableWindow: number | null; contextPercentLeft: number | null }
 export type AgentRunKind = "primary" | "main-delegate" | "subagent"
 /**
  * The session's primary run, if it has one, plus its sorted child runs.
@@ -1957,6 +1978,12 @@ export type CatalogEntry = { id: string; name: string;
  */
 family: string; color: string; initial: string; category: string; format: string; requiresBaseUrl: boolean; models: string[]; freeTier: boolean; riskNotice: boolean; usesDeviceGrant: boolean }
 /**
+ * One selectable option in the agent configuration catalog (a skill,
+ * native tool, plugin tool, or app) — see
+ * [`crate::agents::catalog::CatalogEntry`].
+ */
+export type CatalogEntryInfo = { id: string; label: string; description: string; available: boolean; commandScoped: boolean }
+/**
  * `refresh_catalog`/`catalog_status` rpc result — a thin snapshot of the
  * `catalog_feed_state` row plus counts from the cached
  * `plugin_catalog_cache` table (`crate::store::RemoteCatalogRow`). `sequence`
@@ -1990,7 +2017,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id?: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
 /**
  * A durable transcript row owned by a non-primary agent run.
  */
@@ -2017,6 +2044,14 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * "% context left" indicator).
  */
 { kind: "contextUsage"; session_pk: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; cache_creation_tokens: number; output_tokens: number } |
+/**
+ * Per-response context usage for ONE child run (ephemeral task sub-agent
+ * or delegated main agent). Run-scoped sibling of `ContextUsage`; carries
+ * NO cost buckets — cost stays session-scoped and main-agent-only. Like
+ * `ContextUsage`, its own fields stay snake_case; the enum-level
+ * `rename_all = "camelCase"` only renames the `kind` tag.
+ */
+{ kind: "agentRunContextUsage"; session_pk: string; run_id: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number } |
 /**
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
@@ -2205,7 +2240,7 @@ export type Message = { sessionPk: string; seq: number;
  * The durable agent-run owner when this row was emitted by a run. Rows
  * created outside a run (for example startup notices) remain unowned.
  */
-runId?: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
+runId: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
  * Legacy group-chat attribution retained so existing databases and event
  * payloads remain readable. New message constructors leave it unset.
@@ -2232,7 +2267,7 @@ provider: string; model: string;
  * Explicit effort policy; `None` uses the model default.
  */
 effort?: string | null }
-export type ModelRouteTargetCapability = { provider: string; model: string; supported: ReasoningEffortOption[]; providerDefault: string | null }
+export type ModelRouteTargetCapability = { provider: string; model: string; contextWindow: number; supported: ReasoningEffortOption[]; providerDefault: string | null }
 /**
  * One persisted probe verdict row across ALL families — hydrates the
  * app-wide model-status store consumed by every model picker.
@@ -2452,6 +2487,12 @@ export type QuotaWindowInfo = { label: string; used: number; total: number; rema
 export type ReasoningEffortOption = { value: string; label: string; description: string | null }
 export type RefreshModelsResult = { connectionId: string; label: string; ok: boolean; message: string }
 export type RunInfo = { id: string; status: string; startedAtMs: number; durationMs: number | null; addLines: number | null; delLines: number | null; note: string | null; error: string | null; sessionPk: string | null }
+/**
+ * One workspace search hit for the unified `@` context picker: a
+ * root-relative, forward-slash path plus whether it names a directory.
+ * Serialized camelCase for the Tauri binding (`{ path, dir }`).
+ */
+export type SearchEntryInfo = { path: string; dir: boolean }
 export type SelectableModelInfo = { kind: SelectableModelKind; requestValue: string; displayName: string; preferenceKey: ModelPreferenceKey | null; supported: ReasoningEffortOption[]; configuredDefault: string | null; resolvedDefault: string | null; defaultSource: ModelDefaultSource }
 export type SelectableModelKind = "concrete" | "namedRoute"
 export type Session = { sessionPk: string;

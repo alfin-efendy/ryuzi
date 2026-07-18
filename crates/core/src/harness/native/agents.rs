@@ -70,6 +70,15 @@ pub struct Agent {
     pub mode: AgentMode,
     /// Custom system prompt; `None` uses the runtime's assembled prompt.
     pub prompt: Option<String>,
+    /// Profile-derived personality/tone text (`AgentPersonality::prompt`),
+    /// appended as a distinct, clearly delimited identity section onto the
+    /// normal assembled system prompt for primary and delegated main-agent
+    /// turns only (populated by `adapt_primary_profile` in the parent
+    /// `native` module). Ephemeral `task`-tool sub-agents are built from
+    /// [`AgentRegistry`] entries, which never populate this field, so a
+    /// sub-agent's system prompt never carries its parent's (or any
+    /// profile's) personality.
+    pub identity_prompt: Option<String>,
     pub tools: ToolFilter,
     /// Profile-level rules evaluated before session and project overrides.
     pub permission_rules: Vec<crate::agents::types::PermissionRule>,
@@ -90,6 +99,7 @@ fn builtin_agents() -> Vec<Agent> {
             description: "Full-access engineering agent: reads, edits, runs commands.".into(),
             mode: AgentMode::Primary,
             prompt: None,
+            identity_prompt: None,
             tools: ToolFilter::All,
             permission_rules: Vec::new(),
             can_delegate: false,
@@ -106,6 +116,7 @@ fn builtin_agents() -> Vec<Agent> {
                  Present the plan as clear, ordered steps."
                     .into(),
             ),
+            identity_prompt: None,
             tools: ToolFilter::Only(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect()),
             permission_rules: Vec::new(),
             can_delegate: false,
@@ -116,6 +127,7 @@ fn builtin_agents() -> Vec<Agent> {
             description: "General-purpose sub-agent for multi-step research and edits.".into(),
             mode: AgentMode::Subagent,
             prompt: None,
+            identity_prompt: None,
             tools: ToolFilter::All,
             permission_rules: Vec::new(),
             can_delegate: false,
@@ -130,6 +142,7 @@ fn builtin_agents() -> Vec<Agent> {
                  concise findings with file paths. Do not edit files or run commands."
                     .into(),
             ),
+            identity_prompt: None,
             tools: ToolFilter::Only(
                 ["read", "ls", "glob", "grep"]
                     .iter()
@@ -259,6 +272,7 @@ fn parse_agent_markdown(name: &str, text: &str) -> Agent {
         description,
         mode,
         prompt: (!prompt.is_empty()).then(|| prompt.to_string()),
+        identity_prompt: None,
         tools,
         permission_rules: Vec::new(),
         can_delegate,

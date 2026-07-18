@@ -726,11 +726,17 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
                 description: profile.description,
                 avatar: profile.avatar,
                 model: profile.model.clone(),
+                personality: crate::agents::personality::AgentPersonality::default_profile(),
                 permissions: crate::agents::types::AgentPermissions {
                     mode: crate::domain::PermMode::AcceptEdits,
                     rules: vec![],
                 },
-                skills: vec!["release".into()],
+                // Skills must resolve in the live catalog for the primary to
+                // stay executable (validate_executable_primary now checks all
+                // four reference kinds); no skills are installed in this test,
+                // so leave it empty. The skills→allowed_skills mapping itself is
+                // covered by the adapter unit tests in harness/native/mod.rs.
+                skills: vec![],
                 tools: crate::agents::types::AgentTools {
                     native: vec!["read".into()],
                     plugins: vec![],
@@ -784,10 +790,7 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
             primary_turns[0].agent.profile.permissions.mode,
             crate::domain::PermMode::AcceptEdits
         );
-        assert_eq!(
-            primary_turns[0].allowed_skills,
-            Some(vec!["release".into()])
-        );
+        assert_eq!(primary_turns[0].allowed_skills, None);
         assert!(primary_turns[0].agent_tools.tools.allows("read"));
         assert!(!primary_turns[0].agent_tools.tools.allows("bash"));
         assert_eq!(primary_turns[0].run_id, run_id);
@@ -828,6 +831,7 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
             description: template.description,
             avatar: template.avatar,
             model: template.model,
+            personality: template.personality,
             permissions: template.permissions,
             skills: template.skills,
             tools: template.tools,
@@ -964,6 +968,7 @@ async fn explicit_mentions_keep_queue_rejection_identity_in_durable_synthesis_co
         description: template.description.clone(),
         avatar: template.avatar.clone(),
         model: template.model.clone(),
+        personality: template.personality.clone(),
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
@@ -1080,6 +1085,7 @@ async fn explicit_mentions_persist_completed_outcomes_while_a_sibling_is_pending
         description: template.description.clone(),
         avatar: template.avatar.clone(),
         model: template.model.clone(),
+        personality: template.personality.clone(),
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
@@ -1193,6 +1199,7 @@ async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_parti
         description: template.description.clone(),
         avatar: template.avatar.clone(),
         model: template.model.clone(),
+        personality: template.personality.clone(),
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
@@ -1292,6 +1299,7 @@ async fn ending_explicit_mention_parent_without_a_live_harness_cancels_children_
         description: template.description.clone(),
         avatar: template.avatar.clone(),
         model: template.model.clone(),
+        personality: template.personality.clone(),
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
@@ -1389,6 +1397,7 @@ async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run(
                 description: profile.description,
                 avatar: profile.avatar,
                 model: profile.model,
+                personality: profile.personality,
                 permissions: profile.permissions,
                 skills: profile.skills,
                 tools: crate::agents::types::AgentTools {
@@ -1413,7 +1422,7 @@ async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run(
         )
         .await
         .expect_err("native-incompatible primary must be rejected before persistence");
-    assert!(error.to_string().contains("plugin tools"));
+    assert!(error.to_string().contains("plugin tool"));
     assert!(store.list_sessions(None).await.unwrap().is_empty());
     let run_count: i64 = store
         .with_conn(|connection| {
@@ -1464,6 +1473,7 @@ async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persis
                 description: profile.description,
                 avatar: profile.avatar,
                 model: profile.model,
+                personality: profile.personality,
                 permissions: profile.permissions,
                 skills: profile.skills,
                 tools: crate::agents::types::AgentTools {
@@ -1489,7 +1499,7 @@ async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persis
         )
         .await
         .expect_err("native-incompatible primary must be rejected before a continuation mutates");
-    assert!(error.to_string().contains("plugin tools"));
+    assert!(error.to_string().contains("plugin tool"));
     assert_eq!(
         store
             .list_session_agent_runs(&session.session_pk)
@@ -1556,6 +1566,7 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
                 description: profile.description,
                 avatar: profile.avatar,
                 model: profile.model,
+                personality: profile.personality,
                 permissions: profile.permissions,
                 skills: profile.skills,
                 tools: crate::agents::types::AgentTools {
@@ -1573,7 +1584,7 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
         .resume_session("resume-invalid-primary", "test")
         .await
         .expect_err("native-incompatible primary must be rejected before resume mutations");
-    assert!(error.to_string().contains("plugin tools"));
+    assert!(error.to_string().contains("plugin tool"));
     let stored = store
         .get_session("resume-invalid-primary")
         .await
@@ -3431,6 +3442,73 @@ async fn continue_cold_resumes_when_handle_absent() {
     // Two ACP sessions created total: the initial start + the cold resume.
     assert_eq!(counters.starts.load(Ordering::SeqCst), 2);
     assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn continue_promotes_the_session_to_running() {
+    let _guard = StateDirGuard::new();
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = crate::store::Store::open(db.path()).await.unwrap();
+    let counters = Counters::default();
+    // Blocking harness: a turn stays in-flight until cancelled, so we can
+    // observe the session's status while a turn is running.
+    let cp = test_control_plane(store, registries_with(true, counters.clone())).await;
+    let store = cp.store().clone();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let project = cp.connect_project(repo.path(), "demo").await.unwrap();
+
+    // Start a session; its first (blocking) turn parks a live handle.
+    let session = cp
+        .start_session(&project.project_id, "first", "test", &[])
+        .await
+        .unwrap();
+    let handle = wait_for_running_handle(&cp, &session.session_pk).await;
+
+    // Settle the first turn back to Idle (cancel → send_prompt returns Ok →
+    // the completion arm demotes Running→Idle), then drop the live handle so
+    // the continue takes the cold-resume path onto a fresh, uncancelled handle.
+    handle.cancel().await.unwrap();
+    let mut s = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..400 {
+        if s.status == SessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        s = store
+            .get_session(&session.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(
+        s.status,
+        SessionStatus::Idle,
+        "first turn must settle to Idle"
+    );
+    cp.running.lock().unwrap().remove(&session.session_pk);
+
+    // Continue: the promotion is synchronous, and the fresh turn blocks — so
+    // the session is observably Running once continue_session returns.
+    cp.continue_session(&session.session_pk, "second", &[])
+        .await
+        .unwrap();
+    let status = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    assert_eq!(
+        status,
+        SessionStatus::Running,
+        "continue must reserve the session as Running for the turn"
+    );
 }
 
 #[tokio::test]

@@ -9,8 +9,8 @@ use crate::domain::{
 };
 use crate::harness::{HarnessSession, PrimaryTurnConfig, SessionCtx, TurnPrompt};
 use crate::mentions::{
-    coordinator_context_from_run, resolve_mentions, CoordinatorOutcome, ResolvedMentions,
-    COORDINATOR_SYNTHESIS_INSTRUCTION,
+    coordinator_context_from_run, resolve_mentions_with_catalog, CoordinatorOutcome,
+    ResolvedMentions, COORDINATOR_SYNTHESIS_INSTRUCTION,
 };
 use crate::paths::{new_id, now_ms, worktree_path_for};
 use crate::sessions::ownership::require_executable_session_agent;
@@ -54,38 +54,40 @@ impl PrimaryTurn {
     }
 }
 
-fn validate_executable_primary(
+async fn validate_executable_primary(
+    store: &crate::store::Store,
     registries: &crate::plugins::Registries,
     agent: &Arc<crate::agents::types::AgentSnapshot>,
 ) -> anyhow::Result<()> {
-    if !agent.executable {
-        let details = agent
+    let catalog = crate::agents::catalog::build_live_catalog(store, &registries.plugins).await?;
+    if !crate::agents::catalog::runtime_profile_executable(
+        &agent.profile,
+        agent.executable,
+        &catalog,
+    ) {
+        let mut details = agent
             .validation
             .iter()
-            .map(|issue| issue.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
+            .map(|issue| issue.message.clone())
+            .collect::<Vec<_>>();
+        details.extend(
+            crate::agents::catalog::AgentConfigurationCatalog::validate_profile_references(
+                &agent.profile,
+                &catalog,
+            )
+            .into_iter()
+            .map(|issue| issue.message),
+        );
         let details_suffix = if details.is_empty() {
             String::new()
         } else {
-            format!(": {details}")
+            format!(": {}", details.join("; "))
         };
         anyhow::bail!(
             "primary agent `{}` is not executable{}",
             agent.profile.id,
             details_suffix,
         );
-    }
-    for tool in &agent.profile.tools.plugins {
-        let plugin = tool.split_once('.').map_or(tool.as_str(), |(id, _)| id);
-        if registries.plugins.get(plugin).is_none() {
-            anyhow::bail!("primary agent references unavailable plugin tools: {tool}");
-        }
-    }
-    for app in &agent.profile.tools.apps {
-        if registries.plugins.get(app).is_none() {
-            anyhow::bail!("primary agent references unavailable app tools: {app}");
-        }
     }
     crate::harness::native::primary_turn_config(agent.clone(), String::new(), String::new())?;
     Ok(())
@@ -124,10 +126,19 @@ impl ControlPlane {
         let resolved_mentions = if mentions.is_empty() {
             None
         } else {
+            let catalog =
+                crate::agents::catalog::build_live_catalog(self.store(), &self.registries.plugins)
+                    .await?;
             Some(
-                resolve_mentions(&prompt.display, mentions, primary_agent_id, &self.registry)
-                    .await
-                    .map_err(anyhow::Error::from)?,
+                resolve_mentions_with_catalog(
+                    &prompt.display,
+                    mentions,
+                    primary_agent_id,
+                    &self.registry,
+                    Some(&catalog),
+                )
+                .await
+                .map_err(anyhow::Error::from)?,
             )
         };
         self.start_owned_agent_session_with_prompt(
@@ -184,7 +195,7 @@ impl ControlPlane {
             anyhow::bail!("daemon is draining for an update; try again shortly");
         }
         let primary_agent = self.registry.resolved_snapshot(primary_agent_id).await?;
-        validate_executable_primary(&self.registries, &primary_agent)?;
+        validate_executable_primary(self.store(), &self.registries, &primary_agent).await?;
         let identity = crate::domain::AgentIdentitySnapshot {
             id: primary_agent.profile.id.clone(),
             name: primary_agent.profile.name.clone(),
@@ -353,14 +364,23 @@ impl ControlPlane {
         let agent_id =
             require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&self.registries, &primary_agent)?;
+        validate_executable_primary(self.store(), &self.registries, &primary_agent).await?;
         let resolved_mentions = if mentions.is_empty() {
             None
         } else {
+            let catalog =
+                crate::agents::catalog::build_live_catalog(self.store(), &self.registries.plugins)
+                    .await?;
             Some(
-                resolve_mentions(&prompt.display, mentions, &agent_id, &self.registry)
-                    .await
-                    .map_err(anyhow::Error::from)?,
+                resolve_mentions_with_catalog(
+                    &prompt.display,
+                    mentions,
+                    &agent_id,
+                    &self.registry,
+                    Some(&catalog),
+                )
+                .await
+                .map_err(anyhow::Error::from)?,
             )
         };
         let run = self
@@ -395,7 +415,7 @@ impl ControlPlane {
         let agent_id =
             require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&self.registries, &primary_agent)?;
+        validate_executable_primary(self.store(), &self.registries, &primary_agent).await?;
         let run = self
             .delegation
             .begin_primary(session_pk, primary_agent.clone(), &prompt.display)
@@ -715,8 +735,8 @@ impl ControlPlane {
     }
 
     /// Deliver a queue row whose claim already promoted the session to Running.
-    /// It creates exactly one Plan4 primary run and does not repeat the
-    /// ordinary continuation's status reservation.
+    /// It creates exactly one Plan4 primary run; the shared continuation helper's
+    /// `promote_if_idle` no-ops here because the claim already reserved `Running`.
     async fn continue_reserved_session_with_prompt(
         self: &Arc<Self>,
         session_pk: &str,
@@ -729,7 +749,7 @@ impl ControlPlane {
         let agent_id =
             require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&self.registries, &primary_agent)?;
+        validate_executable_primary(self.store(), &self.registries, &primary_agent).await?;
         let run = self
             .delegation
             .begin_primary(session_pk, primary_agent.clone(), &prompt.display)
@@ -768,6 +788,15 @@ impl ControlPlane {
 
         let primary_config = primary_turn.config()?;
         let run_id = primary_turn.run_id.clone();
+
+        // Reserve the session as Running for the lifetime of this turn so the
+        // sidebar spinner shows and the composer offers Stop. Atomic Idle→Running
+        // only (mirrors `claim_next_session_prompt_if_idle`), so a concurrent stop
+        // (Interrupted) is never clobbered. Any early exit before a turn is
+        // actually spawned demotes it back (cold-resume failure below; the
+        // dispatch_turn coordinator error paths); the normal turn end demotes it
+        // in `spawn_prompt`.
+        let _ = self.store.promote_if_idle(session_pk, now_ms()).await;
 
         // A session still in background startup has no live handle yet, and its
         // FIRST prompt hasn't been driven. Cold-resuming now would spawn a
@@ -1223,7 +1252,7 @@ impl ControlPlane {
         let agent_id =
             require_executable_session_agent(&self.store, &self.registry, session_pk).await?;
         let primary_agent = self.registry.resolved_snapshot(&agent_id).await?;
-        validate_executable_primary(&self.registries, &primary_agent)?;
+        validate_executable_primary(self.store(), &self.registries, &primary_agent).await?;
         if session.agent_session_id.is_none() {
             self.store
                 .update_status(session_pk, SessionStatus::Idle, None)
@@ -1657,6 +1686,7 @@ impl ControlPlane {
             agent_knowledge: self.agent_persistence.knowledge.clone(),
             learning_queue: self.agent_persistence.learning.clone(),
             store: self.store.clone(),
+            telemetry: self.telemetry.clone(),
             app_control,
         };
 
@@ -1803,6 +1833,7 @@ impl ControlPlane {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             if me.delegation.mark_running(&run_id).await.is_err() {
+                let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 return;
             }
             let queued =
@@ -1870,9 +1901,11 @@ impl ControlPlane {
             .await;
             if let Some(error) = outcomes.into_iter().find_map(Result::err) {
                 let _ = me.delegation.fail(&run_id, &error.to_string()).await;
+                let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 return;
             }
             if coordinator_cancelled(&me.store, &session_pk, &run_id).await {
+                let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                 return;
             }
             let context = match coordinator_context_from_run(&me.store, &session_pk, &run_id).await
@@ -1881,6 +1914,7 @@ impl ControlPlane {
                 Err(error) => {
                     let message = error.to_string();
                     let _ = me.delegation.fail(&run_id, &message).await;
+                    let _ = me.store.demote_if_running(&session_pk, now_ms()).await;
                     return;
                 }
             };
@@ -2182,10 +2216,13 @@ impl ControlPlane {
             .filter(|run| run.parent_run_id.is_none() && run.status.is_active())
             .collect::<Vec<_>>();
         for root in roots {
-            let _ = self
+            if let Err(error) = self
                 .delegation
                 .cancel_descendants_of_root(session_pk, &root.run_id)
-                .await;
+                .await
+            {
+                tracing::warn!(%error, run_id = %root.run_id, "stop_session: failed to cancel descendants");
+            }
             let _ = self
                 .delegation
                 .interrupt(&root.run_id, "session stopped")

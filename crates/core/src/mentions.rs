@@ -151,6 +151,16 @@ pub async fn resolve_mentions(
     primary_agent_id: &str,
     registry: &crate::agents::registry::AgentRegistry,
 ) -> Result<ResolvedMentions, MentionError> {
+    resolve_mentions_with_catalog(text, mentions, primary_agent_id, registry, None).await
+}
+
+pub async fn resolve_mentions_with_catalog(
+    text: &str,
+    mentions: &[AgentMention],
+    primary_agent_id: &str,
+    registry: &crate::agents::registry::AgentRegistry,
+    catalog: Option<&crate::agents::catalog::AgentConfigurationCatalog>,
+) -> Result<ResolvedMentions, MentionError> {
     let mut boundaries = vec![Some(0usize)];
     for (byte, character) in text.char_indices() {
         if byte != 0 {
@@ -217,7 +227,15 @@ pub async fn resolve_mentions(
             .map_err(|_| MentionError::Unknown {
                 agent_id: mention.agent_id.clone(),
             })?;
-        if !target.executable {
+        if !target.executable
+            || catalog.is_some_and(|catalog| {
+                !crate::agents::catalog::runtime_profile_executable(
+                    &target.profile,
+                    target.executable,
+                    catalog,
+                )
+            })
+        {
             return Err(MentionError::NonExecutable {
                 agent_id: mention.agent_id.clone(),
             });
@@ -307,6 +325,7 @@ async fn registry() -> (
         description: template.description.clone(),
         avatar: template.avatar.clone(),
         model: template.model.clone(),
+        personality: template.personality.clone(),
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),

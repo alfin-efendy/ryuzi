@@ -54,7 +54,9 @@ impl ContextManager {
             .clone()
             .unwrap_or_else(|| DEFAULT_COMPACT_PROMPT.to_string());
 
-        let mut working: Vec<Value> = self.ledger.messages();
+        let mut working: Vec<Value> = self
+            .ledger
+            .messages_for_request_for_version(self.cfg().native_tools_version);
 
         // Pre-trim: the summarize request itself must fit the usable window
         // (spec §7.2 step 1) — rewrite oversized old tool_results first.
@@ -177,7 +179,10 @@ fn build_replacement(messages: &[Value], summary: &str) -> Vec<Value> {
         let cost = estimate_tokens(m);
         if cost <= budget {
             budget -= cost;
-            retained.push(m.clone()); // full clone: attachments retained
+            // Strip any tool_result folded in by sanitize_tool_pairing: all
+            // tool_use turns are dropped here, so keeping a tool_result would
+            // orphan it in the replacement. Text/image (attachments) survive.
+            retained.push(strip_tool_results(m));
         } else if budget > 100 {
             let max_bytes = (budget as usize) * 4;
             let truncated = super::truncate_for_context(text, max_bytes);
@@ -201,6 +206,25 @@ fn build_replacement(messages: &[Value], summary: &str) -> Vec<Value> {
     retained
 }
 
+/// A user turn with its `tool_result` blocks removed. `build_replacement`
+/// drops every assistant turn (so all `tool_use` blocks vanish); a `tool_result`
+/// that `sanitize_tool_pairing` folded into a retained user turn would otherwise
+/// be left orphaned in the compacted history and 400 the next request. Text and
+/// image blocks (attachments) are preserved.
+fn strip_tool_results(m: &Value) -> Value {
+    let content: Vec<Value> = m["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] != "tool_result")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "role": "user", "content": content })
+}
+
 /// The text of the first `"type": "text"` block in a content array, if any.
 fn first_text_block(content: &Value) -> Option<&str> {
     content
@@ -215,7 +239,9 @@ mod tests {
     use super::*;
     use crate::harness::native::context_manager::{ContextConfig, ContextManager};
     use crate::harness::native::llm::LlmStream;
-    use crate::harness::native::runner::testutil::{message_stop, text_delta, ScriptedLlm};
+    use crate::harness::native::runner::testutil::{
+        message_stop, text_delta, RecordingLlm, ScriptedLlm,
+    };
     use crate::llm_router::model_meta::ModelMeta;
     use serde_json::json;
     use std::sync::Arc;
@@ -468,5 +494,108 @@ mod tests {
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"][0]["type"], "text");
         assert_eq!(msgs[0]["content"][0]["text"], "u1");
+    }
+
+    #[tokio::test]
+    async fn compaction_request_repairs_dangling_tool_use() {
+        // History with a dangling tool_use: an assistant tool_use whose
+        // tool_result was never appended (interrupted turn), followed by a
+        // plain user turn — the "poisoned" shape sanitize_tool_pairing repairs.
+        let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(meta()));
+        cm.append_user(json!([{"type":"text","text":"start task"}]))
+            .await
+            .unwrap();
+        cm.append_assistant(json!([{"type":"tool_use","id":"tu-1","name":"bash","input":{}}]))
+            .await
+            .unwrap();
+        cm.append_user(json!([{"type":"text","text":"keep going"}]))
+            .await
+            .unwrap();
+
+        let rec = std::sync::Arc::new(RecordingLlm::new(vec![vec![
+            text_delta("summary"),
+            message_stop(),
+        ]]));
+        let llm: Arc<dyn LlmStream> = rec.clone();
+        cm.compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
+
+        // Inspect the summarize request body: every tool_use id must have a
+        // matching tool_result somewhere in the messages array.
+        let bodies = rec.bodies.lock().unwrap();
+        let msgs = bodies[0]["messages"].as_array().unwrap();
+        let mut uses = std::collections::HashSet::new();
+        let mut results = std::collections::HashSet::new();
+        for m in msgs {
+            if let Some(blocks) = m["content"].as_array() {
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("tool_use") => {
+                            uses.insert(b["id"].as_str().unwrap().to_string());
+                        }
+                        Some("tool_result") => {
+                            results.insert(b["tool_use_id"].as_str().unwrap().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(
+            uses.contains("tu-1"),
+            "the tool_use is present in the request"
+        );
+        assert!(
+            results.contains("tu-1"),
+            "the dangling tool_use must be repaired before the summarize request is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_replacement_has_no_orphaned_tool_result() {
+        // Interrupted turn: assistant tool_use with no tool_result, then a user
+        // message. After compaction, the history the NEXT request would send must
+        // be tool-pairing valid — no tool_result left without its tool_use.
+        let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(meta()));
+        cm.append_user(json!([{"type":"text","text":"start task"}]))
+            .await
+            .unwrap();
+        cm.append_assistant(json!([{"type":"tool_use","id":"tu-1","name":"bash","input":{}}]))
+            .await
+            .unwrap();
+        cm.append_user(json!([{"type":"text","text":"keep going"}]))
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmStream> = Arc::new(ScriptedLlm::new(vec![vec![
+            text_delta("summary"),
+            message_stop(),
+        ]]));
+        cm.compact(&llm, "test/model", "manual", policy())
+            .await
+            .unwrap();
+
+        let msgs = cm.messages_for_request();
+        let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in &msgs {
+            if let Some(blocks) = m["content"].as_array() {
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("tool_use") => {
+                            open.insert(b["id"].as_str().unwrap().to_string());
+                        }
+                        Some("tool_result") => {
+                            let id = b["tool_use_id"].as_str().unwrap();
+                            assert!(
+                                open.contains(id),
+                                "orphaned tool_result {id} in compacted history: {msgs:?}"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }

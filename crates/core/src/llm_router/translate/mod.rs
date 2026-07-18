@@ -213,10 +213,14 @@ pub fn anthropic_to_openai_request(body: &Value) -> anyhow::Result<Value> {
         let mapped: Vec<Value> = tools
             .iter()
             .map(|t| {
-                json!({"type": "function", "function": {
+                let mut function = json!({
                     "name": t["name"], "description": t["description"],
                     "parameters": t["input_schema"],
-                }})
+                });
+                if let Some(strict) = t.get("strict") {
+                    function["strict"] = strict.clone();
+                }
+                json!({"type": "function", "function": function})
             })
             .collect();
         out.insert("tools".into(), Value::Array(mapped));
@@ -826,6 +830,64 @@ mod tests {
         assert_eq!(out["tool_choice"], "auto");
         assert!(out.get("system").is_none());
         assert!(out.get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn anthropic_strict_function_preserves_schema_and_marker_for_openai_chat() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {"action": {"enum": ["read"]}},
+                            "required": ["action"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"action": {"enum": ["write"]}},
+                            "required": ["action"],
+                            "additionalProperties": false
+                        }
+                    ]
+                }
+            },
+            "required": ["operation"],
+            "additionalProperties": false
+        });
+        let req = json!({
+            "model": "configured-model",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [{
+                "name": "memory_batch",
+                "description": "Apply memory operations atomically",
+                "input_schema": schema,
+                "strict": true
+            }]
+        });
+
+        let out = anthropic_to_openai_request(&req).unwrap();
+        let function = &out["tools"][0]["function"];
+        assert_eq!(function["parameters"], schema);
+        assert_eq!(function["strict"], true);
+        assert!(function["parameters"]["properties"]["operation"]
+            .get("oneOf")
+            .is_none());
+        assert_eq!(
+            function["parameters"]["properties"]["operation"]["anyOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut other_model = req;
+        other_model["model"] = json!("other-opaque-model");
+        let other = anthropic_to_openai_request(&other_model).unwrap();
+        assert_eq!(other["tools"], out["tools"]);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::error::CmdError;
 use std::sync::Arc;
 use tauri::State;
 
-pub use ryuzi_core::api::fsview_api::{DirEntryInfo, MediaFile, WorktreeState};
+pub use ryuzi_core::api::fsview_api::{DirEntryInfo, MediaFile, SearchEntryInfo, WorktreeState};
 
 type R<T> = Result<T, CmdError>;
 type Engine<'a> = State<'a, Arc<EngineManager>>;
@@ -108,7 +108,7 @@ pub async fn search_files(
     runner_id: Option<String>,
     project_id: String,
     query: String,
-) -> R<Vec<String>> {
+) -> R<Vec<SearchEntryInfo>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client
         .rpc(

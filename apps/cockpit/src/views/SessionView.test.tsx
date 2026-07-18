@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { AgentSummaryInfo, CmdError, CommandInfo, OpenTarget, Project, Result, Session } from "@/bindings";
+import type { AgentSummaryInfo, CmdError, CommandInfo, OpenTarget, Project, Result, SearchEntryInfo, Session } from "@/bindings";
 import { LOCAL_RUNNER, refKey, sessKey } from "@/lib/session-key";
 import { useNative } from "@/store-native";
 
@@ -54,7 +54,22 @@ const fetchAttachment = mock(() => Promise.resolve({ status: "ok" as const, data
 const listProjects = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Project[] }));
 const listSessions = mock(() => Promise.resolve({ status: "ok" as const, data: [] as Session[] }));
 const listGateways = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
-const searchFiles = mock(() => Promise.resolve({ status: "ok" as const, data: [] as string[] }));
+// Default fixture for the unified `@` context picker's debounced workspace
+// search: one matching folder, one matching file, both containing "session"
+// so `@session` queries below exercise a real (non-empty) Folders/Files
+// match without colliding with the seeded project name ("demo") or agent
+// ("Ada"). `beforeEach` reinstates this default implementation after every
+// test via `mockReset` + `mockImplementation` so a test that overrides it
+// (e.g. with `mockResolvedValueOnce`) never leaks into a later one.
+const DEFAULT_SEARCH_ENTRIES: SearchEntryInfo[] = [
+  { path: "src/session", dir: true },
+  { path: "src/views/SessionView.tsx", dir: false },
+];
+const searchFiles = mock<
+  (
+    ...args: Parameters<typeof import("@/bindings").commands["searchFiles"]>
+  ) => ReturnType<typeof import("@/bindings").commands["searchFiles"]>
+>(() => Promise.resolve({ status: "ok" as const, data: DEFAULT_SEARCH_ENTRIES }));
 const getChildRuns = mock(() =>
   Promise.resolve({
     status: "ok" as const,
@@ -251,7 +266,8 @@ beforeEach(() => {
   listProjects.mockClear();
   listSessions.mockClear();
   listGateways.mockClear();
-  searchFiles.mockClear();
+  searchFiles.mockReset();
+  searchFiles.mockImplementation(() => Promise.resolve({ status: "ok" as const, data: DEFAULT_SEARCH_ENTRIES }));
   getChildRuns.mockClear();
   getChildTranscript.mockClear();
 });
@@ -601,6 +617,161 @@ test("session mention metadata stays with its draft when switching sessions", as
   );
 });
 
+test("session `@` opens the unified picker with Project/Agents immediately, then Folders/Files once the debounced search resolves", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@", selectionStart: 1 } });
+
+  // Project and Agents come from local state (project/registry props already
+  // in memory) and render on the very first pass, before the 120ms debounced
+  // `searchFiles` call has any chance to resolve.
+  const menu = screen.getByRole("menu");
+  expect(menu.textContent).toContain("Project");
+  expect(menu.textContent).toContain("Agents");
+  expect(screen.queryByText("Folders")).toBeNull();
+  expect(screen.queryByText("Files")).toBeNull();
+
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", ""));
+  await waitFor(() => expect(screen.getByText("Folders")).toBeTruthy());
+  expect(screen.getByText("Files")).toBeTruthy();
+});
+
+test("session `@session` matches only Folders/Files (project/agent don't match) and Enter selects the folder token", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@session", selectionStart: 8 } });
+
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "session"));
+  await waitFor(() => expect(screen.getByText("Folders")).toBeTruthy());
+  expect(screen.getByText("Files")).toBeTruthy();
+  // Neither the project ("demo") nor Ada match "session" — their sections
+  // never appear in the flattened menu.
+  expect(screen.queryByText("Project")).toBeNull();
+  expect(screen.queryByText("Agents")).toBeNull();
+  expect(screen.queryByText("demo")).toBeNull();
+  expect(screen.queryByText("Ada")).toBeNull();
+
+  // Folders sort ahead of Files (`contextPickerGroups`), so the flattened
+  // index 0 that a bare Enter picks is the "src/session" folder, not the
+  // "SessionView.tsx" file.
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("@src/session ");
+});
+
+test("session `@` then Enter selects the Project item (flattened index 0) and its reference doesn't leak into context.references", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@", selectionStart: 1 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+
+  // Project sorts first (`contextPickerGroups`), so a bare Enter at the
+  // default pickerIndex (0) picks it, not an Agent or workspace entry.
+  fireEvent.keyDown(composer, { key: "Enter" });
+  expect(composer.value).toBe("@demo ");
+
+  // Picking an item replaces the composer's value, but jsdom/happy-dom
+  // doesn't synthesize the browser's own caret-to-end move that follows a
+  // programmatic value change — a real browser would fire a `select` event
+  // there. Without it, the stale caret (still inside the now-replaced `@`
+  // token) would make `activeContextQuery` see the old token as still
+  // active and reopen the picker instead of letting the next Enter submit.
+  fireEvent.select(composer, { target: { selectionStart: composer.value.length } });
+  fireEvent.keyDown(composer, { key: "Enter" });
+
+  await waitFor(() =>
+    expect(continueSession).toHaveBeenCalledWith(
+      LOCAL_RUNNER,
+      "s1",
+      expect.objectContaining({ context: expect.objectContaining({ references: [] }) }),
+    ),
+  );
+});
+
+test("session unified context search error preserves Project/Agents but drops Folders/Files", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  searchFiles.mockImplementation(() => Promise.resolve({ status: "error" as const, error: { message: "search failed" } }));
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@", selectionStart: 1 } });
+
+  const menu = screen.getByRole("menu");
+  expect(menu.textContent).toContain("Project");
+  expect(menu.textContent).toContain("Agents");
+
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", ""));
+  expect(screen.queryByText("Folders")).toBeNull();
+  expect(screen.queryByText("Files")).toBeNull();
+  expect(screen.getByRole("menu").textContent).toContain("Project");
+  expect(screen.getByRole("menu").textContent).toContain("Agents");
+});
+
+test("session `@` query with no matches shows a compact no-results panel and Enter still submits (not intercepted)", async () => {
+  const send = mock(async () => true);
+  useStore.setState({ send });
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  searchFiles.mockImplementation(() => Promise.resolve({ status: "ok" as const, data: [] }));
+  render(<SessionView />);
+
+  // "@zzz" matches neither the project ("demo") nor Ada, and the debounced
+  // workspace search below is stubbed empty — the flattened picker has no
+  // items, so the full ContextPickerMenu never renders, only the compact
+  // no-results panel.
+  const composer = (await screen.findByPlaceholderText("Ask for follow-up changes")) as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: "@zzz", selectionStart: 4 } });
+
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "zzz"));
+  await waitFor(() => expect(screen.getByText("No matches.")).toBeTruthy());
+  expect(screen.queryByRole("menu")).toBeNull();
+
+  // Enter must not be swallowed by the no-results panel — with no pickable
+  // items it falls through to the normal submit path.
+  fireEvent.keyDown(composer, { key: "Enter" });
+  await waitFor(() => expect(send).toHaveBeenCalled());
+});
+
+test("session Escape closes the unified context menu and it stays closed once the debounced search resolves", async () => {
+  seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
+    primary("primary"),
+    { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
+  ]);
+  render(<SessionView />);
+
+  const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
+  fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
+  expect(screen.getByRole("menu")).toBeTruthy();
+
+  fireEvent.keyDown(composer, { key: "Escape" });
+  expect(screen.queryByRole("menu")).toBeNull();
+
+  // The debounced `searchFiles` call still fires and resolves for the
+  // already-dismissed query — the dismissal (keyed by draft + token start)
+  // must survive that resolution instead of popping the menu back open.
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "a"));
+  expect(screen.queryByRole("menu")).toBeNull();
+});
+
 test("session textarea Escape closes the agent mention popup", async () => {
   seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
     primary("primary"),
@@ -615,7 +786,7 @@ test("session textarea Escape closes the agent mention popup", async () => {
   expect(screen.queryByRole("menu")).toBeNull();
 });
 
-test("session plain agent @ mentions open the agent menu instead of searching context", async () => {
+test("session plain agent @ mentions open the agent menu immediately and still trigger the unified context search", async () => {
   seed(LOCAL_RUNNER, { primaryAgentId: "primary", primaryAgentSnapshot: { id: "primary", name: "Primary", avatarColor: "violet" } }, [
     primary("primary"),
     { ...primary("ada"), name: "Ada", description: "Accessibility reviewer" },
@@ -625,8 +796,12 @@ test("session plain agent @ mentions open the agent menu instead of searching co
   const composer = await screen.findByPlaceholderText("Ask for follow-up changes");
   fireEvent.change(composer, { target: { value: "@a", selectionStart: 2 } });
 
+  // Project/Agents render synchronously off local state — no need to wait.
   expect(screen.getByRole("menu").textContent).toContain("Agents");
-  expect(searchFiles).not.toHaveBeenCalled();
+  // The unified picker's `@` handling no longer special-cases a plain agent
+  // query: the debounced workspace search still fires for it (query "a"),
+  // it just doesn't have any matching folders/files to add once it resolves.
+  await waitFor(() => expect(searchFiles).toHaveBeenCalledWith(LOCAL_RUNNER, "p1", "a"));
 });
 
 test("session composer selects an agent mention from its keyboard menu", async () => {

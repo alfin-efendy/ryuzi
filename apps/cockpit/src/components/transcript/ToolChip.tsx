@@ -27,6 +27,7 @@ import {
   isAgentDispatchTool,
   partitionActivity,
   toolCardHeader,
+  toolCommand,
   type ActivityFragment,
   type ActivityItem,
 } from "@/lib/transcript";
@@ -118,9 +119,13 @@ export function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "
   // TurnSummary) mount with live=false and start collapsed.
   const [open, setOpen] = useState(live);
   const Icon = (item.kind && kindIcon[item.kind]) || Wrench;
-  const { title, detail } = toolCardHeader(item);
+  const isBash = item.kind === "execute";
+  const command = isBash ? toolCommand(item.input) : null;
+  const { title, detail: rawDetail } = toolCardHeader(item);
+  // The bash command moves to the body; keep only label + badges in the header.
+  const detail = isBash ? null : rawDetail;
   const duration = formatToolDuration(item.durationMs);
-  const expandable = !!item.output;
+  const expandable = !!item.output || command !== null;
   const openWorkspaceFile = useOpenWorkspaceFile();
   const fileCtx = useContext(TranscriptFileContext);
   // Trusted arg path (no probe): clickable when a provider is present and the
@@ -135,7 +140,6 @@ export function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "
   );
   const trailing = (
     <>
-      {item.subagent !== null && <Badge>{item.subagent}</Badge>}
       {duration !== "" && <Badge>{duration}</Badge>}
       {item.exitCode !== null && <Badge tone={item.exitCode === 0 ? "muted" : "error"}>exit {item.exitCode}</Badge>}
       <StatusMark status={item.status} />
@@ -219,6 +223,13 @@ export function ToolChip({ item, live }: { item: Extract<ActivityItem, { type: "
   return (
     <div className="acrylic-panel flex w-full max-w-[640px] flex-col overflow-hidden rounded-md border border-border">
       {headerNode}
+      {open && command !== null && (
+        <div className="chat-md border-t border-border">
+          <pre className="overflow-x-auto px-3 py-2 text-xs" style={{ margin: 0, border: "none", borderRadius: 0 }}>
+            <code className="hljs">{`$ ${command}`}</code>
+          </pre>
+        </div>
+      )}
       {open && item.output && <OutputBlock text={item.output} />}
     </div>
   );

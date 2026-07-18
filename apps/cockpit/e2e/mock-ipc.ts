@@ -363,6 +363,7 @@ export const RYUZI_DETAIL = {
   maxTurns: 40,
   maxToolRounds: 12,
   modelInfo: null,
+  personality: { preset: "helpful", custom: null },
 } satisfies AgentDetailInfo;
 
 export const REVIEWER_DETAIL = {
@@ -375,6 +376,7 @@ export const REVIEWER_DETAIL = {
   maxTurns: 40,
   maxToolRounds: 12,
   modelInfo: null,
+  personality: { preset: "helpful", custom: null },
 } satisfies AgentDetailInfo;
 
 /** `get_agent` is dispatched dynamically by `agentId` (see installMockIPC's
@@ -417,6 +419,9 @@ export const DELEGATE_ACTIVE_RUN = {
   resolvedEffort: "high",
   result: null,
   error: null,
+  contextActiveTokens: null,
+  contextUsableWindow: null,
+  contextPercentLeft: null,
 } satisfies AgentRun;
 
 export const DELEGATE_DONE_RUN = {
@@ -439,6 +444,9 @@ export const DELEGATE_DONE_RUN = {
   resolvedEffort: null,
   result: "All tests passed.",
   error: null,
+  contextActiveTokens: null,
+  contextUsableWindow: null,
+  contextPercentLeft: null,
 } satisfies AgentRun;
 
 export const REVIEWER_CHILD_TRANSCRIPT = [
@@ -534,8 +542,14 @@ export const DELETED_OWNER_MESSAGE = {
  * Route tab's target picker (routeTargetOptions) resolves two real targets
  * without any per-test override. */
 export const ROUTE_TARGET_CAPABILITIES = [
-  { provider: "fixture", model: "model-alpha", supported: [{ value: "high", label: "High", description: null }], providerDefault: null },
-  { provider: "fixture", model: "model-beta", supported: [], providerDefault: null },
+  {
+    provider: "fixture",
+    model: "model-alpha",
+    contextWindow: 128000,
+    supported: [{ value: "high", label: "High", description: null }],
+    providerDefault: null,
+  },
+  { provider: "fixture", model: "model-beta", contextWindow: 128000, supported: [], providerDefault: null },
 ] satisfies ModelRouteTargetCapability[];
 
 /** Tauri command → resolved value (Result-typed commands get the raw data). */

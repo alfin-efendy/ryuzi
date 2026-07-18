@@ -2,11 +2,12 @@ import { beforeEach, expect, test } from "bun:test";
 import { useStore } from "./store";
 import type { CoreEvent } from "./bindings";
 import { LOCAL_RUNNER, sessKey } from "@/lib/session-key";
+import { delegationRunKey } from "@/store-delegation";
 
 const key = sessKey(LOCAL_RUNNER, "s1");
 
 beforeEach(() => {
-  useStore.setState({ contextUsage: {}, sessionCost: {} });
+  useStore.setState({ contextUsage: {}, sessionCost: {}, runContextUsage: {} });
 });
 
 test("contextUsage keeps window + cache + output fields", () => {
@@ -48,6 +49,29 @@ test("sessionCost stores the total and per-model breakdown", () => {
   const c = useStore.getState().sessionCost[key];
   expect(c.totalUsd).toBe(0.1234);
   expect(c.models[0].model).toBe("claude-sonnet-4");
+});
+
+test("agentRunContextUsage stores per-run usage without touching session usage", () => {
+  useStore.setState({ contextUsage: {}, runContextUsage: {} });
+  useStore.getState().applyCoreEvent(
+    {
+      kind: "agentRunContextUsage",
+      session_pk: "s1",
+      run_id: "run-1",
+      active_tokens: 4_000,
+      context_window: 200_000,
+      usable_window: 120_000,
+      percent_left: 60,
+    } as CoreEvent,
+    LOCAL_RUNNER,
+  );
+  expect(useStore.getState().runContextUsage[delegationRunKey(LOCAL_RUNNER, "s1", "run-1")]).toEqual({
+    activeTokens: 4_000,
+    usableWindow: 120_000,
+    percentLeft: 60,
+  });
+  // The session-level ring must NOT be affected by a run-scoped event.
+  expect(useStore.getState().contextUsage[key]).toBeUndefined();
 });
 
 test("contextCompacted is a safe no-op for store state", () => {

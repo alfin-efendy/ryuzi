@@ -64,6 +64,9 @@ function childRun({ sourceToolCallId = null, dispatchIndex = null, ...overrides 
     resolvedEffort: null,
     result: "Child findings",
     error: null,
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }
@@ -391,6 +394,7 @@ test("switching runners, sessions, and full detail resets the selected child run
         {
           seq: 1,
           sessionPk: "session-a",
+          runId,
           role: "assistant",
           blockType: "text",
           payload: { text: `Live transcript for ${runId}` },

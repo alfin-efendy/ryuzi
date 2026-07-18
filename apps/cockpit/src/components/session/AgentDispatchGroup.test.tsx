@@ -33,6 +33,9 @@ function run(overrides: Partial<AgentRun> = {}): AgentRun {
     resolvedEffort: "high",
     result: null,
     error: null,
+    contextActiveTokens: null,
+    contextUsableWindow: null,
+    contextPercentLeft: null,
     ...overrides,
   };
 }
@@ -41,6 +44,7 @@ function message(overrides: Partial<Message> = {}): Message {
   return {
     sessionPk,
     seq: 1,
+    runId: null,
     role: "assistant",
     blockType: "tool_call",
     payload: { name: "read", input: { path: "README.md" } },

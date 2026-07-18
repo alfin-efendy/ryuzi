@@ -2,6 +2,7 @@ import { Bot, CircleAlert, Clock3, Wrench } from "lucide-react";
 import { Button } from "@ryuzi/ui";
 import type { AgentRun } from "@/bindings";
 import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel, type AgentRunPreviewModel } from "@/lib/agent-runs";
+import { useNow } from "@/hooks/useNow";
 import { AgentRunPreview } from "./AgentRunPreview";
 
 export type AgentRunCardProps = {
@@ -21,7 +22,8 @@ function terminalFallback(run: AgentRun): string | null {
 
 /** Compact card for the current attempt in one durable dispatch slot. */
 export function AgentRunCard({ run, attemptNumber, preview, selected, onSelect }: AgentRunCardProps) {
-  const duration = formatAgentRunDuration(run);
+  const now = useNow(run.status === "running");
+  const duration = formatAgentRunDuration(run, now);
   const detail = run.status === "running" ? null : (preview.excerpt ?? terminalFallback(run));
   const metadata = [`${run.toolCount} ${run.toolCount === 1 ? "tool" : "tools"}`, duration, run.resolvedModel, run.resolvedEffort].filter(
     (value): value is string => Boolean(value),

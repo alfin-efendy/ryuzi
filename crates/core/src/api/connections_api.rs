@@ -1357,6 +1357,7 @@ mod tests {
             vec!["low", "medium", "high", "max", "xhigh"]
         );
         assert_eq!(capability.provider_default.as_deref(), Some("high"));
+        assert_eq!(capability.context_window, 1_000_000);
     }
 
     #[test]

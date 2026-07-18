@@ -34,6 +34,7 @@ const reviewerDetail: AgentDetailInfo = {
   maxTurns: 50,
   maxToolRounds: 100,
   modelInfo: null,
+  personality: { preset: "helpful", custom: null },
 };
 
 const registry: AgentRegistryInfo = {

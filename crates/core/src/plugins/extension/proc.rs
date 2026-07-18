@@ -1442,12 +1442,19 @@ pub(crate) struct ToolProvisionEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::plugins::host::{CorePlugin, PluginSource};
+    #[cfg(unix)]
     use crate::settings::SettingsStore;
+    #[cfg(unix)]
     use crate::store::Store;
+    #[cfg(unix)]
     use async_trait::async_trait;
+    #[cfg(unix)]
     use ryuzi_plugin_sdk::PluginManifest;
+    #[cfg(unix)]
     use serial_test::serial;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     /// Generous per-call budget for the in-memory-duplex tests below — long
@@ -1457,6 +1464,7 @@ mod tests {
     /// regression, not test flakiness.
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+    #[cfg(unix)]
     fn spec(name: &str, command: &str, args: &[&str]) -> ExtensionSpec {
         ExtensionSpec {
             name: name.to_string(),
@@ -1791,10 +1799,12 @@ mod tests {
 
     // ---------- ExtensionHost: gating + aggregate spawn/shutdown ----------
 
+    #[cfg(unix)]
     struct FakeExtensionFactory {
         specs: Vec<ExtensionSpec>,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl super::super::ExtensionFactory for FakeExtensionFactory {
         async fn extensions(&self, _ctx: &ExtensionCtx) -> anyhow::Result<Vec<ExtensionSpec>> {
@@ -1802,6 +1812,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
             contract: 1,
@@ -1825,6 +1836,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn extension_only(id: &str, specs: Vec<ExtensionSpec>) -> CorePlugin {
         CorePlugin {
             manifest: manifest(id),
@@ -1836,6 +1848,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn open_ctx() -> (ExtensionCtx, Arc<Store>, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(Store::open(tmp.path()).await.unwrap());
@@ -1910,6 +1923,7 @@ mod tests {
     /// (`parse_ping_response` only requires no `error`), so this one loop
     /// alone is a complete, indefinitely-healthy fake extension — see
     /// [`ack_forever_spec`].
+    #[cfg(unix)]
     fn ack_forever_body() -> &'static str {
         "while IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"ok\":true}}\\n' \"$id\"; done"
     }
@@ -1924,6 +1938,7 @@ mod tests {
     /// Optionally appends a byte to `attempt_log` on every invocation so a
     /// test can prove exactly how many times this command was spawned (each
     /// restart is a fresh OS process) — see [`attempt_count`].
+    #[cfg(unix)]
     fn ack_forever_spec(name: &str, attempt_log: Option<&std::path::Path>) -> ExtensionSpec {
         let log_line = attempt_log
             .map(|p| format!("printf 'x' >> '{}'; ", p.display()))
@@ -1936,6 +1951,7 @@ mod tests {
     /// and then exits immediately (closing its stdout) — simulates a crash
     /// right after a successful startup. Appends to `attempt_log` like
     /// [`ack_forever_spec`].
+    #[cfg(unix)]
     fn dies_after_handshake_spec(name: &str, attempt_log: &std::path::Path) -> ExtensionSpec {
         let body = format!(
             "printf 'x' >> '{}'; IFS= read -r line; id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"ok\":true,\"events\":[]}}}}\\n' \"$id\"",
@@ -1948,6 +1964,7 @@ mod tests {
     /// then exits immediately without ever answering the handshake — so
     /// `spawn_and_handshake` always resolves `Failed` (`InitError::Closed`),
     /// never `Running`, on every attempt (initial AND every restart).
+    #[cfg(unix)]
     fn always_fails_after_spawning_spec(
         name: &str,
         attempt_log: &std::path::Path,
@@ -1960,10 +1977,12 @@ mod tests {
     /// `spawn_and_handshake` attempt fails at the OS `spawn()` call itself
     /// (before any subprocess ever runs), simulating a permanently broken
     /// extension.
+    #[cfg(unix)]
     fn never_spawns_spec(name: &str) -> ExtensionSpec {
         spec(name, "ryuzi-dt4-test-nonexistent-command-xyz", &[])
     }
 
+    #[cfg(unix)]
     fn attempt_count(path: &std::path::Path) -> usize {
         std::fs::read_to_string(path).map(|s| s.len()).unwrap_or(0)
     }
@@ -1975,12 +1994,14 @@ mod tests {
     /// `ExtensionProc::shutdown` hard-kill fallback fires; the production
     /// `SHUTDOWN_GRACE` (5s) would make every such test slow for no
     /// assertion benefit.
+    #[cfg(unix)]
     const TEST_GRACE: Duration = Duration::from_millis(200);
 
     /// Timing knobs fast enough to keep a real-subprocess supervision test
     /// in the tens-to-low-hundreds-of-milliseconds range, while still
     /// leaving comfortable real-time headroom over how long a trivial `sh`
     /// spawn+handshake actually takes.
+    #[cfg(unix)]
     fn fast_test_cfg() -> SupervisorConfig {
         SupervisorConfig {
             ping_interval: Duration::from_millis(40),
@@ -1997,6 +2018,7 @@ mod tests {
     /// or `timeout` elapses (panicking with the last-observed status on
     /// timeout) — avoids guessing a fixed sleep for a background task's
     /// state transition.
+    #[cfg(unix)]
     async fn wait_for_status(
         supervised: &SupervisedExtension,
         timeout: Duration,
@@ -2018,6 +2040,7 @@ mod tests {
 
     /// Poll `attempt_count(path)` every 5ms (real time) until it reaches
     /// `target` or `timeout` elapses (panicking on timeout).
+    #[cfg(unix)]
     async fn wait_for_attempt_count(path: &std::path::Path, target: usize, timeout: Duration) {
         let start = std::time::Instant::now();
         loop {

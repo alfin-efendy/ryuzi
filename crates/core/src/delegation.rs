@@ -1,6 +1,8 @@
+use crate::agents::catalog::{build_live_catalog, runtime_profile_executable};
 use crate::agents::registry::AgentRegistry;
 use crate::agents::types::{AgentModel, AgentSnapshot};
 use crate::domain::{AgentRun, AgentRunKind, AgentRunStatus, CoreEvent, NewAgentRun};
+use crate::plugins::PluginHost;
 use crate::store::Store;
 use anyhow::{anyhow, bail};
 use std::collections::HashMap;
@@ -50,6 +52,7 @@ struct InFlightRun {
 pub struct DelegationRuntime {
     store: Arc<Store>,
     registry: Arc<AgentRegistry>,
+    plugins: Option<Arc<PluginHost>>,
     events: broadcast::Sender<CoreEvent>,
     admission: Mutex<()>,
     live: Mutex<HashMap<String, InFlightRun>>,
@@ -61,12 +64,14 @@ impl DelegationRuntime {
     pub fn new(
         store: Arc<Store>,
         registry: Arc<AgentRegistry>,
+        plugins: Option<Arc<PluginHost>>,
         events: broadcast::Sender<CoreEvent>,
     ) -> Arc<Self> {
         let (terminal_events, _) = broadcast::channel(1024);
         Arc::new(Self {
             store,
             registry,
+            plugins,
             events,
             admission: Mutex::new(()),
             live: Mutex::new(HashMap::new()),
@@ -208,12 +213,28 @@ impl DelegationRuntime {
     /// the catalog into a system prompt, so the executable filter and the
     /// self-exclusion rule live in exactly one place.
     pub async fn delegate_catalog(&self, exclude_agent_id: &str) -> Vec<(String, String, String)> {
+        let catalog = match &self.plugins {
+            Some(plugins) => match build_live_catalog(&self.store, plugins).await {
+                Ok(catalog) => Some(catalog),
+                Err(error) => {
+                    tracing::warn!(?error, "unable to build agent catalog for delegation");
+                    return Vec::new();
+                }
+            },
+            None => None,
+        };
         self.registry
             .snapshot()
             .await
             .agents
             .into_iter()
-            .filter(|agent| agent.executable && agent.profile.id != exclude_agent_id)
+            .filter(|agent| {
+                agent.executable
+                    && agent.profile.id != exclude_agent_id
+                    && catalog.as_ref().is_none_or(|catalog| {
+                        runtime_profile_executable(&agent.profile, agent.executable, catalog)
+                    })
+            })
             .map(|agent| {
                 (
                     agent.profile.id,
@@ -729,7 +750,12 @@ mod tests {
                 .unwrap();
         let (events, receiver) = broadcast::channel(32);
         (
-            DelegationRuntime::new(store, persistence.registry.clone(), events),
+            DelegationRuntime::new(
+                store,
+                persistence.registry.clone(),
+                Some(Arc::new(PluginHost::default())),
+                events,
+            ),
             persistence.registry,
             receiver,
             directory,
@@ -740,6 +766,42 @@ mod tests {
         let profile = registry.resolved_snapshot("first").await.unwrap();
         let second = registry.resolved_snapshot("second").await.unwrap();
         (profile, second)
+    }
+
+    #[tokio::test]
+    async fn delegate_catalog_excludes_structurally_valid_agent_with_unavailable_native_tool() {
+        let (runtime, _registry, _, directory) = runtime().await;
+        std::fs::write(
+            directory.path().join("agents/second/agent.yaml"),
+            "schema_version: 1\nid: second\nname: Second\ndescription: test\navatar: { color: blue }\nmodel: { name: anthropic/claude-opus-4-8, effort: high }\npermissions: { mode: ask, rules: [] }\nskills: { enabled: [] }\ntools: { native: [missing], plugins: [], apps: [] }\nloop: { max_turns: 1, max_tool_rounds: 1 }\n",
+        )
+        .unwrap();
+        let store = runtime.store.clone();
+        let reloaded = Arc::new(
+            AgentRegistry::load(directory.path().to_path_buf(), store.clone())
+                .await
+                .unwrap(),
+        );
+        let second = reloaded.resolved_snapshot("second").await.unwrap();
+        let (events, _) = broadcast::channel(32);
+        let runtime = DelegationRuntime::new(
+            store,
+            reloaded,
+            Some(Arc::new(PluginHost::default())),
+            events,
+        );
+        assert!(
+            second.executable,
+            "registry keeps structural validation only"
+        );
+
+        let ids = runtime
+            .delegate_catalog("first")
+            .await
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&"second".to_string()));
     }
 
     #[tokio::test]
@@ -1118,6 +1180,7 @@ mod tests {
                     description: profile.description,
                     avatar: profile.avatar,
                     model: profile.model,
+                    personality: profile.personality,
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
@@ -1165,6 +1228,7 @@ mod tests {
                     description: profile.description,
                     avatar: profile.avatar,
                     model: profile.model,
+                    personality: profile.personality,
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
@@ -1191,6 +1255,7 @@ mod tests {
                     description: profile.description,
                     avatar: profile.avatar,
                     model: profile.model,
+                    personality: profile.personality,
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
@@ -1231,6 +1296,7 @@ mod tests {
                     description: profile.description,
                     avatar: profile.avatar,
                     model: profile.model,
+                    personality: profile.personality,
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,

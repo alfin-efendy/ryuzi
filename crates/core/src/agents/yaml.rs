@@ -9,6 +9,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
+use crate::agents::personality::{AgentPersonality, PersonalityPreset};
+
 use super::types::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,30 @@ struct LoopWire {
     extensions: IndexMap<String, Value>,
 }
 
+fn default_personality_preset() -> PersonalityPreset {
+    PersonalityPreset::Helpful
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersonalityWire {
+    #[serde(default = "default_personality_preset")]
+    preset: PersonalityPreset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom: Option<String>,
+    #[serde(flatten)]
+    extensions: IndexMap<String, Value>,
+}
+
+impl Default for PersonalityWire {
+    fn default() -> Self {
+        Self {
+            preset: default_personality_preset(),
+            custom: None,
+            extensions: IndexMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentProfileWire {
     schema_version: u32,
@@ -108,6 +134,8 @@ struct AgentProfileWire {
     description: String,
     avatar: AvatarWire,
     model: AgentModelWire,
+    #[serde(default)]
+    personality: PersonalityWire,
     permissions: PermissionsWire,
     skills: SkillsWire,
     tools: ToolsWire,
@@ -294,10 +322,17 @@ fn profile_from_wire(
     let mut extensions = wire.extensions;
     add_nested(&mut extensions, "avatar", wire.avatar.extensions);
     add_nested(&mut extensions, "model", model_extensions);
+    add_nested(&mut extensions, "personality", wire.personality.extensions);
     add_nested(&mut extensions, "permissions", wire.permissions.extensions);
     add_nested(&mut extensions, "skills", wire.skills.extensions);
     add_nested(&mut extensions, "tools", wire.tools.extensions);
     add_nested(&mut extensions, "loop", wire.loop_settings.extensions);
+
+    let personality = AgentPersonality {
+        preset: wire.personality.preset,
+        custom: trim_option(wire.personality.custom),
+    };
+    personality.validate()?;
 
     let profile = AgentProfile {
         schema_version: AGENT_SCHEMA_VERSION,
@@ -308,6 +343,7 @@ fn profile_from_wire(
             color: required(wire.avatar.color, "avatar.color")?,
         },
         model,
+        personality,
         permissions: AgentPermissions {
             mode: wire.permissions.mode.runtime_mode(),
             rules: wire
@@ -347,6 +383,11 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
             extensions: nested_extensions(extensions, "avatar"),
         },
         model: model_to_wire(&value.model, nested_extensions(extensions, "model")),
+        personality: PersonalityWire {
+            preset: value.personality.preset,
+            custom: value.personality.custom.clone(),
+            extensions: nested_extensions(extensions, "personality"),
+        },
         permissions: PermissionsWire {
             mode: AgentPermissionMode::from_runtime(value.permissions.mode),
             rules: value
@@ -379,7 +420,15 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
         },
         extensions: top_extensions(
             extensions,
-            &["avatar", "model", "permissions", "skills", "tools", "loop"],
+            &[
+                "avatar",
+                "model",
+                "personality",
+                "permissions",
+                "skills",
+                "tools",
+                "loop",
+            ],
         ),
     }
 }
@@ -517,6 +566,7 @@ fn merge_and_render<T: Serialize>(raw: &Value, typed: &T) -> anyhow::Result<Stri
     let mut merged = raw.clone();
     let replacement = serde_yaml::to_value(typed)?;
     remove_stale_model_keys(&mut merged, &replacement);
+    remove_stale_personality_keys(&mut merged, &replacement);
     merge_value(&mut merged, replacement);
     render_yaml(&merged)
 }
@@ -543,6 +593,29 @@ fn remove_stale_model_keys(target: &mut Value, replacement: &Value) {
         if !replacement_model.contains_key(&key) {
             target_model.remove(&key);
         }
+    }
+}
+
+fn remove_stale_personality_keys(target: &mut Value, replacement: &Value) {
+    let personality_key = Value::String("personality".into());
+    let Some(replacement_personality) = replacement
+        .as_mapping()
+        .and_then(|mapping| mapping.get(&personality_key))
+        .and_then(Value::as_mapping)
+    else {
+        return;
+    };
+    let Some(target_personality) = target
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(&personality_key))
+        .and_then(Value::as_mapping_mut)
+    else {
+        return;
+    };
+
+    let custom_key = Value::String("custom".into());
+    if !replacement_personality.contains_key(&custom_key) {
+        target_personality.remove(&custom_key);
     }
 }
 
@@ -594,6 +667,90 @@ x_vendor: { enabled: true }
         assert_eq!(reparsed.extensions()["avatar"]["x_icon"], "owl");
         assert_eq!(reparsed.extensions()["model"]["x_model"], "keep");
         assert_eq!(reparsed.extensions()["permissions"]["x_policy"], "keep");
+    }
+
+    const LEGACY_AGENT_YAML: &str = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet }
+model: { name: anthropic/claude-opus-4-8, effort: high }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+
+    const CUSTOM_PERSONALITY_YAML: &str = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet }
+model: { name: anthropic/claude-opus-4-8, effort: high }
+personality: { preset: custom, custom: "Speak like a strict code reviewer.\nBe terse and cite line numbers.", x-user-extension: keep }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+
+    #[test]
+    fn missing_legacy_personality_defaults_to_helpful() {
+        let doc = parse_agent_profile_document(LEGACY_AGENT_YAML).unwrap();
+        assert_eq!(doc.typed().personality.preset, PersonalityPreset::Helpful);
+        assert_eq!(doc.typed().personality.custom, None);
+    }
+
+    #[test]
+    fn custom_personality_round_trips_and_extensions_survive() {
+        let parsed = parse_agent_profile_document(CUSTOM_PERSONALITY_YAML).unwrap();
+        assert_eq!(parsed.typed().personality.preset, PersonalityPreset::Custom);
+        assert_eq!(
+            parsed.typed().personality.custom.as_deref(),
+            Some("Speak like a strict code reviewer.\nBe terse and cite line numbers.")
+        );
+        let rendered = render_agent_profile_document(&parsed).unwrap();
+        assert!(rendered.contains("preset: custom"));
+        assert!(rendered.contains("custom: |-"));
+        assert!(rendered.contains("x-user-extension:"));
+
+        let reparsed = parse_agent_profile_document(&rendered).unwrap();
+        assert_eq!(reparsed.typed().personality, parsed.typed().personality);
+        assert_eq!(
+            reparsed.extensions()["personality"]["x-user-extension"],
+            "keep"
+        );
+    }
+
+    #[test]
+    fn invalid_personality_combination_is_rejected() {
+        let raw = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet }
+model: { name: anthropic/claude-opus-4-8, effort: high }
+personality: { preset: custom }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+        assert!(parse_agent_profile_document(raw).is_err());
+
+        let raw = r#"schema_version: 1
+id: reviewer
+name: Reviewer
+description: Reviews code.
+avatar: { color: violet }
+model: { name: anthropic/claude-opus-4-8, effort: high }
+personality: { preset: technical, custom: "extra text" }
+permissions: { mode: ask, rules: [] }
+skills: { enabled: [] }
+tools: { native: [], plugins: [], apps: [] }
+loop: { max_turns: 50, max_tool_rounds: 100 }
+"#;
+        assert!(parse_agent_profile_document(raw).is_err());
     }
 
     #[test]
@@ -652,6 +809,31 @@ loop: { max_turns: 50, max_tool_rounds: 100 }
             AgentModel::Concrete {
                 name: "anthropic/claude-opus-4-8".into(),
                 effort: None,
+            }
+        );
+    }
+
+    #[test]
+    fn merge_typed_personality_preset_switch_renders_reparseable_yaml() {
+        let mut doc = parse_agent_profile_document(CUSTOM_PERSONALITY_YAML).unwrap();
+        let mut typed = doc.typed().clone();
+        typed.personality = AgentPersonality {
+            preset: PersonalityPreset::Technical,
+            custom: None,
+        };
+        doc.merge_typed(typed);
+        let rendered = render_agent_profile_document(&doc).unwrap();
+        assert!(
+            !rendered.contains("custom:"),
+            "stale custom key in:\n{rendered}"
+        );
+
+        let reparsed = parse_agent_profile_document(&rendered).unwrap();
+        assert_eq!(
+            reparsed.typed().personality,
+            AgentPersonality {
+                preset: PersonalityPreset::Technical,
+                custom: None,
             }
         );
     }

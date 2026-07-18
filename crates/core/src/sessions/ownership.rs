@@ -284,6 +284,7 @@ mod tests {
                         name: "anthropic/claude-opus-4-8".into(),
                         effort: Some("high".into()),
                     },
+                    personality: crate::agents::personality::AgentPersonality::default_profile(),
                     permissions: crate::agents::types::AgentPermissions {
                         mode: PermMode::Default,
                         rules: Vec::new(),
