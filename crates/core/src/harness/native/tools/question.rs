@@ -248,7 +248,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, hub, mut rx, _perm) = ctx_with_interaction(dir.path(), PermMode::Default).await;
         let mut asked =
-            tokio::spawn(async move { AskUserQuestion.execute(&ctx, valid_input()).await.unwrap() });
+            tokio::spawn(
+                async move { AskUserQuestion.execute(&ctx, valid_input()).await.unwrap() },
+            );
 
         let (run_id, request_id) = match rx.recv().await.unwrap() {
             CoreEvent::ApprovalRequested {

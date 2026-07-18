@@ -3454,15 +3454,27 @@ async fn continue_promotes_the_session_to_running() {
     // the completion arm demotes Running→Idle), then drop the live handle so
     // the continue takes the cold-resume path onto a fresh, uncancelled handle.
     handle.cancel().await.unwrap();
-    let mut s = store.get_session(&session.session_pk).await.unwrap().unwrap();
+    let mut s = store
+        .get_session(&session.session_pk)
+        .await
+        .unwrap()
+        .unwrap();
     for _ in 0..400 {
         if s.status == SessionStatus::Idle {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        s = store.get_session(&session.session_pk).await.unwrap().unwrap();
+        s = store
+            .get_session(&session.session_pk)
+            .await
+            .unwrap()
+            .unwrap();
     }
-    assert_eq!(s.status, SessionStatus::Idle, "first turn must settle to Idle");
+    assert_eq!(
+        s.status,
+        SessionStatus::Idle,
+        "first turn must settle to Idle"
+    );
     cp.running.lock().unwrap().remove(&session.session_pk);
 
     // Continue: the promotion is synchronous, and the fresh turn blocks — so
