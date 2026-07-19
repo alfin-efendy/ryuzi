@@ -26,8 +26,6 @@ function initialMutation(registry: AgentRegistryInfo): AgentMutationInfo {
     nativeTools: [],
     pluginTools: [],
     apps: [],
-    maxTurns: 50,
-    maxToolRounds: 100,
   };
 }
 

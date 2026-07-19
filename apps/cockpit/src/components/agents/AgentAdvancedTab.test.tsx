@@ -4,7 +4,7 @@ import type { AgentDetailInfo, AgentMutationInfo, AgentRegistryInfo } from "@/bi
 
 mock.module("@/bindings", () => ({ commands: {}, events: {} }));
 
-const { AgentAdvancedTab, positiveLimit } = await import("./AgentAdvancedTab");
+const { AgentAdvancedTab } = await import("./AgentAdvancedTab");
 const { useAgents } = await import("@/store-agents");
 
 const updateAgent = mock(async (_agentId: string, _input: AgentMutationInfo) => true);
@@ -31,8 +31,6 @@ const reviewerDetail: AgentDetailInfo = {
   nativeTools: ["read", "grep", "bash"],
   pluginTools: [],
   apps: [],
-  maxTurns: 50,
-  maxToolRounds: 100,
   modelInfo: null,
   personality: { preset: "helpful", custom: null },
 };
@@ -51,23 +49,6 @@ beforeEach(() => {
   useAgents.setState({ registry, detail: reviewerDetail, saving: false, update: updateAgent, setDefault, remove });
 });
 afterEach(cleanup);
-
-test("positiveLimit accepts only positive safe integers", () => {
-  expect(positiveLimit(" 75 ")).toBe(75);
-  expect(positiveLimit("0")).toBeNull();
-  expect(positiveLimit("1.5")).toBeNull();
-  expect(positiveLimit("9007199254740992")).toBeNull();
-});
-
-test("Advanced validates and saves per-agent loop limits", () => {
-  render(<AgentAdvancedTab detail={reviewerDetail} />);
-  fireEvent.change(screen.getByRole("textbox", { name: "Max turns" }), { target: { value: "0" } });
-  expect(screen.getByText("Max turns must be at least 1.")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Save limits" }).hasAttribute("disabled")).toBe(true);
-  fireEvent.change(screen.getByRole("textbox", { name: "Max turns" }), { target: { value: "75" } });
-  fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
-  expect(updateAgent).toHaveBeenCalledWith("reviewer", expect.objectContaining({ maxTurns: 75, maxToolRounds: 100 }));
-});
 
 test("default and danger-zone controls use registry operations", async () => {
   render(<AgentAdvancedTab detail={reviewerDetail} />);

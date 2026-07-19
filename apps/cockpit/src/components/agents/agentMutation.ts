@@ -13,7 +13,5 @@ export function mutationFromDetail(detail: AgentDetailInfo): AgentMutationInfo {
     nativeTools: detail.nativeTools,
     pluginTools: detail.pluginTools,
     apps: detail.apps,
-    maxTurns: detail.maxTurns,
-    maxToolRounds: detail.maxToolRounds,
   };
 }

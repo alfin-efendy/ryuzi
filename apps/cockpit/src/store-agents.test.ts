@@ -60,8 +60,6 @@ function detailOf(s: AgentSummaryInfo): AgentDetailInfo {
     nativeTools: [],
     pluginTools: [],
     apps: [],
-    maxTurns: 40,
-    maxToolRounds: 80,
     modelInfo: null,
     personality: { preset: "helpful", custom: null },
   };
@@ -82,8 +80,6 @@ function reviewerInput(): AgentMutationInfo {
     nativeTools: [],
     pluginTools: [],
     apps: [],
-    maxTurns: 40,
-    maxToolRounds: 80,
   };
 }
 
