@@ -76,6 +76,9 @@ pub struct ContextManager {
     pub(super) ledger: Ledger,
     cfg: ContextConfig,
     tokens: TokenState,
+    /// Model id from the latest `message_start` that carried one — the model
+    /// the router actually served (may differ from the requested route name).
+    last_served_model: Option<String>,
 }
 
 impl ContextManager {
@@ -89,6 +92,7 @@ impl ContextManager {
             ledger,
             cfg,
             tokens: TokenState::default(),
+            last_served_model: None,
         };
         // Resume: the reloaded history is "local" until the next server truth.
         cm.tokens.local_appended = cm.ledger.messages().iter().map(estimate_tokens).sum();
@@ -100,6 +104,7 @@ impl ContextManager {
             ledger: Ledger::ephemeral(session_pk),
             cfg,
             tokens: TokenState::default(),
+            last_served_model: None,
         }
     }
 
@@ -118,6 +123,7 @@ impl ContextManager {
             ledger: Ledger::seed_projected(session_pk, messages),
             cfg,
             tokens: TokenState::default(),
+            last_served_model: None,
         };
         cm.tokens.local_appended = cm.ledger.messages().iter().map(estimate_tokens).sum();
         cm
@@ -231,6 +237,9 @@ impl ContextManager {
     }
 
     pub fn observe_message_start(&mut self, message: &Value) {
+        if let Some(model) = message.get("model").and_then(|v| v.as_str()) {
+            self.last_served_model = Some(model.to_string());
+        }
         if let Some(usage) = message.get("usage") {
             self.tokens.observe_start_usage(usage);
         }
@@ -255,6 +264,13 @@ impl ContextManager {
     /// for the `ContextUsage` event; not tracked between commits.
     pub fn last_cache_read(&self) -> u64 {
         self.tokens.cache_read
+    }
+
+    /// The upstream model id the router actually served on the last
+    /// `message_start` (for cost attribution). `None` until the first
+    /// `message_start` with a `model` field.
+    pub fn last_served_model(&self) -> Option<&str> {
+        self.last_served_model.as_deref()
     }
 
     /// The last committed response's output token count (server truth).
@@ -540,6 +556,20 @@ mod tests {
             msgs[0]["content"][0].get("cache_control").is_none(),
             "only the last block"
         );
+    }
+
+    #[test]
+    fn observe_message_start_captures_served_model() {
+        let mut cm = ContextManager::ephemeral("s", ContextConfig::with_meta(meta()));
+        assert_eq!(cm.last_served_model(), None);
+        cm.observe_message_start(&json!({
+            "model": "claude-opus-4-8",
+            "usage": { "input_tokens": 10 }
+        }));
+        assert_eq!(cm.last_served_model(), Some("claude-opus-4-8"));
+        // A later message_start without a model must NOT clobber the captured id.
+        cm.observe_message_start(&json!({ "usage": { "output_tokens": 1 } }));
+        assert_eq!(cm.last_served_model(), Some("claude-opus-4-8"));
     }
 
     #[test]
