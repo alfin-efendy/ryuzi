@@ -77,8 +77,15 @@ export function AgentRunDetail({
   return (
     <div className="min-h-0 flex flex-1 flex-col">
       <header className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border px-3 py-2">
-        <Button variant="ghost" size="sm" aria-label="Back to Agents" onClick={() => select(runnerId, sessionPk, null)} className="-ml-1">
-          <ArrowLeft aria-hidden size={14} /> Back to Agents
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Back to agent runs"
+          title="Back"
+          onClick={() => select(runnerId, sessionPk, null)}
+          className="-ml-1"
+        >
+          <ArrowLeft aria-hidden size={15} />
         </Button>
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <div
@@ -186,7 +193,6 @@ export function AgentRunDetail({
             runnerId={runnerId}
             sessionPk={sessionPk}
             rows={rows}
-            agentName={run.executingAgentNameSnapshot}
             agentColor="#6b7280"
             running={active}
             ownerRunId={run.runId}

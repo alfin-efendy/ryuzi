@@ -195,7 +195,7 @@ async function emitMockCoreEvent(page: import("@playwright/test").Page, input: M
 }
 
 function selectedAgentRunDetail(page: import("@playwright/test").Page) {
-  return page.getByRole("button", { name: "Back to Agents" }).locator("xpath=../..");
+  return page.getByRole("button", { name: "Back to agent runs" }).locator("xpath=../..");
 }
 
 test("agent dispatch: lifecycle cards hydrate, stream, complete, and reload", async ({ page }) => {
@@ -259,7 +259,7 @@ test("agent dispatch: lifecycle cards hydrate, stream, complete, and reload", as
 
   await card.click();
   await expect(page.getByTestId("right-panel-header").getByRole("button", { name: "Agents" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Back to Agents" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back to agent runs" })).toBeVisible();
 
   // Run-scoped context + cost: the ring/popover on the sub-agent run header
   // reflects this run's own AgentRunContextUsage/AgentRunCost events, not
@@ -360,7 +360,7 @@ test("agent dispatch: retry keeps one card slot and both durable attempts", asyn
   await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
   await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await page.getByRole("button", { name: "Back to agent runs" }).click();
   await expect(page.getByText("Done (1)", { exact: true })).toBeVisible();
   await expect(page.getByText("Active (1)", { exact: true })).toBeVisible();
   const activeRoster = page.getByText("Active (1)", { exact: true }).locator("xpath=..");
@@ -370,7 +370,7 @@ test("agent dispatch: retry keeps one card slot and both durable attempts", asyn
   await activeRoster.getByText("Release Scout", { exact: true }).click();
   await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(1);
   await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await page.getByRole("button", { name: "Back to agent runs" }).click();
   await doneRoster.getByText("Release Scout", { exact: true }).click();
   await expect(selectedAgentRunDetail(page).getByText("The first attempt exceeded its timeout.", { exact: true })).toHaveCount(1);
   await expect(selectedAgentRunDetail(page).getByText(retryTranscriptText, { exact: true })).toHaveCount(0);
@@ -730,7 +730,7 @@ test("delegation: mention-selected child run opens its transcript and returns to
   await page.getByText("Reviewer", { exact: true }).click();
   await expect(page.getByText("Reviewing the diff for regressions now.")).toBeVisible();
 
-  await page.getByRole("button", { name: "Back to Agents" }).click();
+  await page.getByRole("button", { name: "Back to agent runs" }).click();
   await expect(page.getByRole("heading", { name: "Active (1)", exact: true })).toBeVisible();
   await expect(page.getByText("Kicking off the review delegation.")).toBeVisible();
 

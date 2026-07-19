@@ -59,12 +59,15 @@ test("switching to Custom reveals the textarea and disables save while blank", a
   fireEvent.change(textarea, { target: { value: "  " } });
   expect(screen.getByRole("button", { name: "Save personality" }).hasAttribute("disabled")).toBe(true);
 
-  fireEvent.change(textarea, { target: { value: "Speak like a stern librarian." } });
+  fireEvent.change(textarea, { target: { value: "## Tone\n\n- Cite line numbers" } });
+  expect(screen.getByText("Markdown preview")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Tone" })).toBeTruthy();
+  expect(screen.getByText("Cite line numbers")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Save personality" }).hasAttribute("disabled")).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Save personality" }));
   expect(updateAgent).toHaveBeenCalledWith(
     "reviewer",
-    expect.objectContaining({ personality: { preset: "custom", custom: "Speak like a stern librarian." } }),
+    expect.objectContaining({ personality: { preset: "custom", custom: "## Tone\n\n- Cite line numbers" } }),
   );
 });
 

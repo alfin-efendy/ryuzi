@@ -36,27 +36,27 @@ describe("todoStepSummary", () => {
 });
 
 describe("TodoPanel", () => {
-  test("expanded panel shows steps and the Step X / N footer; collapses to pill", () => {
-    useNative.setState({ todosBySession: { [KEY]: TODOS }, planCollapsed: {}, loadTodos });
+  test("compact TODO summary expands into the task list", () => {
+    useNative.setState({ todosBySession: { [KEY]: TODOS }, planCollapsed: { [KEY]: true }, loadTodos });
     render(<TodoPanel runnerId={LOCAL_RUNNER} sessionPk="s1" running={true} />);
-    expect(screen.getByText("Write the modal plan")).toBeTruthy();
-    expect(screen.getByText(/Step/)).toBeTruthy();
-    // collapse via the TODO List header button
-    fireEvent.click(screen.getByRole("button", { name: /collapse TODO List/i }));
-    expect(screen.queryByText("Write the effort plan")).toBeNull(); // list hidden
-    expect(screen.getByText(/Step 2\/3/)).toBeTruthy(); // pill summary
-    // expand again via the pill
-    fireEvent.click(screen.getByRole("button", { name: /expand TODO List/i }));
+
+    expect(screen.getByRole("button", { name: "Expand TODO List" })).toBeTruthy();
+    expect(screen.queryByText("Write the effort plan")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand TODO List" }));
+    expect(screen.getByRole("button", { name: "Collapse TODO List" })).toBeTruthy();
     expect(screen.getByText("Write the effort plan")).toBeTruthy();
   });
 
-  test("renders nothing once settled with everything complete", () => {
+  test("auto-collapses completed tasks into a completion summary", () => {
     useNative.setState({
       todosBySession: { [KEY]: TODOS.map((t) => ({ ...t, status: "completed" })) },
-      planCollapsed: {},
+      planCollapsed: { [KEY]: false },
       loadTodos,
     });
-    const { container } = render(<TodoPanel runnerId={LOCAL_RUNNER} sessionPk="s1" running={false} />);
-    expect(container.innerHTML).toBe("");
+    render(<TodoPanel runnerId={LOCAL_RUNNER} sessionPk="s1" running={false} />);
+
+    expect(screen.getByText("All tasks completed")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Expand TODO List" })).toBeTruthy();
   });
 });

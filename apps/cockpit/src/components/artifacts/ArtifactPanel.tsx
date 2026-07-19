@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Download, Eye, FileText, Link2 } from "lucide-react";
-import { Badge, Button, SettingsCard } from "@ryuzi/ui";
+import { Download, Eye, FileText, Link2, RefreshCw } from "lucide-react";
+import { Badge, Button } from "@ryuzi/ui";
 import { commands, type ArtifactFileInfo, type ArtifactInfo } from "@/bindings";
 import { ArtifactPreview } from "./ArtifactPreview";
 
@@ -28,6 +28,8 @@ function save(file: ArtifactFileInfo) {
   URL.revokeObjectURL(url);
 }
 
+/** Session artifacts live in the right panel so the chat transcript remains a
+ * focused reading surface. */
 export function ArtifactPanel({ runnerId, sessionPk, refreshKey }: Props) {
   const [items, setItems] = useState<ArtifactInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -61,51 +63,70 @@ export function ArtifactPanel({ runnerId, sessionPk, refreshKey }: Props) {
   };
 
   return (
-    <SettingsCard className="mx-4 mb-3 shrink-0 overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2">
-        <div className="flex items-center gap-2 text-sm font-semibold">
+    <section className="flex min-h-0 flex-1 flex-col" aria-label="Artifacts">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-3">
+        <div className="flex size-7 items-center justify-center rounded-md bg-sky-500/10 text-sky-600 dark:text-sky-400">
           <FileText aria-hidden size={14} />
-          Artifacts
         </div>
-        <Button variant="ghost" size="sm" onClick={load}>
-          Refresh
+        <div className="min-w-0 flex-1">
+          <h2 className="text-[13px] font-semibold">Artifacts</h2>
+          <p className="text-[12px] text-muted-foreground">
+            {items.length === 0 ? "Files created in this session" : `${items.length} file${items.length === 1 ? "" : "s"} available`}
+          </p>
+        </div>
+        <Button variant="ghost" size="icon-sm" title="Refresh artifacts" onClick={load} className="text-muted-foreground">
+          <RefreshCw aria-hidden size={14} />
         </Button>
       </div>
-      {error ? <div className="px-3 pb-2 text-xs text-destructive">{error}</div> : null}
-      {items.length === 0 ? <div className="px-3 pb-3 text-xs text-muted-foreground">No artifacts in this session.</div> : null}
-      <div className="divide-y divide-border">
-        {items.map((artifact) => {
-          const unavailable = artifact.status === "deleted";
-          return (
-            <div key={`${artifact.id}:${artifact.referenceId ?? "source"}`} className="flex min-h-12 items-center gap-2 px-3 py-2 text-xs">
-              <FileText aria-hidden size={14} className="shrink-0 text-muted-foreground" />
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-medium">{artifact.name}</div>
-                <div className="flex items-center gap-1 truncate text-muted-foreground">
-                  {artifact.referenceId ? (
-                    <>
-                      <Link2 aria-hidden size={11} />
-                      Shared from {artifact.sharedFromSessionPk}
-                    </>
-                  ) : (
-                    <>
-                      {artifact.creator} · {artifact.contentType ?? "file"} · {bytes(artifact.sizeBytes)}
-                    </>
-                  )}
+      {error ? (
+        <div role="alert" className="shrink-0 border-b border-destructive/30 bg-destructive/5 px-4 py-2 text-xs text-destructive">
+          {error}
+        </div>
+      ) : null}
+      {items.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center px-6 text-center text-[12.5px] text-muted-foreground">
+          No artifacts in this session.
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 divide-y divide-border overflow-y-auto">
+          {items.map((artifact) => {
+            const unavailable = artifact.status === "deleted";
+            return (
+              <div
+                key={`${artifact.id}:${artifact.referenceId ?? "source"}`}
+                className="flex min-h-14 items-center gap-2.5 px-4 py-2.5 text-xs"
+              >
+                <FileText aria-hidden size={15} className="shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium text-foreground">{artifact.name}</div>
+                  <div className="flex items-center gap-1 truncate text-muted-foreground">
+                    {artifact.referenceId ? (
+                      <>
+                        <Link2 aria-hidden size={11} />
+                        Shared from {artifact.sharedFromSessionPk}
+                      </>
+                    ) : (
+                      <>
+                        {artifact.creator} · {artifact.contentType ?? "file"} · {bytes(artifact.sizeBytes)}
+                      </>
+                    )}
+                  </div>
+                </div>
+                <Badge variant={unavailable ? "secondary" : "outline"}>{label(artifact.status)}</Badge>
+                <div className="flex shrink-0 items-center">
+                  <Button variant="ghost" size="icon-xs" title="Preview" disabled={unavailable} onClick={() => setPreview(artifact)}>
+                    <Eye aria-hidden size={14} />
+                  </Button>
+                  <Button variant="ghost" size="icon-xs" title="Download" disabled={unavailable} onClick={() => download(artifact)}>
+                    <Download aria-hidden size={14} />
+                  </Button>
                 </div>
               </div>
-              <Badge variant={unavailable ? "secondary" : "outline"}>{label(artifact.status)}</Badge>
-              <Button variant="ghost" size="icon-xs" title="Preview" disabled={unavailable} onClick={() => setPreview(artifact)}>
-                <Eye aria-hidden size={14} />
-              </Button>
-              <Button variant="ghost" size="icon-xs" title="Download" disabled={unavailable} onClick={() => download(artifact)}>
-                <Download aria-hidden size={14} />
-              </Button>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
       {preview ? <ArtifactPreview runnerId={runnerId} sessionPk={sessionPk} artifact={preview} onClose={() => setPreview(null)} /> : null}
-    </SettingsCard>
+    </section>
   );
 }

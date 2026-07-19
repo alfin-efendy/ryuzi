@@ -25,6 +25,23 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
+test("uses green and destructive highlights for write and delete changes", () => {
+  const { container } = render(
+    <FileChangeCards
+      runnerId={LOCAL_RUNNER}
+      sessionPk="s1"
+      cards={[
+        { path: "src/new.ts", kind: "write" },
+        { path: "src/obsolete.ts", kind: "delete" },
+      ]}
+    />,
+  );
+
+  expect(screen.getByTitle("src/new.ts").closest("div")?.className).toContain("bg-green-500/5");
+  expect(screen.getByTitle("src/obsolete.ts").closest("div")?.className).toContain("bg-destructive/5");
+  expect(container.querySelector(".text-green-700")).toBeTruthy();
+  expect(container.querySelector(".text-destructive")).toBeTruthy();
+});
 test("Review opens the right panel on the selected changed file", () => {
   render(
     <FileChangeCards
