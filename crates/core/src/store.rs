@@ -1599,6 +1599,19 @@ fn migrations() -> Migrations<'static> {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_component_plugin_releases_active \
                 ON component_plugin_releases(plugin_id) WHERE active=1;",
         ),
+        // 48: per-plugin key/value storage for WASM component plugins.
+        // Lets a plugin persist small opaque blobs (host-mediated, quota
+        // bounded by `COMPONENT_STORAGE_MAX_VALUE_BYTES`) scoped by its own
+        // `plugin_id` so different plugins can use the same `key` without
+        // colliding.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS component_plugin_storage (\
+                plugin_id TEXT NOT NULL,\
+                key TEXT NOT NULL,\
+                value BLOB NOT NULL,\
+                PRIMARY KEY (plugin_id, key)\
+            );",
+        ),
     ])
 }
 
@@ -1811,6 +1824,16 @@ fn map_component_release_row(r: &Row) -> rusqlite::Result<ComponentPluginRelease
 const COMPONENT_RELEASE_COLS: &str = "plugin_id, version, source_url, sha256, signing_key_id, \
     installed_at, active, revoked, revocation_reason";
 
+fn map_component_storage_row(r: &Row) -> rusqlite::Result<ComponentPluginStorageRecord> {
+    Ok(ComponentPluginStorageRecord {
+        plugin_id: r.get(0)?,
+        key: r.get(1)?,
+        value: r.get(2)?,
+    })
+}
+
+const COMPONENT_STORAGE_COLS: &str = "plugin_id, key, value";
+
 fn map_device_row(r: &Row) -> rusqlite::Result<Device> {
     Ok(Device {
         id: r.get(0)?,
@@ -1984,6 +2007,23 @@ pub struct ComponentPluginReleaseRecord {
     pub active: bool,
     pub revoked: bool,
     pub revocation_reason: Option<String>,
+}
+
+/// Maximum size, in bytes, of a single stored value in
+/// `component_plugin_storage`. Bounds how much a WASM component plugin can
+/// persist through the host-mediated key/value store, keeping the SQLite
+/// database from growing unbounded on a plugin's behalf.
+pub const COMPONENT_STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
+
+/// One row of `component_plugin_storage`: an opaque blob a WASM component
+/// plugin has persisted under its own `plugin_id` and a caller-chosen `key`.
+/// Storage is scoped by `(plugin_id, key)`, so two different plugins may use
+/// the same `key` without colliding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentPluginStorageRecord {
+    pub plugin_id: String,
+    pub key: String,
+    pub value: Vec<u8>,
 }
 
 /// One row of `plugin_catalog_cache`: an entry from the last verified signed
@@ -4862,6 +4902,81 @@ impl Store {
         .await
     }
 
+    /// Fetch a value a WASM component plugin has stored under its own
+    /// `plugin_id` and `key`. `None` if no such row exists.
+    pub async fn get_component_storage(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<ComponentPluginStorageRecord>> {
+        let plugin_id = plugin_id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {COMPONENT_STORAGE_COLS} FROM component_plugin_storage \
+                     WHERE plugin_id=?1 AND key=?2"
+                ),
+                params![plugin_id, key],
+                map_component_storage_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Store `value` under `(plugin_id, key)`, replacing any prior value.
+    /// Rejects a value larger than `COMPONENT_STORAGE_MAX_VALUE_BYTES`
+    /// before writing anything.
+    pub async fn put_component_storage(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: &[u8],
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let key = key.to_string();
+        let value = value.to_vec();
+        self.with_conn(move |c| {
+            if value.len() > COMPONENT_STORAGE_MAX_VALUE_BYTES {
+                return Err(to_sql_json_error(format!(
+                    "component storage value for {plugin_id}/{key} is {} bytes, \
+                     exceeding the {COMPONENT_STORAGE_MAX_VALUE_BYTES}-byte limit",
+                    value.len()
+                )));
+            }
+            c.execute(
+                &format!(
+                    "INSERT INTO component_plugin_storage({COMPONENT_STORAGE_COLS}) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(plugin_id, key) DO UPDATE SET value=excluded.value"
+                ),
+                params![plugin_id, key, value],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Delete the value stored under `(plugin_id, key)`. Returns `true` if a
+    /// row was deleted, `false` if none existed.
+    pub async fn delete_component_storage(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let plugin_id = plugin_id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |c| {
+            let changed = c.execute(
+                "DELETE FROM component_plugin_storage WHERE plugin_id=?1 AND key=?2",
+                params![plugin_id, key],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     /// Replace the entire cached remote catalog with `rows` in one
     /// transaction. Called after a signed feed fetch verifies successfully;
     /// an empty slice clears the cache.
@@ -6325,8 +6440,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);
-        assert_eq!(
+        assert_eq!(user_version, 46);        assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
         );
@@ -6646,15 +6760,13 @@ mod tests {
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
         assert_eq!(user_version, 46);
-
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
         let reopened_version: i64 = reopened
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 46);
-    }
+        assert_eq!(reopened_version, 46);    }
 
     #[tokio::test]
     async fn migration_41_removes_session_wide_tool_call_uniqueness() {
@@ -6674,8 +6786,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);
-        assert!(
+        assert_eq!(user_version, 46);        assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
         );
@@ -6718,8 +6829,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 46);
-    }
+        assert_eq!(user_version, 46);    }
 
     #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
@@ -8609,8 +8719,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 46, "forward migration must land at v46");
-    }
+        assert_eq!(user_version, 46, "forward migration must land at v46");    }
 
     #[tokio::test]
     async fn migration_30_adds_audit_session_and_origin_columns() {
@@ -9346,8 +9455,7 @@ mod tests {
         // 46 agent_runs.context_window/cache_read_tokens/cache_creation_tokens/
         // output_tokens/cost_models
         // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
-        // re-run on next open.
-        // `Migrations` always fast-forwards to the latest defined version, so
+        // re-run on next open.        // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
@@ -9356,8 +9464,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 34)
-        };
+            c.pragma_update(None, "user_version", v - 34)        };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
@@ -9414,8 +9521,7 @@ mod tests {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
         // 22–46) replay against it. Back TWENTY-SIX: the fully migrated tail
-        // is now v46, so rewinding to v20 is what makes
-        // migration 21 (native-only) replay.
+        // is now v46, so rewinding to v20 is what makes        // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
         // orch_tasks ADD COLUMN ...` hook, but migration 39 already dropped
@@ -9423,8 +9529,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 26)
-        };
+            c.pragma_update(None, "user_version", v - 26)        };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
@@ -9556,8 +9661,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");
-        assert!(has_bg, "background_events table must exist");
+        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
 
@@ -9582,8 +9686,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");
-        assert!(has_fts, "messages_fts must survive agentic cleanup");
+        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
             "legacy agentic tables must be removed"
@@ -10470,6 +10573,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_creates_component_plugin_storage_table() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let count: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT count(*) FROM component_plugin_storage", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        store
+            .put_component_storage("github", "k", b"hello")
+            .await
+            .unwrap();
+        let rec = store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .expect("stored value should round-trip");
+        assert_eq!(rec.plugin_id, "github");
+        assert_eq!(rec.key, "k");
+        assert_eq!(rec.value, b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn component_storage_is_scoped_per_plugin_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .put_component_storage("github", "k", b"A")
+            .await
+            .unwrap();
+        store
+            .put_component_storage("atlassian", "k", b"B")
+            .await
+            .unwrap();
+
+        let github = store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        let atlassian = store
+            .get_component_storage("atlassian", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(github.value, b"A".to_vec());
+        assert_eq!(atlassian.value, b"B".to_vec());
+    }
+
+    #[tokio::test]
+    async fn component_storage_rejects_oversized_values() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let oversized = vec![0u8; COMPONENT_STORAGE_MAX_VALUE_BYTES + 1];
+
+        let result = store.put_component_storage("github", "k", &oversized).await;
+        assert!(result.is_err());
+
+        let stored = store.get_component_storage("github", "k").await.unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn component_storage_delete_reports_whether_a_row_existed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .put_component_storage("github", "k", b"hello")
+            .await
+            .unwrap();
+
+        let deleted = store.delete_component_storage("github", "k").await.unwrap();
+        assert!(deleted);
+        assert!(store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .is_none());
+
+        let deleted_again = store.delete_component_storage("github", "k").await.unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[tokio::test]
+    async fn component_storage_put_upserts_latest_value() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .put_component_storage("github", "k", b"first")
+            .await
+            .unwrap();
+        store
+            .put_component_storage("github", "k", b"second")
+            .await
+            .unwrap();
+
+        let rec = store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.value, b"second".to_vec());
     }
 
     #[tokio::test]
