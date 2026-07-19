@@ -28,11 +28,25 @@ const ALLOWED_EXPORTS: &[&str] = &[
 ];
 
 /// Default resource budget a plugin runtime may consume.
+///
+/// **Enforcement note:** `max_memory_bytes` and `max_concurrency` are declared
+/// here so callers can configure them ahead of time, but their runtime
+/// enforcement intentionally arrives with the later supervision / capability
+/// slice.  The current slice validates structure only; no guarantee is made
+/// that these limits are applied during component execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
+    /// Hard memory ceiling in bytes.
+    ///
+    /// Not yet enforced — enforcement will be introduced together with the
+    /// runtime supervision slice.
     pub max_memory_bytes: u64,
     pub fuel: u64,
     pub timeout: Duration,
+    /// Maximum concurrent tasks a component may spawn.
+    ///
+    /// Not yet enforced — enforcement will be introduced together with the
+    /// runtime supervision slice.
     pub max_concurrency: usize,
 }
 
@@ -73,6 +87,7 @@ pub enum PluginRuntimeError {
     DeniedExport { name: String, reason: String },
     InstantiationFailed(String),
     FuelExhausted(String),
+    TimeoutExceeded { timeout: Duration },
 }
 
 impl fmt::Display for PluginRuntimeError {
@@ -95,6 +110,9 @@ impl fmt::Display for PluginRuntimeError {
             Self::FuelExhausted(message) => {
                 write!(f, "component exhausted its fuel budget: {message}")
             }
+            Self::TimeoutExceeded { timeout } => {
+                write!(f, "component exceeded its timeout budget of {timeout:?}")
+            }
         }
     }
 }
@@ -112,6 +130,11 @@ impl ComponentRuntime {
         config.wasm_component_model(true);
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        // Wasmtime 46 always enables async support, but task 6 requires this
+        // explicit configuration call.  Narrow suppression keeps clippy clean
+        // without widening to module or crate scope.
+        #[allow(deprecated)]
+        config.async_support(true);
         let engine = Engine::new(&config)
             .map_err(|error| PluginRuntimeError::EngineInitialization(error.to_string()))?;
         Ok(Self { engine })
@@ -164,6 +187,13 @@ impl ComponentRuntime {
 
     /// Instantiates an import-free component after policy validation. Capability
     /// linker definitions are intentionally deferred to the host-adapter slice.
+    ///
+    /// Timeout enforcement uses epoch interruption on a blocking thread:
+    /// synchronous `Linker::instantiate` runs inside `spawn_blocking`, and a
+    /// `tokio::select!` races it against the deadline.  When the timer fires
+    /// first we call `engine.increment_epoch()` once so the CPU-bound Wasm
+    /// sees its epoch deadline and traps with an interrupt.  The join handle
+    /// is never detached — we always await it.
     pub async fn instantiate(
         &self,
         bundle: &InstalledBundle,
@@ -172,16 +202,69 @@ impl ComponentRuntime {
         let bytes = std::fs::read(&bundle.component_path)
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
         let component = self.validate_component_bytes(&bundle.manifest, &bytes, &policy)?;
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(policy.limits.fuel)
-            .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
-        store.set_epoch_deadline(1);
-        let linker = Linker::new(&self.engine);
-        linker
-            .instantiate(&mut store, &component)
-            .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
-        Ok(())
+
+        // Clone the engine so the spawned task owns everything it needs
+        // without borrowing `self`.
+        let engine = self.engine.clone();
+        let fuel = policy.limits.fuel;
+        let timeout = policy.limits.timeout;
+
+        // Run synchronous instantiation on a blocking thread so that
+        // tokio::select! can race it against a sleep timer.  A plain
+        // tokio::time::timeout around await cannot preempt CPU-bound
+        // Wasm; epoch interruption on a blocking thread is the correct
+        // mechanism.
+        let join_handle = tokio::task::spawn_blocking(move || {
+            let mut store = Store::new(&engine, ());
+            store
+                .set_fuel(fuel)
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            store.set_epoch_deadline(1);
+            let linker = Linker::new(&engine);
+            linker
+                .instantiate(&mut store, &component)
+                .map(|_instance| ())
+                .map_err(|error| match error.downcast_ref::<wasmtime::Trap>() {
+                    Some(wasmtime::Trap::OutOfFuel) => {
+                        PluginRuntimeError::FuelExhausted(error.to_string())
+                    }
+                    _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
+                })
+        });
+
+        tokio::pin!(join_handle);
+
+        tokio::select! {
+            result = &mut join_handle => {
+                // The blocking task completed within the deadline.
+                match result {
+                    Ok(inner) => inner,
+                    Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
+                        "instantiation task panicked: {join_error}"
+                    ))),
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                // The timer fired first.  Increment the epoch exactly once
+                // so the CPU-bound Wasm sees its epoch deadline and traps
+                // with an interrupt.
+                self.engine.increment_epoch();
+
+                // Await the blocking task so we never detach a background
+                // thread.  The Wasm should now exit quickly via the epoch
+                // trap.  Any result after the timer wins is mapped to
+                // TimeoutExceeded because the operation exceeded its host
+                // deadline.
+                match join_handle.await {
+                    Ok(Ok(())) | Ok(Err(_)) => {
+                        Err(PluginRuntimeError::TimeoutExceeded { timeout })
+                    }
+                    Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
+                        "instantiation task panicked: {join_error}"
+                    ))),
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -351,6 +434,23 @@ mod tests {
         }
     }
 
+    /// Creates an [`InstalledBundle`] whose component bytes are the given WAT
+    /// string (compiled to a component by the engine).  The manifest uses the
+    /// default test id/name so export-validation passes for import-free
+    /// components.
+    fn installed_bundle_with_wat(dir: &std::path::Path, wat: &str) -> InstalledBundle {
+        let component_path = dir.join("plugin.wasm");
+        std::fs::write(&component_path, wat.as_bytes())
+            .expect("writing WAT component should succeed");
+        InstalledBundle {
+            manifest: manifest(vec![]),
+            release: release(),
+            release_record: component_release(),
+            root: dir.to_path_buf(),
+            component_path,
+        }
+    }
+
     #[tokio::test]
     async fn instantiate_succeeds_for_an_installed_component_under_deny_all() {
         let dir = tempfile::tempdir().expect("tempdir should create");
@@ -359,6 +459,45 @@ mod tests {
             .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all())
             .await
             .expect("an import-free installed component should instantiate");
+    }
+
+    /// A component-level WAT whose core module start function is a
+    /// nonterminating loop.  Combined with `fuel: u64::MAX` and a short
+    /// timeout, this exercises the timeout enforcement path of the public
+    /// [`ComponentRuntime::instantiate`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instantiate_times_out_on_nonterminating_component() {
+        // WAT component: core module with an infinite-loop start function.
+        // No component-level imports or exports, so manifest validation passes.
+        // The start function must have type () -> () (no result).
+        let loop_wat = "(component \
+            (core module $m \
+                (func $loop \
+                    (loop \
+                        (br 0) \
+                    ) \
+                ) \
+                (start $loop) \
+            ) \
+            (core instance (instantiate $m)) \
+        )";
+
+        let dir = tempfile::tempdir().expect("tempdir should create");
+        let bundle = installed_bundle_with_wat(dir.path(), loop_wat);
+
+        let mut policy = HostPolicy::deny_all();
+        policy.limits.fuel = u64::MAX;
+        policy.limits.timeout = Duration::from_millis(100);
+
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let error = runtime
+            .instantiate(&bundle, policy)
+            .await
+            .expect_err("nonterminating component must not succeed");
+        assert!(
+            matches!(error, PluginRuntimeError::TimeoutExceeded { .. }),
+            "expected TimeoutExceeded, got {error:?}"
+        );
     }
 
     fn component_with_export(name: &str) -> String {
@@ -482,6 +621,21 @@ mod tests {
         runtime
             .validate_component(&bundle)
             .expect("a valid staged component must validate under deny-all policy");
+    }
+
+    /// Regression test: `async_support(true)` is set during engine
+    /// configuration.  The test only asserts that
+    /// `ComponentRuntime::new()` returns `Ok` — it does **not** fail
+    /// against old code without the setting, so it does not prove absence
+    /// of the regression.  It exists as a documented canary for future
+    /// refactorings that might accidentally remove async support.
+    #[test]
+    fn new_runtime_succeeds_with_async_support_enabled() {
+        let result = ComponentRuntime::new();
+        assert!(
+            result.is_ok(),
+            "ComponentRuntime::new() must succeed with async_support enabled"
+        );
     }
 
     /// A missing staged component file is an I/O failure to read it, not a
