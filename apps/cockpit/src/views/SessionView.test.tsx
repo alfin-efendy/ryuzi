@@ -852,7 +852,10 @@ test("a deleted primary labels the header and transcript with its preserved iden
   });
   render(<SessionView />);
 
-  expect(await screen.findAllByText("Deleted (Deleted)")).toHaveLength(2);
+  // The primary's preserved identity labels the session header. The transcript
+  // no longer repeats a per-message agent name (chat is a single-agent surface).
+  expect(await screen.findByText("Deleted (Deleted)")).toBeTruthy();
+  expect(screen.getByText("Preserved response")).toBeTruthy();
 });
 
 test("legacy sessions stay read-only without a repair destination", async () => {
