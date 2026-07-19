@@ -4372,6 +4372,9 @@ async fn emit_run_context_usage(deps: &RunnerDeps, cm: &ContextManager) {
         context_window: st.context_window,
         usable_window: st.usable_window,
         percent_left: st.percent_left,
+        cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
+        output_tokens: cm.last_output(),
     });
     if let Err(e) = deps
         .store
@@ -4380,6 +4383,10 @@ async fn emit_run_context_usage(deps: &RunnerDeps, cm: &ContextManager) {
             st.active_tokens,
             st.usable_window,
             st.percent_left,
+            st.context_window,
+            cm.last_cache_read(),
+            cm.last_cache_creation(),
+            cm.last_output(),
         )
         .await
     {

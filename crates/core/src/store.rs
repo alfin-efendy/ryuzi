@@ -5150,22 +5150,32 @@ impl Store {
 
     /// Snapshot a child run's ephemeral context usage onto its row. Used only
     /// by the run-scoped emit path — never touches session cost/context.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_agent_run_context_usage(
         &self,
         run_id: &str,
         active_tokens: u64,
         usable_window: u64,
         percent_left: u8,
+        context_window: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        output_tokens: u64,
     ) -> anyhow::Result<()> {
         let run_id = run_id.to_string();
         self.with_conn(move |c| {
             c.execute(
                 "UPDATE agent_runs SET context_active_tokens=?1, context_usable_window=?2, \
-                 context_percent_left=?3 WHERE run_id=?4",
+                 context_percent_left=?3, context_window=?4, cache_read_tokens=?5, \
+                 cache_creation_tokens=?6, output_tokens=?7 WHERE run_id=?8",
                 params![
                     active_tokens as i64,
                     usable_window as i64,
                     percent_left as i64,
+                    context_window as i64,
+                    cache_read_tokens as i64,
+                    cache_creation_tokens as i64,
+                    output_tokens as i64,
                     run_id
                 ],
             )?;
@@ -5634,7 +5644,7 @@ fn row_to_artifact_and_reference(r: &Row) -> rusqlite::Result<(ArtifactRecord, A
 }
 
 const AGENT_RUN_COLS: &str =
-    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error,context_active_tokens,context_usable_window,context_percent_left";
+    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error,context_active_tokens,context_usable_window,context_percent_left,context_window,cache_read_tokens,cache_creation_tokens,output_tokens";
 
 fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
     let tool_count: i64 = r.get(14)?;
@@ -5661,6 +5671,10 @@ fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
         context_active_tokens: r.get::<_, Option<i64>>(19)?.map(|v| v as u64),
         context_usable_window: r.get::<_, Option<i64>>(20)?.map(|v| v as u64),
         context_percent_left: r.get::<_, Option<i64>>(21)?.map(|v| v as u8),
+        context_window: r.get::<_, Option<i64>>(22)?.map(|v| v as u64),
+        cache_read_tokens: r.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+        cache_creation_tokens: r.get::<_, Option<i64>>(24)?.map(|v| v as u64),
+        output_tokens: r.get::<_, Option<i64>>(25)?.map(|v| v as u64),
     })
 }
 
@@ -8759,7 +8773,7 @@ mod tests {
         assert_eq!(run.context_percent_left, None);
 
         store
-            .update_agent_run_context_usage("r1", 4_000, 120_000, 60)
+            .update_agent_run_context_usage("r1", 4_000, 120_000, 60, 200_000, 3_000, 500, 200)
             .await
             .unwrap();
 
@@ -8767,6 +8781,56 @@ mod tests {
         assert_eq!(reloaded.context_active_tokens, Some(4_000));
         assert_eq!(reloaded.context_usable_window, Some(120_000));
         assert_eq!(reloaded.context_percent_left, Some(60));
+    }
+
+    #[tokio::test]
+    async fn agent_run_context_usage_round_trips_full_fields() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO sessions(session_pk,status,perm_mode,kind,branch_owned,resume_attempts) \
+                     VALUES ('s1','idle','default','chat',0,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .insert_primary_agent_run(NewAgentRun {
+                run_id: "r1".into(),
+                session_pk: "s1".into(),
+                parent_run_id: None,
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: "lead".into(),
+                executing_agent_id: Some("lead".into()),
+                executing_agent_name_snapshot: "Lead".into(),
+                agent_kind: AgentRunKind::Primary,
+                task: "root".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_agent_run_context_usage("r1", 100, 200, 42, 1000, 300, 40, 12)
+            .await
+            .unwrap();
+
+        let run = store.get_agent_run("r1").await.unwrap().unwrap();
+        assert_eq!(run.context_active_tokens, Some(100));
+        assert_eq!(run.context_usable_window, Some(200));
+        assert_eq!(run.context_percent_left, Some(42));
+        assert_eq!(run.context_window, Some(1000));
+        assert_eq!(run.cache_read_tokens, Some(300));
+        assert_eq!(run.cache_creation_tokens, Some(40));
+        assert_eq!(run.output_tokens, Some(12));
     }
 
     #[tokio::test]

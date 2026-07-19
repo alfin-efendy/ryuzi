@@ -361,6 +361,10 @@ pub struct AgentRun {
     pub context_active_tokens: Option<u64>,
     pub context_usable_window: Option<u64>,
     pub context_percent_left: Option<u8>,
+    pub context_window: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 /// The session's primary run, if it has one, plus its sorted child runs.
@@ -869,6 +873,9 @@ pub enum CoreEvent {
         context_window: u64,
         usable_window: u64,
         percent_left: u8,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        output_tokens: u64,
     },
     /// The native runtime compacted a session's history
     /// (trigger: pre_turn|mid_turn|manual).
@@ -1046,6 +1053,9 @@ mod tests {
             context_window: 200_000,
             usable_window: 190_000,
             percent_left: 88,
+            cache_read_tokens: 900,
+            cache_creation_tokens: 40,
+            output_tokens: 5,
         };
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "agentRunContextUsage");

@@ -1877,7 +1877,7 @@ export type AgentPersonalityInfo = { preset: string; custom: string | null }
  */
 export type AgentRecoveryInfo = { code: string; message: string }
 export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
-export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null; contextActiveTokens: number | null; contextUsableWindow: number | null; contextPercentLeft: number | null }
+export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null; contextActiveTokens: number | null; contextUsableWindow: number | null; contextPercentLeft: number | null; contextWindow: number | null; cacheReadTokens: number | null; cacheCreationTokens: number | null; outputTokens: number | null }
 export type AgentRunKind = "primary" | "main-delegate" | "subagent"
 /**
  * The session's primary run, if it has one, plus its sorted child runs.
@@ -2017,7 +2017,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id?: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
 /**
  * A durable transcript row owned by a non-primary agent run.
  */
@@ -2051,7 +2051,7 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * `ContextUsage`, its own fields stay snake_case; the enum-level
  * `rename_all = "camelCase"` only renames the `kind` tag.
  */
-{ kind: "agentRunContextUsage"; session_pk: string; run_id: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number } |
+{ kind: "agentRunContextUsage"; session_pk: string; run_id: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; cache_creation_tokens: number; output_tokens: number } |
 /**
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).
@@ -2240,7 +2240,7 @@ export type Message = { sessionPk: string; seq: number;
  * The durable agent-run owner when this row was emitted by a run. Rows
  * created outside a run (for example startup notices) remain unowned.
  */
-runId: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
+runId?: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
  * Legacy group-chat attribution retained so existing databases and event
  * payloads remain readable. New message constructors leave it unset.
