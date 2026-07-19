@@ -9,13 +9,24 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::plugins::bundle::{InstalledBundle, VerifiedBundle};
+use crate::plugins::capabilities::host::HostInfo;
+use crate::plugins::capabilities::settings::{ScopedSettings, SettingsErr};
+use crate::plugins::capabilities::storage::{PluginStorage, StorageErr};
+use crate::plugins::capabilities::wit_bindings::ryuzi::host::host as host_iface;
+use crate::plugins::capabilities::wit_bindings::ryuzi::settings::settings as settings_iface;
+use crate::plugins::capabilities::wit_bindings::ryuzi::storage::storage as storage_iface;
+use crate::plugins::capabilities::PluginCapabilityContext;
 use ryuzi_plugin_sdk::PluginBundleManifest;
+use std::sync::Arc;
 use wasmtime::{
-    component::{Component, Linker},
+    component::{Component, HasSelf, Linker},
     Config, Engine, Store,
 };
 
 const HTTP_IMPORT: &str = "ryuzi:http/http@0.1.0";
+const SETTINGS_IMPORT: &str = "ryuzi:settings/settings@0.1.0";
+const STORAGE_IMPORT: &str = "ryuzi:storage/storage@0.1.0";
+const HOST_IMPORT: &str = "ryuzi:host/host@0.1.0";
 const TYPES_IMPORT: &str = "ryuzi:plugin/types@0.1.0";
 const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 const ALLOWED_EXPORTS: &[&str] = &[
@@ -65,6 +76,13 @@ impl Default for ResourceLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPolicy {
     pub allow_network: bool,
+    /// Grants `ryuzi:settings/settings` — a plugin's own scoped
+    /// `plugin.<id>.*` settings slice (see
+    /// `capabilities::settings`'s module doc for the scoping guarantee).
+    pub allow_settings: bool,
+    /// Grants `ryuzi:storage/storage` — a plugin's own scoped rows in
+    /// `component_plugin_storage`.
+    pub allow_storage: bool,
     pub limits: ResourceLimits,
 }
 
@@ -73,6 +91,8 @@ impl HostPolicy {
     pub fn deny_all() -> Self {
         Self {
             allow_network: false,
+            allow_settings: false,
+            allow_storage: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -154,9 +174,22 @@ impl ComponentRuntime {
                 && !manifest.permissions.network.is_empty()
                 && policy.allow_network;
             let types_is_authorized = name == TYPES_IMPORT;
-            if !is_wasi_baseline && !types_is_authorized && !network_is_authorized {
+            let host_is_authorized = name == HOST_IMPORT;
+            let settings_is_authorized = name == SETTINGS_IMPORT && policy.allow_settings;
+            let storage_is_authorized = name == STORAGE_IMPORT && policy.allow_storage;
+            if !is_wasi_baseline
+                && !types_is_authorized
+                && !network_is_authorized
+                && !host_is_authorized
+                && !settings_is_authorized
+                && !storage_is_authorized
+            {
                 let reason = if name == HTTP_IMPORT {
                     "network requires a manifest allowlist and host policy approval".to_string()
+                } else if name == SETTINGS_IMPORT {
+                    "settings access requires host policy approval".to_string()
+                } else if name == STORAGE_IMPORT {
+                    "storage access requires host policy approval".to_string()
                 } else {
                     "no host capability is enabled by this runtime slice".to_string()
                 };
@@ -185,8 +218,10 @@ impl ComponentRuntime {
             .map(|_| ())
     }
 
-    /// Instantiates an import-free component after policy validation. Capability
-    /// linker definitions are intentionally deferred to the host-adapter slice.
+    /// Instantiates a component after policy validation, linking the host
+    /// capability adapters (`ryuzi:host/host` always; `ryuzi:settings/settings`
+    /// and `ryuzi:storage/storage` only when `policy` grants them) into the
+    /// linker before instantiation.
     ///
     /// Timeout enforcement uses epoch interruption on a blocking thread:
     /// synchronous `Linker::instantiate` runs inside `spawn_blocking`, and a
@@ -198,6 +233,7 @@ impl ComponentRuntime {
         &self,
         bundle: &InstalledBundle,
         policy: HostPolicy,
+        ctx: Arc<PluginCapabilityContext>,
     ) -> Result<(), PluginRuntimeError> {
         let bytes = std::fs::read(&bundle.component_path)
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
@@ -208,6 +244,13 @@ impl ComponentRuntime {
         let engine = self.engine.clone();
         let fuel = policy.limits.fuel;
         let timeout = policy.limits.timeout;
+        let allow_network = policy.allow_network;
+        let allow_settings = policy.allow_settings;
+        let allow_storage = policy.allow_storage;
+        // Captured on the async caller's thread — inside `spawn_blocking`
+        // there is no ambient Tokio reactor, so the sync `Host` trait impls
+        // bridge back to it explicitly via `Handle::block_on`.
+        let rt = tokio::runtime::Handle::current();
 
         // Run synchronous instantiation on a blocking thread so that
         // tokio::select! can race it against a sleep timer.  A plain
@@ -215,12 +258,44 @@ impl ComponentRuntime {
         // Wasm; epoch interruption on a blocking thread is the correct
         // mechanism.
         let join_handle = tokio::task::spawn_blocking(move || {
-            let mut store = Store::new(&engine, ());
+            let state = CapabilityState {
+                ctx,
+                allow_network,
+                rt,
+            };
+            let mut store = Store::new(&engine, state);
             store
                 .set_fuel(fuel)
                 .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
             store.set_epoch_deadline(1);
-            let linker = Linker::new(&engine);
+            let mut linker = Linker::new(&engine);
+            // `host` carries no secrets and has no side effects — always
+            // linked regardless of policy.
+            host_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
+                &mut linker
+                    .instance("host")
+                    .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?,
+                |s: &mut CapabilityState| s,
+            )
+            .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            if allow_settings {
+                settings_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
+                    &mut linker.instance("settings").map_err(|error| {
+                        PluginRuntimeError::InstantiationFailed(error.to_string())
+                    })?,
+                    |s: &mut CapabilityState| s,
+                )
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            }
+            if allow_storage {
+                storage_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
+                    &mut linker.instance("storage").map_err(|error| {
+                        PluginRuntimeError::InstantiationFailed(error.to_string())
+                    })?,
+                    |s: &mut CapabilityState| s,
+                )
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            }
             linker
                 .instantiate(&mut store, &component)
                 .map(|_instance| ())
@@ -293,11 +368,191 @@ impl ComponentRuntime {
     }
 }
 
+/// The `wasmtime::component::Store<T>` state type for a linked component
+/// instantiation. Holds everything the three linked `Host` trait impls below
+/// need: which plugin is calling ([`PluginCapabilityContext`]), whether
+/// network was granted (surfaced through `ryuzi:host/host`'s
+/// `capabilities()` call, not itself an HTTP client — that's Task 8), and a
+/// `Handle` back to the async runtime the outer `instantiate` call is
+/// running on.
+///
+/// # Async bridge
+/// `wasmtime::component::bindgen!`'s generated `Host` traits are
+/// synchronous (`&mut self` methods returning `Result` directly, no
+/// `async_trait`/`Future`) even though `ScopedSettings`/`PluginStorage`'s
+/// own methods are `async` (they go through `Store::with_conn`). Each trait
+/// method below bridges the gap with `self.rt.block_on(...)`: `rt` is a
+/// `tokio::runtime::Handle` captured with `Handle::current()` on the async
+/// caller's thread *before* the `spawn_blocking` closure that builds this
+/// state runs (see `instantiate` above) — inside `spawn_blocking` there is
+/// no ambient Tokio reactor to construct a new runtime from, so the handle
+/// must be captured ahead of time and moved in.
+struct CapabilityState {
+    ctx: Arc<PluginCapabilityContext>,
+    allow_network: bool,
+    rt: tokio::runtime::Handle,
+}
+
+impl host_iface::Host for CapabilityState {
+    fn get_plugin_info(&mut self) -> Result<host_iface::PluginInfo, host_iface::HostError> {
+        let info = HostInfo::new(&self.ctx, self.allow_network);
+        let (id, version) = info.plugin_info();
+        Ok(host_iface::PluginInfo { id, version })
+    }
+
+    fn capabilities(&mut self) -> Result<host_iface::HostCapabilities, host_iface::HostError> {
+        let info = HostInfo::new(&self.ctx, self.allow_network);
+        let (network, filesystem, secrets) = info.capabilities();
+        Ok(host_iface::HostCapabilities {
+            network,
+            filesystem,
+            secrets,
+        })
+    }
+}
+
+impl settings_iface::Host for CapabilityState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<settings_iface::Setting, settings_iface::SettingsError> {
+        let ctx = self.ctx.clone();
+        let result = self
+            .rt
+            .block_on(async move { ScopedSettings::new(&ctx).get(&key).await });
+        match result {
+            Ok((key, value, secret)) => Ok(settings_iface::Setting { key, value, secret }),
+            Err(SettingsErr::NotFound) => Err(settings_iface::SettingsError::NotFound),
+            Err(SettingsErr::Invalid(message)) => {
+                Err(settings_iface::SettingsError::Invalid(message))
+            }
+            Err(SettingsErr::Unavailable) => Err(settings_iface::SettingsError::Unavailable),
+        }
+    }
+
+    fn set(
+        &mut self,
+        value: settings_iface::Setting,
+    ) -> Result<settings_iface::Setting, settings_iface::SettingsError> {
+        let ctx = self.ctx.clone();
+        let settings_iface::Setting { key, value, .. } = value;
+        let result = self
+            .rt
+            .block_on(async move { ScopedSettings::new(&ctx).set(&key, &value).await });
+        match result {
+            Ok((key, secret)) => Ok(settings_iface::Setting {
+                key,
+                value: String::new(),
+                secret,
+            }),
+            Err(SettingsErr::NotFound) => Err(settings_iface::SettingsError::NotFound),
+            Err(SettingsErr::Invalid(message)) => {
+                Err(settings_iface::SettingsError::Invalid(message))
+            }
+            Err(SettingsErr::Unavailable) => Err(settings_iface::SettingsError::Unavailable),
+        }
+    }
+
+    fn remove(&mut self, key: String) -> Result<bool, settings_iface::SettingsError> {
+        let ctx = self.ctx.clone();
+        let result = self
+            .rt
+            .block_on(async move { ScopedSettings::new(&ctx).remove(&key).await });
+        match result {
+            Ok(existed) => Ok(existed),
+            Err(SettingsErr::NotFound) => Err(settings_iface::SettingsError::NotFound),
+            Err(SettingsErr::Invalid(message)) => {
+                Err(settings_iface::SettingsError::Invalid(message))
+            }
+            Err(SettingsErr::Unavailable) => Err(settings_iface::SettingsError::Unavailable),
+        }
+    }
+}
+
+impl storage_iface::Host for CapabilityState {
+    fn get(
+        &mut self,
+        key: String,
+    ) -> Result<storage_iface::StoredValue, storage_iface::StorageError> {
+        let ctx = self.ctx.clone();
+        let key_for_response = key.clone();
+        let result = self
+            .rt
+            .block_on(async move { PluginStorage::new(&ctx).get(&key).await });
+        match result {
+            Ok(value) => Ok(storage_iface::StoredValue {
+                key: key_for_response,
+                value,
+            }),
+            Err(StorageErr::NotFound) => Err(storage_iface::StorageError::NotFound),
+            Err(StorageErr::Denied) => Err(storage_iface::StorageError::Denied),
+            Err(StorageErr::Failed(message)) => Err(storage_iface::StorageError::Failed(message)),
+        }
+    }
+
+    fn put(
+        &mut self,
+        value: storage_iface::StoredValue,
+    ) -> Result<storage_iface::StoredValue, storage_iface::StorageError> {
+        let ctx = self.ctx.clone();
+        let storage_iface::StoredValue { key, value } = value;
+        let key_for_response = key.clone();
+        let result = self
+            .rt
+            .block_on(async move { PluginStorage::new(&ctx).put(&key, value).await });
+        match result {
+            Ok(()) => Ok(storage_iface::StoredValue {
+                key: key_for_response,
+                value: Vec::new(),
+            }),
+            Err(StorageErr::NotFound) => Err(storage_iface::StorageError::NotFound),
+            Err(StorageErr::Denied) => Err(storage_iface::StorageError::Denied),
+            Err(StorageErr::Failed(message)) => Err(storage_iface::StorageError::Failed(message)),
+        }
+    }
+
+    fn delete(&mut self, key: String) -> Result<bool, storage_iface::StorageError> {
+        let ctx = self.ctx.clone();
+        let result = self
+            .rt
+            .block_on(async move { PluginStorage::new(&ctx).delete(&key).await });
+        match result {
+            Ok(existed) => Ok(existed),
+            Err(StorageErr::NotFound) => Err(storage_iface::StorageError::NotFound),
+            Err(StorageErr::Denied) => Err(storage_iface::StorageError::Denied),
+            Err(StorageErr::Failed(message)) => Err(storage_iface::StorageError::Failed(message)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::SettingsStore;
     use crate::store::ComponentPluginReleaseRecord;
+    use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{NetworkPermission, PluginLifecycle, PluginPermissions, PluginRelease};
+
+    /// A throwaway [`PluginCapabilityContext`] over a fresh on-disk `Store` —
+    /// enough for `instantiate` tests that don't exercise the settings/
+    /// storage adapters themselves (those are covered directly in
+    /// `capabilities::settings`/`capabilities::storage`). Returns the
+    /// backing tempfile too, so it isn't dropped (and the DB deleted) before
+    /// the test finishes using the context.
+    async fn test_ctx(plugin_id: &str) -> (Arc<PluginCapabilityContext>, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        (
+            Arc::new(PluginCapabilityContext {
+                plugin_id: plugin_id.to_string(),
+                version: "0.1.0".to_string(),
+                settings: SettingsStore::new(store.clone()),
+                store,
+                telemetry: Arc::new(NoopTelemetry),
+            }),
+            tmp,
+        )
+    }
 
     fn manifest(network: Vec<&str>) -> PluginBundleManifest {
         PluginBundleManifest {
@@ -454,9 +709,10 @@ mod tests {
     #[tokio::test]
     async fn instantiate_succeeds_for_an_installed_component_under_deny_all() {
         let dir = tempfile::tempdir().expect("tempdir should create");
+        let (ctx, _tmp) = test_ctx("acme").await;
         let runtime = ComponentRuntime::new().expect("runtime should configure");
         runtime
-            .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all())
+            .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all(), ctx)
             .await
             .expect("an import-free installed component should instantiate");
     }
@@ -484,6 +740,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir should create");
         let bundle = installed_bundle_with_wat(dir.path(), loop_wat);
+        let (ctx, _tmp) = test_ctx("acme").await;
 
         let mut policy = HostPolicy::deny_all();
         policy.limits.fuel = u64::MAX;
@@ -491,7 +748,7 @@ mod tests {
 
         let runtime = ComponentRuntime::new().expect("runtime should configure");
         let error = runtime
-            .instantiate(&bundle, policy)
+            .instantiate(&bundle, policy, ctx)
             .await
             .expect_err("nonterminating component must not succeed");
         assert!(
@@ -599,6 +856,82 @@ mod tests {
         assert!(
             matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == "ryuzi:http/http@0.1.0")
         );
+    }
+
+    #[test]
+    fn settings_import_without_policy_grant_is_denied() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let result = runtime.validate_component_bytes(
+            &manifest(vec![]),
+            br#"(component (import "ryuzi:settings/settings@0.1.0" (instance)))"#,
+            &HostPolicy::deny_all(),
+        );
+        let Err(error) = result else {
+            panic!("settings import must require a policy grant");
+        };
+        assert!(
+            matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == SETTINGS_IMPORT)
+        );
+    }
+
+    #[test]
+    fn settings_import_is_allowed_when_policy_grants_it() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let policy = HostPolicy {
+            allow_settings: true,
+            ..HostPolicy::deny_all()
+        };
+        runtime
+            .validate_component_bytes(
+                &manifest(vec![]),
+                br#"(component (import "ryuzi:settings/settings@0.1.0" (instance)))"#,
+                &policy,
+            )
+            .expect("settings import must validate once the policy grants it");
+    }
+
+    #[test]
+    fn storage_import_without_policy_grant_is_denied() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let result = runtime.validate_component_bytes(
+            &manifest(vec![]),
+            br#"(component (import "ryuzi:storage/storage@0.1.0" (instance)))"#,
+            &HostPolicy::deny_all(),
+        );
+        let Err(error) = result else {
+            panic!("storage import must require a policy grant");
+        };
+        assert!(
+            matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == STORAGE_IMPORT)
+        );
+    }
+
+    #[test]
+    fn storage_import_is_allowed_when_policy_grants_it() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let policy = HostPolicy {
+            allow_storage: true,
+            ..HostPolicy::deny_all()
+        };
+        runtime
+            .validate_component_bytes(
+                &manifest(vec![]),
+                br#"(component (import "ryuzi:storage/storage@0.1.0" (instance)))"#,
+                &policy,
+            )
+            .expect("storage import must validate once the policy grants it");
+    }
+
+    #[test]
+    fn host_import_is_always_allowed_under_deny_all() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime
+            .validate_component_bytes(
+                &manifest(vec![]),
+                br#"(component (import "ryuzi:host/host@0.1.0" (instance)))"#,
+                &HostPolicy::deny_all(),
+            )
+            .expect("the host-info import carries no secrets and is always allowed");
     }
 
     /// The public entrypoint `validate_component` reads the component off a

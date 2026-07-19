@@ -21,6 +21,7 @@
 
 pub mod builtin;
 pub mod bundle;
+pub mod capabilities;
 pub mod catalog;
 pub mod catalog_feed_key;
 pub mod declarative;
