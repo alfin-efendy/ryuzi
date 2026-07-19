@@ -76,7 +76,7 @@ afterEach(cleanup);
 test("shows the full transcript, metadata, result, and related changes", () => {
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
 
-  expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Back to agent runs" })).toBeTruthy();
   expect(screen.getByText("Inspect logs")).toBeTruthy();
   expect(screen.getByText("The complete child transcript")).toBeTruthy();
   expect(screen.getByText("tool failed")).toBeTruthy();
@@ -122,7 +122,7 @@ test("places the run identity and valid action in the detail header", () => {
   expect(header).toBeTruthy();
   const headerContent = within(header!);
 
-  expect(headerContent.getByRole("button", { name: "Back" })).toBeTruthy();
+  expect(headerContent.getByRole("button", { name: "Back to agent runs" })).toBeTruthy();
   expect(headerContent.getByRole("img", { name: "Agent avatar for Researcher" })).toBeTruthy();
   for (const label of ["Researcher", "Subagent", "Running", "2 tools", "2s", "model-a", "high"]) {
     expect(headerContent.getByText(label)).toBeTruthy();
@@ -250,7 +250,7 @@ test("back clears selection and copy writes the final result", () => {
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
 
   fireEvent.click(screen.getByRole("button", { name: "Copy result" }));
-  fireEvent.click(screen.getByRole("button", { name: "Back" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to agent runs" }));
 
   expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Final findings");
   expect(useDelegation.getState().selectedBySession[delegationSessionKey("local", "s1")]).toBeNull();

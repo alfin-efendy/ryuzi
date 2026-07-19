@@ -80,7 +80,7 @@ export function AgentRunDetail({
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label="Back"
+          aria-label="Back to agent runs"
           title="Back"
           onClick={() => select(runnerId, sessionPk, null)}
           className="-ml-1"
