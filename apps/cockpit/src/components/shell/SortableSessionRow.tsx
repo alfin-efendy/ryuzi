@@ -9,7 +9,7 @@ import { sessionKey } from "@/lib/session-key";
 export function SortableSessionRow(props: SessionRowProps) {
   // Composite id (matches the SortableContext's `items`) — a bare `sessionPk`
   // would collide across runners.
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: sessionKey(props.session) });
+  const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: sessionKey(props.session) });
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -18,7 +18,7 @@ export function SortableSessionRow(props: SessionRowProps) {
     cursor: isDragging ? "grabbing" : undefined,
   };
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div ref={setNodeRef} style={style} {...listeners}>
       <SessionRow {...props} />
     </div>
   );
