@@ -111,6 +111,10 @@ pub struct RunnerDeps {
     /// that field's doc. `None` in the common case (no extensions spawned)
     /// and in every bare test `RunnerDeps`.
     pub extension_events: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
+    /// Enabled WASM component bundles' hook dispatcher (Task 9), threaded from
+    /// `SessionCtx::wasm_hooks`. Fired alongside `extension_events` at every
+    /// `fire_hook` site. `None` in the common case and every bare test.
+    pub wasm_hooks: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
     pub model: Option<String>,
     /// Immutable effort/capability snapshot for the current turn.
     pub turn_effort_policy: Arc<TurnEffortPolicy>,
@@ -1926,6 +1930,7 @@ async fn deps_for_subagent(deps: &RunnerDeps) -> anyhow::Result<RunnerDeps> {
         artifacts: deps.artifacts.clone(),
         extra_skill_dirs: deps.extra_skill_dirs.clone(),
         extension_events: deps.extension_events.clone(),
+        wasm_hooks: deps.wasm_hooks.clone(),
         model,
         turn_effort_policy: Arc::new(effort_policy),
         meta,
@@ -2969,6 +2974,7 @@ async fn execute_tool_call(
     let hook = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
+        deps.wasm_hooks.as_ref(),
         super::hooks::HookEvent::ToolBefore,
         &json!({ "tool": tool_name, "input": input }),
     )
@@ -3432,6 +3438,7 @@ async fn fire_tool_after_observation(
     let _ = super::hooks::fire_hook(
         &deps.work_dir,
         deps.extension_events.as_ref(),
+        deps.wasm_hooks.as_ref(),
         super::hooks::HookEvent::ToolAfter,
         &after_payload,
     )
@@ -5813,6 +5820,7 @@ mod tests {
             )),
             extra_skill_dirs: vec![],
             extension_events: None,
+            wasm_hooks: None,
             // bypassPermissions so the scripted bash tool runs without a prompt.
             model: Some("test/model".into()),
             turn_effort_policy: Arc::new(TurnEffortPolicy {

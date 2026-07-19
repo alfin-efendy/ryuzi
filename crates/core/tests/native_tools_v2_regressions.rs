@@ -251,6 +251,8 @@ async fn fixture_context(
             extra_skill_dirs: Vec::new(),
             extension_events: None,
             extension_tools: None,
+            wasm_tools: None,
+            wasm_hooks: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,

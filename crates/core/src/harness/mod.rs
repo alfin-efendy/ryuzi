@@ -86,6 +86,21 @@ pub struct SessionCtx {
     /// every `Running`, `provides_tools` extension's tools and wrap them as
     /// native `Tool`s via `harness::native::tools::extension::ExtensionTool`.
     pub extension_tools: Option<Arc<dyn crate::plugins::extension::ExtensionTools>>,
+    /// Enabled WASM component bundles' connector tools (Task 9), the component
+    /// analogue of `extension_tools`. `None` when no enabled component bundle
+    /// is installed (the common case, and every bare test `SessionCtx`), so a
+    /// session with no component plugins builds its tool registry with zero
+    /// extra work. The native runtime's session start (mirroring
+    /// `connect_extension_tools`) calls `session_tools()` through this to
+    /// enumerate each component's `connector.list-tools` and wrap them as
+    /// native `Tool`s via `harness::native::tools::wasm::WasmTool`.
+    pub wasm_tools: Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
+    /// Enabled WASM component bundles' `ryuzi:hooks/hooks` dispatcher (Task 9),
+    /// threaded next to `extension_events`. `fire_hook` fans a `tool.before`
+    /// gating event out to both sinks; a component that rejects denies, while a
+    /// trapping/timing-out component fails OPEN. `None` under the same
+    /// condition as `wasm_tools`.
+    pub wasm_hooks: Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
     /// Event bus for normalized session output.
     pub events: broadcast::Sender<CoreEvent>,
     /// Shared approval hub for tool-permission requests.
@@ -318,6 +333,8 @@ mod tests {
             extra_skill_dirs: vec![],
             extension_events: None,
             extension_tools: None,
+            wasm_tools: None,
+            wasm_hooks: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,

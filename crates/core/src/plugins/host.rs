@@ -369,6 +369,22 @@ impl PluginHost {
     }
 }
 
+/// Whether an installed WASM component bundle (Task 9+) is enabled, per the
+/// same `plugin.<id>.enabled == "true"` convention (default `false`)
+/// [`PluginHost::is_enabled`] applies to connector/extension plugins.
+///
+/// Component bundles are discovered off-disk
+/// ([`crate::plugins::bundle::load_active_bundles`]) rather than registered as
+/// [`CorePlugin`]s, so this is a standalone check keyed on the bundle's
+/// manifest id rather than a `PluginHost` method — but it deliberately reuses
+/// the identical settings key so a single "enable this plugin" toggle governs
+/// a plugin regardless of whether it ships as a subprocess extension or a WASM
+/// component.
+pub async fn component_plugin_enabled(settings: &SettingsStore, id: &str) -> anyhow::Result<bool> {
+    let key = format!("plugin.{id}.enabled");
+    Ok(settings.get(&key).await?.as_deref() == Some("true"))
+}
+
 /// The extension registries, plus the plugin host recording every
 /// installed [`CorePlugin`]. `harness` is a single slot: the native
 /// runtime is the only harness — production leaves the default, tests

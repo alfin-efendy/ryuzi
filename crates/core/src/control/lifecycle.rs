@@ -1608,6 +1608,12 @@ impl ControlPlane {
                 Some(self.extension_host.clone()
                     as Arc<dyn crate::plugins::extension::ExtensionTools>)
             };
+        // Task 9: discover enabled WASM component bundles and expose their
+        // connector tools + hook dispatcher to this session, mirroring the
+        // extension seams above. `(None, None)` when no enabled component
+        // bundle is installed (the common case), so no component runtime is
+        // even constructed.
+        let (wasm_tools, wasm_hooks) = self.build_wasm_session_providers(&settings).await;
         // `kind`/`agent` come from the session row rather than a caller
         // parameter — every caller of `start_harness_session` (fresh start,
         // cold-resume, crash-resume) has already inserted the row before
@@ -1677,6 +1683,8 @@ impl ControlPlane {
             extra_skill_dirs,
             extension_events,
             extension_tools,
+            wasm_tools,
+            wasm_hooks,
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             automation_events: Some(Arc::new(super::ControlPlaneAutomationSink(Arc::downgrade(
@@ -1706,6 +1714,122 @@ impl ControlPlane {
                 .insert(session_pk.to_string(), handle.clone());
         }
         Ok(handle)
+    }
+
+    /// Discover every active WASM component bundle
+    /// ([`crate::plugins::bundle::load_active_bundles`]), keep only the ENABLED
+    /// ones ([`crate::plugins::host::component_plugin_enabled`], the same
+    /// `plugin.<id>.enabled` convention connector/extension plugins use), and
+    /// build one shared [`WasmActivation`] per enabled bundle. Returns a
+    /// [`WasmTools`] provider (its connector tools) and a
+    /// [`WasmHookDispatcher`] (its `ryuzi:hooks/hooks` export) over the same
+    /// activations, to thread into the session next to the extension seams.
+    ///
+    /// Every failure mode is warn-and-skip: a missing bundle root, a discovery
+    /// error, an unavailable component runtime, a per-bundle compile failure,
+    /// or an enablement-lookup error each drop just the affected bundle (or the
+    /// whole set) rather than blocking the session from starting — a broken
+    /// component plugin must never brick a session. `(None, None)` when nothing
+    /// enabled is installed, so the common case constructs no component runtime
+    /// at all. Declarative connectors are untouched (this migration phase keeps
+    /// both paths live).
+    async fn build_wasm_session_providers(
+        &self,
+        settings: &SettingsStore,
+    ) -> (
+        Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
+        Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
+    ) {
+        use crate::plugins::runtime::{ComponentRuntime, HostPolicy, ResourceLimits};
+        use crate::plugins::wasm_connector::{WasmActivation, WasmToolSet};
+        use crate::plugins::wasm_hooks::WasmHookDispatcher;
+
+        let root = crate::plugins::bundle::installed_bundle_root();
+        if !root.exists() {
+            return (None, None);
+        }
+        let bundles = match crate::plugins::bundle::load_active_bundles(&root, &self.store).await {
+            Ok(bundles) => bundles,
+            Err(error) => {
+                tracing::warn!("wasm: discovering component bundles failed: {error}");
+                return (None, None);
+            }
+        };
+        if bundles.is_empty() {
+            return (None, None);
+        }
+        let runtime = match ComponentRuntime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!("wasm: component runtime unavailable: {error}");
+                return (None, None);
+            }
+        };
+        let mut activations: Vec<Arc<WasmActivation>> = Vec::new();
+        for bundle in bundles {
+            let id = bundle.manifest.id.clone();
+            match crate::plugins::host::component_plugin_enabled(settings, &id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(plugin = %id, "wasm: enablement check failed: {error}");
+                    continue;
+                }
+            }
+            // Capabilities are granted from the bundle's own manifest
+            // declarations: network only when it declares hosts, OAuth only
+            // when it declares profiles; a plugin's own scoped
+            // settings/storage are safe by construction, so they are always
+            // linked. Real outbound network stays gated by the host-mediated
+            // `ryuzi:http`/`ryuzi:oauth` capabilities.
+            let policy = HostPolicy {
+                allow_network: !bundle.manifest.permissions.network.is_empty(),
+                allow_settings: true,
+                allow_storage: true,
+                allow_oauth: !bundle.manifest.oauth.is_empty(),
+                limits: ResourceLimits::default(),
+            };
+            let compiled = match runtime.compile(&bundle, policy) {
+                Ok(compiled) => Arc::new(compiled),
+                Err(error) => {
+                    tracing::warn!(plugin = %id, "wasm: component compile failed: {error}");
+                    continue;
+                }
+            };
+            let ctx = Arc::new(crate::plugins::capabilities::PluginCapabilityContext {
+                plugin_id: id.clone(),
+                version: bundle.manifest.version.clone(),
+                settings: settings.clone(),
+                store: self.store.clone(),
+                telemetry: self.telemetry.clone(),
+                network_allowlist: bundle
+                    .manifest
+                    .permissions
+                    .network
+                    .iter()
+                    .map(|entry| entry.0.clone())
+                    .collect(),
+                oauth_profile_ids: bundle
+                    .manifest
+                    .oauth
+                    .iter()
+                    .map(|profile| profile.id.clone())
+                    .collect(),
+            });
+            let principal = crate::domain::Principal {
+                plugin_id: id.clone(),
+                plugin_name: bundle.manifest.name.clone(),
+            };
+            activations.push(Arc::new(WasmActivation::new(compiled, ctx, id, principal)));
+        }
+        if activations.is_empty() {
+            return (None, None);
+        }
+        let wasm_tools: Arc<dyn crate::plugins::wasm_connector::WasmTools> =
+            Arc::new(WasmToolSet::new(activations.clone()));
+        let wasm_hooks: Arc<dyn crate::plugins::extension::ExtensionEvents> =
+            Arc::new(WasmHookDispatcher::new(activations));
+        (Some(wasm_tools), Some(wasm_hooks))
     }
 
     /// Extend `mcp_servers` with the MCP servers of every enabled,
