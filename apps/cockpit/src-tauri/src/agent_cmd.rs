@@ -383,8 +383,6 @@ mod tests {
             native_tools: vec!["read".to_owned(), "grep".to_owned(), "bash".to_owned()],
             plugin_tools: Vec::new(),
             apps: Vec::new(),
-            max_turns: 50,
-            max_tool_rounds: 100,
         }
     }
 

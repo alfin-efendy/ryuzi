@@ -1184,7 +1184,6 @@ mod tests {
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
-                    loop_settings: profile.loop_settings,
                 },
             )
             .await
@@ -1232,7 +1231,6 @@ mod tests {
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
-                    loop_settings: profile.loop_settings,
                 },
             )
             .await
@@ -1259,7 +1257,6 @@ mod tests {
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
-                    loop_settings: profile.loop_settings,
                 },
             )
             .await
@@ -1300,7 +1297,6 @@ mod tests {
                     permissions: profile.permissions,
                     skills: profile.skills,
                     tools: profile.tools,
-                    loop_settings: profile.loop_settings,
                 },
             )
             .await

@@ -167,10 +167,6 @@ pub fn default_ryuzi_profile(agent_id: String) -> AgentProfile {
             plugins: Vec::new(),
             apps: Vec::new(),
         },
-        loop_settings: AgentLoop {
-            max_turns: 50,
-            max_tool_rounds: 100,
-        },
     }
 }
 
@@ -1058,8 +1054,6 @@ mod tests {
         assert!(agent.profile.tools.native.is_empty());
         assert!(agent.profile.tools.plugins.is_empty());
         assert!(agent.profile.tools.apps.is_empty());
-        assert_eq!(agent.profile.loop_settings.max_turns, 50);
-        assert_eq!(agent.profile.loop_settings.max_tool_rounds, 100);
         assert_eq!(
             agent.profile.personality,
             crate::agents::personality::AgentPersonality::default_profile()

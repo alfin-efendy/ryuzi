@@ -159,8 +159,6 @@ function detail(overrides: Partial<AgentDetailInfo> = {}): AgentDetailInfo {
     nativeTools: ["read", "grep", "bash"],
     pluginTools: [],
     apps: [],
-    maxTurns: 50,
-    maxToolRounds: 100,
     modelInfo: routeInfo,
     personality: { preset: "helpful", custom: null },
     ...overrides,
@@ -381,8 +379,6 @@ test("model transitions preserve supported effort, clear unsupported effort, and
       nativeTools: ["read", "grep", "bash"],
       pluginTools: [],
       apps: [],
-      maxTurns: 50,
-      maxToolRounds: 100,
     }),
   );
 });
@@ -420,7 +416,6 @@ test("Skills & Tools and Advanced tabs render their owned settings", async () =>
   expect(screen.getByRole("combobox", { name: "Skill catalog" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Save skills and tools" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-  expect(screen.getByRole("textbox", { name: "Max turns" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Delete Reviewer" })).toBeTruthy();
 });
 

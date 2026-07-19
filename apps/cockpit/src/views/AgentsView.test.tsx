@@ -68,8 +68,6 @@ function detail(input: AgentMutationInfo): AgentDetailInfo {
     nativeTools: input.nativeTools,
     pluginTools: input.pluginTools,
     apps: input.apps,
-    maxTurns: input.maxTurns,
-    maxToolRounds: input.maxToolRounds,
     modelInfo: null,
     personality: { preset: "helpful", custom: null },
   };
@@ -180,8 +178,6 @@ test("create modal sends the complete initial mutation and opens the new detail"
       nativeTools: [],
       pluginTools: [],
       apps: [],
-      maxTurns: 50,
-      maxToolRounds: 100,
     }),
   );
   await waitFor(() => expect(useNav.getState().history.current).toEqual({ kind: "agentDetail", agentId: "architect" }));

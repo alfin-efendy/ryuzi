@@ -5,10 +5,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Iteration budget for the top-level (user-facing) turn loop.
-pub const PARENT_MAX_ITERS: usize = 90;
+pub const PARENT_MAX_ITERS: usize = 500;
 /// Iteration budget for each sub-agent's own `drive()` call — sub-agents do
 /// not share the parent's budget; each gets a fresh allotment.
-pub const SUBAGENT_MAX_ITERS: usize = 50;
+pub const SUBAGENT_MAX_ITERS: usize = 500;
 
 /// A consumable, refundable counter of remaining provider-turn iterations.
 /// Thread-safe via atomics so it can be shared (`&IterationBudget`) across

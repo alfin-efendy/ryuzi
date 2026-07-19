@@ -742,7 +742,6 @@ async fn agent_owned_sessions_keep_the_creation_identity_and_create_a_primary_ru
                     plugins: vec![],
                     apps: vec![],
                 },
-                loop_settings: profile.loop_settings,
             },
         )
         .await
@@ -835,7 +834,6 @@ async fn explicit_mentions_isolate_child_harness_output_and_synthesize_once() {
             permissions: template.permissions,
             skills: template.skills,
             tools: template.tools,
-            loop_settings: template.loop_settings,
         })
         .await
         .unwrap();
@@ -972,7 +970,6 @@ async fn explicit_mentions_keep_queue_rejection_identity_in_durable_synthesis_co
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
-        loop_settings: template.loop_settings.clone(),
     };
     let mut targets = Vec::new();
     for number in 1..=crate::delegation::MAX_ACTIVE_CHILD_RUNS + 1 {
@@ -1089,7 +1086,6 @@ async fn explicit_mentions_persist_completed_outcomes_while_a_sibling_is_pending
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
-        loop_settings: template.loop_settings.clone(),
     };
     let ada = cp.registry().create(create("Ada")).await.unwrap();
     let bob = cp.registry().create(create("Bob")).await.unwrap();
@@ -1203,7 +1199,6 @@ async fn explicit_mention_child_failure_keeps_sibling_running_and_persists_parti
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
-        loop_settings: template.loop_settings.clone(),
     };
     let ada = cp.registry().create(create("Ada")).await.unwrap();
     let bob = cp.registry().create(create("Bob")).await.unwrap();
@@ -1303,7 +1298,6 @@ async fn ending_explicit_mention_parent_without_a_live_harness_cancels_children_
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
-        loop_settings: template.loop_settings.clone(),
     };
     let ada = cp.registry().create(create("Ada")).await.unwrap();
     let bob = cp.registry().create(create("Bob")).await.unwrap();
@@ -1405,7 +1399,6 @@ async fn start_rejects_an_invalid_primary_before_persisting_session_or_root_run(
                     plugins: vec!["unimplemented.plugin_tool".into()],
                     apps: Vec::new(),
                 },
-                loop_settings: profile.loop_settings,
             },
         )
         .await
@@ -1481,7 +1474,6 @@ async fn continue_rejects_a_native_incompatible_primary_before_queuing_or_persis
                     plugins: vec!["unimplemented.plugin_tool".into()],
                     apps: Vec::new(),
                 },
-                loop_settings: profile.loop_settings,
             },
         )
         .await
@@ -1574,7 +1566,6 @@ async fn resume_rejects_a_native_incompatible_primary_before_session_or_root_mut
                     plugins: vec!["unimplemented.plugin_tool".into()],
                     apps: Vec::new(),
                 },
-                loop_settings: profile.loop_settings,
             },
         )
         .await

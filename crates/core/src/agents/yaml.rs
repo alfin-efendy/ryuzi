@@ -94,14 +94,6 @@ struct ToolsWire {
     extensions: IndexMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LoopWire {
-    max_turns: u32,
-    max_tool_rounds: u32,
-    #[serde(flatten)]
-    extensions: IndexMap<String, Value>,
-}
-
 fn default_personality_preset() -> PersonalityPreset {
     PersonalityPreset::Helpful
 }
@@ -139,8 +131,6 @@ struct AgentProfileWire {
     permissions: PermissionsWire,
     skills: SkillsWire,
     tools: ToolsWire,
-    #[serde(rename = "loop")]
-    loop_settings: LoopWire,
     #[serde(flatten)]
     extensions: IndexMap<String, Value>,
 }
@@ -326,7 +316,6 @@ fn profile_from_wire(
     add_nested(&mut extensions, "permissions", wire.permissions.extensions);
     add_nested(&mut extensions, "skills", wire.skills.extensions);
     add_nested(&mut extensions, "tools", wire.tools.extensions);
-    add_nested(&mut extensions, "loop", wire.loop_settings.extensions);
 
     let personality = AgentPersonality {
         preset: wire.personality.preset,
@@ -363,10 +352,6 @@ fn profile_from_wire(
             native: trim_vec(wire.tools.native),
             plugins: trim_vec(wire.tools.plugins),
             apps: trim_vec(wire.tools.apps),
-        },
-        loop_settings: AgentLoop {
-            max_turns: wire.loop_settings.max_turns,
-            max_tool_rounds: wire.loop_settings.max_tool_rounds,
         },
     };
     Ok((profile, extensions))
@@ -413,11 +398,6 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
             apps: value.tools.apps.clone(),
             extensions: nested_extensions(extensions, "tools"),
         },
-        loop_settings: LoopWire {
-            max_turns: value.loop_settings.max_turns,
-            max_tool_rounds: value.loop_settings.max_tool_rounds,
-            extensions: nested_extensions(extensions, "loop"),
-        },
         extensions: top_extensions(
             extensions,
             &[
@@ -427,7 +407,6 @@ fn profile_to_wire(value: &AgentProfile, extensions: &IndexMap<String, Value>) -
                 "permissions",
                 "skills",
                 "tools",
-                "loop",
             ],
         ),
     }

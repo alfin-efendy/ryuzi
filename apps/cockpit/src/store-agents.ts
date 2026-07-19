@@ -256,8 +256,6 @@ export const useAgents = create<AgentsState>((set, get) => {
                 nativeTools: input.nativeTools,
                 pluginTools: input.pluginTools,
                 apps: input.apps,
-                maxTurns: input.maxTurns,
-                maxToolRounds: input.maxToolRounds,
               }
             : previous.detail;
         set({

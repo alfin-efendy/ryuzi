@@ -43,8 +43,6 @@ function detailOf(s: AgentSummaryInfo): AgentDetailInfo {
     nativeTools: [],
     pluginTools: [],
     apps: [],
-    maxTurns: 50,
-    maxToolRounds: 100,
     modelInfo: null,
     personality: { preset: "helpful", custom: null },
   };

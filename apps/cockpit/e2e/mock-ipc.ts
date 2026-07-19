@@ -360,8 +360,6 @@ export const RYUZI_DETAIL = {
   nativeTools: ["read_file", "grep"],
   pluginTools: [],
   apps: [],
-  maxTurns: 40,
-  maxToolRounds: 12,
   modelInfo: null,
   personality: { preset: "helpful", custom: null },
 } satisfies AgentDetailInfo;
@@ -373,8 +371,6 @@ export const REVIEWER_DETAIL = {
   nativeTools: ["read_file", "grep"],
   pluginTools: [],
   apps: [],
-  maxTurns: 40,
-  maxToolRounds: 12,
   modelInfo: null,
   personality: { preset: "helpful", custom: null },
 } satisfies AgentDetailInfo;

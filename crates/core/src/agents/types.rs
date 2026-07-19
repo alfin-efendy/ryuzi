@@ -90,12 +90,6 @@ pub struct AgentTools {
     pub apps: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentLoop {
-    pub max_turns: u32,
-    pub max_tool_rounds: u32,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentProfile {
     pub schema_version: u32,
@@ -108,7 +102,6 @@ pub struct AgentProfile {
     pub permissions: AgentPermissions,
     pub skills: Vec<String>,
     pub tools: AgentTools,
-    pub loop_settings: AgentLoop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,7 +147,6 @@ pub struct AgentMutationInput {
     pub permissions: AgentPermissions,
     pub skills: Vec<String>,
     pub tools: AgentTools,
-    pub loop_settings: AgentLoop,
 }
 
 #[derive(Debug, Clone, PartialEq)]

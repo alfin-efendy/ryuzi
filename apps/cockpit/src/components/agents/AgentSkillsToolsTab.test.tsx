@@ -60,8 +60,6 @@ const reviewerDetail: AgentDetailInfo = {
   nativeTools: ["read", "grep", "bash"],
   pluginTools: [],
   apps: [],
-  maxTurns: 50,
-  maxToolRounds: 100,
   modelInfo: null,
   personality: { preset: "helpful", custom: null },
 };
