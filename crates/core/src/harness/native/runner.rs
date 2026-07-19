@@ -4269,6 +4269,13 @@ async fn observe_route_selection(
     }
 }
 
+/// The per-model cost-tally key: the actually-served upstream model, falling
+/// back to the requested model/route name, then `"unknown"`. Keying by the
+/// served model splits a fan-out route (e.g. `medium`) into its real legs.
+fn cost_model_key<'a>(served: Option<&'a str>, route: Option<&'a str>) -> &'a str {
+    served.or(route).unwrap_or("unknown")
+}
+
 /// Broadcast ContextUsage and persist it for resume seeding. Sub-agent
 /// (ephemeral) loops skip both — their usage must not clobber the session's.
 /// Also folds this response's billed buckets into the per-session, per-model
@@ -4321,7 +4328,7 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         .map(super::cost::Tally::from_payload)
         .unwrap_or_default();
     tally.add(
-        deps.model.as_deref().unwrap_or("unknown"),
+        cost_model_key(cm.last_served_model(), deps.model.as_deref()),
         cm.last_input(),
         cm.last_output(),
         cm.last_cache_read(),
@@ -7086,6 +7093,16 @@ mod tests {
             saved.get("usd").is_none(),
             "session_context must never persist dollars"
         );
+    }
+
+    #[test]
+    fn cost_model_key_prefers_served_over_route() {
+        assert_eq!(
+            cost_model_key(Some("claude-opus-4-8"), Some("medium")),
+            "claude-opus-4-8"
+        );
+        assert_eq!(cost_model_key(None, Some("medium")), "medium");
+        assert_eq!(cost_model_key(None, None), "unknown");
     }
 
     #[tokio::test]
