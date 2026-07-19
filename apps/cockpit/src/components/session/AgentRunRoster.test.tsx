@@ -33,6 +33,11 @@ function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Pa
     contextActiveTokens: null,
     contextUsableWindow: null,
     contextPercentLeft: null,
+    contextWindow: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+    outputTokens: null,
+    cost: null,
     ...overrides,
   };
 }

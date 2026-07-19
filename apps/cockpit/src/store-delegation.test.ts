@@ -30,6 +30,11 @@ function run(overrides: Partial<AgentRun> = {}): AgentRun {
     contextActiveTokens: null,
     contextUsableWindow: null,
     contextPercentLeft: null,
+    contextWindow: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+    outputTokens: null,
+    cost: null,
     ...overrides,
   };
 }

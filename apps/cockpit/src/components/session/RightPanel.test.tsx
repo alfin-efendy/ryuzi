@@ -67,6 +67,11 @@ function childRun({ sourceToolCallId = null, dispatchIndex = null, ...overrides 
     contextActiveTokens: null,
     contextUsableWindow: null,
     contextPercentLeft: null,
+    contextWindow: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+    outputTokens: null,
+    cost: null,
     ...overrides,
   };
 }
