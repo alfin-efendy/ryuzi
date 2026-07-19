@@ -5584,8 +5584,7 @@ mod tests {
     #[tokio::test]
     async fn primary_agent_model_drives_turn_configuration() {
         use crate::agents::types::{
-            AgentAvatar, AgentModel, AgentPermissions, AgentProfile, AgentSnapshot,
-            AgentTools,
+            AgentAvatar, AgentModel, AgentPermissions, AgentProfile, AgentSnapshot, AgentTools,
         };
         use testutil::RecordingLlm;
 
