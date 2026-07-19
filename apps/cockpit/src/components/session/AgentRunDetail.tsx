@@ -186,7 +186,6 @@ export function AgentRunDetail({
             runnerId={runnerId}
             sessionPk={sessionPk}
             rows={rows}
-            agentName={run.executingAgentNameSnapshot}
             agentColor="#6b7280"
             running={active}
             ownerRunId={run.runId}

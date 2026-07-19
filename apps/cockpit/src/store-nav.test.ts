@@ -156,8 +156,9 @@ test("setDraft persists the map to localStorage", () => {
   useNav.setState({ drafts: {} });
 });
 
-test("sanitizeRightTab accepts agents, keeps file/review, falls back on unknown", () => {
+test("sanitizeRightTab accepts every current tab and falls back on unknown", () => {
   expect(sanitizeRightTab("agents")).toBe("agents");
+  expect(sanitizeRightTab("artifacts")).toBe("artifacts");
   expect(sanitizeRightTab("file")).toBe("file");
   expect(sanitizeRightTab("review")).toBe("review");
   expect(sanitizeRightTab("bogus")).toBe("review");

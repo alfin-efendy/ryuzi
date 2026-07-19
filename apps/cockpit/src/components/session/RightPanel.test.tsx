@@ -18,9 +18,11 @@ const sessionWorkdir = mock(
   (_runnerId: string | null, _sessionPk: string): Promise<Result<string, CmdError>> =>
     Promise.resolve({ status: "ok", data: "C:\\code\\demo" }),
 );
+const sessionTodos = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
+const listSessionArtifacts = mock(() => Promise.resolve({ status: "ok" as const, data: [] }));
 
 mock.module("@/bindings", () => ({
-  commands: { gitDiff, sessionWorkdir, getChildRuns, getChildTranscript },
+  commands: { gitDiff, sessionWorkdir, getChildRuns, getChildTranscript, sessionTodos, listSessionArtifacts },
   events: { coreEventMsg: { listen: async () => () => {} } },
 }));
 // The File tab pulls in CodeMirror and file IPC — irrelevant to the Review-tab
@@ -89,6 +91,10 @@ beforeEach(() => {
     seenRunsByDispatch: {},
     selectedBySession: {},
   });
+  sessionTodos.mockClear();
+  sessionTodos.mockImplementation(() => Promise.resolve({ status: "ok", data: [] }));
+  listSessionArtifacts.mockClear();
+  listSessionArtifacts.mockImplementation(() => Promise.resolve({ status: "ok", data: [] }));
   gitDiff.mockClear();
   getChildRuns.mockClear();
   getChildRuns.mockImplementation((_runnerId, _sessionPk) => Promise.resolve({ status: "ok", data: { rootRunId: null, runs: [] } }));
@@ -99,6 +105,13 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
+test("artifact tab renders its session panel", () => {
+  const view = render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch={null} running={false} isGit={false} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Artifacts" }));
+  expect(screen.getByLabelText("Artifacts")).toBeTruthy();
+  view.unmount();
+});
 test("non-git session: Review shows the empty state and never fetches a diff", () => {
   render(<RightPanel runnerId={LOCAL_RUNNER} sessionPk="s1" branch={null} running={false} isGit={false} />);
   expect(screen.getByText(/Not a git repository/)).toBeTruthy();

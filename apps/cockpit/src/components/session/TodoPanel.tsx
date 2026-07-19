@@ -1,23 +1,22 @@
 import { useEffect, useRef } from "react";
 import { CheckCircle2, ChevronDown, ChevronUp, Circle, CircleDot, ListTodo } from "lucide-react";
-import { cn } from "@ryuzi/ui";
+import { Button, cn } from "@ryuzi/ui";
 import { useNative } from "@/store-native";
 import { sessKey } from "@/lib/session-key";
 import type { TodoItem } from "@/bindings";
 
-/** Step summary for the floating TODO List panel: `step` is the 1-based index of
- *  the first `in_progress` item (the footer's "Step X"); with no active item
- *  it rests at the completed count. `label` headlines the pill. */
+const TODO_LIST_LABEL = "TODO List";
+
 export function todoStepSummary(todos: TodoItem[]): {
   step: number;
   total: number;
   done: number;
   label: string;
 } {
-  const done = todos.filter((t) => t.status === "completed").length;
-  const activeIdx = todos.findIndex((t) => t.status === "in_progress");
+  const done = todos.filter((todo) => todo.status === "completed").length;
+  const activeIdx = todos.findIndex((todo) => todo.status === "in_progress");
   const active = activeIdx >= 0 ? todos[activeIdx] : undefined;
-  const lastDone = [...todos].reverse().find((t) => t.status === "completed");
+  const lastDone = [...todos].reverse().find((todo) => todo.status === "completed");
   return {
     step: activeIdx >= 0 ? activeIdx + 1 : done,
     total: todos.length,
@@ -26,15 +25,15 @@ export function todoStepSummary(todos: TodoItem[]): {
   };
 }
 
-// Floating rounded TODO List panel (todowrite), overlaying the transcript
-// directly below the session header. Expanded: header + step list + "Step X / N"
-// footer. Collapsed: a pill with the live step summary. State per session.
+/** A compact, session-scoped task board that stays at the top of the chat.
+ * It expands for detail without displacing the transcript and collapses once
+ * the work is done. */
 export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; sessionPk: string; running: boolean }) {
   const key = sessKey(runnerId, sessionPk);
-  const todos = useNative((s) => s.todosBySession[key]);
-  const loadTodos = useNative((s) => s.loadTodos);
-  const collapsed = useNative((s) => s.planCollapsed[key] ?? false);
-  const setCollapsed = useNative((s) => s.setPlanCollapsed);
+  const todos = useNative((state) => state.todosBySession[key]);
+  const loadTodos = useNative((state) => state.loadTodos);
+  const collapsed = useNative((state) => state.planCollapsed[key] ?? false);
+  const setCollapsed = useNative((state) => state.setPlanCollapsed);
   const activeRef = useRef<HTMLLIElement>(null);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reload when the run settles
@@ -42,87 +41,121 @@ export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; 
     void loadTodos(runnerId, sessionPk);
   }, [runnerId, sessionPk, running, loadTodos]);
 
-  const total = todos?.length ?? 0;
-  const { step, done, label } = todoStepSummary(todos ?? []);
+  const items = todos ?? [];
+  const { step, total, done, label } = todoStepSummary(items);
   const allDone = total > 0 && done === total;
+  const progress = total === 0 ? 0 : Math.round((done / total) * 100);
 
-  // Auto-collapse to the pill the moment the TODO List completes.
   useEffect(() => {
     if (allDone) setCollapsed(runnerId, sessionPk, true);
   }, [allDone, runnerId, sessionPk, setCollapsed]);
 
-  // Keep the active step visible inside the internal scroll. (Optional call:
-  // happy-dom elements don't implement scrollIntoView.)
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scrolls on step change only
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll only when the active step changes
   useEffect(() => {
     activeRef.current?.scrollIntoView?.({ block: "nearest" });
   }, [step]);
 
-  if (!todos || total === 0) return null;
-  // The panel's job ends with the run: settled + fully complete → gone.
-  if (!running && allDone) return null;
+  if (total === 0) return null;
 
   return (
-    <div className="pointer-events-none absolute top-3 left-1/2 z-20 flex w-[min(480px,calc(100%-32px))] -translate-x-1/2 flex-col items-center">
+    <div className="pointer-events-none absolute left-1/2 top-3 z-20 flex w-[min(520px,calc(100%-32px))] -translate-x-1/2 flex-col items-center">
       {collapsed ? (
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          size="sm"
           aria-label="Expand TODO List"
           onClick={() => setCollapsed(runnerId, sessionPk, false)}
-          className="acrylic-card pointer-events-auto flex max-w-full items-center gap-2 rounded-full border border-border px-3.5 py-1.5 text-[12.5px] shadow-lg"
+          className="pointer-events-auto h-8 max-w-full gap-2 rounded-full border-border bg-background px-3 shadow-lg"
         >
           {allDone ? (
             <CheckCircle2 aria-hidden size={13} className="shrink-0 text-green-500" />
           ) : (
             <CircleDot aria-hidden size={13} className="shrink-0 text-amber-500" />
           )}
-          <span className="shrink-0 font-semibold tabular-nums text-muted-foreground">{`Step ${step}/${total}`}</span>
-          <span className="min-w-0 truncate">{label}</span>
-          <ChevronUp aria-hidden size={11} strokeWidth={2} className="size-[11px] shrink-0 text-muted-foreground" />
-        </button>
+          <span className="shrink-0 text-[12px] font-semibold tabular-nums text-muted-foreground">
+            {done}/{total}
+          </span>
+          <span className="min-w-0 truncate text-[12px]">{allDone ? "All tasks completed" : label}</span>
+          <ChevronUp aria-hidden size={12} className="shrink-0 text-muted-foreground" />
+        </Button>
       ) : (
-        <div className="acrylic-card pointer-events-auto w-full overflow-hidden rounded-2xl border border-border shadow-lg">
-          <button
-            type="button"
+        <section
+          aria-label={TODO_LIST_LABEL}
+          className="pointer-events-auto w-full overflow-hidden rounded-xl border border-border bg-background shadow-lg"
+        >
+          <Button
+            variant="ghost"
+            size="sm"
             aria-label="Collapse TODO List"
             onClick={() => setCollapsed(runnerId, sessionPk, true)}
-            className="flex w-full items-center gap-2 px-3.5 pb-1 pt-2.5 text-[11px] font-semibold uppercase tracking-[0.05em] text-muted-foreground"
+            className="h-auto w-full justify-start gap-2 rounded-none px-3.5 pb-2 pt-2.5 hover:bg-muted/60"
           >
-            <ListTodo aria-hidden size={12} strokeWidth={2} className="size-3 shrink-0" />
-            TODO List
-            <ChevronDown aria-hidden size={11} strokeWidth={2} className="ml-auto size-[11px] shrink-0" />
-          </button>
-          <ul className="flex max-h-[45vh] flex-col gap-px overflow-y-auto px-2 pb-1.5">
-            {todos.map((t, i) => {
-              const active = t.status === "in_progress";
+            <div className="flex size-6 items-center justify-center rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400">
+              <ListTodo aria-hidden size={13} strokeWidth={2} />
+            </div>
+            <span className="min-w-0 flex-1 text-left">
+              <span className="block text-[12.5px] font-semibold">TODO List</span>
+              <span className="block truncate text-[11px] font-normal text-muted-foreground">{label}</span>
+            </span>
+            <span className="text-[12px] font-medium tabular-nums text-muted-foreground">
+              {done}/{total}
+            </span>
+            <ChevronDown aria-hidden size={12} className="shrink-0 text-muted-foreground" />
+          </Button>
+          <div
+            className="mx-3.5 h-1 overflow-hidden rounded-full bg-muted"
+            role="progressbar"
+            aria-label="Task completion"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={progress}
+          >
+            <div className="h-full rounded-full bg-amber-500 transition-[width]" style={{ width: `${progress}%` }} />
+          </div>
+          <ol className="max-h-[34vh] overflow-y-auto p-2" aria-label="Session tasks">
+            {items.map((todo, index) => {
+              const active = todo.status === "in_progress";
               return (
                 <li
-                  key={i}
+                  key={`${index}:${todo.content}`}
                   ref={active ? activeRef : undefined}
                   className={cn(
-                    "flex items-start gap-2.5 rounded-lg px-2 py-[7px] text-[12.5px] leading-[1.45]",
-                    t.status === "completed" && "text-muted-foreground",
-                    active && "bg-amber-500/10 font-medium",
+                    "flex items-start gap-2.5 rounded-lg border border-transparent px-2.5 py-2 text-[12.5px] leading-[1.45]",
+                    todo.status === "completed" && "text-muted-foreground",
+                    active && "border-amber-500/20 bg-amber-500/10",
                   )}
                 >
-                  <TodoIcon status={t.status} />
-                  <span className="min-w-0">{t.content}</span>
+                  <TodoIcon status={todo.status} />
+                  <div className="min-w-0 flex-1">
+                    <p className={cn("break-words", todo.status === "completed" && "line-through decoration-muted-foreground/50")}>
+                      {todo.content}
+                    </p>
+                    {active && (
+                      <span className="mt-1 block text-[10.5px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
+                        In progress
+                      </span>
+                    )}
+                  </div>
                 </li>
               );
             })}
-          </ul>
-          <div className="flex items-center justify-center gap-1.5 border-t border-border px-3 py-2 text-[12px] tabular-nums text-muted-foreground">
-            <CircleDot aria-hidden size={12} className="size-3 shrink-0 text-amber-500" />
-            Step <span className="font-semibold text-foreground">{step}</span> / {total}
+          </ol>
+          <div className="flex items-center gap-2 border-t border-border px-3.5 py-2 text-[11.5px] text-muted-foreground">
+            {allDone ? (
+              <CheckCircle2 aria-hidden size={13} className="text-green-500" />
+            ) : (
+              <CircleDot aria-hidden size={13} className="text-amber-500" />
+            )}
+            <span>{allDone ? "All tasks completed" : `Working on step ${step} of ${total}`}</span>
           </div>
-        </div>
+        </section>
       )}
     </div>
   );
 }
 
 function TodoIcon({ status }: { status: string }) {
-  if (status === "completed") return <CheckCircle2 aria-hidden size={13} className="mt-0.5 shrink-0 text-green-500" />;
-  if (status === "in_progress") return <CircleDot aria-hidden size={13} className="mt-0.5 shrink-0 text-amber-500" />;
-  return <Circle aria-hidden size={13} className="mt-0.5 shrink-0 text-muted-foreground/70" />;
+  if (status === "completed") return <CheckCircle2 aria-hidden size={14} className="mt-0.5 shrink-0 text-green-500" />;
+  if (status === "in_progress") return <CircleDot aria-hidden size={14} className="mt-0.5 shrink-0 text-amber-500" />;
+  return <Circle aria-hidden size={14} className="mt-0.5 shrink-0 text-muted-foreground/70" />;
 }

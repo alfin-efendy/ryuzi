@@ -68,8 +68,8 @@ function AgentDetailContent({ agentId }: { agentId: string }) {
     <div className="min-h-0 flex-1 overflow-y-auto px-8 py-5">
       <div className="mx-auto max-w-[920px]">
         <header className="flex h-[52px] items-center gap-3 border-b border-border">
-          <Button variant="ghost" size="sm" aria-label="Back to Agents" onClick={nav.goBack} className="-ml-2 shrink-0">
-            <ArrowLeft aria-hidden size={14} /> Agents
+          <Button variant="ghost" size="icon-sm" aria-label="Back" title="Back" onClick={nav.goBack} className="-ml-1 shrink-0">
+            <ArrowLeft aria-hidden size={15} />
           </Button>
           <span
             aria-hidden

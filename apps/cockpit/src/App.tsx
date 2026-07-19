@@ -99,7 +99,7 @@ export default function App() {
       <TitleBar />
       <div className="relative z-10 flex min-h-0 flex-1">
         <Sidebar />
-        <main className="acrylic-main mx-2.5 mb-2.5 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border shadow-sm">
+        <main className="mx-2.5 mb-2.5 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl bg-background shadow-sm">
           {restartRequired && (
             <Card className="m-2.5 mb-0 flex shrink-0 items-center gap-2.5 px-[18px] py-2.5 text-[12.5px]">
               <MonitorUp aria-hidden size={15} strokeWidth={2} className="shrink-0" style={{ color: WARN }} />
