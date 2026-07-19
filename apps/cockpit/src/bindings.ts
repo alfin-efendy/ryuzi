@@ -1842,7 +1842,7 @@ export type AgentAccessInfo = { agentId: string; allowed: boolean }
  * [`crate::agents::catalog::AgentConfigurationCatalog`].
  */
 export type AgentConfigurationCatalogInfo = { skills: CatalogEntryInfo[]; nativeTools: CatalogEntryInfo[]; pluginTools: CatalogEntryInfo[]; apps: CatalogEntryInfo[] }
-export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
+export type AgentDetailInfo = { summary: AgentSummaryInfo; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; modelInfo: SelectableModelInfo | null; personality: AgentPersonalityInfo }
 /**
  * An immutable identity captured when an agent becomes the primary owner of a session.
  */
@@ -1863,7 +1863,7 @@ export type AgentModelInfo = { kind: "concrete"; name: string; effort: string | 
  * fields (`id`, counts, `executable`, `validation`, `is_default`) are
  * deliberately absent so the client can't submit them.
  */
-export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[]; maxTurns: number; maxToolRounds: number }
+export type AgentMutationInfo = { name: string; description: string; avatarColor: string; model: AgentModelInfo; personality: AgentPersonalityInfo; permissionMode: string; permissionRules: PermissionRuleInfo[]; skills: string[]; nativeTools: string[]; pluginTools: string[]; apps: string[] }
 /**
  * An agent's personality selection: a preset name (matching
  * [`crate::agents::personality::PersonalityPreset`]'s `snake_case` variants,
@@ -2017,7 +2017,7 @@ needsRelogin: boolean }
 /**
  * Public event broadcast to consumers (the Tauri layer re-emits these).
  */
-export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
+export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id: string | null } | { kind: "message"; session_pk: string; seq: number; run_id?: string | null; role: string; block_type: string; payload: JsonValue; tool_call_id: string | null; status: string | null; tool_kind: string | null; speaker: string | null } |
 /**
  * A durable transcript row owned by a non-primary agent run.
  */
@@ -2240,7 +2240,7 @@ export type Message = { sessionPk: string; seq: number;
  * The durable agent-run owner when this row was emitted by a run. Rows
  * created outside a run (for example startup notices) remain unowned.
  */
-runId: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
+runId?: string | null; role: string; blockType: string; payload: JsonValue; toolCallId: string | null; status: string | null; toolKind: string | null; createdAt: number;
 /**
  * Legacy group-chat attribution retained so existing databases and event
  * payloads remain readable. New message constructors leave it unset.

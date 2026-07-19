@@ -295,10 +295,6 @@ mod tests {
                         plugins: Vec::new(),
                         apps: Vec::new(),
                     },
-                    loop_settings: crate::agents::types::AgentLoop {
-                        max_turns: 10,
-                        max_tool_rounds: 20,
-                    },
                 },
             )
             .await

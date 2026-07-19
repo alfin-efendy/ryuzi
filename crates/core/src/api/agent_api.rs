@@ -9,7 +9,7 @@ use crate::agents::learning_queue::{LearningEventPayload, RollbackEvent};
 use crate::agents::okf::{ConceptArea, KnowledgeConcept, KnowledgeConceptInput, KnowledgeScope};
 use crate::agents::personality::{AgentPersonality, PersonalityPreset};
 use crate::agents::types::{
-    AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissionMode, AgentPermissions,
+    AgentAvatar, AgentModel, AgentMutationInput, AgentPermissionMode, AgentPermissions,
     AgentRegistrySnapshot, AgentSnapshot, AgentTools, PermissionDecision, PermissionRule,
 };
 use crate::api::types::{
@@ -289,12 +289,6 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
         if description.is_empty() {
             return Err(ApiError::bad_request("agent description cannot be blank"));
         }
-        if info.max_turns == 0 {
-            return Err(ApiError::bad_request("max turns must be positive"));
-        }
-        if info.max_tool_rounds == 0 {
-            return Err(ApiError::bad_request("max tool rounds must be positive"));
-        }
         let mode = parse_permission_mode(&info.permission_mode)?;
         let rules = info
             .permission_rules
@@ -335,10 +329,6 @@ impl TryFrom<AgentMutationInfo> for AgentMutationInput {
                 native: clean_references("native tools", info.native_tools)?,
                 plugins: clean_references("plugin tools", info.plugin_tools)?,
                 apps: clean_references("apps", info.apps)?,
-            },
-            loop_settings: AgentLoop {
-                max_turns: info.max_turns,
-                max_tool_rounds: info.max_tool_rounds,
             },
         })
     }
@@ -523,8 +513,6 @@ fn detail_info_from_enrichment(
         native_tools: profile.tools.native,
         plugin_tools: profile.tools.plugins,
         apps: profile.tools.apps,
-        max_turns: profile.loop_settings.max_turns,
-        max_tool_rounds: profile.loop_settings.max_tool_rounds,
         model_info,
         personality: personality_info(&profile.personality),
     }
@@ -1413,9 +1401,7 @@ mod tests {
             "skills": ["requesting-code-review"],
             "nativeTools": ["read", "grep", "bash"],
             "pluginTools": [],
-            "apps": [],
-            "maxTurns": 50,
-            "maxToolRounds": 100
+            "apps": []
         })
     }
 
@@ -1792,8 +1778,6 @@ mod tests {
         assert_eq!(detail["summary"]["toolCount"], 3);
         assert_eq!(detail["skills"], json!(["requesting-code-review"]));
         assert_eq!(detail["nativeTools"], json!(["read", "grep", "bash"]));
-        assert_eq!(detail["maxTurns"], 50);
-        assert_eq!(detail["maxToolRounds"], 100);
         // Route models carry no concrete model metadata.
         assert!(detail["modelInfo"].is_null());
     }

@@ -2150,7 +2150,6 @@ impl RunnerMainAgentSpawner {
                 prompt.push(json!({ "type": "text", "text": context }));
             }
             cm.append_user(Value::Array(prompt)).await?;
-            let turns = snapshot.profile.loop_settings.max_turns.max(1) as usize;
             let text = drive(
                 &child_deps,
                 &child_deps.agent.clone(),
@@ -2165,7 +2164,7 @@ impl RunnerMainAgentSpawner {
                 DisplayMode::ToolsOnly {
                     label: snapshot.profile.name.clone(),
                 },
-                &IterationBudget::new(turns),
+                &IterationBudget::new(SUBAGENT_MAX_ITERS),
             )
             .await?;
             self.deps.delegation.complete(&run_id, &text).await?;
@@ -5557,7 +5556,7 @@ mod tests {
     #[tokio::test]
     async fn primary_agent_model_drives_turn_configuration() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentPermissions, AgentProfile, AgentSnapshot,
+            AgentAvatar, AgentModel, AgentPermissions, AgentProfile, AgentSnapshot,
             AgentTools,
         };
         use testutil::RecordingLlm;
@@ -5588,10 +5587,6 @@ mod tests {
                     native: vec![],
                     plugins: vec![],
                     apps: vec![],
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
                 },
             },
             executable: true,
@@ -5936,7 +5931,7 @@ mod tests {
         name: &str,
     ) -> String {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
 
         registry
@@ -5960,10 +5955,6 @@ mod tests {
                     native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
                 },
             })
             .await
@@ -11895,10 +11886,6 @@ mod tests {
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
-                loop_settings: crate::agents::types::AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
-                },
             })
             .await
             .unwrap();
@@ -11968,7 +11955,7 @@ mod tests {
     #[tokio::test]
     async fn background_main_delegate_reserves_a_cancellable_worker_and_never_enqueues_after_end() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -11998,10 +11985,6 @@ mod tests {
                     native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
                 },
             })
             .await
@@ -12051,7 +12034,7 @@ mod tests {
     #[tokio::test]
     async fn background_main_delegate_enqueues_and_delivers_on_the_delegation_rail() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -12080,10 +12063,6 @@ mod tests {
                     native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
                 },
             })
             .await
@@ -12166,7 +12145,7 @@ mod tests {
     #[serial_test::serial]
     async fn continued_second_turn_background_main_and_task_rails_use_second_root() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
 
         let _guard = StateDirGuard::new();
@@ -12211,10 +12190,6 @@ mod tests {
                     plugins: Vec::new(),
                     apps: Vec::new(),
                 },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
-                },
             })
             .await
             .unwrap();
@@ -12258,7 +12233,7 @@ mod tests {
     #[serial_test::serial]
     async fn explicit_mention_nested_retry_background_rail_uses_outer_root_without_user_turn() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
 
         let _guard = StateDirGuard::new();
@@ -12292,10 +12267,6 @@ mod tests {
                     native: Vec::new(),
                     plugins: Vec::new(),
                     apps: Vec::new(),
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
                 },
             })
             .await
@@ -12392,7 +12363,7 @@ mod tests {
     #[tokio::test]
     async fn delegated_main_child_uses_the_target_profile_without_parent_leaks() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
             PermissionDecision, PermissionRule,
         };
         use testutil::RecordingLlm;
@@ -12456,10 +12427,6 @@ mod tests {
                     plugins: vec![],
                     apps: vec![],
                 },
-                loop_settings: AgentLoop {
-                    max_turns: 9,
-                    max_tool_rounds: 9,
-                },
             })
             .await
             .unwrap();
@@ -12489,10 +12456,6 @@ mod tests {
                     native: vec!["read".into(), "bash".into(), "app_projects".into()],
                     plugins: vec!["github.search".into(), "lint.check".into()],
                     apps: vec!["slack".into()],
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 4,
-                    max_tool_rounds: 1,
                 },
             })
             .await
@@ -12676,7 +12639,7 @@ mod tests {
     #[tokio::test]
     async fn main_delegate_retry_uses_the_target_profile_runner() {
         use crate::agents::types::{
-            AgentAvatar, AgentLoop, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
+            AgentAvatar, AgentModel, AgentMutationInput, AgentPermissions, AgentTools,
         };
         use testutil::RecordingLlm;
 
@@ -12707,10 +12670,6 @@ mod tests {
                     native: vec!["read".into()],
                     plugins: vec!["github.search".into()],
                     apps: vec!["slack".into()],
-                },
-                loop_settings: AgentLoop {
-                    max_turns: 1,
-                    max_tool_rounds: 1,
                 },
             })
             .await

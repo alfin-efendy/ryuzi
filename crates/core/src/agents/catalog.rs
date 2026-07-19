@@ -278,7 +278,7 @@ pub fn native(id: &str, label: &str) -> CatalogEntry {
 mod tests {
     use super::*;
     use crate::agents::personality::AgentPersonality;
-    use crate::agents::types::{AgentAvatar, AgentLoop, AgentModel, AgentPermissions, AgentTools};
+    use crate::agents::types::{AgentAvatar, AgentModel, AgentPermissions, AgentTools};
     use crate::PermMode;
 
     fn base_profile(native_tools: Vec<String>, rules: Vec<PermissionRule>) -> AgentProfile {
@@ -303,10 +303,6 @@ mod tests {
                 native: native_tools,
                 plugins: Vec::new(),
                 apps: Vec::new(),
-            },
-            loop_settings: AgentLoop {
-                max_turns: 1,
-                max_tool_rounds: 1,
             },
         }
     }
@@ -345,7 +341,6 @@ mod tests {
             permissions: profile.permissions,
             skills: vec!["missing_skill".to_string()],
             tools: profile.tools,
-            loop_settings: profile.loop_settings,
         };
 
         let issues = AgentConfigurationCatalog::validate_mutation_references(&input, &catalog);

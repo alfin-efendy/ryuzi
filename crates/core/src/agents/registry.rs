@@ -808,15 +808,6 @@ pub async fn validate_profile(store: &Store, profile: &AgentProfile) -> Vec<Agen
     require_nonblank(&mut issues, "name", &profile.name);
     require_nonblank(&mut issues, "description", &profile.description);
     require_nonblank(&mut issues, "avatar.color", &profile.avatar.color);
-    if profile.loop_settings.max_turns == 0 {
-        issues.push(issue("loop.max_turns", "max turns must be positive"));
-    }
-    if profile.loop_settings.max_tool_rounds == 0 {
-        issues.push(issue(
-            "loop.max_tool_rounds",
-            "max tool rounds must be positive",
-        ));
-    }
     let mut rule_ids = HashSet::new();
     for (index, rule) in profile.permissions.rules.iter().enumerate() {
         require_nonblank(
@@ -1062,10 +1053,6 @@ fn recover_minimal_profile(raw: &str, directory_id: &str) -> Option<AgentProfile
             plugins: Vec::new(),
             apps: Vec::new(),
         },
-        loop_settings: AgentLoop {
-            max_turns: 1,
-            max_tool_rounds: 1,
-        },
     })
 }
 
@@ -1145,7 +1132,6 @@ fn profile_from_input(id: AgentId, input: AgentMutationInput) -> AgentProfile {
         permissions: input.permissions,
         skills: input.skills,
         tools: input.tools,
-        loop_settings: input.loop_settings,
     }
 }
 
@@ -1406,10 +1392,6 @@ mod tests {
                 native: vec!["read".into()],
                 plugins: Vec::new(),
                 apps: Vec::new(),
-            },
-            loop_settings: AgentLoop {
-                max_turns: 10,
-                max_tool_rounds: 20,
             },
         };
         let error = registry.update("one", input).await.unwrap_err();
@@ -2118,10 +2100,6 @@ mod tests {
                 plugins: Vec::new(),
                 apps: Vec::new(),
             },
-            loop_settings: AgentLoop {
-                max_turns: 10,
-                max_tool_rounds: 20,
-            },
         }
     }
 
@@ -2158,10 +2136,6 @@ mod tests {
                 native: vec!["read".into()],
                 plugins: Vec::new(),
                 apps: Vec::new(),
-            },
-            loop_settings: AgentLoop {
-                max_turns: 10,
-                max_tool_rounds: 20,
             },
         };
         let updated = registry.update("ryuzi", input).await.unwrap();

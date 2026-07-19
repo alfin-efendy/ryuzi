@@ -1323,8 +1323,6 @@ pub struct AgentDetailInfo {
     pub native_tools: Vec<String>,
     pub plugin_tools: Vec<String>,
     pub apps: Vec<String>,
-    pub max_turns: u32,
-    pub max_tool_rounds: u32,
     pub model_info: Option<SelectableModelInfo>,
     pub personality: AgentPersonalityInfo,
 }
@@ -1346,8 +1344,6 @@ pub struct AgentMutationInfo {
     pub native_tools: Vec<String>,
     pub plugin_tools: Vec<String>,
     pub apps: Vec<String>,
-    pub max_turns: u32,
-    pub max_tool_rounds: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1647,9 +1643,7 @@ mod agent_management_dto_tests {
             "skills":[],
             "nativeTools":["read"],
             "pluginTools":[],
-            "apps":[],
-            "maxTurns":50,
-            "maxToolRounds":100
+            "apps":[]
         }));
         assert!(parsed.is_err());
     }

@@ -329,7 +329,6 @@ async fn registry() -> (
         permissions: template.permissions.clone(),
         skills: template.skills.clone(),
         tools: template.tools.clone(),
-        loop_settings: template.loop_settings.clone(),
     };
     let ada = persistence.registry.create(input("Ada")).await.unwrap();
     let bob = persistence.registry.create(input("Bob")).await.unwrap();
