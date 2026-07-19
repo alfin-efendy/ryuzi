@@ -55,6 +55,31 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                         .cmp(&left.finished_at.unwrap_or(i64::MIN))
                 })
             });
+            for run in &mut runs {
+                match state
+                    .cp
+                    .store()
+                    .get_agent_run_cost_models(&run.run_id)
+                    .await
+                {
+                    Ok(Some(models)) => {
+                        let tally = crate::harness::native::cost::Tally::from_payload(
+                            &serde_json::json!({ "models": models }),
+                        );
+                        if !tally.is_empty() {
+                            let (total_usd, models) =
+                                crate::harness::native::cost::price_tally(state.cp.store(), &tally)
+                                    .await;
+                            run.cost =
+                                Some(crate::domain::AgentRunCostBreakdown { total_usd, models });
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("get_agent_run_cost_models failed for {}: {e}", run.run_id)
+                    }
+                }
+            }
             ok(AgentRunRosterInfo { root_run_id, runs })
         }
         "get_child_transcript" => {

@@ -418,6 +418,11 @@ export const DELEGATE_ACTIVE_RUN = {
   contextActiveTokens: null,
   contextUsableWindow: null,
   contextPercentLeft: null,
+  contextWindow: null,
+  cacheReadTokens: null,
+  cacheCreationTokens: null,
+  outputTokens: null,
+  cost: null,
 } satisfies AgentRun;
 
 export const DELEGATE_DONE_RUN = {
@@ -443,6 +448,11 @@ export const DELEGATE_DONE_RUN = {
   contextActiveTokens: null,
   contextUsableWindow: null,
   contextPercentLeft: null,
+  contextWindow: null,
+  cacheReadTokens: null,
+  cacheCreationTokens: null,
+  outputTokens: null,
+  cost: null,
 } satisfies AgentRun;
 
 export const REVIEWER_CHILD_TRANSCRIPT = [

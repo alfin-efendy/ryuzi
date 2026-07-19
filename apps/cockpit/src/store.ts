@@ -77,7 +77,20 @@ type State = {
   /** Per-run context-window usage for child runs, from `agentRunContextUsage`.
    *  Keyed by delegationRunKey(runnerId, sessionPk, runId). Distinct from the
    *  session-level `contextUsage` (the main agent's). */
-  runContextUsage: Record<string, { activeTokens: number; usableWindow: number; percentLeft: number }>;
+  runContextUsage: Record<
+    string,
+    {
+      activeTokens: number;
+      usableWindow: number;
+      percentLeft: number;
+      contextWindow: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      outputTokens: number;
+    }
+  >;
+  /** Per-run priced cost from `agentRunCost`, keyed by delegationRunKey. */
+  runCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
   projectRuntimeById: Record<string, ProjectRuntimeInfo>;
   /** Per-session running cost total + per-model breakdown from the latest `sessionCost` event. */
   sessionCost: Record<string, { totalUsd: number; models: ModelCost[] }>;
@@ -151,6 +164,7 @@ export const useStore = create<State>((set, get) => ({
   loaded: {},
   contextUsage: {},
   runContextUsage: {},
+  runCost: {},
   projectRuntimeById: {},
   sessionCost: {},
 
@@ -278,6 +292,20 @@ export const useStore = create<State>((set, get) => ({
                 activeTokens: e.active_tokens,
                 usableWindow: e.usable_window,
                 percentLeft: e.percent_left,
+                contextWindow: e.context_window,
+                cacheReadTokens: e.cache_read_tokens,
+                cacheCreationTokens: e.cache_creation_tokens,
+                outputTokens: e.output_tokens,
+              },
+            },
+          };
+        case "agentRunCost":
+          return {
+            runCost: {
+              ...st.runCost,
+              [delegationRunKey(runnerId, e.session_pk, e.run_id)]: {
+                totalUsd: e.total_usd,
+                models: e.models,
               },
             },
           };

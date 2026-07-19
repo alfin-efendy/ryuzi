@@ -361,6 +361,13 @@ pub struct AgentRun {
     pub context_active_tokens: Option<u64>,
     pub context_usable_window: Option<u64>,
     pub context_percent_left: Option<u8>,
+    pub context_window: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Priced per-run cost, filled by the roster API from persisted
+    /// `cost_models`; `None` on the raw row read.
+    pub cost: Option<AgentRunCostBreakdown>,
 }
 
 /// The session's primary run, if it has one, plus its sorted child runs.
@@ -744,6 +751,16 @@ pub struct ModelCost {
     pub usd: f64,
 }
 
+/// A single run's priced cost: total USD + per-model breakdown. Tokens are the
+/// durable truth (persisted in `agent_runs.cost_models`); `usd` is priced on
+/// emit/read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunCostBreakdown {
+    pub total_usd: f64,
+    pub models: Vec<ModelCost>,
+}
+
 /// Public event broadcast to consumers (the Tauri layer re-emits these).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -869,6 +886,17 @@ pub enum CoreEvent {
         context_window: u64,
         usable_window: u64,
         percent_left: u8,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        output_tokens: u64,
+    },
+    /// Per-run accumulated cost for ONE child run, keyed by the run's real
+    /// served model(s). Run-scoped sibling of `SessionCost`.
+    AgentRunCost {
+        session_pk: String,
+        run_id: String,
+        total_usd: f64,
+        models: Vec<ModelCost>,
     },
     /// The native runtime compacted a session's history
     /// (trigger: pre_turn|mid_turn|manual).
@@ -1046,6 +1074,9 @@ mod tests {
             context_window: 200_000,
             usable_window: 190_000,
             percent_left: 88,
+            cache_read_tokens: 900,
+            cache_creation_tokens: 40,
+            output_tokens: 5,
         };
         let j = serde_json::to_value(&e).unwrap();
         assert_eq!(j["kind"], "agentRunContextUsage");

@@ -445,8 +445,9 @@ impl Router {
             // signal — Discord has no matching surface.
             | CoreEvent::OauthAuthorizeUrl { .. }
             | CoreEvent::PluginOauthAuthorizeUrl { .. }
-            // Per-session cost telemetry is a Cockpit-only surface too.
-            | CoreEvent::SessionCost { .. } => {}
+            // Per-session/per-run cost telemetry is a Cockpit-only surface too.
+            | CoreEvent::SessionCost { .. }
+            | CoreEvent::AgentRunCost { .. } => {}
         }
     }
 

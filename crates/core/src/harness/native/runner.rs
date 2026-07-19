@@ -1542,7 +1542,10 @@ async fn drive(
             cm.commit_response();
             match &display {
                 DisplayMode::Full => emit_context_usage(deps, cm, true).await,
-                DisplayMode::ToolsOnly { .. } => emit_run_context_usage(deps, cm).await,
+                DisplayMode::ToolsOnly { .. } => {
+                    emit_run_context_usage(deps, cm).await;
+                    emit_run_cost(deps, cm).await;
+                }
                 DisplayMode::Silent => {}
             }
             if !turn.text.is_empty() {
@@ -4296,6 +4299,13 @@ async fn observe_route_selection(
     }
 }
 
+/// The per-model cost-tally key: the actually-served upstream model, falling
+/// back to the requested model/route name, then `"unknown"`. Keying by the
+/// served model splits a fan-out route (e.g. `medium`) into its real legs.
+fn cost_model_key<'a>(served: Option<&'a str>, route: Option<&'a str>) -> &'a str {
+    served.or(route).unwrap_or("unknown")
+}
+
 /// Broadcast ContextUsage and persist it for resume seeding. Sub-agent
 /// (ephemeral) loops skip both — their usage must not clobber the session's.
 /// Also folds this response's billed buckets into the per-session, per-model
@@ -4348,11 +4358,18 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         .map(super::cost::Tally::from_payload)
         .unwrap_or_default();
     tally.add(
-        deps.model.as_deref().unwrap_or("unknown"),
+        cost_model_key(cm.last_served_model(), deps.model.as_deref()),
         cm.last_input(),
         cm.last_output(),
         cm.last_cache_read(),
         cm.last_cache_creation(),
+    );
+    tracing::debug!(
+        served = ?cm.last_served_model(),
+        route = ?deps.model,
+        cache_read = cm.last_cache_read(),
+        cache_creation = cm.last_cache_creation(),
+        "session cost attribution"
     );
     emit_session_cost(deps, &tally).await;
 
@@ -4385,6 +4402,9 @@ async fn emit_run_context_usage(deps: &RunnerDeps, cm: &ContextManager) {
         context_window: st.context_window,
         usable_window: st.usable_window,
         percent_left: st.percent_left,
+        cache_read_tokens: cm.last_cache_read(),
+        cache_creation_tokens: cm.last_cache_creation(),
+        output_tokens: cm.last_output(),
     });
     if let Err(e) = deps
         .store
@@ -4393,11 +4413,53 @@ async fn emit_run_context_usage(deps: &RunnerDeps, cm: &ContextManager) {
             st.active_tokens,
             st.usable_window,
             st.percent_left,
+            st.context_window,
+            cm.last_cache_read(),
+            cm.last_cache_creation(),
+            cm.last_output(),
         )
         .await
     {
         tracing::warn!("native: update_agent_run_context_usage failed: {e}");
     }
+}
+
+/// Accumulate this child response's billed buckets into the run's own cost
+/// tally (keyed by the served model), persist it, and broadcast `AgentRunCost`.
+/// Run-scoped twin of the session cost path — never touches `session_context`.
+async fn emit_run_cost(deps: &RunnerDeps, cm: &ContextManager) {
+    let saved = match deps.store.get_agent_run_cost_models(&deps.run_id).await {
+        Ok(saved) => saved,
+        Err(e) => {
+            tracing::warn!("native: get_agent_run_cost_models failed, skipping: {e}");
+            return;
+        }
+    };
+    let mut tally = saved
+        .as_ref()
+        .map(|models| super::cost::Tally::from_payload(&serde_json::json!({ "models": models })))
+        .unwrap_or_default();
+    tally.add(
+        cost_model_key(cm.last_served_model(), deps.model.as_deref()),
+        cm.last_input(),
+        cm.last_output(),
+        cm.last_cache_read(),
+        cm.last_cache_creation(),
+    );
+    if let Err(e) = deps
+        .store
+        .update_agent_run_cost_models(&deps.run_id, &tally.to_payload_value())
+        .await
+    {
+        tracing::warn!("native: update_agent_run_cost_models failed: {e}");
+    }
+    let (total_usd, models) = super::cost::price_tally(&deps.store, &tally).await;
+    let _ = deps.events.send(CoreEvent::AgentRunCost {
+        session_pk: deps.session_pk.clone(),
+        run_id: deps.run_id.clone(),
+        total_usd,
+        models,
+    });
 }
 
 /// Display-only `ContextUsage` re-emit, for every site that is NOT
@@ -4468,20 +4530,7 @@ async fn emit_context_display(deps: &RunnerDeps, cm: &ContextManager, emit: bool
 
 /// Price a tally against the current model metadata and broadcast SessionCost.
 async fn emit_session_cost(deps: &RunnerDeps, tally: &super::cost::Tally) {
-    // Resolve each model's meta once, up front (async), into a map the pure
-    // pricer closes over.
-    let mut metas: std::collections::HashMap<String, crate::llm_router::model_meta::ModelMeta> =
-        std::collections::HashMap::new();
-    for model in tally.model_ids() {
-        let meta = crate::llm_router::model_meta::resolve(&deps.store, &model).await;
-        metas.insert(model, meta);
-    }
-    let (total_usd, models) = tally.to_model_costs(|id| {
-        metas
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| crate::llm_router::model_meta::FALLBACK.clone())
-    });
+    let (total_usd, models) = super::cost::price_tally(&deps.store, tally).await;
     let _ = deps.events.send(CoreEvent::SessionCost {
         session_pk: deps.session_pk.clone(),
         total_usd,
@@ -7114,6 +7163,16 @@ mod tests {
             saved.get("usd").is_none(),
             "session_context must never persist dollars"
         );
+    }
+
+    #[test]
+    fn cost_model_key_prefers_served_over_route() {
+        assert_eq!(
+            cost_model_key(Some("claude-opus-4-8"), Some("medium")),
+            "claude-opus-4-8"
+        );
+        assert_eq!(cost_model_key(None, Some("medium")), "medium");
+        assert_eq!(cost_model_key(None, None), "unknown");
     }
 
     #[tokio::test]

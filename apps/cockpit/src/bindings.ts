@@ -1877,7 +1877,18 @@ export type AgentPersonalityInfo = { preset: string; custom: string | null }
  */
 export type AgentRecoveryInfo = { code: string; message: string }
 export type AgentRegistryInfo = { agents: AgentSummaryInfo[]; defaultAgentId: string; recovery: AgentRecoveryInfo[]; subagentModel: AgentModelInfo }
-export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null; contextActiveTokens: number | null; contextUsableWindow: number | null; contextPercentLeft: number | null }
+export type AgentRun = { runId: string; sessionPk: string; parentRunId: string | null; retryOf: string | null; sourceToolCallId: string | null; dispatchIndex: number | null; primaryAgentId: string; executingAgentId: string | null; executingAgentNameSnapshot: string; agentKind: AgentRunKind; task: string; status: AgentRunStatus; startedAt: number | null; finishedAt: number | null; toolCount: number; resolvedModel: string | null; resolvedEffort: string | null; result: string | null; error: string | null; contextActiveTokens: number | null; contextUsableWindow: number | null; contextPercentLeft: number | null; contextWindow: number | null; cacheReadTokens: number | null; cacheCreationTokens: number | null; outputTokens: number | null;
+/**
+ * Priced per-run cost, filled by the roster API from persisted
+ * `cost_models`; `None` on the raw row read.
+ */
+cost: AgentRunCostBreakdown | null }
+/**
+ * A single run's priced cost: total USD + per-model breakdown. Tokens are the
+ * durable truth (persisted in `agent_runs.cost_models`); `usd` is priced on
+ * emit/read.
+ */
+export type AgentRunCostBreakdown = { totalUsd: number; models: ModelCost[] }
 export type AgentRunKind = "primary" | "main-delegate" | "subagent"
 /**
  * The session's primary run, if it has one, plus its sorted child runs.
@@ -2051,7 +2062,12 @@ export type CoreEvent = { kind: "sessionCreated"; session_pk: string; project_id
  * `ContextUsage`, its own fields stay snake_case; the enum-level
  * `rename_all = "camelCase"` only renames the `kind` tag.
  */
-{ kind: "agentRunContextUsage"; session_pk: string; run_id: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number } |
+{ kind: "agentRunContextUsage"; session_pk: string; run_id: string; active_tokens: number; context_window: number; usable_window: number; percent_left: number; cache_read_tokens: number; cache_creation_tokens: number; output_tokens: number } |
+/**
+ * Per-run accumulated cost for ONE child run, keyed by the run's real
+ * served model(s). Run-scoped sibling of `SessionCost`.
+ */
+{ kind: "agentRunCost"; session_pk: string; run_id: string; total_usd: number; models: ModelCost[] } |
 /**
  * The native runtime compacted a session's history
  * (trigger: pre_turn|mid_turn|manual).

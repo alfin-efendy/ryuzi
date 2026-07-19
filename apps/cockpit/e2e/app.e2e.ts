@@ -115,6 +115,11 @@ function childRun(overrides: Partial<AgentRun> = {}): AgentRun {
     contextActiveTokens: null,
     contextUsableWindow: null,
     contextPercentLeft: null,
+    contextWindow: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+    outputTokens: null,
+    cost: null,
     ...overrides,
   };
 }
@@ -255,6 +260,47 @@ test("agent dispatch: lifecycle cards hydrate, stream, complete, and reload", as
   await card.click();
   await expect(page.getByTestId("right-panel-header").getByRole("button", { name: "Agents" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Back to Agents" })).toBeVisible();
+
+  // Run-scoped context + cost: the ring/popover on the sub-agent run header
+  // reflects this run's own AgentRunContextUsage/AgentRunCost events, not
+  // the parent session's (see store.ts's runContextUsage/runCost).
+  await emitMockCoreEvent(page, {
+    event: {
+      kind: "agentRunContextUsage",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      active_tokens: 100,
+      context_window: 1000,
+      usable_window: 900,
+      percent_left: 40,
+      cache_read_tokens: 30,
+      cache_creation_tokens: 4,
+      output_tokens: 12,
+    },
+  });
+  await emitMockCoreEvent(page, {
+    event: {
+      kind: "agentRunCost",
+      session_pk: dispatchSession.sessionPk,
+      run_id: childRunId,
+      total_usd: 0.5,
+      models: [{ model: "gpt-5.6-terra", input: 10, output: 4, cacheRead: 0, cacheCreation: 0, usd: 0.5 }],
+    },
+  });
+  const contextButton = page.getByRole("button", { name: "Context and cost" });
+  await expect(contextButton).toContainText("60%");
+  await contextButton.click();
+  await expect(page.getByText("Full window")).toBeVisible();
+  await expect(page.getByText("gpt-5.6-terra")).toBeVisible();
+  await expect(page.getByText("$0.50")).toBeVisible();
+  // Close via an outside click rather than re-clicking the trigger: the
+  // trigger's own onClick toggle fires after MenuPanel's outside-mousedown
+  // close, which would immediately reopen it. The popover overlaps the run
+  // detail's own body, so click the session in the sidebar (outside the
+  // right panel entirely) instead.
+  await page.getByRole("button", { name: "Dispatch lifecycle" }).click();
+  await expect(page.getByText("Full window")).toHaveCount(0);
+
   await page.getByRole("button", { name: "See 1 step" }).click();
   await expect(page.getByText("read", { exact: true })).toHaveCount(1);
   await expect(page.getByText("package.json", { exact: true })).toHaveCount(1);

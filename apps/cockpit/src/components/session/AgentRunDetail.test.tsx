@@ -37,6 +37,11 @@ function run({ sourceToolCallId = null, dispatchIndex = null, ...overrides }: Pa
     contextActiveTokens: null,
     contextUsableWindow: null,
     contextPercentLeft: null,
+    contextWindow: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+    outputTokens: null,
+    cost: null,
     ...overrides,
   };
 }
@@ -280,7 +285,17 @@ test("ring reflects the run's own context usage, not the session's", () => {
         outputTokens: 0,
       },
     },
-    runContextUsage: { [delegationRunKey("local", "s1", "run-1")]: { activeTokens: 4000, usableWindow: 120000, percentLeft: 60 } },
+    runContextUsage: {
+      [delegationRunKey("local", "s1", "run-1")]: {
+        activeTokens: 4000,
+        usableWindow: 120000,
+        percentLeft: 60,
+        contextWindow: 200000,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        outputTokens: 0,
+      },
+    },
   });
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
   // Ring shows USED = 100 - percentLeft. Run usage (60 left → 40% used), never the session's (5 left → 95%).
@@ -306,4 +321,61 @@ test("ring is hidden when the run has no usage yet", () => {
   useStore.setState({ contextUsage: {}, runContextUsage: {} });
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run({ contextPercentLeft: null })} onRelatedChanges={() => {}} />);
   expect(screen.queryByTitle(/Sub-agent context/)).toBeNull();
+});
+
+test("context ring opens a Context+Cost popover with the run's own values", () => {
+  useStore.setState({
+    runContextUsage: {
+      [delegationRunKey("local", "s1", "run-1")]: {
+        activeTokens: 100,
+        usableWindow: 900,
+        percentLeft: 40,
+        contextWindow: 1000,
+        cacheReadTokens: 30,
+        cacheCreationTokens: 4,
+        outputTokens: 12,
+      },
+    },
+    runCost: {
+      [delegationRunKey("local", "s1", "run-1")]: {
+        totalUsd: 0.5,
+        models: [{ model: "gpt-5.6-terra", input: 10, output: 4, cacheRead: 0, cacheCreation: 0, usd: 0.5 }],
+      },
+    },
+  });
+
+  render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
+
+  fireEvent.click(screen.getByRole("button", { name: /context and cost/i }));
+
+  expect(screen.getByText("gpt-5.6-terra")).toBeTruthy();
+  expect(screen.getByText("Full window")).toBeTruthy();
+});
+
+test("context ring toggles the popover closed on a second trigger click", () => {
+  useStore.setState({
+    runContextUsage: {
+      [delegationRunKey("local", "s1", "run-1")]: {
+        activeTokens: 100,
+        usableWindow: 900,
+        percentLeft: 40,
+        contextWindow: 1000,
+        cacheReadTokens: 30,
+        cacheCreationTokens: 4,
+        outputTokens: 12,
+      },
+    },
+    runCost: {},
+  });
+
+  render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
+
+  const trigger = screen.getByRole("button", { name: /context and cost/i });
+  fireEvent.click(trigger);
+  expect(screen.getByText("Full window")).toBeTruthy();
+
+  // jsdom never fires the outside-mousedown that MenuPanel listens for, so
+  // this second click only exercises the trigger's own open/close toggle.
+  fireEvent.click(trigger);
+  expect(screen.queryByText("Full window")).toBeNull();
 });

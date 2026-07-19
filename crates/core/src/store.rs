@@ -1549,6 +1549,30 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // 46: extend the per-child-run snapshot (slot 43) with the full context
+        // window + billed cache/output buckets and a per-run cost tally, so a
+        // sub-agent's popover shows its OWN Context + Cost. Guarded for the
+        // idempotent replay test.
+        M::up_with_hook("", |tx: &rusqlite::Transaction<'_>| {
+            for (column, ty) in [
+                ("context_window", "INTEGER"),
+                ("cache_read_tokens", "INTEGER"),
+                ("cache_creation_tokens", "INTEGER"),
+                ("output_tokens", "INTEGER"),
+                ("cost_models", "TEXT"),
+            ] {
+                let exists = tx
+                    .prepare("SELECT 1 FROM pragma_table_info('agent_runs') WHERE name=?1")?
+                    .exists([column])?;
+                if !exists {
+                    tx.execute(
+                        &format!("ALTER TABLE agent_runs ADD COLUMN {column} {ty}"),
+                        [],
+                    )?;
+                }
+            }
+            Ok(())
+        }),
     ])
 }
 
@@ -5126,24 +5150,66 @@ impl Store {
 
     /// Snapshot a child run's ephemeral context usage onto its row. Used only
     /// by the run-scoped emit path — never touches session cost/context.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_agent_run_context_usage(
         &self,
         run_id: &str,
         active_tokens: u64,
         usable_window: u64,
         percent_left: u8,
+        context_window: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        output_tokens: u64,
     ) -> anyhow::Result<()> {
         let run_id = run_id.to_string();
         self.with_conn(move |c| {
             c.execute(
                 "UPDATE agent_runs SET context_active_tokens=?1, context_usable_window=?2, \
-                 context_percent_left=?3 WHERE run_id=?4",
+                 context_percent_left=?3, context_window=?4, cache_read_tokens=?5, \
+                 cache_creation_tokens=?6, output_tokens=?7 WHERE run_id=?8",
                 params![
                     active_tokens as i64,
                     usable_window as i64,
                     percent_left as i64,
+                    context_window as i64,
+                    cache_read_tokens as i64,
+                    cache_creation_tokens as i64,
+                    output_tokens as i64,
                     run_id
                 ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The per-run cost token tally (JSON `models` object), or None.
+    pub async fn get_agent_run_cost_models(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Option<String>> {
+            let mut stmt = c.prepare("SELECT cost_models FROM agent_runs WHERE run_id=?1")?;
+            let mut rows = stmt.query_map(params![run_id], |r| r.get::<_, Option<String>>(0))?;
+            Ok(rows.next().transpose()?.flatten())
+        })
+        .await
+        .map(|opt| opt.and_then(|s| serde_json::from_str(&s).ok()))
+    }
+
+    pub async fn update_agent_run_cost_models(
+        &self,
+        run_id: &str,
+        models: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        let models = serde_json::to_string(models)?;
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE agent_runs SET cost_models=?1 WHERE run_id=?2",
+                params![models, run_id],
             )?;
             Ok(())
         })
@@ -5610,7 +5676,7 @@ fn row_to_artifact_and_reference(r: &Row) -> rusqlite::Result<(ArtifactRecord, A
 }
 
 const AGENT_RUN_COLS: &str =
-    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error,context_active_tokens,context_usable_window,context_percent_left";
+    "run_id,session_pk,parent_run_id,retry_of,source_tool_call_id,dispatch_index,primary_agent_id,executing_agent_id,executing_agent_name_snapshot,agent_kind,task,status,started_at,finished_at,tool_count,resolved_model,resolved_effort,result,error,context_active_tokens,context_usable_window,context_percent_left,context_window,cache_read_tokens,cache_creation_tokens,output_tokens";
 
 fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
     let tool_count: i64 = r.get(14)?;
@@ -5637,6 +5703,11 @@ fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
         context_active_tokens: r.get::<_, Option<i64>>(19)?.map(|v| v as u64),
         context_usable_window: r.get::<_, Option<i64>>(20)?.map(|v| v as u64),
         context_percent_left: r.get::<_, Option<i64>>(21)?.map(|v| v as u8),
+        context_window: r.get::<_, Option<i64>>(22)?.map(|v| v as u64),
+        cache_read_tokens: r.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+        cache_creation_tokens: r.get::<_, Option<i64>>(24)?.map(|v| v as u64),
+        output_tokens: r.get::<_, Option<i64>>(25)?.map(|v| v as u64),
+        cost: None,
     })
 }
 
@@ -6024,7 +6095,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 45);
+        assert_eq!(user_version, 46);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -6273,7 +6344,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-        assert_eq!(user_version, 45);
+        assert_eq!(user_version, 46);
         assert!(columns.iter().any(|column| column == "source_tool_call_id"));
         assert!(columns.iter().any(|column| column == "dispatch_index"));
         assert!(has_dispatch_index);
@@ -6344,7 +6415,7 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 45);
+        assert_eq!(user_version, 46);
 
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
@@ -6352,7 +6423,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 45);
+        assert_eq!(reopened_version, 46);
     }
 
     #[tokio::test]
@@ -6373,7 +6444,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 45);
+        assert_eq!(user_version, 46);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -6417,7 +6488,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 45);
+        assert_eq!(user_version, 46);
     }
 
     #[tokio::test]
@@ -8308,7 +8379,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 45, "forward migration must land at v45");
+        assert_eq!(user_version, 46, "forward migration must land at v46");
     }
 
     #[tokio::test]
@@ -8735,7 +8806,7 @@ mod tests {
         assert_eq!(run.context_percent_left, None);
 
         store
-            .update_agent_run_context_usage("r1", 4_000, 120_000, 60)
+            .update_agent_run_context_usage("r1", 4_000, 120_000, 60, 200_000, 3_000, 500, 200)
             .await
             .unwrap();
 
@@ -8743,6 +8814,56 @@ mod tests {
         assert_eq!(reloaded.context_active_tokens, Some(4_000));
         assert_eq!(reloaded.context_usable_window, Some(120_000));
         assert_eq!(reloaded.context_percent_left, Some(60));
+    }
+
+    #[tokio::test]
+    async fn agent_run_context_usage_round_trips_full_fields() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO sessions(session_pk,status,perm_mode,kind,branch_owned,resume_attempts) \
+                     VALUES ('s1','idle','default','chat',0,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .insert_primary_agent_run(NewAgentRun {
+                run_id: "r1".into(),
+                session_pk: "s1".into(),
+                parent_run_id: None,
+                retry_of: None,
+                source_tool_call_id: None,
+                dispatch_index: None,
+                primary_agent_id: "lead".into(),
+                executing_agent_id: Some("lead".into()),
+                executing_agent_name_snapshot: "Lead".into(),
+                agent_kind: AgentRunKind::Primary,
+                task: "root".into(),
+                status: AgentRunStatus::Queued,
+                resolved_model: None,
+                resolved_effort: None,
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_agent_run_context_usage("r1", 100, 200, 42, 1000, 300, 40, 12)
+            .await
+            .unwrap();
+
+        let run = store.get_agent_run("r1").await.unwrap().unwrap();
+        assert_eq!(run.context_active_tokens, Some(100));
+        assert_eq!(run.context_usable_window, Some(200));
+        assert_eq!(run.context_percent_left, Some(42));
+        assert_eq!(run.context_window, Some(1000));
+        assert_eq!(run.cache_read_tokens, Some(300));
+        assert_eq!(run.cache_creation_tokens, Some(40));
+        assert_eq!(run.output_tokens, Some(12));
     }
 
     #[tokio::test]
@@ -8963,7 +9084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_13_to_45_replay_is_idempotent_and_converges_native_only() {
+    async fn migrations_13_to_46_replay_is_idempotent_and_converges_native_only() {
         // An existing DB carries pre-Ryuzi-only rows. Build a current-schema
         // DB, seed the old values, then rewind far enough that migration 13
         // and every later migration run again.
@@ -8991,25 +9112,27 @@ mod tests {
         // 40 durable dispatch linkage; 41 scoped tool-call ownership; 42
         // immutable native tool versions/plans plus history convergence; 43
         // per-run context-window snapshot columns; 44 artifacts,
-        // artifact_references, and artifact_storage_jobs; 45 sessions.archived_at
+        // artifact_references, and artifact_storage_jobs; 45 sessions.archived_at;
+        // 46 agent_runs.context_window/cache_read_tokens/cache_creation_tokens/
+        // output_tokens/cost_models
         // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
         // re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 45
-        // defined, wind back thirty-three.
+        // this test starts failing its assertions). With migrations through 46
+        // defined, wind back thirty-four.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 33)
+            c.pragma_update(None, "user_version", v - 34)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
-                    // The DB is fully migrated to v45 here, so `harness` was
+                    // The DB is fully migrated to v46 here, so `harness` was
                     // already dropped: re-add it (and rows) so migration 13's
                     // guarded UPDATE and migration 21's guarded DROP both run
                     // their real paths on replay.
@@ -9060,8 +9183,8 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
-        // 22–45) replay against it. Back TWENTY-FIVE: the fully migrated tail
-        // is now v45, so rewinding to v20 is what makes
+        // 22–46) replay against it. Back TWENTY-SIX: the fully migrated tail
+        // is now v46, so rewinding to v20 is what makes
         // migration 21 (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
@@ -9070,7 +9193,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 25)
+            c.pragma_update(None, "user_version", v - 26)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -9203,7 +9326,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 45, "forward migration must land at v45");
+        assert_eq!(uv, 46, "forward migration must land at v46");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -9229,7 +9352,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 45, "forward migration must land at v45");
+        assert_eq!(uv, 46, "forward migration must land at v46");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,

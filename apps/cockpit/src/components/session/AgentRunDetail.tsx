@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { ArrowLeft, Bot, Copy, RotateCw, Square, Waypoints } from "lucide-react";
 import type { AgentRun } from "@/bindings";
 import { agentRunStatusPresentation, formatAgentRunDuration, kindLabel } from "@/lib/agent-runs";
@@ -7,6 +8,7 @@ import { useDelegation, delegationRunKey } from "@/store-delegation";
 import { Transcript } from "@/components/transcript/Transcript";
 import { Markdown } from "@/components/transcript/Markdown";
 import { ContextRing } from "./ContextRing";
+import { ContextCostMenu } from "./ContextCostMenu";
 import { useStore } from "@/store";
 import { Button } from "@ryuzi/ui";
 
@@ -55,6 +57,7 @@ export function AgentRunDetail({
   const active = activeStatuses.has(run.status);
   const status = agentRunStatusPresentation(run.status);
   const live = useStore((s) => s.runContextUsage[transcriptKey]);
+  const liveCost = useStore((s) => s.runCost[transcriptKey]);
   const usage =
     live ??
     (run.contextPercentLeft != null
@@ -62,8 +65,14 @@ export function AgentRunDetail({
           activeTokens: run.contextActiveTokens ?? 0,
           usableWindow: run.contextUsableWindow ?? 0,
           percentLeft: run.contextPercentLeft,
+          contextWindow: run.contextWindow ?? 0,
+          cacheReadTokens: run.cacheReadTokens ?? 0,
+          cacheCreationTokens: run.cacheCreationTokens ?? 0,
+          outputTokens: run.outputTokens ?? 0,
         }
       : undefined);
+  const cost = liveCost ?? run.cost ?? undefined;
+  const [costOpen, setCostOpen] = useState(false);
 
   return (
     <div className="min-h-0 flex flex-1 flex-col">
@@ -91,12 +100,32 @@ export function AgentRunDetail({
           {run.resolvedModel && <span>{run.resolvedModel}</span>}
           {run.resolvedEffort && <span>{run.resolvedEffort}</span>}
           {usage && (
-            <span
-              className="inline-flex items-center"
-              title={`Sub-agent context: ~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
-            >
-              <ContextRing percentLeft={usage.percentLeft} />
-            </span>
+            <div className="relative inline-flex items-center">
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-expanded={costOpen}
+                aria-label="Context and cost"
+                title={`Sub-agent context: ~${usage.activeTokens.toLocaleString()} of ${usage.usableWindow.toLocaleString()} tokens used`}
+                onClick={() => setCostOpen((v) => !v)}
+                className="h-auto gap-1.5 p-0 hover:bg-transparent dark:hover:bg-transparent"
+              >
+                <ContextRing percentLeft={usage.percentLeft} />
+              </Button>
+              {costOpen && (
+                <ContextCostMenu
+                  onClose={() => setCostOpen(false)}
+                  className="top-6 right-0 w-[260px]"
+                  usage={{
+                    activeTokens: usage.activeTokens,
+                    usableWindow: usage.usableWindow,
+                    contextWindow: usage.contextWindow,
+                    cacheReadTokens: usage.cacheReadTokens,
+                  }}
+                  cost={cost}
+                />
+              )}
+            </div>
           )}
         </div>
         {active && (
