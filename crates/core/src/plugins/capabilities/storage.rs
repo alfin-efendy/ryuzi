@@ -76,6 +76,8 @@ mod tests {
             settings: SettingsStore::new(store.clone()),
             store,
             telemetry: Arc::new(NoopTelemetry),
+            network_allowlist: vec![],
+            oauth_profile_ids: vec![],
         }
     }
 

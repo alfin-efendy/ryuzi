@@ -46,7 +46,13 @@ impl<'a> ScopedSettings<'a> {
                 "settings key must be a bare field name".to_string(),
             ));
         }
-        Ok(format!("plugin.{}.{}", self.ctx.plugin_id, key))
+        let effective = format!("plugin.{}.{}", self.ctx.plugin_id, key);
+        if crate::plugins::plugin_field(&effective).is_none() {
+            return Err(SettingsErr::Invalid(format!(
+                "undeclared plugin setting: {effective}"
+            )));
+        }
+        Ok(effective)
     }
 
     /// Returns `(effective key, value, secret)`. A secret field's value is
@@ -168,6 +174,8 @@ mod tests {
             settings: SettingsStore::new(store.clone()),
             store,
             telemetry: Arc::new(NoopTelemetry),
+            network_allowlist: vec![],
+            oauth_profile_ids: vec![],
         }
     }
 
@@ -233,10 +241,15 @@ mod tests {
         let ctx = ctx_for(Arc::new(store), id).await;
         let settings = ScopedSettings::new(&ctx);
 
-        let result = settings.set("nope", "x").await;
-        assert!(
-            matches!(result, Err(SettingsErr::Invalid(_))),
-            "expected Invalid, got {result:?}"
-        );
+        for result in [
+            settings.get("nope").await.map(|_| ()),
+            settings.set("nope", "x").await.map(|_| ()),
+            settings.remove("nope").await.map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(SettingsErr::Invalid(_))),
+                "expected Invalid, got {result:?}"
+            );
+        }
     }
 }

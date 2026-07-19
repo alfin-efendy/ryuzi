@@ -6682,7 +6682,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);        assert_eq!(            ownership_columns,
+        assert_eq!(user_version, 46);
+        assert_eq!(
+            ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
         );
         assert_eq!(agent_run_tables, ["agent_run_messages", "agent_runs"]);
@@ -7000,13 +7002,15 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 46);        drop(upgraded);
+        assert_eq!(user_version, 46);
+        drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
         let reopened_version: i64 = reopened
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 46);    }
+        assert_eq!(reopened_version, 46);
+    }
     #[tokio::test]
     async fn migration_41_removes_session_wide_tool_call_uniqueness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -7025,7 +7029,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);        assert!(            !has_unique_tool_call_index,
+        assert_eq!(user_version, 46);
+        assert!(
+            !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
         );
     }
@@ -7067,7 +7073,8 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 46);    }
+        assert_eq!(user_version, 46);
+    }
     #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -8956,7 +8963,8 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 46, "forward migration must land at v46");    }
+        assert_eq!(user_version, 46, "forward migration must land at v46");
+    }
     #[tokio::test]
     async fn migration_30_adds_audit_session_and_origin_columns() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -9700,7 +9708,9 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 34)        };        {
+            c.pragma_update(None, "user_version", v - 34)
+        };
+        {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
@@ -9763,7 +9773,9 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 26)        };        {
+            c.pragma_update(None, "user_version", v - 26)
+        };
+        {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
@@ -9894,7 +9906,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_bg, "background_events table must exist");        assert!(has_override, "jobs.model_override column must exist");
+        assert_eq!(uv, 46, "forward migration must land at v46");
+        assert!(has_bg, "background_events table must exist");
+        assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
@@ -9918,7 +9932,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_fts, "messages_fts must survive agentic cleanup");        assert!(
+        assert_eq!(uv, 46, "forward migration must land at v46");
+        assert!(has_fts, "messages_fts must survive agentic cleanup");
+        assert!(
             !has_usage && !has_cstate && !has_cruns,
             "legacy agentic tables must be removed"
         );

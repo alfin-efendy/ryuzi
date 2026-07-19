@@ -28,11 +28,11 @@ interface lifecycle {
 }
 
 world plugin {
-  import host: ryuzi:host/host@0.1.0;
+  import host: ryuzi:host/host@0.1.1;
   import settings: ryuzi:settings/settings@0.1.0;
   import storage: ryuzi:storage/storage@0.1.0;
   import http: ryuzi:http/http@0.1.0;
-  import oauth: ryuzi:oauth/oauth@0.1.0;
+  import oauth: ryuzi:oauth/oauth@0.2.0;
 
   export lifecycle;
   export ryuzi:gateway/gateway@0.1.0;

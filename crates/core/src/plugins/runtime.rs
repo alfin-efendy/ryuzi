@@ -11,10 +11,12 @@ use std::time::Duration;
 use crate::plugins::bundle::{InstalledBundle, VerifiedBundle};
 use crate::plugins::capabilities::host::HostInfo;
 use crate::plugins::capabilities::http::{AllowedHttpClient, HttpErr};
+use crate::plugins::capabilities::oauth::{OauthErr, ProfileOauth};
 use crate::plugins::capabilities::settings::{ScopedSettings, SettingsErr};
 use crate::plugins::capabilities::storage::{PluginStorage, StorageErr};
 use crate::plugins::capabilities::wit_bindings::ryuzi::host::host as host_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::http::http as http_iface;
+use crate::plugins::capabilities::wit_bindings::ryuzi::oauth::oauth as oauth_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::settings::settings as settings_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::storage::storage as storage_iface;
 use crate::plugins::capabilities::PluginCapabilityContext;
@@ -28,7 +30,8 @@ use wasmtime::{
 const HTTP_IMPORT: &str = "ryuzi:http/http@0.1.0";
 const SETTINGS_IMPORT: &str = "ryuzi:settings/settings@0.1.0";
 const STORAGE_IMPORT: &str = "ryuzi:storage/storage@0.1.0";
-const HOST_IMPORT: &str = "ryuzi:host/host@0.1.0";
+const HOST_IMPORT: &str = "ryuzi:host/host@0.1.1";
+const OAUTH_IMPORT: &str = "ryuzi:oauth/oauth@0.2.0";
 const TYPES_IMPORT: &str = "ryuzi:plugin/types@0.1.0";
 const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 const ALLOWED_EXPORTS: &[&str] = &[
@@ -85,6 +88,9 @@ pub struct HostPolicy {
     /// Grants `ryuzi:storage/storage` — a plugin's own scoped rows in
     /// `component_plugin_storage`.
     pub allow_storage: bool,
+    /// Grants host-mediated `ryuzi:oauth/oauth@0.2.0`; components can make
+    /// authorized profile requests but never receive raw OAuth tokens.
+    pub allow_oauth: bool,
     pub limits: ResourceLimits,
 }
 
@@ -95,6 +101,7 @@ impl HostPolicy {
             allow_network: false,
             allow_settings: false,
             allow_storage: false,
+            allow_oauth: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -179,12 +186,14 @@ impl ComponentRuntime {
             let host_is_authorized = name == HOST_IMPORT;
             let settings_is_authorized = name == SETTINGS_IMPORT && policy.allow_settings;
             let storage_is_authorized = name == STORAGE_IMPORT && policy.allow_storage;
+            let oauth_is_authorized = name == OAUTH_IMPORT && policy.allow_oauth;
             if !is_wasi_baseline
                 && !types_is_authorized
                 && !network_is_authorized
                 && !host_is_authorized
                 && !settings_is_authorized
                 && !storage_is_authorized
+                && !oauth_is_authorized
             {
                 let reason = if name == HTTP_IMPORT {
                     "network requires a manifest allowlist and host policy approval".to_string()
@@ -192,6 +201,8 @@ impl ComponentRuntime {
                     "settings access requires host policy approval".to_string()
                 } else if name == STORAGE_IMPORT {
                     "storage access requires host policy approval".to_string()
+                } else if name == OAUTH_IMPORT {
+                    "OAuth access requires host policy approval".to_string()
                 } else {
                     "no host capability is enabled by this runtime slice".to_string()
                 };
@@ -249,6 +260,7 @@ impl ComponentRuntime {
         let allow_network = policy.allow_network;
         let allow_settings = policy.allow_settings;
         let allow_storage = policy.allow_storage;
+        let allow_oauth = policy.allow_oauth;
         // Built from the manifest's own declared network permissions (not
         // policy-conditioned here — the import is only linked at all when
         // `allow_network` is true, and `validate_component_bytes` already
@@ -261,6 +273,21 @@ impl ComponentRuntime {
             .iter()
             .map(|entry| entry.0.clone())
             .collect();
+        let oauth_profile_ids: Vec<String> = bundle
+            .manifest
+            .oauth
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect();
+        let runtime_ctx = Arc::new(PluginCapabilityContext {
+            plugin_id: bundle.manifest.id.clone(),
+            version: bundle.manifest.version.clone(),
+            settings: ctx.settings.clone(),
+            store: ctx.store.clone(),
+            telemetry: ctx.telemetry.clone(),
+            network_allowlist: network_allowlist.clone(),
+            oauth_profile_ids: oauth_profile_ids.clone(),
+        });
         // Captured on the async caller's thread — inside `spawn_blocking`
         // there is no ambient Tokio reactor, so the sync `Host` trait impls
         // bridge back to it explicitly via `Handle::block_on`.
@@ -273,7 +300,7 @@ impl ComponentRuntime {
         // mechanism.
         let join_handle = tokio::task::spawn_blocking(move || {
             let state = CapabilityState {
-                ctx,
+                ctx: runtime_ctx,
                 allow_network,
                 network_allowlist,
                 rt,
@@ -314,6 +341,15 @@ impl ComponentRuntime {
             if allow_network {
                 http_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
                     &mut linker.instance("http").map_err(|error| {
+                        PluginRuntimeError::InstantiationFailed(error.to_string())
+                    })?,
+                    |s: &mut CapabilityState| s,
+                )
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            }
+            if allow_oauth {
+                oauth_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
+                    &mut linker.instance("oauth").map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -442,6 +478,26 @@ impl host_iface::Host for CapabilityState {
             filesystem,
             secrets,
         })
+    }
+
+    fn log(
+        &mut self,
+        _message: String,
+        fields: Vec<host_iface::LogField>,
+    ) -> Result<bool, host_iface::HostError> {
+        let redacted_fields = fields
+            .into_iter()
+            .map(|field| {
+                (
+                    "plugin.field",
+                    crate::plugins::capabilities::redact_log_field(&field.name, &field.value),
+                )
+            })
+            .collect();
+        self.ctx
+            .telemetry
+            .count("plugin.capability.log", redacted_fields);
+        Ok(true)
     }
 }
 
@@ -608,6 +664,66 @@ impl http_iface::Host for CapabilityState {
     }
 }
 
+impl oauth_iface::Host for CapabilityState {
+    fn authorized_request(
+        &mut self,
+        profile_id: String,
+        request: oauth_iface::OauthRequest,
+    ) -> Result<oauth_iface::AuthorizedResponse, oauth_iface::OauthError> {
+        let ctx = self.ctx.clone();
+        let oauth_iface::OauthRequest {
+            method,
+            url,
+            headers,
+            body,
+        } = request;
+        let headers = headers
+            .into_iter()
+            .map(|header| (header.name, header.value))
+            .collect();
+        let result = self.rt.block_on(async move {
+            ProfileOauth::new(&ctx)
+                .authorized_request(&profile_id, &method, &url, headers, body)
+                .await
+        });
+        match result {
+            Ok(response) => Ok(oauth_iface::AuthorizedResponse {
+                status: response.status,
+                headers: response
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| oauth_iface::Header { name, value })
+                    .collect(),
+                body: response.body,
+            }),
+            Err(OauthErr::InvalidRequest(message)) => {
+                Err(oauth_iface::OauthError::InvalidRequest(message))
+            }
+            Err(OauthErr::Denied) => Err(oauth_iface::OauthError::Denied),
+            Err(OauthErr::Expired) => Err(oauth_iface::OauthError::Expired),
+            Err(OauthErr::Failed(message)) => Err(oauth_iface::OauthError::Failed(message)),
+        }
+    }
+
+    fn disconnect(&mut self, profile_id: String) -> Result<bool, oauth_iface::OauthError> {
+        let ctx = self.ctx.clone();
+        let result = self.rt.block_on(async move {
+            ProfileOauth::new(&ctx)
+                .disconnect_profile(&profile_id)
+                .await
+        });
+        match result {
+            Ok(()) => Ok(true),
+            Err(OauthErr::InvalidRequest(message)) => {
+                Err(oauth_iface::OauthError::InvalidRequest(message))
+            }
+            Err(OauthErr::Denied) => Err(oauth_iface::OauthError::Denied),
+            Err(OauthErr::Expired) => Err(oauth_iface::OauthError::Expired),
+            Err(OauthErr::Failed(message)) => Err(oauth_iface::OauthError::Failed(message)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +748,8 @@ mod tests {
                 settings: SettingsStore::new(store.clone()),
                 store,
                 telemetry: Arc::new(NoopTelemetry),
+                network_allowlist: vec![],
+                oauth_profile_ids: vec![],
             }),
             tmp,
         )
@@ -958,6 +1076,38 @@ mod tests {
     }
 
     #[test]
+    fn oauth_import_without_policy_grant_is_denied() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let result = runtime.validate_component_bytes(
+            &manifest(vec![]),
+            br#"(component (import "ryuzi:oauth/oauth@0.2.0" (instance)))"#,
+            &HostPolicy::deny_all(),
+        );
+        let Err(error) = result else {
+            panic!("OAuth must require host policy approval");
+        };
+        assert!(
+            matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == OAUTH_IMPORT)
+        );
+    }
+
+    #[test]
+    fn oauth_import_is_allowed_when_policy_grants_it() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let policy = HostPolicy {
+            allow_oauth: true,
+            ..HostPolicy::deny_all()
+        };
+        runtime
+            .validate_component_bytes(
+                &manifest(vec![]),
+                br#"(component (import "ryuzi:oauth/oauth@0.2.0" (instance)))"#,
+                &policy,
+            )
+            .expect("OAuth import must validate once host policy grants it");
+    }
+
+    #[test]
     fn settings_import_without_policy_grant_is_denied() {
         let runtime = ComponentRuntime::new().expect("runtime should configure");
         let result = runtime.validate_component_bytes(
@@ -1027,10 +1177,10 @@ mod tests {
         runtime
             .validate_component_bytes(
                 &manifest(vec![]),
-                br#"(component (import "ryuzi:host/host@0.1.0" (instance)))"#,
+                br#"(component (import "ryuzi:host/host@0.1.1" (instance)))"#,
                 &HostPolicy::deny_all(),
             )
-            .expect("the host-info import carries no secrets and is always allowed");
+            .expect("the host-info/log import carries no secrets and is always allowed");
     }
 
     /// The public entrypoint `validate_component` reads the component off a

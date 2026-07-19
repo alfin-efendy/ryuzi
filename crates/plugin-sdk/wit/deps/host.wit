@@ -1,4 +1,4 @@
-package ryuzi:host@0.1.0;
+package ryuzi:host@0.1.1;
 
 interface host {
   record plugin-info {
@@ -12,6 +12,11 @@ interface host {
     secrets: bool,
   }
 
+  record log-field {
+    name: string,
+    value: string,
+  }
+
   variant host-error {
     unavailable,
     denied,
@@ -20,4 +25,7 @@ interface host {
 
   get-plugin-info: func() -> result<plugin-info, host-error>;
   capabilities: func() -> result<host-capabilities, host-error>;
+  /// Emits a host-sanitized plugin log event. Secret-shaped and declared
+  /// secret fields are redacted before reaching telemetry.
+  log: func(message: string, fields: list<log-field>) -> result<bool, host-error>;
 }

@@ -89,6 +89,20 @@ impl<'a> ProfileOauth<'a> {
         Self { ctx }
     }
 
+    /// Rejects an OAuth profile ID that the installed bundle did not declare.
+    fn ensure_declared_profile(&self, profile_id: &str) -> Result<(), OauthErr> {
+        if self
+            .ctx
+            .oauth_profile_ids
+            .iter()
+            .any(|declared| declared == profile_id)
+        {
+            Ok(())
+        } else {
+            Err(OauthErr::Denied)
+        }
+    }
+
     /// Resolves the OAuth client id for `profile`: prefer the plugin's own
     /// setting named by `client_id_setting`, then the cached profile client
     /// row (filled by discovery/DCR), else `InvalidRequest`.
@@ -121,6 +135,7 @@ impl<'a> ProfileOauth<'a> {
         profile: &OAuthProfile,
         redirect_uri: &str,
     ) -> Result<PkceStart, OauthErr> {
+        self.ensure_declared_profile(&profile.id)?;
         let authorize_url = profile
             .authorize_url
             .as_deref()
@@ -151,7 +166,9 @@ impl<'a> ProfileOauth<'a> {
 
     /// Issues one HTTP request against `url` authenticated with the stored
     /// token for `profile_id`, without ever exposing the token to the
-    /// caller. See the module doc for exactly how the bearer is injected.
+    /// caller. The client is constrained to this context's immutable
+    /// manifest-derived network allowlist; callers cannot widen it. See the
+    /// module doc for exactly how the bearer is injected.
     ///
     /// Refresh is out of scope for this slice: an expired token with no
     /// further handling here simply reports [`OauthErr::Expired`] (refresh
@@ -163,8 +180,8 @@ impl<'a> ProfileOauth<'a> {
         url: &str,
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
-        allowlist: Vec<String>,
     ) -> Result<SafeHttpResponse, OauthErr> {
+        self.ensure_declared_profile(profile_id)?;
         let token = self
             .ctx
             .store
@@ -177,7 +194,7 @@ impl<'a> ProfileOauth<'a> {
             return Err(OauthErr::Expired);
         }
 
-        let client = AllowedHttpClient::new(allowlist);
+        let client = AllowedHttpClient::new(self.ctx.network_allowlist.clone());
         client
             .request_with_bearer(method, url, headers, body, &token.access_token)
             .await
@@ -189,6 +206,7 @@ impl<'a> ProfileOauth<'a> {
     /// [`OauthErr::Denied`]. Does not attempt vendor-side token revocation
     /// (out of scope for this slice).
     pub async fn disconnect_profile(&self, profile_id: &str) -> Result<(), OauthErr> {
+        self.ensure_declared_profile(profile_id)?;
         self.ctx
             .store
             .delete_plugin_oauth_profile_token(&self.ctx.plugin_id, profile_id)
@@ -210,6 +228,7 @@ impl<'a> ProfileOauth<'a> {
         profile: &OAuthProfile,
         device_authorization_url: &str,
     ) -> Result<DeviceFlowStart, OauthErr> {
+        self.ensure_declared_profile(&profile.id)?;
         let client_id = self.resolve_client_id(profile).await?;
 
         let mut form: Vec<(&str, String)> = vec![("client_id", client_id)];
@@ -305,6 +324,7 @@ impl<'a> ProfileOauth<'a> {
             return Ok(DevicePollOutcome::Expired);
         }
 
+        self.ensure_declared_profile(&profile.id)?;
         let client_id = self.resolve_client_id(profile).await?;
 
         let form = [
@@ -407,6 +427,8 @@ mod tests {
             settings: SettingsStore::new(store.clone()),
             store,
             telemetry: Arc::new(NoopTelemetry),
+            network_allowlist: vec!["127.0.0.1".to_string(), "example.test".to_string()],
+            oauth_profile_ids: vec!["default".to_string(), "p1".to_string()],
         }
     }
 
@@ -511,20 +533,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorized_request_with_no_stored_token_is_denied() {
+    async fn authorized_request_rejects_an_undeclared_profile_id() {
         let (store, _tmp) = open_test_store().await;
         let ctx = ctx_for(store, "github");
         let oauth = ProfileOauth::new(&ctx);
 
         let result = oauth
             .authorized_request(
-                "default",
+                "not-declared",
                 "GET",
                 "https://example.test/me",
                 vec![],
                 None,
-                vec!["example.test".to_string()],
             )
+            .await;
+        assert_eq!(result, Err(OauthErr::Denied));
+    }
+
+    #[tokio::test]
+    async fn authorized_request_with_no_stored_token_is_denied() {
+        let (store, _tmp) = open_test_store().await;
+        let ctx = ctx_for(store, "github");
+        let oauth = ProfileOauth::new(&ctx);
+
+        let result = oauth
+            .authorized_request("default", "GET", "https://example.test/me", vec![], None)
             .await;
         assert_eq!(result, Err(OauthErr::Denied));
     }
@@ -577,7 +610,6 @@ mod tests {
                 &format!("http://127.0.0.1:{port}/me"),
                 vec![("Authorization".to_string(), "Bearer sneaky".to_string())],
                 None,
-                vec!["127.0.0.1".to_string()],
             )
             .await
             .unwrap();
@@ -615,14 +647,7 @@ mod tests {
         let other_ctx = ctx_for(store, "atlassian");
         let oauth = ProfileOauth::new(&other_ctx);
         let result = oauth
-            .authorized_request(
-                "p1",
-                "GET",
-                "https://example.test/me",
-                vec![],
-                None,
-                vec!["example.test".to_string()],
-            )
+            .authorized_request("p1", "GET", "https://example.test/me", vec![], None)
             .await;
         assert_eq!(
             result,
@@ -656,14 +681,7 @@ mod tests {
         oauth.disconnect_profile("default").await.unwrap();
 
         let result = oauth
-            .authorized_request(
-                "default",
-                "GET",
-                "https://example.test/me",
-                vec![],
-                None,
-                vec!["example.test".to_string()],
-            )
+            .authorized_request("default", "GET", "https://example.test/me", vec![], None)
             .await;
         assert_eq!(result, Err(OauthErr::Denied));
     }
@@ -693,14 +711,7 @@ mod tests {
         let oauth = ProfileOauth::new(&ctx);
 
         let result = oauth
-            .authorized_request(
-                "default",
-                "GET",
-                "https://example.test/me",
-                vec![],
-                None,
-                vec!["example.test".to_string()],
-            )
+            .authorized_request("default", "GET", "https://example.test/me", vec![], None)
             .await;
         assert_eq!(result, Err(OauthErr::Expired));
     }

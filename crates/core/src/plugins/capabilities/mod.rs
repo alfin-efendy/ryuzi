@@ -44,6 +44,14 @@ pub struct PluginCapabilityContext {
     pub settings: SettingsStore,
     pub store: Arc<Store>,
     pub telemetry: Arc<dyn Telemetry>,
+    /// Immutable outbound-host policy copied from the installed bundle's
+    /// `permissions.network` declaration when this context is created.
+    /// Capability adapters must use this rather than accepting a caller-
+    /// supplied allowlist.
+    pub network_allowlist: Vec<String>,
+    /// OAuth profile IDs declared by the installed bundle. This prevents a
+    /// component from selecting an undeclared same-plugin profile.
+    pub oauth_profile_ids: Vec<String>,
 }
 
 /// Case-insensitive substrings that mark a field *name* as secret-shaped —
