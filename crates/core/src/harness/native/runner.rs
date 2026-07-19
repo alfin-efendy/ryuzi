@@ -4334,6 +4334,13 @@ async fn emit_context_usage(deps: &RunnerDeps, cm: &ContextManager, emit: bool) 
         cm.last_cache_read(),
         cm.last_cache_creation(),
     );
+    tracing::debug!(
+        served = ?cm.last_served_model(),
+        route = ?deps.model,
+        cache_read = cm.last_cache_read(),
+        cache_creation = cm.last_cache_creation(),
+        "session cost attribution"
+    );
     emit_session_cost(deps, &tally).await;
 
     let payload = json!({
