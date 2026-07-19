@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use crate::plugins::bundle::{InstalledBundle, VerifiedBundle};
 use crate::plugins::capabilities::host::HostInfo;
+use crate::plugins::capabilities::http::{AllowedHttpClient, HttpErr};
 use crate::plugins::capabilities::settings::{ScopedSettings, SettingsErr};
 use crate::plugins::capabilities::storage::{PluginStorage, StorageErr};
 use crate::plugins::capabilities::wit_bindings::ryuzi::host::host as host_iface;
+use crate::plugins::capabilities::wit_bindings::ryuzi::http::http as http_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::settings::settings as settings_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::storage::storage as storage_iface;
 use crate::plugins::capabilities::PluginCapabilityContext;
@@ -247,6 +249,18 @@ impl ComponentRuntime {
         let allow_network = policy.allow_network;
         let allow_settings = policy.allow_settings;
         let allow_storage = policy.allow_storage;
+        // Built from the manifest's own declared network permissions (not
+        // policy-conditioned here — the import is only linked at all when
+        // `allow_network` is true, and `validate_component_bytes` already
+        // requires a non-empty manifest allowlist for the import to be
+        // authorized in the first place).
+        let network_allowlist: Vec<String> = bundle
+            .manifest
+            .permissions
+            .network
+            .iter()
+            .map(|entry| entry.0.clone())
+            .collect();
         // Captured on the async caller's thread — inside `spawn_blocking`
         // there is no ambient Tokio reactor, so the sync `Host` trait impls
         // bridge back to it explicitly via `Handle::block_on`.
@@ -261,6 +275,7 @@ impl ComponentRuntime {
             let state = CapabilityState {
                 ctx,
                 allow_network,
+                network_allowlist,
                 rt,
             };
             let mut store = Store::new(&engine, state);
@@ -290,6 +305,15 @@ impl ComponentRuntime {
             if allow_storage {
                 storage_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
                     &mut linker.instance("storage").map_err(|error| {
+                        PluginRuntimeError::InstantiationFailed(error.to_string())
+                    })?,
+                    |s: &mut CapabilityState| s,
+                )
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            }
+            if allow_network {
+                http_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
+                    &mut linker.instance("http").map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -369,12 +393,15 @@ impl ComponentRuntime {
 }
 
 /// The `wasmtime::component::Store<T>` state type for a linked component
-/// instantiation. Holds everything the three linked `Host` trait impls below
+/// instantiation. Holds everything the four linked `Host` trait impls below
 /// need: which plugin is calling ([`PluginCapabilityContext`]), whether
 /// network was granted (surfaced through `ryuzi:host/host`'s
-/// `capabilities()` call, not itself an HTTP client — that's Task 8), and a
-/// `Handle` back to the async runtime the outer `instantiate` call is
-/// running on.
+/// `capabilities()` call, and used together with `network_allowlist` to gate
+/// `ryuzi:http/http` — see `http_iface::Host::request` below), the plugin's
+/// own declared network allowlist (from its bundle manifest's
+/// `permissions.network`, independent of whether `allow_network` ended up
+/// true), and a `Handle` back to the async runtime the outer `instantiate`
+/// call is running on.
 ///
 /// # Async bridge
 /// `wasmtime::component::bindgen!`'s generated `Host` traits are
@@ -390,6 +417,13 @@ impl ComponentRuntime {
 struct CapabilityState {
     ctx: Arc<PluginCapabilityContext>,
     allow_network: bool,
+    /// This plugin's bundle-declared network allowlist entries (bare
+    /// hostnames or `*.`-prefixed wildcards). Populated by `instantiate`
+    /// from `bundle.manifest.permissions.network` regardless of whether
+    /// `allow_network` is true — the `http_iface::Host::request` impl below
+    /// only ever consults it when `allow_network` holds, since the `http`
+    /// instance is not even linked otherwise.
+    network_allowlist: Vec<String>,
     rt: tokio::runtime::Handle,
 }
 
@@ -521,6 +555,55 @@ impl storage_iface::Host for CapabilityState {
             Err(StorageErr::NotFound) => Err(storage_iface::StorageError::NotFound),
             Err(StorageErr::Denied) => Err(storage_iface::StorageError::Denied),
             Err(StorageErr::Failed(message)) => Err(storage_iface::StorageError::Failed(message)),
+        }
+    }
+}
+
+impl http_iface::Host for CapabilityState {
+    /// Builds an [`AllowedHttpClient`] scoped to this plugin's declared
+    /// `network_allowlist` fresh for every call (the client is cheap —
+    /// `reqwest::Client` internally pools connections and is `Clone`-cheap
+    /// itself, so there's no meaningful cost to not caching it on
+    /// `CapabilityState`), then bridges the async request through
+    /// `self.rt.block_on(...)` like every other adapter here. Header
+    /// stripping (`Authorization`/`Host`/`Content-Length`) and per-hop
+    /// redirect allowlist checks happen inside `AllowedHttpClient::request`
+    /// itself — see `capabilities::http`'s module doc.
+    fn request(
+        &mut self,
+        request: http_iface::HttpRequest,
+    ) -> Result<http_iface::HttpResponse, http_iface::HttpError> {
+        let allowlist = self.network_allowlist.clone();
+        let http_iface::HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+        } = request;
+        let headers = headers
+            .into_iter()
+            .map(|header| (header.name, header.value))
+            .collect();
+        let client = AllowedHttpClient::new(allowlist);
+        let result = self
+            .rt
+            .block_on(async move { client.request(&method, &url, headers, body).await });
+        match result {
+            Ok(response) => Ok(http_iface::HttpResponse {
+                status: response.status,
+                headers: response
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| http_iface::Header { name, value })
+                    .collect(),
+                body: response.body,
+            }),
+            Err(HttpErr::InvalidRequest(message)) => {
+                Err(http_iface::HttpError::InvalidRequest(message))
+            }
+            Err(HttpErr::Rejected) => Err(http_iface::HttpError::Rejected),
+            Err(HttpErr::Unavailable) => Err(http_iface::HttpError::Unavailable),
+            Err(HttpErr::Failed(message)) => Err(http_iface::HttpError::Failed(message)),
         }
     }
 }
@@ -856,6 +939,22 @@ mod tests {
         assert!(
             matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == "ryuzi:http/http@0.1.0")
         );
+    }
+
+    #[test]
+    fn http_import_is_allowed_with_manifest_allowlist_and_network_grant() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let policy = HostPolicy {
+            allow_network: true,
+            ..HostPolicy::deny_all()
+        };
+        runtime
+            .validate_component_bytes(
+                &manifest(vec!["api.github.com"]),
+                br#"(component (import "ryuzi:http/http@0.1.0" (instance)))"#,
+                &policy,
+            )
+            .expect("http import must validate with a manifest allowlist and a network grant");
     }
 
     #[test]

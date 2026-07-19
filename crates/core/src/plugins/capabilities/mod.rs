@@ -20,6 +20,7 @@
 //! `SettingsStore`/`Store`/`Telemetry` the host process already owns.
 
 pub mod host;
+pub mod http;
 pub mod settings;
 pub mod storage;
 pub mod wit_bindings;
