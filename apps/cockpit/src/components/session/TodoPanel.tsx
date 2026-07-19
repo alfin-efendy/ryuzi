@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { CheckCircle2, ChevronDown, ChevronUp, Circle, CircleDot, ListTodo } from "lucide-react";
+import { CheckCircle2, ChevronDown, Circle, CircleDot, ListTodo } from "lucide-react";
 import { Button, cn } from "@ryuzi/ui";
 import { useNative } from "@/store-native";
 import { sessKey } from "@/lib/session-key";
@@ -76,7 +76,7 @@ export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; 
             {done}/{total}
           </span>
           <span className="min-w-0 truncate text-[12px]">{allDone ? "All tasks completed" : label}</span>
-          <ChevronUp aria-hidden size={12} className="shrink-0 text-muted-foreground" />
+          <ChevronDown aria-hidden size={12} className="shrink-0 text-muted-foreground" />
         </Button>
       ) : (
         <section
@@ -100,7 +100,7 @@ export function TodoPanel({ runnerId, sessionPk, running }: { runnerId: string; 
             <span className="text-[12px] font-medium tabular-nums text-muted-foreground">
               {done}/{total}
             </span>
-            <ChevronDown aria-hidden size={12} className="shrink-0 text-muted-foreground" />
+            <ChevronDown aria-hidden size={12} className="shrink-0 rotate-180 text-muted-foreground" />
           </Button>
           <div
             className="mx-3.5 h-1 overflow-hidden rounded-full bg-muted"
