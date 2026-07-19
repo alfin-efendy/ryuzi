@@ -1,0 +1,6 @@
+package fixture:hooks@0.1.0;
+
+world hooks-fixture {
+  import ryuzi:plugin/types@0.1.0;
+  export ryuzi:hooks/hooks@0.1.0;
+}

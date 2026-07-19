@@ -23,7 +23,7 @@ use crate::plugins::capabilities::PluginCapabilityContext;
 use ryuzi_plugin_sdk::PluginBundleManifest;
 use std::sync::Arc;
 use wasmtime::{
-    component::{Component, HasSelf, Linker},
+    component::{Component, HasSelf, Instance, Linker},
     Config, Engine, Store,
 };
 
@@ -231,36 +231,21 @@ impl ComponentRuntime {
             .map(|_| ())
     }
 
-    /// Instantiates a component after policy validation, linking the host
-    /// capability adapters (`ryuzi:host/host` always; `ryuzi:settings/settings`
-    /// and `ryuzi:storage/storage` only when `policy` grants them) into the
-    /// linker before instantiation.
-    ///
-    /// Timeout enforcement uses epoch interruption on a blocking thread:
-    /// synchronous `Linker::instantiate` runs inside `spawn_blocking`, and a
-    /// `tokio::select!` races it against the deadline.  When the timer fires
-    /// first we call `engine.increment_epoch()` once so the CPU-bound Wasm
-    /// sees its epoch deadline and traps with an interrupt.  The join handle
-    /// is never detached — we always await it.
-    pub async fn instantiate(
+    /// Validates and compiles a bundle's component under `policy`, returning a
+    /// reusable [`CompiledComponent`]. Compilation (the expensive step —
+    /// parsing + JIT) happens once here; [`CompiledComponent::instantiate`] is
+    /// comparatively cheap and safe to call per operation, so a connector tool
+    /// invoked repeatedly re-instantiates a fresh, isolated instance without
+    /// recompiling. Shared foundation for the connector/hooks adapters (Task 9)
+    /// and the provider/gateway adapters (Task 10).
+    pub fn compile(
         &self,
         bundle: &InstalledBundle,
         policy: HostPolicy,
-        ctx: Arc<PluginCapabilityContext>,
-    ) -> Result<(), PluginRuntimeError> {
+    ) -> Result<CompiledComponent, PluginRuntimeError> {
         let bytes = std::fs::read(&bundle.component_path)
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
         let component = self.validate_component_bytes(&bundle.manifest, &bytes, &policy)?;
-
-        // Clone the engine so the spawned task owns everything it needs
-        // without borrowing `self`.
-        let engine = self.engine.clone();
-        let fuel = policy.limits.fuel;
-        let timeout = policy.limits.timeout;
-        let allow_network = policy.allow_network;
-        let allow_settings = policy.allow_settings;
-        let allow_storage = policy.allow_storage;
-        let allow_oauth = policy.allow_oauth;
         // Built from the manifest's own declared network permissions (not
         // policy-conditioned here — the import is only linked at all when
         // `allow_network` is true, and `validate_component_bytes` already
@@ -279,14 +264,139 @@ impl ComponentRuntime {
             .iter()
             .map(|profile| profile.id.clone())
             .collect();
-        let runtime_ctx = Arc::new(PluginCapabilityContext {
+        Ok(CompiledComponent {
+            engine: self.engine.clone(),
+            component,
+            policy,
             plugin_id: bundle.manifest.id.clone(),
             version: bundle.manifest.version.clone(),
+            network_allowlist,
+            oauth_profile_ids,
+        })
+    }
+
+    /// Instantiates a component after policy validation, discarding the
+    /// resulting instance. Retained as the original one-shot entrypoint
+    /// (`compile` + `instantiate` + discard) so existing callers/tests that
+    /// only need to prove a component links and runs `start` under the
+    /// fuel/epoch budget keep working unchanged. New callers that need to CALL
+    /// a component's exports use [`Self::compile`] +
+    /// [`CompiledComponent::instantiate`] and keep the returned
+    /// [`ComponentInstance`].
+    pub async fn instantiate(
+        &self,
+        bundle: &InstalledBundle,
+        policy: HostPolicy,
+        ctx: Arc<PluginCapabilityContext>,
+    ) -> Result<(), PluginRuntimeError> {
+        self.compile(bundle, policy)?
+            .instantiate(ctx)
+            .await
+            .map(|_instance| ())
+    }
+
+    #[cfg(test)]
+    fn execute_core_module_with_fuel(
+        &self,
+        wat: &str,
+        fuel: u64,
+    ) -> Result<(), PluginRuntimeError> {
+        let module = wasmtime::Module::new(&self.engine, wat)
+            .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(fuel)
+            .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+        store.set_epoch_deadline(1);
+        let linker = wasmtime::Linker::<()>::new(&self.engine);
+        linker
+            .instantiate(&mut store, &module)
+            .map(|_| ())
+            .map_err(|error| match error.downcast_ref::<wasmtime::Trap>() {
+                Some(wasmtime::Trap::OutOfFuel) => {
+                    PluginRuntimeError::FuelExhausted(error.to_string())
+                }
+                _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
+            })
+    }
+}
+
+/// Classify a `wasmtime::Error` raised by instantiation or an export call: an
+/// out-of-fuel trap becomes [`PluginRuntimeError::FuelExhausted`]; anything
+/// else (including an epoch-interrupt trap — which the timeout race relabels
+/// as [`PluginRuntimeError::TimeoutExceeded`] before it is ever surfaced)
+/// becomes [`PluginRuntimeError::InstantiationFailed`].
+fn map_component_error(error: wasmtime::Error) -> PluginRuntimeError {
+    match error.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => PluginRuntimeError::FuelExhausted(error.to_string()),
+        _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
+    }
+}
+
+/// A validated, compiled component held ready to instantiate on demand.
+///
+/// The component's imports/exports were already checked against its manifest
+/// and host policy by [`ComponentRuntime::compile`]; the expensive
+/// parse+compile has happened once. Each [`Self::instantiate`] then produces a
+/// fresh, independent [`ComponentInstance`] with its own `Store`, so instances
+/// never share mutable Wasm state and are safe to build per operation (e.g. a
+/// stateless connector tool re-instantiates for every invoke) and use
+/// concurrently. This is the reusable seam Task 10 builds provider/gateway
+/// activation on top of.
+pub struct CompiledComponent {
+    engine: Engine,
+    component: Component,
+    policy: HostPolicy,
+    plugin_id: String,
+    version: String,
+    network_allowlist: Vec<String>,
+    oauth_profile_ids: Vec<String>,
+}
+
+impl CompiledComponent {
+    /// The compiled plugin's id (its bundle manifest id).
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    /// Instantiate a fresh, isolated instance, linking the host capability
+    /// adapters (`ryuzi:host/host` always; `ryuzi:settings/settings`,
+    /// `ryuzi:storage/storage`, `ryuzi:http/http`, `ryuzi:oauth/oauth` only
+    /// when `policy` grants them) into the linker, then running the
+    /// component's `start` under the fuel + epoch-timeout budget.
+    ///
+    /// `ctx` carries only the shared settings/store/telemetry backends; this
+    /// instance's plugin identity, network allowlist, and OAuth profile ids
+    /// come from the compiled bundle (see [`ComponentRuntime::compile`]),
+    /// never from the caller.
+    ///
+    /// Timeout enforcement uses epoch interruption on a blocking thread:
+    /// synchronous `Linker::instantiate` runs inside `spawn_blocking`, and a
+    /// `tokio::select!` races it against the deadline. When the timer fires
+    /// first we call `engine.increment_epoch()` once so the CPU-bound Wasm
+    /// sees its epoch deadline and traps with an interrupt. The join handle is
+    /// never detached — we always await it.
+    pub async fn instantiate(
+        &self,
+        ctx: Arc<PluginCapabilityContext>,
+    ) -> Result<ComponentInstance, PluginRuntimeError> {
+        let engine = self.engine.clone();
+        let component = self.component.clone();
+        let fuel = self.policy.limits.fuel;
+        let timeout = self.policy.limits.timeout;
+        let allow_network = self.policy.allow_network;
+        let allow_settings = self.policy.allow_settings;
+        let allow_storage = self.policy.allow_storage;
+        let allow_oauth = self.policy.allow_oauth;
+        let network_allowlist = self.network_allowlist.clone();
+        let runtime_ctx = Arc::new(PluginCapabilityContext {
+            plugin_id: self.plugin_id.clone(),
+            version: self.version.clone(),
             settings: ctx.settings.clone(),
             store: ctx.store.clone(),
             telemetry: ctx.telemetry.clone(),
             network_allowlist: network_allowlist.clone(),
-            oauth_profile_ids: oauth_profile_ids.clone(),
+            oauth_profile_ids: self.oauth_profile_ids.clone(),
         });
         // Captured on the async caller's thread — inside `spawn_blocking`
         // there is no ambient Tokio reactor, so the sync `Host` trait impls
@@ -294,16 +404,18 @@ impl ComponentRuntime {
         let rt = tokio::runtime::Handle::current();
 
         // Run synchronous instantiation on a blocking thread so that
-        // tokio::select! can race it against a sleep timer.  A plain
-        // tokio::time::timeout around await cannot preempt CPU-bound
-        // Wasm; epoch interruption on a blocking thread is the correct
-        // mechanism.
+        // tokio::select! can race it against a sleep timer. A plain
+        // tokio::time::timeout around await cannot preempt CPU-bound Wasm;
+        // epoch interruption on a blocking thread is the correct mechanism.
         let join_handle = tokio::task::spawn_blocking(move || {
             let state = CapabilityState {
                 ctx: runtime_ctx,
                 allow_network,
                 network_allowlist,
                 rt,
+                // Locked down: no preopens, no env, no stdio, no sockets.
+                wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
+                wasi_table: wasmtime::component::ResourceTable::new(),
             };
             let mut store = Store::new(&engine, state);
             store
@@ -311,6 +423,11 @@ impl ComponentRuntime {
                 .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
             store.set_epoch_deadline(1);
             let mut linker = Linker::new(&engine);
+            // The WASI p2 baseline: any std-built component imports it even
+            // when it performs no I/O, so it must be linked for instantiation
+            // to succeed. The empty `WasiCtx` above grants no real capability.
+            wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
             // `host` carries no secrets and has no side effects — always
             // linked regardless of policy.
             host_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
@@ -356,44 +473,37 @@ impl ComponentRuntime {
                 )
                 .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
             }
-            linker
+            let instance = linker
                 .instantiate(&mut store, &component)
-                .map(|_instance| ())
-                .map_err(|error| match error.downcast_ref::<wasmtime::Trap>() {
-                    Some(wasmtime::Trap::OutOfFuel) => {
-                        PluginRuntimeError::FuelExhausted(error.to_string())
-                    }
-                    _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
-                })
+                .map_err(map_component_error)?;
+            Ok::<_, PluginRuntimeError>((instance, store))
         });
 
         tokio::pin!(join_handle);
 
         tokio::select! {
-            result = &mut join_handle => {
-                // The blocking task completed within the deadline.
-                match result {
-                    Ok(inner) => inner,
-                    Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
-                        "instantiation task panicked: {join_error}"
-                    ))),
-                }
-            }
+            result = &mut join_handle => match result {
+                Ok(Ok((instance, store))) => Ok(ComponentInstance {
+                    inner: Some((instance, store)),
+                    engine: self.engine.clone(),
+                    fuel,
+                    timeout,
+                }),
+                Ok(Err(error)) => Err(error),
+                Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
+                    "instantiation task panicked: {join_error}"
+                ))),
+            },
             _ = tokio::time::sleep(timeout) => {
-                // The timer fired first.  Increment the epoch exactly once
-                // so the CPU-bound Wasm sees its epoch deadline and traps
-                // with an interrupt.
+                // The timer fired first. Increment the epoch exactly once so
+                // the CPU-bound Wasm sees its epoch deadline and traps with an
+                // interrupt.
                 self.engine.increment_epoch();
-
                 // Await the blocking task so we never detach a background
-                // thread.  The Wasm should now exit quickly via the epoch
-                // trap.  Any result after the timer wins is mapped to
-                // TimeoutExceeded because the operation exceeded its host
-                // deadline.
+                // thread; whatever it produced after the deadline is mapped to
+                // TimeoutExceeded because the operation exceeded its budget.
                 match join_handle.await {
-                    Ok(Ok(())) | Ok(Err(_)) => {
-                        Err(PluginRuntimeError::TimeoutExceeded { timeout })
-                    }
+                    Ok(_) => Err(PluginRuntimeError::TimeoutExceeded { timeout }),
                     Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
                         "instantiation task panicked: {join_error}"
                     ))),
@@ -401,30 +511,100 @@ impl ComponentRuntime {
             }
         }
     }
+}
 
-    #[cfg(test)]
-    fn execute_core_module_with_fuel(
-        &self,
-        wat: &str,
-        fuel: u64,
-    ) -> Result<(), PluginRuntimeError> {
-        let module = wasmtime::Module::new(&self.engine, wat)
-            .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(fuel)
-            .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
-        store.set_epoch_deadline(1);
-        let linker = wasmtime::Linker::<()>::new(&self.engine);
-        linker
-            .instantiate(&mut store, &module)
-            .map(|_| ())
-            .map_err(|error| match error.downcast_ref::<wasmtime::Trap>() {
-                Some(wasmtime::Trap::OutOfFuel) => {
-                    PluginRuntimeError::FuelExhausted(error.to_string())
+/// A single live component instance and its `Store`, ready to have any of its
+/// exported interfaces called under a per-call fuel + epoch-timeout budget.
+///
+/// [`Self::call`] is deliberately generic over which export it invokes: it
+/// hands a caller-supplied closure the raw `Instance` and its `&mut Store`
+/// inside the isolation budget, so the connector/hooks adapters (Task 9) and
+/// the provider/gateway adapters (Task 10) all reach their exports through the
+/// SAME path with no per-interface special-casing here. A caller reaches a
+/// specific export via the generated per-interface accessor, e.g.
+/// `exports::ryuzi::connector::connector::Guest::new(&mut *store, instance)`,
+/// which only requires THAT interface to be exported — so a component that
+/// exports a subset of the `ryuzi:plugin` world (a hooks-only plugin, a
+/// gateway-only plugin, …) is handled uniformly, and asking for an interface
+/// it does not export surfaces as a clean `Err`, never a panic.
+///
+/// Each export call resets the fuel budget and epoch deadline, then runs the
+/// synchronous call on a blocking thread raced against the timeout: a trap or
+/// an infinite loop inside an export is isolated to this call and can never
+/// crash the daemon. On a successful call the instance is retained for further
+/// calls (so a stateful export sequence works — Task 10's gateway
+/// start/…/stop); after a timeout the trap-poisoned instance is dropped rather
+/// than reused.
+pub struct ComponentInstance {
+    // `Option` so the instance + store can be moved into `spawn_blocking` and
+    // handed back on the success path; `None` after a consumed/timed-out call.
+    inner: Option<(Instance, Store<CapabilityState>)>,
+    engine: Engine,
+    fuel: u64,
+    timeout: Duration,
+}
+
+impl ComponentInstance {
+    /// Run `f` against this instance's exports under a fresh fuel budget and
+    /// the epoch timeout. `f` receives the `Instance` (a lightweight `Copy`
+    /// handle) and its `&mut Store`, runs on a blocking thread, and returns a
+    /// `wasmtime::Result`; a trap (guest `unreachable`, host-func error) or an
+    /// out-of-fuel/epoch interrupt is caught and mapped to a
+    /// [`PluginRuntimeError`] — never a panic or a hung daemon. A timeout
+    /// yields [`PluginRuntimeError::TimeoutExceeded`].
+    pub(crate) async fn call<F, R>(&mut self, f: F) -> Result<R, PluginRuntimeError>
+    where
+        F: FnOnce(Instance, &mut Store<CapabilityState>) -> wasmtime::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (instance, mut store) = self.inner.take().ok_or_else(|| {
+            PluginRuntimeError::InstantiationFailed(
+                "component instance already consumed by a prior timed-out call".to_string(),
+            )
+        })?;
+        let fuel = self.fuel;
+        let timeout = self.timeout;
+
+        let join_handle = tokio::task::spawn_blocking(move || {
+            // Reset the per-call budget so a prior call's spend never bleeds
+            // into this one and each call is independently bounded.
+            let prepared = store
+                .set_fuel(fuel)
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()));
+            store.set_epoch_deadline(1);
+            let result = match prepared {
+                Ok(()) => f(instance, &mut store).map_err(map_component_error),
+                Err(error) => Err(error),
+            };
+            (instance, store, result)
+        });
+
+        tokio::pin!(join_handle);
+
+        tokio::select! {
+            joined = &mut join_handle => match joined {
+                Ok((instance, store, result)) => {
+                    // Retain the instance for further calls on the success (or
+                    // clean guest-error) path.
+                    self.inner = Some((instance, store));
+                    result
                 }
-                _ => PluginRuntimeError::InstantiationFailed(error.to_string()),
-            })
+                Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
+                    "component export task panicked: {join_error}"
+                ))),
+            },
+            _ = tokio::time::sleep(timeout) => {
+                self.engine.increment_epoch();
+                match join_handle.await {
+                    // The call exceeded its host deadline; the instance is now
+                    // trap-poisoned, so it is deliberately NOT restored.
+                    Ok(_) => Err(PluginRuntimeError::TimeoutExceeded { timeout }),
+                    Err(join_error) => Err(PluginRuntimeError::InstantiationFailed(format!(
+                        "component export task panicked: {join_error}"
+                    ))),
+                }
+            }
+        }
     }
 }
 
@@ -450,7 +630,7 @@ impl ComponentRuntime {
 /// state runs (see `instantiate` above) — inside `spawn_blocking` there is
 /// no ambient Tokio reactor to construct a new runtime from, so the handle
 /// must be captured ahead of time and moved in.
-struct CapabilityState {
+pub(crate) struct CapabilityState {
     ctx: Arc<PluginCapabilityContext>,
     allow_network: bool,
     /// This plugin's bundle-declared network allowlist entries (bare
@@ -461,6 +641,25 @@ struct CapabilityState {
     /// instance is not even linked otherwise.
     network_allowlist: Vec<String>,
     rt: tokio::runtime::Handle,
+    /// Minimal, locked-down WASI p2 context. Any real (std-built) component
+    /// imports the WASI baseline (`wasi:io`, `wasi:cli`, …) even when it never
+    /// performs I/O, so the linker must satisfy those imports for the
+    /// component to instantiate at all. This context grants NOTHING beyond
+    /// clocks/random: no preopened directories, no environment, no inherited
+    /// stdio, no sockets — so `wasi:filesystem`/`wasi:sockets` host functions
+    /// exist but have nothing to reach. Real outbound network stays gated by
+    /// the host-mediated `ryuzi:http`/`ryuzi:oauth` capabilities, never WASI.
+    wasi_ctx: wasmtime_wasi::WasiCtx,
+    wasi_table: wasmtime::component::ResourceTable,
+}
+
+impl wasmtime_wasi::WasiView for CapabilityState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.wasi_table,
+        }
+    }
 }
 
 impl host_iface::Host for CapabilityState {
@@ -801,24 +1000,17 @@ mod tests {
             .join(match name {
                 "component-noop" => "ryuzi_component_noop_fixture.wasm",
                 "component-http-import" => "ryuzi_component_http_fixture.wasm",
+                "component-connector" => "ryuzi_component_connector_fixture.wasm",
+                "component-hooks" => "ryuzi_component_hooks_fixture.wasm",
                 _ => panic!("unknown fixture {name}"),
             })
     }
 
     fn build_fixture_components() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let script = root
-            .join("tests")
-            .join("fixtures")
-            .join("build-components.sh");
-        let status = std::process::Command::new("sh")
-            .arg(script)
-            .status()
-            .expect("fixture build script should start");
-        assert!(
-            status.success(),
-            "fixture build script failed with {status}"
-        );
+        // Shared process-once build so concurrent fixture tests (here and in
+        // `wasm_connector`/`wasm_hooks`) never race `build-components.sh`'s
+        // non-atomic `wit/deps/` rewrite.
+        crate::plugins::build_fixture_components_once();
     }
 
     #[test]
@@ -916,6 +1108,58 @@ mod tests {
             .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all(), ctx)
             .await
             .expect("an import-free installed component should instantiate");
+    }
+
+    /// An [`InstalledBundle`] pointing at a real prebuilt fixture artifact
+    /// (the caller must `build_fixture_components()` first).
+    fn installed_fixture_bundle(name: &str) -> InstalledBundle {
+        let component_path = fixture_artifact(name);
+        let root = component_path
+            .parent()
+            .expect("fixture artifact has a parent dir")
+            .to_path_buf();
+        InstalledBundle {
+            manifest: manifest(vec![]),
+            release: release(),
+            release_record: component_release(),
+            root,
+            component_path,
+        }
+    }
+
+    /// End-to-end foundation proof: `compile` + `instantiate` produce a live
+    /// [`ComponentInstance`], and the generic [`ComponentInstance::call`]
+    /// reaches a real component's export through the generated per-interface
+    /// `Guest::new` accessor — the same seam the connector/hooks adapters and
+    /// (Task 10) provider/gateway adapters use. The noop fixture exports only
+    /// `ryuzi:plugin/lifecycle`, so this also proves a SUBSET-exporting
+    /// component is callable without the full `ryuzi:plugin` world.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_reaches_a_subset_components_lifecycle_export() {
+        build_fixture_components();
+        let (ctx, _tmp) = test_ctx("acme").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let compiled = runtime
+            .compile(
+                &installed_fixture_bundle("component-noop"),
+                HostPolicy::deny_all(),
+            )
+            .expect("noop fixture should compile under deny-all");
+        let mut instance = compiled
+            .instantiate(ctx)
+            .await
+            .expect("noop fixture should instantiate");
+        let health = instance
+            .call(|inst, store| {
+                use crate::plugins::capabilities::wit_bindings::exports::ryuzi::plugin::lifecycle;
+                let pre = inst.instance_pre(&*store);
+                let guest = lifecycle::GuestIndices::new(&pre)?.load(&mut *store, &inst)?;
+                guest.call_health(&mut *store)
+            })
+            .await
+            .expect("call must not surface a runtime error")
+            .expect("lifecycle.health must return Ok");
+        assert!(health.healthy, "noop fixture reports healthy");
     }
 
     /// A component-level WAT whose core module start function is a

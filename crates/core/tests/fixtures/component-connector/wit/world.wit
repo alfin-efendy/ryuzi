@@ -1,0 +1,6 @@
+package fixture:connector@0.1.0;
+
+world connector-fixture {
+  import ryuzi:plugin/types@0.1.0;
+  export ryuzi:connector/connector@0.1.0;
+}

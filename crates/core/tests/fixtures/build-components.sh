@@ -40,3 +40,5 @@ build_fixture() {
 
 build_fixture component-noop ryuzi_component_noop_fixture
 build_fixture component-http-import ryuzi_component_http_fixture
+build_fixture component-connector ryuzi_component_connector_fixture
+build_fixture component-hooks ryuzi_component_hooks_fixture
