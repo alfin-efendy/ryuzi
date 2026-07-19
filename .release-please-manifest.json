@@ -1,5 +1,5 @@
 {
-  "crates/runner": "0.6.0",
-  "apps/cockpit/src-tauri": "0.3.0",
-  "crates/core": "0.2.0"
+  "crates/runner": "0.7.0",
+  "apps/cockpit/src-tauri": "0.4.0",
+  "crates/core": "0.3.0"
 }
