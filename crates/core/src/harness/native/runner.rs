@@ -47,12 +47,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-/// Default upper bound on provider turns per drain, to bound runaway tool
-/// loops. Overridable via the `agent.max_provider_turns` setting (floor 1).
-/// Used as the default for the auto-continue window size / notice text inside
-/// `drive()`; the parent budget itself is seeded in `run_turn` (defaulting to
-/// [`PARENT_MAX_ITERS`], Phase 2's raised ceiling).
-const DEFAULT_MAX_PROVIDER_TURNS: usize = 50;
 /// Flush the streaming-text buffer into a persisted row at this size or on a
 /// newline, whichever comes first (keeps rows delta-shaped without spamming).
 const TEXT_FLUSH_BYTES: usize = 120;
@@ -1013,6 +1007,12 @@ impl DisplayMode {
     fn text(&self) -> bool {
         matches!(self, DisplayMode::Full)
     }
+    /// Whether the auto-continue re-grant applies. Parent turns and delegated
+    /// sub-agents (`ToolsOnly`) both continue past a spent budget window; a
+    /// fully-silent drive keeps the hard stop.
+    fn auto_continues(&self) -> bool {
+        matches!(self, DisplayMode::Full | DisplayMode::ToolsOnly { .. })
+    }
     /// Sub-agent attribution label for tool rows, if any.
     fn subagent(&self) -> Option<&str> {
         match self {
@@ -1246,18 +1246,16 @@ async fn drive(
     };
     // Window size for the auto-continue notice text and the fresh grant made on
     // each auto-continue (`agent.max_provider_turns`). The parent budget itself
-    // is seeded from the same setting in `run_turn` (defaulting to
-    // PARENT_MAX_ITERS); this read defaults to DEFAULT_MAX_PROVIDER_TURNS and is
-    // only consulted on the top-level auto-continue path.
-    let max_turns = crate::settings::usize_setting(
-        &deps.store,
-        "agent.max_provider_turns",
-        DEFAULT_MAX_PROVIDER_TURNS,
-    )
-    .await;
-    // Auto-continue is a top-level convenience only; sub-agents keep the hard
+    // is seeded from the same setting in `run_turn`; this read defaults to the
+    // same [`PARENT_MAX_ITERS`] ceiling and is consulted on both the top-level
+    // and delegated-sub-agent auto-continue paths (see `auto_continues()`).
+    let max_turns =
+        crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
+            .await;
+    // Auto-continue applies to the parent and to delegated sub-agents
+    // (`DisplayMode::auto_continues()`); a fully-silent drive keeps the hard
     // stop. Read without usize_setting's floor so "0" can disable it.
-    let auto_budget = if display.text() {
+    let auto_budget = if display.auto_continues() {
         deps.store
             .get_setting("agent.auto_continue_budget")
             .await
@@ -1674,12 +1672,14 @@ async fn drive(
             }
             provider_turn += 1;
         }
-        // Budget window exhausted without an end_turn. Auto-continue (#100) is a
-        // top-level convenience only (sub-agents have auto_budget == 0, so this
-        // never fires for them): tell the user, append a synthetic "continue"
-        // user turn to the ledger (ledger-only — NOT a display row, so the
-        // transcript shows the notice, not a fake user message), re-grant a
-        // fresh budget window, and loop back into `while budget.try_consume()`.
+        // Budget window exhausted without an end_turn. Auto-continue (#100)
+        // applies to the parent and to delegated sub-agents alike
+        // (`display.auto_continues()`; only a fully-silent drive has
+        // auto_budget == 0): re-grant a fresh budget window and loop back into
+        // `while budget.try_consume()`. The visible notice below is gated on
+        // `display.text()` separately, so sub-agents auto-continue silently —
+        // no transcript-notice row, no fake user message appended for them to
+        // see.
         // Guarded by `!cancel.is_cancelled()`: if the user stopped the run right
         // as the window exhausted, we must not announce an auto-continue or
         // append a synthetic turn the run will never act on.
@@ -5649,6 +5649,16 @@ mod tests {
         assert!(full.text() && full.subagent().is_none());
         assert!(!sub.text());
         assert_eq!(sub.subagent(), Some("explore"));
+    }
+
+    #[test]
+    fn display_mode_auto_continues_covers_parent_and_subagent_not_silent() {
+        assert!(DisplayMode::Full.auto_continues());
+        assert!(DisplayMode::ToolsOnly {
+            label: "sub".into()
+        }
+        .auto_continues());
+        assert!(!DisplayMode::Silent.auto_continues());
     }
 
     async fn deps_at(dir: &std::path::Path, llm: Arc<dyn LlmStream>) -> RunnerDeps {
