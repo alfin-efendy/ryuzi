@@ -5184,6 +5184,38 @@ impl Store {
         .await
     }
 
+    /// The per-run cost token tally (JSON `models` object), or None.
+    pub async fn get_agent_run_cost_models(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let run_id = run_id.to_string();
+        self.with_conn(move |c| -> rusqlite::Result<Option<String>> {
+            let mut stmt = c.prepare("SELECT cost_models FROM agent_runs WHERE run_id=?1")?;
+            let mut rows = stmt.query_map(params![run_id], |r| r.get::<_, Option<String>>(0))?;
+            Ok(rows.next().transpose()?.flatten())
+        })
+        .await
+        .map(|opt| opt.and_then(|s| serde_json::from_str(&s).ok()))
+    }
+
+    pub async fn update_agent_run_cost_models(
+        &self,
+        run_id: &str,
+        models: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        let models = serde_json::to_string(models)?;
+        self.with_conn(move |c| {
+            c.execute(
+                "UPDATE agent_runs SET cost_models=?1 WHERE run_id=?2",
+                params![models, run_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn interrupt_incomplete_agent_runs(
         &self,
         reason: &str,
@@ -5675,6 +5707,7 @@ fn row_to_agent_run(r: &Row) -> rusqlite::Result<AgentRun> {
         cache_read_tokens: r.get::<_, Option<i64>>(23)?.map(|v| v as u64),
         cache_creation_tokens: r.get::<_, Option<i64>>(24)?.map(|v| v as u64),
         output_tokens: r.get::<_, Option<i64>>(25)?.map(|v| v as u64),
+        cost: None,
     })
 }
 

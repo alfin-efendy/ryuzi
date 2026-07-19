@@ -4,6 +4,7 @@
 
 use crate::domain::ModelCost;
 use crate::llm_router::model_meta::ModelMeta;
+use crate::store::Store;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -109,6 +110,23 @@ impl Tally {
     }
 }
 
+/// Resolve each model's meta (async) then price the tally. Shared by the
+/// session cost emit and the per-run cost emit/reload.
+pub(crate) async fn price_tally(store: &Store, tally: &Tally) -> (f64, Vec<ModelCost>) {
+    let mut metas: std::collections::HashMap<String, crate::llm_router::model_meta::ModelMeta> =
+        std::collections::HashMap::new();
+    for model in tally.model_ids() {
+        let meta = crate::llm_router::model_meta::resolve(store, &model).await;
+        metas.insert(model, meta);
+    }
+    tally.to_model_costs(|id| {
+        metas
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| crate::llm_router::model_meta::FALLBACK.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +188,18 @@ mod tests {
         assert!((total - 18.0).abs() < 1e-9, "total {total}");
         assert!((rows[0].usd - 3.0).abs() < 1e-9);
         assert!((rows[1].usd - 15.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn price_tally_prices_each_model_via_store_meta() {
+        let store = crate::store::Store::open(tempfile::NamedTempFile::new().unwrap().path())
+            .await
+            .unwrap();
+        let mut t = Tally::default();
+        t.add("claude-opus-4-8", 1_000_000, 0, 0, 0);
+        let (total, rows) = super::price_tally(&store, &t).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "claude-opus-4-8");
+        assert!(total >= 0.0);
     }
 }
