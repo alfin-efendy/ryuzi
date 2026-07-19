@@ -1249,6 +1249,12 @@ async fn drive(
     // is seeded from the same setting in `run_turn`; this read defaults to the
     // same [`PARENT_MAX_ITERS`] ceiling and is consulted on both the top-level
     // and delegated-sub-agent auto-continue paths (see `auto_continues()`).
+    // Intentional split: a sub-agent's INITIAL window is the
+    // [`SUBAGENT_MAX_ITERS`] constant (set where its budget is constructed at
+    // delegation), while every RE-GRANT here — parent or sub-agent — comes from
+    // this `agent.max_provider_turns` setting; the two are equal by default
+    // (both 500), but an operator override of the setting governs re-grants
+    // only, not a sub-agent's first window.
     let max_turns =
         crate::settings::usize_setting(&deps.store, "agent.max_provider_turns", PARENT_MAX_ITERS)
             .await;
@@ -1710,7 +1716,29 @@ async fn drive(
             continue;
         }
         // Auto-continue spent (or disabled): fall through to the budget-exhausted
-        // summary tail below.
+        // summary tail below. Only warn when the reason is genuine budget
+        // exhaustion (`auto_continue >= auto_budget`), not a user cancellation —
+        // `!cancel.is_cancelled()` is exactly that condition here, since the
+        // `if` above already ruled out the `auto_continue < auto_budget` case.
+        // With the ~50x higher ceiling and silent sub-agent auto-continue
+        // (no transcript notice for `ToolsOnly`), this is the only signal that
+        // a delegation subtree burned its entire budget without an end_turn.
+        if !cancel.is_cancelled() {
+            // Computed outside the macro call: tracing's `%` sigil expansion
+            // shadows an identifier named `display` for the whole invocation,
+            // which would otherwise collide with our `display: &DisplayMode`.
+            let subagent_label = display.subagent().unwrap_or("-");
+            tracing::warn!(
+                target: "ryuzi::drive",
+                session_pk = %deps.session_pk,
+                run_id = %deps.run_id,
+                subagent = subagent_label,
+                auto_budget,
+                auto_continue,
+                provider_turn,
+                "native: auto-continue budget exhausted without end_turn"
+            );
+        }
         break;
     }
     // A steer that landed after the loop's last drain — or while the final
@@ -11634,6 +11662,131 @@ mod tests {
         assert!(
             !notices.iter().any(|n| n.contains("send a message")),
             "budget was not exhausted, final stop notice must not appear: {notices:?}"
+        );
+    }
+
+    /// Sibling of `turn_limit_auto_continues_with_budget` for the SUB-AGENT
+    /// path (`DisplayMode::ToolsOnly`). Drives directly (like
+    /// `budget_exhaustion_emits_a_summary_not_a_bare_notice`) with a 1-turn
+    /// budget: turn 1 is a tool call that exhausts the window, the loop
+    /// auto-continues once, and turn 2 ends normally.
+    ///
+    /// Uses `RecordingLlm` (not a bare `ScriptedLlm`) because a
+    /// same-length-and-final-text check can't tell the auto-continue path
+    /// apart from the OTHER way `drive` can produce a plausible-looking final
+    /// string here: falling through to the post-exhaustion summary tail,
+    /// which independently makes its own aux call and would consume the same
+    /// queued "turn2" response — so asserting on `text` alone would pass even
+    /// with auto-continue disabled. Recording the request bodies lets us
+    /// assert on the actual second request: it must be the genuine
+    /// auto-continued turn (tools offered, last user message is the synthetic
+    /// `"continue"`), not the tool-less budget-exhausted nudge
+    /// (`BUDGET_EXHAUSTED_PROMPT`) the tail sends instead.
+    ///
+    /// Asserts (a) the drive auto-continued rather than hard-stopping, and
+    /// (b) NOTHING was emitted to the transcript for the auto-continue: no
+    /// `notice` row and no assistant `text` row, because `display.text()` is
+    /// false for `ToolsOnly` (a pure enum test on `auto_continues()` can't
+    /// catch either property — only driving the loop end-to-end can).
+    #[tokio::test]
+    async fn subagent_tools_only_auto_continues_silently() {
+        use testutil::RecordingLlm;
+        let dir = tempfile::tempdir().unwrap();
+        let turn1 = vec![
+            tool_use_start(0, "t1", "ls"),
+            input_json_delta(0, r#"{"path":"."}"#),
+            message_delta("tool_use"),
+            message_stop(),
+        ];
+        let turn2 = vec![
+            text_delta("sub-agent done"),
+            message_delta("end_turn"),
+            message_stop(),
+        ];
+        let llm = Arc::new(RecordingLlm::new(vec![turn1, turn2]));
+        let deps = deps_at(dir.path(), llm.clone()).await;
+        deps.store
+            .set_setting(
+                crate::domain::WriteOrigin::User,
+                "agent.auto_continue_budget",
+                "1",
+            )
+            .await
+            .unwrap();
+
+        let agent = deps.agent.clone();
+        let mut cm = ContextManager::ephemeral(
+            &deps.session_pk,
+            ContextConfig::with_meta(deps.meta.clone()),
+        );
+        cm.append_user(json!([{ "type": "text", "text": "delegate task" }]))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let budget = IterationBudget::new(1);
+
+        let text = drive(
+            &deps,
+            &agent,
+            &mut cm,
+            &cancel,
+            None,
+            DisplayMode::ToolsOnly {
+                label: "researcher".into(),
+            },
+            &budget,
+        )
+        .await
+        .unwrap();
+
+        // (a) Auto-continue happened rather than a hard stop: exactly 2
+        // requests went out (the tool-call turn + the continued turn), and
+        // the second one is a genuine tool-offering turn whose last user
+        // message is the synthetic "continue" nudge — NOT the tool-less
+        // BUDGET_EXHAUSTED_PROMPT summary call the exhaustion tail would send
+        // if auto-continue had NOT kicked in (that tail independently calls
+        // the LLM again, so checking `text` alone can't distinguish the two).
+        assert_eq!(text, "sub-agent done");
+        {
+            // Scoped so the sync `MutexGuard` is dropped before the `.await`
+            // below (holding it across an await point is a clippy lint).
+            let bodies = llm.bodies.lock().unwrap();
+            assert_eq!(
+                bodies.len(),
+                2,
+                "expected exactly 2 provider requests (tool-call turn + auto-continued turn): {bodies:?}"
+            );
+            let second_messages = bodies[1]["messages"].as_array().unwrap();
+            let last_text = second_messages.last().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                last_text, "continue",
+                "second request must be the auto-continued turn (synthetic \"continue\" user \
+                 turn), not the budget-exhausted summary call: {bodies:?}"
+            );
+            let second_tools_empty = bodies[1]
+                .get("tools")
+                .map(|t| t.as_array().is_none_or(|a| a.is_empty()))
+                .unwrap_or(true);
+            assert!(
+                !second_tools_empty,
+                "second request must be a normal tool-offering turn, not the tool-less \
+                 budget-exhausted summary call: {bodies:?}"
+            );
+        }
+
+        // (b) Silent: no notice row, no assistant text row in the transcript.
+        let msgs = deps.store.list_messages(&deps.session_pk).await.unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.block_type == "notice"),
+            "no notice row expected for a silent sub-agent auto-continue: {msgs:?}"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == "assistant" && m.block_type == "text"),
+            "no assistant text row expected for a silent sub-agent auto-continue: {msgs:?}"
         );
     }
 
