@@ -6682,7 +6682,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -6931,7 +6931,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         assert!(columns.iter().any(|column| column == "source_tool_call_id"));
         assert!(columns.iter().any(|column| column == "dispatch_index"));
         assert!(has_dispatch_index);
@@ -7002,14 +7002,14 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
         let reopened_version: i64 = reopened
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 46);
+        assert_eq!(reopened_version, 49);
     }
     #[tokio::test]
     async fn migration_41_removes_session_wide_tool_call_uniqueness() {
@@ -7029,7 +7029,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -7073,7 +7073,7 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
     }
     #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
@@ -8963,7 +8963,7 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 46, "forward migration must land at v46");
+        assert_eq!(user_version, 49, "forward migration must land at v49");
     }
     #[tokio::test]
     async fn migration_30_adds_audit_session_and_origin_columns() {
@@ -9697,18 +9697,20 @@ mod tests {
         // per-run context-window snapshot columns; 44 artifacts,
         // artifact_references, and artifact_storage_jobs; 45 sessions.archived_at;
         // 46 agent_runs.context_window/cache_read_tokens/cache_creation_tokens/
-        // output_tokens/cost_models
-        // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
-        // re-run on next open.        // `Migrations` always fast-forwards to the latest defined version, so
+        // output_tokens/cost_models; 47 component_plugin_releases; 48
+        // component_plugin_storage; 49 plugin_oauth_profile_tokens +
+        // plugin_oauth_profile_clients — all convergent, existence-guarded,
+        // or CREATE TABLE IF NOT EXISTS) re-run on next open.
+        // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 46
-        // defined, wind back thirty-four.
+        // this test starts failing its assertions). With migrations through 49
+        // defined, wind back thirty-seven.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 34)
+            c.pragma_update(None, "user_version", v - 37)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -9765,15 +9767,17 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
-        // 22–46) replay against it. Back TWENTY-SIX: the fully migrated tail
-        // is now v46, so rewinding to v20 is what makes        // migration 21 (native-only) replay.        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // 22–49) replay against it. Back TWENTY-NINE: the fully migrated tail
+        // is now v49, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
         // orch_tasks ADD COLUMN ...` hook, but migration 39 already dropped
         // orch_tasks in this fully-migrated store. The hook must therefore
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 26)
+            c.pragma_update(None, "user_version", v - 29)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -9906,7 +9910,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");
+        assert_eq!(uv, 49, "forward migration must land at v49");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -9932,7 +9936,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");
+        assert_eq!(uv, 49, "forward migration must land at v49");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
