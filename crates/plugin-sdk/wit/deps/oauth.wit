@@ -1,0 +1,33 @@
+package ryuzi:oauth@0.2.0;
+
+interface oauth {
+  record header {
+    name: string,
+    value: string,
+  }
+
+  record oauth-request {
+    method: string,
+    url: string,
+    headers: list<header>,
+    body: option<list<u8>>,
+  }
+
+  record authorized-response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  variant oauth-error {
+    invalid-request(string),
+    denied,
+    expired,
+    failed(string),
+  }
+
+  /// Sends an HTTP request with the selected profile's host-managed bearer.
+  /// Components never receive access or refresh tokens.
+  authorized-request: func(profile-id: string, request: oauth-request) -> result<authorized-response, oauth-error>;
+  disconnect: func(profile-id: string) -> result<bool, oauth-error>;
+}

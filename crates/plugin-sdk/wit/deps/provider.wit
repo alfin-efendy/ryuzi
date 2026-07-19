@@ -1,0 +1,38 @@
+package ryuzi:provider@0.1.0;
+
+interface provider {
+  record completion-request {
+    model: string,
+    prompt: string,
+    max-tokens: option<u32>,
+    temperature: option<f32>,
+  }
+
+  record token-usage {
+    input: u32,
+    output: u32,
+  }
+
+  record completion-chunk {
+    text: string,
+    finished: bool,
+    usage: option<token-usage>,
+  }
+
+  record model-info {
+    id: string,
+    display-name: string,
+    context-window: u32,
+  }
+
+  variant provider-error {
+    invalid-request(string),
+    model-not-found,
+    rate-limited,
+    unavailable,
+    failed(string),
+  }
+
+  list-models: func() -> result<list<model-info>, provider-error>;
+  complete: func(request: completion-request) -> result<list<completion-chunk>, provider-error>;
+}

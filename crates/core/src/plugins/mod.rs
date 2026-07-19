@@ -20,6 +20,8 @@
 //! catalog in one call.
 
 pub mod builtin;
+pub mod bundle;
+pub mod capabilities;
 pub mod catalog;
 pub mod catalog_feed_key;
 pub mod declarative;
@@ -29,6 +31,8 @@ pub mod host;
 pub mod oauth;
 pub mod providers;
 pub mod remote_catalog;
+pub mod runtime;
+pub mod wit;
 
 use crate::settings::{csv, SettingsStore};
 use crate::store::Store;

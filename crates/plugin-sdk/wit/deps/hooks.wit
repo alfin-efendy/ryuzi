@@ -1,0 +1,27 @@
+package ryuzi:hooks@0.1.0;
+
+interface hooks {
+  variant hook-value {
+    text(string),
+    integer(s64),
+    boolean(bool),
+  }
+
+  record hook-event {
+    name: string,
+    values: list<hook-value>,
+  }
+
+  record hook-result {
+    handled: bool,
+    values: list<hook-value>,
+  }
+
+  variant hook-error {
+    unsupported,
+    rejected,
+    failed(string),
+  }
+
+  handle: func(event: hook-event) -> result<hook-result, hook-error>;
+}

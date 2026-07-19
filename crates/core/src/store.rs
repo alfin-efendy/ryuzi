@@ -1573,6 +1573,73 @@ fn migrations() -> Migrations<'static> {
             }
             Ok(())
         }),
+        // 47: versioned component plugin releases (Task 3). Tracks every
+        // fetched build of a WASM component plugin — one row per
+        // (plugin_id, version) — so activation/rollback/revocation can be
+        // audited independently of the single "current install" row in
+        // `plugin_installs`. The partial unique index enforces at most one
+        // active version per plugin id directly in the schema; the
+        // `active`/`revoked` write paths additionally enforce the invariant
+        // in application code (see `set_active_component_release` and
+        // `mark_component_release_revoked`) so a partial-index-less SQLite
+        // build would still behave correctly.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS component_plugin_releases (\
+                plugin_id TEXT NOT NULL,\
+                version TEXT NOT NULL,\
+                source_url TEXT NOT NULL,\
+                sha256 TEXT NOT NULL,\
+                signing_key_id TEXT NOT NULL,\
+                installed_at INTEGER NOT NULL,\
+                active INTEGER NOT NULL DEFAULT 0,\
+                revoked INTEGER NOT NULL DEFAULT 0,\
+                revocation_reason TEXT,\
+                PRIMARY KEY (plugin_id, version)\
+            );\
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_component_plugin_releases_active \
+                ON component_plugin_releases(plugin_id) WHERE active=1;",
+        ),
+        // 48: per-plugin key/value storage for WASM component plugins.
+        // Lets a plugin persist small opaque blobs (host-mediated, quota
+        // bounded by `COMPONENT_STORAGE_MAX_VALUE_BYTES`) scoped by its own
+        // `plugin_id` so different plugins can use the same `key` without
+        // colliding.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS component_plugin_storage (\
+                plugin_id TEXT NOT NULL,\
+                key TEXT NOT NULL,\
+                value BLOB NOT NULL,\
+                PRIMARY KEY (plugin_id, key)\
+            );",
+        ),
+        // 49: profile-keyed OAuth token/client storage for WASM component
+        // plugins (Task 8 slice 2a). A bundle may declare more than one
+        // `[[oauth]]` profile (e.g. a connector talking to two different
+        // OAuth-protected APIs), so the token/client cache must be keyed by
+        // `(plugin_id, profile_id)`, not just `plugin_id`. These are NEW
+        // tables, deliberately separate from `plugin_oauth_tokens`/
+        // `plugin_oauth_clients` (migrations 16/18/19): those two remain
+        // untouched — `plugins/declarative.rs` still reads/writes them for
+        // the single-token-per-plugin flow, and rewriting their primary key
+        // in place would be needless SQLite surgery for no shared caller.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_oauth_profile_tokens (\
+                plugin_id TEXT NOT NULL,\
+                profile_id TEXT NOT NULL,\
+                token_json TEXT NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                PRIMARY KEY (plugin_id, profile_id)\
+            );\
+            CREATE TABLE IF NOT EXISTS plugin_oauth_profile_clients (\
+                plugin_id TEXT NOT NULL,\
+                profile_id TEXT NOT NULL,\
+                authorize_url TEXT,\
+                token_url TEXT,\
+                client_id TEXT,\
+                updated_at INTEGER NOT NULL,\
+                PRIMARY KEY (plugin_id, profile_id)\
+            );",
+        ),
     ])
 }
 
@@ -1768,6 +1835,33 @@ fn map_plugin_attach_row(r: &Row) -> rusqlite::Result<PluginAttachStatus> {
     })
 }
 
+fn map_component_release_row(r: &Row) -> rusqlite::Result<ComponentPluginReleaseRecord> {
+    Ok(ComponentPluginReleaseRecord {
+        plugin_id: r.get(0)?,
+        version: r.get(1)?,
+        source_url: r.get(2)?,
+        sha256: r.get(3)?,
+        signing_key_id: r.get(4)?,
+        installed_at: r.get(5)?,
+        active: r.get::<_, i64>(6)? != 0,
+        revoked: r.get::<_, i64>(7)? != 0,
+        revocation_reason: r.get(8)?,
+    })
+}
+
+const COMPONENT_RELEASE_COLS: &str = "plugin_id, version, source_url, sha256, signing_key_id, \
+    installed_at, active, revoked, revocation_reason";
+
+fn map_component_storage_row(r: &Row) -> rusqlite::Result<ComponentPluginStorageRecord> {
+    Ok(ComponentPluginStorageRecord {
+        plugin_id: r.get(0)?,
+        key: r.get(1)?,
+        value: r.get(2)?,
+    })
+}
+
+const COMPONENT_STORAGE_COLS: &str = "plugin_id, key, value";
+
 fn map_device_row(r: &Row) -> rusqlite::Result<Device> {
     Ok(Device {
         id: r.get(0)?,
@@ -1888,6 +1982,19 @@ pub struct PluginOauthClient {
     pub client_id: Option<String>,
 }
 
+/// One row per `(plugin_id, profile_id)` in `plugin_oauth_profile_clients` —
+/// the profile-keyed counterpart of [`PluginOauthClient`] for bundles that
+/// declare more than one `[[oauth]]` profile (Task 8 slice 2a). Same
+/// column-merge upsert semantics as `upsert_plugin_oauth_client`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOauthProfileClient {
+    pub plugin_id: String,
+    pub profile_id: String,
+    pub authorize_url: Option<String>,
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+}
+
 /// One row of `plugin_installs`: the authoritative record of an installed
 /// skill pack or single skill. `kind` is `"plugin_pack"` or `"single_skill"`.
 /// `resolved_commit` is the git HEAD captured at install/update (`None` for
@@ -1919,6 +2026,45 @@ pub struct PluginAttachStatus {
     pub last_attach_at: i64,
     pub outcome: String,
     pub reason: Option<String>,
+}
+
+/// One row of `component_plugin_releases`: a single fetched build of a WASM
+/// component plugin, keyed by `(plugin_id, version)`. Distinct from the
+/// single "current install" row in `plugin_installs` — this table is an
+/// append-mostly ledger of every version ever fetched for a plugin, so
+/// activation, rollback, and revocation can all be audited independently.
+/// `active` is true for at most one version per `plugin_id` (enforced by a
+/// partial unique index and by `set_active_component_release`). `revoked` +
+/// `revocation_reason` mark a version as no longer safe to activate; a
+/// revoked version is automatically deactivated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentPluginReleaseRecord {
+    pub plugin_id: String,
+    pub version: String,
+    pub source_url: String,
+    pub sha256: String,
+    pub signing_key_id: String,
+    pub installed_at: i64,
+    pub active: bool,
+    pub revoked: bool,
+    pub revocation_reason: Option<String>,
+}
+
+/// Maximum size, in bytes, of a single stored value in
+/// `component_plugin_storage`. Bounds how much a WASM component plugin can
+/// persist through the host-mediated key/value store, keeping the SQLite
+/// database from growing unbounded on a plugin's behalf.
+pub const COMPONENT_STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
+
+/// One row of `component_plugin_storage`: an opaque blob a WASM component
+/// plugin has persisted under its own `plugin_id` and a caller-chosen `key`.
+/// Storage is scoped by `(plugin_id, key)`, so two different plugins may use
+/// the same `key` without colliding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentPluginStorageRecord {
+    pub plugin_id: String,
+    pub key: String,
+    pub value: Vec<u8>,
 }
 
 /// One row of `plugin_catalog_cache`: an entry from the last verified signed
@@ -4482,6 +4628,207 @@ impl Store {
         .await
     }
 
+    /// Profile-keyed counterpart of [`Store::upsert_plugin_oauth_token`] —
+    /// see the `plugin_oauth_profile_tokens` migration doc (49) for why this
+    /// is a separate table rather than a schema change to the existing one.
+    /// Reuses the same encrypt-on-write helper
+    /// (`upsert_plugin_oauth_token_json`) so encryption at rest is identical
+    /// between the single-token and profile-token paths.
+    pub async fn upsert_plugin_oauth_profile_token(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+        token: &PluginOauthToken,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        let token = token.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let existing: Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![&plugin_id, &profile_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let token_json = upsert_plugin_oauth_token_json(existing.as_deref(), &token)
+                .map_err(to_sql_json_error)?;
+            c.execute(
+                "INSERT INTO plugin_oauth_profile_tokens(plugin_id, profile_id, token_json, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(plugin_id, profile_id) DO UPDATE SET \
+                   token_json=excluded.token_json, \
+                   updated_at=excluded.updated_at",
+                params![plugin_id, profile_id, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Profile-keyed counterpart of [`Store::get_plugin_oauth_token`]. Rows
+    /// are isolated per `(plugin_id, profile_id)`: a different plugin id or
+    /// a different profile id within the same plugin never sees another
+    /// profile's token.
+    pub async fn get_plugin_oauth_profile_token(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<Option<PluginOauthToken>> {
+        let plugin_id_owned = plugin_id.to_string();
+        let profile_id_owned = profile_id.to_string();
+        let raw: Option<String> = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![plugin_id_owned, profile_id_owned],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        raw.map(|raw| decode_plugin_oauth_token(plugin_id, &raw))
+            .transpose()
+    }
+
+    /// Profile-keyed counterpart of
+    /// [`Store::mark_plugin_oauth_reconnect_required`].
+    pub async fn mark_plugin_oauth_profile_reconnect_required(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let Some(raw): Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![&plugin_id, &profile_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let mut token = decode_plugin_oauth_token(&plugin_id, &raw)
+                .map_err(|err| from_sql_json_error(0, err))?;
+            token.reconnect_required = true;
+            let token_json =
+                upsert_plugin_oauth_token_json(Some(&raw), &token).map_err(to_sql_json_error)?;
+            c.execute(
+                "UPDATE plugin_oauth_profile_tokens SET token_json=?3, updated_at=?4 \
+                 WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Profile-keyed counterpart of [`Store::delete_plugin_oauth_token`].
+    /// Deletes only the `(plugin_id, profile_id)` row; other profiles for
+    /// the same plugin (or the same profile id under a different plugin)
+    /// are untouched.
+    pub async fn delete_plugin_oauth_profile_token(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_oauth_profile_tokens WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Profile-keyed counterpart of [`Store::upsert_plugin_oauth_client`]:
+    /// same column-merge semantics (`Some` overwrites, `None` preserves),
+    /// keyed by `(plugin_id, profile_id)`.
+    pub async fn upsert_plugin_oauth_profile_client(
+        &self,
+        client: &PluginOauthProfileClient,
+    ) -> anyhow::Result<()> {
+        let client = client.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_oauth_profile_clients(\
+                     plugin_id, profile_id, authorize_url, token_url, client_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(plugin_id, profile_id) DO UPDATE SET \
+                   authorize_url=COALESCE(excluded.authorize_url, plugin_oauth_profile_clients.authorize_url), \
+                   token_url=COALESCE(excluded.token_url, plugin_oauth_profile_clients.token_url), \
+                   client_id=COALESCE(excluded.client_id, plugin_oauth_profile_clients.client_id), \
+                   updated_at=excluded.updated_at",
+                params![
+                    client.plugin_id,
+                    client.profile_id,
+                    client.authorize_url,
+                    client.token_url,
+                    client.client_id,
+                    updated_at
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_oauth_profile_client(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<Option<PluginOauthProfileClient>> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, profile_id, authorize_url, token_url, client_id \
+                 FROM plugin_oauth_profile_clients WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id],
+                |r| {
+                    Ok(PluginOauthProfileClient {
+                        plugin_id: r.get(0)?,
+                        profile_id: r.get(1)?,
+                        authorize_url: r.get(2)?,
+                        token_url: r.get(3)?,
+                        client_id: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn delete_plugin_oauth_profile_client(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_oauth_profile_clients WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     pub async fn upsert_plugin_install(&self, rec: &PluginInstallRecord) -> anyhow::Result<()> {
         let rec = rec.clone();
         self.with_conn(move |c| {
@@ -4628,6 +4975,246 @@ impl Store {
                 .query_map([], map_plugin_attach_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Insert a new component plugin release row, or refresh an existing
+    /// one's metadata (`source_url`, `sha256`, `signing_key_id`) in place.
+    /// `installed_at`, `active`, `revoked`, and `revocation_reason` are never
+    /// clobbered by a refresh — those are durable lifecycle state owned by
+    /// `set_active_component_release` and `mark_component_release_revoked`,
+    /// not by whatever the caller happens to pass in a metadata re-verify.
+    pub async fn upsert_component_release(
+        &self,
+        rec: &ComponentPluginReleaseRecord,
+    ) -> anyhow::Result<()> {
+        let rec = rec.clone();
+        self.with_conn(move |c| {
+            c.execute(
+                &format!(
+                    "INSERT INTO component_plugin_releases({COMPONENT_RELEASE_COLS}) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                     ON CONFLICT(plugin_id, version) DO UPDATE SET \
+                       source_url=excluded.source_url, sha256=excluded.sha256, \
+                       signing_key_id=excluded.signing_key_id"
+                ),
+                params![
+                    rec.plugin_id,
+                    rec.version,
+                    rec.source_url,
+                    rec.sha256,
+                    rec.signing_key_id,
+                    rec.installed_at,
+                    rec.active as i64,
+                    rec.revoked as i64,
+                    rec.revocation_reason,
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// All releases fetched for `plugin_id`, oldest first. Ordered by
+    /// `installed_at ASC, version ASC` — installation order is the primary
+    /// key so history reads chronologically; `version` is the tiebreaker for
+    /// rows that share an `installed_at` timestamp (e.g. backfilled or
+    /// second-granularity clocks), keeping the order fully deterministic.
+    /// This is lexicographic on `version`, not semver-aware.
+    pub async fn list_component_releases(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Vec<ComponentPluginReleaseRecord>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {COMPONENT_RELEASE_COLS} FROM component_plugin_releases \
+                 WHERE plugin_id=?1 ORDER BY installed_at ASC, version ASC"
+            ))?;
+            let rows = stmt
+                .query_map(params![plugin_id], map_component_release_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// The currently active release for `plugin_id`, if any. At most one row
+    /// can be active per plugin (enforced by the partial unique index on
+    /// `component_plugin_releases(plugin_id) WHERE active=1` plus
+    /// `set_active_component_release`'s transaction).
+    pub async fn active_component_release(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<ComponentPluginReleaseRecord>> {
+        let plugin_id = plugin_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {COMPONENT_RELEASE_COLS} FROM component_plugin_releases \
+                     WHERE plugin_id=?1 AND active=1"
+                ),
+                params![plugin_id],
+                map_component_release_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Activate `(plugin_id, version)`, deactivating whatever was previously
+    /// active for that plugin. Validates the target row exists and is not
+    /// revoked *before* touching any state, and runs entirely inside one
+    /// transaction: a rejected activation (missing or revoked target) leaves
+    /// the prior active version untouched, and a mid-transaction failure
+    /// rolls back rather than leaving two (or zero) active rows.
+    pub async fn set_active_component_release(
+        &self,
+        plugin_id: &str,
+        version: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let version = version.to_string();
+        self.with_conn(move |c| {
+            let tx = c.transaction()?;
+            let revoked: Option<i64> = tx
+                .query_row(
+                    "SELECT revoked FROM component_plugin_releases \
+                     WHERE plugin_id=?1 AND version=?2",
+                    params![plugin_id, version],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match revoked {
+                None => {
+                    return Err(to_sql_json_error(format!(
+                        "no component release {plugin_id}@{version} to activate"
+                    )));
+                }
+                Some(revoked) if revoked != 0 => {
+                    return Err(to_sql_json_error(format!(
+                        "component release {plugin_id}@{version} is revoked and cannot be activated"
+                    )));
+                }
+                Some(_) => {}
+            }
+            tx.execute(
+                "UPDATE component_plugin_releases SET active=0 \
+                 WHERE plugin_id=?1 AND active=1",
+                params![plugin_id],
+            )?;
+            tx.execute(
+                "UPDATE component_plugin_releases SET active=1 \
+                 WHERE plugin_id=?1 AND version=?2",
+                params![plugin_id, version],
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+
+    /// Revoke `(plugin_id, version)`: records `reason`, clears `active` if
+    /// this was the active version, and leaves other versions untouched.
+    /// Idempotent — revoking an already-revoked version updates the
+    /// recorded reason and succeeds again rather than erroring.
+    pub async fn mark_component_release_revoked(
+        &self,
+        plugin_id: &str,
+        version: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let version = version.to_string();
+        let reason = reason.to_string();
+        self.with_conn(move |c| {
+            let changed = c.execute(
+                "UPDATE component_plugin_releases \
+                 SET revoked=1, revocation_reason=?3, active=0 \
+                 WHERE plugin_id=?1 AND version=?2",
+                params![plugin_id, version, reason],
+            )?;
+            if changed == 0 {
+                return Err(to_sql_json_error(format!(
+                    "no component release {plugin_id}@{version} to revoke"
+                )));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Fetch a value a WASM component plugin has stored under its own
+    /// `plugin_id` and `key`. `None` if no such row exists.
+    pub async fn get_component_storage(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<ComponentPluginStorageRecord>> {
+        let plugin_id = plugin_id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT {COMPONENT_STORAGE_COLS} FROM component_plugin_storage \
+                     WHERE plugin_id=?1 AND key=?2"
+                ),
+                params![plugin_id, key],
+                map_component_storage_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Store `value` under `(plugin_id, key)`, replacing any prior value.
+    /// Rejects a value larger than `COMPONENT_STORAGE_MAX_VALUE_BYTES`
+    /// before writing anything.
+    pub async fn put_component_storage(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: &[u8],
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let key = key.to_string();
+        let value = value.to_vec();
+        self.with_conn(move |c| {
+            if value.len() > COMPONENT_STORAGE_MAX_VALUE_BYTES {
+                return Err(to_sql_json_error(format!(
+                    "component storage value for {plugin_id}/{key} is {} bytes, \
+                     exceeding the {COMPONENT_STORAGE_MAX_VALUE_BYTES}-byte limit",
+                    value.len()
+                )));
+            }
+            c.execute(
+                &format!(
+                    "INSERT INTO component_plugin_storage({COMPONENT_STORAGE_COLS}) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(plugin_id, key) DO UPDATE SET value=excluded.value"
+                ),
+                params![plugin_id, key, value],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Delete the value stored under `(plugin_id, key)`. Returns `true` if a
+    /// row was deleted, `false` if none existed.
+    pub async fn delete_component_storage(
+        &self,
+        plugin_id: &str,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let plugin_id = plugin_id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |c| {
+            let changed = c.execute(
+                "DELETE FROM component_plugin_storage WHERE plugin_id=?1 AND key=?2",
+                params![plugin_id, key],
+            )?;
+            Ok(changed > 0)
         })
         .await
     }
@@ -6095,7 +6682,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         assert_eq!(
             ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
@@ -6344,7 +6931,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         assert!(columns.iter().any(|column| column == "source_tool_call_id"));
         assert!(columns.iter().any(|column| column == "dispatch_index"));
         assert!(has_dispatch_index);
@@ -6415,17 +7002,15 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 46);
-
+        assert_eq!(user_version, 49);
         drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
         let reopened_version: i64 = reopened
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
-        assert_eq!(reopened_version, 46);
+        assert_eq!(reopened_version, 49);
     }
-
     #[tokio::test]
     async fn migration_41_removes_session_wide_tool_call_uniqueness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -6444,7 +7029,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
         assert!(
             !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
@@ -6488,9 +7073,8 @@ mod tests {
 
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
-        assert_eq!(user_version, 46);
+        assert_eq!(user_version, 49);
     }
-
     #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -8379,9 +8963,8 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |r| r.get(0)))
             .await
             .unwrap();
-        assert_eq!(user_version, 46, "forward migration must land at v46");
+        assert_eq!(user_version, 49, "forward migration must land at v49");
     }
-
     #[tokio::test]
     async fn migration_30_adds_audit_session_and_origin_columns() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -9114,19 +9697,20 @@ mod tests {
         // per-run context-window snapshot columns; 44 artifacts,
         // artifact_references, and artifact_storage_jobs; 45 sessions.archived_at;
         // 46 agent_runs.context_window/cache_read_tokens/cache_creation_tokens/
-        // output_tokens/cost_models
-        // — all convergent, existence-guarded, or CREATE TABLE IF NOT EXISTS)
-        // re-run on next open.
+        // output_tokens/cost_models; 47 component_plugin_releases; 48
+        // component_plugin_storage; 49 plugin_oauth_profile_tokens +
+        // plugin_oauth_profile_clients — all convergent, existence-guarded,
+        // or CREATE TABLE IF NOT EXISTS) re-run on next open.
         // `Migrations` always fast-forwards to the latest defined version, so
         // there is no way to replay 13 alone once something is appended after
         // it. Bump this offset by one for every migration appended after 13 —
         // a stale offset silently skips migration 13 (the DB opens fine, but
-        // this test starts failing its assertions). With migrations through 46
-        // defined, wind back thirty-four.
+        // this test starts failing its assertions). With migrations through 49
+        // defined, wind back thirty-seven.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 34)
+            c.pragma_update(None, "user_version", v - 37)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -9183,9 +9767,9 @@ mod tests {
     async fn migration_21_drops_the_runtime_concept() {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
-        // 22–46) replay against it. Back TWENTY-SIX: the fully migrated tail
-        // is now v46, so rewinding to v20 is what makes
-        // migration 21 (native-only) replay.
+        // 22–49) replay against it. Back TWENTY-NINE: the fully migrated tail
+        // is now v49, so rewinding to v20 is what makes migration 21
+        // (native-only) replay.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
         // orch_tasks ADD COLUMN ...` hook, but migration 39 already dropped
@@ -9193,7 +9777,7 @@ mod tests {
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 26)
+            c.pragma_update(None, "user_version", v - 29)
         };
         {
             let store = Store::open(tmp.path()).await.unwrap();
@@ -9326,7 +9910,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");
+        assert_eq!(uv, 49, "forward migration must land at v49");
         assert!(has_bg, "background_events table must exist");
         assert!(has_override, "jobs.model_override column must exist");
     }
@@ -9352,7 +9936,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");
+        assert_eq!(uv, 49, "forward migration must land at v49");
         assert!(has_fts, "messages_fts must survive agentic cleanup");
         assert!(
             !has_usage && !has_cstate && !has_cruns,
@@ -9941,6 +10525,270 @@ mod tests {
             .is_none());
     }
 
+    async fn raw_plugin_oauth_profile_token_json(
+        store: &Store,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> String {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![plugin_id, profile_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    fn test_profile_token(plugin_id: &str, access_token: &str) -> PluginOauthToken {
+        PluginOauthToken {
+            plugin_id: plugin_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some(format!("{access_token}-refresh")),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into()],
+            reconnect_required: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_tokens_for_the_same_plugin_are_independent() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "token-a"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-b",
+                &test_profile_token("github", "token-b"),
+            )
+            .await
+            .unwrap();
+
+        let a = store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let b = store
+            .get_plugin_oauth_profile_token("github", "profile-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.access_token, "token-a");
+        assert_eq!(b.access_token, "token-b");
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_token_is_isolated_by_plugin_id() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "github-token"),
+            )
+            .await
+            .unwrap();
+
+        let cross_plugin = store
+            .get_plugin_oauth_profile_token("atlassian", "profile-a")
+            .await
+            .unwrap();
+        assert!(
+            cross_plugin.is_none(),
+            "a different plugin id must not see another plugin's profile token"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_token_is_encrypted_at_rest() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = PluginOauthToken {
+            plugin_id: "github".into(),
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into()],
+            reconnect_required: false,
+        };
+
+        store
+            .upsert_plugin_oauth_profile_token("github", "profile-a", &token)
+            .await
+            .unwrap();
+
+        let raw_json = raw_plugin_oauth_profile_token_json(&store, "github", "profile-a").await;
+        assert!(
+            !raw_json.contains("access-secret"),
+            "profile access token must not be stored in plaintext: {raw_json}"
+        );
+        assert!(
+            !raw_json.contains("refresh-secret"),
+            "profile refresh token must not be stored in plaintext: {raw_json}"
+        );
+
+        let roundtrip = store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(roundtrip.access_token, "access-secret");
+        assert_eq!(roundtrip.refresh_token.as_deref(), Some("refresh-secret"));
+    }
+
+    #[tokio::test]
+    async fn delete_plugin_oauth_profile_token_removes_only_that_profile() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "token-a"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-b",
+                &test_profile_token("github", "token-b"),
+            )
+            .await
+            .unwrap();
+
+        store
+            .delete_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_plugin_oauth_profile_token("github", "profile-b")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_client_upsert_merges_columns_and_roundtrips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        assert!(store
+            .get_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .upsert_plugin_oauth_profile_client(&PluginOauthProfileClient {
+                plugin_id: "acme".into(),
+                profile_id: "profile-a".into(),
+                authorize_url: Some("https://acme.test/authorize".into()),
+                token_url: Some("https://acme.test/token".into()),
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&PluginOauthProfileClient {
+                plugin_id: "acme".into(),
+                profile_id: "profile-a".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-123".into()),
+            })
+            .await
+            .unwrap();
+
+        let client = store
+            .get_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.authorize_url.as_deref(),
+            Some("https://acme.test/authorize")
+        );
+        assert_eq!(client.token_url.as_deref(), Some("https://acme.test/token"));
+        assert_eq!(client.client_id.as_deref(), Some("client-123"));
+
+        // A different profile id under the same plugin is untouched.
+        assert!(store
+            .get_plugin_oauth_profile_client("acme", "profile-b")
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .delete_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap();
+        assert!(store
+            .get_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_plugin_oauth_profile_reconnect_required_updates_flag() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "token-a"),
+            )
+            .await
+            .unwrap();
+
+        store
+            .mark_plugin_oauth_profile_reconnect_required("github", "profile-a")
+            .await
+            .unwrap();
+
+        let roundtrip = store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(roundtrip.reconnect_required);
+        assert_eq!(roundtrip.access_token, "token-a");
+    }
+
     #[tokio::test]
     async fn context_checkpoints_and_session_context_roundtrip() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -10207,6 +11055,384 @@ mod tests {
 
         store.delete_plugin_install("acme").await.unwrap();
         assert!(store.get_plugin_install("acme").await.unwrap().is_none());
+    }
+
+    fn component_release(
+        plugin_id: &str,
+        version: &str,
+        installed_at: i64,
+    ) -> ComponentPluginReleaseRecord {
+        ComponentPluginReleaseRecord {
+            plugin_id: plugin_id.into(),
+            version: version.into(),
+            source_url: format!("https://example.test/{plugin_id}/{version}.wasm"),
+            sha256: format!("sha256-{plugin_id}-{version}"),
+            signing_key_id: "key-1".into(),
+            installed_at,
+            active: false,
+            revoked: false,
+            revocation_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_42_creates_component_plugin_releases_table() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let count: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT count(*) FROM component_plugin_releases", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_creates_component_plugin_storage_table() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let count: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT count(*) FROM component_plugin_storage", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        store
+            .put_component_storage("github", "k", b"hello")
+            .await
+            .unwrap();
+        let rec = store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .expect("stored value should round-trip");
+        assert_eq!(rec.plugin_id, "github");
+        assert_eq!(rec.key, "k");
+        assert_eq!(rec.value, b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn component_storage_is_scoped_per_plugin_id() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .put_component_storage("github", "k", b"A")
+            .await
+            .unwrap();
+        store
+            .put_component_storage("atlassian", "k", b"B")
+            .await
+            .unwrap();
+
+        let github = store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        let atlassian = store
+            .get_component_storage("atlassian", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(github.value, b"A".to_vec());
+        assert_eq!(atlassian.value, b"B".to_vec());
+    }
+
+    #[tokio::test]
+    async fn component_storage_rejects_oversized_values() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let oversized = vec![0u8; COMPONENT_STORAGE_MAX_VALUE_BYTES + 1];
+
+        let result = store.put_component_storage("github", "k", &oversized).await;
+        assert!(result.is_err());
+
+        let stored = store.get_component_storage("github", "k").await.unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn component_storage_delete_reports_whether_a_row_existed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .put_component_storage("github", "k", b"hello")
+            .await
+            .unwrap();
+
+        let deleted = store.delete_component_storage("github", "k").await.unwrap();
+        assert!(deleted);
+        assert!(store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .is_none());
+
+        let deleted_again = store.delete_component_storage("github", "k").await.unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[tokio::test]
+    async fn component_storage_put_upserts_latest_value() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .put_component_storage("github", "k", b"first")
+            .await
+            .unwrap();
+        store
+            .put_component_storage("github", "k", b"second")
+            .await
+            .unwrap();
+
+        let rec = store
+            .get_component_storage("github", "k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.value, b"second".to_vec());
+    }
+
+    #[tokio::test]
+    async fn component_release_versions_coexist_with_deterministic_order() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.1", 2000))
+            .await
+            .unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert_eq!(releases.len(), 2);
+        // Ordering is by installed_at ascending (not semver): the 0.1.0 row
+        // was installed first even though it was upserted second above.
+        assert_eq!(releases[0].version, "0.1.0");
+        assert_eq!(releases[1].version, "0.1.1");
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn component_release_activation_is_exclusive() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.1", 2000))
+            .await
+            .unwrap();
+
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+        assert!(active.active);
+
+        store
+            .set_active_component_release("github", "0.1.1")
+            .await
+            .unwrap();
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.1");
+
+        let releases = store.list_component_releases("github").await.unwrap();
+        let old = releases
+            .iter()
+            .find(|r| r.version == "0.1.0")
+            .expect("0.1.0 must still exist");
+        assert!(
+            !old.active,
+            "activating 0.1.1 must clear 0.1.0's active flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn component_release_set_active_rejects_absent_or_revoked_and_preserves_existing_active()
+    {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.2.0", 2000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        // Absent version: rejected, active state untouched.
+        assert!(store
+            .set_active_component_release("github", "9.9.9")
+            .await
+            .is_err());
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+
+        // Revoked version: rejected, active state untouched.
+        store
+            .mark_component_release_revoked("github", "0.2.0", "supply chain concern")
+            .await
+            .unwrap();
+        assert!(store
+            .set_active_component_release("github", "0.2.0")
+            .await
+            .is_err());
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn component_release_revoke_active_clears_active_and_is_idempotent() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        store
+            .mark_component_release_revoked("github", "0.1.0", "hash mismatch")
+            .await
+            .unwrap();
+        let releases = store.list_component_releases("github").await.unwrap();
+        let rev = &releases[0];
+        assert!(rev.revoked);
+        assert!(!rev.active);
+        assert_eq!(rev.revocation_reason.as_deref(), Some("hash mismatch"));
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Idempotent: revoking again does not error and keeps the reason.
+        store
+            .mark_component_release_revoked("github", "0.1.0", "hash mismatch (re-checked)")
+            .await
+            .unwrap();
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert!(releases[0].revoked);
+        assert_eq!(
+            releases[0].revocation_reason.as_deref(),
+            Some("hash mismatch (re-checked)")
+        );
+    }
+
+    #[tokio::test]
+    async fn component_release_upsert_preserves_active_and_revoked_state_on_metadata_refresh() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .set_active_component_release("github", "0.1.0")
+            .await
+            .unwrap();
+
+        // Refresh metadata (e.g. re-verified source_url/sha256) via upsert.
+        // The record passed in claims active=false, but that must not
+        // clobber the durable active flag set above.
+        let mut refreshed = component_release("github", "0.1.0", 1000);
+        refreshed.source_url = "https://example.test/github/0.1.0-mirror.wasm".into();
+        store.upsert_component_release(&refreshed).await.unwrap();
+
+        let active = store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.version, "0.1.0");
+        assert_eq!(
+            active.source_url,
+            "https://example.test/github/0.1.0-mirror.wasm"
+        );
+    }
+
+    #[tokio::test]
+    async fn component_release_upsert_preserves_revoked_state_on_metadata_refresh() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        store
+            .upsert_component_release(&component_release("github", "0.1.0", 1000))
+            .await
+            .unwrap();
+        store
+            .mark_component_release_revoked("github", "0.1.0", "reason A")
+            .await
+            .unwrap();
+
+        // Refresh metadata (e.g. re-verified source_url/sha256/signing_key_id)
+        // via upsert. installed_at is also bumped as if the caller re-derived
+        // it. None of that should clobber the durable revoked/reason state
+        // set above by mark_component_release_revoked.
+        let mut refreshed = component_release("github", "0.1.0", 2000);
+        refreshed.source_url = "https://example.test/github/0.1.0-mirror.wasm".into();
+        refreshed.sha256 = "sha256-github-0.1.0-mirror".into();
+        refreshed.signing_key_id = "key-2".into();
+        store.upsert_component_release(&refreshed).await.unwrap();
+
+        let releases = store.list_component_releases("github").await.unwrap();
+        assert_eq!(releases.len(), 1);
+        let rec = &releases[0];
+        assert!(rec.revoked);
+        assert!(!rec.active);
+        assert_eq!(rec.revocation_reason.as_deref(), Some("reason A"));
+        assert_eq!(
+            rec.source_url,
+            "https://example.test/github/0.1.0-mirror.wasm"
+        );
+        assert_eq!(rec.sha256, "sha256-github-0.1.0-mirror");
+        assert_eq!(rec.signing_key_id, "key-2");
+        assert!(store
+            .active_component_release("github")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

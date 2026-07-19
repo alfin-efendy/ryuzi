@@ -48,6 +48,9 @@ npm/platform/*/ryuzi
 npm/platform/*/ryuzi.exe
 
 /target
+crates/core/tests/fixtures/**/target/
+crates/core/tests/fixtures/**/Cargo.lock
+crates/core/tests/fixtures/**/wit/deps/
 # Local cargo state stays ignored, but the tracked alias file is real config
 # (`cargo gen-bindings` — see apps/cockpit/src-tauri/Cargo.toml).
 /.cargo/*

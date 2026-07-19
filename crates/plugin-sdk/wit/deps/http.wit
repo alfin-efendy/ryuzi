@@ -1,0 +1,30 @@
+package ryuzi:http@0.1.0;
+
+interface http {
+  record header {
+    name: string,
+    value: string,
+  }
+
+  record http-request {
+    method: string,
+    url: string,
+    headers: list<header>,
+    body: option<list<u8>>,
+  }
+
+  record http-response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  variant http-error {
+    invalid-request(string),
+    rejected,
+    unavailable,
+    failed(string),
+  }
+
+  request: func(request: http-request) -> result<http-response, http-error>;
+}

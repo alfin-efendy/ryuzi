@@ -1,0 +1,19 @@
+package ryuzi:settings@0.1.0;
+
+interface settings {
+  record setting {
+    key: string,
+    value: string,
+    secret: bool,
+  }
+
+  variant settings-error {
+    not-found,
+    invalid(string),
+    unavailable,
+  }
+
+  get: func(key: string) -> result<setting, settings-error>;
+  set: func(value: setting) -> result<setting, settings-error>;
+  remove: func(key: string) -> result<bool, settings-error>;
+}

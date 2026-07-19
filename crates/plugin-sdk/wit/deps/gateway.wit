@@ -1,0 +1,36 @@
+package ryuzi:gateway@0.1.0;
+
+interface gateway {
+  record gateway-event {
+    event-type: string,
+    payload: list<u8>,
+    sequence: u64,
+  }
+
+  record gateway-config {
+    account: string,
+    endpoint: string,
+  }
+
+  record gateway-state {
+    running: bool,
+    detail: string,
+  }
+
+  record gateway-delivery {
+    accepted: bool,
+    sequence: u64,
+  }
+
+  variant gateway-error {
+    invalid-config(string),
+    disconnected,
+    rejected,
+    failed(string),
+  }
+
+  start: func(config: gateway-config) -> result<gateway-state, gateway-error>;
+  stop: func() -> result<gateway-state, gateway-error>;
+  deliver-outbound: func(event: gateway-event) -> result<gateway-delivery, gateway-error>;
+  health-check: func() -> result<gateway-state, gateway-error>;
+}
