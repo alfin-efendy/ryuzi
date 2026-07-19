@@ -352,7 +352,7 @@ test("context ring opens a Context+Cost popover with the run's own values", () =
   expect(screen.getByText("Full window")).toBeTruthy();
 });
 
-test("popover closes via onClose (e.g. outside click / escape) and reopens on re-click", () => {
+test("context ring toggles the popover closed on a second trigger click", () => {
   useStore.setState({
     runContextUsage: {
       [delegationRunKey("local", "s1", "run-1")]: {
@@ -365,6 +365,7 @@ test("popover closes via onClose (e.g. outside click / escape) and reopens on re
         outputTokens: 12,
       },
     },
+    runCost: {},
   });
 
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
@@ -373,6 +374,8 @@ test("popover closes via onClose (e.g. outside click / escape) and reopens on re
   fireEvent.click(trigger);
   expect(screen.getByText("Full window")).toBeTruthy();
 
+  // jsdom never fires the outside-mousedown that MenuPanel listens for, so
+  // this second click only exercises the trigger's own open/close toggle.
   fireEvent.click(trigger);
   expect(screen.queryByText("Full window")).toBeNull();
 });

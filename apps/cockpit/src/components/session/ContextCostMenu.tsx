@@ -12,7 +12,6 @@ export type ContextCostUsage = {
   activeTokens: number;
   usableWindow: number;
   contextWindow: number;
-  percentLeft: number;
   cacheReadTokens: number;
 };
 

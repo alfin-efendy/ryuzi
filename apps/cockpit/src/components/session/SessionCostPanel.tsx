@@ -36,7 +36,6 @@ export function SessionCostPanel({ runnerId, sessionPk }: { runnerId: string; se
             activeTokens: usage.activeTokens,
             usableWindow: usage.usableWindow,
             contextWindow: usage.contextWindow,
-            percentLeft: usage.percentLeft,
             cacheReadTokens: usage.cacheReadTokens,
           }}
           cost={cost}
