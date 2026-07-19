@@ -280,7 +280,17 @@ test("ring reflects the run's own context usage, not the session's", () => {
         outputTokens: 0,
       },
     },
-    runContextUsage: { [delegationRunKey("local", "s1", "run-1")]: { activeTokens: 4000, usableWindow: 120000, percentLeft: 60 } },
+    runContextUsage: {
+      [delegationRunKey("local", "s1", "run-1")]: {
+        activeTokens: 4000,
+        usableWindow: 120000,
+        percentLeft: 60,
+        contextWindow: 200000,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        outputTokens: 0,
+      },
+    },
   });
   render(<AgentRunDetail runnerId="local" sessionPk="s1" run={run()} onRelatedChanges={() => {}} />);
   // Ring shows USED = 100 - percentLeft. Run usage (60 left → 40% used), never the session's (5 left → 95%).

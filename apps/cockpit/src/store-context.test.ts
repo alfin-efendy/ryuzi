@@ -7,7 +7,7 @@ import { delegationRunKey } from "@/store-delegation";
 const key = sessKey(LOCAL_RUNNER, "s1");
 
 beforeEach(() => {
-  useStore.setState({ contextUsage: {}, sessionCost: {}, runContextUsage: {} });
+  useStore.setState({ contextUsage: {}, sessionCost: {}, runContextUsage: {}, runCost: {} });
 });
 
 test("contextUsage keeps window + cache + output fields", () => {
@@ -62,6 +62,9 @@ test("agentRunContextUsage stores per-run usage without touching session usage",
       context_window: 200_000,
       usable_window: 120_000,
       percent_left: 60,
+      cache_read_tokens: 800,
+      cache_creation_tokens: 100,
+      output_tokens: 256,
     } as CoreEvent,
     LOCAL_RUNNER,
   );
@@ -69,9 +72,58 @@ test("agentRunContextUsage stores per-run usage without touching session usage",
     activeTokens: 4_000,
     usableWindow: 120_000,
     percentLeft: 60,
+    contextWindow: 200_000,
+    cacheReadTokens: 800,
+    cacheCreationTokens: 100,
+    outputTokens: 256,
   });
   // The session-level ring must NOT be affected by a run-scoped event.
   expect(useStore.getState().contextUsage[key]).toBeUndefined();
+});
+
+test("agentRunCost stores per-run priced breakdown keyed by run", () => {
+  useStore.getState().applyCoreEvent(
+    {
+      kind: "agentRunCost",
+      session_pk: "s1",
+      run_id: "r1",
+      total_usd: 0.5,
+      models: [{ model: "claude-opus-4-8", input: 10, output: 4, cacheRead: 2, cacheCreation: 1, usd: 0.5 }],
+    } as never,
+    "runner1",
+  );
+  const key = "runner1:s1:r1";
+  expect(useStore.getState().runCost[key]).toEqual({
+    totalUsd: 0.5,
+    models: [{ model: "claude-opus-4-8", input: 10, output: 4, cacheRead: 2, cacheCreation: 1, usd: 0.5 }],
+  });
+});
+
+test("agentRunContextUsage keeps full window + cache fields", () => {
+  useStore.getState().applyCoreEvent(
+    {
+      kind: "agentRunContextUsage",
+      session_pk: "s1",
+      run_id: "r1",
+      active_tokens: 100,
+      context_window: 1000,
+      usable_window: 900,
+      percent_left: 40,
+      cache_read_tokens: 30,
+      cache_creation_tokens: 4,
+      output_tokens: 12,
+    } as never,
+    "runner1",
+  );
+  expect(useStore.getState().runContextUsage["runner1:s1:r1"]).toEqual({
+    activeTokens: 100,
+    usableWindow: 900,
+    percentLeft: 40,
+    contextWindow: 1000,
+    cacheReadTokens: 30,
+    cacheCreationTokens: 4,
+    outputTokens: 12,
+  });
 });
 
 test("contextCompacted is a safe no-op for store state", () => {
