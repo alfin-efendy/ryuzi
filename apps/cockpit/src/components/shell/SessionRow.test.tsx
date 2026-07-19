@@ -54,11 +54,6 @@ test("pin button reflects isPinned and calls onTogglePin", () => {
   expect(toggled).toBe(1);
 });
 
-test("dragHandle renders when provided", () => {
-  render(<SessionRow {...base} dragHandle={<span data-testid="grip" />} />);
-  expect(screen.getByTestId("grip")).toBeTruthy();
-});
-
 test("shows a spinner only while running", () => {
   const { rerender } = render(<SessionRow {...base} session={{ ...base.session, status: "running" }} />);
   expect(screen.getByTestId("running-spinner-s1")).toBeTruthy();

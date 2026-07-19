@@ -124,6 +124,34 @@ export function archivedCount(sessions: UiSession[], projectId: string, archived
   return sessions.filter((s) => s.projectId === projectId && archived[sessionKey(s)]).length;
 }
 
+/** Most recent activity timestamp (ms) for a project: the newest session
+ *  last-active/created across its tasks, falling back to the project's own
+ *  createdAt, or 0 when nothing is known. Pure — used to sort/label the
+ *  Projects view without touching the store. */
+export function projectUpdatedAt(project: Pick<Project, "projectId" | "createdAt">, sessions: UiSession[]): number {
+  let latest = project.createdAt ?? 0;
+  for (const s of sessions) {
+    if (s.projectId !== project.projectId) continue;
+    latest = Math.max(latest, s.lastActive ?? 0, s.createdAt ?? 0);
+  }
+  return latest;
+}
+
+/** Compact relative time ("now", "5m", "23h", "3d", "2w") for the Projects
+ *  view's Updated column. 0/absent renders as an em dash. Pure. */
+export function relativeShort(ms: number, now: number = Date.now()): string {
+  if (!ms) return "—";
+  const delta = Math.max(0, now - ms);
+  const mins = Math.floor(delta / 60_000);
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d`;
+  return `${Math.floor(days / 7)}w`;
+}
+
 /** A session has unseen activity iff its last-active timestamp is newer than
  *  the stored read cursor. Absent cursor → not unread (seeded on first sight);
  *  the currently-focused session is never unread — you are looking at it. */

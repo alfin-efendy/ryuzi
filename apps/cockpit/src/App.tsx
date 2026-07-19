@@ -20,6 +20,7 @@ import { JobDetailView } from "./views/JobDetailView";
 import { JobNewView } from "./views/JobNewView";
 import { PluginsView } from "./views/PluginsView";
 import { AppDetailView } from "./views/AppDetailView";
+import { ProjectsView } from "./views/ProjectsView";
 import { GatewaysView } from "./views/GatewaysView";
 import { GatewayDetailView } from "./views/GatewayDetailView";
 import { PluginDetailView } from "./views/PluginDetailView";
@@ -53,6 +54,8 @@ function MainView() {
       return <PluginsView />;
     case "appDetail":
       return <AppDetailView id={view.id} />;
+    case "projects":
+      return <ProjectsView />;
     case "gateways":
       return <GatewaysView />;
     case "gatewayDetail":

@@ -1,6 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import type { Project } from "../bindings";
-import { archivedCount, dropTarget, isUnreadVisible, orderProjects, orderTasks, reorder, sessionTitle, visibleTasks } from "./sidebar";
+import {
+  archivedCount,
+  dropTarget,
+  isUnreadVisible,
+  orderProjects,
+  orderTasks,
+  projectUpdatedAt,
+  relativeShort,
+  reorder,
+  sessionTitle,
+  visibleTasks,
+} from "./sidebar";
 import { LOCAL_RUNNER, sessKey, type UiSession } from "./session-key";
 
 function sess(pk: string, projectId: string, title: string | null, lastActive = 0): UiSession {
@@ -192,5 +203,32 @@ describe("orderTasks", () => {
       "c",
       "a",
     ]);
+  });
+});
+
+describe("projectUpdatedAt", () => {
+  test("takes the newest lastActive/createdAt across the project's sessions", () => {
+    const rows = [sess("a", "p1", "x", 10), sess("b", "p1", "y", 30), sess("c", "p2", "z", 99)];
+    expect(projectUpdatedAt({ projectId: "p1", createdAt: 5 }, rows)).toBe(30);
+  });
+  test("falls back to the project's own createdAt when it has no sessions", () => {
+    expect(projectUpdatedAt({ projectId: "empty", createdAt: 42 }, [])).toBe(42);
+  });
+  test("is 0 when nothing is known", () => {
+    expect(projectUpdatedAt({ projectId: "empty", createdAt: null }, [])).toBe(0);
+  });
+});
+
+describe("relativeShort", () => {
+  const now = 1_000_000_000_000;
+  test("renders an em dash for absent/zero timestamps", () => {
+    expect(relativeShort(0, now)).toBe("—");
+  });
+  test("renders compact units", () => {
+    expect(relativeShort(now - 30_000, now)).toBe("now");
+    expect(relativeShort(now - 5 * 60_000, now)).toBe("5m");
+    expect(relativeShort(now - 23 * 3_600_000, now)).toBe("23h");
+    expect(relativeShort(now - 3 * 86_400_000, now)).toBe("3d");
+    expect(relativeShort(now - 14 * 86_400_000, now)).toBe("2w");
   });
 });

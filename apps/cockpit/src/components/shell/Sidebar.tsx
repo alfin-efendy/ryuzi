@@ -300,7 +300,7 @@ export function Sidebar() {
   // Shared row-prop builder for every task-row render site (top Tasks bucket,
   // By-Project nested lists) so the three paths can't drift on click/pin/
   // archive wiring. `hasTail`/`showGuide` are the only per-site variance.
-  const makeRowProps = (s: UiSession, opts: { hasTail: boolean; showGuide?: boolean }): Omit<SessionRowProps, "dragHandle"> => {
+  const makeRowProps = (s: UiSession, opts: { hasTail: boolean; showGuide?: boolean }): SessionRowProps => {
     const key = sessionKey(s);
     return {
       session: s,
@@ -331,9 +331,18 @@ export function Sidebar() {
       className="flex min-h-0 shrink-0 flex-col overflow-hidden bg-transparent text-sidebar-foreground transition-[width] duration-200"
       style={{ width: nav.sidebarOpen ? 260 : 0 }}
     >
-      {/* Primary navigation */}
-      <div className="box-border flex w-[260px] flex-col gap-[2px] px-2.5 pb-1 pt-3">
-        {NAV.map((item) => {
+      {/* Primary navigation. In By-Task mode the sidebar no longer nests a
+          Projects tree, so a "Projects" entry is spliced in right after
+          "New Task" and routes to the full-page project browser. */}
+      <div className="box-border flex w-[260px] flex-col gap-[3px] px-3 pb-2 pt-3">
+        {(organizeBy === "task"
+          ? [
+              NAV[0],
+              { label: "Projects", icon: Folder, view: { kind: "projects" } as View, group: ["projects"] as View["kind"][] },
+              ...NAV.slice(1),
+            ]
+          : NAV
+        ).map((item, i) => {
           const active = item.group.includes(view.kind);
           const Icon = item.icon;
           return (
@@ -342,9 +351,21 @@ export function Sidebar() {
               type="button"
               variant="ghost"
               onClick={() => nav.navigate(item.view)}
-              className={`h-auto w-full justify-start gap-2.5 rounded-md py-[7px] text-left text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${active ? "bg-sidebar-accent" : ""}`}
+              className={`sidebar-item-enter group/nav relative h-auto w-full justify-start gap-2.5 rounded-md py-[6px] pl-2 pr-2.5 text-left text-[13px] font-medium tracking-[-0.006em] text-sidebar-foreground transition-all duration-150 ease-out hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${active ? "bg-sidebar-accent" : "text-sidebar-foreground/85"}`}
+              style={{ animationDelay: `${i * 25}ms` }}
             >
-              <Icon aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
+              {active && (
+                <span
+                  aria-hidden
+                  className="absolute left-0 top-1/2 h-[15px] w-[2.5px] -translate-y-1/2 rounded-full bg-primary transition-all duration-200 ease-out"
+                />
+              )}
+              <Icon
+                aria-hidden
+                size={15}
+                strokeWidth={2}
+                className={`size-[15px] shrink-0 transition-transform duration-150 ease-out group-hover/nav:scale-[1.04] ${active ? "text-sidebar-foreground" : "text-muted-foreground"}`}
+              />
               {item.label}
               {item.view.kind === "inbox" && pendingCount > 0 && (
                 <Badge variant="secondary" className="ml-auto h-4 min-w-4 px-1 text-[10px]">
@@ -360,87 +381,71 @@ export function Sidebar() {
           (project tasks nest under their project); By Task it holds every task,
           flat. Rendered as guide-less SessionRows apart from the project tree. */}
       {taskList.length > 0 && (
-        <div className="box-border flex w-[260px] flex-col gap-px px-2.5">
-          <div className="flex items-center gap-[2px] py-2 pl-2.5 pr-1.5">
-            <div className="relative flex flex-1 items-center gap-[2px]">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                className={iconBtn}
-                title={collapsed[TASKS_BUCKET] ? "Expand Tasks" : "Collapse Tasks"}
-                onClick={() => toggleCollapsed(TASKS_BUCKET)}
-              >
-                <ChevronDown
-                  aria-hidden
-                  size={14}
-                  strokeWidth={2}
-                  className={`size-[14px] transition-transform ${collapsed[TASKS_BUCKET] ? "-rotate-90" : ""}`}
-                />
-              </Button>
-              <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Tasks</span>
-              <span className="relative">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className={iconBtn}
-                  title="Sort and organize"
-                  onClick={() => setTasksMenuOpen((v) => !v)}
-                >
-                  <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
-                </Button>
-              </span>
-              <OrganizeMenu
-                open={tasksMenuOpen}
-                onClose={() => setTasksMenuOpen(false)}
-                organizeBy={organizeBy}
-                setOrganizeBy={setOrganizeBy}
-                ordering={taskOrdering}
-                setOrdering={setTaskOrdering}
-                className="left-2.5 top-8 z-[70] w-[238px]"
+        <div className={`box-border flex w-[260px] flex-col gap-px px-3 ${organizeBy === "task" ? "min-h-0 flex-1 overflow-y-auto" : ""}`}>
+          <div className="relative flex items-center gap-1 pb-1 pl-2 pr-0.5 pt-3">
+            <span className="flex-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">Tasks</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              className={iconBtn}
+              title="Sort and organize"
+              onClick={() => setTasksMenuOpen((v) => !v)}
+            >
+              <ListFilter aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              className={iconBtn}
+              title={collapsed[TASKS_BUCKET] ? "Expand Tasks" : "Collapse Tasks"}
+              onClick={() => toggleCollapsed(TASKS_BUCKET)}
+            >
+              <ChevronDown
+                aria-hidden
+                size={13}
+                strokeWidth={2}
+                className={`size-[13px] transition-transform duration-200 [transition-timing-function:cubic-bezier(0.34,1.56,0.64,1)] ${collapsed[TASKS_BUCKET] ? "-rotate-90" : ""}`}
               />
-            </div>
+            </Button>
+            <OrganizeMenu
+              open={tasksMenuOpen}
+              onClose={() => setTasksMenuOpen(false)}
+              organizeBy={organizeBy}
+              setOrganizeBy={setOrganizeBy}
+              ordering={taskOrdering}
+              setOrdering={setTaskOrdering}
+              className="right-2 top-8 z-[70] w-[238px]"
+            />
           </div>
           {!collapsed[TASKS_BUCKET] && (
-            <DndContext
-              sensors={sensors}
-              collisionDetection={closestCenter}
-              modifiers={[restrictToVerticalAxis]}
-              onDragEnd={onTaskDragEnd(
-                TASKS_BUCKET,
-                taskList.map((s) => sessionKey(s)),
-              )}
-            >
-              <SortableContext items={taskList.map((s) => sessionKey(s))} strategy={verticalListSortingStrategy}>
-                {taskList.map((s) => (
-                  <SortableSessionRow key={sessionKey(s)} {...makeRowProps(s, { hasTail: false, showGuide: false })} />
-                ))}
-              </SortableContext>
-            </DndContext>
+            <div className="sidebar-section-enter">
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToVerticalAxis]}
+                onDragEnd={onTaskDragEnd(
+                  TASKS_BUCKET,
+                  taskList.map((s) => sessionKey(s)),
+                )}
+              >
+                <SortableContext items={taskList.map((s) => sessionKey(s))} strategy={verticalListSortingStrategy}>
+                  {taskList.map((s) => (
+                    <SortableSessionRow key={sessionKey(s)} {...makeRowProps(s, { hasTail: false, showGuide: false })} />
+                  ))}
+                </SortableContext>
+              </DndContext>
+            </div>
           )}
         </div>
       )}
 
-      {/* Projects header */}
-      <div className="relative box-border flex w-[260px] items-center gap-[2px] py-3 pl-2.5 pr-3">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          className={iconBtn}
-          title={collapsed[PROJECTS_SECTION] ? "Expand Projects" : "Collapse Projects"}
-          onClick={() => toggleCollapsed(PROJECTS_SECTION)}
-        >
-          <ChevronDown
-            aria-hidden
-            size={14}
-            strokeWidth={2}
-            className={`size-[14px] transition-transform ${collapsed[PROJECTS_SECTION] ? "-rotate-90" : ""}`}
-          />
-        </Button>
-        <span className="flex-1 text-[11px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">Projects</span>
-        <span className="relative">
+      {/* Projects header — only in By-Project mode. In By-Task mode the nav's
+          "Projects" entry replaces this whole section. */}
+      {organizeBy === "project" && (
+        <div className="relative box-border flex w-[260px] items-center gap-1 px-3 pb-1 pl-5 pt-3">
+          <span className="flex-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">Projects</span>
           <Button
             type="button"
             variant="ghost"
@@ -449,75 +454,61 @@ export function Sidebar() {
             title="Sort and organize"
             onClick={() => setProjectsMenuOpen((v) => !v)}
           >
-            <ListFilter aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
+            <ListFilter aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
           </Button>
-        </span>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          className={iconBtn}
-          title="New project"
-          onClick={() => setAddProjectOpen(true)}
-        >
-          <FolderPlus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
-        </Button>
-
-        <OrganizeMenu
-          open={projectsMenuOpen}
-          onClose={() => setProjectsMenuOpen(false)}
-          organizeBy={organizeBy}
-          setOrganizeBy={setOrganizeBy}
-          ordering={projectOrdering}
-          setOrdering={setProjectOrdering}
-          className="left-2.5 top-8 z-[70] w-[238px]"
-        />
-      </div>
-
-      {/* Projects — a flat navigable list (By Task) or the nested task tree
-          (By Project). The whole section collapses via the header chevron. */}
-      <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2.5">
-        {!collapsed[PROJECTS_SECTION] && (
-          <DndContext
-            sensors={sensors}
-            collisionDetection={closestCenter}
-            modifiers={[restrictToVerticalAxis]}
-            onDragEnd={onProjectDragEnd(projList.map((p) => p.projectId))}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className={iconBtn}
+            title="New project"
+            onClick={() => setAddProjectOpen(true)}
           >
-            <SortableContext items={projList.map((p) => p.projectId)} strategy={verticalListSortingStrategy}>
-              {organizeBy === "task"
-                ? projList.map((p) => (
-                    <SortableProjectRow key={p.projectId} id={p.projectId}>
-                      {(dragHandle) => (
-                        <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
-                          {dragHandle}
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
-                            onClick={() => nav.setProjectSettingsFor(p.projectId)}
-                          >
-                            <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
-                            <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            title="New task"
-                            className={`${iconBtn} hidden group-hover:flex`}
-                            onClick={() => {
-                              selectProject(p.projectId);
-                              nav.navigate({ kind: "home" });
-                            }}
-                          >
-                            <Plus aria-hidden size={14} strokeWidth={2} className="size-[14px]" />
-                          </Button>
-                        </div>
-                      )}
-                    </SortableProjectRow>
-                  ))
-                : projList.map((p) => {
+            <FolderPlus aria-hidden size={13} strokeWidth={2} className="size-[13px]" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className={iconBtn}
+            title={collapsed[PROJECTS_SECTION] ? "Expand Projects" : "Collapse Projects"}
+            onClick={() => toggleCollapsed(PROJECTS_SECTION)}
+          >
+            <ChevronDown
+              aria-hidden
+              size={13}
+              strokeWidth={2}
+              className={`size-[13px] transition-transform duration-200 [transition-timing-function:cubic-bezier(0.34,1.56,0.64,1)] ${collapsed[PROJECTS_SECTION] ? "-rotate-90" : ""}`}
+            />
+          </Button>
+
+          <OrganizeMenu
+            open={projectsMenuOpen}
+            onClose={() => setProjectsMenuOpen(false)}
+            organizeBy={organizeBy}
+            setOrganizeBy={setOrganizeBy}
+            ordering={projectOrdering}
+            setOrdering={setProjectOrdering}
+            className="right-2 top-8 z-[70] w-[238px]"
+          />
+        </div>
+      )}
+
+      {/* Projects — the nested task tree, By-Project only. In By-Task mode the
+          Tasks (Chats) section above already holds every task flat and this
+          section is gone; a full-page Projects view lives behind the nav entry. */}
+      {organizeBy === "project" && (
+        <div className="box-border flex w-[260px] min-h-0 flex-1 flex-col gap-px overflow-y-auto px-3">
+          {!collapsed[PROJECTS_SECTION] && (
+            <div className="sidebar-section-enter">
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToVerticalAxis]}
+                onDragEnd={onProjectDragEnd(projList.map((p) => p.projectId))}
+              >
+                <SortableContext items={projList.map((p) => p.projectId)} strategy={verticalListSortingStrategy}>
+                  {projList.map((p) => {
                     const showArch = !!showArchived[p.projectId];
                     const sess = orderTasks(
                       visibleTasks(sessions, { projectId: p.projectId }, q, showArch, archived),
@@ -531,13 +522,12 @@ export function Sidebar() {
                     return (
                       <div key={p.projectId} className="flex flex-col gap-px">
                         <SortableProjectRow id={p.projectId}>
-                          {(dragHandle) => (
-                            <div className="group flex items-center gap-1.5 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground hover:bg-sidebar-accent">
-                              {dragHandle}
+                          {() => (
+                            <div className="group flex items-center gap-2 rounded-md py-1.5 pl-2 pr-1.5 text-sidebar-foreground transition-colors duration-150 ease-out hover:bg-sidebar-accent">
                               <Button
                                 type="button"
                                 variant="ghost"
-                                className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
+                                className="h-auto min-w-0 flex-1 justify-start gap-2 p-0 text-left text-[13px] text-sidebar-foreground hover:bg-transparent hover:text-sidebar-foreground dark:hover:bg-transparent"
                                 onClick={() => toggleCollapsed(p.projectId)}
                               >
                                 {open ? (
@@ -545,10 +535,15 @@ export function Sidebar() {
                                     aria-hidden
                                     size={14}
                                     strokeWidth={2}
-                                    className="size-[14px] shrink-0 text-muted-foreground"
+                                    className="size-[14px] shrink-0 text-muted-foreground transition-transform duration-200 [transition-timing-function:cubic-bezier(0.34,1.56,0.64,1)] group-hover:scale-[1.06]"
                                   />
                                 ) : (
-                                  <Folder aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
+                                  <Folder
+                                    aria-hidden
+                                    size={14}
+                                    strokeWidth={2}
+                                    className="size-[14px] shrink-0 text-muted-foreground transition-transform duration-200 [transition-timing-function:cubic-bezier(0.34,1.56,0.64,1)] group-hover:scale-[1.06]"
+                                  />
                                 )}
                                 <span className="min-w-0 flex-1 truncate font-semibold">{projectLabel(p)}</span>
                               </Button>
@@ -616,18 +611,20 @@ export function Sidebar() {
                       </div>
                     );
                   })}
-            </SortableContext>
-          </DndContext>
-        )}
-      </div>
+                </SortableContext>
+              </DndContext>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Workspace / gateway switcher */}
-      <div className="relative box-border w-[260px] shrink-0 px-2.5 py-2">
+      <div className="relative box-border w-[260px] shrink-0 px-3 py-2 pt-1">
         <Button
           type="button"
           variant="ghost"
           onClick={() => setWorkspaceMenuOpen((v) => !v)}
-          className={`h-auto w-full justify-start gap-2.5 rounded-md py-2 text-left text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${workspaceMenuOpen ? "bg-sidebar-accent" : ""}`}
+          className={`h-auto w-full justify-start gap-2.5 rounded-md py-2 pl-2 text-left text-sidebar-foreground transition-colors duration-150 ease-out hover:bg-sidebar-accent hover:text-sidebar-foreground dark:hover:bg-sidebar-accent ${workspaceMenuOpen ? "bg-sidebar-accent" : ""}`}
         >
           <span className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-sidebar-border text-muted-foreground [background:color-mix(in_oklab,var(--sidebar-accent)_90%,transparent)]">
             <Server aria-hidden size={15} strokeWidth={2} className="size-[15px]" />
@@ -637,8 +634,8 @@ export function Sidebar() {
             />
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block text-[10px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">Workspace</span>
-            <span className="block truncate font-semibold">{ws?.name ?? "This PC"}</span>
+            <span className="block text-[9.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">Workspace</span>
+            <span className="block truncate text-[13px] font-semibold tracking-[-0.006em]">{ws?.name ?? "This PC"}</span>
           </span>
           <ChevronsUpDown aria-hidden size={14} strokeWidth={2} className="size-[14px] shrink-0 text-muted-foreground" />
         </Button>

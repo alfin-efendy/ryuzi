@@ -219,7 +219,7 @@ test("Organize menu switches By Project / By Task and offers Manual Order; no St
   expect(screen.queryByText("Mark all as read")).toBeNull();
 });
 
-test("By Task mode shows all tasks flat and a Projects section without nested tasks", () => {
+test("By Task mode shows all tasks flat and replaces the Projects tree with a Projects nav entry", () => {
   useUi.setState({ organizeBy: "task", collapsed: {} });
   useStore.setState({
     projects: [project],
@@ -234,9 +234,10 @@ test("By Task mode shows all tasks flat and a Projects section without nested ta
   // both tasks appear in the flat Tasks list
   expect(screen.getByText("chat task")).toBeTruthy();
   expect(screen.getByText("project task")).toBeTruthy();
-  // Projects section still lists the project for navigation
-  expect(screen.getByText("Ryuzi")).toBeTruthy();
-  // …but flat (no nested per-project tree, so no per-project settings gear).
+  // a "Projects" nav entry replaces the in-sidebar Projects tree
+  expect(screen.getByRole("button", { name: "Projects" })).toBeTruthy();
+  // …and the project tree itself is gone (no project row, no settings gear).
+  expect(screen.queryByText("Ryuzi")).toBeNull();
   expect(screen.queryByTitle("Project settings")).toBeNull();
 });
 
