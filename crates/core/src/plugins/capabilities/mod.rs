@@ -14,6 +14,9 @@
 //!   impossible (see `settings`'s module doc for the exact convention).
 //! - [`storage`] — `ryuzi:storage/storage`: a plugin's own key/value rows in
 //!   `component_plugin_storage`, scoped by `plugin_id` at the `Store` layer.
+//! - [`oauth`] — host-side OAuth profile logic (Task 8 slice 2a): builds PKCE
+//!   authorize URLs and injects a stored bearer token into outbound
+//!   requests, but never hands the raw access/refresh token to a component.
 //!
 //! [`PluginCapabilityContext`] is the one value every adapter borrows from —
 //! it identifies which plugin is calling and gives access to the shared
@@ -21,6 +24,7 @@
 
 pub mod host;
 pub mod http;
+pub mod oauth;
 pub mod settings;
 pub mod storage;
 pub mod wit_bindings;

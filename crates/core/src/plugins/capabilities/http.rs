@@ -121,6 +121,38 @@ impl AllowedHttpClient {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<SafeHttpResponse, HttpErr> {
+        self.request_impl(method, url, headers, body, None).await
+    }
+
+    /// Host-trusted variant of [`Self::request`] for capability adapters
+    /// (see `capabilities::oauth`) that must inject a bearer token a
+    /// component itself must never see or forge. Any component-supplied
+    /// `Authorization` header is stripped first (the same
+    /// `STRIPPED_REQUEST_HEADERS` pass `request` uses), and only *then* is
+    /// `Authorization: Bearer <bearer>` added — last, and unconditionally —
+    /// so a component cannot smuggle its own `Authorization` header past the
+    /// strip by any ordering trick; the host's bearer always wins and is the
+    /// only `Authorization` value that can ever reach the wire.
+    pub async fn request_with_bearer(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+        bearer: &str,
+    ) -> Result<SafeHttpResponse, HttpErr> {
+        self.request_impl(method, url, headers, body, Some(bearer))
+            .await
+    }
+
+    async fn request_impl(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+        bearer: Option<&str>,
+    ) -> Result<SafeHttpResponse, HttpErr> {
         let mut current_url =
             url::Url::parse(url).map_err(|error| HttpErr::InvalidRequest(error.to_string()))?;
         let mut current_method = method.to_string();
@@ -143,6 +175,10 @@ impl AllowedHttpClient {
                     continue;
                 }
                 builder = builder.header(name, value);
+            }
+            if let Some(bearer) = bearer {
+                builder =
+                    builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
             }
             if let Some(bytes) = current_body.clone() {
                 builder = builder.body(bytes);

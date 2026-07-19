@@ -1612,6 +1612,34 @@ fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (plugin_id, key)\
             );",
         ),
+        // 49: profile-keyed OAuth token/client storage for WASM component
+        // plugins (Task 8 slice 2a). A bundle may declare more than one
+        // `[[oauth]]` profile (e.g. a connector talking to two different
+        // OAuth-protected APIs), so the token/client cache must be keyed by
+        // `(plugin_id, profile_id)`, not just `plugin_id`. These are NEW
+        // tables, deliberately separate from `plugin_oauth_tokens`/
+        // `plugin_oauth_clients` (migrations 16/18/19): those two remain
+        // untouched — `plugins/declarative.rs` still reads/writes them for
+        // the single-token-per-plugin flow, and rewriting their primary key
+        // in place would be needless SQLite surgery for no shared caller.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS plugin_oauth_profile_tokens (\
+                plugin_id TEXT NOT NULL,\
+                profile_id TEXT NOT NULL,\
+                token_json TEXT NOT NULL,\
+                updated_at INTEGER NOT NULL,\
+                PRIMARY KEY (plugin_id, profile_id)\
+            );\
+            CREATE TABLE IF NOT EXISTS plugin_oauth_profile_clients (\
+                plugin_id TEXT NOT NULL,\
+                profile_id TEXT NOT NULL,\
+                authorize_url TEXT,\
+                token_url TEXT,\
+                client_id TEXT,\
+                updated_at INTEGER NOT NULL,\
+                PRIMARY KEY (plugin_id, profile_id)\
+            );",
+        ),
     ])
 }
 
@@ -1949,6 +1977,19 @@ fn decode_plugin_oauth_token(plugin_id: &str, raw: &str) -> anyhow::Result<Plugi
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginOauthClient {
     pub plugin_id: String,
+    pub authorize_url: Option<String>,
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+}
+
+/// One row per `(plugin_id, profile_id)` in `plugin_oauth_profile_clients` —
+/// the profile-keyed counterpart of [`PluginOauthClient`] for bundles that
+/// declare more than one `[[oauth]]` profile (Task 8 slice 2a). Same
+/// column-merge upsert semantics as `upsert_plugin_oauth_client`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginOauthProfileClient {
+    pub plugin_id: String,
+    pub profile_id: String,
     pub authorize_url: Option<String>,
     pub token_url: Option<String>,
     pub client_id: Option<String>,
@@ -4587,6 +4628,207 @@ impl Store {
         .await
     }
 
+    /// Profile-keyed counterpart of [`Store::upsert_plugin_oauth_token`] —
+    /// see the `plugin_oauth_profile_tokens` migration doc (49) for why this
+    /// is a separate table rather than a schema change to the existing one.
+    /// Reuses the same encrypt-on-write helper
+    /// (`upsert_plugin_oauth_token_json`) so encryption at rest is identical
+    /// between the single-token and profile-token paths.
+    pub async fn upsert_plugin_oauth_profile_token(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+        token: &PluginOauthToken,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        let token = token.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let existing: Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![&plugin_id, &profile_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let token_json = upsert_plugin_oauth_token_json(existing.as_deref(), &token)
+                .map_err(to_sql_json_error)?;
+            c.execute(
+                "INSERT INTO plugin_oauth_profile_tokens(plugin_id, profile_id, token_json, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(plugin_id, profile_id) DO UPDATE SET \
+                   token_json=excluded.token_json, \
+                   updated_at=excluded.updated_at",
+                params![plugin_id, profile_id, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Profile-keyed counterpart of [`Store::get_plugin_oauth_token`]. Rows
+    /// are isolated per `(plugin_id, profile_id)`: a different plugin id or
+    /// a different profile id within the same plugin never sees another
+    /// profile's token.
+    pub async fn get_plugin_oauth_profile_token(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<Option<PluginOauthToken>> {
+        let plugin_id_owned = plugin_id.to_string();
+        let profile_id_owned = profile_id.to_string();
+        let raw: Option<String> = self
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![plugin_id_owned, profile_id_owned],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        raw.map(|raw| decode_plugin_oauth_token(plugin_id, &raw))
+            .transpose()
+    }
+
+    /// Profile-keyed counterpart of
+    /// [`Store::mark_plugin_oauth_reconnect_required`].
+    pub async fn mark_plugin_oauth_profile_reconnect_required(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            let Some(raw): Option<String> = c
+                .query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![&plugin_id, &profile_id],
+                    |r| r.get(0),
+                )
+                .optional()?
+            else {
+                return Ok(());
+            };
+            let mut token = decode_plugin_oauth_token(&plugin_id, &raw)
+                .map_err(|err| from_sql_json_error(0, err))?;
+            token.reconnect_required = true;
+            let token_json =
+                upsert_plugin_oauth_token_json(Some(&raw), &token).map_err(to_sql_json_error)?;
+            c.execute(
+                "UPDATE plugin_oauth_profile_tokens SET token_json=?3, updated_at=?4 \
+                 WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id, token_json, updated_at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Profile-keyed counterpart of [`Store::delete_plugin_oauth_token`].
+    /// Deletes only the `(plugin_id, profile_id)` row; other profiles for
+    /// the same plugin (or the same profile id under a different plugin)
+    /// are untouched.
+    pub async fn delete_plugin_oauth_profile_token(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_oauth_profile_tokens WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Profile-keyed counterpart of [`Store::upsert_plugin_oauth_client`]:
+    /// same column-merge semantics (`Some` overwrites, `None` preserves),
+    /// keyed by `(plugin_id, profile_id)`.
+    pub async fn upsert_plugin_oauth_profile_client(
+        &self,
+        client: &PluginOauthProfileClient,
+    ) -> anyhow::Result<()> {
+        let client = client.clone();
+        let updated_at = now_ms();
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO plugin_oauth_profile_clients(\
+                     plugin_id, profile_id, authorize_url, token_url, client_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(plugin_id, profile_id) DO UPDATE SET \
+                   authorize_url=COALESCE(excluded.authorize_url, plugin_oauth_profile_clients.authorize_url), \
+                   token_url=COALESCE(excluded.token_url, plugin_oauth_profile_clients.token_url), \
+                   client_id=COALESCE(excluded.client_id, plugin_oauth_profile_clients.client_id), \
+                   updated_at=excluded.updated_at",
+                params![
+                    client.plugin_id,
+                    client.profile_id,
+                    client.authorize_url,
+                    client.token_url,
+                    client.client_id,
+                    updated_at
+                ],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn get_plugin_oauth_profile_client(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<Option<PluginOauthProfileClient>> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.with_conn(move |c| {
+            c.query_row(
+                "SELECT plugin_id, profile_id, authorize_url, token_url, client_id \
+                 FROM plugin_oauth_profile_clients WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id],
+                |r| {
+                    Ok(PluginOauthProfileClient {
+                        plugin_id: r.get(0)?,
+                        profile_id: r.get(1)?,
+                        authorize_url: r.get(2)?,
+                        token_url: r.get(3)?,
+                        client_id: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn delete_plugin_oauth_profile_client(
+        &self,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM plugin_oauth_profile_clients WHERE plugin_id=?1 AND profile_id=?2",
+                params![plugin_id, profile_id],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
     pub async fn upsert_plugin_install(&self, rec: &PluginInstallRecord) -> anyhow::Result<()> {
         let rec = rec.clone();
         self.with_conn(move |c| {
@@ -6440,8 +6682,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);        assert_eq!(
-            ownership_columns,
+        assert_eq!(user_version, 46);        assert_eq!(            ownership_columns,
             ["primary_agent_id", "primary_agent_snapshot"]
         );
         assert_eq!(agent_run_tables, ["agent_run_messages", "agent_runs"]);
@@ -6759,15 +7000,13 @@ mod tests {
                 .unwrap();
         assert_eq!(linkage, (None, None));
         assert!(has_index, "migration 40 must add the dispatch lookup index");
-        assert_eq!(user_version, 46);
-        drop(upgraded);
+        assert_eq!(user_version, 46);        drop(upgraded);
         let reopened = Store::open(tmp.path()).await.unwrap();
         let reopened_version: i64 = reopened
             .with_conn(|c| c.query_row("PRAGMA user_version", [], |row| row.get(0)))
             .await
             .unwrap();
         assert_eq!(reopened_version, 46);    }
-
     #[tokio::test]
     async fn migration_41_removes_session_wide_tool_call_uniqueness() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -6786,8 +7025,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(user_version, 46);        assert!(
-            !has_unique_tool_call_index,
+        assert_eq!(user_version, 46);        assert!(            !has_unique_tool_call_index,
             "tool call IDs must be reusable by separate agent runs"
         );
     }
@@ -6830,7 +7068,6 @@ mod tests {
         assert!(queue_table, "v37 must restore the prompt queue table");
         assert!(queue_index, "v37 must restore the prompt queue index");
         assert_eq!(user_version, 46);    }
-
     #[tokio::test]
     async fn concurrent_permission_update_preserves_atomic_model_effort() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -8720,7 +8957,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(user_version, 46, "forward migration must land at v46");    }
-
     #[tokio::test]
     async fn migration_30_adds_audit_session_and_origin_columns() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -9464,8 +9700,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 34)        };
-        {
+            c.pragma_update(None, "user_version", v - 34)        };        {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
@@ -9521,16 +9756,14 @@ mod tests {
         // Simulate a v20 (pre-native-only) DB: open a fully migrated store,
         // wind user_version back, and reopen so 21 (and the tail migrations
         // 22–46) replay against it. Back TWENTY-SIX: the fully migrated tail
-        // is now v46, so rewinding to v20 is what makes        // migration 21 (native-only) replay.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // is now v46, so rewinding to v20 is what makes        // migration 21 (native-only) replay.        let tmp = tempfile::NamedTempFile::new().unwrap();
         // Replaying from v20 also crosses migration 29's `ALTER TABLE
         // orch_tasks ADD COLUMN ...` hook, but migration 39 already dropped
         // orch_tasks in this fully-migrated store. The hook must therefore
         // no-op instead of altering a legacy table that no longer exists.
         let rewind = |c: &mut rusqlite::Connection| -> rusqlite::Result<()> {
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            c.pragma_update(None, "user_version", v - 26)        };
-        {
+            c.pragma_update(None, "user_version", v - 26)        };        {
             let store = Store::open(tmp.path()).await.unwrap();
             store
                 .with_conn(move |c| {
@@ -9661,8 +9894,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_bg, "background_events table must exist");
-        assert!(has_override, "jobs.model_override column must exist");
+        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_bg, "background_events table must exist");        assert!(has_override, "jobs.model_override column must exist");
     }
 
     #[tokio::test]
@@ -9686,8 +9918,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_fts, "messages_fts must survive agentic cleanup");
-        assert!(
+        assert_eq!(uv, 46, "forward migration must land at v46");        assert!(has_fts, "messages_fts must survive agentic cleanup");        assert!(
             !has_usage && !has_cstate && !has_cruns,
             "legacy agentic tables must be removed"
         );
@@ -10272,6 +10503,270 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    async fn raw_plugin_oauth_profile_token_json(
+        store: &Store,
+        plugin_id: &str,
+        profile_id: &str,
+    ) -> String {
+        let plugin_id = plugin_id.to_string();
+        let profile_id = profile_id.to_string();
+        store
+            .with_conn(move |c| {
+                c.query_row(
+                    "SELECT token_json FROM plugin_oauth_profile_tokens \
+                     WHERE plugin_id=?1 AND profile_id=?2",
+                    params![plugin_id, profile_id],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    fn test_profile_token(plugin_id: &str, access_token: &str) -> PluginOauthToken {
+        PluginOauthToken {
+            plugin_id: plugin_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some(format!("{access_token}-refresh")),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into()],
+            reconnect_required: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_tokens_for_the_same_plugin_are_independent() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "token-a"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-b",
+                &test_profile_token("github", "token-b"),
+            )
+            .await
+            .unwrap();
+
+        let a = store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let b = store
+            .get_plugin_oauth_profile_token("github", "profile-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.access_token, "token-a");
+        assert_eq!(b.access_token, "token-b");
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_token_is_isolated_by_plugin_id() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "github-token"),
+            )
+            .await
+            .unwrap();
+
+        let cross_plugin = store
+            .get_plugin_oauth_profile_token("atlassian", "profile-a")
+            .await
+            .unwrap();
+        assert!(
+            cross_plugin.is_none(),
+            "a different plugin id must not see another plugin's profile token"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_token_is_encrypted_at_rest() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let token = PluginOauthToken {
+            plugin_id: "github".into(),
+            access_token: "access-secret".into(),
+            refresh_token: Some("refresh-secret".into()),
+            token_type: "Bearer".into(),
+            expires_at: Some(1_700_000_000_000),
+            scopes: vec!["repo".into()],
+            reconnect_required: false,
+        };
+
+        store
+            .upsert_plugin_oauth_profile_token("github", "profile-a", &token)
+            .await
+            .unwrap();
+
+        let raw_json = raw_plugin_oauth_profile_token_json(&store, "github", "profile-a").await;
+        assert!(
+            !raw_json.contains("access-secret"),
+            "profile access token must not be stored in plaintext: {raw_json}"
+        );
+        assert!(
+            !raw_json.contains("refresh-secret"),
+            "profile refresh token must not be stored in plaintext: {raw_json}"
+        );
+
+        let roundtrip = store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(roundtrip.access_token, "access-secret");
+        assert_eq!(roundtrip.refresh_token.as_deref(), Some("refresh-secret"));
+    }
+
+    #[tokio::test]
+    async fn delete_plugin_oauth_profile_token_removes_only_that_profile() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "token-a"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-b",
+                &test_profile_token("github", "token-b"),
+            )
+            .await
+            .unwrap();
+
+        store
+            .delete_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_plugin_oauth_profile_token("github", "profile-b")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn plugin_oauth_profile_client_upsert_merges_columns_and_roundtrips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        assert!(store
+            .get_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .upsert_plugin_oauth_profile_client(&PluginOauthProfileClient {
+                plugin_id: "acme".into(),
+                profile_id: "profile-a".into(),
+                authorize_url: Some("https://acme.test/authorize".into()),
+                token_url: Some("https://acme.test/token".into()),
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_plugin_oauth_profile_client(&PluginOauthProfileClient {
+                plugin_id: "acme".into(),
+                profile_id: "profile-a".into(),
+                authorize_url: None,
+                token_url: None,
+                client_id: Some("client-123".into()),
+            })
+            .await
+            .unwrap();
+
+        let client = store
+            .get_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.authorize_url.as_deref(),
+            Some("https://acme.test/authorize")
+        );
+        assert_eq!(client.token_url.as_deref(), Some("https://acme.test/token"));
+        assert_eq!(client.client_id.as_deref(), Some("client-123"));
+
+        // A different profile id under the same plugin is untouched.
+        assert!(store
+            .get_plugin_oauth_profile_client("acme", "profile-b")
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .delete_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap();
+        assert!(store
+            .get_plugin_oauth_profile_client("acme", "profile-a")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_plugin_oauth_profile_reconnect_required_updates_flag() {
+        use_test_key_file();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "profile-a",
+                &test_profile_token("github", "token-a"),
+            )
+            .await
+            .unwrap();
+
+        store
+            .mark_plugin_oauth_profile_reconnect_required("github", "profile-a")
+            .await
+            .unwrap();
+
+        let roundtrip = store
+            .get_plugin_oauth_profile_token("github", "profile-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(roundtrip.reconnect_required);
+        assert_eq!(roundtrip.access_token, "token-a");
     }
 
     #[tokio::test]
