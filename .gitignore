@@ -62,6 +62,9 @@ plugins/**/dist/
 plugins/**/*.wasm
 plugins/**/*.release.json
 plugins/**/*.release.json.sig
+# Default output dir of scripts/plugins/build-first-party.ts (signed release
+# artifacts + built .wasm) — a release artifact, never committed.
+/dist/
 # Local cargo state stays ignored, but the tracked alias file is real config
 # (`cargo gen-bindings` — see apps/cockpit/src-tauri/Cargo.toml).
 /.cargo/*
