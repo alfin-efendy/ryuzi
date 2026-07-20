@@ -543,6 +543,26 @@ impl Store {
         let mut cfg = Config::new(path);
         cfg.pool = Some(deadpool_sqlite::PoolConfig::new(1));
         let pool = cfg.create_pool(Runtime::Tokio1)?;
+        // A database newer than this build's single-migration baseline (for
+        // example a pre-squash install left at user_version ~49) cannot be
+        // upgraded: the squash removed the intermediate migrations, so
+        // `to_latest` would otherwise fail with an opaque "database too far
+        // ahead". Detect it up front and return an actionable error instead.
+        // (0 = fresh file, 1 = current baseline.)
+        const BASELINE_VERSION: i64 = 1;
+        let current_version: i64 = interact_on(&pool, |c| {
+            c.query_row("PRAGMA user_version", [], |r| r.get(0))
+        })
+        .await?;
+        if current_version > BASELINE_VERSION {
+            anyhow::bail!(
+                "database at {} has schema version {current_version}, which is newer than this \
+                 build supports (baseline v{BASELINE_VERSION}). This release squashed the schema \
+                 migrations, so databases created by older builds can't be upgraded in place. \
+                 Back up and remove the database file, then restart to create a fresh one.",
+                path.display()
+            );
+        }
         interact_on(&pool, |c| {
             let _ = c.pragma_update(None, "journal_mode", "WAL");
             migrations().to_latest(c)
@@ -9176,11 +9196,12 @@ mod tests {
         assert!(repeated.is_empty());
     }
 
-    // Regression guard for the migration squash: a fresh `Store::open` must
-    // produce a `user_version` 1 database whose schema + seeded rows exactly
-    // match the pre-squash golden captured from the original 49 migrations.
-    #[tokio::test]
-    async fn baseline_matches_pre_squash_golden() {
+    // Shared dump used by the squash regression tests: the full `sqlite_master`
+    // DDL text for every object (tables, indexes, views, triggers, and the FTS5
+    // shadow tables) followed by every row of every non-empty table. Comparing
+    // raw CREATE text captures collations, CHECK/FK/defaults/WITHOUT ROWID and
+    // the fts5 module args, so text equality is a genuine schema equivalence.
+    async fn dump_schema_and_seed(store: &Store) -> (i64, String) {
         fn sql_literal(v: rusqlite::types::ValueRef) -> String {
             use rusqlite::types::ValueRef;
             match v {
@@ -9196,10 +9217,7 @@ mod tests {
                 }
             }
         }
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
-        let (user_version, dump): (i64, String) = store
+        store
             .with_conn(|c| {
                 let user_version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 let mut out = String::new();
@@ -9267,8 +9285,23 @@ mod tests {
                 Ok((user_version, out))
             })
             .await
-            .unwrap();
+            .unwrap()
+    }
 
+    // Regression guard for the migration squash: a fresh `Store::open` must
+    // produce a `user_version` 1 database whose schema + seeded rows exactly
+    // match the pre-squash golden captured from the original 49 migrations.
+    //
+    // NOTE: the golden pins FTS5-internal storage bytes (messages_fts_config
+    // version, messages_fts_data blocks), which are artifacts of the bundled
+    // SQLite version. A rusqlite/SQLite bump that changes them fails this test
+    // even though the logical schema is unchanged — regenerate the fixture with
+    // `regenerate_baseline_golden_fixture` below when that happens.
+    #[tokio::test]
+    async fn baseline_matches_pre_squash_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
+        let (user_version, dump) = dump_schema_and_seed(&store).await;
         assert_eq!(
             user_version, 1,
             "squashed baseline DB must be user_version 1"
@@ -9277,6 +9310,53 @@ mod tests {
         assert_eq!(
             dump, golden,
             "baseline schema/seed drifted from the pre-squash golden fixture"
+        );
+    }
+
+    // Regenerates tests/fixtures/baseline_schema.sql from the current baseline.
+    // Ignored by default (it writes a source-tree file); run explicitly after an
+    // intentional schema change or a bundled-SQLite bump:
+    //   cargo test -p ryuzi-core --lib regenerate_baseline_golden_fixture -- --ignored
+    #[tokio::test]
+    #[ignore = "writes the golden fixture; run manually after an intentional schema change"]
+    async fn regenerate_baseline_golden_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("baseline.db")).await.unwrap();
+        let (_v, dump) = dump_schema_and_seed(&store).await;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/baseline_schema.sql"
+        );
+        std::fs::write(path, dump).unwrap();
+        eprintln!("regenerated {path}");
+    }
+
+    // A database newer than the single-migration baseline (e.g. a pre-squash
+    // install at a high user_version) must fail to open with an actionable
+    // message rather than an opaque migration error.
+    #[tokio::test]
+    async fn open_rejects_database_newer_than_baseline_with_actionable_error() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = Store::open(tmp.path()).await.unwrap();
+            store
+                .with_conn(|c| c.pragma_update(None, "user_version", 49))
+                .await
+                .unwrap();
+        }
+        // `.err()` (not `.unwrap_err()`) so we don't require `Store: Debug`.
+        let err = Store::open(tmp.path())
+            .await
+            .err()
+            .expect("opening a too-new database should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("newer than this build"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("49"),
+            "error should name the offending version: {msg}"
         );
     }
 }
