@@ -3887,28 +3887,6 @@ impl Store {
         .await
     }
 
-    pub async fn get_native_tool_session_version(
-        &self,
-        session_pk: &str,
-    ) -> anyhow::Result<Option<NativeToolSessionVersion>> {
-        let session_pk = session_pk.to_string();
-        self.with_conn(move |c| {
-            c.query_row(
-                "SELECT session_pk,version,created_at FROM native_tool_session_versions WHERE session_pk=?1",
-                params![session_pk],
-                |row| {
-                    Ok(NativeToolSessionVersion {
-                        session_pk: row.get(0)?,
-                        version: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-        })
-        .await
-    }
-
     pub async fn get_or_insert_native_tool_session_version(
         &self,
         session_pk: &str,

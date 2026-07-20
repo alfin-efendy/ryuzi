@@ -294,11 +294,6 @@ impl CommandRegistry {
             .collect()
     }
 
-    /// All effective commands with their precedence source, for UI listing.
-    pub fn all_with_origins(&self) -> Vec<RegisteredCommand> {
-        self.commands.values().cloned().collect()
-    }
-
     /// Every discovered command source, including sources shadowed by a
     /// higher-precedence project or built-in command.
     pub fn catalog(&self) -> Vec<RegisteredCommand> {

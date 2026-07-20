@@ -1,8 +1,8 @@
 use super::lifecycle::PrimaryTurn;
 use super::*;
 use crate::domain::{
-    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, QueuedSessionPrompt,
-    SessionKind, SessionStatus,
+    ApprovalDecision, ApprovalScope, AttachmentRef, CoreEvent, NewMessage, PermMode,
+    QueuedSessionPrompt, SessionKind, SessionStatus,
 };
 use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
 use crate::paths::now_ms;

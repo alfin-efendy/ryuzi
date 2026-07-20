@@ -571,13 +571,6 @@ impl KnowledgeStore {
         })
     }
 
-    /// Rebuilds `memory/index.md` and `learning/index.md` from the current
-    /// valid concepts.
-    pub async fn regenerate_indexes(&self) -> anyhow::Result<()> {
-        let _guard = self.write_lock.lock().await;
-        self.commit_staged_mutation(|_| Ok(((), Vec::new())))
-    }
-
     /// Applies one learning event's mutations while holding the per-agent
     /// lock across the recorded-event-ID check, the write/remove
     /// application, index regeneration, and the log append. Returns `false`
