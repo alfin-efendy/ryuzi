@@ -1,0 +1,12 @@
+package ryuzi:opencode@0.1.0;
+
+// The OpenCode Zen free-tier provider targets an even narrower world than MiMo:
+// it needs no bootstrap and no persistent state (the bearer is the literal
+// constant `public`), so it imports only the plugin type vocabulary and the
+// host-mediated HTTP egress, and exports the provider interface. `wit/deps/` is
+// materialized from the SDK at build time (see scripts/plugins/build-first-party.ts).
+world opencode {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:http/http@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+}

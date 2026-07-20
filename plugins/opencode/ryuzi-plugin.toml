@@ -1,0 +1,13 @@
+id = "opencode"
+name = "OpenCode (free)"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "opencode.wasm"
+publisher = "Ryuzi"
+description = "OpenCode Zen free-tier chat provider. Talks to opencode.ai/zen/v1 with the static `Bearer public` token and the x-opencode-client header."
+
+# Only host the component may reach through `ryuzi:http/http`. Covers both the
+# /models and /chat/completions endpoints under opencode.ai/zen/v1.
+[permissions]
+network = ["opencode.ai"]
