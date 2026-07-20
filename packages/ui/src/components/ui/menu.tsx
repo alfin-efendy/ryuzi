@@ -37,23 +37,4 @@ function MenuContent({
   );
 }
 
-function MenuItem({ className, variant = "default", ...props }: MenuPrimitive.Item.Props & { variant?: "default" | "destructive" }) {
-  return (
-    <MenuPrimitive.Item
-      data-slot="menu-item"
-      className={cn(
-        "flex cursor-default items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none",
-        "data-highlighted:bg-accent data-highlighted:text-accent-foreground data-disabled:pointer-events-none data-disabled:opacity-50",
-        variant === "destructive" && "text-destructive data-highlighted:bg-destructive/10 data-highlighted:text-destructive",
-        className,
-      )}
-      {...props}
-    />
-  );
-}
-
-function MenuSeparator({ className }: { className?: string }) {
-  return <hr className={cn("my-1 h-px border-0 bg-border", className)} />;
-}
-
-export { Menu, MenuTrigger, MenuContent, MenuItem, MenuSeparator };
+export { Menu, MenuTrigger, MenuContent };
