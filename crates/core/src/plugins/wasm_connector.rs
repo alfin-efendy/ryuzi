@@ -76,6 +76,16 @@ impl WasmActivation {
         &self.component_id
     }
 
+    /// Whether this component exports `ryuzi:connector/connector` (IMP-2).
+    pub(crate) fn exports_connector(&self) -> bool {
+        self.compiled.exports_connector()
+    }
+
+    /// Whether this component exports `ryuzi:hooks/hooks` (IMP-2).
+    pub(crate) fn exports_hooks(&self) -> bool {
+        self.compiled.exports_hooks()
+    }
+
     /// Instantiate a fresh, isolated instance of this bundle's component,
     /// running `start` under the fuel/epoch budget.
     pub(crate) async fn instantiate(&self) -> Result<ComponentInstance, PluginRuntimeError> {
@@ -199,6 +209,12 @@ impl WasmTools for WasmToolSet {
         let mut seen: HashSet<String> = HashSet::new();
         let mut out = Vec::new();
         for activation in &self.activations {
+            // IMP-2: skip a component that exports no connector interface (e.g.
+            // a hooks-only plugin) — never instantiate it just to fail
+            // `GuestIndices::new` and warn.
+            if !activation.exports_connector() {
+                continue;
+            }
             let defs = match activation.connector_list_tools().await {
                 Ok(defs) => defs,
                 Err(reason) => {
@@ -500,26 +516,23 @@ mod tests {
             .join("ryuzi_component_connector_fixture.wasm")
     }
 
-    fn manifest() -> PluginBundleManifest {
-        PluginBundleManifest {
-            id: "acme-tools".to_string(),
-            name: "Acme Tools".to_string(),
-            version: "0.1.0".to_string(),
-            wit_api: "^0.1.0".to_string(),
-            lifecycle: PluginLifecycle::Singleton,
-            component: "plugin.wasm".to_string(),
-            publisher: String::new(),
-            description: String::new(),
-            permissions: PluginPermissions { network: vec![] },
-            oauth: vec![],
-        }
+    fn hooks_artifact() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/component-hooks/target/wasm32-wasip2/release")
+            .join("ryuzi_component_hooks_fixture.wasm")
     }
 
-    async fn test_activation(timeout: Duration) -> (Arc<WasmActivation>, tempfile::NamedTempFile) {
+    /// Build one `WasmActivation` from a prebuilt fixture artifact under an
+    /// arbitrary policy + plugin id.
+    async fn build_activation(
+        component_path: PathBuf,
+        plugin_id: &str,
+        policy: HostPolicy,
+    ) -> (Arc<WasmActivation>, tempfile::NamedTempFile) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let ctx = Arc::new(PluginCapabilityContext {
-            plugin_id: "acme-tools".to_string(),
+            plugin_id: plugin_id.to_string(),
             version: "0.1.0".to_string(),
             settings: SettingsStore::new(store.clone()),
             store,
@@ -527,22 +540,32 @@ mod tests {
             network_allowlist: vec![],
             oauth_profile_ids: vec![],
         });
-        let component_path = connector_artifact();
         let bundle = InstalledBundle {
-            manifest: manifest(),
+            manifest: PluginBundleManifest {
+                id: plugin_id.to_string(),
+                name: plugin_id.to_string(),
+                version: "0.1.0".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+                component: "plugin.wasm".to_string(),
+                publisher: String::new(),
+                description: String::new(),
+                permissions: PluginPermissions { network: vec![] },
+                oauth: vec![],
+            },
             release: PluginRelease {
-                id: "acme-tools".to_string(),
+                id: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
                 wit_api: "0.1.0".to_string(),
-                component_url: "https://example.invalid/acme-tools/plugin.wasm".to_string(),
+                component_url: "https://example.invalid/x.wasm".to_string(),
                 component_sha256: "0".repeat(64),
                 size_bytes: None,
                 published_at: None,
             },
             release_record: ComponentPluginReleaseRecord {
-                plugin_id: "acme-tools".to_string(),
+                plugin_id: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
-                source_url: "https://example.invalid/acme-tools/plugin.wasm".to_string(),
+                source_url: "https://example.invalid/x.wasm".to_string(),
                 sha256: "0".repeat(64),
                 signing_key_id: "test".to_string(),
                 installed_at: 0,
@@ -554,19 +577,23 @@ mod tests {
             component_path,
         };
         let runtime = ComponentRuntime::new().unwrap();
-        let mut policy = HostPolicy::deny_all();
-        policy.limits.timeout = timeout;
         let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
         let activation = Arc::new(WasmActivation::new(
             compiled,
             ctx,
-            "acme-tools".to_string(),
+            plugin_id.to_string(),
             Principal {
-                plugin_id: "acme-tools".to_string(),
-                plugin_name: "Acme Tools".to_string(),
+                plugin_id: plugin_id.to_string(),
+                plugin_name: plugin_id.to_string(),
             },
         ));
         (activation, tmp)
+    }
+
+    async fn test_activation(timeout: Duration) -> (Arc<WasmActivation>, tempfile::NamedTempFile) {
+        let mut policy = HostPolicy::deny_all();
+        policy.limits.timeout = timeout;
+        build_activation(connector_artifact(), "acme-tools", policy).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -636,6 +663,38 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "timeout must fire promptly: {elapsed:?}"
+        );
+    }
+
+    // ---------- IMP-2: skip components lacking the connector export ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_set_is_captured_per_component() {
+        build_fixtures();
+        let (connector, _c) =
+            build_activation(connector_artifact(), "acme-tools", HostPolicy::deny_all()).await;
+        let (hooks, _h) =
+            build_activation(hooks_artifact(), "acme-hooks", HostPolicy::deny_all()).await;
+        assert!(connector.exports_connector() && !connector.exports_hooks());
+        assert!(hooks.exports_hooks() && !hooks.exports_connector());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_tools_skips_a_hooks_only_component_without_instantiating() {
+        build_fixtures();
+        // A tiny timeout: if the hooks-only component were instantiated to
+        // enumerate tools, that would still yield no tools — but with the IMP-2
+        // guard it is skipped BEFORE instantiation, so it never runs `start`.
+        let (hooks, _h) =
+            build_activation(hooks_artifact(), "acme-hooks", HostPolicy::deny_all()).await;
+        assert!(
+            !hooks.exports_connector(),
+            "sanity: the hooks fixture exports no connector"
+        );
+        let set = WasmToolSet::new(vec![hooks]);
+        assert!(
+            set.session_tools().await.is_empty(),
+            "a hooks-only component must contribute no connector tools"
         );
     }
 }

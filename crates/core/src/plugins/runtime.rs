@@ -34,13 +34,19 @@ const HOST_IMPORT: &str = "ryuzi:host/host@0.1.1";
 const OAUTH_IMPORT: &str = "ryuzi:oauth/oauth@0.2.0";
 const TYPES_IMPORT: &str = "ryuzi:plugin/types@0.1.0";
 const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
+/// The `ryuzi:connector/connector` export interface name — the single source
+/// of truth shared by `ALLOWED_EXPORTS` and [`CompiledComponent::exports_connector`].
+pub(crate) const CONNECTOR_EXPORT: &str = "ryuzi:connector/connector@0.1.0";
+/// The `ryuzi:hooks/hooks` export interface name — shared by `ALLOWED_EXPORTS`
+/// and [`CompiledComponent::exports_hooks`].
+pub(crate) const HOOKS_EXPORT: &str = "ryuzi:hooks/hooks@0.1.0";
 const ALLOWED_EXPORTS: &[&str] = &[
     "lifecycle",
     LIFECYCLE_EXPORT,
     "ryuzi:gateway/gateway@0.1.0",
-    "ryuzi:connector/connector@0.1.0",
+    CONNECTOR_EXPORT,
     "ryuzi:provider/provider@0.1.0",
-    "ryuzi:hooks/hooks@0.1.0",
+    HOOKS_EXPORT,
 ];
 
 /// Default resource budget a plugin runtime may consume.
@@ -148,6 +154,83 @@ impl fmt::Display for PluginRuntimeError {
 
 impl std::error::Error for PluginRuntimeError {}
 
+/// Build a component-model [`Engine`] with fuel + epoch interruption + async
+/// support. Called once for the runtime's own validation engine and once PER
+/// [`CompiledComponent`] in [`ComponentRuntime::compile`], so each installed
+/// component owns an independent epoch counter (IMP-1): one component hitting
+/// its timeout (`engine.increment_epoch()`) can never trip another
+/// concurrently-executing component's epoch deadline.
+fn build_component_engine() -> Result<Engine, PluginRuntimeError> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    // Wasmtime 46 always enables async support, but task 6 requires this
+    // explicit configuration call. Narrow suppression keeps clippy clean
+    // without widening to module or crate scope.
+    #[allow(deprecated)]
+    config.async_support(true);
+    Engine::new(&config)
+        .map_err(|error| PluginRuntimeError::EngineInitialization(error.to_string()))
+}
+
+/// Validate a compiled component's imports and exports against its manifest +
+/// host policy, returning the set of exported interface names on success (for
+/// [`CompiledComponent`] to later skip probing interfaces a component does not
+/// export — IMP-2). `component` must have been compiled against `engine`.
+fn validate_component_interfaces(
+    engine: &Engine,
+    manifest: &PluginBundleManifest,
+    component: &Component,
+    policy: &HostPolicy,
+) -> Result<Vec<String>, PluginRuntimeError> {
+    for (name, _) in component.component_type().imports(engine) {
+        let is_wasi_baseline = name.starts_with("wasi:");
+        let network_is_authorized =
+            name == HTTP_IMPORT && !manifest.permissions.network.is_empty() && policy.allow_network;
+        let types_is_authorized = name == TYPES_IMPORT;
+        let host_is_authorized = name == HOST_IMPORT;
+        let settings_is_authorized = name == SETTINGS_IMPORT && policy.allow_settings;
+        let storage_is_authorized = name == STORAGE_IMPORT && policy.allow_storage;
+        let oauth_is_authorized = name == OAUTH_IMPORT && policy.allow_oauth;
+        if !is_wasi_baseline
+            && !types_is_authorized
+            && !network_is_authorized
+            && !host_is_authorized
+            && !settings_is_authorized
+            && !storage_is_authorized
+            && !oauth_is_authorized
+        {
+            let reason = if name == HTTP_IMPORT {
+                "network requires a manifest allowlist and host policy approval".to_string()
+            } else if name == SETTINGS_IMPORT {
+                "settings access requires host policy approval".to_string()
+            } else if name == STORAGE_IMPORT {
+                "storage access requires host policy approval".to_string()
+            } else if name == OAUTH_IMPORT {
+                "OAuth access requires host policy approval".to_string()
+            } else {
+                "no host capability is enabled by this runtime slice".to_string()
+            };
+            return Err(PluginRuntimeError::DeniedImport {
+                name: name.to_string(),
+                reason,
+            });
+        }
+    }
+    let mut exports = Vec::new();
+    for (name, _) in component.component_type().exports(engine) {
+        if !ALLOWED_EXPORTS.contains(&name) {
+            return Err(PluginRuntimeError::DeniedExport {
+                name: name.to_string(),
+                reason: "not declared by the ryuzi:plugin@0.1.0 world".to_string(),
+            });
+        }
+        exports.push(name.to_string());
+    }
+    Ok(exports)
+}
+
 /// Validates a WebAssembly component before later runtime layers link it.
 pub struct ComponentRuntime {
     engine: Engine,
@@ -155,20 +238,16 @@ pub struct ComponentRuntime {
 
 impl ComponentRuntime {
     pub fn new() -> Result<Self, PluginRuntimeError> {
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        // Wasmtime 46 always enables async support, but task 6 requires this
-        // explicit configuration call.  Narrow suppression keeps clippy clean
-        // without widening to module or crate scope.
-        #[allow(deprecated)]
-        config.async_support(true);
-        let engine = Engine::new(&config)
-            .map_err(|error| PluginRuntimeError::EngineInitialization(error.to_string()))?;
-        Ok(Self { engine })
+        Ok(Self {
+            engine: build_component_engine()?,
+        })
     }
 
+    /// Compile `bytes` against `self.engine` and validate its imports/exports,
+    /// discarding the export set. Retained for `validate_component` and the
+    /// runtime's own tests. `compile` does NOT go through here — it needs the
+    /// component compiled against its OWN isolated engine (see
+    /// [`Self::compile`]).
     fn validate_component_bytes(
         &self,
         manifest: &PluginBundleManifest,
@@ -177,49 +256,7 @@ impl ComponentRuntime {
     ) -> Result<Component, PluginRuntimeError> {
         let component = Component::new(&self.engine, bytes)
             .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
-        for (name, _) in component.component_type().imports(&self.engine) {
-            let is_wasi_baseline = name.starts_with("wasi:");
-            let network_is_authorized = name == HTTP_IMPORT
-                && !manifest.permissions.network.is_empty()
-                && policy.allow_network;
-            let types_is_authorized = name == TYPES_IMPORT;
-            let host_is_authorized = name == HOST_IMPORT;
-            let settings_is_authorized = name == SETTINGS_IMPORT && policy.allow_settings;
-            let storage_is_authorized = name == STORAGE_IMPORT && policy.allow_storage;
-            let oauth_is_authorized = name == OAUTH_IMPORT && policy.allow_oauth;
-            if !is_wasi_baseline
-                && !types_is_authorized
-                && !network_is_authorized
-                && !host_is_authorized
-                && !settings_is_authorized
-                && !storage_is_authorized
-                && !oauth_is_authorized
-            {
-                let reason = if name == HTTP_IMPORT {
-                    "network requires a manifest allowlist and host policy approval".to_string()
-                } else if name == SETTINGS_IMPORT {
-                    "settings access requires host policy approval".to_string()
-                } else if name == STORAGE_IMPORT {
-                    "storage access requires host policy approval".to_string()
-                } else if name == OAUTH_IMPORT {
-                    "OAuth access requires host policy approval".to_string()
-                } else {
-                    "no host capability is enabled by this runtime slice".to_string()
-                };
-                return Err(PluginRuntimeError::DeniedImport {
-                    name: name.to_string(),
-                    reason,
-                });
-            }
-        }
-        for (name, _) in component.component_type().exports(&self.engine) {
-            if !ALLOWED_EXPORTS.contains(&name) {
-                return Err(PluginRuntimeError::DeniedExport {
-                    name: name.to_string(),
-                    reason: "not declared by the ryuzi:plugin@0.1.0 world".to_string(),
-                });
-            }
-        }
+        validate_component_interfaces(&self.engine, manifest, &component, policy)?;
         Ok(component)
     }
 
@@ -245,12 +282,23 @@ impl ComponentRuntime {
     ) -> Result<CompiledComponent, PluginRuntimeError> {
         let bytes = std::fs::read(&bundle.component_path)
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
-        let component = self.validate_component_bytes(&bundle.manifest, &bytes, &policy)?;
+        // IMP-1: each component is compiled against its OWN engine so its epoch
+        // counter is isolated from every other enabled component. A `Component`
+        // is tied to the `Engine` it is compiled with, so the engine, the
+        // component, and every `Store`/`Linker` built from it in
+        // `CompiledComponent::instantiate` all share this one private engine —
+        // and `ComponentInstance::call`'s timeout `increment_epoch()` only ever
+        // advances THIS component's epoch.
+        let engine = build_component_engine()?;
+        let component = Component::new(&engine, &bytes)
+            .map_err(|error| PluginRuntimeError::MalformedComponent(error.to_string()))?;
+        let exports =
+            validate_component_interfaces(&engine, &bundle.manifest, &component, &policy)?;
         // Built from the manifest's own declared network permissions (not
         // policy-conditioned here — the import is only linked at all when
-        // `allow_network` is true, and `validate_component_bytes` already
-        // requires a non-empty manifest allowlist for the import to be
-        // authorized in the first place).
+        // `allow_network` is true, and validation already requires a non-empty
+        // manifest allowlist for the import to be authorized in the first
+        // place).
         let network_allowlist: Vec<String> = bundle
             .manifest
             .permissions
@@ -265,13 +313,14 @@ impl ComponentRuntime {
             .map(|profile| profile.id.clone())
             .collect();
         Ok(CompiledComponent {
-            engine: self.engine.clone(),
+            engine,
             component,
             policy,
             plugin_id: bundle.manifest.id.clone(),
             version: bundle.manifest.version.clone(),
             network_allowlist,
             oauth_profile_ids,
+            exports,
         })
     }
 
@@ -351,12 +400,30 @@ pub struct CompiledComponent {
     version: String,
     network_allowlist: Vec<String>,
     oauth_profile_ids: Vec<String>,
+    /// The component's exported interface names (a subset of `ALLOWED_EXPORTS`),
+    /// captured at compile time so an adapter can skip instantiating/probing a
+    /// component that does not export the interface it wants (IMP-2).
+    exports: Vec<String>,
 }
 
 impl CompiledComponent {
     /// The compiled plugin's id (its bundle manifest id).
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+
+    /// Whether this component exports `ryuzi:connector/connector` — used by the
+    /// connector tool enumeration to skip components that provide no tools
+    /// (e.g. a hooks-only plugin) without instantiating them (IMP-2).
+    pub(crate) fn exports_connector(&self) -> bool {
+        self.exports.iter().any(|name| name == CONNECTOR_EXPORT)
+    }
+
+    /// Whether this component exports `ryuzi:hooks/hooks` — used by the hook
+    /// dispatcher to skip components with no hooks (e.g. a connector-only
+    /// plugin) without instantiating them or logging a warning (IMP-2).
+    pub(crate) fn exports_hooks(&self) -> bool {
+        self.exports.iter().any(|name| name == HOOKS_EXPORT)
     }
 
     /// Instantiate a fresh, isolated instance, linking the host capability
@@ -1002,6 +1069,7 @@ mod tests {
                 "component-http-import" => "ryuzi_component_http_fixture.wasm",
                 "component-connector" => "ryuzi_component_connector_fixture.wasm",
                 "component-hooks" => "ryuzi_component_hooks_fixture.wasm",
+                "component-hooks-loop" => "ryuzi_component_hooks_loop_fixture.wasm",
                 _ => panic!("unknown fixture {name}"),
             })
     }

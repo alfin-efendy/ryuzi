@@ -44,6 +44,24 @@ impl WasmHookDispatcher {
     pub fn new(activations: Vec<Arc<WasmActivation>>) -> Self {
         WasmHookDispatcher { activations }
     }
+
+    /// The activations a gating event is actually dispatched to: only those
+    /// that export `ryuzi:hooks/hooks` (IMP-2). A connector-only component is
+    /// excluded HERE, before any instantiation, so it is never instantiated
+    /// and never logs a fail-open warning on a `tool.before`.
+    fn hook_targets(&self) -> impl Iterator<Item = &Arc<WasmActivation>> {
+        self.activations
+            .iter()
+            .filter(|activation| activation.exports_hooks())
+    }
+
+    /// Test seam: the component ids that a gating event would be dispatched to.
+    #[cfg(test)]
+    pub(crate) fn hook_target_ids(&self) -> Vec<String> {
+        self.hook_targets()
+            .map(|activation| activation.component_id().to_string())
+            .collect()
+    }
 }
 
 /// The outcome of dispatching one gating event to one component.
@@ -62,12 +80,18 @@ impl ExtensionEvents for WasmHookDispatcher {
     async fn dispatch(&self, event: HookEvent, payload: &Value) -> HookResult {
         // Observational events never gate — return immediately without paying
         // a component instantiation. (See the module doc.)
-        if !event.is_gating() || self.activations.is_empty() {
+        if !event.is_gating() {
+            return HookResult::allow();
+        }
+        // IMP-2: only dispatch to components that actually export hooks, so a
+        // connector-only component is never instantiated (and never warns) on a
+        // `tool.before`.
+        let targets: Vec<Arc<WasmActivation>> = self.hook_targets().cloned().collect();
+        if targets.is_empty() {
             return HookResult::allow();
         }
         let payload_json = serde_json::to_string(payload).unwrap_or_default();
-        let calls = self.activations.iter().map(|activation| {
-            let activation = activation.clone();
+        let calls = targets.into_iter().map(|activation| {
             let payload_json = payload_json.clone();
             async move {
                 let outcome = dispatch_gating_one(&activation, event, payload_json).await;
@@ -151,29 +175,37 @@ mod tests {
 
     use crate::plugins::build_fixture_components_once as build_fixtures;
 
-    fn hooks_artifact() -> PathBuf {
+    fn fixture_artifact(dir: &str, file: &str) -> PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/component-hooks/target/wasm32-wasip2/release")
-            .join("ryuzi_component_hooks_fixture.wasm")
+            .join("tests/fixtures")
+            .join(dir)
+            .join("target/wasm32-wasip2/release")
+            .join(file)
     }
 
-    async fn hooks_dispatcher(timeout: Duration) -> (WasmHookDispatcher, tempfile::NamedTempFile) {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
-        let ctx = Arc::new(PluginCapabilityContext {
-            plugin_id: "acme-hooks".to_string(),
-            version: "0.1.0".to_string(),
-            settings: SettingsStore::new(store.clone()),
-            store,
-            telemetry: Arc::new(NoopTelemetry),
-            network_allowlist: vec![],
-            oauth_profile_ids: vec![],
-        });
-        let component_path = hooks_artifact();
-        let bundle = InstalledBundle {
+    fn hooks_artifact() -> PathBuf {
+        fixture_artifact("component-hooks", "ryuzi_component_hooks_fixture.wasm")
+    }
+
+    fn hooks_loop_artifact() -> PathBuf {
+        fixture_artifact(
+            "component-hooks-loop",
+            "ryuzi_component_hooks_loop_fixture.wasm",
+        )
+    }
+
+    fn connector_artifact() -> PathBuf {
+        fixture_artifact(
+            "component-connector",
+            "ryuzi_component_connector_fixture.wasm",
+        )
+    }
+
+    fn test_bundle(component_path: PathBuf, plugin_id: &str) -> InstalledBundle {
+        InstalledBundle {
             manifest: PluginBundleManifest {
-                id: "acme-hooks".to_string(),
-                name: "Acme Hooks".to_string(),
+                id: plugin_id.to_string(),
+                name: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
                 wit_api: "^0.1.0".to_string(),
                 lifecycle: PluginLifecycle::Singleton,
@@ -184,18 +216,18 @@ mod tests {
                 oauth: vec![],
             },
             release: PluginRelease {
-                id: "acme-hooks".to_string(),
+                id: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
                 wit_api: "0.1.0".to_string(),
-                component_url: "https://example.invalid/acme-hooks/plugin.wasm".to_string(),
+                component_url: "https://example.invalid/x.wasm".to_string(),
                 component_sha256: "0".repeat(64),
                 size_bytes: None,
                 published_at: None,
             },
             release_record: ComponentPluginReleaseRecord {
-                plugin_id: "acme-hooks".to_string(),
+                plugin_id: plugin_id.to_string(),
                 version: "0.1.0".to_string(),
-                source_url: "https://example.invalid/acme-hooks/plugin.wasm".to_string(),
+                source_url: "https://example.invalid/x.wasm".to_string(),
                 sha256: "0".repeat(64),
                 signing_key_id: "test".to_string(),
                 installed_at: 0,
@@ -205,20 +237,69 @@ mod tests {
             },
             root: component_path.parent().unwrap().to_path_buf(),
             component_path,
-        };
+        }
+    }
+
+    fn test_ctx(store: &Arc<crate::store::Store>, plugin_id: &str) -> Arc<PluginCapabilityContext> {
+        Arc::new(PluginCapabilityContext {
+            plugin_id: plugin_id.to_string(),
+            version: "0.1.0".to_string(),
+            settings: SettingsStore::new(store.clone()),
+            store: store.clone(),
+            telemetry: Arc::new(NoopTelemetry),
+            network_allowlist: vec![],
+            oauth_profile_ids: vec![],
+        })
+    }
+
+    fn principal(plugin_id: &str) -> Principal {
+        Principal {
+            plugin_id: plugin_id.to_string(),
+            plugin_name: plugin_id.to_string(),
+        }
+    }
+
+    /// Compile + wrap one activation using a CALLER-SUPPLIED runtime + store,
+    /// so a test can put multiple components on the SAME `ComponentRuntime` —
+    /// exactly as production does (`lifecycle::build_wasm_session_providers`
+    /// compiles every enabled bundle with one runtime). Essential for the
+    /// epoch-isolation regression: only a shared runtime exposes whether the
+    /// engine (and its epoch counter) is shared across components.
+    fn shared_activation(
+        runtime: &ComponentRuntime,
+        store: &Arc<crate::store::Store>,
+        component_path: PathBuf,
+        plugin_id: &str,
+        policy: HostPolicy,
+    ) -> Arc<WasmActivation> {
+        let bundle = test_bundle(component_path, plugin_id);
+        let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
+        Arc::new(WasmActivation::new(
+            compiled,
+            test_ctx(store, plugin_id),
+            plugin_id.to_string(),
+            principal(plugin_id),
+        ))
+    }
+
+    /// Build one `WasmActivation` (its own runtime + store) from a prebuilt
+    /// fixture artifact under an arbitrary policy. Keeps the tempfile alive.
+    async fn build_activation(
+        component_path: PathBuf,
+        plugin_id: &str,
+        policy: HostPolicy,
+    ) -> (Arc<WasmActivation>, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         let runtime = ComponentRuntime::new().unwrap();
+        let activation = shared_activation(&runtime, &store, component_path, plugin_id, policy);
+        (activation, tmp)
+    }
+
+    async fn hooks_dispatcher(timeout: Duration) -> (WasmHookDispatcher, tempfile::NamedTempFile) {
         let mut policy = HostPolicy::deny_all();
         policy.limits.timeout = timeout;
-        let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
-        let activation = Arc::new(WasmActivation::new(
-            compiled,
-            ctx,
-            "acme-hooks".to_string(),
-            Principal {
-                plugin_id: "acme-hooks".to_string(),
-                plugin_name: "Acme Hooks".to_string(),
-            },
-        ));
+        let (activation, tmp) = build_activation(hooks_artifact(), "acme-hooks", policy).await;
         (WasmHookDispatcher::new(vec![activation]), tmp)
     }
 
@@ -288,5 +369,95 @@ mod tests {
                 event.as_str()
             );
         }
+    }
+
+    fn policy_with_fuel(timeout: Duration, fuel: u64) -> HostPolicy {
+        let mut policy = HostPolicy::deny_all();
+        policy.limits.timeout = timeout;
+        policy.limits.fuel = fuel;
+        policy
+    }
+
+    // ---------- IMP-2: skip components lacking the hooks export ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connector_only_component_is_not_a_hook_target() {
+        build_fixtures();
+        // A 1ms timeout would make any real hook call fail; the connector-only
+        // component must be excluded from the target set BEFORE any
+        // instantiation, so it is never instantiated and never warns.
+        let (connector, _c) = build_activation(
+            connector_artifact(),
+            "acme-tools",
+            policy_with_fuel(Duration::from_millis(1), 10_000_000),
+        )
+        .await;
+        let dispatcher = WasmHookDispatcher::new(vec![connector]);
+        assert!(
+            dispatcher.hook_target_ids().is_empty(),
+            "a connector-only component must not be a hook dispatch target"
+        );
+        let result = dispatcher
+            .dispatch(HookEvent::ToolBefore, &json!({ "tool": "deny" }))
+            .await;
+        assert!(
+            result.allowed,
+            "with no hooks-exporting component, tool.before allows without instantiation"
+        );
+    }
+
+    // ---------- IMP-1: per-component engine isolates epoch counters ----------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_timeout_does_not_flip_another_components_deny() {
+        build_fixtures();
+        // Compile BOTH components on ONE ComponentRuntime, exactly as
+        // production does. That is the only configuration under which the old
+        // bug could occur: a single shared `Engine` (hence a single shared
+        // epoch counter) across all enabled components. The IMP-1 fix gives
+        // each `CompiledComponent` its own engine even off a shared runtime.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+        let runtime = ComponentRuntime::new().unwrap();
+        // A: always loops, short timeout — it traps and calls
+        // `increment_epoch()` on ITS engine at ~30ms.
+        let loop_component = shared_activation(
+            &runtime,
+            &store,
+            hooks_loop_artifact(),
+            "loop-plugin",
+            policy_with_fuel(Duration::from_millis(30), u64::MAX),
+        );
+        // B: spins (well within its own 30s budget + unbounded fuel) then
+        // returns `rejected`. With per-component engines (IMP-1), A's timeout
+        // must NOT trip B's epoch deadline, so B's deny survives. Under the old
+        // shared-engine bug, A's `increment_epoch` would trap B mid-spin,
+        // making B fail open (allow) — silently dropping the deny.
+        let deny_component = shared_activation(
+            &runtime,
+            &store,
+            hooks_artifact(),
+            "deny-plugin",
+            policy_with_fuel(Duration::from_secs(30), u64::MAX),
+        );
+        let dispatcher = WasmHookDispatcher::new(vec![loop_component, deny_component]);
+
+        let result = dispatcher
+            .dispatch(HookEvent::ToolBefore, &json!({ "tool": "spinreject" }))
+            .await;
+        assert!(
+            !result.allowed,
+            "the deny component's rejection must survive the other component's \
+             concurrent timeout — epoch counters are isolated per component"
+        );
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deny-plugin"),
+            "the surviving denial must be the deny component's: {:?}",
+            result.message
+        );
     }
 }

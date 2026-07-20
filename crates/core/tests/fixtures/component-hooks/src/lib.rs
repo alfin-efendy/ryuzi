@@ -29,6 +29,20 @@ impl Guest for Fixture {
             })
             .unwrap_or_default();
 
+        // Spin for a bounded but large number of iterations, then reject. Used
+        // by the epoch-isolation regression: this component must still be
+        // executing (well within its own budget) when ANOTHER component hits
+        // its timeout, so its `rejected` (deny) must survive. `black_box` keeps
+        // the loop from being optimized away.
+        if payload.contains("spinreject") {
+            let mut counter: u64 = 0;
+            for _ in 0..3_000_000_000u64 {
+                counter = counter.wrapping_add(1);
+                std::hint::black_box(counter);
+            }
+            return Err(HookError::Rejected);
+        }
+
         // `black_box` keeps the optimizer from eliding this otherwise
         // side-effect-free loop, so the host's fuel/epoch budget really fires.
         if payload.contains("boom") {
