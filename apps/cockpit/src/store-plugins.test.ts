@@ -1,6 +1,6 @@
 import { test, expect, spyOn } from "bun:test";
-import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll } from "./store-plugins";
-import { commands, type CatalogStatus, type DoctorFinding, type PluginInfo } from "./bindings";
+import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll, FIRST_PARTY_BUNDLE_IDS } from "./store-plugins";
+import { commands, type CatalogStatus, type ComponentReleaseDetail, type DoctorFinding, type PluginInfo } from "./bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
 function reset() {
@@ -10,7 +10,21 @@ function reset() {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
+    catalogStatus: null,
+    componentBootstrapStatus: null,
+    componentPlugins: [],
+    componentPluginsLoaded: false,
   });
+}
+
+function componentReleaseDetail(over: Partial<ComponentReleaseDetail> = {}): ComponentReleaseDetail {
+  return {
+    pluginId: "mimo",
+    releases: [],
+    activeVersion: null,
+    activeManifest: null,
+    ...over,
+  };
 }
 
 // `load()` also calls `pluginsRestartRequired` — every test that exercises it
@@ -387,4 +401,192 @@ test("summarizeUpdateAll counts updated/needsReack/failed outcomes", () => {
     { id: "e", outcome: { kind: "alreadyCurrent" } },
   ]);
   expect(summary).toBe("2 updated, 1 need re-review, 1 failed");
+});
+
+// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+
+test("FIRST_PARTY_BUNDLE_IDS mirrors the core constant", () => {
+  expect(FIRST_PARTY_BUNDLE_IDS).toEqual(["mimo", "opencode"]);
+});
+
+test("loadComponentBootstrapStatus populates componentBootstrapStatus", async () => {
+  reset();
+  const spy = spyOn(commands, "componentBootstrapStatus").mockResolvedValue({
+    status: "ok",
+    data: { pending: true, message: "network unreachable" },
+  });
+
+  await usePlugins.getState().loadComponentBootstrapStatus();
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER);
+  expect(usePlugins.getState().componentBootstrapStatus).toEqual({ pending: true, message: "network unreachable" });
+  spy.mockRestore();
+});
+
+test("loadComponentBootstrapStatus leaves the prior status untouched on error", async () => {
+  reset();
+  usePlugins.setState({ componentBootstrapStatus: { pending: false, message: null } });
+  const spy = spyOn(commands, "componentBootstrapStatus").mockResolvedValue({ status: "error", error: { message: "boom" } });
+
+  await usePlugins.getState().loadComponentBootstrapStatus();
+
+  expect(usePlugins.getState().componentBootstrapStatus).toEqual({ pending: false, message: null });
+  spy.mockRestore();
+});
+
+test("loadComponentPlugins fetches every known first-party id and keeps only the ok results", async () => {
+  reset();
+  const spy = spyOn(commands, "pluginReleaseDetail").mockImplementation(async (_runnerId, id) => {
+    if (id === "mimo") return { status: "ok", data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }) };
+    return { status: "error", error: { message: "boom" } };
+  });
+
+  await usePlugins.getState().loadComponentPlugins();
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo");
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode");
+  expect(usePlugins.getState().componentPlugins).toEqual([componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" })]);
+  expect(usePlugins.getState().componentPluginsLoaded).toBe(true);
+  spy.mockRestore();
+});
+
+test("pluginReleaseDetail returns the fetched detail", async () => {
+  reset();
+  const detail = componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.2.0" });
+  const spy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: detail });
+
+  const result = await usePlugins.getState().pluginReleaseDetail("mimo");
+
+  expect(spy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo");
+  expect(result).toEqual(detail);
+  spy.mockRestore();
+});
+
+test("pluginReleaseDetail toasts and returns null on error", async () => {
+  reset();
+  const spy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "error", error: { message: "boom" } });
+
+  const result = await usePlugins.getState().pluginReleaseDetail("mimo");
+
+  expect(result).toBeNull();
+  spy.mockRestore();
+});
+
+test("installComponentPlugin installs, reloads componentPlugins, and returns the release detail", async () => {
+  reset();
+  const installed = componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.2.0" });
+  const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({ status: "ok", data: installed });
+  const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: installed });
+
+  const result = await usePlugins.getState().installComponentPlugin("mimo");
+
+  expect(installSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null);
+  expect(result).toEqual(installed);
+  expect(usePlugins.getState().componentPlugins).toEqual([installed, installed]);
+  expect(usePlugins.getState().componentPluginsLoaded).toBe(true);
+  installSpy.mockRestore();
+  detailSpy.mockRestore();
+});
+
+test("installComponentPlugin passes an explicit version through", async () => {
+  reset();
+  const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({
+    status: "ok",
+    data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }),
+  });
+  const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({
+    status: "ok",
+    data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }),
+  });
+
+  await usePlugins.getState().installComponentPlugin("mimo", "0.1.0");
+
+  expect(installSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", "0.1.0");
+  installSpy.mockRestore();
+  detailSpy.mockRestore();
+});
+
+test("installComponentPlugin toasts the error and returns null without touching componentPlugins", async () => {
+  reset();
+  const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({
+    status: "error",
+    error: { message: "disabled until…" },
+  });
+
+  const result = await usePlugins.getState().installComponentPlugin("mimo");
+
+  expect(result).toBeNull();
+  expect(usePlugins.getState().componentPluginsLoaded).toBe(false);
+  installSpy.mockRestore();
+});
+
+test("rollbackComponentPlugin dispatches from/to versions, reloads componentPlugins, and returns the release detail", async () => {
+  reset();
+  const rolledBack = componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" });
+  const rollbackSpy = spyOn(commands, "rollbackComponentPlugin").mockResolvedValue({ status: "ok", data: rolledBack });
+  const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: rolledBack });
+
+  const result = await usePlugins.getState().rollbackComponentPlugin("mimo", "0.2.0", "0.1.0");
+
+  expect(rollbackSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", "0.2.0", "0.1.0");
+  expect(result).toEqual(rolledBack);
+  expect(usePlugins.getState().componentPluginsLoaded).toBe(true);
+  rollbackSpy.mockRestore();
+  detailSpy.mockRestore();
+});
+
+test("rollbackComponentPlugin toasts the error and returns null", async () => {
+  reset();
+  const rollbackSpy = spyOn(commands, "rollbackComponentPlugin").mockResolvedValue({
+    status: "error",
+    error: { message: "no such version" },
+  });
+
+  const result = await usePlugins.getState().rollbackComponentPlugin("mimo", "0.2.0", "9.9.9");
+
+  expect(result).toBeNull();
+  rollbackSpy.mockRestore();
+});
+
+test("retryComponentBootstrap installs every known first-party id, then reloads status and componentPlugins", async () => {
+  reset();
+  const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({
+    status: "ok",
+    data: componentReleaseDetail(),
+  });
+  const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: componentReleaseDetail() });
+  const statusSpy = spyOn(commands, "componentBootstrapStatus").mockResolvedValue({
+    status: "ok",
+    data: { pending: false, message: null },
+  });
+
+  await usePlugins.getState().retryComponentBootstrap();
+
+  expect(installSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null);
+  expect(installSpy).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode", null);
+  expect(statusSpy).toHaveBeenCalled();
+  expect(usePlugins.getState().componentBootstrapStatus).toEqual({ pending: false, message: null });
+  installSpy.mockRestore();
+  detailSpy.mockRestore();
+  statusSpy.mockRestore();
+});
+
+test("retryComponentBootstrap tolerates a per-id install failure and still refreshes the pending status", async () => {
+  reset();
+  const installSpy = spyOn(commands, "installComponentPlugin").mockImplementation(async (_runnerId, id) => {
+    if (id === "mimo") return { status: "ok", data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }) };
+    return { status: "error", error: { message: "still unreachable" } };
+  });
+  const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: componentReleaseDetail() });
+  const statusSpy = spyOn(commands, "componentBootstrapStatus").mockResolvedValue({
+    status: "ok",
+    data: { pending: true, message: "opencode still unreachable" },
+  });
+
+  await usePlugins.getState().retryComponentBootstrap();
+
+  expect(usePlugins.getState().componentBootstrapStatus).toEqual({ pending: true, message: "opencode still unreachable" });
+  installSpy.mockRestore();
+  detailSpy.mockRestore();
+  statusSpy.mockRestore();
 });
