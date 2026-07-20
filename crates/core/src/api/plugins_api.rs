@@ -1731,27 +1731,38 @@ async fn install_component_plugin(
     plugin_release_detail(cp, plugin_id).await
 }
 
-/// Roll a component plugin off a bad release: revoke + deactivate
-/// `from_version`, re-point the active release to the prior-good `to_version`
-/// (rejected by the store if that version is missing or itself revoked), and
-/// mark the host restart-required so the rolled-back bundle is loaded fresh on
-/// the next session/boot (the same reload signal `uninstall_plugin` uses).
+/// Roll a component plugin off a bad release: re-point the active release to the
+/// prior-good `to_version`, revoke + deactivate `from_version`, and mark the
+/// host restart-required so the rolled-back bundle is loaded fresh on the next
+/// session/boot (the same reload signal `uninstall_plugin` uses).
+///
+/// ORDER MATTERS: `set_active_component_release` runs first. It validates — in
+/// one transaction, before mutating anything — that `to_version` exists and is
+/// not revoked, so a missing/revoked target is a clean no-op that leaves
+/// `from_version` still active. Only once the good version is active do we
+/// revoke the bad one, so a failed reactivation can NEVER strand the plugin with
+/// no active release (the non-atomic revoke-first ordering could).
 async fn rollback_component_plugin(
     cp: &ControlPlane,
     plugin_id: &str,
     from_version: &str,
     to_version: &str,
 ) -> anyhow::Result<ComponentReleaseDetail> {
+    if from_version == to_version {
+        anyhow::bail!(
+            "cannot roll back {plugin_id} to the same version being revoked ({from_version})"
+        );
+    }
     let store = cp.store();
+    store
+        .set_active_component_release(plugin_id, to_version)
+        .await?;
     store
         .mark_component_release_revoked(
             plugin_id,
             from_version,
             &format!("rolled back to {to_version}"),
         )
-        .await?;
-    store
-        .set_active_component_release(plugin_id, to_version)
         .await?;
     cp.mark_plugins_restart_required();
     plugin_release_detail(cp, plugin_id).await
@@ -3589,6 +3600,80 @@ mod tests {
         assert!(
             cp.plugins_restart_required(),
             "rollback must signal a host reload"
+        );
+    }
+
+    // IMP-1: rollback whose target does NOT exist must be a clean no-op — the
+    // bad version stays ACTIVE and un-revoked, never leaving the plugin with no
+    // active release despite the RPC reporting failure.
+    #[tokio::test]
+    async fn rollback_is_a_no_op_when_target_version_is_missing() {
+        let cp = test_cp().await;
+        cp.store()
+            .upsert_component_release(&component_release("0.2.0"))
+            .await
+            .unwrap();
+        cp.store()
+            .set_active_component_release("mimo", "0.2.0")
+            .await
+            .unwrap();
+
+        match rollback_component_plugin(&cp, "mimo", "0.2.0", "9.9.9").await {
+            Ok(_) => panic!("rollback to a missing target version must fail"),
+            Err(err) => assert!(
+                err.to_string().contains("no component release"),
+                "unexpected error: {err}"
+            ),
+        }
+        let active = cp
+            .store()
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .expect("the bad version must remain active after a failed rollback");
+        assert_eq!(active.version, "0.2.0");
+        assert!(
+            !active.revoked,
+            "the bad version must not have been revoked"
+        );
+    }
+
+    // IMP-1: rollback to a REVOKED target is likewise a clean no-op.
+    #[tokio::test]
+    async fn rollback_is_a_no_op_when_target_version_is_revoked() {
+        let cp = test_cp().await;
+        for v in ["0.1.0", "0.2.0"] {
+            cp.store()
+                .upsert_component_release(&component_release(v))
+                .await
+                .unwrap();
+        }
+        cp.store()
+            .set_active_component_release("mimo", "0.2.0")
+            .await
+            .unwrap();
+        cp.store()
+            .mark_component_release_revoked("mimo", "0.1.0", "bad")
+            .await
+            .unwrap();
+
+        match rollback_component_plugin(&cp, "mimo", "0.2.0", "0.1.0").await {
+            Ok(_) => panic!("rollback to a revoked target version must fail"),
+            Err(err) => assert!(
+                err.to_string().contains("revoked"),
+                "unexpected error: {err}"
+            ),
+        }
+        let active = cp
+            .store()
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .expect("the bad version must remain active after a failed rollback");
+        assert_eq!(active.version, "0.2.0");
+        assert!(
+            !active.revoked,
+            "the bad version must not have been revoked on a failed rollback"
         );
     }
 

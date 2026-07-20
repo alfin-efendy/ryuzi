@@ -524,6 +524,54 @@ async fn get_2xx(http: &dyn CatalogHttp, url: &str) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// Reject a staged-component filename that is not a strictly-relative path
+/// contained in its staging dir. `manifest.component` is ATTACKER-NAMED — it
+/// comes from the fetched, still-UNVERIFIED `ryuzi-plugin.toml`, and is staged
+/// via `staging_dir.join(name)`, where an absolute path or a drive/UNC prefix
+/// replaces the staging root outright and `..` is not normalized. Only
+/// `Normal`/`CurDir` path components are allowed; a root, drive/UNC prefix, or
+/// `..` (`ParentDir`) is rejected BEFORE any filesystem write, so a malicious
+/// feed cannot turn the staging step into an arbitrary-file-write primitive.
+/// (`verify_bundle` re-checks containment, but only after the wasm is staged,
+/// so this pre-write guard is the load-bearing one here.)
+fn sanitize_staged_component(name: &str) -> anyhow::Result<()> {
+    use std::path::{Component, Path};
+    if name.is_empty() {
+        anyhow::bail!("component filename must not be empty");
+    }
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => anyhow::bail!(
+                "component filename {name:?} must be a relative path inside the bundle \
+                 (no absolute path, drive/UNC prefix, or '..')"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Reject a `component_url` that is not same-origin (scheme + host + port) with
+/// the release `base_url`. The URL comes from the fetched, still-UNVERIFIED
+/// `release.json`; without this constraint it is an arbitrary outbound-fetch
+/// (SSRF) primitive — and, paired with an unsanitized staged filename, an
+/// arbitrary-fetch-then-arbitrary-write. First-party releases keep the wasm on
+/// the same host as the release base (both are GitHub release assets), so this
+/// never rejects a legitimate artifact.
+fn require_same_origin(base_url: &str, component_url: &str) -> anyhow::Result<()> {
+    let base = url::Url::parse(base_url).context("parsing component release base url")?;
+    let target = url::Url::parse(component_url).context("parsing release component_url")?;
+    let same = base.scheme() == target.scheme()
+        && base.host_str() == target.host_str()
+        && base.port_or_known_default() == target.port_or_known_default();
+    if !same {
+        anyhow::bail!(
+            "release component_url {component_url:?} is not same-origin with the release base {base_url:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve, download, stage, VERIFY, and install+activate one signed component
 /// release for `plugin_id` (optionally pinned to `version`). Fetches the four
 /// bundle artifacts (see this section's doc), stages them into a throwaway
@@ -581,6 +629,16 @@ pub async fn install_component_release(
             );
         }
     }
+
+    // SECURITY: `manifest.component` and `release.component_url` both come from
+    // the fetched, still-UNVERIFIED descriptors. Constrain them BEFORE any
+    // outbound fetch or filesystem write — `verify_bundle`'s own containment
+    // check runs only AFTER the wasm is staged, so it cannot guard the write.
+    //   1. Arbitrary-file-write: the staged wasm filename must stay inside the
+    //      staging dir (no absolute path / drive-UNC prefix / `..`).
+    //   2. SSRF: the wasm must be fetched from the release base's own origin.
+    sanitize_staged_component(&manifest.component)?;
+    require_same_origin(base_url, &release.component_url)?;
 
     // Download the component wasm named by the release.
     let component_bytes = get_2xx(http, &release.component_url).await?;
@@ -752,12 +810,27 @@ mod component_install_tests {
     }
 
     /// Build a fully valid, signed set of the four artifacts for `(id,
-    /// version)` under `key`/`key_id`.
+    /// version)` under `key`/`key_id`. The wasm host matches the tests' base
+    /// `http://feed.test/latest` (same-origin).
     fn build_artifacts(id: &str, version: &str, key: &SigningKey, key_id: &str) -> Artifacts {
-        let wasm = format!("wasm bytes for {id} {version}").into_bytes();
-        let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let component = format!("{id}.wasm");
         let component_url = format!("http://feed.test/{id}-{version}/{component}");
+        build_artifacts_full(id, version, key, key_id, &component, &component_url)
+    }
+
+    /// Like [`build_artifacts`] but with an explicit staged-component filename
+    /// and wasm URL — the security tests drive a malicious `component` or a
+    /// cross-origin `component_url` through here.
+    fn build_artifacts_full(
+        id: &str,
+        version: &str,
+        key: &SigningKey,
+        key_id: &str,
+        component: &str,
+        component_url: &str,
+    ) -> Artifacts {
+        let wasm = format!("wasm bytes for {id} {version}").into_bytes();
+        let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
         let manifest_toml = format!(
             "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
         )
@@ -777,7 +850,7 @@ mod component_install_tests {
             release_json,
             sig_json,
             wasm,
-            component_url,
+            component_url: component_url.to_string(),
         }
     }
 
@@ -916,6 +989,125 @@ mod component_install_tests {
             format!("{err:#}").contains("hash mismatch"),
             "unexpected error: {err:#}"
         );
+    }
+
+    // SECURITY (Critical): a manifest whose `component` is an ABSOLUTE path must
+    // be rejected BEFORE any file is written — `staging.join(component)` must
+    // never escape the staging dir and write the (also-unverified) wasm bytes to
+    // an arbitrary location the daemon can reach.
+    #[tokio::test]
+    async fn install_pipeline_rejects_absolute_component_path() {
+        let (store, _tmp) = test_store().await;
+        let root = tempfile::tempdir().unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        let base = "http://feed.test/latest";
+
+        // A path OUTSIDE any staging dir that the malicious component name points
+        // at; if the write is not blocked, `evil.wasm` would be created here.
+        let evil_dir = tempfile::tempdir().unwrap();
+        let evil_path = evil_dir.path().join("evil.wasm");
+        // Forward slashes so the path embeds in a double-quoted TOML string
+        // (backslashes are TOML escapes) while staying an absolute path.
+        let component = evil_path.to_string_lossy().replace('\\', "/");
+        assert!(std::path::Path::new(&component).is_absolute());
+
+        let http = FakeReleaseHttp::new();
+        // component_url stays same-origin, so the SANITIZE check (not the SSRF
+        // check) is what must reject this.
+        let a = build_artifacts_full(
+            "mimo",
+            "0.1.0",
+            &bundle_key(),
+            KEY_ID,
+            &component,
+            "http://feed.test/mimo.wasm",
+        );
+        http.register_latest(base, "mimo", &a);
+
+        let err = install_component_release(&http, &installer, &trusted(), base, "mimo", None)
+            .await
+            .expect_err("an absolute component path must be rejected before any write");
+        assert!(
+            format!("{err:#}").contains("relative path"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !evil_path.exists(),
+            "no file may be written to the attacker-named absolute path"
+        );
+        assert!(store
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // SECURITY (Critical): a `..` escape in the component name must be rejected
+    // before any write (PathBuf::join does not normalize `..`).
+    #[tokio::test]
+    async fn install_pipeline_rejects_parent_dir_escape_in_component() {
+        let (store, _tmp) = test_store().await;
+        let root = tempfile::tempdir().unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        let base = "http://feed.test/latest";
+        let http = FakeReleaseHttp::new();
+        let a = build_artifacts_full(
+            "mimo",
+            "0.1.0",
+            &bundle_key(),
+            KEY_ID,
+            "../evil.wasm",
+            "http://feed.test/mimo.wasm",
+        );
+        http.register_latest(base, "mimo", &a);
+
+        let err = install_component_release(&http, &installer, &trusted(), base, "mimo", None)
+            .await
+            .expect_err("a '..' escape in the component path must be rejected");
+        assert!(
+            format!("{err:#}").contains("relative path"),
+            "unexpected error: {err:#}"
+        );
+        assert!(store
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // SECURITY (Important): the wasm URL from the unverified release.json must be
+    // same-origin with the release base — no arbitrary outbound fetch (SSRF).
+    #[tokio::test]
+    async fn install_pipeline_rejects_cross_origin_component_url() {
+        let (store, _tmp) = test_store().await;
+        let root = tempfile::tempdir().unwrap();
+        let installer = ComponentBundleInstaller::new(root.path().to_path_buf(), store.clone());
+        let base = "http://feed.test/latest";
+        let http = FakeReleaseHttp::new();
+        // Valid relative component name, but the wasm URL points at a DIFFERENT
+        // host than the release base.
+        let a = build_artifacts_full(
+            "mimo",
+            "0.1.0",
+            &bundle_key(),
+            KEY_ID,
+            "mimo.wasm",
+            "http://evil.test/mimo.wasm",
+        );
+        http.register_latest(base, "mimo", &a);
+
+        let err = install_component_release(&http, &installer, &trusted(), base, "mimo", None)
+            .await
+            .expect_err("a cross-origin component_url must be rejected");
+        assert!(
+            format!("{err:#}").contains("same-origin"),
+            "unexpected error: {err:#}"
+        );
+        assert!(store
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     async fn installer_for(store: &Store) -> (ComponentBundleInstaller, tempfile::TempDir) {
