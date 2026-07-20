@@ -655,7 +655,8 @@ two-phase trust gate, attach-status + doctor) built on top of it.
 
 Every skill/plugin-pack install or update writes one row to a `plugin_installs`
 table in the same SQLite database as the rest of Ryuzi's state (see the
-migration in `crates/core/src/store.rs`, and `PluginInstallRecord`):
+`plugin_installs` schema in `crates/core/src/store.rs`, and
+`PluginInstallRecord`):
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -1344,7 +1345,7 @@ remove the line.
 The `session_search` native tool
 (`crates/core/src/harness/native/tools/session_search.rs`) gives a session
 DISCOVERY-style recall over past conversations, backed by the `messages_fts`
-FTS5 index (migration #28 — see `Store::search_messages_fts`). It excludes
+FTS5 index (see `Store::search_messages_fts`). It excludes
 the calling session's own lineage (recall is for *past* sessions, not the
 current thread) and excludes worker/review sessions outright, so
 learning-loop chatter (nudge captures, review forks) never pollutes what a
@@ -1405,7 +1406,7 @@ the embedded set, so new/updated integrations (and revocations) can ship
 between releases. Engine code: `crates/core/src/plugins/remote_catalog.rs`
 (fetch/verify/cache + the background cadence), `catalog_feed_key.rs` (the
 embedded public key), `catalog.rs`'s `merged_catalog_plugins` (the
-version-gated merge), and migration 24 in `store.rs` (the cache tables).
+version-gated merge), and the catalog cache tables in `store.rs`.
 Publish tooling: `scripts/catalog/*.ts` (this section's second half).
 
 ### Feed format

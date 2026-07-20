@@ -26,7 +26,7 @@ pub struct GatewayRow {
     /// value-encrypted (`enc:v1:...` via `secrets::encrypt_field`) — NOT
     /// hashed, since Cockpit must recover and replay it as a bearer on every
     /// call to the remote runner. Contrast with the server-side `devices`
-    /// table (migration 24), which stores only a hash.
+    /// table, which stores only a hash.
     pub device_token: Option<String>,
 }
 

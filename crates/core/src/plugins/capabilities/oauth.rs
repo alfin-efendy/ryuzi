@@ -1,9 +1,9 @@
 //! Host-side OAuth *profile* logic (Task 8 slice 2a). A plugin bundle may
 //! declare more than one `[[oauth]]` profile (see
 //! `ryuzi_plugin_sdk::OAuthProfile`), so every operation here is keyed by
-//! `(ctx.plugin_id, profile_id)` against the profile-scoped tables added in
-//! `store.rs` migration 44 (`plugin_oauth_profile_tokens` /
-//! `plugin_oauth_profile_clients`).
+//! `(ctx.plugin_id, profile_id)` against the profile-scoped
+//! `plugin_oauth_profile_tokens` / `plugin_oauth_profile_clients` tables in
+//! `store.rs`.
 //!
 //! # A component never sees the raw token
 //! [`ProfileOauth::begin_pkce`] returns the PKCE verifier and authorize URL
