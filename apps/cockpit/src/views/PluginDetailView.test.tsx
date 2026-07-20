@@ -357,6 +357,13 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   if (id === "vercel-sandbox") return ok(sandboxDetail);
   if (id === "acme-ext") return ok(extensionDetail);
   if (id === "acme-pack") return ok({ ...skillPackDetail, info: { ...skillPackDetail.info, pinned: acmePackPinned } });
+  // Component (WASM bundle) plugins — e.g. mimo/opencode — are never
+  // `CorePlugin`s, so `plugin_detail` 404s for them with this EXACT message
+  // shape (`anyhow::bail!("unknown plugin: {id}")` in `assemble_detail`).
+  // The view must suppress the toast for precisely this shape (component-only
+  // render below) while still toasting the generic "unknown plugin" fallback
+  // (no id) used by the ghost-id test.
+  if (id === "mimo" || id === "opencode") return err(`unknown plugin: ${id}`);
   return err("unknown plugin");
 });
 const setPluginEnabled = mock((_runnerId: string, _id: string, _enabled: boolean) => ok(null));
@@ -385,6 +392,73 @@ const setPluginPin = mock((_runnerId: string, id: string, pinned: boolean, _reas
   return ok(null);
 });
 const openUrl = mock(async (_url: string) => {});
+
+// Task 12: `PluginDetailView` now also fetches `pluginReleaseDetail` for the
+// component-release card. Every fixture here defaults to "no releases" (a
+// non-component plugin id), matching the RPC's real behavior for an id with
+// no `component_plugin_releases` rows — so pre-existing tests are unaffected
+// unless they opt into a component-plugin fixture.
+type ReleaseInfoFixture = {
+  pluginId: string;
+  version: string;
+  sourceUrl: string;
+  sha256: string;
+  signingKeyId: string;
+  installedAt: number;
+  active: boolean;
+  revoked: boolean;
+  revocationReason: string | null;
+  firstParty: boolean;
+};
+type ReleaseDetailFixture = {
+  pluginId: string;
+  releases: ReleaseInfoFixture[];
+  activeVersion: string | null;
+  activeManifest: {
+    publisher: string;
+    description: string;
+    lifecycle: string;
+    domains: string[];
+    oauthProfiles: { id: string; scopes: string[] }[];
+  } | null;
+};
+const emptyReleaseDetail = (id: string): ReleaseDetailFixture => ({
+  pluginId: id,
+  releases: [],
+  activeVersion: null,
+  activeManifest: null,
+});
+function releaseInfo(over: Partial<ReleaseInfoFixture> = {}): ReleaseInfoFixture {
+  return {
+    pluginId: "mimo",
+    version: "0.1.0",
+    sourceUrl: "https://feed.test/mimo/0.1.0",
+    sha256: "0".repeat(64),
+    signingKeyId: "first-party",
+    installedAt: 1_751_500_800_000,
+    active: false,
+    revoked: false,
+    revocationReason: null,
+    firstParty: true,
+    ...over,
+  };
+}
+// mimo's fixture is mutable so tests can install a multi-release, active
+// manifest scenario for the permission-summary/rollback/one-active-version
+// tests, while every other id stays "never a component plugin" by default.
+let mimoReleaseFixture: ReleaseDetailFixture = emptyReleaseDetail("mimo");
+const pluginReleaseDetail = mock(async (_runnerId: string, id: string) => ({
+  status: "ok" as const,
+  data: id === "mimo" ? mimoReleaseFixture : emptyReleaseDetail(id),
+}));
+const installComponentPlugin = mock(async (_runnerId: string, id: string, _version: string | null) => ({
+  status: "ok" as const,
+  data: id === "mimo" ? mimoReleaseFixture : emptyReleaseDetail(id),
+}));
+const rollbackComponentPlugin = mock(async (_runnerId: string, id: string, _fromVersion: string, _toVersion: string) => ({
+  status: "ok" as const,
+  data: id === "mimo" ? mimoReleaseFixture : emptyReleaseDetail(id),
+}));
 const pluginOauthAuthorizeUrlMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {},
 );
@@ -421,6 +495,9 @@ mock.module("@/bindings", () => ({
     updatePlugin,
     setPluginPin,
     extensionStatus,
+    pluginReleaseDetail,
+    installComponentPlugin,
+    rollbackComponentPlugin,
   },
 }));
 mock.module("@tauri-apps/plugin-opener", () => ({ openUrl }));
@@ -449,9 +526,13 @@ beforeEach(() => {
   updatePlugin.mockClear();
   setPluginPin.mockClear();
   extensionStatus.mockClear();
+  pluginReleaseDetail.mockClear();
+  installComponentPlugin.mockClear();
+  rollbackComponentPlugin.mockClear();
   doctorFindingsFixture = [];
   extensionStatusFixture = [];
   acmePackPinned = false;
+  mimoReleaseFixture = emptyReleaseDetail("mimo");
   openUrl.mockClear();
   usePlugins.setState({
     plugins: [],
@@ -459,6 +540,9 @@ beforeEach(() => {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
+    componentBootstrapStatus: null,
+    componentPlugins: [],
+    componentPluginsLoaded: false,
   });
 });
 
@@ -470,6 +554,9 @@ afterEach(() => {
     restartRequired: false,
     doctorFindings: [],
     doctorLoaded: false,
+    componentBootstrapStatus: null,
+    componentPlugins: [],
+    componentPluginsLoaded: false,
   });
 });
 
@@ -800,4 +887,147 @@ test("extension_status entries for a different plugin are filtered out", async (
 
   expect(await screen.findByText("No extension status reported yet.")).toBeTruthy();
   expect(screen.queryByText("other")).toBeNull();
+});
+
+// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+//
+// mimo/opencode are never `CorePlugin`s, so `pluginDetail("mimo")` 404s
+// (`unknown plugin: mimo` — see the `pluginDetail` mock above) and the view
+// falls back to the component-only render driven entirely by
+// `pluginReleaseDetail`.
+
+test("a never-installed component plugin opens its management page (not 'Plugin not found') and never toasts the expected 404", async () => {
+  render(<PluginDetailView id="mimo" />);
+
+  expect(await screen.findByText("mimo")).toBeTruthy();
+  expect(screen.getByText("Component plugin (WASM bundle)")).toBeTruthy();
+  expect(screen.getByText("Not installed")).toBeTruthy();
+  expect(screen.queryByText("Plugin not found.")).toBeNull();
+});
+
+test("an unrelated unknown plugin id still shows Plugin not found", async () => {
+  render(<PluginDetailView id="ghost-2" />);
+  expect(await screen.findByText("Plugin not found.")).toBeTruthy();
+});
+
+test("install is DISABLED until the permission-acceptance switch is toggled, then dispatches installComponentPlugin", async () => {
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  const install = screen.getByRole("button", { name: "Install" }) as HTMLButtonElement;
+  expect(install.disabled).toBe(true);
+
+  fireEvent.click(screen.getByRole("switch", { name: "Accept permissions" }));
+  expect((screen.getByRole("button", { name: "Install" }) as HTMLButtonElement).disabled).toBe(false);
+
+  fireEvent.click(screen.getByRole("button", { name: "Install" }));
+  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null));
+});
+
+test("the permission summary shows 'Unknown until…' before any release is installed", async () => {
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.getByText(/Unknown until a release is fetched and its signature is verified/)).toBeTruthy();
+});
+
+test("the permission summary renders the active release's publisher, lifecycle, domains, and OAuth profiles", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.2.0",
+    releases: [releaseInfo({ version: "0.2.0", active: true, installedAt: 1_751_500_800_000 })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "Xiaomi MiMo free-tier chat provider.",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [{ id: "github", scopes: ["repo", "read:user"] }],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.getByText("Ryuzi")).toBeTruthy();
+  expect(screen.getByText(/Per call — a fresh instance every call/)).toBeTruthy();
+  expect(screen.getByText("api.xiaomimimo.com")).toBeTruthy();
+  expect(screen.getByText(/github \(repo, read:user\)/)).toBeTruthy();
+  // Update button label flips once a version is active.
+  expect(screen.getByRole("button", { name: "Update to latest" })).toBeTruthy();
+});
+
+test("exactly one release shows the Active badge among several (one-active-version display)", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.3.0",
+    releases: [
+      releaseInfo({ version: "0.1.0", active: false, revoked: true, revocationReason: "superseded" }),
+      releaseInfo({ version: "0.2.0", active: false }),
+      releaseInfo({ version: "0.3.0", active: true }),
+    ],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.getAllByText("Active").length).toBe(1);
+  expect(screen.getByText("0.1.0")).toBeTruthy();
+  expect(screen.getByText("0.2.0")).toBeTruthy();
+  expect(screen.getByText("0.3.0")).toBeTruthy();
+});
+
+test("rolling back to a prior good version dispatches rollbackComponentPlugin with the active version as `from`", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.2.0",
+    releases: [releaseInfo({ version: "0.1.0", active: false }), releaseInfo({ version: "0.2.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.xiaomimimo.com"],
+      oauthProfiles: [],
+    },
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  fireEvent.click(screen.getByRole("button", { name: "Roll back to 0.1.0" }));
+  await waitFor(() => expect(rollbackComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", "0.2.0", "0.1.0"));
+});
+
+test("a revoked release offers no Roll back action, and the active release offers none either", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.2.0",
+    releases: [
+      releaseInfo({ version: "0.1.0", active: false, revoked: true, revocationReason: "bad" }),
+      releaseInfo({ version: "0.2.0", active: true }),
+    ],
+    activeManifest: null,
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.queryByRole("button", { name: "Roll back to 0.1.0" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Roll back to 0.2.0" })).toBeNull();
+  expect(screen.getByText(/— bad/)).toBeTruthy();
+});
+
+test("a third-party (non-first-party) release is labeled distinctly from a first-party one", async () => {
+  mimoReleaseFixture = {
+    pluginId: "mimo",
+    activeVersion: "0.2.0",
+    releases: [releaseInfo({ version: "0.2.0", active: true, firstParty: false, signingKeyId: "some-other-key" })],
+    activeManifest: null,
+  };
+  render(<PluginDetailView id="mimo" />);
+  await screen.findByText("mimo");
+
+  expect(screen.getByText("Third-party (key: some-other-key)")).toBeTruthy();
 });

@@ -195,6 +195,24 @@ const completePluginOauth = mock(async (_runnerId: string, _pluginId: string, _c
 }));
 const setPluginSetting = mock(async (_runnerId: string, _key: string, _value: string) => ({ status: "ok" as const, data: null }));
 const setPluginEnabled = mock(async (_runnerId: string, _id: string, _enabled: boolean) => ({ status: "ok" as const, data: null }));
+
+// Task 12: the bootstrap-retry banner + "Component plugins" section fetch
+// these on mount. Defaults are the quiet/nothing-to-see shape so every
+// pre-existing test (which never touches component plugins) is unaffected.
+let componentBootstrapStatusFixture: { pending: boolean; message: string | null } = { pending: false, message: null };
+function emptyReleaseDetail(id: string) {
+  return { pluginId: id, releases: [] as unknown[], activeVersion: null as string | null, activeManifest: null };
+}
+const componentBootstrapStatus = mock(async () => ({ status: "ok" as const, data: componentBootstrapStatusFixture }));
+const pluginReleaseDetail = mock(async (_runnerId: string, id: string) => ({ status: "ok" as const, data: emptyReleaseDetail(id) }));
+const installComponentPlugin = mock(async (_runnerId: string, id: string, _version: string | null) => ({
+  status: "ok" as const,
+  data: emptyReleaseDetail(id),
+}));
+const rollbackComponentPlugin = mock(async (_runnerId: string, id: string, _fromVersion: string, _toVersion: string) => ({
+  status: "ok" as const,
+  data: emptyReleaseDetail(id),
+}));
 const pluginOauthCompletedMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; ok: boolean; error: string | null } }) => void) => () => {},
 );
@@ -234,6 +252,10 @@ mock.module("@/bindings", () => ({
     completePluginOauth,
     setPluginSetting,
     setPluginEnabled,
+    componentBootstrapStatus,
+    pluginReleaseDetail,
+    installComponentPlugin,
+    rollbackComponentPlugin,
   },
 }));
 // `refreshCatalog`'s store action toasts the outcome — mock the boundary
@@ -253,7 +275,7 @@ const { usePlugins } = await import("@/store-plugins");
 const { useGateways } = await import("@/store-gateways");
 const { useNav } = await import("@/store-nav");
 const { useConnections } = await import("@/store-connections");
-const { filterByCategory, PluginsView } = await import("./PluginsView");
+const { filterByCategory, bootstrapBannerMessage, componentPluginStatusLabel, PluginsView } = await import("./PluginsView");
 
 // Provider install/uninstall now flow through the connections store's installed
 // set, not the add-account modal. Override just those two actions with mocks and
@@ -282,6 +304,9 @@ function resetPluginsStore() {
     doctorFindings: [],
     doctorLoaded: false,
     catalogStatus: null,
+    componentBootstrapStatus: null,
+    componentPlugins: [],
+    componentPluginsLoaded: false,
   });
 }
 
@@ -290,6 +315,7 @@ beforeEach(() => {
   pluginsFixture = [github, notion];
   doctorFindingsFixture = [];
   catalogStatusFixture = { sequence: 0, lastFetchAt: null, outcome: null, entries: 0, blocked: 0 };
+  componentBootstrapStatusFixture = { pending: false, message: null };
   listApps.mockClear();
   addApp.mockClear();
   listPlugins.mockClear();
@@ -320,6 +346,10 @@ beforeEach(() => {
   toastError.mockClear();
   installProviderMock.mockClear();
   uninstallProviderMock.mockClear();
+  componentBootstrapStatus.mockClear();
+  pluginReleaseDetail.mockClear();
+  installComponentPlugin.mockClear();
+  rollbackComponentPlugin.mockClear();
   useConnections.setState({ installProvider: installProviderMock, uninstallProvider: uninstallProviderMock });
   useApps.setState({ apps: [], loaded: false, probing: null });
   resetPluginsStore();
@@ -622,4 +652,77 @@ test("a blocked catalog entry renders the Blocked badge and hides the Install bu
 
   expect(await screen.findByText("Blocked")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Install evil-plugin" })).toBeNull();
+});
+
+// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+
+test("bootstrapBannerMessage is null when there's nothing pending", () => {
+  expect(bootstrapBannerMessage(null)).toBeNull();
+  expect(bootstrapBannerMessage({ pending: false, message: null })).toBeNull();
+  expect(bootstrapBannerMessage({ pending: false, message: "stale message" })).toBeNull();
+});
+
+test("bootstrapBannerMessage surfaces the recorded retry message, or a generic fallback", () => {
+  expect(bootstrapBannerMessage({ pending: true, message: "opencode: network unreachable" })).toBe("opencode: network unreachable");
+  expect(bootstrapBannerMessage({ pending: true, message: null })).toBe(
+    "Some first-party component plugins couldn't be installed automatically.",
+  );
+});
+
+test("componentPluginStatusLabel reports the active version or Not installed", () => {
+  expect(componentPluginStatusLabel({ pluginId: "mimo", releases: [], activeVersion: "0.2.0", activeManifest: null })).toBe(
+    "v0.2.0 active",
+  );
+  expect(componentPluginStatusLabel({ pluginId: "mimo", releases: [], activeVersion: null, activeManifest: null })).toBe("Not installed");
+});
+
+test("renders the Component plugins section listing every known first-party id, regardless of tab", async () => {
+  await renderView();
+
+  expect(await screen.findByText("mimo")).toBeTruthy();
+  expect(screen.getByText("opencode")).toBeTruthy();
+  expect(screen.getAllByText("Not installed").length).toBe(2);
+
+  fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+  expect(screen.getByText("mimo")).toBeTruthy();
+});
+
+test("Manage navigates to the component plugin's detail view", async () => {
+  await renderView();
+  await screen.findByText("mimo");
+
+  fireEvent.click(screen.getByRole("button", { name: "Manage mimo" }));
+
+  expect(useNav.getState().history.current).toEqual({ kind: "pluginDetail", id: "mimo" });
+});
+
+test("shows the retryable bootstrap banner when component_bootstrap_status reports pending, and hides it otherwise", async () => {
+  componentBootstrapStatusFixture = { pending: true, message: "mimo: signature verification failed" };
+  await renderView();
+
+  expect(await screen.findByText("Component plugins need attention")).toBeTruthy();
+  expect(screen.getByText("mimo: signature verification failed")).toBeTruthy();
+});
+
+test("omits the bootstrap banner when nothing is pending", async () => {
+  await renderView();
+  await screen.findByText("mimo");
+
+  expect(screen.queryByText("Component plugins need attention")).toBeNull();
+});
+
+test("the bootstrap banner's Retry button reinstalls every known first-party id and refreshes the status", async () => {
+  componentBootstrapStatusFixture = { pending: true, message: "opencode: network unreachable" };
+  await renderView();
+  await screen.findByText("Component plugins need attention");
+
+  // The retry itself succeeds this time — flip the fixture before the click
+  // so the post-retry re-fetch reports resolved.
+  componentBootstrapStatusFixture = { pending: false, message: null };
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "mimo", null));
+  await waitFor(() => expect(installComponentPlugin).toHaveBeenCalledWith(LOCAL_RUNNER, "opencode", null));
+  await waitFor(() => expect(screen.queryByText("Component plugins need attention")).toBeNull());
+  expect(toastSuccess).toHaveBeenCalled();
 });
