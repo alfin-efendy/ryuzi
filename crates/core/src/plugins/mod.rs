@@ -27,6 +27,7 @@ pub mod catalog_feed_key;
 pub mod declarative;
 pub mod doctor;
 pub mod extension;
+pub mod first_party_key;
 pub mod host;
 pub mod oauth;
 pub mod providers;

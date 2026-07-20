@@ -108,6 +108,7 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
         // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         harness_factory: None,
+        component_bootstrap: None,
     }
 }
 
