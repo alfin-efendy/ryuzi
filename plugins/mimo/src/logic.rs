@@ -296,9 +296,15 @@ mod tests {
     fn fingerprint_is_a_stable_64_char_lowercase_hex() {
         let a = fingerprint_from_seed(b"seed-one");
         assert_eq!(a.len(), 64);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(a, fingerprint_from_seed(b"seed-one"), "same seed is stable");
-        assert_ne!(a, fingerprint_from_seed(b"seed-two"), "distinct seeds differ");
+        assert_ne!(
+            a,
+            fingerprint_from_seed(b"seed-two"),
+            "distinct seeds differ"
+        );
     }
 
     #[test]
@@ -307,7 +313,11 @@ mod tests {
         assert!(id.starts_with("ses_"));
         assert_eq!(id.len(), "ses_".len() + 24);
         assert!(id["ses_".len()..].chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(id, session_affinity_from_seed(b"install-x"), "stable per seed");
+        assert_eq!(
+            id,
+            session_affinity_from_seed(b"install-x"),
+            "stable per seed"
+        );
     }
 
     #[test]
@@ -321,8 +331,14 @@ mod tests {
     fn parse_bootstrap_jwt_extracts_a_non_empty_token() {
         let ok = parse_bootstrap_jwt(br#"{"jwt":"abc.def.ghi"}"#).unwrap();
         assert_eq!(ok, "abc.def.ghi");
-        assert!(parse_bootstrap_jwt(br#"{"jwt":""}"#).is_err(), "empty jwt rejected");
-        assert!(parse_bootstrap_jwt(br#"{"nope":1}"#).is_err(), "missing jwt rejected");
+        assert!(
+            parse_bootstrap_jwt(br#"{"jwt":""}"#).is_err(),
+            "empty jwt rejected"
+        );
+        assert!(
+            parse_bootstrap_jwt(br#"{"nope":1}"#).is_err(),
+            "missing jwt rejected"
+        );
         assert!(parse_bootstrap_jwt(b"not json").is_err());
     }
 
@@ -378,7 +394,10 @@ mod tests {
         };
         assert_eq!(get("user-agent"), Some(CHROME_UA));
         assert_eq!(get("x-mimo-source"), Some("mimocode-cli-free"));
-        assert_eq!(get("x-session-affinity"), Some("ses_0123456789abcdef01234567"));
+        assert_eq!(
+            get("x-session-affinity"),
+            Some("ses_0123456789abcdef01234567")
+        );
         assert_eq!(get("authorization"), Some("Bearer the-jwt"));
     }
 
@@ -388,7 +407,8 @@ mod tests {
         assert!(transient_block_message("mimo-auto", risk)
             .unwrap()
             .contains("rate-limited"));
-        let illegal = r#"{"error":{"code":"403","message":"Illegal access","type":"illegal_access"}}"#;
+        let illegal =
+            r#"{"error":{"code":"403","message":"Illegal access","type":"illegal_access"}}"#;
         assert!(transient_block_message("mimo-auto", illegal)
             .unwrap()
             .contains("access gate"));
@@ -421,7 +441,13 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hello, world!");
         assert!(chunks[0].finished);
-        assert_eq!(chunks[0].usage, Some(UsageOut { input: 7, output: 3 }));
+        assert_eq!(
+            chunks[0].usage,
+            Some(UsageOut {
+                input: 7,
+                output: 3
+            })
+        );
     }
 
     #[test]

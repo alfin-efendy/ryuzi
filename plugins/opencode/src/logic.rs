@@ -65,7 +65,10 @@ pub enum ProviderFail {
 pub fn request_headers() -> Vec<(String, String)> {
     vec![
         ("authorization".to_string(), format!("Bearer {BEARER}")),
-        ("x-opencode-client".to_string(), X_OPENCODE_CLIENT.to_string()),
+        (
+            "x-opencode-client".to_string(),
+            X_OPENCODE_CLIENT.to_string(),
+        ),
         ("accept".to_string(), "application/json".to_string()),
         ("content-type".to_string(), "application/json".to_string()),
     ]
@@ -87,7 +90,10 @@ pub fn build_chat_body(
 
     let mut obj = Map::new();
     obj.insert("model".to_string(), Value::String(model.to_string()));
-    obj.insert("messages".to_string(), Value::Array(vec![Value::Object(user)]));
+    obj.insert(
+        "messages".to_string(),
+        Value::Array(vec![Value::Object(user)]),
+    );
     obj.insert("stream".to_string(), Value::Bool(false));
     if let Some(max) = max_tokens {
         obj.insert("max_tokens".to_string(), Value::from(max));
@@ -107,10 +113,9 @@ pub fn build_chat_body(
 pub fn parse_models(body: &[u8]) -> Result<Vec<ModelOut>, ProviderFail> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|e| ProviderFail::Failed(format!("OpenCode /models response is not JSON: {e}")))?;
-    let data = value
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ProviderFail::Failed("OpenCode /models response has no data array".to_string()))?;
+    let data = value.get("data").and_then(Value::as_array).ok_or_else(|| {
+        ProviderFail::Failed("OpenCode /models response has no data array".to_string())
+    })?;
     let models = data
         .iter()
         .filter_map(|entry| {
@@ -208,8 +213,7 @@ mod tests {
 
     #[test]
     fn chat_body_omits_optional_fields_when_absent() {
-        let body: Value =
-            serde_json::from_slice(&build_chat_body("m", "hi", None, None)).unwrap();
+        let body: Value = serde_json::from_slice(&build_chat_body("m", "hi", None, None)).unwrap();
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
     }
@@ -260,7 +264,13 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hi there");
         assert!(chunks[0].finished);
-        assert_eq!(chunks[0].usage, Some(UsageOut { input: 5, output: 2 }));
+        assert_eq!(
+            chunks[0].usage,
+            Some(UsageOut {
+                input: 5,
+                output: 2
+            })
+        );
     }
 
     #[test]

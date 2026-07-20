@@ -60,7 +60,9 @@ impl Guest for Mimo {
         } else {
             Err(logic::classify_chat_error(response.status, &response.body))
         };
-        chunks.map(|c| c.into_iter().map(map_chunk).collect()).map_err(map_fail)
+        chunks
+            .map(|c| c.into_iter().map(map_chunk).collect())
+            .map_err(map_fail)
     }
 }
 
@@ -71,17 +73,19 @@ fn send_chat(
     model: &str,
     request: &CompletionRequest,
 ) -> Result<ryuzi::http::http::HttpResponse, ProviderFail> {
-    let body = logic::build_chat_body(model, &request.prompt, request.max_tokens, request.temperature);
+    let body = logic::build_chat_body(
+        model,
+        &request.prompt,
+        request.max_tokens,
+        request.temperature,
+    );
     let headers = logic::chat_headers(jwt, session_affinity);
     http_post(logic::CHAT_URL, headers, body)
 }
 
 /// The cached JWT if still fresh, otherwise a freshly minted one.
 fn ensure_jwt() -> Result<String, ProviderFail> {
-    if let (Some(jwt), Some(exp)) = (
-        storage_get_string(KEY_JWT),
-        storage_get_string(KEY_JWT_EXP),
-    ) {
+    if let (Some(jwt), Some(exp)) = (storage_get_string(KEY_JWT), storage_get_string(KEY_JWT_EXP)) {
         if let Ok(exp_ms) = exp.parse::<i64>() {
             if logic::jwt_is_fresh(exp_ms, now_ms()) {
                 return Ok(jwt);
@@ -149,7 +153,8 @@ fn http_post(
             .collect(),
         body: Some(body),
     };
-    ryuzi::http::http::request(&request).map_err(|error| ProviderFail::Failed(describe_http_error(error)))
+    ryuzi::http::http::request(&request)
+        .map_err(|error| ProviderFail::Failed(describe_http_error(error)))
 }
 
 fn describe_http_error(error: ryuzi::http::http::HttpError) -> String {
