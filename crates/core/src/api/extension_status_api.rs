@@ -177,6 +177,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: Some(std::sync::Arc::new(NoopExtensionFactory)),
+            provider: None,
             source: crate::plugins::PluginSource::Builtin,
         }
     }

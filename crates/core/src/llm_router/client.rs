@@ -2113,6 +2113,46 @@ pub async fn anthropic_messages_stream(
             }
         }
 
+        // A connection backed by an installed WASM provider bundle diverts to
+        // the in-process component, BEFORE the generic HTTP `match
+        // target.desc.format` — the same choke point kiro/openai-oauth use. The
+        // predicate is DATA-driven (a lookup by provider id in the registered
+        // WASM providers), so no plugin id is hardcoded and the divert stays
+        // generic. A trapping/looping `complete` is caught by the component's
+        // fuel/epoch budget and surfaces as a route-scoped failure, never a
+        // daemon crash.
+        if let Some(transport) = crate::plugins::wasm_provider::wasm_provider(&target.conn.provider)
+        {
+            match wasm_provider_stream(ctx, &mut target, &attempt_body, transport, started).await {
+                Ok(rx) => match probe_stream_head(&target.conn.provider, rx).await {
+                    StreamProbe::Deliver { buffered, rest } => {
+                        let selection = selection_for_accepted_target(
+                            &target,
+                            &requested,
+                            effort_policy,
+                            accepted_reason(origin, &failures),
+                        );
+                        return Ok(RoutedStream {
+                            selection,
+                            events: deliver_probed(buffered, rest),
+                        });
+                    }
+                    StreamProbe::Failover(failure) => {
+                        failures.push(failure);
+                        continue;
+                    }
+                },
+                Err(failure) => {
+                    let try_next = should_try_next_target(&failure);
+                    failures.push(failure);
+                    if try_next {
+                        continue;
+                    }
+                    return Err(fallback_error(&requested, &failures));
+                }
+            }
+        }
+
         let conn_id = target.conn.id.clone();
         let provider = target.conn.provider.clone();
         let upstream_model = target.upstream_model.clone();
@@ -2734,6 +2774,133 @@ async fn pump_kiro(
     );
 }
 
+/// Divert a routed connection to its in-process WASM provider component. Mirror
+/// of `kiro_stream`/`codex_stream`: returns the same
+/// `Result<mpsc::Receiver<..>, UpstreamAttemptFailure>` shape so the dispatch
+/// loop treats it uniformly. The component's `complete` returns ALL chunks as a
+/// list; this converts them into an ordered `AnthropicEvent` stream (preserving
+/// chunk order) via the same `OpenAiToAnthropicStream` the HTTP pumps use, so
+/// the synthesized message_start/content_block_delta/message_stop shape matches
+/// exactly. A guest `provider-error` or a host-side trap/timeout becomes a
+/// route-scoped `UpstreamAttemptFailure` (never a panic or a daemon crash).
+async fn wasm_provider_stream(
+    ctx: &UpstreamCtx,
+    target: &mut RouteTarget,
+    body: &Value,
+    transport: Arc<dyn crate::plugins::wasm_provider::WasmProviderRuntime>,
+    started: i64,
+) -> Result<mpsc::Receiver<anyhow::Result<AnthropicEvent>>, UpstreamAttemptFailure> {
+    let provider = target.conn.provider.clone();
+    let model = target.upstream_model.clone();
+    let request = crate::plugins::wasm_provider::WasmCompletionRequest {
+        model: model.clone(),
+        prompt: flatten_anthropic_prompt(body),
+        max_tokens: body["max_tokens"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok()),
+        temperature: body["temperature"].as_f64().map(|v| v as f32),
+    };
+    // The whole completion is produced up front. A trap/provider-error surfaces
+    // here (before any events are yielded) as a route-scoped failure, so the
+    // dispatch loop can fail over to the next target.
+    let chunks = transport.complete(request).await.map_err(|message| {
+        UpstreamAttemptFailure::upstream(provider.clone(), format!("wasm provider: {message}"))
+    })?;
+    let (tx, rx) = mpsc::channel::<anyhow::Result<AnthropicEvent>>(64);
+    let store = ctx.store.clone();
+    let conn_id = target.conn.id.clone();
+    tokio::spawn(async move {
+        pump_wasm_provider(chunks, model, tx, store, conn_id, provider, started).await;
+    });
+    Ok(rx)
+}
+
+/// Convert an ordered list of WASM provider completion chunks into Anthropic SSE
+/// events, preserving chunk order. Each chunk is fed to the shared
+/// `OpenAiToAnthropicStream` as a synthetic OpenAI streaming chunk, so the event
+/// shape is identical to the HTTP pumps'. A leading empty feed guarantees a
+/// well-formed `message_start` even for an empty completion.
+async fn pump_wasm_provider(
+    chunks: Vec<crate::plugins::wasm_provider::WasmCompletionChunk>,
+    model: String,
+    tx: mpsc::Sender<anyhow::Result<AnthropicEvent>>,
+    store: Arc<Store>,
+    conn_id: String,
+    provider: String,
+    started: i64,
+) {
+    let mut tr = translate::OpenAiToAnthropicStream::new(&model);
+    let mut input = 0i64;
+    let mut output = 0i64;
+    // Establish message_start up front (empty content emits no content block),
+    // so even a zero-chunk completion produces a valid stream head.
+    for event in tr.feed(&json!({"choices": [{"delta": {"content": ""}, "finish_reason": null}]})) {
+        if tx.send(Ok(event)).await.is_err() {
+            return; // consumer dropped
+        }
+    }
+    'pump: for chunk in chunks {
+        let mut oai =
+            json!({"choices": [{"delta": {"content": chunk.text}, "finish_reason": null}]});
+        if chunk.finished {
+            oai["choices"][0]["finish_reason"] = json!("stop");
+        }
+        if let Some(usage) = &chunk.usage {
+            input = usage.input as i64;
+            output = usage.output as i64;
+            oai["usage"] = json!({"prompt_tokens": usage.input, "completion_tokens": usage.output});
+        }
+        for event in tr.feed(&oai) {
+            if tx.send(Ok(event)).await.is_err() {
+                break 'pump; // consumer dropped
+            }
+        }
+    }
+    for event in tr.finish() {
+        let _ = tx.send(Ok(event)).await;
+    }
+    crate::llm_router::usage::record(
+        &store,
+        &conn_id,
+        &provider,
+        &model,
+        "native",
+        crate::llm_router::usage::Usage { input, output },
+        200,
+        started,
+        None,
+    );
+}
+
+/// Flatten an Anthropic-Messages body into the single `prompt` string the
+/// generic WASM `provider` ABI takes: the system text followed by each message's
+/// text content, in order. A generic provider gets a flattened prompt rather
+/// than a role-structured transcript — lossy but sufficient for the ABI's
+/// deliberately minimal shape.
+fn flatten_anthropic_prompt(body: &Value) -> String {
+    fn push_content(content: &Value, parts: &mut Vec<String>) {
+        match content {
+            Value::String(text) => parts.push(text.clone()),
+            Value::Array(blocks) => {
+                for block in blocks {
+                    if let Some(text) = block["text"].as_str() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    push_content(&body["system"], &mut parts);
+    if let Some(messages) = body["messages"].as_array() {
+        for message in messages {
+            push_content(&message["content"], &mut parts);
+        }
+    }
+    parts.join("\n")
+}
+
 /// Start a Codex stream for the native path: Anthropic body -> OpenAI chat ->
 /// Responses request -> Codex-normalized -> POST (via the existing openai-oauth
 /// upstream branch), then a pump that yields Anthropic events.
@@ -3205,6 +3372,139 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
         UpstreamCtx::new(store)
+    }
+
+    /// Leak + register a minimal `&'static ProviderDescriptor` for a WASM
+    /// provider `id` (its own family head, so routes accept it), mirroring
+    /// `llm_router::custom::register`. Base URL is a dummy — the router diverts a
+    /// WASM provider to its in-process component before any HTTP is attempted.
+    fn register_wasm_descriptor(id: &'static str) {
+        let desc: &'static ProviderDescriptor = Box::leak(Box::new(ProviderDescriptor {
+            id,
+            name: "WASM Fixture Provider",
+            family: id,
+            color: "#8B8B8B",
+            initial: "W",
+            category: registry::ProviderCategory::ApiKey,
+            format: ApiFormat::OpenAi,
+            tool_transport: registry::ProviderToolTransport::for_format(ApiFormat::OpenAi),
+            base_url: Some("http://127.0.0.1"),
+            auth: AuthScheme::Bearer,
+            models: &["fixture-model"],
+            requires_base_url: false,
+            oauth: None,
+            no_auth: false,
+            device_flow: None,
+            free_tier: false,
+            risk_notice: false,
+            chat_path: None,
+            has_models_endpoint: false,
+            uses_max_completion_tokens: false,
+            device_grant: None,
+        }));
+        registry::register_custom_descriptor(desc);
+    }
+
+    fn empty_policy(requested_model: &str) -> Arc<model_effort::TurnEffortPolicy> {
+        Arc::new(model_effort::TurnEffortPolicy {
+            requested_model: requested_model.to_string(),
+            caller_override: None,
+            route_targets: Default::default(),
+            configured: Default::default(),
+            surfaces: Default::default(),
+        })
+    }
+
+    /// Step-1: generic LLM routing diverts a connection backed by an installed
+    /// WASM provider bundle to its in-process component, preserves completion
+    /// chunk ORDER in the emitted Anthropic stream, and converts a component
+    /// trap into a route-scoped error (never a panic).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_diverts_to_a_wasm_provider_preserving_chunk_order_and_isolating_a_trap() {
+        crate::plugins::build_fixture_components_once();
+        const PROVIDER_ID: &str = "wasm-router-fixture";
+        let ctx = test_ctx().await;
+
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::llm_router::installed::install_provider(&ctx.store, PROVIDER_ID)
+            .await
+            .unwrap();
+        let (transport, _tmp) = crate::plugins::wasm_provider::build_test_transport(
+            crate::plugins::wasm_provider::provider_fixture_artifact(),
+            PROVIDER_ID,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        crate::plugins::wasm_provider::register_wasm_provider(transport);
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "wasm-conn",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("unused".into()),
+                    models_override: Some(vec!["fixture-model".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        // Happy path: the two-chunk completion streams IN ORDER.
+        let requested = format!("{PROVIDER_ID}/fixture-model");
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": requested,
+                "messages": [{"role": "user", "content": "say hello"}]
+            }),
+            &empty_policy(&requested),
+        )
+        .await
+        .expect("routing to a wasm provider must succeed");
+        let events = collect_stream(routed.events).await;
+        let text: String = events
+            .iter()
+            .filter(|(name, _)| name == "content_block_delta")
+            .filter_map(|(_, data)| data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(
+            text, "Hello, world!",
+            "the router must preserve wasm provider chunk order"
+        );
+        assert!(
+            events.iter().any(|(name, _)| name == "message_start"),
+            "the synthesized stream must open with message_start"
+        );
+        assert!(
+            events.iter().any(|(name, _)| name == "message_stop"),
+            "the synthesized stream must close with message_stop"
+        );
+
+        // A trapping completion becomes a route-scoped error, not a panic.
+        // (`RoutedStream` is not `Debug`, so match instead of `expect_err`.)
+        let error = match anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": requested,
+                "messages": [{"role": "user", "content": "please boom now"}]
+            }),
+            &empty_policy(&requested),
+        )
+        .await
+        {
+            Ok(_) => panic!("a trapping wasm completion must surface as a route-scoped error"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("wasm provider"),
+            "the route-scoped error must name the wasm provider: {error}"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
     }
 
     #[tokio::test]

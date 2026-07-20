@@ -155,6 +155,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: crate::plugins::PluginSource::Builtin,
         });
 

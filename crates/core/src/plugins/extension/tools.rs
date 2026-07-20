@@ -307,6 +307,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: Some(std::sync::Arc::new(FakeExtensionFactory { specs })),
+            provider: None,
             source: PluginSource::Builtin,
         }
     }

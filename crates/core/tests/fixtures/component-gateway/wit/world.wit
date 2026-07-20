@@ -1,0 +1,6 @@
+package fixture:gateway@0.1.0;
+
+world gateway-fixture {
+  import ryuzi:plugin/types@0.1.0;
+  export ryuzi:gateway/gateway@0.1.0;
+}

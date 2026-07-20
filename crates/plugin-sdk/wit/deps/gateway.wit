@@ -33,4 +33,13 @@ interface gateway {
   stop: func() -> result<gateway-state, gateway-error>;
   deliver-outbound: func(event: gateway-event) -> result<gateway-delivery, gateway-error>;
   health-check: func() -> result<gateway-state, gateway-error>;
+
+  // Host-driven pull of inbound events the gateway has buffered since the last
+  // poll. Added in place at @0.1.0 (no version bump): no gateway component has
+  // been released, so the only consumer is the Phase-4 supervisor + fixtures in
+  // this same change — there is no deployed component built against the old,
+  // inbound-less shape. Returns every event queued since the previous call (an
+  // empty list when idle); the supervisor surfaces them as observable status
+  // for now (session routing is Task 14).
+  poll-inbound: func() -> result<list<gateway-event>, gateway-error>;
 }

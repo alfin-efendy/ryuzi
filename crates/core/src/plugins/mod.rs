@@ -33,7 +33,9 @@ pub mod providers;
 pub mod remote_catalog;
 pub mod runtime;
 pub mod wasm_connector;
+pub mod wasm_gateway;
 pub mod wasm_hooks;
+pub mod wasm_provider;
 pub mod wit;
 
 use crate::settings::{csv, SettingsStore};
@@ -477,6 +479,7 @@ mod toggle_enabled_tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -488,6 +491,7 @@ mod toggle_enabled_tests {
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -499,6 +503,7 @@ mod toggle_enabled_tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -510,6 +515,7 @@ mod toggle_enabled_tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }

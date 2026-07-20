@@ -1844,6 +1844,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: Some(Arc::new(FakeExtensionFactory { specs })),
+            provider: None,
             source: PluginSource::Builtin,
         }
     }

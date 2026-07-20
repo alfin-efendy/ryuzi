@@ -40,12 +40,18 @@ pub(crate) const CONNECTOR_EXPORT: &str = "ryuzi:connector/connector@0.1.0";
 /// The `ryuzi:hooks/hooks` export interface name — shared by `ALLOWED_EXPORTS`
 /// and [`CompiledComponent::exports_hooks`].
 pub(crate) const HOOKS_EXPORT: &str = "ryuzi:hooks/hooks@0.1.0";
+/// The `ryuzi:provider/provider` export interface name — shared by
+/// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_provider`] (Task 10).
+pub(crate) const PROVIDER_EXPORT: &str = "ryuzi:provider/provider@0.1.0";
+/// The `ryuzi:gateway/gateway` export interface name — shared by
+/// `ALLOWED_EXPORTS` and [`CompiledComponent::exports_gateway`] (Task 10).
+pub(crate) const GATEWAY_EXPORT: &str = "ryuzi:gateway/gateway@0.1.0";
 const ALLOWED_EXPORTS: &[&str] = &[
     "lifecycle",
     LIFECYCLE_EXPORT,
-    "ryuzi:gateway/gateway@0.1.0",
+    GATEWAY_EXPORT,
     CONNECTOR_EXPORT,
-    "ryuzi:provider/provider@0.1.0",
+    PROVIDER_EXPORT,
     HOOKS_EXPORT,
 ];
 
@@ -424,6 +430,20 @@ impl CompiledComponent {
     /// plugin) without instantiating them or logging a warning (IMP-2).
     pub(crate) fn exports_hooks(&self) -> bool {
         self.exports.iter().any(|name| name == HOOKS_EXPORT)
+    }
+
+    /// Whether this component exports `ryuzi:provider/provider` — used by the
+    /// generic provider transport to skip a non-provider bundle before any
+    /// instantiation (Task 10, mirrors the IMP-2 connector/hooks gating).
+    pub(crate) fn exports_provider(&self) -> bool {
+        self.exports.iter().any(|name| name == PROVIDER_EXPORT)
+    }
+
+    /// Whether this component exports `ryuzi:gateway/gateway` — used by the
+    /// daemon's gateway-supervisor discovery to skip a non-gateway bundle
+    /// before any instantiation (Task 10, mirrors the IMP-2 gating).
+    pub(crate) fn exports_gateway(&self) -> bool {
+        self.exports.iter().any(|name| name == GATEWAY_EXPORT)
     }
 
     /// Instantiate a fresh, isolated instance, linking the host capability
@@ -1070,6 +1090,8 @@ mod tests {
                 "component-connector" => "ryuzi_component_connector_fixture.wasm",
                 "component-hooks" => "ryuzi_component_hooks_fixture.wasm",
                 "component-hooks-loop" => "ryuzi_component_hooks_loop_fixture.wasm",
+                "component-provider" => "ryuzi_component_provider_fixture.wasm",
+                "component-gateway" => "ryuzi_component_gateway_fixture.wasm",
                 _ => panic!("unknown fixture {name}"),
             })
     }

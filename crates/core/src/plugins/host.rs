@@ -166,6 +166,16 @@ pub struct CorePlugin {
     /// [`Registries::add_plugin`]; it is consumed directly from the host
     /// (`plugins::extension::ExtensionHost::spawn_all`).
     pub extension: Option<Arc<dyn ExtensionFactory>>,
+    /// Live WASM component model-provider capability (Task 10). Like
+    /// `connector`/`extension`, a live instance rather than a factory-by-config,
+    /// and deliberately NOT fanned into `Registries` by
+    /// [`Registries::add_plugin`]: it is consumed directly — the router looks it
+    /// up through the process-wide registry in
+    /// [`crate::plugins::wasm_provider`], not off this field — so `Registries`
+    /// stays unaware of provider bundles. Distinct from the metadata-only
+    /// `manifest.provider` string (which merely marks a catalog entry as a
+    /// provider): this is the executable component.
+    pub provider: Option<Arc<dyn crate::plugins::wasm_provider::WasmProviderRuntime>>,
     pub source: PluginSource,
 }
 
@@ -179,7 +189,11 @@ impl CorePlugin {
     /// convention themselves.
     pub fn capabilities(&self) -> Vec<&'static str> {
         let mut caps = Vec::new();
-        if self.manifest.provider.is_some() {
+        // A single "provider" capability whether it is a metadata-only catalog
+        // entry (`manifest.provider`) or a live component provider
+        // (`self.provider`, Task 10) — reported once, never double-counted, so a
+        // bundle carrying both still lists "provider" a single time.
+        if self.manifest.provider.is_some() || self.provider.is_some() {
             caps.push("provider");
         }
         if self.harness.is_some() {
@@ -549,6 +563,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -560,6 +575,7 @@ mod tests {
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -571,6 +587,7 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -582,6 +599,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -596,6 +614,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -618,6 +637,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: Some(Arc::new(FakeExtensionFactory)),
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -903,6 +923,7 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::SkillPack(base.path().to_path_buf()),
         };
         let mut host = PluginHost::new();
@@ -940,6 +961,7 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::SkillPack(base.path().to_path_buf()),
         });
         store
@@ -966,6 +988,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         });
 
@@ -1001,6 +1024,7 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::SkillPack(plugin_base.path().to_path_buf()),
         };
 

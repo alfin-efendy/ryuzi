@@ -113,6 +113,11 @@ pub struct Daemon {
     learning_handle: JoinHandle<()>,
     /// Periodic source-session artifact retention cleanup.
     artifact_retention_handle: JoinHandle<()>,
+    /// One supervisor per enabled long-lived WASM gateway bundle (Task 10). Each
+    /// owns a background task tracked exactly like `router_handle`/
+    /// `fanout_handle`: `stop()` stops each gracefully and `Drop` aborts them, so
+    /// no supervisor (nor the component instance it holds) outlives the daemon.
+    gateway_supervisors: Vec<crate::plugins::wasm_gateway::WasmGatewaySupervisor>,
 }
 
 impl Daemon {
@@ -273,6 +278,11 @@ impl Daemon {
         for gw in &self.gateways {
             let _ = gw.stop().await;
         }
+        // Gracefully stop every WASM gateway supervisor (calls each component's
+        // `stop()` and exits + aborts its task). Safe when empty.
+        for supervisor in &self.gateway_supervisors {
+            supervisor.stop().await;
+        }
         // Give already-enqueued listener/worker tasks one scheduling
         // opportunity to begin processing a just-published terminal status
         // transition (e.g. reach the point of persisting a `queued`
@@ -316,6 +326,9 @@ impl Drop for Daemon {
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.artifact_retention_handle.abort();
+        for supervisor in &self.gateway_supervisors {
+            supervisor.abort();
+        }
     }
 }
 
@@ -531,6 +544,16 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
     router_server.attach_control_plane(&cp);
 
+    // Supervise every enabled long-lived WASM gateway bundle (Task 10). Discovery
+    // is warn-and-skip and returns empty when nothing enabled/long-lived is
+    // installed, so a clean install spawns nothing.
+    let gateway_supervisors = crate::plugins::wasm_gateway::build_gateway_supervisors(
+        Arc::clone(&store),
+        &settings,
+        Arc::clone(&telemetry),
+    )
+    .await;
+
     Ok(Daemon {
         cp,
         store,
@@ -552,6 +575,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         rail_handle,
         learning_handle,
         artifact_retention_handle,
+        gateway_supervisors,
     })
 }
 
@@ -1044,6 +1068,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         }
     }
 
@@ -2215,6 +2240,7 @@ mod tests {
             rail_handle,
             learning_handle,
             artifact_retention_handle: tokio::spawn(async {}),
+            gateway_supervisors: Vec::new(),
         };
 
         let err = daemon.start().await.unwrap_err();
@@ -2794,6 +2820,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         };
 
         daemon.start().await.unwrap();
@@ -2982,6 +3009,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         });
 
         let (recovery_entered, release_recovery) =
@@ -3112,6 +3140,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         });
 
         let (recovery_entered, release_recovery) =
@@ -3215,6 +3244,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         });
 
         let (recovery_entered, release_recovery) =
@@ -3371,6 +3401,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
+            gateway_supervisors: Vec::new(),
         };
 
         daemon.start().await.unwrap();
@@ -3472,6 +3503,7 @@ mod tests {
             rail_handle,
             learning_handle,
             artifact_retention_handle: tokio::spawn(async {}),
+            gateway_supervisors: Vec::new(),
         };
 
         daemon.stop().await;

@@ -70,6 +70,7 @@ pub fn discord_plugin() -> CorePlugin {
         gateway,
         connector: None,
         extension: None,
+        provider: None,
         source: PluginSource::Builtin,
     }
 }

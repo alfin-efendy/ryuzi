@@ -1705,6 +1705,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -1716,6 +1717,7 @@ mod tests {
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Catalog,
         }
     }
@@ -1727,6 +1729,7 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::SkillPack(std::path::PathBuf::from("/tmp/whatever")),
         }
     }
@@ -1749,6 +1752,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -1783,6 +1787,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
         .capabilities()

@@ -755,6 +755,7 @@ mod tests {
             gateway: None,
             connector: Some(Arc::new(NoopConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         });
         {

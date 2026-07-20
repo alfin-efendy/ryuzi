@@ -62,6 +62,7 @@ pub fn declarative_plugin(
         gateway: None,
         connector,
         extension,
+        provider: None,
         source,
     })
 }

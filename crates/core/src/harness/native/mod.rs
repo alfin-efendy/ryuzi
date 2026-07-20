@@ -709,6 +709,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
         gateway: None,
         connector: None,
         extension: None,
+        provider: None,
         source: PluginSource::Builtin,
     }
 }
@@ -1997,6 +1998,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: Some(Arc::new(FakeExtFactory { spec })),
+            provider: None,
             source: PluginSource::Builtin,
         });
 
