@@ -69,6 +69,17 @@ pub(crate) const HANDLES: &[&str] = &[
     "set_plugin_pin",
     "plugin_doctor",
     "plugins_restart_required",
+    // Component-plugin (WASM bundle) release management — Task 11a.
+    "plugin_release_detail",
+    "install_component_plugin",
+    "rollback_component_plugin",
+    "component_bootstrap_status",
+    // Thin, profile-aware wrappers over the Phase-3 OAuth profile engine
+    // (`plugins::capabilities::oauth`) — Task 11a.
+    "plugin_profile_begin_pkce",
+    "plugin_profile_disconnect",
+    "plugin_profile_begin_device_flow",
+    "plugin_profile_poll_device_flow",
 ];
 
 #[derive(Clone)]
@@ -145,6 +156,45 @@ struct SetPluginPinP {
     id: String,
     pinned: bool,
     reason: Option<String>,
+}
+#[derive(Deserialize)]
+struct InstallComponentP {
+    id: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+#[derive(Deserialize)]
+struct RollbackComponentP {
+    id: String,
+    /// The bad version to revoke + deactivate.
+    from_version: String,
+    /// The prior good version to re-point the active pointer at.
+    to_version: String,
+}
+#[derive(Deserialize)]
+struct ProfileBeginPkceP {
+    plugin_id: String,
+    profile_id: String,
+    redirect_uri: String,
+}
+#[derive(Deserialize)]
+struct ProfileIdP {
+    plugin_id: String,
+    profile_id: String,
+}
+#[derive(Deserialize)]
+struct ProfileDeviceFlowP {
+    plugin_id: String,
+    profile_id: String,
+    device_authorization_url: String,
+}
+#[derive(Deserialize)]
+struct ProfilePollDeviceP {
+    plugin_id: String,
+    profile_id: String,
+    token_url: String,
+    device_code: String,
+    expires_at: i64,
 }
 
 pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result<Value, ApiError> {
@@ -228,6 +278,50 @@ pub(crate) async fn dispatch(state: &ApiState, method: &str, p: Value) -> Result
                 .collect::<Vec<_>>())
         }
         "plugins_restart_required" => ok(cp.plugins_restart_required()),
+        "plugin_release_detail" => {
+            let a: IdP = params(p)?;
+            ok(plugin_release_detail(cp, &a.id).await?)
+        }
+        "install_component_plugin" => {
+            let a: InstallComponentP = params(p)?;
+            ok(install_component_plugin(cp, &a.id, a.version.as_deref()).await?)
+        }
+        "rollback_component_plugin" => {
+            let a: RollbackComponentP = params(p)?;
+            ok(rollback_component_plugin(cp, &a.id, &a.from_version, &a.to_version).await?)
+        }
+        "component_bootstrap_status" => ok(component_bootstrap_status(cp).await?),
+        "plugin_profile_begin_pkce" => {
+            let a: ProfileBeginPkceP = params(p)?;
+            ok(plugin_profile_begin_pkce(cp, &a.plugin_id, &a.profile_id, &a.redirect_uri).await?)
+        }
+        "plugin_profile_disconnect" => {
+            let a: ProfileIdP = params(p)?;
+            plugin_profile_disconnect(cp, &a.plugin_id, &a.profile_id).await?;
+            ok(())
+        }
+        "plugin_profile_begin_device_flow" => {
+            let a: ProfileDeviceFlowP = params(p)?;
+            ok(plugin_profile_begin_device_flow(
+                cp,
+                &a.plugin_id,
+                &a.profile_id,
+                &a.device_authorization_url,
+            )
+            .await?)
+        }
+        "plugin_profile_poll_device_flow" => {
+            let a: ProfilePollDeviceP = params(p)?;
+            ok(plugin_profile_poll_device_flow(
+                cp,
+                &a.plugin_id,
+                &a.profile_id,
+                &a.token_url,
+                &a.device_code,
+                a.expires_at,
+            )
+            .await?)
+        }
         _ => Err(ApiError::not_found(format!("unknown method: {method}"))),
     }
 }
@@ -1566,6 +1660,280 @@ async fn cancel_plugin_install(
     }
     drop_pending_plugin_flows(&plugin_id, state_token.as_deref());
     Ok(())
+}
+
+// ===========================================================================
+// Component-plugin (WASM bundle) release management — Task 11a.
+// ===========================================================================
+
+/// The release ledger for a component plugin: every recorded release (oldest
+/// first) plus the active version. Read-only; the template is `plugin_detail`.
+async fn plugin_release_detail(
+    cp: &ControlPlane,
+    plugin_id: &str,
+) -> anyhow::Result<ComponentReleaseDetail> {
+    let releases = cp.store().list_component_releases(plugin_id).await?;
+    let active_version = cp
+        .store()
+        .active_component_release(plugin_id)
+        .await?
+        .map(|r| r.version);
+    Ok(ComponentReleaseDetail {
+        plugin_id: plugin_id.to_string(),
+        releases: releases
+            .into_iter()
+            .map(ComponentReleaseInfo::from)
+            .collect(),
+        active_version,
+    })
+}
+
+/// Install (or update to) a component plugin's signed release via the Task 11a
+/// pipeline (resolve+download+stage+verify_bundle+install+activate), then mark
+/// the host restart-required so the newly activated bundle is picked up.
+/// Returns the release ledger after the install. Fail-closed: with no
+/// first-party signing key yet (the placeholder), this refuses before any
+/// network I/O rather than staging an unverifiable bundle.
+async fn install_component_plugin(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    version: Option<&str>,
+) -> anyhow::Result<ComponentReleaseDetail> {
+    let store = cp.store();
+    let trusted_keys = crate::plugins::first_party_key::first_party_trusted_keys();
+    if trusted_keys.is_empty() {
+        anyhow::bail!(
+            "component plugin installs are disabled until the first-party signing key is configured"
+        );
+    }
+    let base_url = store
+        .get_setting_raw("component_release_base_url")
+        .await?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL.to_string()
+        });
+    let http = crate::plugins::remote_catalog::ReqwestCatalogHttp::new();
+    let installer = crate::plugins::bundle::ComponentBundleInstaller::new(
+        crate::plugins::bundle::installed_bundle_root(),
+        store.as_ref().clone(),
+    );
+    crate::plugins::remote_catalog::install_component_release(
+        &http,
+        &installer,
+        &trusted_keys,
+        &base_url,
+        plugin_id,
+        version,
+    )
+    .await?;
+    cp.mark_plugins_restart_required();
+    plugin_release_detail(cp, plugin_id).await
+}
+
+/// Roll a component plugin off a bad release: revoke + deactivate
+/// `from_version`, re-point the active release to the prior-good `to_version`
+/// (rejected by the store if that version is missing or itself revoked), and
+/// mark the host restart-required so the rolled-back bundle is loaded fresh on
+/// the next session/boot (the same reload signal `uninstall_plugin` uses).
+async fn rollback_component_plugin(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    from_version: &str,
+    to_version: &str,
+) -> anyhow::Result<ComponentReleaseDetail> {
+    let store = cp.store();
+    store
+        .mark_component_release_revoked(
+            plugin_id,
+            from_version,
+            &format!("rolled back to {to_version}"),
+        )
+        .await?;
+    store
+        .set_active_component_release(plugin_id, to_version)
+        .await?;
+    cp.mark_plugins_restart_required();
+    plugin_release_detail(cp, plugin_id).await
+}
+
+/// The first-party component bootstrap's retryable status: pending when the
+/// last bootstrap attempt landed nothing AND bootstrap has not since completed,
+/// so Cockpit (Task 12) can surface a retry banner.
+async fn component_bootstrap_status(cp: &ControlPlane) -> anyhow::Result<ComponentBootstrapStatus> {
+    let store = cp.store();
+    let message = store
+        .get_setting_raw(crate::plugins::remote_catalog::FIRST_PARTY_BOOTSTRAP_RETRY)
+        .await?
+        .filter(|m| !m.is_empty());
+    let completed = store
+        .get_setting_raw(crate::plugins::remote_catalog::FIRST_PARTY_BOOTSTRAP_MARKER)
+        .await?
+        .is_some();
+    let pending = message.is_some() && !completed;
+    Ok(ComponentBootstrapStatus {
+        message: pending.then(|| message.clone().unwrap_or_default()),
+        pending,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Thin, profile-aware wrappers over the Phase-3 OAuth profile engine
+// (`plugins::capabilities::oauth::ProfileOauth`). No new OAuth engine logic —
+// each handler just builds the plugin's capability context from its installed
+// bundle (so the network allowlist and declared profile set come from the
+// signed manifest, never the caller) and dispatches one method. Deliberately
+// minimal: mimo/opencode don't use OAuth (that lands with Task 13/GitHub), and
+// `authorized_request` is a component-runtime-facing HTTP proxy, not a Cockpit
+// surface, so it is intentionally NOT exposed here.
+// ---------------------------------------------------------------------------
+
+/// Map a capability-adapter `OauthErr` to an `ApiError` status.
+fn oauth_err(err: crate::plugins::capabilities::oauth::OauthErr) -> ApiError {
+    use crate::plugins::capabilities::oauth::OauthErr;
+    match err {
+        OauthErr::InvalidRequest(message) => ApiError::bad_request(message),
+        OauthErr::Denied => ApiError {
+            status: 403,
+            message: "oauth profile denied".to_string(),
+        },
+        OauthErr::Expired => ApiError::conflict("oauth token expired"),
+        OauthErr::Failed(message) => ApiError {
+            status: 502,
+            message,
+        },
+    }
+}
+
+/// Load the active installed bundle for `plugin_id` and build its capability
+/// context (+ return the manifest). The context's network allowlist and OAuth
+/// profile ids come from the signed bundle manifest, so a component can never
+/// widen its own permissions through these RPCs. Telemetry is a no-op here (the
+/// wrapped `ProfileOauth` methods don't emit).
+async fn profile_capability_context(
+    cp: &ControlPlane,
+    plugin_id: &str,
+) -> Result<
+    (
+        crate::plugins::capabilities::PluginCapabilityContext,
+        ryuzi_plugin_sdk::PluginBundleManifest,
+    ),
+    ApiError,
+> {
+    let root = crate::plugins::bundle::installed_bundle_root();
+    let bundles = crate::plugins::bundle::load_active_bundles(&root, cp.store())
+        .await
+        .map_err(ApiError::from)?;
+    let bundle = bundles
+        .into_iter()
+        .find(|b| b.manifest.id == plugin_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("no active component bundle for {plugin_id}"))
+        })?;
+    let manifest = bundle.manifest.clone();
+    let ctx = crate::plugins::capabilities::PluginCapabilityContext {
+        plugin_id: manifest.id.clone(),
+        version: manifest.version.clone(),
+        settings: SettingsStore::new(cp.store().clone()),
+        store: cp.store().clone(),
+        telemetry: std::sync::Arc::new(crate::telemetry::NoopTelemetry),
+        network_allowlist: manifest
+            .permissions
+            .network
+            .iter()
+            .map(|entry| entry.0.clone())
+            .collect(),
+        oauth_profile_ids: manifest.oauth.iter().map(|p| p.id.clone()).collect(),
+    };
+    Ok((ctx, manifest))
+}
+
+fn find_oauth_profile(
+    manifest: &ryuzi_plugin_sdk::PluginBundleManifest,
+    profile_id: &str,
+) -> Result<ryuzi_plugin_sdk::OAuthProfile, ApiError> {
+    manifest
+        .oauth
+        .iter()
+        .find(|p| p.id == profile_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "plugin does not declare oauth profile {profile_id:?}"
+            ))
+        })
+}
+
+fn device_poll_outcome_label(
+    outcome: crate::plugins::capabilities::oauth::DevicePollOutcome,
+) -> &'static str {
+    use crate::plugins::capabilities::oauth::DevicePollOutcome;
+    match outcome {
+        DevicePollOutcome::Pending => "pending",
+        DevicePollOutcome::SlowDown => "slow-down",
+        DevicePollOutcome::Ready => "ready",
+        DevicePollOutcome::Expired => "expired",
+        DevicePollOutcome::Denied => "denied",
+    }
+}
+
+async fn plugin_profile_begin_pkce(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    profile_id: &str,
+    redirect_uri: &str,
+) -> Result<PluginProfilePkceStart, ApiError> {
+    let (ctx, manifest) = profile_capability_context(cp, plugin_id).await?;
+    let profile = find_oauth_profile(&manifest, profile_id)?;
+    let start = crate::plugins::capabilities::oauth::ProfileOauth::new(&ctx)
+        .begin_pkce(&profile, redirect_uri)
+        .await
+        .map_err(oauth_err)?;
+    Ok(start.into())
+}
+
+async fn plugin_profile_disconnect(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    profile_id: &str,
+) -> Result<(), ApiError> {
+    let (ctx, _manifest) = profile_capability_context(cp, plugin_id).await?;
+    crate::plugins::capabilities::oauth::ProfileOauth::new(&ctx)
+        .disconnect_profile(profile_id)
+        .await
+        .map_err(oauth_err)
+}
+
+async fn plugin_profile_begin_device_flow(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    profile_id: &str,
+    device_authorization_url: &str,
+) -> Result<PluginProfileDeviceFlowStart, ApiError> {
+    let (ctx, manifest) = profile_capability_context(cp, plugin_id).await?;
+    let profile = find_oauth_profile(&manifest, profile_id)?;
+    let start = crate::plugins::capabilities::oauth::ProfileOauth::new(&ctx)
+        .begin_device_flow(&profile, device_authorization_url)
+        .await
+        .map_err(oauth_err)?;
+    Ok(start.into())
+}
+
+async fn plugin_profile_poll_device_flow(
+    cp: &ControlPlane,
+    plugin_id: &str,
+    profile_id: &str,
+    token_url: &str,
+    device_code: &str,
+    expires_at: i64,
+) -> Result<String, ApiError> {
+    let (ctx, manifest) = profile_capability_context(cp, plugin_id).await?;
+    let profile = find_oauth_profile(&manifest, profile_id)?;
+    let outcome = crate::plugins::capabilities::oauth::ProfileOauth::new(&ctx)
+        .poll_device_flow(&profile, token_url, device_code, expires_at)
+        .await
+        .map_err(oauth_err)?;
+    Ok(device_poll_outcome_label(outcome).to_string())
 }
 
 #[cfg(test)]
@@ -3151,5 +3519,127 @@ mod tests {
         let s = state().await;
         let out = dispatch(&s, "list_plugins", json!({})).await.unwrap();
         assert!(out.is_array());
+    }
+
+    // ---------- component-plugin release management (Task 11a) ----------
+
+    fn component_release(version: &str) -> crate::store::ComponentPluginReleaseRecord {
+        crate::store::ComponentPluginReleaseRecord {
+            plugin_id: "mimo".into(),
+            version: version.into(),
+            source_url: format!("https://feed.test/mimo/{version}"),
+            sha256: "0".repeat(64),
+            signing_key_id: "first-party".into(),
+            installed_at: crate::paths::now_ms(),
+            active: false,
+            revoked: false,
+            revocation_reason: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_release_detail_lists_releases_and_active_version() {
+        let cp = test_cp().await;
+        for v in ["0.1.0", "0.2.0"] {
+            cp.store()
+                .upsert_component_release(&component_release(v))
+                .await
+                .unwrap();
+        }
+        cp.store()
+            .set_active_component_release("mimo", "0.2.0")
+            .await
+            .unwrap();
+
+        let detail = plugin_release_detail(&cp, "mimo").await.unwrap();
+        assert_eq!(detail.plugin_id, "mimo");
+        assert_eq!(detail.releases.len(), 2);
+        assert_eq!(detail.active_version.as_deref(), Some("0.2.0"));
+        assert!(detail
+            .releases
+            .iter()
+            .any(|r| r.version == "0.2.0" && r.active));
+    }
+
+    #[tokio::test]
+    async fn rollback_component_plugin_revokes_bad_and_reactivates_prior_good() {
+        let cp = test_cp().await;
+        for v in ["0.1.0", "0.2.0"] {
+            cp.store()
+                .upsert_component_release(&component_release(v))
+                .await
+                .unwrap();
+        }
+        cp.store()
+            .set_active_component_release("mimo", "0.2.0")
+            .await
+            .unwrap();
+
+        let detail = rollback_component_plugin(&cp, "mimo", "0.2.0", "0.1.0")
+            .await
+            .unwrap();
+        assert_eq!(detail.active_version.as_deref(), Some("0.1.0"));
+        let bad = detail
+            .releases
+            .iter()
+            .find(|r| r.version == "0.2.0")
+            .unwrap();
+        assert!(bad.revoked, "the bad version must be revoked");
+        assert!(!bad.active);
+        assert!(
+            cp.plugins_restart_required(),
+            "rollback must signal a host reload"
+        );
+    }
+
+    // With no first-party signing key configured yet (the all-zero
+    // placeholder), an install must refuse fail-closed BEFORE any network I/O
+    // rather than stage an unverifiable bundle.
+    #[tokio::test]
+    async fn install_component_plugin_is_fail_closed_without_a_signing_key() {
+        let cp = test_cp().await;
+        match install_component_plugin(&cp, "mimo", None).await {
+            Ok(_) => panic!("expected a fail-closed refusal without a signing key"),
+            Err(err) => assert!(
+                err.to_string().contains("disabled until"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn component_bootstrap_status_reports_pending_retry_until_completed() {
+        let cp = test_cp().await;
+        assert!(!component_bootstrap_status(&cp).await.unwrap().pending);
+
+        cp.store()
+            .set_setting_raw(
+                crate::plugins::remote_catalog::FIRST_PARTY_BOOTSTRAP_RETRY,
+                "download failed",
+            )
+            .await
+            .unwrap();
+        let pending = component_bootstrap_status(&cp).await.unwrap();
+        assert!(pending.pending);
+        assert_eq!(pending.message.as_deref(), Some("download failed"));
+
+        // Completion clears the pending state even if the retry row lingers.
+        cp.store()
+            .set_setting_raw(
+                crate::plugins::remote_catalog::FIRST_PARTY_BOOTSTRAP_MARKER,
+                "1",
+            )
+            .await
+            .unwrap();
+        assert!(!component_bootstrap_status(&cp).await.unwrap().pending);
+    }
+
+    #[tokio::test]
+    async fn component_bootstrap_status_dispatches() {
+        let s = state().await;
+        let out = dispatch(&s, "component_bootstrap_status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["pending"], json!(false));
     }
 }

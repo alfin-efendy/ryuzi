@@ -1194,6 +1194,113 @@ pub struct CatalogStatus {
     pub blocked: u32,
 }
 
+/// One row of a component plugin's release ledger (Task 11a). Mirror of
+/// `crate::store::ComponentPluginReleaseRecord` with the specta `Type` the
+/// core struct doesn't derive; no field added or dropped. Carries no secret
+/// (source URL, hash, key id, timestamps, lifecycle flags only).
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentReleaseInfo {
+    pub plugin_id: String,
+    pub version: String,
+    pub source_url: String,
+    pub sha256: String,
+    pub signing_key_id: String,
+    pub installed_at: i64,
+    pub active: bool,
+    pub revoked: bool,
+    pub revocation_reason: Option<String>,
+}
+
+impl From<crate::store::ComponentPluginReleaseRecord> for ComponentReleaseInfo {
+    fn from(r: crate::store::ComponentPluginReleaseRecord) -> Self {
+        ComponentReleaseInfo {
+            plugin_id: r.plugin_id,
+            version: r.version,
+            source_url: r.source_url,
+            sha256: r.sha256,
+            signing_key_id: r.signing_key_id,
+            installed_at: r.installed_at,
+            active: r.active,
+            revoked: r.revoked,
+            revocation_reason: r.revocation_reason,
+        }
+    }
+}
+
+/// `plugin_release_detail` RPC result: every recorded release for a component
+/// plugin (oldest first, as the store returns them) plus the currently active
+/// version, if any.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentReleaseDetail {
+    pub plugin_id: String,
+    pub releases: Vec<ComponentReleaseInfo>,
+    pub active_version: Option<String>,
+}
+
+/// `component_bootstrap_status` RPC result (Task 11a): whether the first-party
+/// component bootstrap has a pending retryable failure Cockpit should surface,
+/// and the human-readable message if so.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentBootstrapStatus {
+    /// True when the last bootstrap attempt landed nothing and bootstrap has
+    /// not since completed — Cockpit shows a "retry" banner.
+    pub pending: bool,
+    /// The recorded retry message, present iff `pending`.
+    pub message: Option<String>,
+}
+
+/// `plugin_profile_begin_pkce` RPC result. Mirror of
+/// `crate::plugins::capabilities::oauth::PkceStart`. `verifier` is returned to
+/// the caller (Cockpit) so it can complete the token exchange; it must never
+/// be persisted to durable telemetry (see that type's doc).
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginProfilePkceStart {
+    pub authorize_url: String,
+    pub state: String,
+    pub verifier: String,
+}
+
+impl From<crate::plugins::capabilities::oauth::PkceStart> for PluginProfilePkceStart {
+    fn from(p: crate::plugins::capabilities::oauth::PkceStart) -> Self {
+        PluginProfilePkceStart {
+            authorize_url: p.authorize_url,
+            state: p.state,
+            verifier: p.verifier,
+        }
+    }
+}
+
+/// `plugin_profile_begin_device_flow` RPC result. Mirror of
+/// `crate::plugins::capabilities::oauth::DeviceFlowStart`. `user_code` is shown
+/// to the user once and must never be written to durable telemetry.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginProfileDeviceFlowStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    pub interval_secs: u64,
+    pub expires_at: i64,
+}
+
+impl From<crate::plugins::capabilities::oauth::DeviceFlowStart> for PluginProfileDeviceFlowStart {
+    fn from(d: crate::plugins::capabilities::oauth::DeviceFlowStart) -> Self {
+        PluginProfileDeviceFlowStart {
+            device_code: d.device_code,
+            user_code: d.user_code,
+            verification_uri: d.verification_uri,
+            verification_uri_complete: d.verification_uri_complete,
+            interval_secs: d.interval_secs,
+            expires_at: d.expires_at,
+        }
+    }
+}
+
 /// `extension_status` rpc result — one entry per extension (Track D "code
 /// plugin") the daemon's `ExtensionHost` currently knows about (DT8). Mirrors
 /// `plugins::extension::{ExtensionSnapshot, ExtensionStatus}` flattened into
