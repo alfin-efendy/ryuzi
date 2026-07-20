@@ -1196,8 +1196,9 @@ pub struct CatalogStatus {
 
 /// One row of a component plugin's release ledger (Task 11a). Mirror of
 /// `crate::store::ComponentPluginReleaseRecord` with the specta `Type` the
-/// core struct doesn't derive; no field added or dropped. Carries no secret
-/// (source URL, hash, key id, timestamps, lifecycle flags only).
+/// core struct doesn't derive, PLUS a Task 12 addition: `first_party` (see
+/// its own doc). Carries no secret (source URL, hash, key id, timestamps,
+/// lifecycle flags only).
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ComponentReleaseInfo {
@@ -1210,10 +1211,16 @@ pub struct ComponentReleaseInfo {
     pub active: bool,
     pub revoked: bool,
     pub revocation_reason: Option<String>,
+    /// Task 12 addition: `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID`.
+    /// Computed server-side (rather than left for Cockpit to compare a magic
+    /// string) so the UI's "publisher verification" badge and the backing
+    /// trust check can never drift.
+    pub first_party: bool,
 }
 
 impl From<crate::store::ComponentPluginReleaseRecord> for ComponentReleaseInfo {
     fn from(r: crate::store::ComponentPluginReleaseRecord) -> Self {
+        let first_party = r.signing_key_id == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID;
         ComponentReleaseInfo {
             plugin_id: r.plugin_id,
             version: r.version,
@@ -1224,6 +1231,76 @@ impl From<crate::store::ComponentPluginReleaseRecord> for ComponentReleaseInfo {
             active: r.active,
             revoked: r.revoked,
             revocation_reason: r.revocation_reason,
+            first_party,
+        }
+    }
+}
+
+/// One OAuth profile a component bundle's manifest declares — id + scopes
+/// only (no client id/secret/endpoint: Task 12 renders declared metadata,
+/// never a live credential; the full connect flow is Task 13). Mirror of
+/// `ryuzi_plugin_sdk::OAuthProfile` trimmed to what Cockpit displays.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentOauthProfileInfo {
+    pub id: String,
+    pub scopes: Vec<String>,
+}
+
+/// Task 12 cross-layer addition: the currently ACTIVE version's bundle
+/// manifest metadata a component plugin's permission-confirmation summary
+/// needs to render (publisher, description, lifecycle, network allowlist
+/// "domains", declared OAuth profiles) — none of this was in Task 11a's
+/// `ComponentReleaseDetail`, which only carries per-release ledger rows
+/// (version/hash/signing key/timestamps), not manifest content.
+///
+/// Sourced from the already-verified on-disk bundle
+/// (`plugins::bundle::load_active_bundles`, the same read
+/// `profile_capability_context` already performs) rather than a new network
+/// fetch — safe because this data has already passed `verify_bundle`. `None`
+/// when nothing is currently active (including: never installed, or
+/// uninstalled) — there is no pipeline seam to preview an unverified
+/// manifest's fields before an install actually runs the signature check, so
+/// a plugin's very first install has no permission preview to show beyond
+/// the generic acknowledgement Cockpit renders in that case.
+#[derive(Serialize, Deserialize, Type, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentManifestInfo {
+    pub publisher: String,
+    pub description: String,
+    /// `singleton` | `per-session` | `per-call` (mirrors
+    /// `ryuzi_plugin_sdk::PluginLifecycle`'s kebab-case wire form).
+    pub lifecycle: String,
+    /// The outbound network allowlist ("domains") — bare or `*.`-wildcard
+    /// hostnames the component may reach.
+    pub domains: Vec<String>,
+    pub oauth_profiles: Vec<ComponentOauthProfileInfo>,
+}
+
+fn lifecycle_label(l: ryuzi_plugin_sdk::PluginLifecycle) -> &'static str {
+    use ryuzi_plugin_sdk::PluginLifecycle::*;
+    match l {
+        Singleton => "singleton",
+        PerSession => "per-session",
+        PerCall => "per-call",
+    }
+}
+
+impl From<ryuzi_plugin_sdk::PluginBundleManifest> for ComponentManifestInfo {
+    fn from(m: ryuzi_plugin_sdk::PluginBundleManifest) -> Self {
+        ComponentManifestInfo {
+            publisher: m.publisher,
+            description: m.description,
+            lifecycle: lifecycle_label(m.lifecycle).to_string(),
+            domains: m.permissions.network.into_iter().map(|n| n.0).collect(),
+            oauth_profiles: m
+                .oauth
+                .into_iter()
+                .map(|p| ComponentOauthProfileInfo {
+                    id: p.id,
+                    scopes: p.scopes,
+                })
+                .collect(),
         }
     }
 }
@@ -1237,6 +1314,8 @@ pub struct ComponentReleaseDetail {
     pub plugin_id: String,
     pub releases: Vec<ComponentReleaseInfo>,
     pub active_version: Option<String>,
+    /// Task 12 addition — see [`ComponentManifestInfo`]'s doc.
+    pub active_manifest: Option<ComponentManifestInfo>,
 }
 
 /// `component_bootstrap_status` RPC result (Task 11a): whether the first-party

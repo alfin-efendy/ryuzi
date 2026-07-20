@@ -44,9 +44,11 @@ use tokio::sync::oneshot;
 // way.
 #[allow(unused_imports)]
 pub use ryuzi_core::api::types::{
-    CatalogStatus, DoctorFinding, ExtensionStatusEntry, PluginAuthInfo, PluginDetail,
-    PluginFieldInfo, PluginInfo, PluginInstallBeginResult, PluginMcpInfo, PluginOauthBeginResult,
-    SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto, UpdateOutcomeEntry,
+    CatalogStatus, ComponentBootstrapStatus, ComponentManifestInfo, ComponentOauthProfileInfo,
+    ComponentReleaseDetail, ComponentReleaseInfo, DoctorFinding, ExtensionStatusEntry,
+    PluginAuthInfo, PluginDetail, PluginFieldInfo, PluginInfo, PluginInstallBeginResult,
+    PluginMcpInfo, PluginOauthBeginResult, SkillInstallBegin, TrustPromptDto, UpdateOutcomeDto,
+    UpdateOutcomeEntry,
 };
 
 type R<T> = Result<T, CmdError>;
@@ -618,4 +620,93 @@ pub async fn extension_status(
 ) -> R<Vec<ExtensionStatusEntry>> {
     let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
     client.rpc("extension_status", serde_json::json!({})).await
+}
+
+// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+//
+// Thin mirrors of the Task 11a RPC family in `ryuzi_core::api::plugins_api`
+// (`crates/core/src/api/plugins_api.rs`) — every handler here is just a
+// resolve-client-then-`rpc(...)` call, matching `plugin_detail` above. The
+// daemon owns the signed-release resolve/verify/install pipeline, the
+// rollback ordering, and the bootstrap-retry ledger; Cockpit only surfaces
+// them.
+
+/// The release ledger for a component plugin (mimo/opencode today): every
+/// recorded release plus the active version and (Task 12) the active
+/// version's manifest-derived permission metadata. Read-only, never mutates
+/// state. Safe to call for ANY plugin id, including one that was never a
+/// component bundle — it just comes back with an empty `releases` list.
+#[tauri::command]
+#[specta::specta]
+pub async fn plugin_release_detail(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+) -> R<ComponentReleaseDetail> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("plugin_release_detail", serde_json::json!({ "id": id }))
+        .await
+}
+
+/// Install (or update to) a component plugin's signed release —
+/// resolve+download+stage+verify+install+activate, then mark the host
+/// restart-required. `version: None` means "latest". Fail-closed while the
+/// first-party signing key is the placeholder (refuses before any network
+/// I/O — see `install_component_plugin`'s doc in `plugins_api.rs`).
+#[tauri::command]
+#[specta::specta]
+pub async fn install_component_plugin(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    version: Option<String>,
+) -> R<ComponentReleaseDetail> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "install_component_plugin",
+            serde_json::json!({ "id": id, "version": version }),
+        )
+        .await
+}
+
+/// Roll a component plugin off a bad release: re-point the active pointer at
+/// `to_version`, then revoke + deactivate `from_version`, then mark the host
+/// restart-required. A missing/revoked `to_version` is a clean no-op — see
+/// `rollback_component_plugin`'s doc in `plugins_api.rs` for the ordering
+/// rationale (the good version activates FIRST, so a bad target can never
+/// strand the plugin with no active release).
+#[tauri::command]
+#[specta::specta]
+pub async fn rollback_component_plugin(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+    id: String,
+    from_version: String,
+    to_version: String,
+) -> R<ComponentReleaseDetail> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc(
+            "rollback_component_plugin",
+            serde_json::json!({ "id": id, "from_version": from_version, "to_version": to_version }),
+        )
+        .await
+}
+
+/// The first-party component bootstrap's retryable status: `pending` when
+/// the last automatic bootstrap attempt (at daemon start) landed nothing and
+/// hasn't since completed — Cockpit shows a retry banner in that case.
+/// Read-only, never mutates state.
+#[tauri::command]
+#[specta::specta]
+pub async fn component_bootstrap_status(
+    engine: Engine<'_>,
+    runner_id: Option<String>,
+) -> R<ComponentBootstrapStatus> {
+    let client = engine.client(runner_id.as_deref().unwrap_or("local"))?;
+    client
+        .rpc("component_bootstrap_status", serde_json::json!({}))
+        .await
 }

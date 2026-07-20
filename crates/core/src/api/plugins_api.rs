@@ -1668,6 +1668,14 @@ async fn cancel_plugin_install(
 
 /// The release ledger for a component plugin: every recorded release (oldest
 /// first) plus the active version. Read-only; the template is `plugin_detail`.
+///
+/// Task 12 addition: when a version is active, also resolves that version's
+/// on-disk bundle manifest (publisher/lifecycle/domains/oauth) for the
+/// permission-confirmation summary — see [`ComponentManifestInfo`]'s doc for
+/// why this is read-only-disk, not a new network fetch, and why it is `None`
+/// for a never-installed plugin. Best-effort: any I/O error (most commonly,
+/// the bundle root not existing yet) degrades to `None` rather than failing
+/// the whole RPC, since this is read-only display data.
 async fn plugin_release_detail(
     cp: &ControlPlane,
     plugin_id: &str,
@@ -1678,6 +1686,20 @@ async fn plugin_release_detail(
         .active_component_release(plugin_id)
         .await?
         .map(|r| r.version);
+    let active_manifest = if active_version.is_some() {
+        let root = crate::plugins::bundle::installed_bundle_root();
+        crate::plugins::bundle::load_active_bundles(&root, cp.store())
+            .await
+            .ok()
+            .and_then(|bundles| {
+                bundles
+                    .into_iter()
+                    .find(|b| b.manifest.id == plugin_id)
+                    .map(|b| ComponentManifestInfo::from(b.manifest))
+            })
+    } else {
+        None
+    };
     Ok(ComponentReleaseDetail {
         plugin_id: plugin_id.to_string(),
         releases: releases
@@ -1685,6 +1707,7 @@ async fn plugin_release_detail(
             .map(ComponentReleaseInfo::from)
             .collect(),
         active_version,
+        active_manifest,
     })
 }
 
@@ -3570,6 +3593,48 @@ mod tests {
             .releases
             .iter()
             .any(|r| r.version == "0.2.0" && r.active));
+        // Task 12: every release here was signed with the first-party test
+        // fixture's key id ("first-party"), so `first_party` must be true for
+        // all of them.
+        assert!(detail.releases.iter().all(|r| r.first_party));
+        // Task 12: no bundle is installed on disk in this test environment
+        // (only the ledger row exists), so the manifest-derived permission
+        // summary must be absent rather than guessed.
+        assert!(detail.active_manifest.is_none());
+    }
+
+    // Task 12: a release signed by a key other than the first-party constant
+    // must report `first_party: false` — the UI's publisher-verification
+    // badge relies on this being computed server-side, never string-matched
+    // client-side.
+    #[tokio::test]
+    async fn plugin_release_detail_marks_non_first_party_releases() {
+        let cp = test_cp().await;
+        let mut third_party = component_release("0.1.0");
+        third_party.signing_key_id = "some-other-key".into();
+        cp.store()
+            .upsert_component_release(&third_party)
+            .await
+            .unwrap();
+
+        let detail = plugin_release_detail(&cp, "mimo").await.unwrap();
+        let release = detail.releases.first().unwrap();
+        assert!(!release.first_party);
+        assert_eq!(release.signing_key_id, "some-other-key");
+    }
+
+    // Task 12: a component id with no recorded releases at all (never
+    // installed) must return an empty, well-formed detail rather than an
+    // error — this is the shape Cockpit's PluginDetailView sees for a
+    // never-installed component plugin.
+    #[tokio::test]
+    async fn plugin_release_detail_is_empty_for_a_never_installed_plugin() {
+        let cp = test_cp().await;
+        let detail = plugin_release_detail(&cp, "opencode").await.unwrap();
+        assert_eq!(detail.plugin_id, "opencode");
+        assert!(detail.releases.is_empty());
+        assert!(detail.active_version.is_none());
+        assert!(detail.active_manifest.is_none());
     }
 
     #[tokio::test]
