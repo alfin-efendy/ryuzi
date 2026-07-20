@@ -1787,6 +1787,14 @@ impl ControlPlane {
                 allow_settings: true,
                 allow_storage: true,
                 allow_oauth: !bundle.manifest.oauth.is_empty(),
+                // Self-set Authorization is granted ONLY to VERIFIED first-party
+                // bundles, keyed off the installed release's signing key id
+                // (set by `verify_bundle` from the trusted-key match — never
+                // manifest content). The built-in mimo/opencode providers need
+                // it to present their own bearer; every other bundle keeps the
+                // strict Task 8 stripping.
+                allow_self_auth: bundle.release_record.signing_key_id
+                    == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
                 limits: ResourceLimits::default(),
             };
             let compiled = match runtime.compile(&bundle, policy) {

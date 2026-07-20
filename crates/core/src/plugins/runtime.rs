@@ -103,6 +103,15 @@ pub struct HostPolicy {
     /// Grants host-mediated `ryuzi:oauth/oauth@0.2.0`; components can make
     /// authorized profile requests but never receive raw OAuth tokens.
     pub allow_oauth: bool,
+    /// Lets this bundle set its OWN `Authorization` header on `ryuzi:http/http`
+    /// requests (the initial hop to an allowlisted host only). Granted ONLY to
+    /// VERIFIED first-party bundles — the caller derives it from the installed
+    /// release's `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID`, NEVER
+    /// from manifest content or anything a component can forge. Every ordinary
+    /// bundle keeps the strict Task 8 stripping (see `capabilities::http`). The
+    /// self-set bearer is dropped on every redirect and never coexists with a
+    /// host-injected OAuth bearer.
+    pub allow_self_auth: bool,
     pub limits: ResourceLimits,
 }
 
@@ -114,6 +123,7 @@ impl HostPolicy {
             allow_settings: false,
             allow_storage: false,
             allow_oauth: false,
+            allow_self_auth: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -475,6 +485,7 @@ impl CompiledComponent {
         let allow_settings = self.policy.allow_settings;
         let allow_storage = self.policy.allow_storage;
         let allow_oauth = self.policy.allow_oauth;
+        let allow_self_auth = self.policy.allow_self_auth;
         let network_allowlist = self.network_allowlist.clone();
         let runtime_ctx = Arc::new(PluginCapabilityContext {
             plugin_id: self.plugin_id.clone(),
@@ -499,6 +510,7 @@ impl CompiledComponent {
                 ctx: runtime_ctx,
                 allow_network,
                 network_allowlist,
+                allow_self_auth,
                 rt,
                 // Locked down: no preopens, no env, no stdio, no sockets.
                 wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
@@ -727,6 +739,11 @@ pub(crate) struct CapabilityState {
     /// only ever consults it when `allow_network` holds, since the `http`
     /// instance is not even linked otherwise.
     network_allowlist: Vec<String>,
+    /// Whether this bundle may set its own `Authorization` header on
+    /// `ryuzi:http/http` requests — VERIFIED first-party bundles only, mirrored
+    /// from [`HostPolicy::allow_self_auth`] at instantiation. Threaded into the
+    /// per-request [`AllowedHttpClient`] in `http_iface::Host::request`.
+    allow_self_auth: bool,
     rt: tokio::runtime::Handle,
     /// Minimal, locked-down WASI p2 context. Any real (std-built) component
     /// imports the WASI baseline (`wasi:io`, `wasi:cli`, …) even when it never
@@ -916,6 +933,7 @@ impl http_iface::Host for CapabilityState {
         request: http_iface::HttpRequest,
     ) -> Result<http_iface::HttpResponse, http_iface::HttpError> {
         let allowlist = self.network_allowlist.clone();
+        let allow_self_auth = self.allow_self_auth;
         let http_iface::HttpRequest {
             method,
             url,
@@ -926,7 +944,7 @@ impl http_iface::Host for CapabilityState {
             .into_iter()
             .map(|header| (header.name, header.value))
             .collect();
-        let client = AllowedHttpClient::new(allowlist);
+        let client = AllowedHttpClient::with_self_auth(allowlist, allow_self_auth);
         let result = self
             .rt
             .block_on(async move { client.request(&method, &url, headers, body).await });
