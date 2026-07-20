@@ -26,14 +26,6 @@ export const refKey = (ref: SessionRef): string => sessKey(ref.runnerId, ref.pk)
 /** A ref for a stamped session. */
 export const refOf = (s: UiSession): SessionRef => ({ runnerId: s.runnerId, pk: s.sessionPk });
 
-/** Parse a composite key back into its parts (splits on the FIRST `::`). A key
- *  with no separator is treated as a bare pk on the local runner. */
-export function parseSessKey(key: string): SessionRef {
-  const i = key.indexOf("::");
-  if (i === -1) return { runnerId: LOCAL_RUNNER, pk: key };
-  return { runnerId: key.slice(0, i), pk: key.slice(i + 2) };
-}
-
 /** True when two refs point at the same session (same runner AND same pk). */
 export const sameRef = (a: SessionRef | null | undefined, b: SessionRef | null | undefined): boolean =>
   !!a && !!b && a.runnerId === b.runnerId && a.pk === b.pk;
