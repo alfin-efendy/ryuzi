@@ -1,0 +1,14 @@
+package ryuzi:mimo@0.1.0;
+
+// The narrow world the MiMo free-tier provider component targets: it imports
+// only the plugin type vocabulary, the host-mediated HTTP egress (all network
+// I/O), and per-plugin storage (to cache the bootstrap JWT + device identity
+// across per-call re-instantiation), and exports the provider interface the
+// Task 10 adapter calls. The build materializes `wit/deps/` from the SDK the
+// same way the fixtures do (see scripts/plugins/build-first-party.ts).
+world mimo {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:http/http@0.1.0;
+  import ryuzi:storage/storage@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+}
