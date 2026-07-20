@@ -11,6 +11,9 @@
 //     route-scoped error (never a daemon crash).
 //   - a prompt containing "reject" returns a `provider-error`, the clean
 //     guest-error path.
+//   - a prompt containing "unterminated" returns two chunks NEITHER of which is
+//     `finished`, so the adapter's truncated-stream detection (no terminal
+//     event) fires instead of fabricating a completed stream.
 
 wit_bindgen::generate!({
     path: "wit",
@@ -47,6 +50,21 @@ impl Guest for Fixture {
             return Err(ProviderError::Failed(
                 "intentional provider failure".to_string(),
             ));
+        }
+        if request.prompt.contains("unterminated") {
+            // Two chunks, NEITHER `finished` — a truncated completion.
+            return Ok(vec![
+                CompletionChunk {
+                    text: "partial ".to_string(),
+                    finished: false,
+                    usage: None,
+                },
+                CompletionChunk {
+                    text: "answer".to_string(),
+                    finished: false,
+                    usage: None,
+                },
+            ]);
         }
         Ok(vec![
             CompletionChunk {

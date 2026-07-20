@@ -2856,8 +2856,34 @@ async fn pump_wasm_provider(
             }
         }
     }
-    for event in tr.finish() {
-        let _ = tx.send(Ok(event)).await;
+    // A completion whose chunks NEVER set `finished` (guest-controlled, nothing
+    // enforces it) ended without a terminal event — that is a truncated
+    // response, not a completed one, so emit an `error_frame` and record the
+    // attempt as failed rather than synthesizing a `message_stop` with a
+    // fabricated `stop_reason` and logging a `200`. This mirrors the OpenAI /
+    // kiro / codex pumps' `saw_terminal()` guard (see
+    // `OpenAiToAnthropicStream`'s doc); like them it is post-hoc detection —
+    // `complete()` has already returned — so it cannot do live failover, but it
+    // must stop reporting a truncated wasm-provider response as success.
+    // A completion whose chunks NEVER set `finished` (guest-controlled, nothing
+    // enforces it) ended without a terminal event — that is a truncated
+    // response, not a completed one, so emit an `error_frame` and record the
+    // attempt as failed rather than synthesizing a `message_stop` with a
+    // fabricated `stop_reason` and logging a `200`. This mirrors the OpenAI /
+    // kiro / codex pumps' `saw_terminal()` guard (see
+    // `OpenAiToAnthropicStream`'s doc); like them it is post-hoc detection —
+    // `complete()` has already returned — so it cannot do live failover, but it
+    // must stop reporting a truncated wasm-provider response as success.
+    let mut errored = false;
+    if tr.saw_terminal() {
+        for event in tr.finish() {
+            let _ = tx.send(Ok(event)).await;
+        }
+    } else {
+        for event in tr.error_frame("wasm provider completion ended without a finished chunk") {
+            let _ = tx.send(Ok(event)).await;
+        }
+        errored = true;
     }
     crate::llm_router::usage::record(
         &store,
@@ -2866,9 +2892,9 @@ async fn pump_wasm_provider(
         &model,
         "native",
         crate::llm_router::usage::Usage { input, output },
-        200,
+        if errored { 502 } else { 200 },
         started,
-        None,
+        errored.then(|| "completion ended without a finished chunk".to_string()),
     );
 }
 
@@ -3501,6 +3527,84 @@ mod tests {
         assert!(
             error.to_string().contains("wasm provider"),
             "the route-scoped error must name the wasm provider: {error}"
+        );
+
+        crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
+        registry::unregister_custom_descriptor(PROVIDER_ID);
+    }
+
+    /// Regression: a WASM provider completion whose chunks NEVER set `finished`
+    /// is a truncated response, so the router must emit an `error` frame and NOT
+    /// synthesize a completed `message_stop` (which would fabricate a success and
+    /// silently defeat the router's truncated-stream failover for wasm
+    /// providers). Mirrors the OpenAI/kiro/codex pumps' `saw_terminal()` guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_reports_a_wasm_provider_completion_with_no_finished_chunk_as_truncated() {
+        crate::plugins::build_fixture_components_once();
+        const PROVIDER_ID: &str = "wasm-router-noterm";
+        let ctx = test_ctx().await;
+
+        register_wasm_descriptor(PROVIDER_ID);
+        crate::llm_router::installed::install_provider(&ctx.store, PROVIDER_ID)
+            .await
+            .unwrap();
+        let (transport, _tmp) = crate::plugins::wasm_provider::build_test_transport(
+            crate::plugins::wasm_provider::provider_fixture_artifact(),
+            PROVIDER_ID,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        crate::plugins::wasm_provider::register_wasm_provider(transport);
+        connections::add_connection(
+            &ctx.store,
+            mk_conn(
+                "wasm-conn-noterm",
+                PROVIDER_ID,
+                "api_key",
+                ConnectionData {
+                    api_key: Some("unused".into()),
+                    models_override: Some(vec!["fixture-model".into()]),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let requested = format!("{PROVIDER_ID}/fixture-model");
+        let routed = anthropic_messages_stream(
+            &ctx,
+            json!({
+                "model": requested,
+                "messages": [{"role": "user", "content": "give me an unterminated answer"}]
+            }),
+            &empty_policy(&requested),
+        )
+        .await
+        .expect("routing to the wasm provider must still deliver a (truncated) stream");
+        let events = collect_stream(routed.events).await;
+
+        // The truncated completion ends with an `error` frame, NOT a fabricated
+        // `message_stop`. On the pre-fix code the pump called `finish()`
+        // unconditionally, so `message_stop` was present and the `error` frame
+        // absent — this assertion is the RED→GREEN.
+        let error_message = events
+            .iter()
+            .find(|(name, _)| name == "error")
+            .map(|(_, data)| {
+                data["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .expect("a truncated wasm completion must emit an error frame");
+        assert!(
+            error_message.contains("without a finished chunk"),
+            "unexpected error frame message: {error_message}"
+        );
+        assert!(
+            !events.iter().any(|(name, _)| name == "message_stop"),
+            "a truncated completion must NOT synthesize a completed message_stop"
         );
 
         crate::plugins::wasm_provider::unregister_wasm_provider(PROVIDER_ID);
