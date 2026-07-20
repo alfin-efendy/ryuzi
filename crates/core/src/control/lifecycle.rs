@@ -1740,7 +1740,7 @@ impl ControlPlane {
         Option<Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
         Option<Arc<dyn crate::plugins::extension::ExtensionEvents>>,
     ) {
-        use crate::plugins::runtime::{ComponentRuntime, HostPolicy, ResourceLimits};
+        use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
         use crate::plugins::wasm_connector::{WasmActivation, WasmToolSet};
         use crate::plugins::wasm_hooks::WasmHookDispatcher;
 
@@ -1777,26 +1777,11 @@ impl ControlPlane {
                 }
             }
             // Capabilities are granted from the bundle's own manifest
-            // declarations: network only when it declares hosts, OAuth only
-            // when it declares profiles; a plugin's own scoped
-            // settings/storage are safe by construction, so they are always
-            // linked. Real outbound network stays gated by the host-mediated
-            // `ryuzi:http`/`ryuzi:oauth` capabilities.
-            let policy = HostPolicy {
-                allow_network: !bundle.manifest.permissions.network.is_empty(),
-                allow_settings: true,
-                allow_storage: true,
-                allow_oauth: !bundle.manifest.oauth.is_empty(),
-                // Self-set Authorization is granted ONLY to VERIFIED first-party
-                // bundles, keyed off the installed release's signing key id
-                // (set by `verify_bundle` from the trusted-key match — never
-                // manifest content). The built-in mimo/opencode providers need
-                // it to present their own bearer; every other bundle keeps the
-                // strict Task 8 stripping.
-                allow_self_auth: bundle.release_record.signing_key_id
-                    == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
-                limits: ResourceLimits::default(),
-            };
+            // declarations + verified install provenance — the single source of
+            // truth every InstalledBundle→HostPolicy site shares (see
+            // `HostPolicy::for_installed_bundle` for the exact derivation,
+            // including the first-party-only `allow_self_auth` gate).
+            let policy = HostPolicy::for_installed_bundle(&bundle);
             let compiled = match runtime.compile(&bundle, policy) {
                 Ok(compiled) => Arc::new(compiled),
                 Err(error) => {

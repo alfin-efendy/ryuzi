@@ -547,7 +547,7 @@ pub async fn build_gateway_supervisors(
     settings: &SettingsStore,
     telemetry: Arc<dyn Telemetry>,
 ) -> Vec<WasmGatewaySupervisor> {
-    use crate::plugins::runtime::{ComponentRuntime, HostPolicy, ResourceLimits};
+    use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
 
     let root = crate::plugins::bundle::installed_bundle_root();
     if !root.exists() {
@@ -581,17 +581,10 @@ pub async fn build_gateway_supervisors(
                 continue;
             }
         }
-        let policy = HostPolicy {
-            allow_network: !bundle.manifest.permissions.network.is_empty(),
-            allow_settings: true,
-            allow_storage: true,
-            allow_oauth: !bundle.manifest.oauth.is_empty(),
-            // First-party-only self-auth, keyed off the verified release
-            // signing key id (see `control::lifecycle` for the rationale).
-            allow_self_auth: bundle.release_record.signing_key_id
-                == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
-            limits: ResourceLimits::default(),
-        };
+        // Single source of truth for the installed-bundle capability policy
+        // (incl. the first-party-only `allow_self_auth` gate) — see
+        // `HostPolicy::for_installed_bundle`.
+        let policy = HostPolicy::for_installed_bundle(&bundle);
         let compiled = match runtime.compile(&bundle, policy) {
             Ok(compiled) => Arc::new(compiled),
             Err(error) => {

@@ -127,6 +127,38 @@ impl HostPolicy {
             limits: ResourceLimits::default(),
         }
     }
+
+    /// The standard capability policy for an installed, active component bundle
+    /// — the SINGLE source of truth every `InstalledBundle → HostPolicy` site
+    /// must use (session connector/hooks activation, the gateway supervisor,
+    /// and any future provider-transport wiring), so a security-sensitive flag
+    /// can never be silently omitted or mis-derived by an inline copy.
+    ///
+    /// Capabilities are granted from the bundle's own manifest declarations plus
+    /// its verified install provenance:
+    /// - `allow_network` only when the manifest declares hosts, `allow_oauth`
+    ///   only when it declares profiles;
+    /// - `allow_settings`/`allow_storage` are always granted — a plugin's own
+    ///   scoped settings/storage are safe by construction, and real outbound
+    ///   network stays gated by the host-mediated `ryuzi:http`/`ryuzi:oauth`
+    ///   capabilities;
+    /// - `allow_self_auth` (let the bundle set its own `Authorization` header)
+    ///   ONLY for a VERIFIED first-party bundle, keyed off the installed
+    ///   release's `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID` — set
+    ///   by `verify_bundle` from the trusted-key match, NEVER from manifest
+    ///   content or anything a component can forge. Every other bundle keeps the
+    ///   strict Task 8 `Authorization` stripping.
+    pub fn for_installed_bundle(bundle: &InstalledBundle) -> Self {
+        Self {
+            allow_network: !bundle.manifest.permissions.network.is_empty(),
+            allow_settings: true,
+            allow_storage: true,
+            allow_oauth: !bundle.manifest.oauth.is_empty(),
+            allow_self_auth: bundle.release_record.signing_key_id
+                == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
+            limits: ResourceLimits::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1205,6 +1237,58 @@ mod tests {
             root: dir.to_path_buf(),
             component_path,
         }
+    }
+
+    #[test]
+    fn host_policy_for_installed_bundle_gates_self_auth_on_the_first_party_key() {
+        use crate::plugins::first_party_key::FIRST_PARTY_KEY_ID;
+
+        fn bundle_with(signing_key_id: &str, network: Vec<&str>) -> InstalledBundle {
+            let mut record = component_release();
+            record.signing_key_id = signing_key_id.to_string();
+            InstalledBundle {
+                manifest: manifest(network),
+                release: release(),
+                release_record: record,
+                root: std::path::PathBuf::from("nonexistent"),
+                component_path: std::path::PathBuf::from("nonexistent/plugin.wasm"),
+            }
+        }
+
+        // The security-sensitive gate is bound to VERIFIED install provenance:
+        // only a bundle whose recorded signing key id is the first-party key
+        // (set by `verify_bundle` from the trusted-key match) gets self-auth.
+        let first_party =
+            HostPolicy::for_installed_bundle(&bundle_with(FIRST_PARTY_KEY_ID, vec![]));
+        assert!(
+            first_party.allow_self_auth,
+            "the first-party key must grant self-auth"
+        );
+
+        let third_party =
+            HostPolicy::for_installed_bundle(&bundle_with("some-other-registry", vec![]));
+        assert!(
+            !third_party.allow_self_auth,
+            "a non-first-party key must NOT grant self-auth"
+        );
+
+        // The rest of the derivation is manifest-driven and independent of the
+        // self-auth gate: settings/storage always on, network only with a
+        // declared host — and a network grant never implies self-auth.
+        assert!(first_party.allow_settings && first_party.allow_storage);
+        assert!(
+            !first_party.allow_network,
+            "no manifest hosts => no network"
+        );
+        let networked = HostPolicy::for_installed_bundle(&bundle_with(
+            "some-other-registry",
+            vec!["api.example.com"],
+        ));
+        assert!(networked.allow_network, "a manifest host grants network");
+        assert!(
+            !networked.allow_self_auth,
+            "a network grant must not imply self-auth"
+        );
     }
 
     #[tokio::test]
