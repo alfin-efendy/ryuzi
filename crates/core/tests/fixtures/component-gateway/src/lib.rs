@@ -22,13 +22,28 @@
 //     `op.result`s are queued "ready" (returned on the immediate post-deliver
 //     poll); an `approval.decision` is queued "deferred" (returned one poll
 //     LATER), modelling a user clicking the button a moment after the buttons
-//     are posted. The delivery echoes the event's sequence.
+//     are posted. The delivery echoes the event's sequence. `sequence` itself
+//     is assigned lazily, at the moment an event actually lands in a returned
+//     `poll-inbound` batch (never at queue time) — so it always reflects true
+//     wire delivery order, even across the deferred path's one-poll gap
+//     (queuing an approval decision, then queuing/returning something else in
+//     between, must never let the eventually-returned decision carry a LOWER
+//     sequence than something the host already saw).
 //   - `health-check` reports healthy.
 //   - when `config.endpoint` contains "boom", `poll-inbound` loops forever, so
 //     the host fuel/epoch budget traps it and the supervisor restarts the
 //     component with capped backoff. Because each restart is a FRESH instance,
 //     the boom config is re-applied by the supervisor's own `start` call, so it
 //     traps again — exactly the repeated-trap scenario the backoff cap bounds.
+//   - when `config.endpoint` contains "message-flow" (Task 5), the first poll
+//     ALSO emits `message.mention` (workspace_id "ws-1"), then `message.thread`
+//     (conversation_id "conv-0", matching the first id `FakeGateway::
+//     create_conversation` hands back in the host bridge's own tests), then a
+//     DUPLICATE of that same `message.thread` event — same event-type, payload,
+//     AND `sequence` — proving the host bridge's replay dedup drops it instead
+//     of double-dispatching `on_reply`.
+//   - when `config.endpoint` contains "dm-flow" (Task 5), the first poll ALSO
+//     emits a single `message.dm` event (conversation_id "dm-conv-1").
 
 wit_bindgen::generate!({
     path: "wit",
@@ -49,12 +64,25 @@ struct State {
     account: String,
     emitted: bool,
     seq: u64,
-    /// Inbound events returned on the NEXT `poll-inbound` (op.results, so they
-    /// come back on the immediate post-`deliver-outbound` poll).
-    ready: VecDeque<GatewayEvent>,
-    /// Inbound events held back one extra poll (approval decisions), so they
-    /// arrive a poll AFTER the delivery that produced them.
-    deferred: VecDeque<GatewayEvent>,
+    /// Inbound events (event-type, payload) returned on the NEXT
+    /// `poll-inbound` (op.results, so they come back on the immediate
+    /// post-`deliver-outbound` poll; also approval decisions PROMOTED here
+    /// from `deferred` on a prior poll). No `sequence` is stored — see the
+    /// module doc: it is assigned only once an event is actually placed into
+    /// a returned batch.
+    ready: VecDeque<(String, Vec<u8>)>,
+    /// Inbound events (event-type, payload) held back one extra poll
+    /// (approval decisions), so they arrive a poll AFTER the delivery that
+    /// produced them. Also unsequenced until promoted to `ready`.
+    deferred: VecDeque<(String, Vec<u8>)>,
+    /// Task 5: `config.endpoint` contained "message-flow" — emit the
+    /// mention/thread/duplicate-thread sequence on the first poll.
+    message_flow: bool,
+    message_flow_emitted: bool,
+    /// Task 5: `config.endpoint` contained "dm-flow" — emit a `message.dm` on
+    /// the first poll.
+    dm_flow: bool,
+    dm_flow_emitted: bool,
 }
 
 thread_local! {
@@ -81,12 +109,8 @@ fn next_seq(state: &mut State) -> u64 {
     state.seq
 }
 
-fn queue(queue: &mut VecDeque<GatewayEvent>, seq: u64, event_type: &str, payload: String) {
-    queue.push_back(GatewayEvent {
-        event_type: event_type.to_string(),
-        payload: payload.into_bytes(),
-        sequence: seq,
-    });
+fn queue(queue: &mut VecDeque<(String, Vec<u8>)>, event_type: &str, payload: String) {
+    queue.push_back((event_type.to_string(), payload.into_bytes()));
 }
 
 impl Guest for Fixture {
@@ -95,6 +119,8 @@ impl Guest for Fixture {
             *state.borrow_mut() = State {
                 boom: config.endpoint.contains("boom"),
                 account: config.account.clone(),
+                message_flow: config.endpoint.contains("message-flow"),
+                dm_flow: config.endpoint.contains("dm-flow"),
                 ..State::default()
             };
         });
@@ -117,31 +143,27 @@ impl Guest for Fixture {
             match event.event_type.as_str() {
                 "create-channel" => {
                     if let Some(op_id) = json_str(&event.payload, "op_id") {
-                        let seq = next_seq(&mut state);
                         let payload = format!("{{\"op_id\":\"{op_id}\",\"channel_id\":\"chan-1\"}}");
-                        queue(&mut state.ready, seq, "op.result", payload);
+                        queue(&mut state.ready, "op.result", payload);
                     }
                 }
                 "create-thread" => {
                     if let Some(op_id) = json_str(&event.payload, "op_id") {
-                        let seq = next_seq(&mut state);
                         let payload =
                             format!("{{\"op_id\":\"{op_id}\",\"thread_id\":\"thread-1\"}}");
-                        queue(&mut state.ready, seq, "op.result", payload);
+                        queue(&mut state.ready, "op.result", payload);
                     }
                 }
                 "send-message" => {
                     if let Some(op_id) = json_str(&event.payload, "op_id") {
-                        let seq = next_seq(&mut state);
                         let payload = format!("{{\"op_id\":\"{op_id}\",\"message_id\":\"msg-1\"}}");
-                        queue(&mut state.ready, seq, "op.result", payload);
+                        queue(&mut state.ready, "op.result", payload);
                     }
                 }
                 "edit-message" | "send-messages" => {
                     if let Some(op_id) = json_str(&event.payload, "op_id") {
-                        let seq = next_seq(&mut state);
                         let payload = format!("{{\"op_id\":\"{op_id}\",\"ok\":true}}");
-                        queue(&mut state.ready, seq, "op.result", payload);
+                        queue(&mut state.ready, "op.result", payload);
                     }
                 }
                 "approval-request" => {
@@ -152,11 +174,10 @@ impl Guest for Fixture {
                         .unwrap_or(false);
                     if !silent {
                         if let Some(request_id) = json_str(&event.payload, "request_id") {
-                            let seq = next_seq(&mut state);
                             let payload = format!(
                                 "{{\"request_id\":\"{request_id}\",\"allow\":true,\"actor\":\"tester\"}}"
                             );
-                            queue(&mut state.deferred, seq, "approval.decision", payload);
+                            queue(&mut state.deferred, "approval.decision", payload);
                         }
                     }
                 }
@@ -190,12 +211,23 @@ impl Guest for Fixture {
         }
         STATE.with(|state| {
             let mut state = state.borrow_mut();
-            // "ready" events (op.results from a just-delivered op) come back
-            // now; "deferred" events (approval decisions) become ready for the
-            // NEXT poll, so they arrive a poll after their delivery.
-            let mut batch: Vec<GatewayEvent> = state.ready.drain(..).collect();
-            let deferred: Vec<GatewayEvent> = state.deferred.drain(..).collect();
-            state.ready.extend(deferred);
+            let mut batch: Vec<GatewayEvent> = Vec::new();
+
+            // "ready" events (op.results from a just-delivered op, or an
+            // approval decision PROMOTED here on a prior poll) come back now.
+            // `sequence` is assigned HERE — at actual return time, in return
+            // order — never at queue time, so it always matches true wire
+            // delivery order (see the module doc).
+            let ready: Vec<(String, Vec<u8>)> = state.ready.drain(..).collect();
+            for (event_type, payload) in ready {
+                let seq = next_seq(&mut state);
+                batch.push(GatewayEvent {
+                    event_type,
+                    payload,
+                    sequence: seq,
+                });
+            }
+
             // The one-time seed inbound event the supervisor lifecycle test asserts.
             if !state.emitted {
                 state.emitted = true;
@@ -206,6 +238,55 @@ impl Guest for Fixture {
                     sequence: seq,
                 });
             }
+            // Task 5: the host bridge's message-routing + replay-dedup tests.
+            if state.message_flow && !state.message_flow_emitted {
+                state.message_flow_emitted = true;
+                let mention_seq = next_seq(&mut state);
+                batch.push(GatewayEvent {
+                    event_type: "message.mention".to_string(),
+                    payload:
+                        br#"{"workspace_id":"ws-1","actor":"u1","prompt":"start it","attachments":[]}"#
+                            .to_vec(),
+                    sequence: mention_seq,
+                });
+                let thread_seq = next_seq(&mut state);
+                let thread_payload =
+                    br#"{"conversation_id":"conv-0","actor":"u1","prompt":"continue it","attachments":[]}"#
+                        .to_vec();
+                batch.push(GatewayEvent {
+                    event_type: "message.thread".to_string(),
+                    payload: thread_payload.clone(),
+                    sequence: thread_seq,
+                });
+                // A duplicate of the SAME thread event (identical event-type,
+                // payload, AND sequence) — the host bridge must drop this as a
+                // replay instead of dispatching a second `on_reply`.
+                batch.push(GatewayEvent {
+                    event_type: "message.thread".to_string(),
+                    payload: thread_payload,
+                    sequence: thread_seq,
+                });
+            }
+            if state.dm_flow && !state.dm_flow_emitted {
+                state.dm_flow_emitted = true;
+                let seq = next_seq(&mut state);
+                batch.push(GatewayEvent {
+                    event_type: "message.dm".to_string(),
+                    payload:
+                        br#"{"conversation_id":"dm-conv-1","user_id":"user-9","text":"hello there"}"#
+                            .to_vec(),
+                    sequence: seq,
+                });
+            }
+
+            // "deferred" events (approval decisions queued by a `deliver-
+            // outbound` call before this poll) become ready for the NEXT
+            // poll, so they arrive one poll after their delivery. Still no
+            // sequence assigned — that happens only once THEY are actually
+            // returned, above.
+            let deferred: Vec<(String, Vec<u8>)> = state.deferred.drain(..).collect();
+            state.ready.extend(deferred);
+
             Ok(batch)
         })
     }

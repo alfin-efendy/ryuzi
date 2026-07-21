@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::domain::{ApprovalDecision, ApprovalRequest, Surface};
+use crate::domain::{ApprovalDecision, ApprovalRequest, AttachmentRef, Surface};
 use crate::gateway::{
     Gateway, GatewayStatus, GatewayStatusPublisher, GatewayStatusSubscription, MessageRef,
 };
@@ -478,9 +478,9 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub struct WasmGateway {
     id: String,
     supervisor: WasmGatewaySupervisor,
-    /// The outbound `Router`, installed by `set_router`. Consumed by inbound
-    /// message/slash routing in Task 5; for now it only gates the drain task's
-    /// "no router yet" placeholder for non-correlation inbound events.
+    /// The outbound `Router`, installed by `set_router`. Consumed by the drain
+    /// task to dispatch `message.*` inbound events (Task 5); `slash.*` events
+    /// are decoded but not yet acted on (Task 6).
     router: Arc<OnceLock<Arc<Router>>>,
     correlation: Arc<Correlation>,
     status: Arc<GatewayStatusPublisher>,
@@ -519,6 +519,7 @@ impl WasmGateway {
             inbound_rx,
             Arc::clone(&correlation),
             Arc::clone(&router),
+            plugin_id.clone(),
         ));
         let watch = tokio::spawn(watch_status(
             supervisor.status_handle(),
@@ -597,19 +598,42 @@ fn status_of(snapshot: &GatewaySnapshot) -> GatewayStatus {
     }
 }
 
-/// Drain inbound events forwarded by the supervisor and resolve the matching
-/// correlation. Honours the T3 mapping exactly: an `op.result` resolves a
-/// `CorrelationKey::Op` with a `CorrelationValue::OpResult`; an
-/// `approval.decision` resolves a `CorrelationKey::Approval` with the decision —
-/// never crossed. Everything else (message/slash inbound events) is routed into
-/// the `Router` in Task 5; here it is dropped. Exits when the supervisor drops
-/// the sink.
+/// Drain inbound events forwarded by the supervisor: correlate `op.result`/
+/// `approval.decision` (Task 4) and dispatch `message.*` into the stored
+/// `Router` (Task 5), reproducing `gateway/discord/mod.rs`'s native routing
+/// rules exactly (design doc §5.2) — `message.mention` -> `on_start`,
+/// `message.thread` -> `on_reply`, `message.dm` -> `on_dm`. `slash.*` events
+/// are decoded but not yet acted on (interaction-reply correlation is Task 6).
+///
+/// Every event's raw wire `sequence` is checked against the last-processed
+/// sequence FIRST, before it is even decoded: an event with `sequence <=
+/// last_sequence` is a replay (e.g. a re-sent batch after a component
+/// restart/reconnect) and is dropped outright, so a replayed `message.*`
+/// never double-dispatches into the `Router` and a replayed `op.result`/
+/// `approval.decision` never double-resolves a correlation. `last_sequence`
+/// only advances past an event once it is accepted, so replays are compared
+/// against the highest sequence actually processed, not merely seen.
+///
+/// Exits when the supervisor drops the sink.
 async fn drain_inbound(
     mut inbound: mpsc::UnboundedReceiver<GatewayInboundEvent>,
     correlation: Arc<Correlation>,
     router: Arc<OnceLock<Arc<Router>>>,
+    gateway_id: String,
 ) {
+    let mut last_sequence: u64 = 0;
     while let Some(event) = inbound.recv().await {
+        if event.sequence <= last_sequence {
+            tracing::trace!(
+                event = %event.event_type,
+                sequence = event.sequence,
+                last_sequence,
+                "wasm gateway inbound event dropped: replayed sequence"
+            );
+            continue;
+        }
+        last_sequence = event.sequence;
+
         match InboundEvent::decode(&event.event_type, &event.payload) {
             Ok(InboundEvent::OpResult { op_id, result }) => {
                 correlation.resolve(
@@ -627,16 +651,75 @@ async fn drain_inbound(
                     CorrelationValue::Approval { allow, actor },
                 );
             }
-            Ok(_routable) => {
-                // message.*/slash.* inbound events become Router calls in Task 5.
-                // Until then (and, like the native gateway, until a Router is
-                // set) they are dropped.
-                if router.get().is_none() {
-                    tracing::trace!(
-                        event = %event.event_type,
-                        "wasm gateway inbound event dropped: no router set yet"
-                    );
+            Ok(InboundEvent::MessageMention {
+                workspace_id,
+                actor,
+                prompt,
+                attachments,
+            }) => {
+                if let Some(router) = require_router(&router, &event.event_type) {
+                    let attachments = attachment_refs(&attachments);
+                    if let Err(error) = router
+                        .on_start(&gateway_id, &workspace_id, &actor, &prompt, &attachments)
+                        .await
+                    {
+                        tracing::warn!(
+                            event = %event.event_type,
+                            "wasm gateway on_start failed: {error}"
+                        );
+                    }
                 }
+            }
+            Ok(InboundEvent::MessageThread {
+                conversation_id,
+                actor,
+                prompt,
+                attachments,
+            }) => {
+                if let Some(router) = require_router(&router, &event.event_type) {
+                    let attachments = attachment_refs(&attachments);
+                    if let Err(error) = router
+                        .on_reply(&gateway_id, &conversation_id, &actor, &prompt, &attachments)
+                        .await
+                    {
+                        tracing::warn!(
+                            event = %event.event_type,
+                            "wasm gateway on_reply failed: {error}"
+                        );
+                    }
+                }
+            }
+            Ok(InboundEvent::MessageDm {
+                conversation_id,
+                user_id,
+                text,
+            }) => {
+                if let Some(router) = require_router(&router, &event.event_type) {
+                    if let Err(error) = router
+                        .on_dm(&gateway_id, &conversation_id, &user_id, &text)
+                        .await
+                    {
+                        tracing::warn!(
+                            event = %event.event_type,
+                            "wasm gateway on_dm failed: {error}"
+                        );
+                    }
+                }
+            }
+            Ok(
+                InboundEvent::SlashConnect { .. }
+                | InboundEvent::SlashEnd { .. }
+                | InboundEvent::SlashStop { .. }
+                | InboundEvent::SlashStatus { .. },
+            ) => {
+                // Slash-command routing (`on_connect`/`on_end`/`on_stop`) and its
+                // `interaction-reply` correlation is Task 6 — these events are
+                // decoded (proving the wire contract round-trips) but otherwise a
+                // no-op here.
+                tracing::trace!(
+                    event = %event.event_type,
+                    "wasm gateway slash inbound event not yet routed (Task 6)"
+                );
             }
             Err(error) => {
                 // Undecodable (e.g. the fixture's non-JSON `message` seed) — drop.
@@ -647,6 +730,45 @@ async fn drain_inbound(
             }
         }
     }
+}
+
+/// Look up the stored router, tracing (and returning `None`) if `set_router`
+/// hasn't been called yet — matches the native Discord gateway's "events
+/// arriving before `set_router` are dropped with a warning" behaviour
+/// (`gateway/discord/mod.rs`'s `InboundRouting::handle_message`).
+fn require_router<'a>(
+    router: &'a OnceLock<Arc<Router>>,
+    event_type: &str,
+) -> Option<&'a Arc<Router>> {
+    let router = router.get();
+    if router.is_none() {
+        tracing::trace!(
+            event = %event_type,
+            "wasm gateway inbound event dropped: no router set yet"
+        );
+    }
+    router
+}
+
+/// Convert the wire `attachments: Vec<String>` (URLs only — the component
+/// pre-computes/normalizes everything else per design doc §5.2, so the bridge
+/// does no further Discord-specific processing) into the `Router`'s
+/// `&[AttachmentRef]` shape. The wire carries no filename/content-type/size
+/// metadata, so `name` is derived from the URL's basename (the same helper
+/// `Router::on_connect` uses to name a project from a git URL) and
+/// `content_type`/`size` are left unknown: `attachments::materialize_attachments`
+/// only uses `name` (for its extension allowlist) and re-derives the real
+/// size from the actual download, so a `0` declared size never falsely trips
+/// its size cap.
+fn attachment_refs(urls: &[String]) -> Vec<AttachmentRef> {
+    urls.iter()
+        .map(|url| AttachmentRef {
+            name: crate::control::basename_of(url),
+            url: url.clone(),
+            content_type: None,
+            size: 0,
+        })
+        .collect()
 }
 
 /// Sample the supervisor snapshot on an interval and publish `Connected`/
@@ -1531,5 +1653,439 @@ mod gateway_impl_tests {
         .await
         .expect("status must reach Connected within the deadline");
         assert!(connected, "gateway must report Connected");
+    }
+
+    // -------------------------------------------------------------
+    // Task 5: inbound `message.*` -> Router dispatch + sequence dedup
+    // -------------------------------------------------------------
+    //
+    // These reuse the SAME `component-gateway` fixture (extended for Task 5
+    // with a "message-flow"/"dm-flow" `endpoint` marker) but drive a REAL
+    // `Router` over a `ControlPlane`, mirroring `router.rs`'s own inbound
+    // test harness (`wired_control_plane`/`StateDirGuard`/a `send_prompt`-
+    // recording `Harness`) rather than inventing a mock `Router` — `Router`
+    // is a concrete struct with no trait seam to mock, and this harness
+    // already exists and is proven in `router.rs`'s own Task 4 tests and
+    // `daemon.rs`'s inbound tests (duplicated here, not imported: both are
+    // private to their own `mod tests`).
+
+    use crate::control::ControlPlane;
+    use crate::domain::{
+        AgentIdentitySnapshot, PermMode, Project, Session, SessionKind, SessionStatus,
+    };
+    use crate::harness::{Harness, HarnessFactory, HarnessSession, SessionCtx, TurnPrompt};
+    use crate::router::Router;
+    use serial_test::serial;
+
+    /// A minimal `Gateway` that only records `create_conversation` calls
+    /// (`on_start` is the only inbound Router method that touches a
+    /// `Gateway`), registered under the SAME id the tested `WasmGateway` uses
+    /// (`"acme-gateway"`, see `test_surface`/`build_test_gateway` above) so
+    /// `Router::on_start` finds it via `gateway_id`. Mirrors `router.rs`'s own
+    /// private `FakeGateway` test harness.
+    struct RecordingGateway {
+        gid: String,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingGateway {
+        fn new(gid: &str) -> Self {
+            RecordingGateway {
+                gid: gid.to_string(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Gateway for RecordingGateway {
+        fn id(&self) -> &str {
+            &self.gid
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create_workspace:{name}"));
+            Ok(format!("ws-{name}"))
+        }
+        async fn create_conversation(
+            &self,
+            workspace_id: &str,
+            title: &str,
+        ) -> anyhow::Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create_conversation:{workspace_id}:{title}"));
+            Ok("conv-0".to_string())
+        }
+        async fn post_status(&self, surface: &Surface, text: &str) -> anyhow::Result<MessageRef> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("post_status:{}:{}", surface.conversation_id, text));
+            Ok(MessageRef {
+                surface: surface.clone(),
+                message_id: "m0".to_string(),
+            })
+        }
+        async fn edit_status(&self, _msg: &MessageRef, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_result(&self, _surface: &Surface, _chunks: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn post_error(&self, _surface: &Surface, _message: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _surface: &Surface,
+            _req: &ApprovalRequest,
+        ) -> anyhow::Result<ApprovalDecision> {
+            Ok(ApprovalDecision::AllowOnce)
+        }
+    }
+
+    /// A harness session that completes each turn immediately but ALSO
+    /// appends the turn's display text to a shared log — the seam this suite
+    /// uses to prove a Router call actually reached a live session turn (and,
+    /// for the dedup test, that a replayed `message.thread` does NOT produce
+    /// a second entry). Mirrors `daemon.rs`'s own `ResumeFakeSession`/
+    /// `router.rs`'s `OneShotSession` (both private to their own `mod tests`).
+    struct RecordingSession {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl HarnessSession for RecordingSession {
+        async fn send_prompt(&self, prompt: TurnPrompt) -> anyhow::Result<()> {
+            self.log.lock().unwrap().push(prompt.display);
+            Ok(())
+        }
+        async fn cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn end(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn agent_session_id(&self) -> Option<String> {
+            None
+        }
+    }
+    struct RecordingHarness {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Harness for RecordingHarness {
+        async fn start_session(&self, _ctx: SessionCtx) -> anyhow::Result<Box<dyn HarnessSession>> {
+            Ok(Box::new(RecordingSession {
+                log: self.log.clone(),
+            }))
+        }
+    }
+    struct RecordingHarnessFactory {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+    impl HarnessFactory for RecordingHarnessFactory {
+        fn create(&self) -> anyhow::Result<Arc<dyn Harness>> {
+            Ok(Arc::new(RecordingHarness {
+                log: self.log.clone(),
+            }))
+        }
+    }
+
+    /// Redirect `dirs::data_dir()`/`HOME` into a tempdir for the test's
+    /// duration — `on_start`'s `start_session` (worktree/scratch-dir prep)
+    /// otherwise touches the real state dir. Process-global env, so every
+    /// test using it must be `#[serial]`. Mirrors `router.rs`'s own
+    /// `StateDirGuard` (private to that module).
+    struct StateDirGuard {
+        _dir: tempfile::TempDir,
+    }
+    impl StateDirGuard {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+            std::env::set_var("HOME", dir.path());
+            StateDirGuard { _dir: dir }
+        }
+    }
+
+    /// A `ControlPlane` wired with a working LLM connection + default agent
+    /// route (so `start_session`/`continue_session`/`start_chat_session`
+    /// resolve a model instead of erroring) and `harness` as its harness
+    /// factory. Mirrors `router.rs`'s own `wired_control_plane_with_harness`
+    /// (private to that module, so duplicated here rather than exported).
+    async fn wired_control_plane(
+        harness: Arc<dyn HarnessFactory>,
+    ) -> (Arc<ControlPlane>, Arc<Store>, tempfile::NamedTempFile) {
+        let db_guard = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db_guard.path()).await.unwrap());
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: "test-anthropic".into(),
+                provider: "anthropic".into(),
+                auth_type: "api_key".into(),
+                label: "Test Anthropic".into(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some("test-key".into()),
+                    models_override: Some(vec!["claude-opus-4-8".into()]),
+                    ..Default::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        crate::agents::bootstrap::ensure_default_routes(&store)
+            .await
+            .unwrap();
+        let mut regs = crate::plugins::Registries::new();
+        regs.harness = harness;
+        let cp = {
+            let persistence = crate::agents::bootstrap::AgentPersistence::temporary(store.clone())
+                .await
+                .unwrap();
+            ControlPlane::new(store, regs, persistence).await
+        };
+        let store_ref = cp.store().clone();
+        (cp, store_ref, db_guard)
+    }
+
+    /// Seed a non-git project directly (no `on_connect`/git provisioning
+    /// needed) — mirrors `daemon.rs`'s own `seed_project` test helper.
+    async fn seed_project(store: &Store, project_id: &str) {
+        store
+            .insert_project(Project {
+                project_id: project_id.to_string(),
+                name: "demo".into(),
+                workdir: "/tmp/demo".into(),
+                source: None,
+                model: None,
+                effort: None,
+                perm_mode: PermMode::Default,
+                created_at: Some(crate::paths::now_ms()),
+                is_git: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Seed an Idle, project-less `chat` session directly and bind it to
+    /// `(gateway_id, conversation_id)` — bypassing `on_start`/`on_connect`
+    /// entirely, exactly the pattern `daemon.rs`'s own inbound-`on_reply`
+    /// tests use to drive `on_reply` against a cold (never-live) session.
+    async fn seed_chat_session(
+        cp: &ControlPlane,
+        store: &Store,
+        gateway_id: &str,
+        conversation_id: &str,
+        session_pk: &str,
+    ) {
+        let primary_agent = cp.registry().resolved_snapshot("ryuzi").await.unwrap();
+        let now = crate::paths::now_ms();
+        store
+            .insert_session(Session {
+                session_pk: session_pk.to_string(),
+                primary_agent_id: Some(primary_agent.profile.id.clone()),
+                primary_agent_snapshot: Some(AgentIdentitySnapshot {
+                    id: primary_agent.profile.id.clone(),
+                    name: primary_agent.profile.name.clone(),
+                    avatar_color: primary_agent.profile.avatar.color.clone(),
+                }),
+                project_id: None,
+                agent_session_id: None,
+                worktree_path: None,
+                branch: None,
+                title: Some("seed".into()),
+                status: SessionStatus::Idle,
+                perm_mode: PermMode::Default,
+                started_by: Some("test".into()),
+                created_at: Some(now),
+                last_active: Some(now),
+                resume_attempts: 0,
+                branch_owned: false,
+                kind: SessionKind::Chat,
+                speaker: None,
+                agent: None,
+                parent_session_pk: None,
+                archived_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_surface(gateway_id, conversation_id, session_pk)
+            .await
+            .unwrap();
+    }
+
+    /// Poll `predicate(log)` up to `attempts` times (short sleep between
+    /// reads) — mirrors `router.rs`'s `wait_for_sessions`/`wait_for_status`
+    /// polling style, applied to this suite's harness-log assertions.
+    async fn wait_for_log(
+        log: &Arc<Mutex<Vec<String>>>,
+        attempts: usize,
+        predicate: impl Fn(&[String]) -> bool,
+    ) -> Vec<String> {
+        for _ in 0..attempts {
+            let snapshot = log.lock().unwrap().clone();
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        log.lock().unwrap().clone()
+    }
+
+    /// `message.mention` decodes and reaches `Router::on_start`: the fixture's
+    /// "message-flow" endpoint emits a mention for `workspace_id "ws-1"`
+    /// (bound below to a real project), so `on_start` must call
+    /// `create_conversation("ws-1", "start it")` on the gateway registered
+    /// under this `WasmGateway`'s own id — proving the decoded `workspace_id`
+    /// and prompt-derived title both round-tripped correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn inbound_mention_message_drives_on_start_with_decoded_fields() {
+        let _guard = StateDirGuard::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (cp, store, _db_guard) =
+            wired_control_plane(Arc::new(RecordingHarnessFactory { log })).await;
+        let recording = Arc::new(RecordingGateway::new("acme-gateway"));
+        let router = Arc::new(Router::new(
+            Arc::clone(&cp),
+            vec![recording.clone() as Arc<dyn Gateway>],
+        ));
+        seed_project(&store, "proj-1").await;
+        store
+            .bind_project("acme-gateway", "ws-1", "proj-1")
+            .await
+            .unwrap();
+
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "message-flow".to_string(),
+        })
+        .await;
+        gateway.set_router(Arc::clone(&router));
+
+        let mut calls = Vec::new();
+        for _ in 0..300 {
+            calls = recording.calls();
+            if !calls.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "create_conversation:ws-1:start it"),
+            "expected create_conversation:ws-1:start it (the decoded mention's \
+             workspace_id + prompt-derived title), got: {calls:?}"
+        );
+    }
+
+    /// `message.dm` decodes and reaches `Router::on_dm`: no `/connect`
+    /// binding is involved, so the fixture's "dm-flow" endpoint's single
+    /// `message.dm` must bind a project-less `chat` session to its
+    /// `conversation_id` — mirroring `router.rs`'s own
+    /// `discord_dm_starts_a_chat_session` assertion style.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn inbound_dm_message_drives_on_dm_with_decoded_fields() {
+        let _guard = StateDirGuard::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (cp, store, _db_guard) =
+            wired_control_plane(Arc::new(RecordingHarnessFactory { log })).await;
+        let router = Arc::new(Router::new(Arc::clone(&cp), vec![]));
+
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "dm-flow".to_string(),
+        })
+        .await;
+        gateway.set_router(Arc::clone(&router));
+
+        let mut bound = None;
+        for _ in 0..300 {
+            bound = store
+                .resolve_by_conversation("acme-gateway", "dm-conv-1")
+                .await
+                .unwrap();
+            if bound.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let session = bound.expect("on_dm must bind a session to dm-conv-1");
+        assert_eq!(
+            session.kind,
+            SessionKind::Chat,
+            "on_dm starts a project-less chat session"
+        );
+    }
+
+    /// The headline Task-5 test: `message.thread` decodes and reaches
+    /// `Router::on_reply` for a session already bound to "conv-0", and the
+    /// fixture's immediately-following DUPLICATE `message.thread` (identical
+    /// event-type/payload/sequence) must be dropped by the bridge's replay
+    /// dedup rather than dispatching a second `on_reply` — proven by the
+    /// recording harness's `send_prompt` log settling at exactly ONE entry,
+    /// never two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn inbound_thread_message_drives_on_reply_and_dedups_replays() {
+        let _guard = StateDirGuard::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (cp, store, _db_guard) =
+            wired_control_plane(Arc::new(RecordingHarnessFactory { log: log.clone() })).await;
+        let router = Arc::new(Router::new(Arc::clone(&cp), vec![]));
+        // Bound directly (no `on_start` involved): the fixture's "message-flow"
+        // endpoint's `message.mention` (workspace_id "ws-1", left unbound here)
+        // is a harmless no-op; only its `message.thread` (conversation_id
+        // "conv-0") and the duplicate matter for this test.
+        seed_chat_session(&cp, &store, "acme-gateway", "conv-0", "session-1").await;
+
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "message-flow".to_string(),
+        })
+        .await;
+        gateway.set_router(Arc::clone(&router));
+
+        let settled = wait_for_log(&log, 300, |entries| !entries.is_empty()).await;
+        assert_eq!(
+            settled,
+            vec!["continue it".to_string()],
+            "on_reply must run exactly once, with the decoded thread prompt"
+        );
+
+        // Give a replayed (undeduped) on_reply every chance to show up before
+        // asserting the log never grows past one entry.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log,
+            vec!["continue it".to_string()],
+            "the duplicate message.thread (same sequence) must be dropped, not \
+             dispatched as a second on_reply: {final_log:?}"
+        );
     }
 }
