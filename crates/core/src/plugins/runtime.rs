@@ -14,6 +14,7 @@ use crate::plugins::capabilities::http::{AllowedHttpClient, HttpErr};
 use crate::plugins::capabilities::oauth::{OauthErr, ProfileOauth};
 use crate::plugins::capabilities::settings::{ScopedSettings, SettingsErr};
 use crate::plugins::capabilities::storage::{PluginStorage, StorageErr};
+use crate::plugins::capabilities::websocket::{WsConnState, WsErr, WsFrame, WsHeader, WsRegistry};
 use crate::plugins::capabilities::wit_bindings::ryuzi::host::host as host_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::http::http as http_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::oauth::oauth as oauth_iface;
@@ -569,6 +570,7 @@ impl CompiledComponent {
                 // Locked down: no preopens, no env, no stdio, no sockets.
                 wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
                 wasi_table: wasmtime::component::ResourceTable::new(),
+                ws: WsRegistry::new(),
             };
             let mut store = Store::new(&engine, state);
             store
@@ -829,6 +831,12 @@ pub(crate) struct CapabilityState {
     /// the host-mediated `ryuzi:http`/`ryuzi:oauth` capabilities, never WASI.
     wasi_ctx: wasmtime_wasi::WasiCtx,
     wasi_table: wasmtime::component::ResourceTable,
+    /// Per-instance registry of host-owned `ryuzi:websocket` connections. Its
+    /// [`WsRegistry`] owns every open socket + reader task; dropping this
+    /// `CapabilityState` (on supervisor stop/restart) drops the registry, which
+    /// aborts each reader task and closes each socket — see
+    /// `capabilities::websocket`.
+    ws: WsRegistry,
 }
 
 impl wasmtime_wasi::WasiView for CapabilityState {
@@ -1100,6 +1108,89 @@ impl oauth_iface::Host for CapabilityState {
             Err(OauthErr::Expired) => Err(oauth_iface::OauthError::Expired),
             Err(OauthErr::Failed(message)) => Err(oauth_iface::OauthError::Failed(message)),
         }
+    }
+}
+
+/// Thin `ryuzi:websocket` adapter: maps the generated WIT types to the
+/// registry's adapter-local types and drives `self.ws` (the per-instance
+/// [`WsRegistry`]) using this state's captured network allowlist and runtime
+/// handle. All the socket ownership, allowlist/scheme gating, per-instance
+/// caps, and lifecycle live in `capabilities::websocket`; this is only the
+/// binding layer (mirroring `http_iface::Host` above).
+impl websocket_iface::Host for CapabilityState {
+    fn connect(
+        &mut self,
+        url: String,
+        headers: Vec<websocket_iface::WsHeader>,
+    ) -> Result<u64, websocket_iface::WsError> {
+        let headers = headers
+            .into_iter()
+            .map(|header| WsHeader {
+                name: header.name,
+                value: header.value,
+            })
+            .collect();
+        self.ws
+            .connect(&self.network_allowlist, &self.rt, &url, headers)
+            .map_err(map_ws_err)
+    }
+
+    fn send(
+        &mut self,
+        handle: u64,
+        frame: websocket_iface::WsFrame,
+    ) -> Result<(), websocket_iface::WsError> {
+        let frame = WsFrame {
+            data: frame.data,
+            is_text: frame.is_text,
+        };
+        self.ws.send(&self.rt, handle, frame).map_err(map_ws_err)
+    }
+
+    fn poll(
+        &mut self,
+        handle: u64,
+    ) -> Result<Vec<websocket_iface::WsFrame>, websocket_iface::WsError> {
+        self.ws
+            .poll(handle)
+            .map(|frames| {
+                frames
+                    .into_iter()
+                    .map(|frame| websocket_iface::WsFrame {
+                        data: frame.data,
+                        is_text: frame.is_text,
+                    })
+                    .collect()
+            })
+            .map_err(map_ws_err)
+    }
+
+    fn state(&mut self, handle: u64) -> Result<websocket_iface::WsState, websocket_iface::WsError> {
+        self.ws
+            .state(handle)
+            .map(|state| match state {
+                WsConnState::Connecting => websocket_iface::WsState::Connecting,
+                WsConnState::Open => websocket_iface::WsState::Open,
+                WsConnState::Closing => websocket_iface::WsState::Closing,
+                WsConnState::Closed => websocket_iface::WsState::Closed,
+            })
+            .map_err(map_ws_err)
+    }
+
+    fn close(&mut self, handle: u64) -> Result<(), websocket_iface::WsError> {
+        self.ws.close(handle).map_err(map_ws_err)
+    }
+}
+
+/// Maps the `capabilities::websocket` adapter-local error to the generated WIT
+/// `websocket::WsError`.
+fn map_ws_err(error: WsErr) -> websocket_iface::WsError {
+    match error {
+        WsErr::InvalidRequest(message) => websocket_iface::WsError::InvalidRequest(message),
+        WsErr::Rejected => websocket_iface::WsError::Rejected,
+        WsErr::Disconnected => websocket_iface::WsError::Disconnected,
+        WsErr::LimitExceeded(message) => websocket_iface::WsError::LimitExceeded(message),
+        WsErr::Failed(message) => websocket_iface::WsError::Failed(message),
     }
 }
 

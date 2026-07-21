@@ -21,6 +21,10 @@ indexmap.workspace = true
 jsonschema.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["net"] }
+# Host-owned TLS WebSocket for the `ryuzi:websocket` capability adapter
+# (capabilities/websocket.rs). ring-only rustls — see the workspace dep note.
+tokio-tungstenite = { workspace = true }
+webpki-roots = { workspace = true }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures.workspace = true
 specta = { workspace = true, features = ["derive", "serde_json"] }
