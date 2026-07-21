@@ -43,13 +43,28 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+use crate::domain::{ApprovalDecision, ApprovalRequest, Surface};
+use crate::gateway::{
+    Gateway, GatewayStatus, GatewayStatusPublisher, GatewayStatusSubscription, MessageRef,
+};
+use crate::plugins::capabilities::PluginCapabilityContext;
+use crate::plugins::runtime::CompiledComponent;
+use crate::plugins::wasm_gateway::{
+    GatewayConfig, GatewayInboundEvent, GatewayOutboundEvent, GatewaySnapshot, SupervisorTuning,
+    WasmGatewaySupervisor,
+};
+use crate::router::Router;
 
 // ---------------------------------------------------------------------
 // Inbound events (component -> host, delivered via `poll-inbound`)
@@ -407,6 +422,18 @@ impl Correlation {
         }
     }
 
+    /// Remove a pending registration without delivering a value — e.g. the
+    /// outbound `deliver-outbound` failed, so no `op.result`/`approval.decision`
+    /// will ever arrive for it. Dropping the stored sender makes the matching
+    /// [`Correlation::register`] future resolve PROMPTLY to
+    /// [`CorrelationOutcome::TimedOut`] on its next poll (rather than blocking
+    /// for the full timeout), so the caller can still await it — never dropping
+    /// a registered future early — without hanging. Returns whether an entry
+    /// was removed.
+    pub fn cancel(&self, key: &CorrelationKey) -> bool {
+        self.pending.lock().unwrap().remove(key).is_some()
+    }
+
     /// Number of currently-pending registrations. Test/introspection only —
     /// production code should never need to poll this instead of awaiting
     /// [`Correlation::register`]'s returned future.
@@ -416,6 +443,394 @@ impl Correlation {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+// ---------------------------------------------------------------------
+// WasmGateway: `impl Gateway` backed by the supervisor (design doc §5.1/§5.3)
+// ---------------------------------------------------------------------
+
+/// How long an outbound op (`create-channel`/`send-message`/…) waits for its
+/// `op.result` before giving up. Generous: the supervisor's immediate
+/// post-`deliver-outbound` poll normally resolves it within a tick, so this
+/// only bounds a wedged/absent component.
+const OP_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The approval wait when a request carries no explicit `timeout_ms`. Matches
+/// the "no deadline configured" fallback; a request with a `timeout_ms` uses
+/// exactly that value and auto-rejects when it elapses.
+const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often the status-watch task samples the supervisor snapshot to publish
+/// `Connected`/`Offline` transitions.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A host-side [`crate::gateway::Gateway`] backed by a
+/// [`WasmGatewaySupervisor`]. Each outbound trait method becomes a typed
+/// `deliver-outbound` event correlated to its `op.result` (or, for approvals,
+/// to a later `approval.decision`) through the shared [`Correlation`]. This
+/// lets the daemon's outbound `Router` and approval fan-out drive a WASM
+/// gateway component through the same trait they use for native gateways.
+///
+/// Generic by construction: nothing here branches on `"discord"` or any plugin
+/// id — the behaviour is entirely determined by the component the supervisor
+/// drives (design doc §2/§5.1).
+pub struct WasmGateway {
+    id: String,
+    supervisor: WasmGatewaySupervisor,
+    /// The outbound `Router`, installed by `set_router`. Consumed by inbound
+    /// message/slash routing in Task 5; for now it only gates the drain task's
+    /// "no router yet" placeholder for non-correlation inbound events.
+    router: Arc<OnceLock<Arc<Router>>>,
+    correlation: Arc<Correlation>,
+    status: Arc<GatewayStatusPublisher>,
+    next_op: AtomicU64,
+    /// Background tasks (inbound drain + status watch) aborted on drop.
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl WasmGateway {
+    /// Build a `WasmGateway` over a fresh supervisor for `plugin_id`'s
+    /// component. Spawns the supervisor (with an inbound sink), the inbound
+    /// drain task that resolves correlations, and the status-watch task that
+    /// publishes connection transitions.
+    pub fn new(
+        plugin_id: String,
+        compiled: Arc<CompiledComponent>,
+        ctx: Arc<PluginCapabilityContext>,
+        config: GatewayConfig,
+        tuning: SupervisorTuning,
+    ) -> Self {
+        let correlation = Arc::new(Correlation::new());
+        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let supervisor = WasmGatewaySupervisor::spawn_with_inbound(
+            plugin_id.clone(),
+            compiled,
+            ctx,
+            config,
+            tuning,
+            Some(inbound_tx),
+        );
+
+        let status = Arc::new(GatewayStatusPublisher::new(status_of(&supervisor.status())));
+
+        let drain = tokio::spawn(drain_inbound(
+            inbound_rx,
+            Arc::clone(&correlation),
+            Arc::clone(&router),
+        ));
+        let watch = tokio::spawn(watch_status(
+            supervisor.status_handle(),
+            Arc::clone(&status),
+        ));
+
+        WasmGateway {
+            id: plugin_id,
+            supervisor,
+            router,
+            correlation,
+            status,
+            next_op: AtomicU64::new(0),
+            tasks: vec![drain, watch],
+        }
+    }
+
+    /// A fresh, per-gateway-unique outbound op id.
+    fn next_op_id(&self) -> String {
+        format!("op-{}", self.next_op.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Encode and hand `op` to the component. `Ok(())` means the component
+    /// accepted the delivery (its `op.result`/`approval.decision`, if any, then
+    /// arrives via `poll-inbound`); `Err` means the supervisor is
+    /// restarting/stopped or the component rejected it.
+    async fn deliver(&self, op: OutboundOp) -> std::result::Result<(), String> {
+        let (event_type, payload) = op.encode();
+        let delivery = self
+            .supervisor
+            .deliver_outbound(GatewayOutboundEvent {
+                event_type,
+                payload,
+                // `sequence` is a Task-5 inbound-dedup concern; the component
+                // merely echoes an outbound op's sequence, so 0 is fine here.
+                sequence: 0,
+            })
+            .await?;
+        if !delivery.accepted {
+            return Err("component rejected the outbound op".to_string());
+        }
+        Ok(())
+    }
+
+    /// Register an `op_id` correlation, deliver `op`, and await the matching
+    /// `op.result` body. Always awaits the registered future (T3 carry-forward):
+    /// on a delivery failure it `cancel`s the registration first so the await
+    /// returns promptly instead of blocking for the full timeout.
+    async fn run_op(&self, op_id: String, op: OutboundOp) -> Result<OpResultBody> {
+        let key = CorrelationKey::Op(op_id);
+        let waiter = self.correlation.register(key.clone(), OP_RESULT_TIMEOUT);
+        if let Err(reason) = self.deliver(op).await {
+            self.correlation.cancel(&key);
+            let _ = waiter.await;
+            bail!("wasm gateway delivery failed: {reason}");
+        }
+        match waiter.await {
+            CorrelationOutcome::Resolved(CorrelationValue::OpResult(body)) => Ok(body),
+            CorrelationOutcome::Resolved(other) => {
+                bail!("wasm gateway op {key:?} resolved with a non-op-result value: {other:?}")
+            }
+            CorrelationOutcome::TimedOut => {
+                bail!("wasm gateway op {key:?} timed out waiting for its op.result")
+            }
+        }
+    }
+}
+
+/// Map a supervisor snapshot's `running` flag to the coarse `GatewayStatus` the
+/// `Gateway::subscribe_status` contract exposes.
+fn status_of(snapshot: &GatewaySnapshot) -> GatewayStatus {
+    if snapshot.running {
+        GatewayStatus::Connected
+    } else {
+        GatewayStatus::Offline
+    }
+}
+
+/// Drain inbound events forwarded by the supervisor and resolve the matching
+/// correlation. Honours the T3 mapping exactly: an `op.result` resolves a
+/// `CorrelationKey::Op` with a `CorrelationValue::OpResult`; an
+/// `approval.decision` resolves a `CorrelationKey::Approval` with the decision —
+/// never crossed. Everything else (message/slash inbound events) is routed into
+/// the `Router` in Task 5; here it is dropped. Exits when the supervisor drops
+/// the sink.
+async fn drain_inbound(
+    mut inbound: mpsc::UnboundedReceiver<GatewayInboundEvent>,
+    correlation: Arc<Correlation>,
+    router: Arc<OnceLock<Arc<Router>>>,
+) {
+    while let Some(event) = inbound.recv().await {
+        match InboundEvent::decode(&event.event_type, &event.payload) {
+            Ok(InboundEvent::OpResult { op_id, result }) => {
+                correlation.resolve(
+                    &CorrelationKey::Op(op_id),
+                    CorrelationValue::OpResult(result),
+                );
+            }
+            Ok(InboundEvent::ApprovalDecision {
+                request_id,
+                allow,
+                actor,
+            }) => {
+                correlation.resolve(
+                    &CorrelationKey::Approval(request_id),
+                    CorrelationValue::Approval { allow, actor },
+                );
+            }
+            Ok(_routable) => {
+                // message.*/slash.* inbound events become Router calls in Task 5.
+                // Until then (and, like the native gateway, until a Router is
+                // set) they are dropped.
+                if router.get().is_none() {
+                    tracing::trace!(
+                        event = %event.event_type,
+                        "wasm gateway inbound event dropped: no router set yet"
+                    );
+                }
+            }
+            Err(error) => {
+                // Undecodable (e.g. the fixture's non-JSON `message` seed) — drop.
+                tracing::trace!(
+                    event = %event.event_type,
+                    "wasm gateway inbound event undecodable, dropped: {error}"
+                );
+            }
+        }
+    }
+}
+
+/// Sample the supervisor snapshot on an interval and publish `Connected`/
+/// `Offline` transitions (the publisher only emits on an actual change).
+async fn watch_status(
+    snapshot: Arc<Mutex<GatewaySnapshot>>,
+    publisher: Arc<GatewayStatusPublisher>,
+) {
+    let mut ticker = tokio::time::interval(STATUS_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let running = snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .running;
+        publisher.publish(if running {
+            GatewayStatus::Connected
+        } else {
+            GatewayStatus::Offline
+        });
+    }
+}
+
+impl Drop for WasmGateway {
+    fn drop(&mut self) {
+        // Hard-stop the supervisor and background tasks so a dropped gateway
+        // leaves nothing running (mirrors `WasmGatewaySupervisor::abort`).
+        self.supervisor.abort();
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl Gateway for WasmGateway {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        // The supervisor already `start`s the component on spawn and keeps it
+        // running with capped-backoff restarts, so there is no separate start
+        // handshake to perform here.
+        Ok(())
+    }
+
+    async fn stop(&self) -> anyhow::Result<()> {
+        self.supervisor.stop().await;
+        Ok(())
+    }
+
+    async fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+        let op_id = self.next_op_id();
+        let op = OutboundOp::CreateChannel {
+            op_id: op_id.clone(),
+            name: name.to_string(),
+        };
+        self.run_op(op_id, op)
+            .await?
+            .channel_id
+            .ok_or_else(|| anyhow!("create-channel op.result is missing channel_id"))
+    }
+
+    async fn create_conversation(&self, workspace_id: &str, title: &str) -> anyhow::Result<String> {
+        let op_id = self.next_op_id();
+        let op = OutboundOp::CreateThread {
+            op_id: op_id.clone(),
+            channel_id: workspace_id.to_string(),
+            title: title.to_string(),
+        };
+        self.run_op(op_id, op)
+            .await?
+            .thread_id
+            .ok_or_else(|| anyhow!("create-thread op.result is missing thread_id"))
+    }
+
+    async fn post_status(&self, surface: &Surface, text: &str) -> anyhow::Result<MessageRef> {
+        let op_id = self.next_op_id();
+        let op = OutboundOp::SendMessage {
+            op_id: op_id.clone(),
+            channel_id: surface.conversation_id.clone(),
+            text: text.to_string(),
+        };
+        let message_id = self
+            .run_op(op_id, op)
+            .await?
+            .message_id
+            .ok_or_else(|| anyhow!("send-message op.result is missing message_id"))?;
+        Ok(MessageRef {
+            surface: surface.clone(),
+            message_id,
+        })
+    }
+
+    async fn edit_status(&self, msg: &MessageRef, text: &str) -> anyhow::Result<()> {
+        let op_id = self.next_op_id();
+        let op = OutboundOp::EditMessage {
+            op_id: op_id.clone(),
+            channel_id: msg.surface.conversation_id.clone(),
+            message_id: msg.message_id.clone(),
+            text: text.to_string(),
+        };
+        self.run_op(op_id, op).await?;
+        Ok(())
+    }
+
+    async fn post_result(&self, surface: &Surface, chunks: &[String]) -> anyhow::Result<()> {
+        let op_id = self.next_op_id();
+        let op = OutboundOp::SendMessages {
+            op_id: op_id.clone(),
+            channel_id: surface.conversation_id.clone(),
+            chunks: chunks.to_vec(),
+        };
+        self.run_op(op_id, op).await?;
+        Ok(())
+    }
+
+    async fn post_error(&self, surface: &Surface, message: &str) -> anyhow::Result<()> {
+        let op_id = self.next_op_id();
+        let op = OutboundOp::SendMessage {
+            op_id: op_id.clone(),
+            channel_id: surface.conversation_id.clone(),
+            text: message.to_string(),
+        };
+        // Native `post_error` returns `()`; the op.result (a message_id) is
+        // acknowledged and discarded.
+        self.run_op(op_id, op).await?;
+        Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        surface: &Surface,
+        req: &ApprovalRequest,
+    ) -> anyhow::Result<ApprovalDecision> {
+        let op_id = self.next_op_id();
+        // Correlated by `request_id` (resolved by a later `approval.decision`),
+        // NOT by `op_id` — the T3 mapping (design doc §5.4).
+        let key = CorrelationKey::Approval(req.request_id.clone());
+        let timeout = req
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_APPROVAL_TIMEOUT);
+        let waiter = self.correlation.register(key.clone(), timeout);
+        let op = OutboundOp::ApprovalRequest {
+            op_id,
+            request_id: req.request_id.clone(),
+            conversation_id: surface.conversation_id.clone(),
+            tool: req.tool.clone(),
+            summary: req.summary.clone(),
+            approver_role_ids: req.approver_role_ids.clone(),
+            started_by: req.started_by.clone(),
+            timeout_ms: req.timeout_ms,
+        };
+        if let Err(reason) = self.deliver(op).await {
+            self.correlation.cancel(&key);
+            let _ = waiter.await;
+            bail!("wasm gateway approval delivery failed: {reason}");
+        }
+        match waiter.await {
+            CorrelationOutcome::Resolved(CorrelationValue::Approval { allow, .. }) => {
+                Ok(if allow {
+                    ApprovalDecision::AllowOnce
+                } else {
+                    ApprovalDecision::RejectOnce
+                })
+            }
+            CorrelationOutcome::Resolved(other) => {
+                bail!("approval {key:?} resolved with a non-approval value: {other:?}")
+            }
+            // Timeout auto-rejects, matching the native gateway's behaviour.
+            CorrelationOutcome::TimedOut => Ok(ApprovalDecision::RejectOnce),
+        }
+    }
+
+    fn set_router(&self, router: Arc<Router>) {
+        // First writer wins (single `set_router` call, per the trait doc).
+        let _ = self.router.set(router);
+    }
+
+    fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
+        Some(self.status.subscribe())
     }
 }
 
@@ -762,6 +1177,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_removes_the_entry_and_the_waiter_resolves_to_timed_out_promptly() {
+        let correlation = Correlation::new();
+        let key = CorrelationKey::Op("op1".into());
+        // A long timeout: only `cancel` should make the waiter resolve, and it
+        // must do so promptly (not after the full timeout).
+        let waiter = correlation.register(key.clone(), Duration::from_secs(3600));
+        assert_eq!(correlation.len(), 1);
+
+        assert!(
+            correlation.cancel(&key),
+            "cancel must report the entry removed"
+        );
+        assert!(
+            correlation.is_empty(),
+            "cancel must remove the pending entry"
+        );
+        assert_eq!(
+            waiter.await,
+            CorrelationOutcome::TimedOut,
+            "a cancelled registration resolves to TimedOut without blocking"
+        );
+        // Cancelling again is a harmless no-op.
+        assert!(!correlation.cancel(&key));
+    }
+
+    #[tokio::test]
     async fn resolve_on_an_unregistered_key_returns_false_and_is_a_no_op() {
         let correlation = Correlation::new();
         let resolved = correlation.resolve(
@@ -795,5 +1236,300 @@ mod tests {
 
         // The now-stale key can no longer be resolved (nothing is waiting).
         assert!(!correlation.resolve(&key, CorrelationValue::OpResult(OpResultBody::default())));
+    }
+}
+
+// ---------------------------------------------------------------------
+// WasmGateway integration tests over the extended `component-gateway` fixture
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod gateway_impl_tests {
+    use super::*;
+
+    use crate::gateway::Gateway;
+    use crate::plugins::build_fixture_components_once as build_fixtures;
+    use crate::plugins::bundle::InstalledBundle;
+    use crate::plugins::capabilities::PluginCapabilityContext;
+    use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
+    use crate::plugins::wasm_gateway::{GatewayConfig, SupervisorTuning};
+    use crate::settings::SettingsStore;
+    use crate::store::{ComponentPluginReleaseRecord, Store};
+    use crate::telemetry::NoopTelemetry;
+    use ryuzi_plugin_sdk::{
+        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+    };
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn gateway_artifact() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/component-gateway/target/wasm32-wasip2/release")
+            .join("ryuzi_component_gateway_fixture.wasm")
+    }
+
+    /// Fast tuning so op.results (immediate post-deliver poll) and the deferred
+    /// approval decision (one poll later) both resolve within a few ms.
+    fn fast_tuning() -> SupervisorTuning {
+        SupervisorTuning {
+            poll_interval: Duration::from_millis(20),
+            ..SupervisorTuning::default()
+        }
+    }
+
+    async fn build_test_gateway(config: GatewayConfig) -> (WasmGateway, tempfile::NamedTempFile) {
+        build_fixtures();
+        let mut policy = HostPolicy::deny_all();
+        policy.limits.timeout = Duration::from_secs(5);
+        let component_path = gateway_artifact();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let ctx = Arc::new(PluginCapabilityContext {
+            plugin_id: "acme-gateway".to_string(),
+            version: "0.1.0".to_string(),
+            settings: SettingsStore::new(store.clone()),
+            store,
+            telemetry: Arc::new(NoopTelemetry),
+            network_allowlist: vec![],
+            oauth_profile_ids: vec![],
+        });
+        let bundle = InstalledBundle {
+            manifest: PluginBundleManifest {
+                id: "acme-gateway".to_string(),
+                name: "acme-gateway".to_string(),
+                version: "0.1.0".to_string(),
+                wit_api: "^0.1.0".to_string(),
+                lifecycle: PluginLifecycle::Singleton,
+                component: "plugin.wasm".to_string(),
+                publisher: String::new(),
+                description: String::new(),
+                permissions: PluginPermissions { network: vec![] },
+                oauth: vec![],
+            },
+            release: PluginRelease {
+                id: "acme-gateway".to_string(),
+                version: "0.1.0".to_string(),
+                wit_api: "0.1.0".to_string(),
+                component_url: "https://example.invalid/x.wasm".to_string(),
+                component_sha256: "0".repeat(64),
+                size_bytes: None,
+                published_at: None,
+            },
+            release_record: ComponentPluginReleaseRecord {
+                plugin_id: "acme-gateway".to_string(),
+                version: "0.1.0".to_string(),
+                source_url: "https://example.invalid/x.wasm".to_string(),
+                sha256: "0".repeat(64),
+                signing_key_id: "test".to_string(),
+                installed_at: 0,
+                active: true,
+                revoked: false,
+                revocation_reason: None,
+            },
+            root: component_path.parent().unwrap().to_path_buf(),
+            component_path,
+        };
+        let runtime = ComponentRuntime::new().unwrap();
+        let compiled = Arc::new(runtime.compile(&bundle, policy).unwrap());
+        let gateway = WasmGateway::new(
+            "acme-gateway".to_string(),
+            compiled,
+            ctx,
+            config,
+            fast_tuning(),
+        );
+        (gateway, tmp)
+    }
+
+    fn test_surface() -> Surface {
+        Surface {
+            gateway: "acme-gateway".to_string(),
+            conversation_id: "chan-1".to_string(),
+        }
+    }
+
+    fn approval_req(request_id: &str, summary: &str, timeout_ms: Option<u64>) -> ApprovalRequest {
+        ApprovalRequest {
+            run_id: "run-1".to_string(),
+            requesting_agent_id: "agent-1".to_string(),
+            requesting_agent_name: "Agent 1".to_string(),
+            request_id: request_id.to_string(),
+            tool: "Bash".to_string(),
+            summary: summary.to_string(),
+            approver_role_ids: vec![],
+            started_by: None,
+            timeout_ms,
+            principal: None,
+        }
+    }
+
+    /// The headline correlation test: `create_workspace` mints an op, delivers a
+    /// `create-channel`, and returns the `channel_id` the component echoes back
+    /// via the correlated `op.result`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_create_workspace_correlates_op_result() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        let channel_id = gateway
+            .create_workspace("proj")
+            .await
+            .expect("create_workspace must resolve its op.result");
+        assert_eq!(channel_id, "chan-1");
+        assert!(
+            gateway.correlation.is_empty(),
+            "the resolved op must leave no pending correlation entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_create_conversation_returns_thread_id() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        let thread_id = gateway
+            .create_conversation("chan-1", "a task")
+            .await
+            .expect("create_conversation must resolve its op.result");
+        assert_eq!(thread_id, "thread-1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_post_status_returns_message_ref_from_op_result() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        let surface = test_surface();
+        let msg = gateway
+            .post_status(&surface, "working")
+            .await
+            .expect("post_status must resolve its op.result");
+        assert_eq!(
+            msg.message_id, "msg-1",
+            "message id must come from op.result"
+        );
+        assert_eq!(
+            msg.surface, surface,
+            "the ref keeps the originating surface"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_edit_status_and_post_result_succeed() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        let surface = test_surface();
+        let msg = MessageRef {
+            surface: surface.clone(),
+            message_id: "msg-1".to_string(),
+        };
+        gateway
+            .edit_status(&msg, "still working")
+            .await
+            .expect("edit_status must resolve Ok");
+        gateway
+            .post_result(&surface, &["part1".to_string(), "part2".to_string()])
+            .await
+            .expect("post_result must resolve Ok");
+        gateway
+            .post_error(&surface, "boom")
+            .await
+            .expect("post_error must resolve Ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_request_approval_resolves_to_allow_once() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        let surface = test_surface();
+        let decision = gateway
+            .request_approval(
+                &surface,
+                &approval_req("req-1", "please allow", Some(5_000)),
+            )
+            .await
+            .expect("request_approval must resolve to a decision");
+        // The fixture emits `approval.decision{allow:true, actor:"tester"}`.
+        assert_eq!(decision, ApprovalDecision::AllowOnce);
+        assert!(
+            gateway.correlation.is_empty(),
+            "a resolved approval must leave no pending correlation entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_request_approval_times_out_to_reject_once() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        let surface = test_surface();
+        // A "silent" summary: the fixture accepts the request but never emits a
+        // decision, so the bridge's `timeout_ms` must auto-reject.
+        let decision = gateway
+            .request_approval(
+                &surface,
+                &approval_req("req-2", "silent request", Some(150)),
+            )
+            .await
+            .expect("request_approval must resolve (via timeout) to a decision");
+        assert_eq!(decision, ApprovalDecision::RejectOnce);
+        assert!(
+            gateway.correlation.is_empty(),
+            "a timed-out approval must leave no pending correlation entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_gateway_reports_id_and_status_subscription() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+
+        assert_eq!(gateway.id(), "acme-gateway");
+        // A status subscription is offered and reaches `Connected` once the
+        // supervisor reports the component running.
+        let mut sub = gateway
+            .subscribe_status()
+            .expect("wasm gateway offers a status subscription");
+        if sub.initial == GatewayStatus::Connected {
+            return;
+        }
+        let connected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match sub.events.recv().await {
+                    Ok(GatewayStatus::Connected) => return true,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        sub.resync();
+                    }
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await
+        .expect("status must reach Connected within the deadline");
+        assert!(connected, "gateway must report Connected");
     }
 }

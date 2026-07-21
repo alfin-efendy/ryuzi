@@ -155,6 +155,23 @@ impl WasmGatewaySupervisor {
         config: GatewayConfig,
         tuning: SupervisorTuning,
     ) -> Self {
+        Self::spawn_with_inbound(plugin_id, compiled, ctx, config, tuning, None)
+    }
+
+    /// Like [`WasmGatewaySupervisor::spawn`], but every inbound event pulled via
+    /// `poll-inbound` is ALSO forwarded to `inbound` (in addition to being
+    /// recorded in the observable snapshot). The host gateway bridge
+    /// ([`crate::plugins::wasm_gateway_bridge::WasmGateway`]) passes a sink here
+    /// and drains it to resolve outbound-op / approval correlations. `None`
+    /// preserves the plain lifecycle-only behaviour.
+    pub fn spawn_with_inbound(
+        plugin_id: String,
+        compiled: Arc<CompiledComponent>,
+        ctx: Arc<PluginCapabilityContext>,
+        config: GatewayConfig,
+        tuning: SupervisorTuning,
+        inbound: Option<mpsc::UnboundedSender<GatewayInboundEvent>>,
+    ) -> Self {
         let status = Arc::new(Mutex::new(GatewaySnapshot::default()));
         let (commands_tx, commands_rx) = mpsc::channel(16);
         let task_status = Arc::clone(&status);
@@ -168,6 +185,7 @@ impl WasmGatewaySupervisor {
                 tuning,
                 commands_rx,
                 task_status,
+                inbound,
             )
             .await;
         });
@@ -190,6 +208,13 @@ impl WasmGatewaySupervisor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// A shared handle to the observable snapshot, so a bridge can watch status
+    /// transitions (e.g. to publish a `GatewayStatus` subscription) without
+    /// holding the supervisor itself.
+    pub fn status_handle(&self) -> Arc<Mutex<GatewaySnapshot>> {
+        Arc::clone(&self.status)
     }
 
     /// Hand the component an outbound event to deliver. An `Err` means the
@@ -227,6 +252,10 @@ impl WasmGatewaySupervisor {
 }
 
 /// The supervisor task body: an outer restart loop around an inner serve loop.
+// Internal task entry point wiring together the compiled component, its
+// capability context, config/tuning, and the command/status/inbound channels —
+// grouping them into a struct would only obscure a one-call-site function.
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     plugin_id: String,
     compiled: Arc<CompiledComponent>,
@@ -235,6 +264,7 @@ async fn supervise(
     tuning: SupervisorTuning,
     mut commands: mpsc::Receiver<Command>,
     status: Arc<Mutex<GatewaySnapshot>>,
+    inbound: Option<mpsc::UnboundedSender<GatewayInboundEvent>>,
 ) {
     let mut restart_attempt: u32 = 0;
     loop {
@@ -264,7 +294,7 @@ async fn supervise(
             }
         };
 
-        match serve(&mut instance, &mut commands, &status, &tuning).await {
+        match serve(&mut instance, &mut commands, &status, &tuning, &inbound).await {
             ServeOutcome::Stopped | ServeOutcome::ChannelClosed => return,
             ServeOutcome::Trapped { reason, uptime } => {
                 update_status(&status, |snapshot| {
@@ -308,6 +338,7 @@ async fn serve(
     commands: &mut mpsc::Receiver<Command>,
     status: &Arc<Mutex<GatewaySnapshot>>,
     tuning: &SupervisorTuning,
+    inbound: &Option<mpsc::UnboundedSender<GatewayInboundEvent>>,
 ) -> ServeOutcome {
     let started_at = Instant::now();
     let mut poll = tokio::time::interval(tuning.poll_interval);
@@ -328,6 +359,20 @@ async fn serve(
                     match call_deliver(instance, event).await {
                         Ok(delivery) => {
                             let _ = reply.send(Ok(delivery));
+                            // Latency note (design §5.3): a delivered op's
+                            // `op.result` (or an `approval.decision`) is queued by
+                            // the component and only surfaced via `poll-inbound`.
+                            // Do one immediate poll now so it reaches the bridge's
+                            // `Correlation` without waiting a full poll interval.
+                            match call_poll_inbound(instance).await {
+                                Ok(events) => forward_inbound(status, tuning, inbound, events),
+                                Err(reason) => {
+                                    return ServeOutcome::Trapped {
+                                        reason: format!("poll-inbound: {reason}"),
+                                        uptime: started_at.elapsed(),
+                                    };
+                                }
+                            }
                         }
                         Err(reason) => {
                             let _ = reply.send(Err(reason.clone()));
@@ -342,7 +387,7 @@ async fn serve(
             },
             _ = poll.tick() => {
                 match call_poll_inbound(instance).await {
-                    Ok(events) => append_inbound(status, tuning, events),
+                    Ok(events) => forward_inbound(status, tuning, inbound, events),
                     Err(reason) => {
                         return ServeOutcome::Trapped {
                             reason: format!("poll-inbound: {reason}"),
@@ -395,6 +440,30 @@ async fn backoff_or_stop(commands: &mut mpsc::Receiver<Command>, delay: Duration
 fn update_status(status: &Arc<Mutex<GatewaySnapshot>>, mutate: impl FnOnce(&mut GatewaySnapshot)) {
     let mut guard = status.lock().unwrap_or_else(PoisonError::into_inner);
     mutate(&mut guard);
+}
+
+/// Forward freshly-polled inbound events to the optional bridge sink (so an
+/// `op.result`/`approval.decision` reaches the bridge's `Correlation`) AND
+/// record them in the observable snapshot. Cloning per-sink is cheap (small
+/// events) and keeps the snapshot's status view intact for callers that only
+/// read it.
+fn forward_inbound(
+    status: &Arc<Mutex<GatewaySnapshot>>,
+    tuning: &SupervisorTuning,
+    inbound: &Option<mpsc::UnboundedSender<GatewayInboundEvent>>,
+    events: Vec<GatewayInboundEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    if let Some(sink) = inbound {
+        for event in &events {
+            // A closed receiver (bridge dropped) just means nobody is
+            // correlating anymore — the snapshot append below still runs.
+            let _ = sink.send(event.clone());
+        }
+    }
+    append_inbound(status, tuning, events);
 }
 
 fn append_inbound(
@@ -847,18 +916,40 @@ mod tests {
         )
         .await;
 
-        let snapshot = wait_for(&supervisor, 200, |s| s.restart_count >= 1).await;
-        assert!(
-            snapshot.restart_count >= 1,
-            "a trapping gateway must be restarted after its trap: {snapshot:?}"
-        );
-        assert!(
-            snapshot
+        // The trap reason (`last_error` naming `poll-inbound`) is recorded on
+        // each trap but CLEARED on the next successful restart-start, so it and
+        // a bumped `restart_count` need not both appear in the SAME snapshot.
+        // Accumulate the two facts across the polling window rather than reading
+        // a single snapshot (which races the restart that clears `last_error`).
+        let mut saw_restart = false;
+        let mut saw_trap_reason = false;
+        let mut last = supervisor.status();
+        for _ in 0..400 {
+            let snapshot = supervisor.status();
+            if snapshot.restart_count >= 1 {
+                saw_restart = true;
+            }
+            if snapshot
                 .last_error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("poll-inbound"),
-            "the recorded trap reason must name the trapping export: {snapshot:?}"
+                .contains("poll-inbound")
+            {
+                saw_trap_reason = true;
+            }
+            last = snapshot;
+            if saw_restart && saw_trap_reason {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_restart,
+            "a trapping gateway must be restarted after its trap: {last:?}"
+        );
+        assert!(
+            saw_trap_reason,
+            "the recorded trap reason must name the trapping export: {last:?}"
         );
 
         // The supervisor never hangs — stop tears it down promptly even mid-restart.

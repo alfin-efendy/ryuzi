@@ -1,13 +1,28 @@
 // A component fixture exporting `ryuzi:gateway/gateway@0.1.0` (including the
-// Task-10 `poll-inbound`) for the `WasmGatewaySupervisor`. A single fixture
-// covers every supervisor behaviour the Step-2 test needs; behaviour is driven
-// by the `gateway-config` passed to `start`, which the component stashes in
-// per-instance state so later `poll-inbound`/`health-check` calls can read it:
+// Task-10 `poll-inbound`) for the `WasmGatewaySupervisor` and the Task-4 host
+// gateway bridge (`WasmGateway`). One fixture covers every behaviour those
+// tests need; behaviour is driven by the `gateway-config` passed to `start`
+// and by the outbound ops handed to `deliver-outbound`:
 //   - `start` records the config and reports running.
-//   - `poll-inbound` emits ONE typed inbound event on the first poll of an
-//     instance (sequence 1), then empty lists — so the supervisor surfaces at
-//     least one inbound event as observable status.
-//   - `deliver-outbound` accepts the outbound event, echoing its sequence.
+//   - `poll-inbound` emits ONE seed inbound event on the first poll of an
+//     instance (event-type `message`, sequence 1), then whatever `op.result`/
+//     `approval.decision` events prior `deliver-outbound` calls queued — so
+//     the supervisor surfaces at least one inbound event as observable status
+//     and the bridge's `Correlation` receives the results it awaits.
+//   - `deliver-outbound` decodes the typed outbound op (by its `event-type`)
+//     and queues the matching correlated inbound event:
+//       * `create-channel`  -> `op.result{op_id, channel_id:"chan-1"}`
+//       * `create-thread`   -> `op.result{op_id, thread_id:"thread-1"}`
+//       * `send-message`     -> `op.result{op_id, message_id:"msg-1"}`
+//       * `edit-message` / `send-messages` -> `op.result{op_id, ok:true}`
+//       * `approval-request` -> `approval.decision{request_id, allow:true,
+//         actor:"tester"}`, unless the request's `summary` contains "silent"
+//         (then NO decision is queued, so the host bridge exercises its
+//         approval-timeout -> auto-reject path).
+//     `op.result`s are queued "ready" (returned on the immediate post-deliver
+//     poll); an `approval.decision` is queued "deferred" (returned one poll
+//     LATER), modelling a user clicking the button a moment after the buttons
+//     are posted. The delivery echoes the event's sequence.
 //   - `health-check` reports healthy.
 //   - when `config.endpoint` contains "boom", `poll-inbound` loops forever, so
 //     the host fuel/epoch budget traps it and the supervisor restarts the
@@ -22,6 +37,7 @@ wit_bindgen::generate!({
 });
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use exports::ryuzi::gateway::gateway::{
     GatewayConfig, GatewayDelivery, GatewayError, GatewayEvent, GatewayState, Guest,
@@ -29,11 +45,16 @@ use exports::ryuzi::gateway::gateway::{
 
 #[derive(Default)]
 struct State {
-    started: bool,
     boom: bool,
     account: String,
     emitted: bool,
     seq: u64,
+    /// Inbound events returned on the NEXT `poll-inbound` (op.results, so they
+    /// come back on the immediate post-`deliver-outbound` poll).
+    ready: VecDeque<GatewayEvent>,
+    /// Inbound events held back one extra poll (approval decisions), so they
+    /// arrive a poll AFTER the delivery that produced them.
+    deferred: VecDeque<GatewayEvent>,
 }
 
 thread_local! {
@@ -42,15 +63,40 @@ thread_local! {
 
 struct Fixture;
 
+/// Extract a flat JSON string field's value from `payload`. Test payloads are
+/// simple, un-escaped flat objects (`{"op_id":"op-1",...}`), so a full JSON
+/// parser is unnecessary — keeping the fixture dependency-free.
+fn json_str(payload: &[u8], key: &str) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let needle = format!("\"{key}\"");
+    let after_key = &text[text.find(&needle)? + needle.len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let inner = after_colon.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
+}
+
+fn next_seq(state: &mut State) -> u64 {
+    state.seq += 1;
+    state.seq
+}
+
+fn queue(queue: &mut VecDeque<GatewayEvent>, seq: u64, event_type: &str, payload: String) {
+    queue.push_back(GatewayEvent {
+        event_type: event_type.to_string(),
+        payload: payload.into_bytes(),
+        sequence: seq,
+    });
+}
+
 impl Guest for Fixture {
     fn start(config: GatewayConfig) -> Result<GatewayState, GatewayError> {
         STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.started = true;
-            state.boom = config.endpoint.contains("boom");
-            state.account = config.account.clone();
-            state.emitted = false;
-            state.seq = 0;
+            *state.borrow_mut() = State {
+                boom: config.endpoint.contains("boom"),
+                account: config.account.clone(),
+                ..State::default()
+            };
         });
         Ok(GatewayState {
             running: true,
@@ -59,7 +105,6 @@ impl Guest for Fixture {
     }
 
     fn stop() -> Result<GatewayState, GatewayError> {
-        STATE.with(|state| state.borrow_mut().started = false);
         Ok(GatewayState {
             running: false,
             detail: "stopped".to_string(),
@@ -67,6 +112,57 @@ impl Guest for Fixture {
     }
 
     fn deliver_outbound(event: GatewayEvent) -> Result<GatewayDelivery, GatewayError> {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            match event.event_type.as_str() {
+                "create-channel" => {
+                    if let Some(op_id) = json_str(&event.payload, "op_id") {
+                        let seq = next_seq(&mut state);
+                        let payload = format!("{{\"op_id\":\"{op_id}\",\"channel_id\":\"chan-1\"}}");
+                        queue(&mut state.ready, seq, "op.result", payload);
+                    }
+                }
+                "create-thread" => {
+                    if let Some(op_id) = json_str(&event.payload, "op_id") {
+                        let seq = next_seq(&mut state);
+                        let payload =
+                            format!("{{\"op_id\":\"{op_id}\",\"thread_id\":\"thread-1\"}}");
+                        queue(&mut state.ready, seq, "op.result", payload);
+                    }
+                }
+                "send-message" => {
+                    if let Some(op_id) = json_str(&event.payload, "op_id") {
+                        let seq = next_seq(&mut state);
+                        let payload = format!("{{\"op_id\":\"{op_id}\",\"message_id\":\"msg-1\"}}");
+                        queue(&mut state.ready, seq, "op.result", payload);
+                    }
+                }
+                "edit-message" | "send-messages" => {
+                    if let Some(op_id) = json_str(&event.payload, "op_id") {
+                        let seq = next_seq(&mut state);
+                        let payload = format!("{{\"op_id\":\"{op_id}\",\"ok\":true}}");
+                        queue(&mut state.ready, seq, "op.result", payload);
+                    }
+                }
+                "approval-request" => {
+                    // A "silent" request (summary marker) never resolves, so the
+                    // host bridge exercises its approval-timeout -> auto-reject.
+                    let silent = json_str(&event.payload, "summary")
+                        .map(|summary| summary.contains("silent"))
+                        .unwrap_or(false);
+                    if !silent {
+                        if let Some(request_id) = json_str(&event.payload, "request_id") {
+                            let seq = next_seq(&mut state);
+                            let payload = format!(
+                                "{{\"request_id\":\"{request_id}\",\"allow\":true,\"actor\":\"tester\"}}"
+                            );
+                            queue(&mut state.deferred, seq, "approval.decision", payload);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
         Ok(GatewayDelivery {
             accepted: true,
             sequence: event.sequence,
@@ -94,16 +190,23 @@ impl Guest for Fixture {
         }
         STATE.with(|state| {
             let mut state = state.borrow_mut();
-            if state.emitted {
-                return Ok(Vec::new());
+            // "ready" events (op.results from a just-delivered op) come back
+            // now; "deferred" events (approval decisions) become ready for the
+            // NEXT poll, so they arrive a poll after their delivery.
+            let mut batch: Vec<GatewayEvent> = state.ready.drain(..).collect();
+            let deferred: Vec<GatewayEvent> = state.deferred.drain(..).collect();
+            state.ready.extend(deferred);
+            // The one-time seed inbound event the supervisor lifecycle test asserts.
+            if !state.emitted {
+                state.emitted = true;
+                let seq = next_seq(&mut state);
+                batch.push(GatewayEvent {
+                    event_type: "message".to_string(),
+                    payload: b"hello from gateway".to_vec(),
+                    sequence: seq,
+                });
             }
-            state.emitted = true;
-            state.seq += 1;
-            Ok(vec![GatewayEvent {
-                event_type: "message".to_string(),
-                payload: b"hello from gateway".to_vec(),
-                sequence: state.seq,
-            }])
+            Ok(batch)
         })
     }
 }
