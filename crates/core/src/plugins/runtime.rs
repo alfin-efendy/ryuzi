@@ -1131,7 +1131,13 @@ impl websocket_iface::Host for CapabilityState {
             })
             .collect();
         self.ws
-            .connect(&self.network_allowlist, &self.rt, &url, headers)
+            .connect(
+                &self.network_allowlist,
+                &self.rt,
+                self.http_timeout,
+                &url,
+                headers,
+            )
             .map_err(map_ws_err)
     }
 
@@ -1144,7 +1150,9 @@ impl websocket_iface::Host for CapabilityState {
             data: frame.data,
             is_text: frame.is_text,
         };
-        self.ws.send(&self.rt, handle, frame).map_err(map_ws_err)
+        self.ws
+            .send(&self.rt, self.http_timeout, handle, frame)
+            .map_err(map_ws_err)
     }
 
     fn poll(

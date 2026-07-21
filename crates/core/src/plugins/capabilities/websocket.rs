@@ -16,10 +16,13 @@
 //!   host, never re-implemented here. Not allowed → `rejected`. Because the
 //!   component re-calls `connect` to reconnect, every reconnect is re-checked.
 //! - **Per-instance caps.** At most [`MAX_WS_HANDLES_PER_INSTANCE`] concurrent
-//!   sockets; a single frame is capped at [`MAX_WS_FRAME_BYTES`]; the inbound
-//!   buffer holds at most [`MAX_WS_INBOUND_BUFFER`] frames (on overflow the
-//!   connection is marked disconnected and further frames are dropped). Each
-//!   cap breach surfaces as `limit-exceeded`, never a host crash.
+//!   sockets; a single frame (outbound AND inbound — the latter enforced by the
+//!   tungstenite [`WebSocketConfig`] message/frame size, not the 64 MiB
+//!   default) is capped at [`MAX_WS_FRAME_BYTES`]; the inbound buffer holds at
+//!   most [`MAX_WS_INBOUND_BUFFER`] frames (on overflow the connection is marked
+//!   disconnected and further frames are dropped), so total buffered bytes are
+//!   bounded by `MAX_WS_INBOUND_BUFFER × MAX_WS_FRAME_BYTES`. Each cap breach
+//!   surfaces as `limit-exceeded` (outbound) or a disconnect, never a host crash.
 //!
 //! # Lifecycle
 //! The registry lives on the component instance's `CapabilityState` (see
@@ -32,19 +35,26 @@
 //! The generated `Host` trait is synchronous, but opening/sending on a socket
 //! is async. Exactly like `capabilities::http`, the blocking work is bridged
 //! through a captured `tokio::runtime::Handle` (`rt.block_on(...)`); the reader
-//! task is spawned onto the same handle. The thin `impl websocket_iface::Host`
+//! task is spawned onto the same handle. Both the connect handshake and each
+//! `send` are wrapped in a `tokio::time::timeout` (the same budget the http
+//! client uses) so a slowloris handshake or a peer that stops reading can never
+//! block the `spawn_blocking` host thread forever — the wasmtime epoch cannot
+//! preempt a blocked host function. The thin `impl websocket_iface::Host`
 //! that maps WIT types to these calls lives in `runtime.rs` alongside the
 //! `http`/`oauth` adapters.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::runtime::Handle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
@@ -189,6 +199,7 @@ impl WsRegistry {
         &mut self,
         allowlist: &[String],
         rt: &Handle,
+        timeout: Duration,
         url: &str,
         headers: Vec<WsHeader>,
     ) -> Result<u64, WsErr> {
@@ -198,16 +209,23 @@ impl WsRegistry {
             )));
         }
 
-        let parsed =
-            url::Url::parse(url).map_err(|error| WsErr::InvalidRequest(error.to_string()))?;
-        let host = parsed
-            .host_str()
+        // Build the client request ONCE and validate the EXACT host + scheme
+        // tungstenite will dial from its `http::Uri`. Validating a second,
+        // separate `url::Url` parse would risk the two parsers disagreeing on
+        // the host, so the allowlist could approve host A while the socket
+        // (and its TLS SNI) dials host B — the SSRF/exfiltration bypass the
+        // allowlist exists to prevent. Guard and dial therefore read the same
+        // request URI.
+        let request = build_request(url, headers)?;
+        let uri = request.uri();
+        let host = uri
+            .host()
             .ok_or_else(|| WsErr::InvalidRequest("url has no host".to_string()))?
             .to_string();
 
         // Scheme gate FIRST (before the allowlist): production is `wss` only.
         // A `ws://` loopback address is allowed only under `#[cfg(test)]`.
-        let scheme = parsed.scheme();
+        let scheme = uri.scheme_str().unwrap_or_default();
         let plaintext = match scheme {
             "wss" => false,
             "ws" if is_test_loopback(&host) => true,
@@ -218,13 +236,14 @@ impl WsRegistry {
             }
         };
 
-        // Same allowlist matcher as `ryuzi:http` — never re-implemented here.
+        // Same allowlist matcher as `ryuzi:http`, run on the DIALED host —
+        // never re-implemented here.
         if !host_is_allowed(allowlist, &host) {
             return Err(WsErr::Rejected);
         }
 
         let inbox = Arc::new(Mutex::new(Inbox::new()));
-        let (sink, source) = rt.block_on(open_stream(url, headers, plaintext))?;
+        let (sink, source) = rt.block_on(open_stream(request, plaintext, timeout))?;
         let reader = rt.spawn(reader_loop(source, inbox.clone()));
 
         let handle = self.next_handle;
@@ -245,7 +264,13 @@ impl WsRegistry {
     /// (`limit-exceeded`), or a send on an already-dropped connection
     /// (`disconnected`); a text frame whose bytes are not valid UTF-8 is
     /// `invalid-request`. A write error marks the connection disconnected.
-    pub fn send(&mut self, rt: &Handle, handle: u64, frame: WsFrame) -> Result<(), WsErr> {
+    pub fn send(
+        &mut self,
+        rt: &Handle,
+        timeout: Duration,
+        handle: u64,
+        frame: WsFrame,
+    ) -> Result<(), WsErr> {
         let conn = self
             .conns
             .get_mut(&handle)
@@ -274,11 +299,17 @@ impl WsRegistry {
             Message::binary(frame.data)
         };
 
-        match rt.block_on(conn.write.send(message)) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // A failed write means the socket is broken — surface it as a
-                // disconnect so the guest reconnects, and mark it so.
+        // Bound the write: a peer that stops reading fills the TCP send buffer
+        // and would otherwise block this `spawn_blocking` host thread forever
+        // (the wasmtime epoch cannot preempt a blocked host fn). Both a write
+        // error and a timeout mean the socket is broken/stalled, so mark the
+        // connection disconnected and surface `disconnected` for the guest to
+        // reconnect.
+        let sent =
+            rt.block_on(async { tokio::time::timeout(timeout, conn.write.send(message)).await });
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => {
                 conn.inbox
                     .lock()
                     .expect("ws inbox mutex poisoned")
@@ -353,41 +384,71 @@ fn is_test_loopback(host: &str) -> bool {
     }
 }
 
-/// Open the WebSocket and split it into its write/read halves. A `wss` URL uses
-/// an explicit ring-backed rustls connector (never the process-default
-/// provider — the workspace is ring-only); a plaintext `ws` URL (test loopback
-/// only) uses a plain connect.
-async fn open_stream(
-    url: &str,
-    headers: Vec<WsHeader>,
-    plaintext: bool,
-) -> Result<(WsSink, WsSource), WsErr> {
+/// Build the tungstenite client request from `url` and apply the component's
+/// requested handshake headers. The returned request's `http::Uri` is the
+/// single source of truth for the host/scheme both the allowlist guard and the
+/// socket dial use (see [`WsRegistry::connect`]).
+fn build_request(url: &str, headers: Vec<WsHeader>) -> Result<Request, WsErr> {
     let mut request = url
         .into_client_request()
         .map_err(|error| WsErr::InvalidRequest(error.to_string()))?;
-    {
-        let request_headers = request.headers_mut();
-        for WsHeader { name, value } in &headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|error| WsErr::InvalidRequest(error.to_string()))?;
-            let header_value = HeaderValue::from_str(value)
-                .map_err(|error| WsErr::InvalidRequest(error.to_string()))?;
-            request_headers.append(header_name, header_value);
-        }
+    let request_headers = request.headers_mut();
+    for WsHeader { name, value } in &headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| WsErr::InvalidRequest(error.to_string()))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|error| WsErr::InvalidRequest(error.to_string()))?;
+        request_headers.append(header_name, header_value);
     }
+    Ok(request)
+}
 
-    let stream = if plaintext {
-        tokio_tungstenite::connect_async(request)
+/// A [`WebSocketConfig`] that bounds a single inbound message AND frame to
+/// [`MAX_WS_FRAME_BYTES`]. Without this the tungstenite defaults (64 MiB
+/// message / 16 MiB frame) apply, so a hostile allowlisted server could pin up
+/// to `MAX_WS_INBOUND_BUFFER × 64 MiB` of host memory; capping the message size
+/// bounds total buffered bytes to `MAX_WS_INBOUND_BUFFER × MAX_WS_FRAME_BYTES`
+/// and makes an oversized inbound message a socket error (→ disconnect in the
+/// reader loop) rather than something the host buffers.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_FRAME_BYTES))
+        .max_frame_size(Some(MAX_WS_FRAME_BYTES))
+}
+
+/// Open the WebSocket (bounded by `timeout`) and split it into its write/read
+/// halves. A `wss` URL uses an explicit ring-backed rustls connector (never the
+/// process-default provider — the workspace is ring-only); a plaintext `ws` URL
+/// (test loopback only) uses a plain connect. `timeout` bounds the whole
+/// handshake so a slowloris peer cannot hang the host thread.
+async fn open_stream(
+    request: Request,
+    plaintext: bool,
+    timeout: Duration,
+) -> Result<(WsSink, WsSource), WsErr> {
+    let config = Some(ws_config());
+    let connect = async move {
+        if plaintext {
+            tokio_tungstenite::connect_async_with_config(request, config, false)
+                .await
+                .map(|(stream, _)| stream)
+        } else {
+            let connector = Connector::Rustls(Arc::new(rustls_client_config()));
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                config,
+                false,
+                Some(connector),
+            )
             .await
-            .map_err(|error| WsErr::Failed(error.to_string()))?
-            .0
-    } else {
-        let connector = Connector::Rustls(Arc::new(rustls_client_config()));
-        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
-            .await
-            .map_err(|error| WsErr::Failed(error.to_string()))?
-            .0
+            .map(|(stream, _)| stream)
+        }
     };
+
+    let stream = tokio::time::timeout(timeout, connect)
+        .await
+        .map_err(|_| WsErr::Failed(format!("websocket connect timed out after {timeout:?}")))?
+        .map_err(|error| WsErr::Failed(error.to_string()))?;
     Ok(stream.split())
 }
 
@@ -447,8 +508,11 @@ async fn reader_loop(mut source: WsSource, inbox: Arc<Mutex<Inbox>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::net::TcpListener;
+
+    /// Generous per-op timeout for the local tests — the loopback echo server
+    /// answers in microseconds, so this only ever fires if something wedges.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Spawn a loopback `tokio-tungstenite` echo server, returning its bound
     /// port. Each accepted connection echoes text/binary frames back until the
@@ -515,10 +579,11 @@ mod tests {
             let mut reg = WsRegistry::new();
             let url = format!("ws://127.0.0.1:{port}/");
             let handle = reg
-                .connect(&["127.0.0.1".to_string()], &rt, &url, vec![])
+                .connect(&["127.0.0.1".to_string()], &rt, TEST_TIMEOUT, &url, vec![])
                 .expect("connect to an allowlisted host");
             reg.send(
                 &rt,
+                TEST_TIMEOUT,
                 handle,
                 WsFrame {
                     data: b"hello ryuzi".to_vec(),
@@ -544,7 +609,13 @@ mod tests {
             // 127.0.0.1 is a valid test loopback scheme-wise, but it is NOT in
             // the allowlist, so the connect must be rejected.
             let err = reg
-                .connect(&["example.com".to_string()], &rt, &url, vec![])
+                .connect(
+                    &["example.com".to_string()],
+                    &rt,
+                    TEST_TIMEOUT,
+                    &url,
+                    vec![],
+                )
                 .expect_err("a non-allowlisted host must be rejected");
             assert_eq!(err, WsErr::Rejected);
         })
@@ -562,6 +633,7 @@ mod tests {
                 .connect(
                     &["example.com".to_string()],
                     &rt,
+                    TEST_TIMEOUT,
                     "ws://example.com/socket",
                     vec![],
                 )
@@ -578,12 +650,13 @@ mod tests {
             let mut reg = WsRegistry::new();
             let url = format!("ws://127.0.0.1:{port}/");
             let handle = reg
-                .connect(&["127.0.0.1".to_string()], &rt, &url, vec![])
+                .connect(&["127.0.0.1".to_string()], &rt, TEST_TIMEOUT, &url, vec![])
                 .expect("connect");
             let oversized = vec![b'x'; MAX_WS_FRAME_BYTES + 1];
             let err = reg
                 .send(
                     &rt,
+                    TEST_TIMEOUT,
                     handle,
                     WsFrame {
                         data: oversized,
@@ -604,11 +677,11 @@ mod tests {
             let url = format!("ws://127.0.0.1:{port}/");
             let allow = vec!["127.0.0.1".to_string()];
             for _ in 0..MAX_WS_HANDLES_PER_INSTANCE {
-                reg.connect(&allow, &rt, &url, vec![])
+                reg.connect(&allow, &rt, TEST_TIMEOUT, &url, vec![])
                     .expect("connect within the handle cap");
             }
             let err = reg
-                .connect(&allow, &rt, &url, vec![])
+                .connect(&allow, &rt, TEST_TIMEOUT, &url, vec![])
                 .expect_err("the handle past the cap must be rejected");
             assert!(matches!(err, WsErr::LimitExceeded(_)), "got {err:?}");
         })
@@ -632,7 +705,7 @@ mod tests {
             let mut reg = WsRegistry::new();
             let url = format!("ws://127.0.0.1:{port}/");
             let handle = reg
-                .connect(&["127.0.0.1".to_string()], &rt, &url, vec![])
+                .connect(&["127.0.0.1".to_string()], &rt, TEST_TIMEOUT, &url, vec![])
                 .expect("connect");
 
             let mut closed = false;
@@ -683,7 +756,9 @@ mod tests {
         // thread — WsConn::Drop must abort the reader and close the socket.
         tokio::task::spawn_blocking(move || {
             let mut reg = WsRegistry::new();
-            let _handle = reg.connect(&allow, &rt, &url, vec![]).expect("connect");
+            let _handle = reg
+                .connect(&allow, &rt, TEST_TIMEOUT, &url, vec![])
+                .expect("connect");
             // `reg` drops here.
         })
         .await
@@ -693,6 +768,123 @@ mod tests {
             .await
             .expect("the server must observe the dropped socket closing")
             .expect("the close signal channel should not close early");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_binary_frame_roundtrips_on_an_allowlisted_host() {
+        let port = spawn_echo_server().await;
+        on_blocking(move |rt| {
+            let mut reg = WsRegistry::new();
+            let url = format!("ws://127.0.0.1:{port}/");
+            let handle = reg
+                .connect(&["127.0.0.1".to_string()], &rt, TEST_TIMEOUT, &url, vec![])
+                .expect("connect");
+            reg.send(
+                &rt,
+                TEST_TIMEOUT,
+                handle,
+                WsFrame {
+                    data: vec![0x00, 0xFF, 0x10, 0x7F],
+                    is_text: false,
+                },
+            )
+            .expect("send a binary frame");
+
+            let frames = poll_until_frame(&mut reg, handle);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].data, vec![0x00, 0xFF, 0x10, 0x7F]);
+            assert!(!frames[0].is_text, "the echoed frame must be binary");
+        })
+        .await;
+    }
+
+    /// Important 1 regression: the allowlist guard must key on the EXACT host
+    /// tungstenite dials from the request `http::Uri`, not the raw authority —
+    /// a userinfo prefix must not smuggle a value past the check nor become the
+    /// "allowlisted" token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_guard_keys_on_the_dialed_uri_host_not_the_authority() {
+        let port = spawn_echo_server().await;
+        on_blocking(move |rt| {
+            let mut reg = WsRegistry::new();
+            // The URL carries a userinfo prefix; the dialed host is 127.0.0.1.
+            let url = format!("ws://ignored-user@127.0.0.1:{port}/");
+
+            // Allowlisting the dialed host connects.
+            let handle = reg
+                .connect(&["127.0.0.1".to_string()], &rt, TEST_TIMEOUT, &url, vec![])
+                .expect("the dialed host (127.0.0.1) is allowlisted");
+            reg.close(handle).expect("close");
+
+            // Allowlisting only the userinfo token does NOT permit the dial —
+            // the guard uses the URI host, so it is still rejected.
+            let err = reg
+                .connect(
+                    &["ignored-user".to_string()],
+                    &rt,
+                    TEST_TIMEOUT,
+                    &url,
+                    vec![],
+                )
+                .expect_err("only the dialed host may satisfy the allowlist");
+            assert_eq!(err, WsErr::Rejected);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_handle_is_no_longer_usable() {
+        let port = spawn_echo_server().await;
+        on_blocking(move |rt| {
+            let mut reg = WsRegistry::new();
+            let url = format!("ws://127.0.0.1:{port}/");
+            let handle = reg
+                .connect(&["127.0.0.1".to_string()], &rt, TEST_TIMEOUT, &url, vec![])
+                .expect("connect");
+            reg.close(handle).expect("close a live handle");
+
+            // Every op on the released handle is now an invalid-request.
+            assert!(matches!(reg.close(handle), Err(WsErr::InvalidRequest(_))));
+            assert!(matches!(reg.state(handle), Err(WsErr::InvalidRequest(_))));
+            assert!(matches!(reg.poll(handle), Err(WsErr::InvalidRequest(_))));
+            assert!(matches!(
+                reg.send(
+                    &rt,
+                    TEST_TIMEOUT,
+                    handle,
+                    WsFrame {
+                        data: b"x".to_vec(),
+                        is_text: true,
+                    },
+                ),
+                Err(WsErr::InvalidRequest(_))
+            ));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn operations_on_an_unknown_handle_are_invalid_request() {
+        on_blocking(|rt| {
+            let mut reg = WsRegistry::new();
+            let bogus = 424_242;
+            assert!(matches!(reg.state(bogus), Err(WsErr::InvalidRequest(_))));
+            assert!(matches!(reg.poll(bogus), Err(WsErr::InvalidRequest(_))));
+            assert!(matches!(reg.close(bogus), Err(WsErr::InvalidRequest(_))));
+            assert!(matches!(
+                reg.send(
+                    &rt,
+                    TEST_TIMEOUT,
+                    bogus,
+                    WsFrame {
+                        data: b"x".to_vec(),
+                        is_text: true,
+                    },
+                ),
+                Err(WsErr::InvalidRequest(_))
+            ));
+        })
+        .await;
     }
 
     #[test]
