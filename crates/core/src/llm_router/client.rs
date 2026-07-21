@@ -2865,15 +2865,6 @@ async fn pump_wasm_provider(
     // `OpenAiToAnthropicStream`'s doc); like them it is post-hoc detection —
     // `complete()` has already returned — so it cannot do live failover, but it
     // must stop reporting a truncated wasm-provider response as success.
-    // A completion whose chunks NEVER set `finished` (guest-controlled, nothing
-    // enforces it) ended without a terminal event — that is a truncated
-    // response, not a completed one, so emit an `error_frame` and record the
-    // attempt as failed rather than synthesizing a `message_stop` with a
-    // fabricated `stop_reason` and logging a `200`. This mirrors the OpenAI /
-    // kiro / codex pumps' `saw_terminal()` guard (see
-    // `OpenAiToAnthropicStream`'s doc); like them it is post-hoc detection —
-    // `complete()` has already returned — so it cannot do live failover, but it
-    // must stop reporting a truncated wasm-provider response as success.
     let mut errored = false;
     if tr.saw_terminal() {
         for event in tr.finish() {
