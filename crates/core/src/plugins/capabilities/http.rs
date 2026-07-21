@@ -24,10 +24,25 @@
 //! it can never leak to a different origin, and never coexists with a
 //! host-injected OAuth bearer (see [`AllowedHttpClient::request_impl`]).
 
+use std::time::Duration;
+
 /// Maximum number of redirect hops [`AllowedHttpClient::request`] will
 /// follow manually before giving up. Bounded to avoid a malicious or
 /// misbehaving allowlisted server driving the host into an unbounded loop.
 const MAX_REDIRECT_HOPS: u8 = 5;
+
+/// Default wall-clock bound applied to BOTH the connect phase and the whole
+/// request of every host-side HTTP call. It matches the default per-component
+/// epoch timeout (`runtime::ResourceLimits::timeout`, 30s), so a plain
+/// [`AllowedHttpClient::new`] can never hang longer than the budget the epoch
+/// timeout uses. Epoch/fuel interruption only preempts GUEST wasm — never a
+/// host function — so without this bound a stalled allowlisted server would
+/// hang `ComponentInstance::call` forever (its timeout branch awaits the
+/// blocking task after bumping the epoch), bricking the gating hook / session
+/// this module must never deadlock. Callers that know the component's actual
+/// epoch timeout thread it through [`AllowedHttpClient::with_self_auth`] so a
+/// shorter epoch budget also shortens the HTTP bound.
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Header names the host ALWAYS strips from every outbound request,
 /// regardless of what a component supplies or how it is signed:
@@ -90,7 +105,7 @@ impl AllowedHttpClient {
     /// following it — `reqwest`'s built-in redirect handling has no way to
     /// veto a hop mid-chain.
     pub fn new(allowlist: Vec<String>) -> Self {
-        Self::with_self_auth(allowlist, false)
+        Self::with_self_auth(allowlist, false, DEFAULT_HTTP_TIMEOUT)
     }
 
     /// Like [`Self::new`], but when `allow_self_auth` is true a
@@ -101,10 +116,22 @@ impl AllowedHttpClient {
     /// via `runtime::HostPolicy::allow_self_auth`), never from manifest content
     /// or anything a component can set. Every other component keeps the strict
     /// Task 8 stripping.
-    pub fn with_self_auth(allowlist: Vec<String>, allow_self_auth: bool) -> Self {
+    ///
+    /// `timeout` bounds BOTH the connect phase and the whole request (see
+    /// [`DEFAULT_HTTP_TIMEOUT`]). Callers thread the component's own per-call
+    /// epoch timeout here so a stalled allowlisted server surfaces as an
+    /// [`HttpErr::Failed`] within the budget instead of hanging the host
+    /// function past the epoch deadline it can never preempt.
+    pub fn with_self_auth(
+        allowlist: Vec<String>,
+        allow_self_auth: bool,
+        timeout: Duration,
+    ) -> Self {
         let allowlist = allowlist.into_iter().map(|h| h.to_lowercase()).collect();
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .connect_timeout(timeout)
             .build()
             .expect("reqwest client with no non-default TLS/proxy config should always build");
         Self {
@@ -347,6 +374,50 @@ mod tests {
         assert_eq!(response.body, b"hello from plugin server");
     }
 
+    // Epoch/fuel interruption only preempts guest wasm, never a host function,
+    // so a stalled allowlisted server must be bounded by the client's OWN
+    // timeout or `ComponentInstance::call` hangs forever after bumping the
+    // epoch. A deliberately-slow endpoint (sleeps far longer than the client's
+    // 300ms bound) must surface as an ERROR well within a generous outer guard.
+    #[tokio::test]
+    async fn a_stalled_endpoint_errors_within_the_configured_timeout() {
+        async fn stall() -> impl IntoResponse {
+            // Far longer than the client's bound below; the client's own
+            // timeout must fire first.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "too slow"
+        }
+        let app = Router::new().route("/slow", get(stall));
+        let port = spawn_server(app).await;
+
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            false,
+            Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request(
+                "GET",
+                &format!("http://127.0.0.1:{port}/slow"),
+                vec![],
+                None,
+            ),
+        )
+        .await
+        .expect("the client's own 300ms timeout must fire long before this 5s guard");
+
+        assert!(
+            matches!(result, Err(HttpErr::Failed(_))),
+            "a stalled endpoint must surface as an error, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the request must return promptly, not hang"
+        );
+    }
+
     #[tokio::test]
     async fn unlisted_host_is_refused() {
         let app = Router::new().route("/ok", get(|| async { "hello" }));
@@ -463,7 +534,11 @@ mod tests {
         let app = Router::new().route("/echo", get(echo_authorization));
         let port = spawn_server(app).await;
 
-        let client = AllowedHttpClient::with_self_auth(vec!["127.0.0.1".to_string()], true);
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            true,
+            DEFAULT_HTTP_TIMEOUT,
+        );
         let response = client
             .request(
                 "GET",
@@ -489,7 +564,11 @@ mod tests {
         let app = Router::new().route("/echo", get(echo_authorization));
         let port = spawn_server(app).await;
 
-        let client = AllowedHttpClient::with_self_auth(vec!["127.0.0.1".to_string()], false);
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            false,
+            DEFAULT_HTTP_TIMEOUT,
+        );
         let response = client
             .request(
                 "GET",
@@ -525,7 +604,11 @@ mod tests {
 
         // Both origins share the allowlisted host `127.0.0.1`, so the redirect
         // IS followed — the point of the test is that auth is dropped anyway.
-        let client = AllowedHttpClient::with_self_auth(vec!["127.0.0.1".to_string()], true);
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            true,
+            DEFAULT_HTTP_TIMEOUT,
+        );
         let response = client
             .request(
                 "GET",
@@ -549,7 +632,11 @@ mod tests {
         let app = Router::new().route("/ok", get(|| async { "hello" }));
         let port = spawn_server(app).await;
 
-        let client = AllowedHttpClient::with_self_auth(vec!["example.com".to_string()], true);
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["example.com".to_string()],
+            true,
+            DEFAULT_HTTP_TIMEOUT,
+        );
         let result = client
             .request(
                 "GET",

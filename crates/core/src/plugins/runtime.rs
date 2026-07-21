@@ -543,6 +543,7 @@ impl CompiledComponent {
                 allow_network,
                 network_allowlist,
                 allow_self_auth,
+                http_timeout: timeout,
                 rt,
                 // Locked down: no preopens, no env, no stdio, no sockets.
                 wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
@@ -776,6 +777,12 @@ pub(crate) struct CapabilityState {
     /// from [`HostPolicy::allow_self_auth`] at instantiation. Threaded into the
     /// per-request [`AllowedHttpClient`] in `http_iface::Host::request`.
     allow_self_auth: bool,
+    /// This component's per-call epoch timeout (`policy.limits.timeout`),
+    /// mirrored at instantiation. It bounds the per-request [`AllowedHttpClient`]
+    /// in `http_iface::Host::request` so a stalled allowlisted server can never
+    /// hang a host function past the epoch deadline the guest-only epoch
+    /// interruption cannot preempt — see `capabilities::http::DEFAULT_HTTP_TIMEOUT`.
+    http_timeout: Duration,
     rt: tokio::runtime::Handle,
     /// Minimal, locked-down WASI p2 context. Any real (std-built) component
     /// imports the WASI baseline (`wasi:io`, `wasi:cli`, …) even when it never
@@ -966,6 +973,7 @@ impl http_iface::Host for CapabilityState {
     ) -> Result<http_iface::HttpResponse, http_iface::HttpError> {
         let allowlist = self.network_allowlist.clone();
         let allow_self_auth = self.allow_self_auth;
+        let http_timeout = self.http_timeout;
         let http_iface::HttpRequest {
             method,
             url,
@@ -976,7 +984,7 @@ impl http_iface::Host for CapabilityState {
             .into_iter()
             .map(|header| (header.name, header.value))
             .collect();
-        let client = AllowedHttpClient::with_self_auth(allowlist, allow_self_auth);
+        let client = AllowedHttpClient::with_self_auth(allowlist, allow_self_auth, http_timeout);
         let result = self
             .rt
             .block_on(async move { client.request(&method, &url, headers, body).await });

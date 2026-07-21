@@ -17,7 +17,7 @@
 //! The component only ever receives the upstream [`SafeHttpResponse`]; the
 //! access token itself never crosses back into adapter-returned data.
 
-use super::http::{AllowedHttpClient, SafeHttpResponse};
+use super::http::{AllowedHttpClient, SafeHttpResponse, DEFAULT_HTTP_TIMEOUT};
 use super::PluginCapabilityContext;
 use crate::plugins::oauth::{generate_pkce_verifier, needs_refresh, pkce_challenge_s256};
 use ryuzi_plugin_sdk::OAuthProfile;
@@ -237,7 +237,7 @@ impl<'a> ProfileOauth<'a> {
             form.push(("scope", scope));
         }
 
-        let response = reqwest::Client::new()
+        let response = bounded_http_client()?
             .post(device_authorization_url)
             .form(&form)
             .send()
@@ -332,7 +332,7 @@ impl<'a> ProfileOauth<'a> {
             ("device_code", device_code),
             ("client_id", client_id.as_str()),
         ];
-        let response = reqwest::Client::new()
+        let response = bounded_http_client()?
             .post(token_url)
             .form(&form)
             .send()
@@ -398,6 +398,21 @@ impl<'a> ProfileOauth<'a> {
 
 fn now_ms() -> i64 {
     crate::paths::now_ms()
+}
+
+/// A plain `reqwest::Client` bounded on BOTH the connect phase and the whole
+/// request by [`DEFAULT_HTTP_TIMEOUT`], used by the device-flow endpoints that
+/// talk to an OAuth provider directly (not through [`AllowedHttpClient`]).
+/// Without the bound a stalled provider would hang the device-authorization /
+/// token poll forever. Building this client only fails on a malformed
+/// TLS/proxy config — which this never sets — but the error is surfaced as
+/// [`OauthErr::Failed`] rather than panicking.
+fn bounded_http_client() -> Result<reqwest::Client, OauthErr> {
+    reqwest::Client::builder()
+        .timeout(DEFAULT_HTTP_TIMEOUT)
+        .connect_timeout(DEFAULT_HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| OauthErr::Failed(error.to_string()))
 }
 
 #[cfg(test)]
