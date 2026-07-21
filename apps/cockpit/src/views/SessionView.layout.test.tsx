@@ -162,7 +162,7 @@ test("bottom terminal is outside the horizontal main row", async () => {
   expect(mainRow.parentElement).toBe(bottomRow.parentElement);
 });
 
-test("TODO List overlays the transcript before it and remains outside the composer", async () => {
+test("TODO List overlays the transcript near the chat header and remains outside the composer", async () => {
   render(<SessionView />);
   await act(async () => {});
   const todoPanel = screen.getByTestId("todo-panel");

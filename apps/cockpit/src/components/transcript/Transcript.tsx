@@ -6,7 +6,6 @@ import { buildTranscript, closeDanglingFence, formatTurnDuration, liveTurnStartM
 import { useNow } from "@/hooks/useNow";
 import { mediaKindForContentType } from "@/lib/attachments";
 import { distanceFromBottom, isStuck, pinningInterrupted, showScrollFab } from "@/lib/scroll";
-import { StatusDot } from "@/components/common/bits";
 import { Markdown } from "./Markdown";
 import { ThoughtBlock } from "./ThoughtBlock";
 import { ActivityCluster } from "./ToolChip";
@@ -133,21 +132,9 @@ function NoticeRow({ text }: { text: string }) {
 }
 
 // memo: completed turns never re-render while the streaming tail grows.
-const AgentTurn = memo(function AgentTurn({
-  markdown,
-  agentName,
-  agentColor,
-}: {
-  markdown: string;
-  agentName: string;
-  agentColor: string;
-}) {
+const AgentTurn = memo(function AgentTurn({ markdown }: { markdown: string }) {
   return (
     <div className="flex max-w-[82%] flex-col text-[13.5px] leading-relaxed text-foreground">
-      <div className="mb-1 flex items-center gap-1.5 text-[11.5px] font-semibold text-muted-foreground">
-        <StatusDot color={agentColor} />
-        {agentName}
-      </div>
       <Markdown text={markdown} />
     </div>
   );
@@ -173,7 +160,6 @@ export function Transcript({
   runnerId,
   sessionPk,
   rows,
-  agentName,
   agentColor,
   running,
   ownerRunId,
@@ -183,7 +169,6 @@ export function Transcript({
   runnerId: string;
   sessionPk: string;
   rows: Row[];
-  agentName: string;
   agentColor: string;
   running: boolean;
   ownerRunId: string | null;
@@ -287,11 +272,7 @@ export function Transcript({
                 case "agent":
                   return (
                     <div key={g.key} className="flex flex-col">
-                      <AgentTurn
-                        markdown={streamingTail ? closeDanglingFence(g.markdown) : g.markdown}
-                        agentName={agentName}
-                        agentColor={agentColor}
-                      />
+                      <AgentTurn markdown={streamingTail ? closeDanglingFence(g.markdown) : g.markdown} />
                       {g.turnEnd === true && <TurnActions markdown={g.markdown} />}
                     </div>
                   );

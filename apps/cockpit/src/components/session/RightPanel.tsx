@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Bot, ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
+import { Archive, Bot, ChevronRight, FileText, Maximize2, Minimize2, RotateCw, Search, SquareCheck, X } from "lucide-react";
 import { useUi } from "@/store-ui";
 import { useNav, type RightTab, clampPanelSize, RIGHT_WIDTH } from "@/store-nav";
 import { useDiff, reviewFileIndex, EMPTY, type PendingReview } from "@/store-diff";
@@ -13,6 +13,7 @@ import { defaultModeForPath, previewKindForPath, type ViewMode } from "@/lib/pre
 import { FileTreePane } from "@/components/FileTreePane";
 import { AgentRunRoster } from "@/components/session/AgentRunRoster";
 import { AgentRunDetail } from "@/components/session/AgentRunDetail";
+import { ArtifactPanel } from "@/components/artifacts/ArtifactPanel";
 import { useDelegation, delegationSessionKey } from "@/store-delegation";
 import { DiffStat } from "@/components/common/bits";
 import { PanelResizeHandle } from "@/components/common/PanelResizeHandle";
@@ -207,6 +208,7 @@ export function RightPanel({
   const rightTabs: { id: RightTab; label: string; icon: typeof SquareCheck }[] = [
     { id: "review", label: "Review", icon: SquareCheck },
     { id: "file", label: activeFileTab ? activeFileTab.title : "Files", icon: FileText },
+    { id: "artifacts", label: "Artifacts", icon: Archive },
     { id: "agents", label: "Agents", icon: Bot },
   ];
 
@@ -486,6 +488,8 @@ export function RightPanel({
           </div>
         </>
       )}
+
+      {nav.rightTab === "artifacts" && <ArtifactPanel runnerId={runnerId} sessionPk={sessionPk} />}
 
       {nav.rightTab === "agents" &&
         (selectedRun ? (

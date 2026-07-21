@@ -274,7 +274,7 @@ test("Advanced delete uses the same success-only detail navigation", async () =>
 
 test("detail has Back, identity, actions, six tabs, and overview metrics", () => {
   render(<AgentDetailView agentId="reviewer" />);
-  expect(screen.getByRole("button", { name: "Back to Agents" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Reviewer" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Actions for Reviewer" })).toBeTruthy();
   const tabs = screen.getByTestId("agent-detail-tabs");
@@ -293,7 +293,7 @@ test("detail has Back, identity, actions, six tabs, and overview metrics", () =>
 test("Back uses navigation history", () => {
   useNav.setState({ history: { back: [{ kind: "models" }], current: { kind: "agentDetail", agentId: "reviewer" }, forward: [] } });
   render(<AgentDetailView agentId="reviewer" />);
-  fireEvent.click(screen.getByRole("button", { name: "Back to Agents" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back" }));
   expect(useNav.getState().history.current).toEqual({ kind: "models" });
 });
 

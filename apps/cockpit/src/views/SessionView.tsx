@@ -30,7 +30,6 @@ import { TranscriptFileContext } from "@/components/transcript/TranscriptFileCon
 import { RightPanel } from "@/components/session/RightPanel";
 import { BottomTerminalDrawer } from "@/components/session/BottomTerminalDrawer";
 import { TodoPanel } from "@/components/session/TodoPanel";
-import { ArtifactPanel } from "@/components/artifacts/ArtifactPanel";
 import { OpenInMenu } from "@/components/session/OpenInMenu";
 import { QueuedMessages } from "@/components/session/QueuedMessages";
 import { SessionCostPanel } from "@/components/session/SessionCostPanel";
@@ -451,7 +450,7 @@ export function SessionView() {
             <OpenInMenu runnerId={runnerId} sessionPk={session.sessionPk} />
           </div>
 
-          {/* Transcript, with the TODO List overlaying it */}
+          {/* Transcript with a compact TODO board near the chat header. */}
           <div className="relative flex min-h-0 flex-1 flex-col">
             <TodoPanel runnerId={runnerId} sessionPk={session.sessionPk} running={running} />
             <TranscriptFileContext.Provider value={transcriptFileCtx}>
@@ -459,7 +458,6 @@ export function SessionView() {
                 runnerId={runnerId}
                 sessionPk={session.sessionPk}
                 rows={rows}
-                agentName={sessionPrimaryLabel(session.primaryAgentSnapshot, registry?.agents)}
                 agentColor={session.primaryAgentSnapshot?.avatarColor ?? "#71717A"}
                 running={running}
                 ownerRunId={rootRunId}
@@ -472,8 +470,6 @@ export function SessionView() {
               </Transcript>
             </TranscriptFileContext.Provider>
           </div>
-
-          <ArtifactPanel runnerId={runnerId} sessionPk={session.sessionPk} refreshKey={rows.length} />
 
           {/* Session composer */}
           <div className="shrink-0 px-6 pb-4 pt-3">

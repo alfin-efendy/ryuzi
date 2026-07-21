@@ -9,6 +9,7 @@ import {
   SettingsCardTitle,
   Textarea,
 } from "@ryuzi/ui";
+import { Markdown } from "@/components/transcript/Markdown";
 import type { AgentDetailInfo, AgentPersonalityInfo } from "@/bindings";
 import { useAgents } from "@/store-agents";
 import { mutationFromDetail } from "./agentMutation";
@@ -144,14 +145,22 @@ export function AgentPersonalityCard({ detail }: { detail: AgentDetailInfo }) {
       {isCustom ? (
         <SettingsCardRow className="items-start gap-4">
           <span className="w-40 shrink-0 pt-2 text-[13px] font-medium">Custom instructions</span>
-          <Textarea
-            aria-label="Custom personality"
-            className="min-w-0 flex-1"
-            rows={4}
-            value={customText}
-            disabled={saving}
-            onChange={(event) => setPersonality((current) => ({ ...current, custom: event.target.value }))}
-          />
+          <div className="min-w-0 flex-1">
+            <Textarea
+              aria-label="Custom personality"
+              className="w-full"
+              rows={4}
+              value={customText}
+              disabled={saving}
+              onChange={(event) => setPersonality((current) => ({ ...current, custom: event.target.value }))}
+            />
+            {customText.trim() && (
+              <section className="mt-3 rounded-md border border-border bg-muted/30 px-3 py-2.5" aria-label="Instruction preview">
+                <span className="mb-2 block text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Markdown preview</span>
+                <Markdown text={customText} />
+              </section>
+            )}
+          </div>
         </SettingsCardRow>
       ) : description !== null ? (
         <SettingsCardRow>

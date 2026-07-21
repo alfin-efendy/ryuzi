@@ -15,6 +15,7 @@ export type View =
   | { kind: "jobNew" }
   | { kind: "plugins" }
   | { kind: "appDetail"; id: string }
+  | { kind: "projects" }
   | { kind: "gateways" }
   | { kind: "gatewayDetail"; id: string }
   | { kind: "pluginDetail"; id: string }
@@ -22,7 +23,7 @@ export type View =
   | { kind: "agents" }
   | { kind: "agentDetail"; agentId: string };
 
-export type RightTab = "review" | "file" | "agents";
+export type RightTab = "review" | "file" | "agents" | "artifacts";
 
 export type NavHistory = { back: View[]; current: View; forward: View[] };
 
@@ -77,9 +78,9 @@ export function clampPanelSize(px: number, viewport: number, b: { min: number; m
   return Math.min(Math.max(Math.round(px), b.min), max);
 }
 
-/** Legacy persisted values ("term") and garbage collapse to "review". */
+/** Legacy persisted values ("term") and unknown values collapse to "review". */
 export function sanitizeRightTab(raw: string | null): RightTab {
-  return raw === "file" ? "file" : raw === "agents" ? "agents" : "review";
+  return raw === "file" || raw === "agents" || raw === "artifacts" ? raw : "review";
 }
 
 /** Parse a persisted panel size and clamp it to the current viewport. A size
