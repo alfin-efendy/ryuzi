@@ -564,14 +564,14 @@ impl CompiledComponent {
             // linked regardless of policy.
             host_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
                 &mut linker
-                    .instance("host")
+                    .instance(HOST_IMPORT)
                     .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?,
                 |s: &mut CapabilityState| s,
             )
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
             if allow_settings {
                 settings_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("settings").map_err(|error| {
+                    &mut linker.instance(SETTINGS_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -580,7 +580,7 @@ impl CompiledComponent {
             }
             if allow_storage {
                 storage_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("storage").map_err(|error| {
+                    &mut linker.instance(STORAGE_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -589,7 +589,7 @@ impl CompiledComponent {
             }
             if allow_network {
                 http_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("http").map_err(|error| {
+                    &mut linker.instance(HTTP_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -598,7 +598,7 @@ impl CompiledComponent {
             }
             if allow_oauth {
                 oauth_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("oauth").map_err(|error| {
+                    &mut linker.instance(OAUTH_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -1308,6 +1308,45 @@ mod tests {
             .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all(), ctx)
             .await
             .expect("an import-free installed component should instantiate");
+    }
+
+    /// Positive instantiation proof for a host CAPABILITY import. The
+    /// `component-http-import` fixture imports `ryuzi:http/http@0.1.0`, so once
+    /// network is granted it must instantiate — which only works if the http
+    /// adapter is linked under the interface's FULLY-QUALIFIED import name.
+    ///
+    /// Regression guard: every capability adapter used to be linked under a
+    /// SHORT instance name (`linker.instance("http"/"oauth"/…)`) that no
+    /// component import — which is keyed by the fully-qualified id
+    /// (`ryuzi:http/http@0.1.0`) — can match. Every fixture except this one
+    /// imports only `ryuzi:plugin/types`, so nothing ever instantiated a
+    /// capability import positively and the mismatch stayed latent until the
+    /// first first-party component to import `ryuzi:oauth` (the github
+    /// connector) hit it. This test fails before that fix and passes after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instantiate_links_a_capability_import_by_its_full_interface_name() {
+        build_fixture_components();
+        let component_path = fixture_artifact("component-http-import");
+        let root = component_path
+            .parent()
+            .expect("fixture artifact has a parent dir")
+            .to_path_buf();
+        let bundle = InstalledBundle {
+            manifest: manifest(vec!["fixture.invalid"]),
+            release: release(),
+            release_record: component_release(),
+            root,
+            component_path,
+        };
+        // A declared network host grants the http capability under host policy.
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        assert!(policy.allow_network, "a manifest host must grant network");
+        let (ctx, _tmp) = test_ctx("acme").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime
+            .instantiate(&bundle, policy, ctx)
+            .await
+            .expect("a component importing ryuzi:http/http must instantiate once http is linked");
     }
 
     /// An [`InstalledBundle`] pointing at a real prebuilt fixture artifact
