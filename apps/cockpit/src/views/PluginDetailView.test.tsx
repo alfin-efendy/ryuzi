@@ -363,7 +363,10 @@ const pluginDetail = mock((_runnerId: string, id: string) => {
   // The view must suppress the toast for precisely this shape (component-only
   // render below) while still toasting the generic "unknown plugin" fallback
   // (no id) used by the ghost-id test.
-  if (id === "mimo" || id === "opencode") return err(`unknown plugin: ${id}`);
+  // Task 15c: `atlassian`/`bitbucket` are first-party connector components
+  // installed on demand via `install_component_release` (like `github`), NOT
+  // `CorePlugin`s — same 404 shape as mimo/opencode.
+  if (id === "mimo" || id === "opencode" || id === "atlassian" || id === "bitbucket") return err(`unknown plugin: ${id}`);
   return err("unknown plugin");
 });
 const setPluginEnabled = mock((_runnerId: string, _id: string, _enabled: boolean) => ok(null));
@@ -447,17 +450,26 @@ function releaseInfo(over: Partial<ReleaseInfoFixture> = {}): ReleaseInfoFixture
 // manifest scenario for the permission-summary/rollback/one-active-version
 // tests, while every other id stays "never a component plugin" by default.
 let mimoReleaseFixture: ReleaseDetailFixture = emptyReleaseDetail("mimo");
+// Task 15c: a per-id map for the atlassian/bitbucket isolation tests — kept
+// separate from `mimoReleaseFixture` so none of the pre-existing mimo-keyed
+// tests change behavior. Any id not in this map (and not "mimo") still falls
+// back to `emptyReleaseDetail(id)`, same as before.
+let componentReleaseFixtures: Record<string, ReleaseDetailFixture> = {};
+function releaseDetailFor(id: string): ReleaseDetailFixture {
+  if (id === "mimo") return mimoReleaseFixture;
+  return componentReleaseFixtures[id] ?? emptyReleaseDetail(id);
+}
 const pluginReleaseDetail = mock(async (_runnerId: string, id: string) => ({
   status: "ok" as const,
-  data: id === "mimo" ? mimoReleaseFixture : emptyReleaseDetail(id),
+  data: releaseDetailFor(id),
 }));
 const installComponentPlugin = mock(async (_runnerId: string, id: string, _version: string | null) => ({
   status: "ok" as const,
-  data: id === "mimo" ? mimoReleaseFixture : emptyReleaseDetail(id),
+  data: releaseDetailFor(id),
 }));
 const rollbackComponentPlugin = mock(async (_runnerId: string, id: string, _fromVersion: string, _toVersion: string) => ({
   status: "ok" as const,
-  data: id === "mimo" ? mimoReleaseFixture : emptyReleaseDetail(id),
+  data: releaseDetailFor(id),
 }));
 const pluginOauthAuthorizeUrlMsgListen = mock(
   async (_cb: (event: { payload: { pluginId: string; authorizeUrl: string } }) => void) => () => {},
@@ -533,6 +545,7 @@ beforeEach(() => {
   extensionStatusFixture = [];
   acmePackPinned = false;
   mimoReleaseFixture = emptyReleaseDetail("mimo");
+  componentReleaseFixtures = {};
   openUrl.mockClear();
   usePlugins.setState({
     plugins: [],
@@ -1030,4 +1043,88 @@ test("a third-party (non-first-party) release is labeled distinctly from a first
   await screen.findByText("mimo");
 
   expect(screen.getByText("Third-party (key: some-other-key)")).toBeTruthy();
+});
+
+// ---------- Task 15c: Atlassian/Bitbucket render as INDEPENDENT experiences,
+// each with its own single, non-shared OAuth profile ----------
+//
+// Both are first-party connector components (like mimo/opencode above), each
+// a separate signed bundle with exactly one `[[oauth]]` profile in its own
+// manifest. Nothing in `PluginDetailView` branches on plugin id — this proves
+// the GENERIC permission-summary rendering already keeps the two profiles
+// (and their scopes) fully separate, never implying a shared token.
+
+test("atlassian's detail page shows only its own atlassian-cloud profile, never bitbucket-cloud", async () => {
+  componentReleaseFixtures.atlassian = {
+    pluginId: "atlassian",
+    activeVersion: "0.1.0",
+    releases: [releaseInfo({ pluginId: "atlassian", version: "0.1.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "Jira + Confluence over one host-managed atlassian-cloud 3LO OAuth profile.",
+      lifecycle: "per-call",
+      domains: ["api.atlassian.com", "auth.atlassian.com"],
+      oauthProfiles: [{ id: "atlassian-cloud", scopes: ["read:jira-work", "write:jira-work"] }],
+    },
+  };
+  render(<PluginDetailView id="atlassian" />);
+  await screen.findByText("atlassian");
+
+  expect(screen.getByText(/atlassian-cloud \(read:jira-work, write:jira-work\)/)).toBeTruthy();
+  expect(screen.queryByText(/bitbucket-cloud/)).toBeNull();
+});
+
+test("bitbucket's detail page shows only its own bitbucket-cloud profile, never atlassian-cloud", async () => {
+  componentReleaseFixtures.bitbucket = {
+    pluginId: "bitbucket",
+    activeVersion: "0.1.0",
+    releases: [releaseInfo({ pluginId: "bitbucket", version: "0.1.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "Bitbucket Cloud over a host-managed bitbucket-cloud OAuth profile, distinct from atlassian-cloud.",
+      lifecycle: "per-call",
+      domains: ["api.bitbucket.org", "bitbucket.org"],
+      oauthProfiles: [{ id: "bitbucket-cloud", scopes: ["account", "repository"] }],
+    },
+  };
+  render(<PluginDetailView id="bitbucket" />);
+  await screen.findByText("bitbucket");
+
+  expect(screen.getByText(/bitbucket-cloud \(account, repository\)/)).toBeTruthy();
+  expect(screen.queryByText(/atlassian-cloud/)).toBeNull();
+});
+
+test("rendering both in sequence never leaks one's profile into the other's page (two independent experiences, not a shared one)", async () => {
+  componentReleaseFixtures.atlassian = {
+    pluginId: "atlassian",
+    activeVersion: "0.1.0",
+    releases: [releaseInfo({ pluginId: "atlassian", version: "0.1.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.atlassian.com"],
+      oauthProfiles: [{ id: "atlassian-cloud", scopes: [] }],
+    },
+  };
+  componentReleaseFixtures.bitbucket = {
+    pluginId: "bitbucket",
+    activeVersion: "0.1.0",
+    releases: [releaseInfo({ pluginId: "bitbucket", version: "0.1.0", active: true })],
+    activeManifest: {
+      publisher: "Ryuzi",
+      description: "",
+      lifecycle: "per-call",
+      domains: ["api.bitbucket.org"],
+      oauthProfiles: [{ id: "bitbucket-cloud", scopes: [] }],
+    },
+  };
+
+  const first = render(<PluginDetailView id="atlassian" />);
+  await screen.findByText(/atlassian-cloud/);
+  first.unmount();
+
+  render(<PluginDetailView id="bitbucket" />);
+  await screen.findByText(/bitbucket-cloud/);
+  expect(screen.queryByText(/atlassian-cloud/)).toBeNull();
 });

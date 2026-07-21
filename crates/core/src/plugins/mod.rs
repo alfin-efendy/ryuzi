@@ -57,6 +57,18 @@ mod github_e2e;
 #[cfg(test)]
 mod discord_e2e;
 
+/// Task 15c — the OAuth-profile ISOLATION proof for the REAL first-party
+/// Atlassian (`plugins/atlassian`) and Bitbucket (`plugins/bitbucket`)
+/// connector components: both sign, install, and load through the generic
+/// pipeline, and a token seeded ONLY for `(atlassian, atlassian-cloud)` lets
+/// both Jira- and Confluence-style requests through that ONE profile while
+/// every Bitbucket request is denied absent its own separate
+/// `(bitbucket, bitbucket-cloud)` token — proving the two connectors never
+/// share a token, keyed purely by the generic `(plugin_id, profile_id)` store
+/// + `ProfileOauth::ensure_declared_profile`, with no plugin-id host branch.
+#[cfg(test)]
+mod atlassian_bitbucket_e2e;
+
 use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
@@ -152,6 +164,63 @@ pub(crate) fn build_discord_component_once() {
             .status()
             .expect("discord component build script should start");
         assert!(status.success(), "discord component build failed: {status}");
+    });
+}
+
+/// Build the first-party Atlassian connector component (`plugins/atlassian`)
+/// to wasm32-wasip2 EXACTLY ONCE per test process.
+///
+/// `plugins/atlassian` is a STANDALONE workspace crate (like `plugins/github`),
+/// not a `tests/fixtures/*` fixture, so [`build_fixture_components_once`] does
+/// not build it. This sibling helper runs
+/// `tests/fixtures/build-atlassian-component.sh`, which materializes
+/// `plugins/atlassian/wit/deps` from the SDK and builds the component the same
+/// way `scripts/plugins/build-first-party.ts` does. The script touches only
+/// `plugins/atlassian/wit/deps` (gitignored), so it never races the other
+/// builders' rewrites of their own deps. Cached via its own `OnceLock` so the
+/// (real) atlassian/bitbucket OAuth-isolation e2e tests share a single build.
+#[cfg(test)]
+pub(crate) fn build_atlassian_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-atlassian-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("atlassian component build script should start");
+        assert!(
+            status.success(),
+            "atlassian component build failed: {status}"
+        );
+    });
+}
+
+/// Build the first-party Bitbucket connector component (`plugins/bitbucket`)
+/// to wasm32-wasip2 EXACTLY ONCE per test process. Sibling of
+/// [`build_atlassian_component_once`] — see that function's doc.
+#[cfg(test)]
+pub(crate) fn build_bitbucket_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-bitbucket-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("bitbucket component build script should start");
+        assert!(
+            status.success(),
+            "bitbucket component build failed: {status}"
+        );
     });
 }
 
