@@ -27,11 +27,16 @@ pub mod catalog_feed_key;
 pub mod declarative;
 pub mod doctor;
 pub mod extension;
+pub mod first_party_key;
 pub mod host;
 pub mod oauth;
 pub mod providers;
 pub mod remote_catalog;
 pub mod runtime;
+pub mod wasm_connector;
+pub mod wasm_gateway;
+pub mod wasm_hooks;
+pub mod wasm_provider;
 pub mod wit;
 
 use crate::settings::{csv, SettingsStore};
@@ -43,6 +48,33 @@ pub use extension::{
     ExtensionSnapshot, ExtensionSpec, ExtensionStatus,
 };
 pub use host::{plugin_field, plugin_fields_all, CorePlugin, PluginHost, PluginSource, Registries};
+
+/// Build every `tests/fixtures/*` component EXACTLY ONCE per test process.
+///
+/// The fixture-backed tests run concurrently (multi-thread tokio), and
+/// `build-components.sh`'s `materialize_deps` rewrites each fixture's
+/// `wit/deps/` non-atomically (`rm -rf` then repopulate) — so two concurrent
+/// invocations corrupt each other and `cargo build` fails. Routing every
+/// fixture test (in `runtime`, `wasm_connector`, `wasm_hooks`) through this
+/// shared `OnceLock` serializes the build to a single run the whole binary
+/// waits on, then reuses the artifacts.
+#[cfg(test)]
+pub(crate) fn build_fixture_components_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-components.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("fixture build script should start");
+        assert!(status.success(), "fixture build failed: {status}");
+    });
+}
 
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — to `regs`. Factored out of
@@ -448,6 +480,7 @@ mod toggle_enabled_tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -459,6 +492,7 @@ mod toggle_enabled_tests {
             gateway: Some(Arc::new(FakeGatewayFactory)),
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -470,6 +504,7 @@ mod toggle_enabled_tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }
@@ -481,6 +516,7 @@ mod toggle_enabled_tests {
             gateway: None,
             connector: Some(Arc::new(FakeConnector)),
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         }
     }

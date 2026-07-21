@@ -1,0 +1,6 @@
+package fixture:provider@0.1.0;
+
+world provider-fixture {
+  import ryuzi:plugin/types@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+}

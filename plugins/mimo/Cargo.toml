@@ -1,0 +1,36 @@
+[workspace]
+
+[package]
+name = "ryuzi-plugin-mimo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "First-party Xiaomi MiMo free-tier provider component (ryuzi:provider/provider)."
+
+[lib]
+crate-type = ["cdylib"]
+
+# `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
+# guest module; the pure `logic` module (and its native `cargo test`) never
+# touches the generated host bindings. serde_json/sha2/base64 are shared by
+# both the pure logic and the guest glue.
+[dependencies]
+wit-bindgen = "0.57"
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+
+# wasm32-only: the guest seeds its per-install device id from the host's
+# `wasi:random/random` (the WASI baseline the runtime always grants) via
+# getrandom's wasip2 backend. Target-gated so the native `logic` tests never
+# pull it. No features needed — wasm32-wasip2 is supported out of the box.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = "0.3"
+
+[profile.release]
+# Small, reproducible components: no debug info, abort on panic (a panicking
+# guest is caught by the host fuel/epoch budget as a trap either way).
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

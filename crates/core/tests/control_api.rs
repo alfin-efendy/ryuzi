@@ -139,6 +139,7 @@ async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
+        component_bootstrap: None,
     })
     .await
     .unwrap();
@@ -247,6 +248,7 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
+        component_bootstrap: None,
     })
     .await
     .unwrap();
@@ -388,6 +390,7 @@ async fn daemon_start_autostarts_the_endpoint_server_when_configured() {
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
+        component_bootstrap: None,
     })
     .await
     .unwrap();

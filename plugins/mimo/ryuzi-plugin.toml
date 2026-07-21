@@ -1,0 +1,14 @@
+id = "mimo"
+name = "MiMo (free)"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "mimo.wasm"
+publisher = "Ryuzi"
+description = "Xiaomi MiMo free-tier chat provider. Talks to api.xiaomimimo.com behind the MiMoCode anti-abuse gate (bootstrap JWT, Chrome-like headers, MiMoCode system marker)."
+
+# Only host the component may reach through `ryuzi:http/http`. The host enforces
+# this allowlist (and re-checks it on every redirect); a request to any other
+# host is rejected. Both the bootstrap and chat endpoints live on this host.
+[permissions]
+network = ["api.xiaomimimo.com"]

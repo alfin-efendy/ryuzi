@@ -1,10 +1,25 @@
 import { create } from "zustand";
 import { toast } from "sonner";
-import { commands, type CatalogStatus, type DoctorFinding, type PluginInfo } from "./bindings";
+import {
+  commands,
+  type CatalogStatus,
+  type ComponentBootstrapStatus,
+  type ComponentReleaseDetail,
+  type DoctorFinding,
+  type PluginInfo,
+} from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
 // embedded catalog, or user-authored — and this store mirrors the flattened
 // `PluginInfo` list Cockpit needs for the Plugins hub screens.
+
+// The Task 11a first-party component (WASM bundle) ids, mirroring
+// `crate::plugins::remote_catalog::FIRST_PARTY_BUNDLE_IDS`. Component bundles
+// are NOT registered as `CorePlugin`s (see `plugins::host`'s doc), so they
+// never appear in `listPlugins`/`pluginDetail` — this is Cockpit's only way
+// to know which ids to ask `pluginReleaseDetail` about for the Installed
+// tab's "Component plugins" section and the bootstrap-retry banner.
+export const FIRST_PARTY_BUNDLE_IDS = ["mimo", "opencode"] as const;
 
 type PluginsState = {
   plugins: PluginInfo[];
@@ -19,6 +34,15 @@ type PluginsState = {
   /** Last accepted remote-catalog feed snapshot — `null` until the first
    *  `catalog_status`/`refresh_catalog` call resolves. */
   catalogStatus: CatalogStatus | null;
+  /** `component_bootstrap_status` snapshot for the Plugins view's retryable
+   *  bootstrap banner — `null` until the first fetch resolves. */
+  componentBootstrapStatus: ComponentBootstrapStatus | null;
+  /** `plugin_release_detail` for every known first-party component id
+   *  (`FIRST_PARTY_BUNDLE_IDS`) — the Installed tab's "Component plugins"
+   *  section reads this instead of `plugins` (component bundles aren't
+   *  `PluginInfo` entries). */
+  componentPlugins: ComponentReleaseDetail[];
+  componentPluginsLoaded: boolean;
   load: () => Promise<void>;
   loadDoctor: () => Promise<void>;
   refreshCatalog: () => Promise<void>;
@@ -26,6 +50,18 @@ type PluginsState = {
   uninstall: (id: string) => Promise<boolean>;
   update: (id: string, force: boolean) => Promise<void>;
   pin: (id: string, pinned: boolean, reason?: string) => Promise<void>;
+  loadComponentBootstrapStatus: () => Promise<void>;
+  loadComponentPlugins: () => Promise<void>;
+  pluginReleaseDetail: (id: string) => Promise<ComponentReleaseDetail | null>;
+  installComponentPlugin: (id: string, version?: string) => Promise<ComponentReleaseDetail | null>;
+  rollbackComponentPlugin: (id: string, fromVersion: string, toVersion: string) => Promise<ComponentReleaseDetail | null>;
+  /** Manually retries the first-party bootstrap (which otherwise only runs
+   *  automatically at daemon start): attempts `installComponentPlugin` for
+   *  every known first-party id, then reloads the bootstrap status and the
+   *  component-plugins list. Individual failures are tolerated — the
+   *  refreshed `componentBootstrapStatus.pending` is the source of truth for
+   *  whether the banner should still show. */
+  retryComponentBootstrap: () => Promise<void>;
 };
 
 /** `update_all_plugins`'s outcome summary, shared so the store action and any
@@ -47,6 +83,9 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   doctorFindings: [],
   doctorLoaded: false,
   catalogStatus: null,
+  componentBootstrapStatus: null,
+  componentPlugins: [],
+  componentPluginsLoaded: false,
 
   load: async () => {
     const res = await commands.listPlugins("local");
@@ -146,6 +185,67 @@ export const usePlugins = create<PluginsState>((set, get) => ({
     if (res.status === "error") toast.error(`Pin update failed: ${res.error.message}`);
     else toast.success(pinned ? "Pinned" : "Unpinned");
     await get().load();
+  },
+
+  // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+  //
+  // Thin actions over the Task 11a RPC family (mirrors `plugin_detail`'s own
+  // shape: `commands.X("local", ...)` → toast on error → reload). Component
+  // bundles have no `PluginInfo` row to optimistically paint, so these read
+  // straight from the RPC result rather than the `plugins` list.
+
+  loadComponentBootstrapStatus: async () => {
+    const res = await commands.componentBootstrapStatus("local");
+    if (res.status === "ok") set({ componentBootstrapStatus: res.data });
+    // Best-effort, same reasoning as `catalogStatus`/`restartRequired` in
+    // `load()`: a failure here just leaves the banner at its prior state.
+  },
+
+  loadComponentPlugins: async () => {
+    const details = await Promise.all(FIRST_PARTY_BUNDLE_IDS.map((id) => commands.pluginReleaseDetail("local", id)));
+    const componentPlugins = details.flatMap((res) => (res.status === "ok" ? [res.data] : []));
+    set({ componentPlugins, componentPluginsLoaded: true });
+  },
+
+  pluginReleaseDetail: async (id) => {
+    const res = await commands.pluginReleaseDetail("local", id);
+    if (res.status === "error") {
+      toast.error(`Couldn't load release detail: ${res.error.message}`);
+      return null;
+    }
+    return res.data;
+  },
+
+  installComponentPlugin: async (id, version) => {
+    const res = await commands.installComponentPlugin("local", id, version ?? null);
+    if (res.status === "error") {
+      toast.error(`Install failed: ${res.error.message}`);
+      return null;
+    }
+    toast.success(res.data.activeVersion ? `${id} installed — v${res.data.activeVersion}` : `${id} installed`);
+    await get().loadComponentPlugins();
+    return res.data;
+  },
+
+  rollbackComponentPlugin: async (id, fromVersion, toVersion) => {
+    const res = await commands.rollbackComponentPlugin("local", id, fromVersion, toVersion);
+    if (res.status === "error") {
+      toast.error(`Rollback failed: ${res.error.message}`);
+      return null;
+    }
+    toast.success(`Rolled back ${id} to v${toVersion}`);
+    await get().loadComponentPlugins();
+    return res.data;
+  },
+
+  retryComponentBootstrap: async () => {
+    await Promise.allSettled(FIRST_PARTY_BUNDLE_IDS.map((id) => commands.installComponentPlugin("local", id, null)));
+    await get().loadComponentPlugins();
+    const res = await commands.componentBootstrapStatus("local");
+    if (res.status !== "ok") return;
+    set({ componentBootstrapStatus: res.data });
+    if (res.data.pending) toast.warning(res.data.message ?? "Component plugins still couldn't be installed");
+    else toast.success("Component plugins installed");
   },
 }));
 

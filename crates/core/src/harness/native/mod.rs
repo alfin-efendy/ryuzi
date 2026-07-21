@@ -259,6 +259,27 @@ async fn connect_extension_tools(
         .collect()
 }
 
+/// Gather every enabled WASM component bundle's connector tool (Task 9) and
+/// wrap each as a native `Tool` — the component analogue of
+/// `connect_extension_tools`, called at the same session-start point and
+/// folded into the same registry. `None` (no enabled component bundle
+/// installed — the common case, and every bare test `SessionCtx`) is a true
+/// zero-cost no-op, mirroring `connect_extension_tools`.
+async fn connect_wasm_tools(
+    wasm_tools: Option<&Arc<dyn crate::plugins::wasm_connector::WasmTools>>,
+) -> Vec<Arc<dyn tools::Tool>> {
+    let Some(host) = wasm_tools else {
+        return Vec::new();
+    };
+    host.session_tools()
+        .await
+        .into_iter()
+        .map(|binding| {
+            Arc::new(tools::wasm::WasmTool::from_binding(binding)) as Arc<dyn tools::Tool>
+        })
+        .collect()
+}
+
 async fn resolve_native_model(
     store: &crate::store::Store,
     configured: Option<String>,
@@ -321,6 +342,7 @@ impl Harness for NativeHarness {
         let _ = hooks::fire_hook(
             &ctx.work_dir,
             ctx.extension_events.as_ref(),
+            ctx.wasm_hooks.as_ref(),
             hooks::HookEvent::SessionStart,
             &json!({
                 "session": ctx.session_pk.clone(),
@@ -347,6 +369,11 @@ impl Harness for NativeHarness {
         // runner dispatches either through the identical `deps.tools.get(name)`
         // path with no special-casing.
         extra_tools.extend(connect_extension_tools(ctx.extension_tools.as_ref()).await);
+        // Task 9: fold in every enabled WASM component bundle's connector tool
+        // alongside the MCP + extension ones — all flow into the SAME registry,
+        // dispatched through the identical `deps.tools.get(name)` path with no
+        // special-casing by source.
+        extra_tools.extend(connect_wasm_tools(ctx.wasm_tools.as_ref()).await);
         let tools = Arc::new(tools::ToolRegistry::with_extra(extra_tools));
         // The registry is complete only after MCP and extension attachment.
         // Resolve this immutable profile against that final namespace so a
@@ -418,6 +445,7 @@ impl Harness for NativeHarness {
                 artifacts: ctx.artifacts,
                 extra_skill_dirs: ctx.extra_skill_dirs,
                 extension_events: ctx.extension_events,
+                wasm_hooks: ctx.wasm_hooks,
                 model,
                 turn_effort_policy: Arc::new(effort_policy),
                 meta,
@@ -552,6 +580,7 @@ impl HarnessSession for NativeSession {
         let _ = hooks::fire_hook(
             &deps.work_dir,
             deps.extension_events.as_ref(),
+            deps.wasm_hooks.as_ref(),
             hooks::HookEvent::SessionEnd,
             &json!({ "session": self.session_pk.clone(), "reason": "ended" }),
         )
@@ -680,6 +709,7 @@ pub fn native_plugin_with_llm_factory(llm_factory: Arc<dyn llm::LlmStreamFactory
         gateway: None,
         connector: None,
         extension: None,
+        provider: None,
         source: PluginSource::Builtin,
     }
 }
@@ -794,6 +824,8 @@ mod tests {
             extra_skill_dirs: vec![],
             extension_events: None,
             extension_tools: None,
+            wasm_tools: None,
+            wasm_hooks: None,
             events,
             approvals: Arc::new(ApprovalHub::new()),
             automation_events: None,
@@ -1966,6 +1998,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: Some(Arc::new(FakeExtFactory { spec })),
+            provider: None,
             source: PluginSource::Builtin,
         });
 

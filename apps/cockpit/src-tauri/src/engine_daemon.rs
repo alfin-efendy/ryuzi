@@ -64,6 +64,7 @@ async fn run_inner() -> i32 {
         extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
         // Native-only: production uses the real in-process native harness.
         harness_factory: None,
+        component_bootstrap: None,
     };
 
     let daemon = match tokio::time::timeout(Duration::from_millis(CONNECT_TIMEOUT_MS), async {

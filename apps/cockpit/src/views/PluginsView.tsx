@@ -1,8 +1,15 @@
 import { useEffect, useState } from "react";
-import { CircleAlert, MonitorUp, Pin, PinOff, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { Blocks, CircleAlert, MonitorUp, Pin, PinOff, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge, Button, Combobox, Segmented, SettingsCard as Card } from "@ryuzi/ui";
-import { commands, type AppInfo, type CatalogStatus, type PluginInfo } from "@/bindings";
+import {
+  commands,
+  type AppInfo,
+  type CatalogStatus,
+  type ComponentBootstrapStatus,
+  type ComponentReleaseDetail,
+  type PluginInfo,
+} from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BlockedBadge, Chip, IconChip, Pill, PluginStatusBadge, StatusDot } from "@/components/common/bits";
 import { DoctorPanel } from "@/components/DoctorPanel";
@@ -43,6 +50,24 @@ export function catalogStatusLabel(status: CatalogStatus): string {
   const when = new Date(status.lastFetchAt).toLocaleString();
   const blockedPart = status.blocked > 0 ? `, ${status.blocked} blocked` : "";
   return `Catalog seq ${status.sequence} · ${status.entries} entries${blockedPart} · fetched ${when}`;
+}
+
+// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+
+/** The retryable bootstrap banner's message, or `null` when there's nothing
+ *  to show (not yet loaded, or the last automatic attempt at daemon start
+ *  fully completed). Pure and exported so it stays unit-testable without
+ *  mounting the view. */
+export function bootstrapBannerMessage(status: ComponentBootstrapStatus | null): string | null {
+  if (!status?.pending) return null;
+  return status.message ?? "Some first-party component plugins couldn't be installed automatically.";
+}
+
+/** One-line status for a component (WASM bundle) plugin's release ledger —
+ *  drives the "Component plugins" section's summary line. Pure and exported
+ *  so it stays unit-testable without mounting the view. */
+export function componentPluginStatusLabel(detail: ComponentReleaseDetail): string {
+  return detail.activeVersion ? `v${detail.activeVersion} active` : "Not installed";
 }
 
 function BrowseCard({ plugin, onInstall }: { plugin: PluginInfo; onInstall: () => void }) {
@@ -170,6 +195,12 @@ export function PluginsView() {
     loadDoctor,
     catalogStatus,
     refreshCatalog,
+    componentBootstrapStatus,
+    componentPlugins,
+    componentPluginsLoaded,
+    loadComponentBootstrapStatus,
+    loadComponentPlugins,
+    retryComponentBootstrap,
   } = usePlugins();
   const { installProvider, uninstallProvider } = useConnections();
   const skills = useSkills((s) => s.skills);
@@ -187,6 +218,7 @@ export function PluginsView() {
   const [updatingAll, setUpdatingAll] = useState(false);
   const [doctorOpen, setDoctorOpen] = useState(false);
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  const [retryingBootstrap, setRetryingBootstrap] = useState(false);
 
   useEffect(() => {
     void hydrate();
@@ -195,6 +227,17 @@ export function PluginsView() {
   useEffect(() => {
     if (!pluginsLoaded) void loadPlugins();
   }, [pluginsLoaded, loadPlugins]);
+
+  // Component (WASM bundle) plugins — e.g. mimo/opencode — are never
+  // `CorePlugin`s, so they never appear in `listPlugins`; this is Cockpit's
+  // only fetch for their release ledger + bootstrap status.
+  useEffect(() => {
+    void loadComponentBootstrapStatus();
+  }, [loadComponentBootstrapStatus]);
+
+  useEffect(() => {
+    if (!componentPluginsLoaded) void loadComponentPlugins();
+  }, [componentPluginsLoaded, loadComponentPlugins]);
 
   useEffect(() => {
     if (!doctorLoaded) void loadDoctor();
@@ -291,6 +334,13 @@ export function PluginsView() {
     setRefreshingCatalog(false);
   };
 
+  const runRetryBootstrap = async () => {
+    if (retryingBootstrap) return;
+    setRetryingBootstrap(true);
+    await retryComponentBootstrap();
+    setRetryingBootstrap(false);
+  };
+
   const scopeLabel = (app: AppInfo): string => {
     if (app.scope === "global") return "Global";
     const names = gateways.filter((w) => app.scopeGateways.includes(w.id)).map((w) => w.name);
@@ -319,6 +369,57 @@ export function PluginsView() {
             Add MCP server
           </Button>
         </div>
+
+        {bootstrapBannerMessage(componentBootstrapStatus) && (
+          <Card className="mb-3 flex items-start gap-3 px-[18px] py-3.5">
+            <CircleAlert aria-hidden size={16} strokeWidth={2} className="mt-px shrink-0" style={{ color: WARN }} />
+            <div className="min-w-0 flex-1">
+              <div className="text-[13.5px] font-semibold">Component plugins need attention</div>
+              <div className="mt-1 text-[12.5px] text-muted-foreground">{bootstrapBannerMessage(componentBootstrapStatus)}</div>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => void runRetryBootstrap()} disabled={retryingBootstrap} className="shrink-0">
+              <RefreshCw aria-hidden size={13} strokeWidth={2} className={retryingBootstrap ? "animate-spin" : undefined} />
+              {retryingBootstrap ? "Retrying…" : "Retry"}
+            </Button>
+          </Card>
+        )}
+
+        {/* Component (WASM bundle) plugins — e.g. mimo/opencode — are never
+            `CorePlugin`s (see `store-plugins.ts`'s `FIRST_PARTY_BUNDLE_IDS`
+            doc), so they never appear in the Installed/Browse grids below,
+            which are both sourced from `listPlugins`. This card is their only
+            entry point regardless of which tab is selected, and doubles as
+            the "not installed yet" affordance (its detail view owns the
+            permission-confirmation install flow). */}
+        {componentPluginsLoaded && componentPlugins.length > 0 && (
+          <Card className="mb-4 px-[18px] py-4">
+            <div className="mb-3 text-sm font-semibold">Component plugins</div>
+            <div className="flex flex-col">
+              {componentPlugins.map((detail) => (
+                <div
+                  key={detail.pluginId}
+                  className="flex items-center gap-3 border-t border-border py-3 first:border-t-0 first:pt-0 last:pb-0"
+                >
+                  <IconChip icon={Blocks} size={34} />
+                  <div className="min-w-0 flex-1">
+                    <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[13px] font-medium">{detail.pluginId}</div>
+                    <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[11.5px] text-muted-foreground">
+                      {componentPluginStatusLabel(detail)}
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => nav.navigate({ kind: "pluginDetail", id: detail.pluginId })}
+                    aria-label={`Manage ${detail.pluginId}`}
+                  >
+                    Manage
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
 
         <div className="mb-3 flex items-center gap-2">
           <Button

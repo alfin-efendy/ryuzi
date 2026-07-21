@@ -163,6 +163,7 @@ mod tests {
             gateway: None,
             connector: None,
             extension: None,
+            provider: None,
             source: PluginSource::Builtin,
         });
     }

@@ -8,21 +8,55 @@
 //! host (Task 8 slice 2 — host-managed OAuth — is what injects real
 //! authentication, and it must never be something a component can forge or
 //! override).
+//!
+//! # First-party self-auth exception
+//! A narrow, host-gated exception exists for VERIFIED first-party bundles
+//! (the built-in `mimo`/`opencode` providers, whose free-tier gateways
+//! require the component to present its own bearer — a bootstrap JWT or a
+//! literal `Bearer public`). When [`AllowedHttpClient::with_self_auth`] is
+//! constructed with `allow_self_auth = true`, a component-supplied
+//! `Authorization` header is forwarded on the INITIAL hop only. The gate is
+//! set by the host from the installed release's verified `signing_key_id`
+//! (`== "first-party"`), NEVER from manifest content or anything a component
+//! can influence — see `runtime::HostPolicy::allow_self_auth`. The strict
+//! stripping is unchanged for every ordinary/third-party bundle, and even a
+//! first-party self-set `Authorization` is dropped on every redirect hop so
+//! it can never leak to a different origin, and never coexists with a
+//! host-injected OAuth bearer (see [`AllowedHttpClient::request_impl`]).
+
+use std::time::Duration;
 
 /// Maximum number of redirect hops [`AllowedHttpClient::request`] will
 /// follow manually before giving up. Bounded to avoid a malicious or
 /// misbehaving allowlisted server driving the host into an unbounded loop.
 const MAX_REDIRECT_HOPS: u8 = 5;
 
-/// Header names the host strips from (or refuses to forward on) every
-/// outbound request, regardless of what a component supplies.
+/// Default wall-clock bound applied to BOTH the connect phase and the whole
+/// request of every host-side HTTP call. It matches the default per-component
+/// epoch timeout (`runtime::ResourceLimits::timeout`, 30s), so a plain
+/// [`AllowedHttpClient::new`] can never hang longer than the budget the epoch
+/// timeout uses. Epoch/fuel interruption only preempts GUEST wasm — never a
+/// host function — so without this bound a stalled allowlisted server would
+/// hang `ComponentInstance::call` forever (its timeout branch awaits the
+/// blocking task after bumping the epoch), bricking the gating hook / session
+/// this module must never deadlock. Callers that know the component's actual
+/// epoch timeout thread it through [`AllowedHttpClient::with_self_auth`] so a
+/// shorter epoch budget also shortens the HTTP bound.
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Header names the host ALWAYS strips from every outbound request,
+/// regardless of what a component supplies or how it is signed:
+/// `host`/`content-length` are managed by the HTTP client itself, and
+/// forwarding a component-supplied value could desync the request from its
+/// actual body/target.
 ///
-/// - `authorization`: a component must never set its own auth — see the
-///   module doc.
-/// - `host`/`content-length`: managed by the HTTP client itself; forwarding
-///   a component-supplied value could desync the request from its actual
-///   body/target.
-const STRIPPED_REQUEST_HEADERS: &[&str] = &["authorization", "host", "content-length"];
+/// `authorization` is deliberately NOT in this list because it needs
+/// per-request logic: it is stripped for every ordinary component (a
+/// component must never set its own auth — see the module doc), but a
+/// VERIFIED first-party bundle may carry its own bearer on the initial hop
+/// (see [`AllowedHttpClient::allow_self_auth`] and the header loop in
+/// [`AllowedHttpClient::request_impl`]).
+const ALWAYS_STRIPPED_REQUEST_HEADERS: &[&str] = &["host", "content-length"];
 
 /// A capability-adapter-local error, mapped to the generated WIT
 /// `http::HttpError` by the runtime's `Host` trait impl.
@@ -50,6 +84,13 @@ pub struct SafeHttpResponse {
 pub struct AllowedHttpClient {
     allowlist: Vec<String>,
     http: reqwest::Client,
+    /// Whether a component-supplied `Authorization` header may pass through on
+    /// the initial hop. `false` for every ordinary/third-party component
+    /// (strict Task 8 stripping); `true` ONLY for VERIFIED first-party bundles
+    /// (see [`Self::with_self_auth`]). Never forwarded across a redirect and
+    /// never combined with a host-injected OAuth bearer — see
+    /// [`Self::request_impl`].
+    allow_self_auth: bool,
 }
 
 impl AllowedHttpClient {
@@ -64,12 +105,40 @@ impl AllowedHttpClient {
     /// following it — `reqwest`'s built-in redirect handling has no way to
     /// veto a hop mid-chain.
     pub fn new(allowlist: Vec<String>) -> Self {
+        Self::with_self_auth(allowlist, false, DEFAULT_HTTP_TIMEOUT)
+    }
+
+    /// Like [`Self::new`], but when `allow_self_auth` is true a
+    /// component-supplied `Authorization` header is allowed to pass through on
+    /// the initial request to an allowlisted host (see [`Self::request_impl`]).
+    /// This is granted ONLY to VERIFIED first-party bundles: the host derives
+    /// the flag from the installed release's `signing_key_id` (`== "first-party"`,
+    /// via `runtime::HostPolicy::allow_self_auth`), never from manifest content
+    /// or anything a component can set. Every other component keeps the strict
+    /// Task 8 stripping.
+    ///
+    /// `timeout` bounds BOTH the connect phase and the whole request (see
+    /// [`DEFAULT_HTTP_TIMEOUT`]). Callers thread the component's own per-call
+    /// epoch timeout here so a stalled allowlisted server surfaces as an
+    /// [`HttpErr::Failed`] within the budget instead of hanging the host
+    /// function past the epoch deadline it can never preempt.
+    pub fn with_self_auth(
+        allowlist: Vec<String>,
+        allow_self_auth: bool,
+        timeout: Duration,
+    ) -> Self {
         let allowlist = allowlist.into_iter().map(|h| h.to_lowercase()).collect();
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .connect_timeout(timeout)
             .build()
             .expect("reqwest client with no non-default TLS/proxy config should always build");
-        Self { allowlist, http }
+        Self {
+            allowlist,
+            http,
+            allow_self_auth,
+        }
     }
 
     /// `true` if `host` is covered by this client's allowlist. Matching is
@@ -171,7 +240,24 @@ impl AllowedHttpClient {
                 .map_err(|error| HttpErr::InvalidRequest(error.to_string()))?;
             let mut builder = self.http.request(reqwest_method, current_url.clone());
             for (name, value) in &current_headers {
-                if STRIPPED_REQUEST_HEADERS.contains(&name.to_lowercase().as_str()) {
+                let lower = name.to_lowercase();
+                if lower == "authorization" {
+                    // Task 8 default: a component must never set its own auth,
+                    // so a component-supplied Authorization is stripped. The
+                    // ONLY exception is a VERIFIED first-party bundle
+                    // (`allow_self_auth`), and even then only on the INITIAL hop
+                    // AND only when the host is not itself injecting a managed
+                    // OAuth bearer for this request (`bearer.is_none()`) — the
+                    // two auth sources must never both reach the wire. Redirect
+                    // hops clear `current_headers` entirely (see the redirect
+                    // branch below), so a self-set bearer is never carried
+                    // across a redirect to another origin.
+                    if self.allow_self_auth && bearer.is_none() {
+                        builder = builder.header(name, value);
+                    }
+                    continue;
+                }
+                if ALWAYS_STRIPPED_REQUEST_HEADERS.contains(&lower.as_str()) {
                     continue;
                 }
                 builder = builder.header(name, value);
@@ -288,6 +374,50 @@ mod tests {
         assert_eq!(response.body, b"hello from plugin server");
     }
 
+    // Epoch/fuel interruption only preempts guest wasm, never a host function,
+    // so a stalled allowlisted server must be bounded by the client's OWN
+    // timeout or `ComponentInstance::call` hangs forever after bumping the
+    // epoch. A deliberately-slow endpoint (sleeps far longer than the client's
+    // 300ms bound) must surface as an ERROR well within a generous outer guard.
+    #[tokio::test]
+    async fn a_stalled_endpoint_errors_within_the_configured_timeout() {
+        async fn stall() -> impl IntoResponse {
+            // Far longer than the client's bound below; the client's own
+            // timeout must fire first.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "too slow"
+        }
+        let app = Router::new().route("/slow", get(stall));
+        let port = spawn_server(app).await;
+
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            false,
+            Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request(
+                "GET",
+                &format!("http://127.0.0.1:{port}/slow"),
+                vec![],
+                None,
+            ),
+        )
+        .await
+        .expect("the client's own 300ms timeout must fire long before this 5s guard");
+
+        assert!(
+            matches!(result, Err(HttpErr::Failed(_))),
+            "a stalled endpoint must surface as an error, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the request must return promptly, not hang"
+        );
+    }
+
     #[tokio::test]
     async fn unlisted_host_is_refused() {
         let app = Router::new().route("/ok", get(|| async { "hello" }));
@@ -384,6 +514,139 @@ mod tests {
             .expect("request must still succeed once the header is stripped");
 
         assert_eq!(response.body, b"no-auth");
+    }
+
+    /// Echoes back the exact `Authorization` value the server saw, or
+    /// `no-auth` — shared by the self-auth security tests below.
+    async fn echo_authorization(headers: HeaderMap) -> impl IntoResponse {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| format!("auth:{v}"))
+            .unwrap_or_else(|| "no-auth".to_string())
+    }
+
+    // Guardrail (a): a VERIFIED first-party bundle (`allow_self_auth = true`)
+    // CAN set its own `Authorization` header to an allowlisted host — the free
+    // providers depend on this to present their bootstrap JWT / `Bearer public`.
+    #[tokio::test]
+    async fn first_party_self_auth_forwards_component_authorization_to_allowlisted_host() {
+        let app = Router::new().route("/echo", get(echo_authorization));
+        let port = spawn_server(app).await;
+
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            true,
+            DEFAULT_HTTP_TIMEOUT,
+        );
+        let response = client
+            .request(
+                "GET",
+                &format!("http://127.0.0.1:{port}/echo"),
+                vec![(
+                    "Authorization".to_string(),
+                    "Bearer first-party-token".to_string(),
+                )],
+                None,
+            )
+            .await
+            .expect("a first-party self-auth request must succeed");
+
+        assert_eq!(response.body, b"auth:Bearer first-party-token");
+    }
+
+    // Guardrail (b): a NON-first-party bundle (`allow_self_auth = false`, the
+    // default every ordinary/third-party component gets) has its component
+    // `Authorization` STILL stripped — the self-auth relaxation must never leak
+    // to a bundle the host did not verify as first-party.
+    #[tokio::test]
+    async fn non_first_party_component_authorization_is_still_stripped() {
+        let app = Router::new().route("/echo", get(echo_authorization));
+        let port = spawn_server(app).await;
+
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            false,
+            DEFAULT_HTTP_TIMEOUT,
+        );
+        let response = client
+            .request(
+                "GET",
+                &format!("http://127.0.0.1:{port}/echo"),
+                vec![("Authorization".to_string(), "Bearer sneaky".to_string())],
+                None,
+            )
+            .await
+            .expect("request must still succeed once the header is stripped");
+
+        assert_eq!(response.body, b"no-auth");
+    }
+
+    // Guardrail (c): a first-party self-set `Authorization` must NOT be
+    // forwarded across a redirect to a DIFFERENT origin. Here the first hop
+    // (`127.0.0.1:{a}`) redirects to a different-origin allowlisted target
+    // (`127.0.0.1:{b}` — same host, different port => different origin); the
+    // bearer must be dropped so it never reaches the redirect target.
+    #[tokio::test]
+    async fn self_auth_authorization_is_not_forwarded_across_a_redirect() {
+        let landing = Router::new().route("/landed", get(echo_authorization));
+        let landing_port = spawn_server(landing).await;
+
+        let redirect_target = format!("http://127.0.0.1:{landing_port}/landed");
+        let start = Router::new().route(
+            "/start",
+            get(move || {
+                let target = redirect_target.clone();
+                async move { Redirect::temporary(&target) }
+            }),
+        );
+        let start_port = spawn_server(start).await;
+
+        // Both origins share the allowlisted host `127.0.0.1`, so the redirect
+        // IS followed — the point of the test is that auth is dropped anyway.
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["127.0.0.1".to_string()],
+            true,
+            DEFAULT_HTTP_TIMEOUT,
+        );
+        let response = client
+            .request(
+                "GET",
+                &format!("http://127.0.0.1:{start_port}/start"),
+                vec![("Authorization".to_string(), "Bearer leak-me".to_string())],
+                None,
+            )
+            .await
+            .expect("the redirect to an allowlisted host must be followed");
+
+        assert_eq!(
+            response.body, b"no-auth",
+            "a first-party self-set Authorization must be dropped on redirect"
+        );
+    }
+
+    // Guardrail (d): self-auth does NOT widen the allowlist — a first-party
+    // request to an UNLISTED host is still rejected before anything is sent.
+    #[tokio::test]
+    async fn self_auth_does_not_bypass_the_allowlist() {
+        let app = Router::new().route("/ok", get(|| async { "hello" }));
+        let port = spawn_server(app).await;
+
+        let client = AllowedHttpClient::with_self_auth(
+            vec!["example.com".to_string()],
+            true,
+            DEFAULT_HTTP_TIMEOUT,
+        );
+        let result = client
+            .request(
+                "GET",
+                &format!("http://127.0.0.1:{port}/ok"),
+                vec![("Authorization".to_string(), "Bearer x".to_string())],
+                None,
+            )
+            .await;
+
+        assert_eq!(result, Err(HttpErr::Rejected));
     }
 
     #[tokio::test]

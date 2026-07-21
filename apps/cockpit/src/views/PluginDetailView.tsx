@@ -1,5 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { CircleAlert, ExternalLink, Pin, PinOff, RefreshCw } from "lucide-react";
+import { Blocks, CircleAlert, Download, ExternalLink, Pin, PinOff, RefreshCw, Undo2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
@@ -15,13 +15,22 @@ import {
   SettingsCardTitle as CardTitle,
   Switch,
 } from "@ryuzi/ui";
-import { commands, events, type ExtensionStatusEntry, type PluginDetail } from "@/bindings";
+import {
+  commands,
+  events,
+  type ComponentManifestInfo,
+  type ComponentReleaseDetail,
+  type ComponentReleaseInfo,
+  type DoctorFinding,
+  type ExtensionStatusEntry,
+  type PluginDetail,
+} from "@/bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { useNav } from "@/store-nav";
-import { usePlugins } from "@/store-plugins";
+import { FIRST_PARTY_BUNDLE_IDS, usePlugins } from "@/store-plugins";
 
 const WARN = "#F59E0B";
 
@@ -76,6 +85,74 @@ export function extensionStatusPillVariant(status: string): "primary" | "warn" |
     default:
       return "secondary";
   }
+}
+
+// ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
+//
+// mimo/opencode (and any future first-party component) are never `CorePlugin`s
+// (see `store-plugins.ts`'s `FIRST_PARTY_BUNDLE_IDS` doc), so `pluginDetail`
+// 404s for them — this view falls back to a component-only render (below)
+// driven entirely by `plugin_release_detail`. Pure helpers here are exported
+// so they stay unit-testable without mounting the view.
+
+/** Human label for a `PluginBundleManifest.lifecycle` value (already a plain
+ *  kebab-case string on the wire — see `ComponentManifestInfo.lifecycle`). */
+export function componentLifecycleLabel(lifecycle: string): string {
+  switch (lifecycle) {
+    case "singleton":
+      return "Singleton — one shared instance for the whole process";
+    case "per-session":
+      return "Per session — one instance per chat session";
+    case "per-call":
+      return "Per call — a fresh instance every call";
+    default:
+      return lifecycle;
+  }
+}
+
+/** Publisher-verification label for one release row. `firstParty` is computed
+ *  server-side (`ComponentReleaseInfo.firstParty`) so this never re-derives
+ *  trust from a magic string client-side. */
+export function firstPartyBadgeLabel(release: ComponentReleaseInfo): string {
+  return release.firstParty ? "First-party" : `Third-party (key: ${release.signingKeyId})`;
+}
+
+/** The install/update permission-confirmation summary rows — `null` manifest
+ *  (nothing installed yet, so nothing has been fetched+verified) renders a
+ *  single honest placeholder rather than guessing at undeclared permissions. */
+export function permissionSummaryRows(manifest: ComponentManifestInfo | null): { label: string; value: string }[] {
+  if (!manifest) {
+    return [
+      {
+        label: "Permissions",
+        value: "Unknown until a release is fetched and its signature is verified — nothing is fetched until you accept and install.",
+      },
+    ];
+  }
+  const rows = [
+    { label: "Publisher", value: manifest.publisher || "Unknown" },
+    { label: "Lifecycle", value: componentLifecycleLabel(manifest.lifecycle) },
+    { label: "Domains", value: manifest.domains.length > 0 ? manifest.domains.join(", ") : "None declared" },
+  ];
+  if (manifest.oauthProfiles.length > 0) {
+    rows.push({
+      label: "OAuth",
+      value: manifest.oauthProfiles.map((p) => `${p.id} (${p.scopes.length > 0 ? p.scopes.join(", ") : "no scopes declared"})`).join("; "),
+    });
+  }
+  return rows;
+}
+
+/** Whether `version` can be activated (installed/rolled back to) right now:
+ *  it must be a recorded, non-revoked release that isn't already active.
+ *  Pure so the "Roll back"/"Activate" affordance's gating is unit-testable —
+ *  mirrors the daemon's own `rollback_component_plugin` no-op guard (a
+ *  missing/revoked target is refused server-side too; this just keeps the
+ *  button from offering an action that would only bounce). */
+export function canActivateVersion(detail: ComponentReleaseDetail, version: string): boolean {
+  if (detail.activeVersion === version) return false;
+  const target = detail.releases.find((r) => r.version === version);
+  return target !== undefined && !target.revoked;
 }
 
 // One label+input+Save row, shared by the auth credential and every
@@ -188,9 +265,127 @@ function FieldRow({
   );
 }
 
+// The component (WASM bundle) release-management card: release version,
+// publisher verification, domains/OAuth/lifecycle, an install/update
+// permission-confirmation gate, the release list (with a "Roll back"
+// action per prior-good version — this doubles as "pin to this version"
+// since there is no separate pin RPC for component releases; see the Task
+// 12 report), and any doctor findings for this id (already-redacted per
+// `plugin_doctor`). Shared by both the full `PluginDetail` render (appended
+// at the bottom, forward-compatible with a future generic registration) and
+// the component-only fallback render below (today's actual mimo/opencode
+// path, since they are never `CorePlugin`s).
+function ComponentReleaseCard({
+  id,
+  detail,
+  doctorFindings,
+  permissionsAccepted,
+  onAcceptedChange,
+  installBusy,
+  onInstall,
+  activateBusyVersion,
+  onActivateVersion,
+}: {
+  id: string;
+  detail: ComponentReleaseDetail;
+  doctorFindings: DoctorFinding[];
+  permissionsAccepted: boolean;
+  onAcceptedChange: (accepted: boolean) => void;
+  installBusy: boolean;
+  onInstall: () => void;
+  activateBusyVersion: string | null;
+  onActivateVersion: (version: string) => void;
+}) {
+  const hasActive = detail.activeVersion !== null;
+  const rows = permissionSummaryRows(detail.activeManifest);
+  const findings = doctorFindings.filter((f) => f.pluginId === id);
+  // Newest-first for the release list (the store returns oldest-first).
+  const releases = [...detail.releases].reverse();
+
+  return (
+    <Card className="mb-3">
+      <CardHeader>
+        <CardTitle>Component plugin</CardTitle>
+        <CardHint>{hasActive ? `v${detail.activeVersion} active` : "Not installed"}</CardHint>
+      </CardHeader>
+
+      <div className="border-b border-border px-[18px] py-3.5">
+        <div className="mb-2 text-[12.5px] font-semibold">{hasActive ? "Permissions (current release)" : "Permissions"}</div>
+        <div className="flex flex-col gap-1.5">
+          {rows.map((r) => (
+            <div key={r.label} className="flex gap-2 text-[12.5px]">
+              <span className="w-[75px] shrink-0 font-medium text-muted-foreground">{r.label}</span>
+              <span className="min-w-0 flex-1 break-words">{r.value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between gap-3 border-b border-border px-[18px] py-3">
+        <span className="text-[12.5px] font-medium">I understand and accept these permissions</span>
+        <Switch on={permissionsAccepted} onToggle={() => onAcceptedChange(!permissionsAccepted)} label="Accept permissions" />
+      </div>
+
+      <div className="flex justify-end gap-2 border-b border-border px-[18px] py-3">
+        <Button size="sm" onClick={onInstall} disabled={!permissionsAccepted || installBusy}>
+          <Download aria-hidden size={13} strokeWidth={2} />
+          {installBusy ? "Installing…" : hasActive ? "Update to latest" : "Install"}
+        </Button>
+      </div>
+
+      {releases.map((r) => (
+        <CardRow key={r.version}>
+          <span className="w-[70px] shrink-0 font-mono text-xs font-medium">{r.version}</span>
+          {r.active && <Pill variant="primary">Active</Pill>}
+          {r.revoked && <Pill variant="danger">Revoked</Pill>}
+          <Pill variant={r.firstParty ? "mono" : "warn"}>{firstPartyBadgeLabel(r)}</Pill>
+          <span className="shrink-0 text-[11.5px] text-muted-foreground">{formatLedgerTimestamp(r.installedAt)}</span>
+          {r.revoked && r.revocationReason && (
+            <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">— {r.revocationReason}</span>
+          )}
+          {canActivateVersion(detail, r.version) && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onActivateVersion(r.version)}
+              disabled={activateBusyVersion !== null}
+              aria-label={`Roll back to ${r.version}`}
+            >
+              <Undo2 aria-hidden size={12} strokeWidth={2} />
+              {activateBusyVersion === r.version ? "Rolling back…" : "Roll back"}
+            </Button>
+          )}
+        </CardRow>
+      ))}
+
+      {findings.length > 0 && (
+        <div className="border-t border-border px-[18px] py-3.5">
+          <div className="mb-2 text-[12.5px] font-semibold">Health</div>
+          {findings.map((f) => (
+            <div key={f.kind} className="mb-1.5 text-[12px] text-muted-foreground last:mb-0">
+              {f.message}
+              {f.suggestedAction && <div className="text-[11px]">{f.suggestedAction}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export function PluginDetailView({ id }: { id: string }) {
   const nav = useNav();
-  const { setEnabled, load: reloadPlugins, update: updatePlugin, pin: pinPlugin, doctorFindings, doctorLoaded, loadDoctor } = usePlugins();
+  const {
+    setEnabled,
+    load: reloadPlugins,
+    update: updatePlugin,
+    pin: pinPlugin,
+    doctorFindings,
+    doctorLoaded,
+    loadDoctor,
+    installComponentPlugin,
+    rollbackComponentPlugin,
+  } = usePlugins();
   const [detail, setDetail] = useState<PluginDetail | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [authValue, setAuthValue] = useState("");
@@ -204,6 +399,12 @@ export function PluginDetailView({ id }: { id: string }) {
   const [oauthBusy, setOauthBusy] = useState<"begin" | "complete" | "disconnect" | null>(null);
   const [updatingPack, setUpdatingPack] = useState(false);
   const [extensionEntries, setExtensionEntries] = useState<ExtensionStatusEntry[]>([]);
+  // Component-plugin (WASM bundle) release management — Task 12.
+  const [releaseDetail, setReleaseDetail] = useState<ComponentReleaseDetail | null>(null);
+  const [releaseLoaded, setReleaseLoaded] = useState(false);
+  const [permissionsAccepted, setPermissionsAccepted] = useState(false);
+  const [installBusy, setInstallBusy] = useState(false);
+  const [activateBusyVersion, setActivateBusyVersion] = useState<string | null>(null);
   // Scroll targets for the attach-failure banner's "Configure" affordance —
   // whichever of Authentication/Settings actually rendered (each ref only
   // attaches when its section is present, so an absent section reads as
@@ -214,8 +415,22 @@ export function PluginDetailView({ id }: { id: string }) {
   const load = useCallback(async () => {
     const res = await commands.pluginDetail(LOCAL_RUNNER, id);
     if (res.status === "ok") setDetail(res.data);
-    else toast.error(`Couldn't load plugin: ${res.error.message}`);
+    // A component (WASM bundle) plugin id — mimo/opencode today — is never a
+    // `CorePlugin`, so this 404s for it EXPECTEDLY; the component-only render
+    // below (driven by `releaseDetail`) carries its own state, so this
+    // specific, deterministic error is not worth alarming the user with.
+    // Any other failure (a real 404, a network error, …) still toasts.
+    else if (!res.error.message.startsWith("unknown plugin:")) toast.error(`Couldn't load plugin: ${res.error.message}`);
     setLoaded(true);
+  }, [id]);
+
+  const loadRelease = useCallback(async () => {
+    const res = await commands.pluginReleaseDetail(LOCAL_RUNNER, id);
+    if (res.status === "ok") setReleaseDetail(res.data);
+    // Best-effort, same reasoning as `catalog_status` elsewhere: most plugin
+    // ids simply have no component-release ledger rows, which is the normal
+    // (not an error) case — never toast here.
+    setReleaseLoaded(true);
   }, [id]);
 
   useEffect(() => {
@@ -228,8 +443,14 @@ export function PluginDetailView({ id }: { id: string }) {
     setOauthRedirectUri("");
     setOauthCode("");
     setOauthBusy(null);
+    setReleaseDetail(null);
+    setReleaseLoaded(false);
+    setPermissionsAccepted(false);
+    setInstallBusy(false);
+    setActivateBusyVersion(null);
     void load();
-  }, [load]);
+    void loadRelease();
+  }, [load, loadRelease]);
 
   useEffect(() => {
     if (!doctorLoaded) void loadDoctor();
@@ -307,16 +528,84 @@ export function PluginDetailView({ id }: { id: string }) {
     };
   }, [id, load, reloadPlugins]);
 
-  if (!loaded || !detail) {
+  const onInstallComponent = async () => {
+    if (installBusy || !permissionsAccepted) return;
+    setInstallBusy(true);
+    const res = await installComponentPlugin(id);
+    setInstallBusy(false);
+    if (res) {
+      setReleaseDetail(res);
+      // A newly-installed/updated release may declare different permissions
+      // than what was just accepted — require a fresh accept for the next
+      // mutating action rather than carrying acceptance across releases.
+      setPermissionsAccepted(false);
+    }
+  };
+
+  const onActivateComponentVersion = async (version: string) => {
+    if (activateBusyVersion !== null || !releaseDetail?.activeVersion) return;
+    setActivateBusyVersion(version);
+    const res = await rollbackComponentPlugin(id, releaseDetail.activeVersion, version);
+    setActivateBusyVersion(null);
+    if (res) setReleaseDetail(res);
+  };
+
+  if (!loaded || !releaseLoaded) {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
         <div className="mx-auto max-w-[720px]">
           <BackButton label="Back" onClick={() => nav.goBack()} />
-          <div className="text-[13px] text-muted-foreground">{loaded ? "Plugin not found." : "Loading…"}</div>
+          <div className="text-[13px] text-muted-foreground">Loading…</div>
         </div>
       </div>
     );
   }
+
+  // A component (WASM bundle) plugin — mimo/opencode today — is never a
+  // `CorePlugin`, so `detail` is always `null` for it; treat it as "known" if
+  // it's one of the documented first-party ids (so a brand-new, never-yet-
+  // installed one still opens its management page from the "Manage" button)
+  // or it already has SOME release-ledger footprint (forward-compatible with
+  // a future non-first-party component plugin).
+  const isComponentOnly =
+    !detail && releaseDetail !== null && ((FIRST_PARTY_BUNDLE_IDS as readonly string[]).includes(id) || releaseDetail.releases.length > 0);
+
+  if (!detail && !isComponentOnly) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
+        <div className="mx-auto max-w-[720px]">
+          <BackButton label="Back" onClick={() => nav.goBack()} />
+          <div className="text-[13px] text-muted-foreground">Plugin not found.</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (isComponentOnly && releaseDetail) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-[22px]">
+        <div className="mx-auto max-w-[720px]">
+          <BackButton label="Back" onClick={() => nav.goBack()} />
+          <DetailHeader chip={<IconChip icon={Blocks} size={44} />} title={id} sub="Component plugin (WASM bundle)" />
+          <ComponentReleaseCard
+            id={id}
+            detail={releaseDetail}
+            doctorFindings={doctorFindings}
+            permissionsAccepted={permissionsAccepted}
+            onAcceptedChange={setPermissionsAccepted}
+            installBusy={installBusy}
+            onInstall={() => void onInstallComponent()}
+            activateBusyVersion={activateBusyVersion}
+            onActivateVersion={(v) => void onActivateComponentVersion(v)}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // `detail` is non-null past this point (the two early returns above cover
+  // every `!detail` case).
+  if (!detail) return null;
 
   const { info } = detail;
   const Icon = pluginIcon(info.icon);
@@ -746,7 +1035,9 @@ export function PluginDetailView({ id }: { id: string }) {
         )}
 
         {info.capabilities.includes("provider") && (
-          <Card>
+          <Card
+            className={releaseDetail && (releaseDetail.releases.length > 0 || releaseDetail.activeVersion !== null) ? "mb-3" : undefined}
+          >
             <CardHeader>
               <CardTitle>Models</CardTitle>
               <CardHint>{detail.models.length} available</CardHint>
@@ -761,6 +1052,25 @@ export function PluginDetailView({ id }: { id: string }) {
               ))
             )}
           </Card>
+        )}
+
+        {/* Forward-compat: a component (WASM bundle) plugin isn't a
+            `CorePlugin` today (see `isComponentOnly` above), so this never
+            renders alongside a real `detail` yet — kept so a future plugin
+            that is BOTH gets the release-management card without another
+            code path. */}
+        {releaseDetail && (releaseDetail.releases.length > 0 || releaseDetail.activeVersion !== null) && (
+          <ComponentReleaseCard
+            id={id}
+            detail={releaseDetail}
+            doctorFindings={doctorFindings}
+            permissionsAccepted={permissionsAccepted}
+            onAcceptedChange={setPermissionsAccepted}
+            installBusy={installBusy}
+            onInstall={() => void onInstallComponent()}
+            activateBusyVersion={activateBusyVersion}
+            onActivateVersion={(v) => void onActivateComponentVersion(v)}
+          />
         )}
       </div>
     </div>

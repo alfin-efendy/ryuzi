@@ -1688,6 +1688,66 @@ async extensionStatus(runnerId: string | null) : Promise<Result<ExtensionStatusE
 }
 },
 /**
+ * The release ledger for a component plugin (mimo/opencode today): every
+ * recorded release plus the active version and (Task 12) the active
+ * version's manifest-derived permission metadata. Read-only, never mutates
+ * state. Safe to call for ANY plugin id, including one that was never a
+ * component bundle — it just comes back with an empty `releases` list.
+ */
+async pluginReleaseDetail(runnerId: string | null, id: string) : Promise<Result<ComponentReleaseDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("plugin_release_detail", { runnerId, id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Install (or update to) a component plugin's signed release —
+ * resolve+download+stage+verify+install+activate, then mark the host
+ * restart-required. `version: None` means "latest". Fail-closed while the
+ * first-party signing key is the placeholder (refuses before any network
+ * I/O — see `install_component_plugin`'s doc in `plugins_api.rs`).
+ */
+async installComponentPlugin(runnerId: string | null, id: string, version: string | null) : Promise<Result<ComponentReleaseDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_component_plugin", { runnerId, id, version }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Roll a component plugin off a bad release: re-point the active pointer at
+ * `to_version`, then revoke + deactivate `from_version`, then mark the host
+ * restart-required. A missing/revoked `to_version` is a clean no-op — see
+ * `rollback_component_plugin`'s doc in `plugins_api.rs` for the ordering
+ * rationale (the good version activates FIRST, so a bad target can never
+ * strand the plugin with no active release).
+ */
+async rollbackComponentPlugin(runnerId: string | null, id: string, fromVersion: string, toVersion: string) : Promise<Result<ComponentReleaseDetail, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rollback_component_plugin", { runnerId, id, fromVersion, toVersion }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The first-party component bootstrap's retryable status: `pending` when
+ * the last automatic bootstrap attempt (at daemon start) landed nothing and
+ * hasn't since completed — Cockpit shows a retry banner in that case.
+ * Read-only, never mutates state.
+ */
+async componentBootstrapStatus(runnerId: string | null) : Promise<Result<ComponentBootstrapStatus, CmdError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("component_bootstrap_status", { runnerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Export a session as a pretty JSON string.
  */
 async exportSession(runnerId: string | null, sessionPk: string) : Promise<Result<string, CmdError>> {
@@ -2019,6 +2079,82 @@ export type CodexResetCreditResult = { reset: boolean; code: string | null; wind
 export type CodexResetCreditsInfo = { availableCount: number; credits: CodexResetCreditInfo[] }
 export type CommandInfo = { name: string; description: string; agent: string | null; model?: string | null; subtask?: boolean; origin: CommandOriginInfo; effective?: boolean; shadowsGlobal: boolean }
 export type CommandOriginInfo = "builtin" | "global" | "project"
+/**
+ * `component_bootstrap_status` RPC result (Task 11a): whether the first-party
+ * component bootstrap has a pending retryable failure Cockpit should surface,
+ * and the human-readable message if so.
+ */
+export type ComponentBootstrapStatus = {
+/**
+ * True when the last bootstrap attempt landed nothing and bootstrap has
+ * not since completed — Cockpit shows a "retry" banner.
+ */
+pending: boolean;
+/**
+ * The recorded retry message, present iff `pending`.
+ */
+message: string | null }
+/**
+ * Task 12 cross-layer addition: the currently ACTIVE version's bundle
+ * manifest metadata a component plugin's permission-confirmation summary
+ * needs to render (publisher, description, lifecycle, network allowlist
+ * "domains", declared OAuth profiles) — none of this was in Task 11a's
+ * `ComponentReleaseDetail`, which only carries per-release ledger rows
+ * (version/hash/signing key/timestamps), not manifest content.
+ *
+ * Sourced from the already-verified on-disk bundle
+ * (`plugins::bundle::load_active_bundles`, the same read
+ * `profile_capability_context` already performs) rather than a new network
+ * fetch — safe because this data has already passed `verify_bundle`. `None`
+ * when nothing is currently active (including: never installed, or
+ * uninstalled) — there is no pipeline seam to preview an unverified
+ * manifest's fields before an install actually runs the signature check, so
+ * a plugin's very first install has no permission preview to show beyond
+ * the generic acknowledgement Cockpit renders in that case.
+ */
+export type ComponentManifestInfo = { publisher: string; description: string;
+/**
+ * `singleton` | `per-session` | `per-call` (mirrors
+ * `ryuzi_plugin_sdk::PluginLifecycle`'s kebab-case wire form).
+ */
+lifecycle: string;
+/**
+ * The outbound network allowlist ("domains") — bare or `*.`-wildcard
+ * hostnames the component may reach.
+ */
+domains: string[]; oauthProfiles: ComponentOauthProfileInfo[] }
+/**
+ * One OAuth profile a component bundle's manifest declares — id + scopes
+ * only (no client id/secret/endpoint: Task 12 renders declared metadata,
+ * never a live credential; the full connect flow is Task 13). Mirror of
+ * `ryuzi_plugin_sdk::OAuthProfile` trimmed to what Cockpit displays.
+ */
+export type ComponentOauthProfileInfo = { id: string; scopes: string[] }
+/**
+ * `plugin_release_detail` RPC result: every recorded release for a component
+ * plugin (oldest first, as the store returns them) plus the currently active
+ * version, if any.
+ */
+export type ComponentReleaseDetail = { pluginId: string; releases: ComponentReleaseInfo[]; activeVersion: string | null;
+/**
+ * Task 12 addition — see [`ComponentManifestInfo`]'s doc.
+ */
+activeManifest: ComponentManifestInfo | null }
+/**
+ * One row of a component plugin's release ledger (Task 11a). Mirror of
+ * `crate::store::ComponentPluginReleaseRecord` with the specta `Type` the
+ * core struct doesn't derive, PLUS a Task 12 addition: `first_party` (see
+ * its own doc). Carries no secret (source URL, hash, key id, timestamps,
+ * lifecycle flags only).
+ */
+export type ComponentReleaseInfo = { pluginId: string; version: string; sourceUrl: string; sha256: string; signingKeyId: string; installedAt: number; active: boolean; revoked: boolean; revocationReason: string | null;
+/**
+ * Task 12 addition: `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID`.
+ * Computed server-side (rather than left for Cockpit to compare a magic
+ * string) so the UI's "publisher verification" badge and the backing
+ * trust check can never drift.
+ */
+firstParty: boolean }
 export type ConnectionInfo = { id: string; provider: string; providerName: string; color: string; initial: string; authType: string; label: string; priority: number; enabled: boolean; quotaCapability: ProviderQuotaCapability | null; models: string[];
 /**
  * OAuth connections only: true once refresh has failed terminally and

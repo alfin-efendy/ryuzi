@@ -51,6 +51,20 @@ npm/platform/*/ryuzi.exe
 crates/core/tests/fixtures/**/target/
 crates/core/tests/fixtures/**/Cargo.lock
 crates/core/tests/fixtures/**/wit/deps/
+# First-party component bundle projects (plugins/mimo, plugins/opencode) are
+# their own cargo workspaces; only src + wit/world.wit + manifest are tracked.
+# Build output, materialized WIT deps, lockfiles, and the signed release
+# artifacts the signer emits are all local/release-only, never committed.
+plugins/**/target/
+plugins/**/Cargo.lock
+plugins/**/wit/deps/
+plugins/**/dist/
+plugins/**/*.wasm
+plugins/**/*.release.json
+plugins/**/*.release.json.sig
+# Default output dir of scripts/plugins/build-first-party.ts (signed release
+# artifacts + built .wasm) — a release artifact, never committed.
+/dist/
 # Local cargo state stays ignored, but the tracked alias file is real config
 # (`cargo gen-bindings` — see apps/cockpit/src-tauri/Cargo.toml).
 /.cargo/*

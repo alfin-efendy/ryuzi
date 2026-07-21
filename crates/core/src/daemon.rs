@@ -48,6 +48,29 @@ pub struct BuildDaemonOpts {
     /// Test seam: replace the single native harness factory with a fake.
     /// `None` (production) uses the real native runtime.
     pub harness_factory: Option<Arc<dyn HarnessFactory>>,
+    /// Test/override seam for the first-party component-bundle bootstrap
+    /// (Task 11a). `None` (production) uses the real reqwest client, the
+    /// compiled-in first-party trusted key, the settings/default release base
+    /// URL, and the per-user install root — see [`ComponentBootstrapConfig`].
+    pub component_bootstrap: Option<ComponentBootstrapConfig>,
+}
+
+/// Inputs to the first-party component-bundle bootstrap step (Task 11a),
+/// injectable via [`BuildDaemonOpts::component_bootstrap`]. `None` there
+/// resolves each field to its production default: a real
+/// [`crate::plugins::remote_catalog::ReqwestCatalogHttp`], the
+/// [`crate::plugins::first_party_key::first_party_trusted_keys`] map (empty
+/// while the placeholder key is in place → fail-closed no-op), the
+/// `component_release_base_url` setting (or
+/// [`crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL`]), and
+/// [`crate::plugins::bundle::installed_bundle_root`]. Tests inject a fake
+/// `CatalogHttp`, a generated trusted key, and a throwaway root to exercise the
+/// pipeline hermetically.
+pub struct ComponentBootstrapConfig {
+    pub http: Arc<dyn crate::plugins::remote_catalog::CatalogHttp>,
+    pub trusted_keys: std::collections::HashMap<String, [u8; 32]>,
+    pub base_url: String,
+    pub root: PathBuf,
 }
 
 /// A fully wired daemon: control plane, shared store handle, and the
@@ -113,6 +136,11 @@ pub struct Daemon {
     learning_handle: JoinHandle<()>,
     /// Periodic source-session artifact retention cleanup.
     artifact_retention_handle: JoinHandle<()>,
+    /// One supervisor per enabled long-lived WASM gateway bundle (Task 10). Each
+    /// owns a background task tracked exactly like `router_handle`/
+    /// `fanout_handle`: `stop()` stops each gracefully and `Drop` aborts them, so
+    /// no supervisor (nor the component instance it holds) outlives the daemon.
+    gateway_supervisors: Vec<crate::plugins::wasm_gateway::WasmGatewaySupervisor>,
 }
 
 impl Daemon {
@@ -273,6 +301,11 @@ impl Daemon {
         for gw in &self.gateways {
             let _ = gw.stop().await;
         }
+        // Gracefully stop every WASM gateway supervisor (calls each component's
+        // `stop()` and exits + aborts its task). Safe when empty.
+        for supervisor in &self.gateway_supervisors {
+            supervisor.stop().await;
+        }
         // Give already-enqueued listener/worker tasks one scheduling
         // opportunity to begin processing a just-published terminal status
         // transition (e.g. reach the point of persisting a `queued`
@@ -316,6 +349,9 @@ impl Drop for Daemon {
         self.rail_handle.abort();
         self.learning_handle.abort();
         self.artifact_retention_handle.abort();
+        for supervisor in &self.gateway_supervisors {
+            supervisor.abort();
+        }
     }
 }
 
@@ -385,12 +421,51 @@ fn try_otel_telemetry(_otel_endpoint: &str) -> Option<Arc<dyn Telemetry>> {
 /// Telemetry selection: an explicit `opts.telemetry` override always wins;
 /// otherwise selection is delegated to [`select_telemetry`] (see its doc for
 /// the empty/non-empty `otel_endpoint` behavior).
-pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
+pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let store = Arc::new(Store::open(&opts.db_path).await?);
     // Auto-connect the MiMo/OpenCode free tiers on first run so a fresh
     // install has runnable models (and the `free` route below has candidates)
     // without any "Add account" step. Idempotent + respects user deletion.
     crate::agents::bootstrap::ensure_free_providers_seeded(&store).await?;
+    // Bootstrap the first-party component bundles (MiMo/OpenCode) on first run
+    // so their signed provider bundles can land + activate without any manual
+    // install. Non-propagating (warn-and-continue, `let _`) — a download
+    // failure must NEVER fail the whole daemon; the retryable status is
+    // persisted and surfaced via the `component_bootstrap_status` RPC. Mirrors
+    // the gateway-build warn+skip pattern below, NOT the `?` on the
+    // free-providers line above.
+    {
+        let cfg = match opts.component_bootstrap.take() {
+            Some(cfg) => cfg,
+            None => ComponentBootstrapConfig {
+                http: Arc::new(crate::plugins::remote_catalog::ReqwestCatalogHttp::new()),
+                trusted_keys: crate::plugins::first_party_key::first_party_trusted_keys(),
+                base_url: store
+                    .get_setting_raw("component_release_base_url")
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        crate::plugins::remote_catalog::DEFAULT_COMPONENT_RELEASE_BASE_URL
+                            .to_string()
+                    }),
+                root: crate::plugins::bundle::installed_bundle_root(),
+            },
+        };
+        let installer = crate::plugins::bundle::ComponentBundleInstaller::new(
+            cfg.root.clone(),
+            store.as_ref().clone(),
+        );
+        let _ = crate::plugins::remote_catalog::bootstrap_first_party_components(
+            &store,
+            cfg.http.as_ref(),
+            &cfg.trusted_keys,
+            &installer,
+            &cfg.base_url,
+        )
+        .await;
+    }
     // Seed the explicit "installed providers" set once (defaults ∪ families
     // that already have a connection) so the Models list gates on it. Visibility
     // only — routing still uses enabled connections. Idempotent.
@@ -531,6 +606,16 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     let router_server = Arc::new(RouterServer::new(Arc::clone(&store)));
     router_server.attach_control_plane(&cp);
 
+    // Supervise every enabled long-lived WASM gateway bundle (Task 10). Discovery
+    // is warn-and-skip and returns empty when nothing enabled/long-lived is
+    // installed, so a clean install spawns nothing.
+    let gateway_supervisors = crate::plugins::wasm_gateway::build_gateway_supervisors(
+        Arc::clone(&store),
+        &settings,
+        Arc::clone(&telemetry),
+    )
+    .await;
+
     Ok(Daemon {
         cp,
         store,
@@ -552,6 +637,7 @@ pub async fn build_daemon(opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         rail_handle,
         learning_handle,
         artifact_retention_handle,
+        gateway_supervisors,
     })
 }
 
@@ -966,6 +1052,207 @@ mod tests {
         (f, path)
     }
 
+    // ---------- first-party component bootstrap (Task 11a) ----------
+
+    /// Deterministic bundle-signing key + its trusted map, for the daemon
+    /// bootstrap wiring tests.
+    fn bootstrap_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[13u8; 32])
+    }
+    fn bootstrap_trusted_keys() -> std::collections::HashMap<String, [u8; 32]> {
+        std::collections::HashMap::from([(
+            "first-party".to_string(),
+            bootstrap_signing_key().verifying_key().to_bytes(),
+        )])
+    }
+
+    /// The four artifacts (`ryuzi-plugin.toml`, `release.json`, `plugin.sig`,
+    /// wasm) for one bundle, plus the wasm's URL.
+    struct BootstrapArtifacts {
+        manifest_toml: Vec<u8>,
+        release_json: Vec<u8>,
+        sig_json: Vec<u8>,
+        wasm: Vec<u8>,
+        component_url: String,
+    }
+
+    fn build_bootstrap_artifacts(base: &str, id: &str, version: &str) -> BootstrapArtifacts {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        use sha2::Digest as _;
+        let wasm = format!("wasm {id} {version}").into_bytes();
+        let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
+        let component = format!("{id}.wasm");
+        let component_url = format!("{base}/{id}.wasm");
+        let manifest_toml = format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+        )
+        .into_bytes();
+        let release_json = format!(
+            "{{\"id\":\"{id}\",\"version\":\"{version}\",\"wit-api\":\"0.1.0\",\"component_url\":\"{component_url}\",\"component_sha256\":\"{sha}\"}}"
+        )
+        .into_bytes();
+        let signature = bootstrap_signing_key().sign(&release_json);
+        let sig_json = serde_json::to_vec(&serde_json::json!({
+            "key_id": "first-party",
+            "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        }))
+        .unwrap();
+        BootstrapArtifacts {
+            manifest_toml,
+            release_json,
+            sig_json,
+            wasm,
+            component_url,
+        }
+    }
+
+    /// A `CatalogHttp` fake serving canned bodies keyed by exact URL; anything
+    /// unregistered is a 404.
+    struct FakeBootstrapHttp {
+        routes: Mutex<std::collections::HashMap<String, (u16, Vec<u8>)>>,
+    }
+    impl FakeBootstrapHttp {
+        fn new() -> Self {
+            Self {
+                routes: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        fn register(&self, base: &str, id: &str, a: &BootstrapArtifacts) {
+            let mut routes = self.routes.lock().unwrap();
+            routes.insert(
+                format!("{base}/{id}.ryuzi-plugin.toml"),
+                (200, a.manifest_toml.clone()),
+            );
+            routes.insert(
+                format!("{base}/{id}.release.json"),
+                (200, a.release_json.clone()),
+            );
+            routes.insert(
+                format!("{base}/{id}.release.json.sig"),
+                (200, a.sig_json.clone()),
+            );
+            routes.insert(a.component_url.clone(), (200, a.wasm.clone()));
+        }
+    }
+    #[async_trait]
+    impl crate::plugins::remote_catalog::CatalogHttp for FakeBootstrapHttp {
+        async fn get(&self, url: &str) -> anyhow::Result<(u16, Vec<u8>)> {
+            Ok(self
+                .routes
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .unwrap_or((404, vec![])))
+        }
+    }
+
+    // First run must attempt both first-party bundles and, given a fake signed
+    // catalog serving valid releases, land + activate BOTH — without failing
+    // `build_daemon`.
+    #[tokio::test]
+    async fn build_daemon_bootstraps_first_party_components() {
+        let (_guard, db_path) = temp_db_path();
+        let base = "http://bootstrap.test/latest";
+        let http = Arc::new(FakeBootstrapHttp::new());
+        http.register(
+            base,
+            "mimo",
+            &build_bootstrap_artifacts(base, "mimo", "0.1.0"),
+        );
+        http.register(
+            base,
+            "opencode",
+            &build_bootstrap_artifacts(base, "opencode", "0.1.0"),
+        );
+        let root = tempfile::tempdir().unwrap();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+            component_bootstrap: Some(ComponentBootstrapConfig {
+                http,
+                trusted_keys: bootstrap_trusted_keys(),
+                base_url: base.to_string(),
+                root: root.path().to_path_buf(),
+            }),
+        })
+        .await
+        .expect("build_daemon must succeed with a successful bootstrap");
+
+        assert_eq!(
+            daemon
+                .store
+                .active_component_release("mimo")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            "0.1.0"
+        );
+        assert!(daemon
+            .store
+            .active_component_release("opencode")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            daemon
+                .store
+                .get_setting_raw(crate::plugins::remote_catalog::FIRST_PARTY_BOOTSTRAP_RETRY)
+                .await
+                .unwrap()
+                .is_none(),
+            "a fully successful bootstrap records no retry status"
+        );
+    }
+
+    // When BOTH downloads fail, the daemon must still build (Ok) and record a
+    // retryable bootstrap status for Cockpit to surface.
+    #[tokio::test]
+    async fn build_daemon_survives_component_bootstrap_download_failure() {
+        let (_guard, db_path) = temp_db_path();
+        // A fake that 404s everything → both bundles fail.
+        let http = Arc::new(FakeBootstrapHttp::new());
+        let root = tempfile::tempdir().unwrap();
+
+        let daemon = build_daemon(BuildDaemonOpts {
+            db_path,
+            config_root: tempfile::tempdir().unwrap().keep(),
+            telemetry: Some(Arc::new(NoopTelemetry)),
+            extra_gateway_factories: vec![],
+            harness_factory: None,
+            component_bootstrap: Some(ComponentBootstrapConfig {
+                http,
+                trusted_keys: bootstrap_trusted_keys(),
+                base_url: "http://bootstrap.test/latest".to_string(),
+                root: root.path().to_path_buf(),
+            }),
+        })
+        .await
+        .expect("a bootstrap download failure must NEVER fail build_daemon");
+
+        assert!(daemon
+            .store
+            .active_component_release("mimo")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            daemon
+                .store
+                .get_setting_raw(crate::plugins::remote_catalog::FIRST_PARTY_BOOTSTRAP_RETRY)
+                .await
+                .unwrap()
+                .is_some(),
+            "both-fail must record a retryable bootstrap status"
+        );
+    }
+
     async fn test_agent_persistence(
         store: Arc<Store>,
     ) -> crate::agents::bootstrap::AgentPersistence {
@@ -1044,6 +1331,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         }
     }
 
@@ -1397,6 +1685,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -1440,6 +1729,7 @@ mod tests {
                 Arc::new(UnconfiguredGatewayFactory) as Arc<dyn GatewayFactory>,
             )],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .expect("a fresh install must boot even though the seeded gateway is unconfigured");
@@ -1473,6 +1763,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -1504,6 +1795,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -1583,6 +1875,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -1689,6 +1982,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -1759,6 +2053,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -1836,6 +2131,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await;
         match previous_home {
@@ -2215,6 +2511,7 @@ mod tests {
             rail_handle,
             learning_handle,
             artifact_retention_handle: tokio::spawn(async {}),
+            gateway_supervisors: Vec::new(),
         };
 
         let err = daemon.start().await.unwrap_err();
@@ -2794,6 +3091,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         };
 
         daemon.start().await.unwrap();
@@ -2982,6 +3280,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         });
 
         let (recovery_entered, release_recovery) =
@@ -3112,6 +3411,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         });
 
         let (recovery_entered, release_recovery) =
@@ -3215,6 +3515,7 @@ mod tests {
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
             gateway_status_handles: Mutex::new(Vec::new()),
+            gateway_supervisors: Vec::new(),
         });
 
         let (recovery_entered, release_recovery) =
@@ -3371,6 +3672,7 @@ mod tests {
             rail_handle: tokio::spawn(async {}),
             learning_handle: tokio::spawn(async {}),
             artifact_retention_handle: tokio::spawn(async {}),
+            gateway_supervisors: Vec::new(),
         };
 
         daemon.start().await.unwrap();
@@ -3472,6 +3774,7 @@ mod tests {
             rail_handle,
             learning_handle,
             artifact_retention_handle: tokio::spawn(async {}),
+            gateway_supervisors: Vec::new(),
         };
 
         daemon.stop().await;
@@ -3584,6 +3887,7 @@ mod tests {
             telemetry: None,
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -3619,6 +3923,7 @@ mod tests {
             telemetry: None,
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -3657,6 +3962,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![("discord".to_string(), factory)],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -3731,6 +4037,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -3800,6 +4107,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -3821,6 +4129,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();
@@ -3848,6 +4157,7 @@ mod tests {
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![],
             harness_factory: None,
+            component_bootstrap: None,
         })
         .await
         .unwrap();

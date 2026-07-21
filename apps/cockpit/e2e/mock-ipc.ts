@@ -606,6 +606,12 @@ const FIXTURES: Record<string, unknown> & ChildRunMockState = {
   // `catalog_status` above. Empty list is a safe default (no plugin in these
   // fixtures declares an `extension` capability).
   extension_status: [],
+  // Task 12: PluginsView's retryable bootstrap banner calls this on mount —
+  // same "without a fixture the unmocked fallback returns `null` and the
+  // view crashes" lesson as `catalog_status`/`extension_status` above.
+  // `plugin_release_detail` (the other Task 12 mount-time call) is dispatched
+  // dynamically further down instead of listed here, since it takes an `id`.
+  component_bootstrap_status: { pending: false, message: null },
   get_setting: null,
   backdrop_capability: "none",
   system_accent_color: null,
@@ -964,6 +970,16 @@ export async function installMockIPC(page: Page, overrides: MockIPCOverrides = {
             const { agentId } = args as { agentId: string };
             const details = fixtures.agent_details as Record<string, unknown>;
             return Promise.resolve(details[agentId] ?? null);
+          }
+          // Task 12: PluginsView (bootstrap-retry banner + "Component plugins"
+          // section) and PluginDetailView's component-only fallback both call
+          // this on mount, for arbitrary ids (mimo/opencode today). Dispatched
+          // dynamically (echoing `id` back) rather than a single static
+          // FIXTURES entry so two different requested ids never collide on
+          // the same fixture object (which would break `pluginId`-keyed lists).
+          if (cmd === "plugin_release_detail") {
+            const { id } = args as { id: string };
+            return Promise.resolve({ pluginId: id, releases: [], activeVersion: null, activeManifest: null });
           }
           if (cmd === "list_model_routes") return Promise.resolve(modelRoutes);
           if (cmd === "save_model_route") {

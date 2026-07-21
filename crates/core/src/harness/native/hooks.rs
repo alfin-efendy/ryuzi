@@ -150,33 +150,49 @@ pub async fn run(work_dir: &Path, event: HookEvent, payload: &Value) -> HookResu
     HookResult::allow()
 }
 
-/// Fire `event` to BOTH sinks — the on-disk scripts (`run`, Track C) and,
-/// when the session has one (`extension_events.is_some()`), the extension
-/// host (Track D, `plugins::extension::ExtensionEvents::dispatch`) — and
-/// combine their results (see [`combine_hook_results`]). The two run
-/// CONCURRENTLY (`tokio::join!`), so paying for a slow script never doubles
-/// the cost of a slow extension dispatch, or vice versa.
+/// Fire `event` to every sink — the on-disk scripts (`run`, Track C), the
+/// subprocess extension host (Track D, `extension_events`), and the WASM
+/// component hook dispatcher (Task 9, `wasm_hooks`) — and combine their
+/// results (see [`combine_hook_results`]). All present sinks run CONCURRENTLY
+/// (`tokio::join!`), so paying for a slow one never serializes the others.
 ///
-/// `extension_events: None` (no extensions registered — the common case,
-/// and every bare test context) skips the extension side entirely and is
-/// exactly equivalent to calling `run` directly: zero behavioral change from
-/// before Track D existed.
+/// A `None` sink is skipped entirely; `(None, None)` is exactly equivalent to
+/// calling `run` directly (the common case, and every bare test context):
+/// zero behavioral change from before extension/component hooks existed.
 ///
 /// This is the single point every `harness::native` fire site should call
 /// instead of `run` — see the module doc.
 pub async fn fire_hook(
     work_dir: &Path,
     extension_events: Option<&Arc<dyn ExtensionEvents>>,
+    wasm_hooks: Option<&Arc<dyn ExtensionEvents>>,
     event: HookEvent,
     payload: &Value,
 ) -> HookResult {
-    let combined = match extension_events {
-        Some(ext) => {
+    // All three sinks (on-disk scripts, subprocess extensions, WASM
+    // components) run CONCURRENTLY, so a slow one never serializes the cost of
+    // the others; a `None` sink is a true no-op. Any one denying denies the
+    // combined gating result (see `combine_hook_results`).
+    let combined = match (extension_events, wasm_hooks) {
+        (None, None) => run(work_dir, event, payload).await,
+        (Some(ext), None) => {
             let (script, extension) =
                 tokio::join!(run(work_dir, event, payload), ext.dispatch(event, payload));
             combine_hook_results(script, extension)
         }
-        None => run(work_dir, event, payload).await,
+        (None, Some(wasm)) => {
+            let (script, wasm) =
+                tokio::join!(run(work_dir, event, payload), wasm.dispatch(event, payload));
+            combine_hook_results(script, wasm)
+        }
+        (Some(ext), Some(wasm)) => {
+            let (script, extension, wasm) = tokio::join!(
+                run(work_dir, event, payload),
+                ext.dispatch(event, payload),
+                wasm.dispatch(event, payload)
+            );
+            combine_hook_results(combine_hook_results(script, extension), wasm)
+        }
     };
     if event.is_gating() {
         combined
@@ -379,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn fire_hook_with_no_extension_events_behaves_exactly_like_run() {
         let dir = tempfile::tempdir().unwrap();
-        let r = fire_hook(dir.path(), None, HookEvent::ToolBefore, &json!({})).await;
+        let r = fire_hook(dir.path(), None, None, HookEvent::ToolBefore, &json!({})).await;
         assert_eq!(r, HookResult::allow());
     }
 
@@ -393,6 +409,7 @@ mod tests {
         let r = fire_hook(
             dir.path(),
             Some(&ext),
+            None,
             HookEvent::ToolBefore,
             &json!({ "tool": "bash" }),
         )
@@ -415,6 +432,7 @@ mod tests {
         let r = fire_hook(
             dir.path(),
             Some(&ext),
+            None,
             HookEvent::ToolBefore,
             &json!({ "tool": "bash" }),
         )
@@ -440,6 +458,7 @@ mod tests {
         let r = fire_hook(
             dir.path(),
             Some(&ext),
+            None,
             HookEvent::ToolBefore,
             &json!({ "tool": "read" }),
         )
@@ -461,6 +480,7 @@ mod tests {
         let r = fire_hook(
             dir.path(),
             Some(&ext),
+            None,
             HookEvent::ToolAfter,
             &json!({ "tool": "bash" }),
         )
