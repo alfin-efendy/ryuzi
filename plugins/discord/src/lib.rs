@@ -22,8 +22,10 @@
 //! Message normalization (Task 8) is now wired into [`logic::on_frame`]'s
 //! `MESSAGE_CREATE` dispatch handling, reproducing the native inbound routing
 //! rules exactly (`message.mention`/`message.thread`/`message.dm`). Slash
-//! commands + approval buttons (Task 9) and Discord REST + outbound-op wiring
-//! (Task 10) build on this protocol core.
+//! commands + approval-button routing (Task 9) are now wired into
+//! [`logic::on_frame`]'s `INTERACTION_CREATE` dispatch handling
+//! (`logic::handle_interaction`, `logic::can_approve`, `logic::build_commands`).
+//! Discord REST + outbound-op wiring (Task 10) builds on this protocol core.
 
 pub mod logic;
 

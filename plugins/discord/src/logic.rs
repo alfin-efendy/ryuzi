@@ -12,6 +12,7 @@
 //! verified against the official docs (docs.discord.com/developers).
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// The Discord gateway websocket endpoint (v10, JSON encoding).
 pub const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -58,7 +59,78 @@ pub enum Action {
     SendFrame(String),
     SetHeartbeat(u64),
     EmitInbound(InboundEvent),
-    Reconnect { resume: bool },
+    Reconnect {
+        resume: bool,
+    },
+    /// Defer a slash-command interaction (Discord's 3-second ack) via its
+    /// interaction `token`, BEFORE the paired `EmitInbound(slash.*)` action is
+    /// acted on (Task 10 sends the REST defer, then routes the event).
+    DeferInteraction {
+        token: String,
+    },
+    /// An authorized approval-button click: edit the original message (via
+    /// Discord's `UpdateMessage` interaction-response, keyed by the button
+    /// click's OWN interaction `token` — no message id needed) to `text`.
+    /// Paired with an `EmitInbound(approval.decision)` action.
+    EditInteractionMessage {
+        token: String,
+        text: String,
+    },
+    /// An unauthorized approval-button click: reply ephemerally via the
+    /// click's interaction `token`. No decision is emitted.
+    ReplyEphemeral {
+        token: String,
+        text: String,
+    },
+}
+
+/// The pending state of one outstanding approval request, keyed by
+/// `request_id` — populated by the guest from a `deliver-outbound`
+/// `approval-request` event (Task 10) before Discord's buttons are even
+/// posted, so a click can be authorized purely against this map without any
+/// host call. `approver_role_ids` + `started_by` are exactly the two fields
+/// [`can_approve`] needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    pub approver_role_ids: Vec<String>,
+    pub started_by: Option<String>,
+}
+
+/// `request_id -> PendingApproval`, threaded into [`on_frame`]/[`handle_interaction`]
+/// as a parameter (never owned or mutated here) — see [`PendingApproval`]'s doc.
+pub type PendingApprovals = HashMap<String, PendingApproval>;
+
+/// The result of routing one Discord `INTERACTION_CREATE` dispatch, computed
+/// purely by [`handle_interaction`]. `token` fields are the interaction's OWN
+/// token (distinct per interaction, even for two clicks on the same
+/// approval message) — the guest (Task 10) uses it for the deferred slash
+/// reply / message edit / ephemeral reply respectively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionOutcome {
+    /// A slash command (`/connect`, `/end`, `/stop`, `/status`): the guest
+    /// must defer (when `defer` is true — always, today) then route `event`.
+    Slash {
+        defer: bool,
+        token: String,
+        event: InboundEvent,
+    },
+    /// An authorized approval-button click: the decision to emit plus the
+    /// text to edit the original message to.
+    Approval {
+        request_id: String,
+        allow: bool,
+        actor: String,
+        edit: String,
+        token: String,
+    },
+    /// An approval-button click by a clicker `can_approve` rejects: no
+    /// decision is emitted, only an ephemeral reply.
+    Unauthorized { token: String, ephemeral: String },
+    /// Anything else this component doesn't act on: an unknown interaction
+    /// type, an unrecognized slash-command name, a malformed/unrecognized
+    /// button `custom_id`, or a button click for a `request_id` with no
+    /// entry in `pending` (already resolved/expired/unknown). Never panics.
+    Ignored,
 }
 
 /// The full protocol state. Pure data — no host handles, no clock.
@@ -109,7 +181,15 @@ impl GatewayState {
 /// `GET /channels/{id}` round trip, which is the guest's job (wired in Task
 /// 10) — this function stays pure by taking the pre-resolved answer as a
 /// parameter instead of performing the lookup itself.
-pub fn on_frame(state: &mut GatewayState, raw_json: &str, is_thread: bool) -> Vec<Action> {
+///
+/// `pending` is only consulted for an `INTERACTION_CREATE` dispatch that
+/// turns out to be an approval-button click — see [`PendingApprovals`]'s doc.
+pub fn on_frame(
+    state: &mut GatewayState,
+    raw_json: &str,
+    is_thread: bool,
+    pending: &PendingApprovals,
+) -> Vec<Action> {
     let value: Value = match serde_json::from_str(raw_json) {
         Ok(value) => value,
         Err(_) => return Vec::new(),
@@ -132,7 +212,7 @@ pub fn on_frame(state: &mut GatewayState, raw_json: &str, is_thread: bool) -> Ve
 
     match op {
         OP_HELLO => on_hello(state, &value),
-        OP_DISPATCH => on_dispatch(state, &value, is_thread),
+        OP_DISPATCH => on_dispatch(state, &value, is_thread, pending),
         OP_HEARTBEAT => {
             // Server-requested heartbeat: send one immediately, now awaiting ack.
             state.heartbeat_acked = false;
@@ -182,9 +262,17 @@ fn on_hello(state: &mut GatewayState, value: &Value) -> Vec<Action> {
 /// DISPATCH (op 0): `last_seq` is already updated by the caller. READY/RESUMED
 /// drive the phase + session capture; MESSAGE_CREATE normalizes into an
 /// inbound `message.*` `gateway-event` (Task 8, stamped with the dispatch's
-/// `last_seq`); INTERACTION_CREATE and the rest remain the Task 9 hook (no
-/// emission here yet).
-fn on_dispatch(state: &mut GatewayState, value: &Value, is_thread: bool) -> Vec<Action> {
+/// `last_seq`); INTERACTION_CREATE routes through [`handle_interaction`]
+/// (Task 9) into a slash `EmitInbound` (+ a paired `DeferInteraction`), an
+/// authorized approval-button `EmitInbound(approval.decision)` (+ a paired
+/// `EditInteractionMessage`), or an unauthorized click's lone
+/// `ReplyEphemeral` — see [`interaction_actions`].
+fn on_dispatch(
+    state: &mut GatewayState,
+    value: &Value,
+    is_thread: bool,
+    pending: &PendingApprovals,
+) -> Vec<Action> {
     let event = value.get("t").and_then(Value::as_str).unwrap_or_default();
     match event {
         "READY" => {
@@ -216,6 +304,12 @@ fn on_dispatch(state: &mut GatewayState, value: &Value, is_thread: bool) -> Vec<
                 Some(event) => vec![Action::EmitInbound(event)],
                 None => Vec::new(),
             }
+        }
+        "INTERACTION_CREATE" => {
+            let Some(data) = value.get("d") else {
+                return Vec::new();
+            };
+            interaction_actions(handle_interaction(data, pending))
         }
         _ => Vec::new(),
     }
@@ -391,6 +485,311 @@ fn strip_mentions(content: &str) -> String {
     out.trim().to_string()
 }
 
+/// Plain Discord application-command JSON (a valid REST body; no `serenity`
+/// import), reproducing `crates/core/src/gateway/discord/mod.rs::build_commands`
+/// verbatim: `/connect` (`name`/`git`/`model`/`effort`/`mode`, `mode` a
+/// 3-choice string enum), `/end`, `/stop`, `/status`. Option `"type": 3` is
+/// Discord's `ApplicationCommandOptionType.String`, inlined as the literal
+/// `3`. Registered via REST in Task 10 — this only produces the
+/// command-registration JSON.
+pub fn build_commands() -> Value {
+    json!([
+        {
+            "name": "connect",
+            "description": "Connect a repo (new folder by name, or clone a git URL) to a new channel",
+            "options": [
+                { "name": "name", "description": "New project folder name", "type": 3, "required": false },
+                { "name": "git", "description": "Git URL to clone", "type": 3, "required": false },
+                { "name": "model", "description": "Model override", "type": 3, "required": false },
+                { "name": "effort", "description": "Reasoning effort", "type": 3, "required": false },
+                {
+                    "name": "mode",
+                    "description": "Permission mode",
+                    "type": 3,
+                    "required": false,
+                    "choices": [
+                        { "name": "default", "value": "default" },
+                        { "name": "acceptEdits", "value": "acceptEdits" },
+                        { "name": "bypassPermissions", "value": "bypassPermissions" }
+                    ]
+                }
+            ]
+        },
+        { "name": "end", "description": "End the session in this thread (removes its worktree)" },
+        { "name": "stop", "description": "Stop the running turn in this thread" },
+        { "name": "status", "description": "Show harness status" }
+    ])
+}
+
+/// Whether a clicker may approve a tool. Ported verbatim from
+/// `crates/core/src/policy.rs::can_approve`: the session starter always may.
+/// If NO approver roles are configured, only the starter may approve
+/// (safe-by-default). Otherwise the clicker must hold one of the approver
+/// roles.
+pub fn can_approve(
+    clicker_role_ids: &[String],
+    approver_role_ids: &[String],
+    is_starter: bool,
+) -> bool {
+    if is_starter {
+        return true;
+    }
+    if approver_role_ids.is_empty() {
+        return false;
+    }
+    clicker_role_ids
+        .iter()
+        .any(|r| approver_role_ids.contains(r))
+}
+
+/// Discord interaction types this component acts on (the rest are ignored).
+const INTERACTION_TYPE_APPLICATION_COMMAND: u64 = 2;
+const INTERACTION_TYPE_MESSAGE_COMPONENT: u64 = 3;
+
+/// Route one raw Discord `INTERACTION_CREATE` dispatch payload (the frame's
+/// `d` object) into an [`InteractionOutcome`], reproducing native
+/// `InboundRouting::handle_interaction` (slash routing,
+/// `crates/core/src/gateway/discord/mod.rs:318-368`) and
+/// `SerenityDiscordPort::request_approval`'s button-click authorization
+/// (`crates/core/src/gateway/discord/serenity_port.rs:467-568`). A malformed
+/// or unrecognized interaction (unknown `type`, unknown slash-command name,
+/// unparseable `custom_id`, or a button click for a `request_id` absent from
+/// `pending`) returns [`InteractionOutcome::Ignored`] — never panics.
+pub fn handle_interaction(raw: &Value, pending: &PendingApprovals) -> InteractionOutcome {
+    match raw.get("type").and_then(Value::as_u64) {
+        Some(INTERACTION_TYPE_APPLICATION_COMMAND) => handle_slash(raw),
+        Some(INTERACTION_TYPE_MESSAGE_COMPONENT) => handle_button(raw, pending),
+        _ => InteractionOutcome::Ignored,
+    }
+}
+
+/// Extract the interacting user's id + role ids. Discord puts a guild
+/// interaction's user under `member.user` (with `member.roles`); a DM
+/// interaction (no `member`) puts it directly under `user` (with no roles —
+/// DMs have no guild roles). Matches native's
+/// `cmd.member.as_ref().map(|m| ...).unwrap_or_default()` role-id fallback.
+fn interaction_user_and_roles(raw: &Value) -> (String, Vec<String>) {
+    if let Some(member) = raw.get("member") {
+        let user_id = member
+            .get("user")
+            .and_then(|u| u.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let role_ids = member
+            .get("roles")
+            .and_then(Value::as_array)
+            .map(|roles| {
+                roles
+                    .iter()
+                    .filter_map(|r| r.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (user_id, role_ids)
+    } else {
+        let user_id = raw
+            .get("user")
+            .and_then(|u| u.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        (user_id, Vec::new())
+    }
+}
+
+/// Parse `data.options[{name,value}]` (Discord's chat-input command option
+/// array shape) into a flat `name -> value` map, matching native's
+/// `CommandDataOptionValue::String` extraction. Non-string option values
+/// (none of `/connect`'s options are anything else) are simply absent.
+fn parse_string_options(data: Option<&Value>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Some(options) = data
+        .and_then(|d| d.get("options"))
+        .and_then(Value::as_array)
+    {
+        for opt in options {
+            if let (Some(name), Some(value)) = (
+                opt.get("name").and_then(Value::as_str),
+                opt.get("value").and_then(Value::as_str),
+            ) {
+                out.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A chat-input (`APPLICATION_COMMAND`) interaction: build the matching
+/// `slash.*` inbound event, always paired with a defer (Discord's 3-second
+/// ack — the guest must defer before the router resolves and replies, Task
+/// 10). Wire fields verbatim (design §5.2): `slash.connect{token,user_id,
+/// opts{name,git,model,effort,mode},role_ids}`, `slash.end{token,
+/// conversation_id}`, `slash.stop{token,conversation_id}`,
+/// `slash.status{token}`. An unrecognized command name is ignored.
+fn handle_slash(raw: &Value) -> InteractionOutcome {
+    let token = raw
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let channel_id = raw
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (user_id, role_ids) = interaction_user_and_roles(raw);
+    let data = raw.get("data");
+    let name = data
+        .and_then(|d| d.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let options = parse_string_options(data);
+
+    let (event_type, payload) = match name {
+        "connect" => (
+            "slash.connect",
+            json!({
+                "token": token,
+                "user_id": user_id,
+                "opts": {
+                    "name": options.get("name"),
+                    "git": options.get("git"),
+                    "model": options.get("model"),
+                    "effort": options.get("effort"),
+                    "mode": options.get("mode"),
+                },
+                "role_ids": role_ids,
+            }),
+        ),
+        "end" => (
+            "slash.end",
+            json!({ "token": token, "conversation_id": channel_id }),
+        ),
+        "stop" => (
+            "slash.stop",
+            json!({ "token": token, "conversation_id": channel_id }),
+        ),
+        "status" => ("slash.status", json!({ "token": token })),
+        _ => return InteractionOutcome::Ignored,
+    };
+
+    InteractionOutcome::Slash {
+        defer: true,
+        token: token.clone(),
+        event: build_event(event_type, payload, 0),
+    }
+}
+
+/// `"{request_id}:approve"` / `"{request_id}:deny"` custom-id parsing —
+/// matches native's `custom_id.ends_with(":approve"/":deny")` (the
+/// `request_id` may itself contain colons; only the KNOWN suffix is
+/// stripped, matching native exactly rather than splitting on the first
+/// colon). Anything else (native's "unexpected custom_id — ignore") returns
+/// `None`.
+fn parse_custom_id(custom_id: &str) -> Option<(&str, bool)> {
+    if let Some(request_id) = custom_id.strip_suffix(":approve") {
+        Some((request_id, true))
+    } else if let Some(request_id) = custom_id.strip_suffix(":deny") {
+        Some((request_id, false))
+    } else {
+        None
+    }
+}
+
+/// A `MESSAGE_COMPONENT` interaction (an approval button click): parse the
+/// `custom_id`, look up the pending approval, authorize via [`can_approve`]
+/// exactly like native `request_approval`'s collector loop, and produce
+/// either an authorized [`InteractionOutcome::Approval`] (edit text
+/// `"{label} by <@{actor}>"`, `label` = "✅ Approved"/"🚫 Denied" — native
+/// also appends `" — **{tool}**"`, omitted here since [`PendingApproval`]
+/// deliberately carries only what [`can_approve`] needs, not the tool name;
+/// a delegated simplification, not a fidelity gap in the authorization
+/// logic itself) or an [`InteractionOutcome::Unauthorized`] ephemeral reply
+/// (native's exact "You are not authorized to approve this." string). A
+/// `request_id` absent from `pending` (already resolved, expired, or
+/// unknown) is ignored, same as a malformed `custom_id`.
+fn handle_button(raw: &Value, pending: &PendingApprovals) -> InteractionOutcome {
+    let token = raw
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(custom_id) = raw
+        .get("data")
+        .and_then(|d| d.get("custom_id"))
+        .and_then(Value::as_str)
+    else {
+        return InteractionOutcome::Ignored;
+    };
+    let Some((request_id, allow)) = parse_custom_id(custom_id) else {
+        return InteractionOutcome::Ignored;
+    };
+    let Some(approval) = pending.get(request_id) else {
+        return InteractionOutcome::Ignored;
+    };
+
+    let (actor, clicker_role_ids) = interaction_user_and_roles(raw);
+    let is_starter = approval.started_by.as_deref() == Some(actor.as_str());
+    if !can_approve(&clicker_role_ids, &approval.approver_role_ids, is_starter) {
+        return InteractionOutcome::Unauthorized {
+            token,
+            ephemeral: "You are not authorized to approve this.".to_string(),
+        };
+    }
+
+    let label = if allow { "✅ Approved" } else { "🚫 Denied" };
+    InteractionOutcome::Approval {
+        request_id: request_id.to_string(),
+        allow,
+        edit: format!("{label} by <@{actor}>"),
+        actor,
+        token,
+    }
+}
+
+/// Convert an [`InteractionOutcome`] into the [`Action`]s the guest must
+/// perform, in order — a defer always precedes its paired event; an
+/// authorized decision's message edit always precedes its paired event
+/// (mirroring native's straight-line "decision locked, then the
+/// best-effort edit" sequencing, though here both are guest-performed
+/// effects rather than one being this function's own await).
+fn interaction_actions(outcome: InteractionOutcome) -> Vec<Action> {
+    match outcome {
+        InteractionOutcome::Slash {
+            defer,
+            token,
+            event,
+        } => {
+            let mut actions = Vec::new();
+            if defer {
+                actions.push(Action::DeferInteraction { token });
+            }
+            actions.push(Action::EmitInbound(event));
+            actions
+        }
+        InteractionOutcome::Approval {
+            request_id,
+            allow,
+            actor,
+            edit,
+            token,
+        } => vec![
+            Action::EditInteractionMessage { token, text: edit },
+            Action::EmitInbound(build_event(
+                "approval.decision",
+                json!({ "request_id": request_id, "allow": allow, "actor": actor }),
+                0,
+            )),
+        ],
+        InteractionOutcome::Unauthorized { token, ephemeral } => vec![Action::ReplyEphemeral {
+            token,
+            text: ephemeral,
+        }],
+        InteractionOutcome::Ignored => Vec::new(),
+    }
+}
+
 /// RECONNECT / INVALID_SESSION: plan the reconnect. A resumable one keeps the
 /// session (the next HELLO sends RESUME); a non-resumable one drops it (the next
 /// HELLO sends a fresh IDENTIFY).
@@ -538,7 +937,7 @@ mod tests {
     #[test]
     fn hello_sets_heartbeat_and_sends_identify() {
         let mut state = GatewayState::new("bot-token");
-        let actions = on_frame(&mut state, &hello(41250), false);
+        let actions = on_frame(&mut state, &hello(41250), false, &no_pending());
 
         assert!(actions.contains(&Action::SetHeartbeat(41250)));
         assert_eq!(state.heartbeat_interval_ms, Some(41250));
@@ -565,6 +964,7 @@ mod tests {
             &mut state,
             &dispatch("MESSAGE_CREATE", 42, json!({})),
             false,
+            &no_pending(),
         );
         assert_eq!(state.last_seq, Some(42));
         assert!(actions.is_empty());
@@ -573,8 +973,8 @@ mod tests {
     #[test]
     fn ready_stores_session_and_bot_identity() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &ready(1), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(1), false, &no_pending());
 
         assert_eq!(state.phase, GatewayPhase::Ready);
         assert_eq!(state.session_id.as_deref(), Some("sess-abc"));
@@ -589,8 +989,13 @@ mod tests {
     #[test]
     fn due_heartbeat_arms_then_emits_op1_with_last_seq() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &dispatch("MESSAGE_CREATE", 7, json!({})), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(
+            &mut state,
+            &dispatch("MESSAGE_CREATE", 7, json!({})),
+            false,
+            &no_pending(),
+        );
 
         // First tick arms the timer; no heartbeat is due yet.
         assert_eq!(due_heartbeat(&mut state, 0), None);
@@ -604,13 +1009,19 @@ mod tests {
     #[test]
     fn server_requested_heartbeat_sends_immediately() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &dispatch("MESSAGE_CREATE", 5, json!({})), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(
+            &mut state,
+            &dispatch("MESSAGE_CREATE", 5, json!({})),
+            false,
+            &no_pending(),
+        );
 
         let actions = on_frame(
             &mut state,
             &json!({ "op": OP_HEARTBEAT, "d": null }).to_string(),
             false,
+            &no_pending(),
         );
         let frame = sent_frame(&actions);
         assert_eq!(frame["op"].as_u64(), Some(OP_HEARTBEAT));
@@ -620,7 +1031,7 @@ mod tests {
     #[test]
     fn heartbeat_ack_marks_connection_alive() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
         assert_eq!(due_heartbeat(&mut state, 0), None); // arm
         assert!(due_heartbeat(&mut state, 41250).is_some()); // send -> awaiting ack
         assert!(!state.heartbeat_acked);
@@ -629,6 +1040,7 @@ mod tests {
             &mut state,
             &json!({ "op": OP_HEARTBEAT_ACK, "d": null }).to_string(),
             false,
+            &no_pending(),
         );
         assert!(state.heartbeat_acked);
     }
@@ -636,8 +1048,8 @@ mod tests {
     #[test]
     fn missed_heartbeat_ack_signals_reconnect() {
         let mut state = GatewayState::new("bot-token");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &ready(4), false); // live session, last_seq = 4
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(4), false, &no_pending()); // live session, last_seq = 4
         assert_eq!(due_heartbeat(&mut state, 0), None); // arm, next due 41250
         assert!(due_heartbeat(&mut state, 41250).is_some()); // send, awaiting ack
                                                              // No ACK arrives; the next due tick detects the zombie connection.
@@ -652,7 +1064,7 @@ mod tests {
 
         // The recovery connection's HELLO therefore emits RESUME, carrying the
         // preserved session id + sequence — proving no fresh IDENTIFY.
-        let actions = on_frame(&mut state, &hello(41250), false);
+        let actions = on_frame(&mut state, &hello(41250), false, &no_pending());
         let frame = sent_frame(&actions);
         assert_eq!(frame["op"].as_u64(), Some(OP_RESUME));
         assert_eq!(frame["d"]["session_id"].as_str(), Some("sess-abc"));
@@ -666,6 +1078,7 @@ mod tests {
             &mut state,
             &json!({ "op": OP_RECONNECT, "d": null }).to_string(),
             false,
+            &no_pending(),
         );
         assert_eq!(actions, vec![Action::Reconnect { resume: true }]);
         assert!(state.pending_resume);
@@ -675,13 +1088,14 @@ mod tests {
     fn invalid_session_non_resumable_requests_fresh_identify() {
         let mut state = GatewayState::new("t");
         // Pretend we had a live session that Discord now invalidates.
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &ready(9), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(9), false, &no_pending());
 
         let actions = on_frame(
             &mut state,
             &json!({ "op": OP_INVALID_SESSION, "d": false }).to_string(),
             false,
+            &no_pending(),
         );
         assert_eq!(actions, vec![Action::Reconnect { resume: false }]);
         assert!(!state.pending_resume);
@@ -695,6 +1109,7 @@ mod tests {
             &mut state,
             &json!({ "op": OP_INVALID_SESSION, "d": true }).to_string(),
             false,
+            &no_pending(),
         );
         assert_eq!(actions, vec![Action::Reconnect { resume: true }]);
         assert!(state.pending_resume);
@@ -703,18 +1118,19 @@ mod tests {
     #[test]
     fn hello_after_reconnect_sends_resume_frame() {
         let mut state = GatewayState::new("bot-token");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &ready(3), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(3), false, &no_pending());
         // Discord asks us to reconnect; we keep the session and plan a resume.
         on_frame(
             &mut state,
             &json!({ "op": OP_RECONNECT, "d": null }).to_string(),
             false,
+            &no_pending(),
         );
         assert!(state.pending_resume);
 
         // On the fresh connection's HELLO we RESUME rather than IDENTIFY.
-        let actions = on_frame(&mut state, &hello(41250), false);
+        let actions = on_frame(&mut state, &hello(41250), false, &no_pending());
         let frame = sent_frame(&actions);
         assert_eq!(frame["op"].as_u64(), Some(OP_RESUME));
         assert_eq!(frame["d"]["token"].as_str(), Some("bot-token"));
@@ -902,8 +1318,8 @@ mod tests {
     #[test]
     fn on_frame_wires_message_create_to_mention_event_with_dispatch_sequence() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &ready(1), false); // bot_user_id == "111222333"
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(1), false, &no_pending()); // bot_user_id == "111222333"
 
         let data = message_create(
             "40",
@@ -914,7 +1330,12 @@ mod tests {
             &["111222333"],
             &[],
         );
-        let actions = on_frame(&mut state, &dispatch("MESSAGE_CREATE", 99, data), false);
+        let actions = on_frame(
+            &mut state,
+            &dispatch("MESSAGE_CREATE", 99, data),
+            false,
+            &no_pending(),
+        );
 
         let event = emitted_event(&actions);
         assert_eq!(event.event_type, "message.mention");
@@ -935,11 +1356,16 @@ mod tests {
     #[test]
     fn on_frame_wires_message_create_to_thread_event_when_is_thread_true() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250), false);
-        on_frame(&mut state, &ready(1), false);
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(1), false, &no_pending());
 
         let data = message_create("77", Some("99"), "5", false, "still working", &[], &[]);
-        let actions = on_frame(&mut state, &dispatch("MESSAGE_CREATE", 123, data), true);
+        let actions = on_frame(
+            &mut state,
+            &dispatch("MESSAGE_CREATE", 123, data),
+            true,
+            &no_pending(),
+        );
 
         let event = emitted_event(&actions);
         assert_eq!(event.event_type, "message.thread");
@@ -960,5 +1386,465 @@ mod tests {
         assert_eq!(strip_mentions("<@123> hi <@!456> there"), "hi  there");
         // A role mention (`&`) never matches the user-mention pattern.
         assert_eq!(strip_mentions("<@&789> team ping"), "<@&789> team ping");
+    }
+
+    // ---- Task 9: slash commands + approval-button handling ---------------
+
+    fn no_pending() -> PendingApprovals {
+        PendingApprovals::new()
+    }
+
+    fn pending_with(
+        request_id: &str,
+        approver_role_ids: &[&str],
+        started_by: Option<&str>,
+    ) -> PendingApprovals {
+        let mut map = PendingApprovals::new();
+        map.insert(
+            request_id.to_string(),
+            PendingApproval {
+                approver_role_ids: approver_role_ids.iter().map(|s| s.to_string()).collect(),
+                started_by: started_by.map(str::to_string),
+            },
+        );
+        map
+    }
+
+    /// A synthetic APPLICATION_COMMAND (`type: 2`) interaction, matching
+    /// Discord's wire shape: `token` (top-level), `channel_id`,
+    /// `member.user.id` + `member.roles`, `data.name` +
+    /// `data.options[{name,value}]`.
+    fn slash_interaction(
+        name: &str,
+        token: &str,
+        channel_id: &str,
+        user_id: &str,
+        role_ids: &[&str],
+        options: &[(&str, &str)],
+    ) -> Value {
+        json!({
+            "type": 2,
+            "token": token,
+            "channel_id": channel_id,
+            "member": {
+                "user": { "id": user_id },
+                "roles": role_ids,
+            },
+            "data": {
+                "name": name,
+                "options": options
+                    .iter()
+                    .map(|(n, v)| json!({ "name": n, "value": v }))
+                    .collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    /// A synthetic MESSAGE_COMPONENT (`type: 3`) interaction (an approval
+    /// button click).
+    fn button_interaction(
+        token: &str,
+        channel_id: &str,
+        custom_id: &str,
+        user_id: &str,
+        role_ids: &[&str],
+    ) -> Value {
+        json!({
+            "type": 3,
+            "token": token,
+            "channel_id": channel_id,
+            "member": {
+                "user": { "id": user_id },
+                "roles": role_ids,
+            },
+            "data": { "custom_id": custom_id },
+        })
+    }
+
+    // ---------- build_commands ----------
+
+    #[test]
+    fn build_commands_defines_connect_end_stop_status() {
+        let names: Vec<String> = build_commands()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        for expected in ["connect", "end", "stop", "status"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_commands_connect_has_expected_options_and_mode_choices() {
+        let commands = build_commands();
+        let connect = commands
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "connect")
+            .unwrap();
+        let opts = connect["options"].as_array().unwrap();
+        let opt_names: Vec<String> = opts
+            .iter()
+            .map(|o| o["name"].as_str().unwrap().to_string())
+            .collect();
+        for expected in ["name", "git", "model", "effort", "mode"] {
+            assert!(
+                opt_names.contains(&expected.to_string()),
+                "missing {expected}: {opt_names:?}"
+            );
+        }
+        let mode = opts.iter().find(|o| o["name"] == "mode").unwrap();
+        let values: Vec<String> = mode["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["default", "acceptEdits", "bypassPermissions"]);
+    }
+
+    // ---------- can_approve ----------
+
+    #[test]
+    fn can_approve_starter_always_wins() {
+        assert!(can_approve(&[], &[], true));
+    }
+
+    #[test]
+    fn can_approve_empty_approver_list_means_starter_only() {
+        assert!(!can_approve(&[], &[], false));
+    }
+
+    #[test]
+    fn can_approve_role_intersection() {
+        let approver = vec!["r1".to_string()];
+        assert!(can_approve(&["r1".to_string()], &approver, false));
+        assert!(!can_approve(&["r2".to_string()], &approver, false));
+    }
+
+    // ---------- handle_interaction: slash commands ----------
+
+    #[test]
+    fn handle_interaction_connect_emits_event_with_token_opts_and_role_ids() {
+        let raw = slash_interaction(
+            "connect",
+            "tok-1",
+            "chan-1",
+            "u1",
+            &["r1", "r2"],
+            &[
+                ("name", "myproj"),
+                ("git", "https://example.com/x.git"),
+                ("model", "opus"),
+                ("effort", "high"),
+                ("mode", "acceptEdits"),
+            ],
+        );
+        let outcome = handle_interaction(&raw, &no_pending());
+        let InteractionOutcome::Slash {
+            defer,
+            token,
+            event,
+        } = outcome
+        else {
+            panic!("expected Slash outcome");
+        };
+        assert!(defer);
+        assert_eq!(token, "tok-1");
+        assert_eq!(event.event_type, "slash.connect");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "token": "tok-1",
+                "user_id": "u1",
+                "opts": {
+                    "name": "myproj",
+                    "git": "https://example.com/x.git",
+                    "model": "opus",
+                    "effort": "high",
+                    "mode": "acceptEdits",
+                },
+                "role_ids": ["r1", "r2"],
+            })
+        );
+    }
+
+    #[test]
+    fn handle_interaction_connect_missing_options_are_null() {
+        let raw = slash_interaction("connect", "tok-2", "chan-1", "u1", &[], &[]);
+        let outcome = handle_interaction(&raw, &no_pending());
+        let InteractionOutcome::Slash { event, .. } = outcome else {
+            panic!("expected Slash outcome");
+        };
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(
+            payload["opts"],
+            json!({
+                "name": null,
+                "git": null,
+                "model": null,
+                "effort": null,
+                "mode": null,
+            })
+        );
+    }
+
+    #[test]
+    fn handle_interaction_end_emits_token_and_conversation_id() {
+        let raw = slash_interaction("end", "tok-3", "chan-9", "u1", &[], &[]);
+        let outcome = handle_interaction(&raw, &no_pending());
+        let InteractionOutcome::Slash {
+            defer,
+            token,
+            event,
+        } = outcome
+        else {
+            panic!("expected Slash outcome");
+        };
+        assert!(defer);
+        assert_eq!(token, "tok-3");
+        assert_eq!(event.event_type, "slash.end");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({ "token": "tok-3", "conversation_id": "chan-9" })
+        );
+    }
+
+    #[test]
+    fn handle_interaction_stop_emits_token_and_conversation_id() {
+        let raw = slash_interaction("stop", "tok-4", "chan-9", "u1", &[], &[]);
+        let outcome = handle_interaction(&raw, &no_pending());
+        let InteractionOutcome::Slash { event, .. } = outcome else {
+            panic!("expected Slash outcome");
+        };
+        assert_eq!(event.event_type, "slash.stop");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({ "token": "tok-4", "conversation_id": "chan-9" })
+        );
+    }
+
+    #[test]
+    fn handle_interaction_status_emits_token_only() {
+        let raw = slash_interaction("status", "tok-5", "chan-1", "u1", &[], &[]);
+        let outcome = handle_interaction(&raw, &no_pending());
+        let InteractionOutcome::Slash { event, .. } = outcome else {
+            panic!("expected Slash outcome");
+        };
+        assert_eq!(event.event_type, "slash.status");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(payload, json!({ "token": "tok-5" }));
+    }
+
+    #[test]
+    fn handle_interaction_unknown_command_name_is_ignored() {
+        let raw = slash_interaction("bogus", "tok-6", "chan-1", "u1", &[], &[]);
+        assert_eq!(
+            handle_interaction(&raw, &no_pending()),
+            InteractionOutcome::Ignored
+        );
+    }
+
+    // ---------- handle_interaction: approval buttons ----------
+
+    #[test]
+    fn handle_interaction_button_approve_by_authorized_role_emits_decision() {
+        let pending = pending_with("req-1", &["approver"], Some("starter-1"));
+        let raw = button_interaction(
+            "tok-btn-1",
+            "chan-1",
+            "req-1:approve",
+            "clicker-1",
+            &["approver"],
+        );
+        let outcome = handle_interaction(&raw, &pending);
+        let InteractionOutcome::Approval {
+            request_id,
+            allow,
+            actor,
+            edit,
+            token,
+        } = outcome
+        else {
+            panic!("expected Approval outcome");
+        };
+        assert_eq!(request_id, "req-1");
+        assert!(allow);
+        assert_eq!(actor, "clicker-1");
+        assert_eq!(token, "tok-btn-1");
+        assert_eq!(edit, "✅ Approved by <@clicker-1>");
+    }
+
+    #[test]
+    fn handle_interaction_button_deny_by_authorized_role_emits_decision_false() {
+        let pending = pending_with("req-1", &["approver"], Some("starter-1"));
+        let raw = button_interaction(
+            "tok-btn-2",
+            "chan-1",
+            "req-1:deny",
+            "clicker-1",
+            &["approver"],
+        );
+        let outcome = handle_interaction(&raw, &pending);
+        let InteractionOutcome::Approval { allow, edit, .. } = outcome else {
+            panic!("expected Approval outcome");
+        };
+        assert!(!allow);
+        assert_eq!(edit, "🚫 Denied by <@clicker-1>");
+    }
+
+    #[test]
+    fn handle_interaction_button_starter_is_always_allowed() {
+        // Empty approver_role_ids would deny anyone else, but the starter
+        // clicking their own request is always authorized.
+        let pending = pending_with("req-2", &[], Some("starter-9"));
+        let raw = button_interaction("tok-btn-3", "chan-1", "req-2:approve", "starter-9", &[]);
+        let outcome = handle_interaction(&raw, &pending);
+        assert!(matches!(
+            outcome,
+            InteractionOutcome::Approval { allow: true, .. }
+        ));
+    }
+
+    #[test]
+    fn handle_interaction_button_unauthorized_click_denies_no_decision() {
+        let pending = pending_with("req-3", &["approver"], Some("starter-1"));
+        let raw = button_interaction(
+            "tok-btn-4",
+            "chan-1",
+            "req-3:approve",
+            "rando",
+            &["not-approver"],
+        );
+        let outcome = handle_interaction(&raw, &pending);
+        let InteractionOutcome::Unauthorized { token, ephemeral } = outcome else {
+            panic!("expected Unauthorized outcome");
+        };
+        assert_eq!(token, "tok-btn-4");
+        assert_eq!(ephemeral, "You are not authorized to approve this.");
+    }
+
+    #[test]
+    fn handle_interaction_button_missing_pending_entry_is_ignored() {
+        let raw = button_interaction(
+            "tok-btn-5",
+            "chan-1",
+            "unknown-req:approve",
+            "u1",
+            &["approver"],
+        );
+        assert_eq!(
+            handle_interaction(&raw, &no_pending()),
+            InteractionOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn handle_interaction_button_bad_custom_id_is_ignored() {
+        let pending = pending_with("req-1", &["approver"], Some("starter-1"));
+        let raw = button_interaction("tok-btn-6", "chan-1", "req-1:maybe", "u1", &["approver"]);
+        assert_eq!(
+            handle_interaction(&raw, &pending),
+            InteractionOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn handle_interaction_unknown_interaction_type_is_ignored() {
+        let raw = json!({ "type": 99, "token": "t" });
+        assert_eq!(
+            handle_interaction(&raw, &no_pending()),
+            InteractionOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn handle_interaction_missing_type_field_is_ignored_not_panicking() {
+        let raw = json!({ "token": "t" });
+        assert_eq!(
+            handle_interaction(&raw, &no_pending()),
+            InteractionOutcome::Ignored
+        );
+    }
+
+    // ---------- on_frame wiring: INTERACTION_CREATE ----------
+
+    #[test]
+    fn on_frame_wires_interaction_create_slash_to_defer_and_emit() {
+        let mut state = GatewayState::new("t");
+        let raw = slash_interaction("status", "tok-7", "chan-1", "u1", &[], &[]);
+        let frame = dispatch("INTERACTION_CREATE", 1, raw);
+        let actions = on_frame(&mut state, &frame, false, &no_pending());
+
+        assert!(actions.contains(&Action::DeferInteraction {
+            token: "tok-7".to_string()
+        }));
+        let event = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::EmitInbound(e) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("expected an EmitInbound action");
+        assert_eq!(event.event_type, "slash.status");
+    }
+
+    #[test]
+    fn on_frame_wires_interaction_create_authorized_button_to_edit_and_emit() {
+        let mut state = GatewayState::new("t");
+        let pending = pending_with("req-9", &["approver"], Some("starter-1"));
+        let raw = button_interaction(
+            "tok-8",
+            "chan-1",
+            "req-9:approve",
+            "clicker-1",
+            &["approver"],
+        );
+        let frame = dispatch("INTERACTION_CREATE", 1, raw);
+        let actions = on_frame(&mut state, &frame, false, &pending);
+
+        assert!(actions.contains(&Action::EditInteractionMessage {
+            token: "tok-8".to_string(),
+            text: "✅ Approved by <@clicker-1>".to_string(),
+        }));
+        let event = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::EmitInbound(e) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("expected an EmitInbound action");
+        assert_eq!(event.event_type, "approval.decision");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(
+            payload,
+            json!({ "request_id": "req-9", "allow": true, "actor": "clicker-1" })
+        );
+    }
+
+    #[test]
+    fn on_frame_wires_interaction_create_unauthorized_button_to_ephemeral_reply_only() {
+        let mut state = GatewayState::new("t");
+        let pending = pending_with("req-9", &["approver"], Some("starter-1"));
+        let raw = button_interaction("tok-9", "chan-1", "req-9:approve", "rando", &[]);
+        let frame = dispatch("INTERACTION_CREATE", 1, raw);
+        let actions = on_frame(&mut state, &frame, false, &pending);
+
+        assert_eq!(
+            actions,
+            vec![Action::ReplyEphemeral {
+                token: "tok-9".to_string(),
+                text: "You are not authorized to approve this.".to_string(),
+            }]
+        );
     }
 }

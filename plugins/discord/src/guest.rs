@@ -9,8 +9,13 @@
 //! is wired into [`logic::on_frame`] itself — this module's only Task 8
 //! responsibility is the `is_thread` input, currently hardcoded `false` (see
 //! `drive`'s comment) until the REST `GET /channels/{id}` channel-type
-//! classification lands in Task 10. Slash commands + approvals (Task 9) and
-//! Discord REST for `deliver-outbound` (Task 10) build on this skeleton.
+//! classification lands in Task 10. Slash commands + approval-button routing
+//! (Task 9) are likewise wired into [`logic::on_frame`]/[`logic::handle_interaction`]
+//! themselves — the three new [`logic::Action`] variants they emit
+//! (`DeferInteraction`/`EditInteractionMessage`/`ReplyEphemeral`) are
+//! deliberately no-ops here, and `Runtime::pending_approvals` starts empty,
+//! until Discord REST (interaction defer/edit/reply, command registration,
+//! and `deliver-outbound`) lands in Task 10.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -44,6 +49,12 @@ struct Runtime {
     state: logic::GatewayState,
     clock_base: Instant,
     pending: VecDeque<logic::InboundEvent>,
+    /// Outstanding approval requests, keyed by `request_id` — empty until
+    /// Task 10 populates it from a `deliver-outbound(approval-request)` call
+    /// (before the buttons are even posted), so an `INTERACTION_CREATE`
+    /// button click can be authorized by [`logic::handle_interaction`]
+    /// purely against this map.
+    pending_approvals: logic::PendingApprovals,
     last_error: Option<String>,
     /// Read at `start`; consumed by Task 9 slash-command registration.
     #[allow(dead_code)]
@@ -72,6 +83,7 @@ impl Guest for Discord {
                 state: logic::GatewayState::new(token),
                 clock_base: Instant::now(),
                 pending: VecDeque::new(),
+                pending_approvals: logic::PendingApprovals::new(),
                 last_error: None,
                 app_id: settings_get(KEY_APP_ID),
                 guild_id: settings_get(KEY_GUILD_ID),
@@ -177,7 +189,8 @@ fn drive(runtime: &mut Runtime) {
                 // ahead of this call — channel messages and DMs are
                 // unaffected; a thread reply is simply not yet detected as
                 // one (falls through to the mention/bare-message rules).
-                let actions = logic::on_frame(&mut runtime.state, &text, false);
+                let actions =
+                    logic::on_frame(&mut runtime.state, &text, false, &runtime.pending_approvals);
                 perform(runtime, actions);
             }
         }
@@ -212,6 +225,14 @@ fn perform(runtime: &mut Runtime, actions: Vec<Action>) {
             Action::SetHeartbeat(_) => {}
             Action::EmitInbound(event) => runtime.pending.push_back(event),
             Action::Reconnect { resume } => reconnect(runtime, resume),
+            // Discord REST for the interaction defer / approval-message edit /
+            // ephemeral reply (over `ryuzi:http`) lands in Task 10, which also
+            // populates `runtime.pending_approvals` from a delivered
+            // `approval-request` outbound op. Until then these are no-ops —
+            // the paired `EmitInbound` action (if any) still queues normally.
+            Action::DeferInteraction { .. } => {}
+            Action::EditInteractionMessage { .. } => {}
+            Action::ReplyEphemeral { .. } => {}
         }
     }
 }
