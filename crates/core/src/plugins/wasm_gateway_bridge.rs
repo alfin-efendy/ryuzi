@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -489,7 +489,17 @@ pub struct WasmGateway {
     /// task to dispatch `message.*` inbound events (Task 5) and route `slash.*`
     /// commands to `on_connect`/`on_end`/`on_stop` with an `interaction-reply`
     /// (Task 6).
-    router: Arc<OnceLock<Arc<Router>>>,
+    ///
+    /// Held as a `Weak` on purpose: the daemon's inbound `router_in`
+    /// (`Arc<Router>`) holds this gateway in its `gateways` map, and `set_router`
+    /// stores that same router back here — a STRONG `Arc` would form an
+    /// unbreakable `router_in ⟷ WasmGateway` cycle, so `WasmGateway::drop` (which
+    /// aborts the background tasks) would never run on daemon shutdown. A `Weak`
+    /// lets the refcount reach 0. During normal operation the daemon keeps
+    /// `router_in` alive, so `upgrade()` always succeeds; once it is dropped
+    /// (shutting down) `upgrade()` returns `None` and the event is dropped, same
+    /// as the router-not-set-yet path.
+    router: Arc<OnceLock<Weak<Router>>>,
     correlation: Arc<Correlation>,
     status: Arc<GatewayStatusPublisher>,
     next_op: AtomicU64,
@@ -510,7 +520,7 @@ impl WasmGateway {
         tuning: SupervisorTuning,
     ) -> Self {
         let correlation = Arc::new(Correlation::new());
-        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
+        let router: Arc<OnceLock<Weak<Router>>> = Arc::new(OnceLock::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let supervisor = Arc::new(WasmGatewaySupervisor::spawn_with_inbound(
             plugin_id.clone(),
@@ -554,6 +564,14 @@ impl WasmGateway {
     /// A fresh, per-gateway-unique outbound op id.
     fn next_op_id(&self) -> String {
         format!("op-{}", self.next_op.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Test-only: `AbortHandle`s for the background tasks, so a leak test can
+    /// prove they are aborted after `stop()`/`Drop` (the tasks themselves are
+    /// private and unobservable once the gateway is dropped).
+    #[cfg(test)]
+    fn task_abort_handles(&self) -> Vec<tokio::task::AbortHandle> {
+        self.tasks.iter().map(|task| task.abort_handle()).collect()
     }
 
     /// Encode and hand `op` to the component. `Ok(())` means the component
@@ -696,7 +714,7 @@ fn connect_opts_from_wire(opts: ConnectOptsWire, role_ids: Vec<String>) -> Conne
 async fn drain_inbound(
     mut inbound: mpsc::UnboundedReceiver<GatewayInboundEvent>,
     correlation: Arc<Correlation>,
-    router: Arc<OnceLock<Arc<Router>>>,
+    router: Arc<OnceLock<Weak<Router>>>,
     reply_sink: Arc<dyn OutboundReplySink>,
     gateway_id: String,
 ) {
@@ -789,7 +807,7 @@ async fn drain_inbound(
                 user_id,
                 opts,
                 role_ids,
-            }) => match router.get() {
+            }) => match router.get().and_then(Weak::upgrade) {
                 Some(router) => {
                     let text = match router
                         .on_connect(
@@ -826,7 +844,7 @@ async fn drain_inbound(
             Ok(InboundEvent::SlashEnd {
                 token,
                 conversation_id,
-            }) => match router.get() {
+            }) => match router.get().and_then(Weak::upgrade) {
                 Some(router) => {
                     let text = match router.on_end(&gateway_id, &conversation_id).await {
                         Ok(()) => "🟥 session ended".to_string(),
@@ -844,7 +862,7 @@ async fn drain_inbound(
             Ok(InboundEvent::SlashStop {
                 token,
                 conversation_id,
-            }) => match router.get() {
+            }) => match router.get().and_then(Weak::upgrade) {
                 Some(router) => {
                     let text = match router.on_stop(&gateway_id, &conversation_id).await {
                         Ok(()) => "⏹️ stopping the current turn".to_string(),
@@ -861,8 +879,9 @@ async fn drain_inbound(
             },
             Ok(InboundEvent::SlashStatus { token }) => {
                 // Pure reply, no session op (design doc §5.2) — but still gated on
-                // a router being set, matching native's uniform interaction drop.
-                if router.get().is_some() {
+                // a router being set (and still live), matching native's uniform
+                // interaction drop.
+                if router.get().and_then(Weak::upgrade).is_some() {
                     reply_sink
                         .deliver_reply(OutboundOp::InteractionReply {
                             token,
@@ -894,11 +913,11 @@ async fn drain_inbound(
 /// to — so an event dropped for "no router set yet" leaves `last_sequence`
 /// untouched, and a later reconnect replay of that same sequence is still
 /// admitted once a router IS set (never permanently lost to the gate).
-fn admit_message<'a>(
-    router: &'a OnceLock<Arc<Router>>,
+fn admit_message(
+    router: &OnceLock<Weak<Router>>,
     last_sequence: &mut u64,
     event: &GatewayInboundEvent,
-) -> Option<&'a Arc<Router>> {
+) -> Option<Arc<Router>> {
     if event.sequence <= *last_sequence {
         tracing::trace!(
             event = %event.event_type,
@@ -910,11 +929,13 @@ fn admit_message<'a>(
     }
     // Matches the native Discord gateway's documented "events arriving
     // before `set_router` are dropped with a warning" behaviour
-    // (`gateway/discord/mod.rs`'s `InboundRouting::handle_message`).
-    let Some(router) = router.get() else {
+    // (`gateway/discord/mod.rs`'s `InboundRouting::handle_message`). Upgrading
+    // the `Weak` also returns `None` once the router has been dropped (daemon
+    // shutting down) — the event is likewise dropped, never dispatched.
+    let Some(router) = router.get().and_then(Weak::upgrade) else {
         tracing::trace!(
             event = %event.event_type,
-            "wasm gateway inbound event dropped: no router set yet"
+            "wasm gateway inbound event dropped: no live router set yet"
         );
         return None;
     };
@@ -991,6 +1012,13 @@ impl Gateway for WasmGateway {
 
     async fn stop(&self) -> anyhow::Result<()> {
         self.supervisor.stop().await;
+        // Tear down the background tasks on the graceful path too, not only via
+        // `Drop`: the daemon calls `stop()` on every gateway at shutdown, and the
+        // `watch_status` loop otherwise runs forever (it is aborted only in
+        // `Drop`). Aborting here is idempotent with `Drop`'s own abort.
+        for task in &self.tasks {
+            task.abort();
+        }
         Ok(())
     }
 
@@ -1119,8 +1147,10 @@ impl Gateway for WasmGateway {
     }
 
     fn set_router(&self, router: Arc<Router>) {
-        // First writer wins (single `set_router` call, per the trait doc).
-        let _ = self.router.set(router);
+        // Store a `Weak` (not the strong `Arc`) to avoid the `router_in ⟷
+        // WasmGateway` reference cycle — see the `router` field doc. First writer
+        // wins (single `set_router` call, per the trait doc).
+        let _ = self.router.set(Arc::downgrade(&router));
     }
 
     fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
@@ -2310,12 +2340,13 @@ mod gateway_impl_tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (cp, _store, _db_guard) =
             wired_control_plane(Arc::new(RecordingHarnessFactory { log })).await;
-        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
-        // `Router` isn't `Debug`, so assert via `is_err()` rather than `.expect()`.
+        // A strong Router kept alive for the whole (spawned) drain so its `Weak`
+        // upgrades — needed here so the message.dm actually advances
+        // `last_sequence` past the low-sequenced op.result under test.
+        let router_strong = Arc::new(Router::new(Arc::clone(&cp), vec![]));
+        let router: Arc<OnceLock<Weak<Router>>> = Arc::new(OnceLock::new());
         assert!(
-            router
-                .set(Arc::new(Router::new(Arc::clone(&cp), vec![])))
-                .is_ok(),
+            router.set(Arc::downgrade(&router_strong)).is_ok(),
             "router OnceLock is set exactly once, freshly, here"
         );
 
@@ -2437,11 +2468,13 @@ mod gateway_impl_tests {
         gateways: Vec<Arc<dyn Gateway>>,
         event: InboundEvent,
     ) -> Arc<RecordingReplySink> {
-        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
+        // A strong `Router` kept alive for the whole drain (production's daemon
+        // holds `router_in`); the `OnceLock` stores only a `Weak`, mirroring
+        // `WasmGateway::set_router`, so `upgrade()` succeeds throughout.
+        let router_strong = Arc::new(Router::new(Arc::clone(cp), gateways));
+        let router: Arc<OnceLock<Weak<Router>>> = Arc::new(OnceLock::new());
         assert!(
-            router
-                .set(Arc::new(Router::new(Arc::clone(cp), gateways)))
-                .is_ok(),
+            router.set(Arc::downgrade(&router_strong)).is_ok(),
             "fresh router OnceLock is set exactly once here"
         );
         let sink = Arc::new(RecordingReplySink::default());
@@ -2462,6 +2495,7 @@ mod gateway_impl_tests {
             "acme-gateway".to_string(),
         )
         .await;
+        drop(router_strong);
         sink
     }
 
@@ -2623,7 +2657,7 @@ mod gateway_impl_tests {
     /// no reply is produced.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slash_events_before_set_router_are_dropped_without_reply() {
-        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new()); // never set
+        let router: Arc<OnceLock<Weak<Router>>> = Arc::new(OnceLock::new()); // never set
         let sink = Arc::new(RecordingReplySink::default());
         let (tx, rx) = mpsc::unbounded_channel();
         let (event_type, payload) = InboundEvent::SlashStatus {
@@ -2809,5 +2843,86 @@ mod gateway_impl_tests {
             .start()
             .await
             .expect("the daemon start path starts the constructed gateway");
+    }
+
+    // -------------------------------------------------------------
+    // Task 6: teardown — no leaked background tasks (Arc-cycle regression)
+    // -------------------------------------------------------------
+
+    /// Poll `cond` up to `attempts` times (10ms between), returning whether it
+    /// ever held.
+    async fn wait_until(attempts: usize, cond: impl Fn() -> bool) -> bool {
+        for _ in 0..attempts {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// Regression for the `router_in ⟷ WasmGateway` Arc-cycle leak: a
+    /// daemon-registered gateway is `set_router`'d with the very `Arc<Router>`
+    /// whose `gateways` map holds the gateway (exactly how `build_daemon` wires
+    /// `router_in`). Storing that router STRONGLY in the gateway would form an
+    /// unbreakable cycle, so `WasmGateway::drop` (which aborts the drain +
+    /// status-watch tasks) would never run. The `Weak` keeps it breakable:
+    /// dropping BOTH the gateway ref and the router (daemon shutdown) lets the
+    /// refcount reach 0 → `Drop` aborts every background task. With a strong
+    /// `Arc` here the tasks would leak and this test would hang-then-fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn dropping_a_router_wired_gateway_and_its_router_aborts_all_tasks() {
+        let (cp, _store, _db) = wired_control_plane(empty_log_harness()).await;
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+        let gateway = Arc::new(gateway);
+        // The router holds the gateway in its `gateways` map, just like the
+        // daemon's `router_in`; `set_router` stores that same router back.
+        let router = Arc::new(Router::new(
+            Arc::clone(&cp),
+            vec![Arc::clone(&gateway) as Arc<dyn Gateway>],
+        ));
+        gateway.set_router(Arc::clone(&router));
+
+        let handles = gateway.task_abort_handles();
+        assert_eq!(handles.len(), 2, "drain + status-watch tasks");
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "tasks run while the gateway is live"
+        );
+
+        // Daemon shutdown: drop both strong refs.
+        drop(gateway);
+        drop(router);
+
+        assert!(
+            wait_until(50, || handles.iter().all(|h| h.is_finished())).await,
+            "Drop must abort every background task once the Arc cycle is broken"
+        );
+    }
+
+    /// The graceful path: `stop()` must abort the background tasks (not only the
+    /// supervisor), so the daemon's shutdown `gw.stop()` loop tears everything
+    /// down without relying on `Drop`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_aborts_all_background_tasks() {
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "wss://example.invalid/gw".to_string(),
+        })
+        .await;
+        let handles = gateway.task_abort_handles();
+        assert!(handles.iter().all(|h| !h.is_finished()));
+
+        gateway.stop().await.unwrap();
+
+        assert!(
+            wait_until(50, || handles.iter().all(|h| h.is_finished())).await,
+            "stop() must abort every background task, not only the supervisor"
+        );
     }
 }
