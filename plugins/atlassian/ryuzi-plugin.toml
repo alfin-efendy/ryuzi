@@ -1,0 +1,53 @@
+id = "atlassian"
+name = "Atlassian"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "atlassian.wasm"
+publisher = "Ryuzi"
+description = "Atlassian connector: Jira issue search/get/create/comment/transition and Confluence page search/get/create/update, all over one host-managed atlassian-cloud 3LO OAuth profile. Every mutating tool (issue create/comment/transition, page create/update) is gated behind an explicit `confirm=true` argument — an unconfirmed mutation never leaves the component."
+
+# The only hosts the component may reach through the host-mediated OAuth egress
+# (`ryuzi:oauth/oauth`'s `authorized-request`, which is bounded to this same
+# allowlist). Every Jira/Confluence REST call goes through the OAuth 2.0 (3LO)
+# API gateway at `api.atlassian.com/ex/{jira,confluence}/{cloudid}/...` — the
+# component never talks to a tenant's own `*.atlassian.net` host directly.
+# `auth.atlassian.com` is where the host-driven OAuth (authorize/token)
+# endpoints live — the component itself never calls auth.atlassian.com (that
+# flow is host-side, see `crates/core/src/plugins/capabilities/oauth.rs`), but
+# the profile below authorizes against it, and it is kept here to mirror how
+# the GitHub connector keeps `github.com` alongside `api.github.com`.
+[permissions]
+network = ["api.atlassian.com", "auth.atlassian.com"]
+
+# Host-managed OAuth profile (Task 8). The component only ever calls
+# `authorized-request("atlassian-cloud", ..)`; it never drives the 3LO
+# authorize/token exchange and never sees a token — Cockpit + the host own
+# that (see crates/core/src/plugins/capabilities/oauth.rs). Field names mirror
+# `ryuzi_plugin_sdk::OAuthProfile` (kebab-case). ONE profile serves both Jira
+# and Confluence tools — Atlassian Cloud's 3LO grant is per-app, not
+# per-product, and `GET /oauth/token/accessible-resources` (the `auth_status`
+# tool) returns every Jira/Confluence site the single granted token can reach.
+[[oauth]]
+id = "atlassian-cloud"
+authorize-url = "https://auth.atlassian.com/authorize"
+token-url = "https://auth.atlassian.com/oauth/token"
+scopes = [
+  "read:jira-work",
+  "write:jira-work",
+  "read:confluence-content.all",
+  "write:confluence-content",
+  "offline_access",
+]
+# Atlassian OAuth apps do not support RFC 7591 Dynamic Client Registration;
+# the client id is provisioned out-of-band (developer.atlassian.com console)
+# and supplied host-side at connect time.
+dynamic-registration = false
+# Atlassian's authorize URL REQUIRES an `audience=api.atlassian.com` query
+# parameter (undocumented by any other OAuthProfile field name — the closest
+# schema field is `resource`, which host-side `ProfileOauth::begin_pkce` does
+# not yet forward as a query parameter; see crates/core/src/plugins/capabilities/oauth.rs).
+# Recorded here for the host-side 3LO wiring this profile needs before a real
+# "Connect Atlassian" flow works end-to-end:
+#   https://auth.atlassian.com/authorize?audience=api.atlassian.com&...
+resource = "api.atlassian.com"

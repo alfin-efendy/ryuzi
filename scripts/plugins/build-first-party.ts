@@ -71,6 +71,7 @@ export const COMPONENTS: ComponentSpec[] = [
   { id: "opencode", dir: "plugins/opencode", crateWasmStem: "ryuzi_plugin_opencode" },
   { id: "github", dir: "plugins/github", crateWasmStem: "ryuzi_plugin_github" },
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
+  { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },
 ];
 
 /** The `PluginRelease` JSON shape (crates/plugin-sdk/src/bundle.rs). `wit-api` is kebab in the wire form. */
