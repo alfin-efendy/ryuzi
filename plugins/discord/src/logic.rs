@@ -63,22 +63,27 @@ pub enum Action {
         resume: bool,
     },
     /// Defer a slash-command interaction (Discord's 3-second ack) via its
-    /// interaction `token`, BEFORE the paired `EmitInbound(slash.*)` action is
-    /// acted on (Task 10 sends the REST defer, then routes the event).
+    /// interaction `id` + `token`, BEFORE the paired `EmitInbound(slash.*)`
+    /// action is acted on (Task 10 POSTs the REST `type:5` deferred callback to
+    /// `/interactions/{id}/{token}/callback`, then routes the event).
     DeferInteraction {
+        id: String,
         token: String,
     },
     /// An authorized approval-button click: edit the original message (via
-    /// Discord's `UpdateMessage` interaction-response, keyed by the button
-    /// click's OWN interaction `token` — no message id needed) to `text`.
-    /// Paired with an `EmitInbound(approval.decision)` action.
+    /// Discord's `UpdateMessage` interaction-response `type:7`, keyed by the
+    /// button click's OWN interaction `id` + `token` — no message id needed)
+    /// to `text`. Paired with an `EmitInbound(approval.decision)` action.
     EditInteractionMessage {
+        id: String,
         token: String,
         text: String,
     },
-    /// An unauthorized approval-button click: reply ephemerally via the
-    /// click's interaction `token`. No decision is emitted.
+    /// An unauthorized approval-button click: reply ephemerally (`type:4`,
+    /// `flags:64`) via the click's interaction `id` + `token`. No decision is
+    /// emitted.
     ReplyEphemeral {
+        id: String,
         token: String,
         text: String,
     },
@@ -94,6 +99,10 @@ pub enum Action {
 pub struct PendingApproval {
     pub approver_role_ids: Vec<String>,
     pub started_by: Option<String>,
+    /// The name of the tool being approved — carried so [`handle_button`]'s
+    /// message edit can restore native's `" — **{tool}**"` suffix. The guest
+    /// fills it from the `deliver-outbound(approval-request)` payload.
+    pub tool: String,
 }
 
 /// `request_id -> PendingApproval`, threaded into [`on_frame`]/[`handle_interaction`]
@@ -109,23 +118,32 @@ pub type PendingApprovals = HashMap<String, PendingApproval>;
 pub enum InteractionOutcome {
     /// A slash command (`/connect`, `/end`, `/stop`, `/status`): the guest
     /// must defer (when `defer` is true — always, today) then route `event`.
+    /// `id` is the interaction's own snowflake, needed alongside `token` for
+    /// the REST `/interactions/{id}/{token}/callback` defer.
     Slash {
         defer: bool,
+        id: String,
         token: String,
         event: InboundEvent,
     },
     /// An authorized approval-button click: the decision to emit plus the
-    /// text to edit the original message to.
+    /// text to edit the original message to. `id`+`token` address the REST
+    /// `UpdateMessage` callback.
     Approval {
         request_id: String,
         allow: bool,
         actor: String,
         edit: String,
+        id: String,
         token: String,
     },
     /// An approval-button click by a clicker `can_approve` rejects: no
-    /// decision is emitted, only an ephemeral reply.
-    Unauthorized { token: String, ephemeral: String },
+    /// decision is emitted, only an ephemeral reply (via `id`+`token`).
+    Unauthorized {
+        id: String,
+        token: String,
+        ephemeral: String,
+    },
     /// Anything else this component doesn't act on: an unknown interaction
     /// type, an unrecognized slash-command name, a malformed/unrecognized
     /// button `custom_id`, or a button click for a `request_id` with no
@@ -169,6 +187,38 @@ impl GatewayState {
     pub fn take_reconnect(&mut self) -> Option<bool> {
         self.reconnect.take()
     }
+
+    /// Prepare the state for a guest-detected dropped socket (a `ws::poll`
+    /// disconnect or a `closed`/`closing` `ws::state`, §6.1): resume if we still
+    /// hold a session (arms a RESUME on the next HELLO), else re-IDENTIFY.
+    /// Returns whether the guest should reconnect to the stored
+    /// `resume_gateway_url` (`true`) or the base gateway (`false`). Mirrors the
+    /// RECONNECT/INVALID_SESSION opcode paths, but triggered by the transport
+    /// dropping rather than a gateway frame — so the guest need not wait ~41s
+    /// for the heartbeat-blackout path to notice.
+    pub fn plan_reconnect(&mut self) -> bool {
+        if self.session_id.is_some() {
+            self.pending_resume = true;
+            self.phase = GatewayPhase::Resuming;
+            true
+        } else {
+            self.pending_resume = false;
+            self.phase = GatewayPhase::Connecting;
+            false
+        }
+    }
+}
+
+/// Build the websocket URL to RESUME on: Discord's `resume_gateway_url` (from
+/// READY) with the same `?v=10&encoding=json` query the base gateway uses
+/// appended (the READY value is a bare `wss://host`, no query). Resuming to
+/// this per-session host — NOT the base [`GATEWAY_URL`] — is required: the base
+/// can land on a shard without the session and provoke an INVALID_SESSION.
+pub fn resume_ws_url(resume_gateway_url: &str) -> String {
+    format!(
+        "{}/?v=10&encoding=json",
+        resume_gateway_url.trim_end_matches('/')
+    )
 }
 
 /// Advance the state machine by one inbound gateway frame, returning the side
@@ -628,6 +678,11 @@ fn parse_string_options(data: Option<&Value>) -> HashMap<String, String> {
 /// conversation_id}`, `slash.stop{token,conversation_id}`,
 /// `slash.status{token}`. An unrecognized command name is ignored.
 fn handle_slash(raw: &Value) -> InteractionOutcome {
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let token = raw
         .get("token")
         .and_then(Value::as_str)
@@ -676,6 +731,7 @@ fn handle_slash(raw: &Value) -> InteractionOutcome {
 
     InteractionOutcome::Slash {
         defer: true,
+        id,
         token: token.clone(),
         event: build_event(event_type, payload, 0),
     }
@@ -701,15 +757,19 @@ fn parse_custom_id(custom_id: &str) -> Option<(&str, bool)> {
 /// `custom_id`, look up the pending approval, authorize via [`can_approve`]
 /// exactly like native `request_approval`'s collector loop, and produce
 /// either an authorized [`InteractionOutcome::Approval`] (edit text
-/// `"{label} by <@{actor}>"`, `label` = "✅ Approved"/"🚫 Denied" — native
-/// also appends `" — **{tool}**"`, omitted here since [`PendingApproval`]
-/// deliberately carries only what [`can_approve`] needs, not the tool name;
-/// a delegated simplification, not a fidelity gap in the authorization
-/// logic itself) or an [`InteractionOutcome::Unauthorized`] ephemeral reply
-/// (native's exact "You are not authorized to approve this." string). A
-/// `request_id` absent from `pending` (already resolved, expired, or
-/// unknown) is ignored, same as a malformed `custom_id`.
+/// `"{label} by <@{actor}> — **{tool}**"`, `label` = "✅ Approved"/"🚫 Denied",
+/// `tool` from the [`PendingApproval`] — reproducing native
+/// `request_approval`'s exact edit string) or an
+/// [`InteractionOutcome::Unauthorized`] ephemeral reply (native's exact
+/// "You are not authorized to approve this." string). A `request_id` absent
+/// from `pending` (already resolved, expired, or unknown) is ignored, same as
+/// a malformed `custom_id`.
 fn handle_button(raw: &Value, pending: &PendingApprovals) -> InteractionOutcome {
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let token = raw
         .get("token")
         .and_then(Value::as_str)
@@ -733,6 +793,7 @@ fn handle_button(raw: &Value, pending: &PendingApprovals) -> InteractionOutcome 
     let is_starter = approval.started_by.as_deref() == Some(actor.as_str());
     if !can_approve(&clicker_role_ids, &approval.approver_role_ids, is_starter) {
         return InteractionOutcome::Unauthorized {
+            id,
             token,
             ephemeral: "You are not authorized to approve this.".to_string(),
         };
@@ -742,8 +803,9 @@ fn handle_button(raw: &Value, pending: &PendingApprovals) -> InteractionOutcome 
     InteractionOutcome::Approval {
         request_id: request_id.to_string(),
         allow,
-        edit: format!("{label} by <@{actor}>"),
+        edit: format!("{label} by <@{actor}> — **{}**", approval.tool),
         actor,
+        id,
         token,
     }
 }
@@ -758,12 +820,13 @@ fn interaction_actions(outcome: InteractionOutcome) -> Vec<Action> {
     match outcome {
         InteractionOutcome::Slash {
             defer,
+            id,
             token,
             event,
         } => {
             let mut actions = Vec::new();
             if defer {
-                actions.push(Action::DeferInteraction { token });
+                actions.push(Action::DeferInteraction { id, token });
             }
             actions.push(Action::EmitInbound(event));
             actions
@@ -773,16 +836,26 @@ fn interaction_actions(outcome: InteractionOutcome) -> Vec<Action> {
             allow,
             actor,
             edit,
+            id,
             token,
         } => vec![
-            Action::EditInteractionMessage { token, text: edit },
+            Action::EditInteractionMessage {
+                id,
+                token,
+                text: edit,
+            },
             Action::EmitInbound(build_event(
                 "approval.decision",
                 json!({ "request_id": request_id, "allow": allow, "actor": actor }),
                 0,
             )),
         ],
-        InteractionOutcome::Unauthorized { token, ephemeral } => vec![Action::ReplyEphemeral {
+        InteractionOutcome::Unauthorized {
+            id,
+            token,
+            ephemeral,
+        } => vec![Action::ReplyEphemeral {
+            id,
             token,
             text: ephemeral,
         }],
@@ -884,6 +957,461 @@ fn str_field(data: Option<&Value>, key: &str) -> Option<String> {
     data.and_then(|d| d.get(key))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+// =====================================================================
+// Task 10: outbound Discord REST (pure request planning + response parsing)
+// =====================================================================
+//
+// The guest (`guest.rs`) performs no Discord-specific decision-making: it
+// decodes a `deliver-outbound` event into an [`OutboundKind`], asks
+// [`plan_outbound`] for the exact [`RestRequest`]s to send over `ryuzi:http`,
+// sends them, and asks [`outbound_op_result`] for the `op.result` inbound
+// event (if any) to queue. Everything below is pure — no host handle, no
+// network — so it is exercised natively with synthetic REST bodies/statuses.
+//
+// The bot token appears in exactly ONE place: the `Authorization: Bot {token}`
+// header [`auth_headers`] stamps on every request. It is never placed in a
+// URL, a body, or a log line (the `token_never_leaves_the_bot_auth_header`
+// test enforces this across every op).
+
+/// Discord REST base, v10 JSON (matches the native serenity `Http` base).
+pub const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+
+/// The bot-token + surrounding ids the REST planners need. Borrowed, so the
+/// guest can build one per call from its long-lived `GatewayState`/settings
+/// without cloning the token around.
+pub struct RestCtx<'a> {
+    pub token: &'a str,
+    pub app_id: &'a str,
+    pub guild_id: &'a str,
+}
+
+/// A fully-planned Discord REST request the guest hands verbatim to
+/// `ryuzi:http`. `body` is a JSON string (`None` for a bodyless GET/defer);
+/// `headers` always carries the `Authorization: Bot {token}` pair, plus
+/// `Content-Type: application/json` whenever there is a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+}
+
+/// The correlated result body of one outbound op — the `op.result` payload
+/// (design §5.3). Only the field relevant to the op kind is ever populated:
+/// `create-channel` → `channel_id`, `create-thread` → `thread_id`,
+/// `send-message` → `message_id`, `edit-message`/`send-messages` → `ok`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpResultBody {
+    pub channel_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub message_id: Option<String>,
+    pub ok: Option<bool>,
+}
+
+/// A decoded `deliver-outbound` op (design §5.3). The component's own mirror of
+/// the host bridge's `OutboundOp` (this crate can't depend on `crates/core`),
+/// carrying only the fields the REST planners actually consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundKind {
+    CreateChannel {
+        op_id: String,
+        name: String,
+    },
+    CreateThread {
+        op_id: String,
+        channel_id: String,
+        title: String,
+    },
+    SendMessage {
+        op_id: String,
+        channel_id: String,
+        text: String,
+    },
+    EditMessage {
+        op_id: String,
+        channel_id: String,
+        message_id: String,
+        text: String,
+    },
+    SendMessages {
+        op_id: String,
+        channel_id: String,
+        chunks: Vec<String>,
+    },
+    ApprovalRequest {
+        op_id: String,
+        request_id: String,
+        conversation_id: String,
+        tool: String,
+        summary: String,
+        approver_role_ids: Vec<String>,
+        started_by: Option<String>,
+    },
+    InteractionReply {
+        token: String,
+        text: String,
+    },
+}
+
+impl OutboundKind {
+    /// The op's correlation `op_id`, if it has one. `interaction-reply` has
+    /// none (it edits a deferred slash response, uncorrelated).
+    pub fn op_id(&self) -> Option<&str> {
+        match self {
+            OutboundKind::CreateChannel { op_id, .. }
+            | OutboundKind::CreateThread { op_id, .. }
+            | OutboundKind::SendMessage { op_id, .. }
+            | OutboundKind::EditMessage { op_id, .. }
+            | OutboundKind::SendMessages { op_id, .. }
+            | OutboundKind::ApprovalRequest { op_id, .. } => Some(op_id),
+            OutboundKind::InteractionReply { .. } => None,
+        }
+    }
+}
+
+/// Decode a `deliver-outbound` `gateway-event` (its `event-type` + flat JSON
+/// `payload`, design §5.3) into an [`OutboundKind`]. `None` on an unknown
+/// event-type or a payload missing a required field — the guest then rejects
+/// the delivery rather than trapping.
+pub fn decode_outbound(event_type: &str, payload: &[u8]) -> Option<OutboundKind> {
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    let s = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let strings = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    match event_type {
+        "create-channel" => Some(OutboundKind::CreateChannel {
+            op_id: s("op_id")?,
+            name: s("name").unwrap_or_default(),
+        }),
+        "create-thread" => Some(OutboundKind::CreateThread {
+            op_id: s("op_id")?,
+            channel_id: s("channel_id")?,
+            title: s("title").unwrap_or_default(),
+        }),
+        "send-message" => Some(OutboundKind::SendMessage {
+            op_id: s("op_id")?,
+            channel_id: s("channel_id")?,
+            text: s("text").unwrap_or_default(),
+        }),
+        "edit-message" => Some(OutboundKind::EditMessage {
+            op_id: s("op_id")?,
+            channel_id: s("channel_id")?,
+            message_id: s("message_id")?,
+            text: s("text").unwrap_or_default(),
+        }),
+        "send-messages" => Some(OutboundKind::SendMessages {
+            op_id: s("op_id")?,
+            channel_id: s("channel_id")?,
+            chunks: strings("chunks"),
+        }),
+        "approval-request" => Some(OutboundKind::ApprovalRequest {
+            op_id: s("op_id")?,
+            request_id: s("request_id")?,
+            conversation_id: s("conversation_id")?,
+            tool: s("tool").unwrap_or_default(),
+            summary: s("summary").unwrap_or_default(),
+            approver_role_ids: strings("approver_role_ids"),
+            started_by: s("started_by"),
+        }),
+        "interaction-reply" => Some(OutboundKind::InteractionReply {
+            token: s("token")?,
+            text: s("text").unwrap_or_default(),
+        }),
+        _ => None,
+    }
+}
+
+/// The shared REST-request builder: `https://discord.com/api/v10{path}` with
+/// the `Authorization: Bot {token}` header (the ONLY place the token ever
+/// appears) plus `Content-Type: application/json` whenever there is a body.
+fn discord_request(ctx: &RestCtx, method: &str, path: &str, body: Option<Value>) -> RestRequest {
+    let mut headers = vec![("Authorization".to_string(), format!("Bot {}", ctx.token))];
+    let body = body.map(|value| {
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        value.to_string()
+    });
+    RestRequest {
+        method: method.to_string(),
+        url: format!("{DISCORD_API_BASE}{path}"),
+        headers,
+        body,
+    }
+}
+
+/// The Approve/Deny button message body — content + a single action row of two
+/// buttons whose `custom_id`s are `"{request_id}:approve"` / `":deny"` (parsed
+/// back by [`parse_custom_id`]). Component type 1 = action row, 2 = button;
+/// styles 3 = success, 4 = danger (matches native `ButtonStyle::Success/Danger`).
+fn approval_message_body(request_id: &str, tool: &str, summary: &str) -> Value {
+    json!({
+        "content": format!("🔐 Approve **{tool}**?\n```\n{summary}\n```"),
+        "components": [{
+            "type": 1,
+            "components": [
+                { "type": 2, "style": 3, "label": "Approve", "custom_id": format!("{request_id}:approve") },
+                { "type": 2, "style": 4, "label": "Deny", "custom_id": format!("{request_id}:deny") },
+            ],
+        }],
+    })
+}
+
+/// Plan the REST request(s) for one outbound op. Most ops map to a single
+/// request; `send-messages` fans out to one POST per chunk (design §5.3).
+/// `approval-request` posts the Approve/Deny button message;
+/// `interaction-reply` edits the deferred slash response.
+pub fn plan_outbound(op: &OutboundKind, ctx: &RestCtx) -> Vec<RestRequest> {
+    match op {
+        OutboundKind::CreateChannel { name, .. } => vec![discord_request(
+            ctx,
+            "POST",
+            &format!("/guilds/{}/channels", ctx.guild_id),
+            Some(json!({ "name": name, "type": 0 })),
+        )],
+        OutboundKind::CreateThread {
+            channel_id, title, ..
+        } => vec![discord_request(
+            ctx,
+            "POST",
+            &format!("/channels/{channel_id}/threads"),
+            Some(json!({ "name": title })),
+        )],
+        OutboundKind::SendMessage {
+            channel_id, text, ..
+        } => vec![discord_request(
+            ctx,
+            "POST",
+            &format!("/channels/{channel_id}/messages"),
+            Some(json!({ "content": text })),
+        )],
+        OutboundKind::EditMessage {
+            channel_id,
+            message_id,
+            text,
+            ..
+        } => vec![discord_request(
+            ctx,
+            "PATCH",
+            &format!("/channels/{channel_id}/messages/{message_id}"),
+            Some(json!({ "content": text })),
+        )],
+        OutboundKind::SendMessages {
+            channel_id, chunks, ..
+        } => chunks
+            .iter()
+            .map(|chunk| {
+                discord_request(
+                    ctx,
+                    "POST",
+                    &format!("/channels/{channel_id}/messages"),
+                    Some(json!({ "content": chunk })),
+                )
+            })
+            .collect(),
+        OutboundKind::ApprovalRequest {
+            request_id,
+            conversation_id,
+            tool,
+            summary,
+            ..
+        } => vec![discord_request(
+            ctx,
+            "POST",
+            &format!("/channels/{conversation_id}/messages"),
+            Some(approval_message_body(request_id, tool, summary)),
+        )],
+        OutboundKind::InteractionReply { token, text } => vec![discord_request(
+            ctx,
+            "PATCH",
+            &format!("/webhooks/{}/{token}/messages/@original", ctx.app_id),
+            Some(json!({ "content": text })),
+        )],
+    }
+}
+
+/// The `PUT /applications/{app_id}/guilds/{guild_id}/commands` guild-command
+/// registration request (bulk overwrite with [`build_commands`]) the guest
+/// sends once at start.
+pub fn register_commands_request(ctx: &RestCtx) -> RestRequest {
+    discord_request(
+        ctx,
+        "PUT",
+        &format!(
+            "/applications/{}/guilds/{}/commands",
+            ctx.app_id, ctx.guild_id
+        ),
+        Some(build_commands()),
+    )
+}
+
+/// The `GET /channels/{id}` request whose response [`is_thread_channel`]
+/// classifies — the REST round-trip native `Handler::message` does to resolve
+/// `is_thread` per inbound message.
+pub fn channel_get_request(ctx: &RestCtx, channel_id: &str) -> RestRequest {
+    discord_request(ctx, "GET", &format!("/channels/{channel_id}"), None)
+}
+
+/// The `POST /interactions/{id}/{token}/callback` deferred-response (`type:5`,
+/// ephemeral `flags:64`) that acks a slash command within Discord's 3s window —
+/// the REST equivalent of native `defer_ephemeral`.
+pub fn defer_request(ctx: &RestCtx, interaction_id: &str, interaction_token: &str) -> RestRequest {
+    discord_request(
+        ctx,
+        "POST",
+        &format!("/interactions/{interaction_id}/{interaction_token}/callback"),
+        Some(json!({ "type": 5, "data": { "flags": 64 } })),
+    )
+}
+
+/// The `POST /interactions/{id}/{token}/callback` ephemeral message (`type:4`,
+/// `flags:64`) that answers an unauthorized approval-button click.
+pub fn ephemeral_reply_request(
+    ctx: &RestCtx,
+    interaction_id: &str,
+    interaction_token: &str,
+    text: &str,
+) -> RestRequest {
+    discord_request(
+        ctx,
+        "POST",
+        &format!("/interactions/{interaction_id}/{interaction_token}/callback"),
+        Some(json!({ "type": 4, "data": { "content": text, "flags": 64 } })),
+    )
+}
+
+/// The `POST /interactions/{id}/{token}/callback` update-message (`type:7`,
+/// clears the buttons) that rewrites an approval message after an authorized
+/// decision — the REST equivalent of native's `UpdateMessage` response.
+pub fn update_message_request(
+    ctx: &RestCtx,
+    interaction_id: &str,
+    interaction_token: &str,
+    text: &str,
+) -> RestRequest {
+    discord_request(
+        ctx,
+        "POST",
+        &format!("/interactions/{interaction_id}/{interaction_token}/callback"),
+        Some(json!({ "type": 7, "data": { "content": text, "components": [] } })),
+    )
+}
+
+/// Classify a `GET /channels/{id}` response body: `true` iff the channel's
+/// `type` is one of Discord's thread kinds — 10 (announcement),
+/// 11 (public), 12 (private) — matching native's `PublicThread |
+/// PrivateThread | NewsThread` check. A non-JSON / typeless body → `false`
+/// (native's `_ => false`).
+pub fn is_thread_channel(channel_body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(channel_body)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_u64))
+        .is_some_and(|kind| matches!(kind, 10..=12))
+}
+
+/// If `raw_json` is a `MESSAGE_CREATE` dispatch, return its `d.channel_id` —
+/// the channel the guest must `GET`/classify before calling [`on_frame`] with
+/// the resolved `is_thread`. `None` for any other frame (no classification
+/// needed).
+pub fn message_create_channel_id(raw_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw_json).ok()?;
+    if value.get("op").and_then(Value::as_u64) != Some(OP_DISPATCH) {
+        return None;
+    }
+    if value.get("t").and_then(Value::as_str) != Some("MESSAGE_CREATE") {
+        return None;
+    }
+    value
+        .get("d")
+        .and_then(|d| d.get("channel_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Parse one op's REST outcome into its [`OpResultBody`] (design §5.3):
+/// id-returning ops (`create-channel`/`create-thread`/`send-message`) read
+/// `body.id`; `edit-message`/`send-messages` report `ok` from a 2xx `status`.
+/// `approval-request`/`interaction-reply` return `None` (they produce no
+/// `op.result`).
+pub fn parse_outbound(op: &OutboundKind, status: u16, body: &[u8]) -> Option<OpResultBody> {
+    let ok = (200..300).contains(&status);
+    match op {
+        OutboundKind::CreateChannel { .. } => Some(OpResultBody {
+            channel_id: extract_id(body),
+            ..Default::default()
+        }),
+        OutboundKind::CreateThread { .. } => Some(OpResultBody {
+            thread_id: extract_id(body),
+            ..Default::default()
+        }),
+        OutboundKind::SendMessage { .. } => Some(OpResultBody {
+            message_id: extract_id(body),
+            ..Default::default()
+        }),
+        OutboundKind::EditMessage { .. } | OutboundKind::SendMessages { .. } => {
+            Some(OpResultBody {
+                ok: Some(ok),
+                ..Default::default()
+            })
+        }
+        OutboundKind::ApprovalRequest { .. } | OutboundKind::InteractionReply { .. } => None,
+    }
+}
+
+/// Read Discord's `id` snowflake from a REST response body (a created
+/// channel/thread/message all echo their new id). `None` on a non-JSON or
+/// id-less body (e.g. a Discord error object) — the bridge then surfaces the
+/// missing id as an op failure.
+fn extract_id(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Build the flat `op.result` inbound event (payload `{op_id, <field>}`,
+/// design §5.3) the guest queues for the next `poll-inbound`.
+pub fn op_result_event(op_id: &str, body: &OpResultBody) -> InboundEvent {
+    let mut payload = serde_json::Map::new();
+    payload.insert("op_id".to_string(), json!(op_id));
+    if let Some(channel_id) = &body.channel_id {
+        payload.insert("channel_id".to_string(), json!(channel_id));
+    }
+    if let Some(thread_id) = &body.thread_id {
+        payload.insert("thread_id".to_string(), json!(thread_id));
+    }
+    if let Some(message_id) = &body.message_id {
+        payload.insert("message_id".to_string(), json!(message_id));
+    }
+    if let Some(ok) = body.ok {
+        payload.insert("ok".to_string(), json!(ok));
+    }
+    InboundEvent {
+        event_type: "op.result".to_string(),
+        payload: Value::Object(payload).to_string().into_bytes(),
+        sequence: 0,
+    }
+}
+
+/// Guest one-shot: given an op and its REST outcome, produce the `op.result`
+/// inbound event to queue, or `None` when the op has no correlated result
+/// (`approval-request` resolves via a later `approval.decision`;
+/// `interaction-reply` is uncorrelated).
+pub fn outbound_op_result(op: &OutboundKind, status: u16, body: &[u8]) -> Option<InboundEvent> {
+    let op_id = op.op_id()?;
+    let result = parse_outbound(op, status, body)?;
+    Some(op_result_event(op_id, &result))
 }
 
 #[cfg(test)]
@@ -1399,12 +1927,22 @@ mod tests {
         approver_role_ids: &[&str],
         started_by: Option<&str>,
     ) -> PendingApprovals {
+        pending_with_tool(request_id, approver_role_ids, started_by, "Bash")
+    }
+
+    fn pending_with_tool(
+        request_id: &str,
+        approver_role_ids: &[&str],
+        started_by: Option<&str>,
+        tool: &str,
+    ) -> PendingApprovals {
         let mut map = PendingApprovals::new();
         map.insert(
             request_id.to_string(),
             PendingApproval {
                 approver_role_ids: approver_role_ids.iter().map(|s| s.to_string()).collect(),
                 started_by: started_by.map(str::to_string),
+                tool: tool.to_string(),
             },
         );
         map
@@ -1424,6 +1962,7 @@ mod tests {
     ) -> Value {
         json!({
             "type": 2,
+            "id": "interaction-1",
             "token": token,
             "channel_id": channel_id,
             "member": {
@@ -1451,6 +1990,7 @@ mod tests {
     ) -> Value {
         json!({
             "type": 3,
+            "id": "interaction-btn",
             "token": token,
             "channel_id": channel_id,
             "member": {
@@ -1551,6 +2091,7 @@ mod tests {
             defer,
             token,
             event,
+            ..
         } = outcome
         else {
             panic!("expected Slash outcome");
@@ -1604,6 +2145,7 @@ mod tests {
             defer,
             token,
             event,
+            ..
         } = outcome
         else {
             panic!("expected Slash outcome");
@@ -1673,6 +2215,7 @@ mod tests {
             actor,
             edit,
             token,
+            ..
         } = outcome
         else {
             panic!("expected Approval outcome");
@@ -1681,7 +2224,9 @@ mod tests {
         assert!(allow);
         assert_eq!(actor, "clicker-1");
         assert_eq!(token, "tok-btn-1");
-        assert_eq!(edit, "✅ Approved by <@clicker-1>");
+        // Tool suffix restored (native's exact edit string); default helper
+        // tool is "Bash".
+        assert_eq!(edit, "✅ Approved by <@clicker-1> — **Bash**");
     }
 
     #[test]
@@ -1699,7 +2244,7 @@ mod tests {
             panic!("expected Approval outcome");
         };
         assert!(!allow);
-        assert_eq!(edit, "🚫 Denied by <@clicker-1>");
+        assert_eq!(edit, "🚫 Denied by <@clicker-1> — **Bash**");
     }
 
     #[test]
@@ -1726,7 +2271,10 @@ mod tests {
             &["not-approver"],
         );
         let outcome = handle_interaction(&raw, &pending);
-        let InteractionOutcome::Unauthorized { token, ephemeral } = outcome else {
+        let InteractionOutcome::Unauthorized {
+            token, ephemeral, ..
+        } = outcome
+        else {
             panic!("expected Unauthorized outcome");
         };
         assert_eq!(token, "tok-btn-4");
@@ -1786,6 +2334,7 @@ mod tests {
         let actions = on_frame(&mut state, &frame, false, &no_pending());
 
         assert!(actions.contains(&Action::DeferInteraction {
+            id: "interaction-1".to_string(),
             token: "tok-7".to_string()
         }));
         let event = actions
@@ -1813,8 +2362,9 @@ mod tests {
         let actions = on_frame(&mut state, &frame, false, &pending);
 
         assert!(actions.contains(&Action::EditInteractionMessage {
+            id: "interaction-btn".to_string(),
             token: "tok-8".to_string(),
-            text: "✅ Approved by <@clicker-1>".to_string(),
+            text: "✅ Approved by <@clicker-1> — **Bash**".to_string(),
         }));
         let event = actions
             .iter()
@@ -1842,9 +2392,617 @@ mod tests {
         assert_eq!(
             actions,
             vec![Action::ReplyEphemeral {
+                id: "interaction-btn".to_string(),
                 token: "tok-9".to_string(),
                 text: "You are not authorized to approve this.".to_string(),
             }]
         );
+    }
+
+    // ---- Task 10: outbound REST planning + response parsing --------------
+
+    const TEST_TOKEN: &str = "SECRET-BOT-TOKEN";
+
+    fn ctx() -> RestCtx<'static> {
+        RestCtx {
+            token: TEST_TOKEN,
+            app_id: "app-1",
+            guild_id: "guild-1",
+        }
+    }
+
+    /// The one Authorization header value a request carries (panics if absent).
+    fn auth(req: &RestRequest) -> &str {
+        req.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str())
+            .expect("every Discord REST request carries an Authorization header")
+    }
+
+    fn body_json(req: &RestRequest) -> Value {
+        serde_json::from_str(req.body.as_deref().expect("request has a body"))
+            .expect("request body is valid JSON")
+    }
+
+    fn header(req: &RestRequest, key: &str) -> Option<String> {
+        req.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn plan_create_channel_posts_guild_channel_of_text_type() {
+        let op = OutboundKind::CreateChannel {
+            op_id: "op1".into(),
+            name: "general".into(),
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.url,
+            "https://discord.com/api/v10/guilds/guild-1/channels"
+        );
+        assert_eq!(body_json(req), json!({ "name": "general", "type": 0 }));
+        assert_eq!(auth(req), "Bot SECRET-BOT-TOKEN");
+        assert_eq!(
+            header(req, "content-type").as_deref(),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn plan_create_thread_posts_thread_on_channel() {
+        let op = OutboundKind::CreateThread {
+            op_id: "op1".into(),
+            channel_id: "chan-1".into(),
+            title: "session xyz".into(),
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(
+            reqs[0].url,
+            "https://discord.com/api/v10/channels/chan-1/threads"
+        );
+        assert_eq!(body_json(&reqs[0]), json!({ "name": "session xyz" }));
+    }
+
+    #[test]
+    fn plan_send_message_posts_content() {
+        let op = OutboundKind::SendMessage {
+            op_id: "op1".into(),
+            channel_id: "chan-1".into(),
+            text: "hello world".into(),
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(
+            reqs[0].url,
+            "https://discord.com/api/v10/channels/chan-1/messages"
+        );
+        assert_eq!(body_json(&reqs[0]), json!({ "content": "hello world" }));
+    }
+
+    #[test]
+    fn plan_edit_message_patches_content() {
+        let op = OutboundKind::EditMessage {
+            op_id: "op1".into(),
+            channel_id: "chan-1".into(),
+            message_id: "msg-1".into(),
+            text: "edited".into(),
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(
+            reqs[0].url,
+            "https://discord.com/api/v10/channels/chan-1/messages/msg-1"
+        );
+        assert_eq!(body_json(&reqs[0]), json!({ "content": "edited" }));
+    }
+
+    #[test]
+    fn plan_send_messages_posts_one_request_per_chunk() {
+        let op = OutboundKind::SendMessages {
+            op_id: "op1".into(),
+            channel_id: "chan-1".into(),
+            chunks: vec!["part 1".into(), "part 2".into(), "part 3".into()],
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 3);
+        for (req, expected) in reqs.iter().zip(["part 1", "part 2", "part 3"]) {
+            assert_eq!(req.method, "POST");
+            assert_eq!(
+                req.url,
+                "https://discord.com/api/v10/channels/chan-1/messages"
+            );
+            assert_eq!(body_json(req), json!({ "content": expected }));
+        }
+    }
+
+    #[test]
+    fn plan_approval_request_posts_buttons_with_custom_ids() {
+        let op = OutboundKind::ApprovalRequest {
+            op_id: "op1".into(),
+            request_id: "req-1".into(),
+            conversation_id: "conv-1".into(),
+            tool: "Bash".into(),
+            summary: "rm -rf /tmp/x".into(),
+            approver_role_ids: vec!["r1".into()],
+            started_by: Some("u1".into()),
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 1);
+        let req = &reqs[0];
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.url,
+            "https://discord.com/api/v10/channels/conv-1/messages"
+        );
+        let body = body_json(req);
+        assert_eq!(
+            body["content"].as_str().unwrap(),
+            "🔐 Approve **Bash**?\n```\nrm -rf /tmp/x\n```"
+        );
+        let row = &body["components"][0];
+        assert_eq!(row["type"].as_u64(), Some(1)); // action row
+        let buttons = row["components"].as_array().unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["type"].as_u64(), Some(2)); // button
+        assert_eq!(buttons[0]["style"].as_u64(), Some(3)); // success
+        assert_eq!(buttons[0]["custom_id"].as_str(), Some("req-1:approve"));
+        assert_eq!(buttons[1]["style"].as_u64(), Some(4)); // danger
+        assert_eq!(buttons[1]["custom_id"].as_str(), Some("req-1:deny"));
+    }
+
+    #[test]
+    fn plan_interaction_reply_patches_original_webhook_message() {
+        let op = OutboundKind::InteractionReply {
+            token: "int-token".into(),
+            text: "✅ connected".into(),
+        };
+        let reqs = plan_outbound(&op, &ctx());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(
+            reqs[0].url,
+            "https://discord.com/api/v10/webhooks/app-1/int-token/messages/@original"
+        );
+        assert_eq!(body_json(&reqs[0]), json!({ "content": "✅ connected" }));
+    }
+
+    #[test]
+    fn register_commands_puts_guild_commands_body() {
+        let req = register_commands_request(&ctx());
+        assert_eq!(req.method, "PUT");
+        assert_eq!(
+            req.url,
+            "https://discord.com/api/v10/applications/app-1/guilds/guild-1/commands"
+        );
+        assert_eq!(body_json(&req), build_commands());
+        assert_eq!(auth(&req), "Bot SECRET-BOT-TOKEN");
+    }
+
+    #[test]
+    fn channel_get_is_a_bodyless_get_with_auth() {
+        let req = channel_get_request(&ctx(), "chan-1");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.url, "https://discord.com/api/v10/channels/chan-1");
+        assert!(req.body.is_none());
+        assert_eq!(auth(&req), "Bot SECRET-BOT-TOKEN");
+    }
+
+    #[test]
+    fn defer_request_is_type5_ephemeral_callback() {
+        let req = defer_request(&ctx(), "int-1", "int-token");
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.url,
+            "https://discord.com/api/v10/interactions/int-1/int-token/callback"
+        );
+        assert_eq!(
+            body_json(&req),
+            json!({ "type": 5, "data": { "flags": 64 } })
+        );
+    }
+
+    #[test]
+    fn ephemeral_reply_is_type4_flags64_callback() {
+        let req = ephemeral_reply_request(&ctx(), "int-1", "int-token", "nope");
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.url,
+            "https://discord.com/api/v10/interactions/int-1/int-token/callback"
+        );
+        assert_eq!(
+            body_json(&req),
+            json!({ "type": 4, "data": { "content": "nope", "flags": 64 } })
+        );
+    }
+
+    #[test]
+    fn update_message_is_type7_callback_clearing_components() {
+        let req = update_message_request(&ctx(), "int-1", "int-token", "✅ Approved");
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.url,
+            "https://discord.com/api/v10/interactions/int-1/int-token/callback"
+        );
+        assert_eq!(
+            body_json(&req),
+            json!({ "type": 7, "data": { "content": "✅ Approved", "components": [] } })
+        );
+    }
+
+    #[test]
+    fn parse_create_channel_extracts_channel_id() {
+        let op = OutboundKind::CreateChannel {
+            op_id: "op1".into(),
+            name: "n".into(),
+        };
+        let body = br#"{"id":"555","name":"n","type":0}"#;
+        assert_eq!(
+            parse_outbound(&op, 201, body),
+            Some(OpResultBody {
+                channel_id: Some("555".into()),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_create_thread_extracts_thread_id() {
+        let op = OutboundKind::CreateThread {
+            op_id: "op1".into(),
+            channel_id: "c".into(),
+            title: "t".into(),
+        };
+        let body = br#"{"id":"777"}"#;
+        assert_eq!(
+            parse_outbound(&op, 201, body),
+            Some(OpResultBody {
+                thread_id: Some("777".into()),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_send_message_extracts_message_id() {
+        let op = OutboundKind::SendMessage {
+            op_id: "op1".into(),
+            channel_id: "c".into(),
+            text: "t".into(),
+        };
+        let body = br#"{"id":"999"}"#;
+        assert_eq!(
+            parse_outbound(&op, 200, body),
+            Some(OpResultBody {
+                message_id: Some("999".into()),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_edit_message_reports_ok_from_status() {
+        let op = OutboundKind::EditMessage {
+            op_id: "op1".into(),
+            channel_id: "c".into(),
+            message_id: "m".into(),
+            text: "t".into(),
+        };
+        assert_eq!(
+            parse_outbound(&op, 200, b""),
+            Some(OpResultBody {
+                ok: Some(true),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            parse_outbound(&op, 403, b""),
+            Some(OpResultBody {
+                ok: Some(false),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_send_messages_reports_ok() {
+        let op = OutboundKind::SendMessages {
+            op_id: "op1".into(),
+            channel_id: "c".into(),
+            chunks: vec!["a".into()],
+        };
+        assert_eq!(parse_outbound(&op, 200, b"").unwrap().ok, Some(true));
+    }
+
+    #[test]
+    fn parse_approval_and_interaction_reply_have_no_op_result() {
+        let approval = OutboundKind::ApprovalRequest {
+            op_id: "op1".into(),
+            request_id: "r".into(),
+            conversation_id: "c".into(),
+            tool: "Bash".into(),
+            summary: "s".into(),
+            approver_role_ids: vec![],
+            started_by: None,
+        };
+        assert_eq!(parse_outbound(&approval, 200, br#"{"id":"1"}"#), None);
+        let reply = OutboundKind::InteractionReply {
+            token: "t".into(),
+            text: "x".into(),
+        };
+        assert_eq!(parse_outbound(&reply, 200, b""), None);
+    }
+
+    #[test]
+    fn token_never_leaves_the_bot_auth_header() {
+        let ctx = ctx();
+        let ops = [
+            OutboundKind::CreateChannel {
+                op_id: "o".into(),
+                name: "n".into(),
+            },
+            OutboundKind::CreateThread {
+                op_id: "o".into(),
+                channel_id: "c".into(),
+                title: "t".into(),
+            },
+            OutboundKind::SendMessage {
+                op_id: "o".into(),
+                channel_id: "c".into(),
+                text: "t".into(),
+            },
+            OutboundKind::EditMessage {
+                op_id: "o".into(),
+                channel_id: "c".into(),
+                message_id: "m".into(),
+                text: "t".into(),
+            },
+            OutboundKind::SendMessages {
+                op_id: "o".into(),
+                channel_id: "c".into(),
+                chunks: vec!["a".into(), "b".into()],
+            },
+            OutboundKind::ApprovalRequest {
+                op_id: "o".into(),
+                request_id: "r".into(),
+                conversation_id: "c".into(),
+                tool: "Bash".into(),
+                summary: "s".into(),
+                approver_role_ids: vec![],
+                started_by: None,
+            },
+            OutboundKind::InteractionReply {
+                token: "t".into(),
+                text: "x".into(),
+            },
+        ];
+        let mut requests: Vec<RestRequest> =
+            ops.iter().flat_map(|op| plan_outbound(op, &ctx)).collect();
+        requests.push(register_commands_request(&ctx));
+        requests.push(channel_get_request(&ctx, "c"));
+        requests.push(defer_request(&ctx, "i", "it"));
+        requests.push(ephemeral_reply_request(&ctx, "i", "it", "x"));
+        requests.push(update_message_request(&ctx, "i", "it", "x"));
+
+        for req in &requests {
+            // The token appears in EXACTLY one place: the Bot auth header.
+            assert!(
+                !req.url.contains(TEST_TOKEN),
+                "token leaked into URL: {}",
+                req.url
+            );
+            if let Some(body) = &req.body {
+                assert!(!body.contains(TEST_TOKEN), "token leaked into body: {body}");
+            }
+            let mut auth_headers = 0;
+            for (name, value) in &req.headers {
+                if name.eq_ignore_ascii_case("authorization") {
+                    auth_headers += 1;
+                    assert_eq!(value, "Bot SECRET-BOT-TOKEN");
+                } else {
+                    assert!(
+                        !value.contains(TEST_TOKEN),
+                        "token leaked into header {name}: {value}"
+                    );
+                }
+            }
+            assert_eq!(auth_headers, 1, "exactly one Bot auth header per request");
+        }
+    }
+
+    #[test]
+    fn is_thread_channel_classifies_thread_types() {
+        assert!(is_thread_channel(br#"{"type":11}"#)); // public thread
+        assert!(is_thread_channel(br#"{"type":12}"#)); // private thread
+        assert!(is_thread_channel(br#"{"type":10}"#)); // announcement thread
+        assert!(!is_thread_channel(br#"{"type":0}"#)); // text channel
+        assert!(!is_thread_channel(br#"{"type":1}"#)); // DM
+        assert!(!is_thread_channel(b"not json")); // native's `_ => false`
+        assert!(!is_thread_channel(br#"{}"#)); // no type
+    }
+
+    #[test]
+    fn message_create_channel_id_only_for_message_create() {
+        let frame = dispatch(
+            "MESSAGE_CREATE",
+            5,
+            json!({ "channel_id": "chan-42", "content": "hi" }),
+        );
+        assert_eq!(
+            message_create_channel_id(&frame),
+            Some("chan-42".to_string())
+        );
+        assert_eq!(message_create_channel_id(&hello(41250)), None);
+        assert_eq!(
+            message_create_channel_id(&dispatch("READY", 1, json!({}))),
+            None
+        );
+        assert_eq!(message_create_channel_id("not json"), None);
+    }
+
+    #[test]
+    fn decode_outbound_round_trips_each_kind() {
+        let cases = vec![
+            (
+                "create-channel",
+                json!({ "op_id": "o", "name": "general" }),
+                OutboundKind::CreateChannel {
+                    op_id: "o".into(),
+                    name: "general".into(),
+                },
+            ),
+            (
+                "create-thread",
+                json!({ "op_id": "o", "channel_id": "c", "title": "t" }),
+                OutboundKind::CreateThread {
+                    op_id: "o".into(),
+                    channel_id: "c".into(),
+                    title: "t".into(),
+                },
+            ),
+            (
+                "send-message",
+                json!({ "op_id": "o", "channel_id": "c", "text": "hi" }),
+                OutboundKind::SendMessage {
+                    op_id: "o".into(),
+                    channel_id: "c".into(),
+                    text: "hi".into(),
+                },
+            ),
+            (
+                "edit-message",
+                json!({ "op_id": "o", "channel_id": "c", "message_id": "m", "text": "e" }),
+                OutboundKind::EditMessage {
+                    op_id: "o".into(),
+                    channel_id: "c".into(),
+                    message_id: "m".into(),
+                    text: "e".into(),
+                },
+            ),
+            (
+                "send-messages",
+                json!({ "op_id": "o", "channel_id": "c", "chunks": ["a", "b"] }),
+                OutboundKind::SendMessages {
+                    op_id: "o".into(),
+                    channel_id: "c".into(),
+                    chunks: vec!["a".into(), "b".into()],
+                },
+            ),
+            (
+                "approval-request",
+                json!({
+                    "op_id": "o", "request_id": "r", "conversation_id": "c",
+                    "tool": "Bash", "summary": "s", "approver_role_ids": ["r1"],
+                    "started_by": "u1",
+                }),
+                OutboundKind::ApprovalRequest {
+                    op_id: "o".into(),
+                    request_id: "r".into(),
+                    conversation_id: "c".into(),
+                    tool: "Bash".into(),
+                    summary: "s".into(),
+                    approver_role_ids: vec!["r1".into()],
+                    started_by: Some("u1".into()),
+                },
+            ),
+            (
+                "interaction-reply",
+                json!({ "token": "t", "text": "x" }),
+                OutboundKind::InteractionReply {
+                    token: "t".into(),
+                    text: "x".into(),
+                },
+            ),
+        ];
+        for (event_type, payload, expected) in cases {
+            let decoded = decode_outbound(event_type, payload.to_string().as_bytes());
+            assert_eq!(decoded, Some(expected), "decoding {event_type}");
+        }
+        assert_eq!(decode_outbound("nope", b"{}"), None);
+    }
+
+    #[test]
+    fn op_result_event_is_flat_op_result() {
+        let event = op_result_event(
+            "op-7",
+            &OpResultBody {
+                channel_id: Some("555".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(event.event_type, "op.result");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(payload, json!({ "op_id": "op-7", "channel_id": "555" }));
+    }
+
+    #[test]
+    fn plan_reconnect_resumes_when_a_session_exists() {
+        let mut state = GatewayState::new("t");
+        on_frame(&mut state, &hello(41250), false, &no_pending());
+        on_frame(&mut state, &ready(4), false, &no_pending()); // stores session_id
+
+        assert!(state.plan_reconnect(), "should resume with a live session");
+        assert!(state.pending_resume);
+        assert_eq!(state.phase, GatewayPhase::Resuming);
+        // The next HELLO must therefore RESUME (session preserved), not IDENTIFY.
+        let actions = on_frame(&mut state, &hello(41250), false, &no_pending());
+        assert_eq!(sent_frame(&actions)["op"].as_u64(), Some(OP_RESUME));
+    }
+
+    #[test]
+    fn plan_reconnect_reidentifies_without_a_session() {
+        let mut state = GatewayState::new("t");
+        assert!(!state.plan_reconnect(), "no session → fresh identify");
+        assert!(!state.pending_resume);
+        assert_eq!(state.phase, GatewayPhase::Connecting);
+    }
+
+    #[test]
+    fn resume_ws_url_appends_the_query_to_the_session_host() {
+        assert_eq!(
+            resume_ws_url("wss://gateway-us-east1-b.discord.gg"),
+            "wss://gateway-us-east1-b.discord.gg/?v=10&encoding=json"
+        );
+        // A trailing slash is not doubled.
+        assert_eq!(
+            resume_ws_url("wss://resume.discord.gg/"),
+            "wss://resume.discord.gg/?v=10&encoding=json"
+        );
+    }
+
+    #[test]
+    fn outbound_op_result_none_for_approval_and_interaction_reply() {
+        let approval = OutboundKind::ApprovalRequest {
+            op_id: "o".into(),
+            request_id: "r".into(),
+            conversation_id: "c".into(),
+            tool: "Bash".into(),
+            summary: "s".into(),
+            approver_role_ids: vec![],
+            started_by: None,
+        };
+        assert!(outbound_op_result(&approval, 200, br#"{"id":"1"}"#).is_none());
+        let reply = OutboundKind::InteractionReply {
+            token: "t".into(),
+            text: "x".into(),
+        };
+        assert!(outbound_op_result(&reply, 200, b"").is_none());
+        let create = OutboundKind::CreateChannel {
+            op_id: "op-1".into(),
+            name: "n".into(),
+        };
+        let event = outbound_op_result(&create, 201, br#"{"id":"42"}"#).unwrap();
+        assert_eq!(event.event_type, "op.result");
+        let payload: Value = serde_json::from_slice(&event.payload).unwrap();
+        assert_eq!(payload, json!({ "op_id": "op-1", "channel_id": "42" }));
     }
 }

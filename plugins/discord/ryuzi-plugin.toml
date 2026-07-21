@@ -11,13 +11,17 @@ description = "Discord gateway: connects the Discord gateway (wss) over the host
 # `connect` url (and re-checked on every component-driven reconnect) and on every
 # `ryuzi:http` REST request, exactly like the other first-party components. A
 # request to any other host is rejected.
-#   - `gateway.discord.gg`  the gateway websocket endpoint (IDENTIFY/heartbeat).
+#   - `gateway.discord.gg`  the base gateway websocket endpoint (IDENTIFY/heartbeat).
+#   - `*.discord.gg`        the per-session `resume_gateway_url` shard Discord hands
+#                           back in READY (e.g. `gateway-us-east1-b.discord.gg`) — a
+#                           RESUME dials this host, so the host allowlist MUST admit
+#                           it (host matching is exact-host + `*.`-suffix, so the
+#                           `.discord.gg` shards need their own wildcard entry).
 #   - `discord.com`         the REST API base (`discord.com/api/v10`).
-#   - `*.discord.com`       `resume_gateway_url` and CDN/attachment hosts Discord
-#                           hands back at runtime resolve under this suffix.
+#   - `*.discord.com`       CDN/attachment hosts Discord hands back at runtime.
 #   - `*.discordapp.com`    legacy CDN host for attachments/avatars.
 [permissions]
-network = ["gateway.discord.gg", "discord.com", "*.discord.com", "*.discordapp.com"]
+network = ["gateway.discord.gg", "*.discord.gg", "discord.com", "*.discord.com", "*.discordapp.com"]
 
 # The bundle manifest schema (crates/plugin-sdk/src/bundle.rs) has no `settings`
 # section — like github/mimo, the component reads its host settings at runtime by

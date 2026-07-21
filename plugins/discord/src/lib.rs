@@ -3,9 +3,9 @@
 //! Exports the generic `ryuzi:gateway/gateway@0.1.0` interface
 //! (`start`/`stop`/`deliver-outbound`/`health-check`/`poll-inbound`) and speaks
 //! the raw Discord gateway v10 protocol over the host-owned `ryuzi:websocket`
-//! transport (Discord REST over `ryuzi:http` follows in Task 10). The host owns
-//! the TLS socket and enforces the manifest network allowlist; this component
-//! only drives the protocol.
+//! transport, with Discord REST (`discord.com/api/v10`) over `ryuzi:http` for
+//! the outbound ops. The host owns the TLS socket and enforces the manifest
+//! network allowlist; this component only drives the protocol.
 //!
 //! # Architecture: pure `logic` vs. wasm `guest`
 //! The entire Discord gateway protocol state machine — HELLO→IDENTIFY, the
@@ -25,7 +25,11 @@
 //! commands + approval-button routing (Task 9) are now wired into
 //! [`logic::on_frame`]'s `INTERACTION_CREATE` dispatch handling
 //! (`logic::handle_interaction`, `logic::can_approve`, `logic::build_commands`).
-//! Discord REST + outbound-op wiring (Task 10) builds on this protocol core.
+//! Discord REST request planning + response parsing for each outbound op
+//! (Task 10) is pure in [`logic`] too (`logic::plan_outbound`/
+//! `logic::parse_outbound`/`logic::decode_outbound`, the interaction-callback
+//! builders, and the `is_thread`/reconnect helpers); [`guest`] only issues the
+//! planned requests over `ryuzi:http`.
 
 pub mod logic;
 
