@@ -605,14 +605,18 @@ fn status_of(snapshot: &GatewaySnapshot) -> GatewayStatus {
 /// `message.thread` -> `on_reply`, `message.dm` -> `on_dm`. `slash.*` events
 /// are decoded but not yet acted on (interaction-reply correlation is Task 6).
 ///
-/// Every event's raw wire `sequence` is checked against the last-processed
-/// sequence FIRST, before it is even decoded: an event with `sequence <=
-/// last_sequence` is a replay (e.g. a re-sent batch after a component
-/// restart/reconnect) and is dropped outright, so a replayed `message.*`
-/// never double-dispatches into the `Router` and a replayed `op.result`/
-/// `approval.decision` never double-resolves a correlation. `last_sequence`
-/// only advances past an event once it is accepted, so replays are compared
-/// against the highest sequence actually processed, not merely seen.
+/// Sequence-replay dedup (`sequence <= last_sequence` drops an event as a
+/// replay — e.g. a re-sent batch after a component restart/reconnect —
+/// without dispatching it) applies ONLY to `message.*` events, via
+/// [`admit_message`]. Correlation events (`op.result`/`approval.decision`)
+/// deliberately BYPASS it entirely: `Correlation::resolve` is already
+/// idempotent (a resolve on an absent/already-resolved key is a harmless
+/// no-op, so a genuine replay is naturally safe), and a real gateway
+/// component's REST-synthesized op-results/approval-decisions are not
+/// numbered against the same monotonic, reconnect-stable counter as
+/// messages (e.g. Discord's gateway `s`) — sequence-gating them risks
+/// dropping a legitimate, still-awaited correlation outright (hanging its
+/// caller to a 30s timeout, or auto-rejecting an approval).
 ///
 /// Exits when the supervisor drops the sink.
 async fn drain_inbound(
@@ -621,19 +625,11 @@ async fn drain_inbound(
     router: Arc<OnceLock<Arc<Router>>>,
     gateway_id: String,
 ) {
+    // Starts at 0 (never a valid wire sequence — the component's first
+    // message must use sequence >= 1), so the first genuine message always
+    // passes `sequence > last_sequence` in `admit_message`.
     let mut last_sequence: u64 = 0;
     while let Some(event) = inbound.recv().await {
-        if event.sequence <= last_sequence {
-            tracing::trace!(
-                event = %event.event_type,
-                sequence = event.sequence,
-                last_sequence,
-                "wasm gateway inbound event dropped: replayed sequence"
-            );
-            continue;
-        }
-        last_sequence = event.sequence;
-
         match InboundEvent::decode(&event.event_type, &event.payload) {
             Ok(InboundEvent::OpResult { op_id, result }) => {
                 correlation.resolve(
@@ -657,7 +653,7 @@ async fn drain_inbound(
                 prompt,
                 attachments,
             }) => {
-                if let Some(router) = require_router(&router, &event.event_type) {
+                if let Some(router) = admit_message(&router, &mut last_sequence, &event) {
                     let attachments = attachment_refs(&attachments);
                     if let Err(error) = router
                         .on_start(&gateway_id, &workspace_id, &actor, &prompt, &attachments)
@@ -676,7 +672,7 @@ async fn drain_inbound(
                 prompt,
                 attachments,
             }) => {
-                if let Some(router) = require_router(&router, &event.event_type) {
+                if let Some(router) = admit_message(&router, &mut last_sequence, &event) {
                     let attachments = attachment_refs(&attachments);
                     if let Err(error) = router
                         .on_reply(&gateway_id, &conversation_id, &actor, &prompt, &attachments)
@@ -694,7 +690,7 @@ async fn drain_inbound(
                 user_id,
                 text,
             }) => {
-                if let Some(router) = require_router(&router, &event.event_type) {
+                if let Some(router) = admit_message(&router, &mut last_sequence, &event) {
                     if let Err(error) = router
                         .on_dm(&gateway_id, &conversation_id, &user_id, &text)
                         .await
@@ -732,22 +728,39 @@ async fn drain_inbound(
     }
 }
 
-/// Look up the stored router, tracing (and returning `None`) if `set_router`
-/// hasn't been called yet — matches the native Discord gateway's "events
-/// arriving before `set_router` are dropped with a warning" behaviour
-/// (`gateway/discord/mod.rs`'s `InboundRouting::handle_message`).
-fn require_router<'a>(
+/// Gate a `message.*` event before dispatching it to the `Router`: drop it
+/// (returning `None`) if it's a replay (`event.sequence <= *last_sequence`)
+/// or if no `Router` is set yet. `*last_sequence` is advanced past this
+/// event's sequence ONLY when a router is actually available to dispatch
+/// to — so an event dropped for "no router set yet" leaves `last_sequence`
+/// untouched, and a later reconnect replay of that same sequence is still
+/// admitted once a router IS set (never permanently lost to the gate).
+fn admit_message<'a>(
     router: &'a OnceLock<Arc<Router>>,
-    event_type: &str,
+    last_sequence: &mut u64,
+    event: &GatewayInboundEvent,
 ) -> Option<&'a Arc<Router>> {
-    let router = router.get();
-    if router.is_none() {
+    if event.sequence <= *last_sequence {
         tracing::trace!(
-            event = %event_type,
+            event = %event.event_type,
+            sequence = event.sequence,
+            last_sequence = *last_sequence,
+            "wasm gateway inbound event dropped: replayed sequence"
+        );
+        return None;
+    }
+    // Matches the native Discord gateway's documented "events arriving
+    // before `set_router` are dropped with a warning" behaviour
+    // (`gateway/discord/mod.rs`'s `InboundRouting::handle_message`).
+    let Some(router) = router.get() else {
+        tracing::trace!(
+            event = %event.event_type,
             "wasm gateway inbound event dropped: no router set yet"
         );
-    }
-    router
+        return None;
+    };
+    *last_sequence = event.sequence;
+    Some(router)
 }
 
 /// Convert the wire `attachments: Vec<String>` (URLs only — the component
@@ -2087,5 +2100,98 @@ mod gateway_impl_tests {
             "the duplicate message.thread (same sequence) must be dropped, not \
              dispatched as a second on_reply: {final_log:?}"
         );
+    }
+
+    /// The Important-hazard regression test: a `message.*` event advances
+    /// `last_sequence`, then a correlation event (`op.result`) carrying a
+    /// LOWER sequence must still resolve — proving the sequence-replay gate
+    /// never applies to `op.result`/`approval.decision`. Drives `drain_inbound`
+    /// directly (not through the full `WasmGateway`/supervisor/fixture stack)
+    /// since this is purely about the drain loop's own sequence-gating logic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_low_sequenced_op_result_is_not_dropped_by_message_dedup() {
+        let _guard = StateDirGuard::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (cp, _store, _db_guard) =
+            wired_control_plane(Arc::new(RecordingHarnessFactory { log })).await;
+        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
+        // `Router` isn't `Debug`, so assert via `is_err()` rather than `.expect()`.
+        assert!(
+            router
+                .set(Arc::new(Router::new(Arc::clone(&cp), vec![])))
+                .is_ok(),
+            "router OnceLock is set exactly once, freshly, here"
+        );
+
+        let correlation = Arc::new(Correlation::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // A message.dm event at a HIGH sequence — advances `last_sequence`
+        // well past the op.result below once dispatched.
+        let (event_type, payload) = InboundEvent::MessageDm {
+            conversation_id: "dm-conv-hazard".to_string(),
+            user_id: "user-hazard".to_string(),
+            text: "hi".to_string(),
+        }
+        .encode();
+        tx.send(GatewayInboundEvent {
+            event_type,
+            payload,
+            sequence: 10,
+        })
+        .unwrap();
+
+        // Register the waiter BEFORE the drain task can possibly process the
+        // op.result below, so a resolve racing in can never be missed.
+        let waiter = correlation.register(
+            CorrelationKey::Op("op-hazard".to_string()),
+            Duration::from_secs(5),
+        );
+
+        // An op.result carrying a LOWER sequence than the message-dm above
+        // (10) — a real gateway component's REST-synthesized op-results are
+        // not numbered against the same counter as messages (design intent),
+        // so this must resolve regardless of `last_sequence`.
+        let (event_type, payload) = InboundEvent::OpResult {
+            op_id: "op-hazard".to_string(),
+            result: OpResultBody {
+                channel_id: Some("chan-hazard".to_string()),
+                ..Default::default()
+            },
+        }
+        .encode();
+        tx.send(GatewayInboundEvent {
+            event_type,
+            payload,
+            sequence: 1,
+        })
+        .unwrap();
+        drop(tx);
+
+        let drain = tokio::spawn(drain_inbound(
+            rx,
+            Arc::clone(&correlation),
+            router,
+            "acme-gateway".to_string(),
+        ));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect(
+                "the low-sequenced op.result must resolve well within the \
+                 timeout, not hang behind the message-dedup gate",
+            );
+        match outcome {
+            CorrelationOutcome::Resolved(CorrelationValue::OpResult(body)) => {
+                assert_eq!(body.channel_id.as_deref(), Some("chan-hazard"));
+            }
+            other => panic!(
+                "expected the low-sequenced op.result to resolve the \
+                 correlation, got: {other:?}"
+            ),
+        }
+
+        drain.await.unwrap();
     }
 }
