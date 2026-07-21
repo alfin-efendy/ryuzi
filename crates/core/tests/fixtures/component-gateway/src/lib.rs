@@ -44,6 +44,11 @@
 //     of double-dispatching `on_reply`.
 //   - when `config.endpoint` contains "dm-flow" (Task 5), the first poll ALSO
 //     emits a single `message.dm` event (conversation_id "dm-conv-1").
+//   - when `config.endpoint` contains "slash-flow" (Task 6), the first poll ALSO
+//     emits a single `slash.connect` event (token "tok-connect", opts name
+//     "proj"), so the host bridge's slash routing drives `Router::on_connect`
+//     and then delivers the computed `interaction-reply` back (which this
+//     fixture accepts and ignores, like any unrecognized outbound op).
 
 wit_bindgen::generate!({
     path: "wit",
@@ -83,6 +88,10 @@ struct State {
     /// the first poll.
     dm_flow: bool,
     dm_flow_emitted: bool,
+    /// Task 6: `config.endpoint` contained "slash-flow" — emit a
+    /// `slash.connect` on the first poll.
+    slash_flow: bool,
+    slash_flow_emitted: bool,
 }
 
 thread_local! {
@@ -121,6 +130,7 @@ impl Guest for Fixture {
                 account: config.account.clone(),
                 message_flow: config.endpoint.contains("message-flow"),
                 dm_flow: config.endpoint.contains("dm-flow"),
+                slash_flow: config.endpoint.contains("slash-flow"),
                 ..State::default()
             };
         });
@@ -274,6 +284,21 @@ impl Guest for Fixture {
                     event_type: "message.dm".to_string(),
                     payload:
                         br#"{"conversation_id":"dm-conv-1","user_id":"user-9","text":"hello there"}"#
+                            .to_vec(),
+                    sequence: seq,
+                });
+            }
+            // Task 6: the host bridge's slash-command routing test. A single
+            // `slash.connect` drives `Router::on_connect`; the bridge posts back
+            // an `interaction-reply` via `deliver-outbound`, which this fixture
+            // accepts and ignores (no `op.result` — it is fire-and-forget).
+            if state.slash_flow && !state.slash_flow_emitted {
+                state.slash_flow_emitted = true;
+                let seq = next_seq(&mut state);
+                batch.push(GatewayEvent {
+                    event_type: "slash.connect".to_string(),
+                    payload:
+                        br#"{"token":"tok-connect","user_id":"u1","opts":{"name":"proj"},"role_ids":[]}"#
                             .to_vec(),
                     sequence: seq,
                 });

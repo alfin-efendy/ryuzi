@@ -54,7 +54,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::domain::{ApprovalDecision, ApprovalRequest, AttachmentRef, Surface};
+use crate::control::ProvisionSettings;
+use crate::domain::{ApprovalDecision, ApprovalRequest, AttachmentRef, PermMode, Surface};
 use crate::gateway::{
     Gateway, GatewayStatus, GatewayStatusPublisher, GatewayStatusSubscription, MessageRef,
 };
@@ -64,7 +65,10 @@ use crate::plugins::wasm_gateway::{
     GatewayConfig, GatewayInboundEvent, GatewayOutboundEvent, GatewaySnapshot, SupervisorTuning,
     WasmGatewaySupervisor,
 };
-use crate::router::Router;
+use crate::router::{ConnectOpts, Router};
+use crate::settings::SettingsStore;
+use crate::store::Store;
+use crate::telemetry::Telemetry;
 
 // ---------------------------------------------------------------------
 // Inbound events (component -> host, delivered via `poll-inbound`)
@@ -477,10 +481,14 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// drives (design doc §2/§5.1).
 pub struct WasmGateway {
     id: String,
-    supervisor: WasmGatewaySupervisor,
+    /// Shared (`Arc`) so the inbound drain task can also drive the supervisor's
+    /// `deliver-outbound` for slash `interaction-reply`s (Task 6), not just the
+    /// outbound `Gateway` methods on this struct.
+    supervisor: Arc<WasmGatewaySupervisor>,
     /// The outbound `Router`, installed by `set_router`. Consumed by the drain
-    /// task to dispatch `message.*` inbound events (Task 5); `slash.*` events
-    /// are decoded but not yet acted on (Task 6).
+    /// task to dispatch `message.*` inbound events (Task 5) and route `slash.*`
+    /// commands to `on_connect`/`on_end`/`on_stop` with an `interaction-reply`
+    /// (Task 6).
     router: Arc<OnceLock<Arc<Router>>>,
     correlation: Arc<Correlation>,
     status: Arc<GatewayStatusPublisher>,
@@ -504,21 +512,27 @@ impl WasmGateway {
         let correlation = Arc::new(Correlation::new());
         let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let supervisor = WasmGatewaySupervisor::spawn_with_inbound(
+        let supervisor = Arc::new(WasmGatewaySupervisor::spawn_with_inbound(
             plugin_id.clone(),
             compiled,
             ctx,
             config,
             tuning,
             Some(inbound_tx),
-        );
+        ));
 
         let status = Arc::new(GatewayStatusPublisher::new(status_of(&supervisor.status())));
 
+        // The drain task delivers slash `interaction-reply`s through the same
+        // supervisor these outbound `Gateway` methods use.
+        let reply_sink: Arc<dyn OutboundReplySink> = Arc::new(SupervisorReplySink {
+            supervisor: Arc::clone(&supervisor),
+        });
         let drain = tokio::spawn(drain_inbound(
             inbound_rx,
             Arc::clone(&correlation),
             Arc::clone(&router),
+            reply_sink,
             plugin_id.clone(),
         ));
         let watch = tokio::spawn(watch_status(
@@ -598,12 +612,72 @@ fn status_of(snapshot: &GatewaySnapshot) -> GatewayStatus {
     }
 }
 
+/// How the drain loop posts a bridge-computed slash `interaction-reply` back to
+/// the component. A trait (rather than a direct supervisor handle) so
+/// [`drain_inbound`] stays unit-testable with a recording sink instead of a live
+/// supervisor. Production wiring is [`SupervisorReplySink`].
+#[async_trait]
+trait OutboundReplySink: Send + Sync {
+    /// Deliver `op` (an `interaction-reply`) to the component, fire-and-forget:
+    /// a slash reply expects no `op.result`, and a failed delivery is logged,
+    /// never surfaced — it must not wedge the drain loop.
+    async fn deliver_reply(&self, op: OutboundOp);
+}
+
+/// The production [`OutboundReplySink`]: routes the `interaction-reply` through
+/// the supervisor's `deliver-outbound` (the same path the outbound `Gateway`
+/// methods use), so the component can edit its deferred slash response.
+struct SupervisorReplySink {
+    supervisor: Arc<WasmGatewaySupervisor>,
+}
+
+#[async_trait]
+impl OutboundReplySink for SupervisorReplySink {
+    async fn deliver_reply(&self, op: OutboundOp) {
+        let (event_type, payload) = op.encode();
+        if let Err(reason) = self
+            .supervisor
+            .deliver_outbound(GatewayOutboundEvent {
+                event_type,
+                payload,
+                // `sequence` is a Task-5 inbound-dedup concern only; an outbound
+                // interaction-reply carries none.
+                sequence: 0,
+            })
+            .await
+        {
+            tracing::warn!("wasm gateway interaction-reply delivery failed: {reason}");
+        }
+    }
+}
+
+/// Map a `slash.connect`'s wire opts onto [`crate::router::ConnectOpts`],
+/// reproducing native `/connect`'s option handling exactly
+/// (`gateway/discord/mod.rs`'s `handle_interaction`): `name`/`git` →
+/// `name`/`git_url`; `model`/`effort`/`mode` → the `ProvisionSettings`, with
+/// `mode` parsed through `PermMode::from_db`; and the interaction's `role_ids`
+/// → `actor_role_ids` (the perm-mode admin gate).
+fn connect_opts_from_wire(opts: ConnectOptsWire, role_ids: Vec<String>) -> ConnectOpts {
+    ConnectOpts {
+        name: opts.name,
+        git_url: opts.git,
+        settings: ProvisionSettings {
+            model: opts.model,
+            effort: opts.effort,
+            perm_mode: opts.mode.as_deref().map(PermMode::from_db),
+        },
+        actor_role_ids: role_ids,
+    }
+}
+
 /// Drain inbound events forwarded by the supervisor: correlate `op.result`/
-/// `approval.decision` (Task 4) and dispatch `message.*` into the stored
-/// `Router` (Task 5), reproducing `gateway/discord/mod.rs`'s native routing
-/// rules exactly (design doc §5.2) — `message.mention` -> `on_start`,
-/// `message.thread` -> `on_reply`, `message.dm` -> `on_dm`. `slash.*` events
-/// are decoded but not yet acted on (interaction-reply correlation is Task 6).
+/// `approval.decision` (Task 4), dispatch `message.*` into the stored `Router`
+/// (Task 5), and route `slash.*` commands to `Router::on_connect`/`on_end`/
+/// `on_stop` with a computed `interaction-reply` back to the component (Task 6)
+/// — reproducing `gateway/discord/mod.rs`'s native routing rules exactly (design
+/// doc §5.2) — `message.mention` -> `on_start`, `message.thread` -> `on_reply`,
+/// `message.dm` -> `on_dm`, `slash.connect/end/stop` -> the matching inbound
+/// Router method, `slash.status` -> a pure reply.
 ///
 /// Sequence-replay dedup (`sequence <= last_sequence` drops an event as a
 /// replay — e.g. a re-sent batch after a component restart/reconnect —
@@ -623,6 +697,7 @@ async fn drain_inbound(
     mut inbound: mpsc::UnboundedReceiver<GatewayInboundEvent>,
     correlation: Arc<Correlation>,
     router: Arc<OnceLock<Arc<Router>>>,
+    reply_sink: Arc<dyn OutboundReplySink>,
     gateway_id: String,
 ) {
     // Starts at 0 (never a valid wire sequence — the component's first
@@ -702,20 +777,104 @@ async fn drain_inbound(
                     }
                 }
             }
-            Ok(
-                InboundEvent::SlashConnect { .. }
-                | InboundEvent::SlashEnd { .. }
-                | InboundEvent::SlashStop { .. }
-                | InboundEvent::SlashStatus { .. },
-            ) => {
-                // Slash-command routing (`on_connect`/`on_end`/`on_stop`) and its
-                // `interaction-reply` correlation is Task 6 — these events are
-                // decoded (proving the wire contract round-trips) but otherwise a
-                // no-op here.
-                tracing::trace!(
+            // Slash commands (design doc §5.2/§5.4): route to the matching
+            // inbound Router method, then post the computed reply back as an
+            // `interaction-reply`. NOT sequence-gated (like the correlation
+            // events above, and unlike `message.*`): a Discord interaction is
+            // identified by its `token`, not the gateway `s` sequence. A router
+            // not yet set drops the event with a warning, mirroring native's
+            // "interactions before `set_router` are dropped" rule.
+            Ok(InboundEvent::SlashConnect {
+                token,
+                user_id,
+                opts,
+                role_ids,
+            }) => match router.get() {
+                Some(router) => {
+                    let text = match router
+                        .on_connect(
+                            &gateway_id,
+                            &user_id,
+                            connect_opts_from_wire(opts, role_ids),
+                        )
+                        .await
+                    {
+                        Ok(outcome) => {
+                            // The native `/connect` reply: created-channel
+                            // confirmation, plus the perm-mode downgrade warning
+                            // when a non-admin's requested bypassPermissions was
+                            // refused (`gateway/discord/mod.rs`).
+                            let mut msg = format!("✅ connected → <#{}>", outcome.workspace_id);
+                            if outcome.perm_mode_downgraded {
+                                msg.push_str(
+                                    "\n⚠️ bypassPermissions requires an admin role — using default mode.",
+                                );
+                            }
+                            msg
+                        }
+                        Err(error) => format!("❌ {error}"),
+                    };
+                    reply_sink
+                        .deliver_reply(OutboundOp::InteractionReply { token, text })
+                        .await;
+                }
+                None => tracing::warn!(
                     event = %event.event_type,
-                    "wasm gateway slash inbound event not yet routed (Task 6)"
-                );
+                    "wasm gateway slash.connect dropped: no router set yet"
+                ),
+            },
+            Ok(InboundEvent::SlashEnd {
+                token,
+                conversation_id,
+            }) => match router.get() {
+                Some(router) => {
+                    let text = match router.on_end(&gateway_id, &conversation_id).await {
+                        Ok(()) => "🟥 session ended".to_string(),
+                        Err(error) => format!("❌ {error}"),
+                    };
+                    reply_sink
+                        .deliver_reply(OutboundOp::InteractionReply { token, text })
+                        .await;
+                }
+                None => tracing::warn!(
+                    event = %event.event_type,
+                    "wasm gateway slash.end dropped: no router set yet"
+                ),
+            },
+            Ok(InboundEvent::SlashStop {
+                token,
+                conversation_id,
+            }) => match router.get() {
+                Some(router) => {
+                    let text = match router.on_stop(&gateway_id, &conversation_id).await {
+                        Ok(()) => "⏹️ stopping the current turn".to_string(),
+                        Err(error) => format!("❌ {error}"),
+                    };
+                    reply_sink
+                        .deliver_reply(OutboundOp::InteractionReply { token, text })
+                        .await;
+                }
+                None => tracing::warn!(
+                    event = %event.event_type,
+                    "wasm gateway slash.stop dropped: no router set yet"
+                ),
+            },
+            Ok(InboundEvent::SlashStatus { token }) => {
+                // Pure reply, no session op (design doc §5.2) — but still gated on
+                // a router being set, matching native's uniform interaction drop.
+                if router.get().is_some() {
+                    reply_sink
+                        .deliver_reply(OutboundOp::InteractionReply {
+                            token,
+                            text: "harness is running ✅".to_string(),
+                        })
+                        .await;
+                } else {
+                    tracing::warn!(
+                        event = %event.event_type,
+                        "wasm gateway slash.status dropped: no router set yet"
+                    );
+                }
             }
             Err(error) => {
                 // Undecodable (e.g. the fixture's non-JSON `message` seed) — drop.
@@ -967,6 +1126,42 @@ impl Gateway for WasmGateway {
     fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
         Some(self.status.subscribe())
     }
+}
+
+/// Construct one [`WasmGateway`] per enabled, long-lived gateway bundle under
+/// `root` (design doc §5.5): the daemon registers each returned gateway
+/// alongside its native gateways — into the outbound `Router`, the inbound
+/// `set_router`, and the approval fan-out — so the WASM Discord component is
+/// driven through the very same `Gateway` trait native gateways use, with no
+/// plugin-id host branch.
+///
+/// This is the `WasmGateway`-producing analogue of the supervisor-only
+/// discovery it wraps ([`crate::plugins::wasm_gateway::discover_gateway_components`]):
+/// each `WasmGateway::new` spawns the supervisor (with the bridge's inbound
+/// sink) and holds the `Correlation` + supervisor. Warn-and-skip discovery
+/// returns empty when nothing enabled/long-lived is installed, so a clean
+/// install constructs nothing. `root` is a parameter so the migration tests can
+/// point it at a hermetic install root; production passes
+/// [`crate::plugins::bundle::installed_bundle_root`].
+pub async fn build_wasm_gateways(
+    store: Arc<Store>,
+    settings: &SettingsStore,
+    telemetry: Arc<dyn Telemetry>,
+    root: &std::path::Path,
+) -> Vec<Arc<WasmGateway>> {
+    crate::plugins::wasm_gateway::discover_gateway_components(store, settings, telemetry, root)
+        .await
+        .into_iter()
+        .map(|component| {
+            Arc::new(WasmGateway::new(
+                component.id,
+                component.compiled,
+                component.ctx,
+                component.config,
+                SupervisorTuning::default(),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2173,6 +2368,7 @@ mod gateway_impl_tests {
             rx,
             Arc::clone(&correlation),
             router,
+            Arc::new(RecordingReplySink::default()) as Arc<dyn OutboundReplySink>,
             "acme-gateway".to_string(),
         ));
 
@@ -2193,5 +2389,425 @@ mod gateway_impl_tests {
         }
 
         drain.await.unwrap();
+    }
+
+    // -------------------------------------------------------------
+    // Task 6: slash.* -> Router routing + interaction-reply
+    // -------------------------------------------------------------
+
+    /// Captures every `interaction-reply` the drain loop posts, so a direct
+    /// `drain_inbound` test can assert the reply token + text without a live
+    /// supervisor.
+    #[derive(Default)]
+    struct RecordingReplySink {
+        replies: Mutex<Vec<OutboundOp>>,
+    }
+    impl RecordingReplySink {
+        fn replies(&self) -> Vec<OutboundOp> {
+            self.replies.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl OutboundReplySink for RecordingReplySink {
+        async fn deliver_reply(&self, op: OutboundOp) {
+            self.replies.lock().unwrap().push(op);
+        }
+    }
+
+    /// Assert exactly one `interaction-reply` was produced and return its
+    /// `(token, text)`.
+    fn slash_reply(replies: &[OutboundOp]) -> (&str, &str) {
+        assert_eq!(
+            replies.len(),
+            1,
+            "exactly one interaction-reply expected: {replies:?}"
+        );
+        match &replies[0] {
+            OutboundOp::InteractionReply { token, text } => (token, text),
+            other => panic!("expected an interaction-reply, got: {other:?}"),
+        }
+    }
+
+    /// Drive a single `slash.*` event through `drain_inbound` (router pre-set to
+    /// a fresh `Router` over `gateways`) with a recording reply sink, awaiting
+    /// the drain to completion (the sole event is processed, then the closed
+    /// channel exits the loop). Returns the sink for the caller's assertions.
+    async fn drive_slash(
+        cp: &Arc<ControlPlane>,
+        gateways: Vec<Arc<dyn Gateway>>,
+        event: InboundEvent,
+    ) -> Arc<RecordingReplySink> {
+        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new());
+        assert!(
+            router
+                .set(Arc::new(Router::new(Arc::clone(cp), gateways)))
+                .is_ok(),
+            "fresh router OnceLock is set exactly once here"
+        );
+        let sink = Arc::new(RecordingReplySink::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (event_type, payload) = event.encode();
+        tx.send(GatewayInboundEvent {
+            event_type,
+            payload,
+            sequence: 1,
+        })
+        .unwrap();
+        drop(tx);
+        drain_inbound(
+            rx,
+            Arc::new(Correlation::new()),
+            router,
+            Arc::clone(&sink) as Arc<dyn OutboundReplySink>,
+            "acme-gateway".to_string(),
+        )
+        .await;
+        sink
+    }
+
+    fn empty_log_harness() -> Arc<RecordingHarnessFactory> {
+        Arc::new(RecordingHarnessFactory {
+            log: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    /// The full `slash.connect` opts map onto `ConnectOpts` exactly like native
+    /// `/connect` (`gateway/discord/mod.rs`): every field, incl. `mode` ->
+    /// `PermMode` and `role_ids` -> `actor_role_ids`.
+    #[test]
+    fn connect_opts_from_wire_maps_every_native_option() {
+        let opts = connect_opts_from_wire(
+            ConnectOptsWire {
+                name: Some("proj".into()),
+                git: Some("https://git/repo.git".into()),
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                mode: Some("bypassPermissions".into()),
+            },
+            vec!["role1".into(), "role2".into()],
+        );
+        assert_eq!(opts.name.as_deref(), Some("proj"));
+        assert_eq!(opts.git_url.as_deref(), Some("https://git/repo.git"));
+        assert_eq!(opts.settings.model.as_deref(), Some("opus"));
+        assert_eq!(opts.settings.effort.as_deref(), Some("high"));
+        assert_eq!(opts.settings.perm_mode, Some(PermMode::BypassPermissions));
+        assert_eq!(
+            opts.actor_role_ids,
+            vec!["role1".to_string(), "role2".to_string()]
+        );
+    }
+
+    /// A bare `/connect` leaves every opts field absent (no `mode` -> no
+    /// `perm_mode`), matching what the native command allows.
+    #[test]
+    fn connect_opts_from_wire_leaves_a_bare_connect_empty() {
+        let opts = connect_opts_from_wire(ConnectOptsWire::default(), vec![]);
+        assert!(opts.name.is_none());
+        assert!(opts.git_url.is_none());
+        assert!(opts.settings.model.is_none());
+        assert!(opts.settings.effort.is_none());
+        assert!(opts.settings.perm_mode.is_none());
+        assert!(opts.actor_role_ids.is_empty());
+    }
+
+    /// The headline slash test: a `slash.connect` reaches `Router::on_connect`
+    /// AND its outcome shapes an `interaction-reply` carrying the interaction
+    /// `token`. Uses a bare `/connect` so `on_connect` bails ("requires name or
+    /// gitUrl") BEFORE any provisioning — deterministic and git-free — while
+    /// still exercising the full slash.connect -> on_connect -> reply plumbing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn slash_connect_routes_to_on_connect_and_produces_interaction_reply() {
+        let (cp, _store, _db) = wired_control_plane(empty_log_harness()).await;
+        let recording = Arc::new(RecordingGateway::new("acme-gateway"));
+        let sink = drive_slash(
+            &cp,
+            vec![recording as Arc<dyn Gateway>],
+            InboundEvent::SlashConnect {
+                token: "tok-c".into(),
+                user_id: "u1".into(),
+                opts: ConnectOptsWire::default(),
+                role_ids: vec![],
+            },
+        )
+        .await;
+        let replies = sink.replies();
+        let (token, text) = slash_reply(&replies);
+        assert_eq!(token, "tok-c", "the reply must echo the interaction token");
+        assert!(
+            text.contains("connect requires name or gitUrl"),
+            "the on_connect error must reach the interaction-reply: {text:?}"
+        );
+    }
+
+    /// `slash.end` reaches `Router::on_end` (the bound session ends) and replies
+    /// with native's confirmation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn slash_end_routes_to_on_end_and_replies() {
+        let (cp, store, _db) = wired_control_plane(empty_log_harness()).await;
+        seed_chat_session(&cp, &store, "acme-gateway", "conv-end", "sess-end").await;
+        let sink = drive_slash(
+            &cp,
+            vec![],
+            InboundEvent::SlashEnd {
+                token: "tok-e".into(),
+                conversation_id: "conv-end".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            store.get_session("sess-end").await.unwrap().unwrap().status,
+            SessionStatus::Ended,
+            "slash.end must drive on_end -> end_session"
+        );
+        let replies = sink.replies();
+        let (token, text) = slash_reply(&replies);
+        assert_eq!(token, "tok-e");
+        assert_eq!(text, "🟥 session ended");
+    }
+
+    /// `slash.stop` reaches `Router::on_stop` (the bound session is interrupted)
+    /// and replies with native's confirmation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn slash_stop_routes_to_on_stop_and_replies() {
+        let (cp, store, _db) = wired_control_plane(empty_log_harness()).await;
+        seed_chat_session(&cp, &store, "acme-gateway", "conv-stop", "sess-stop").await;
+        let sink = drive_slash(
+            &cp,
+            vec![],
+            InboundEvent::SlashStop {
+                token: "tok-s".into(),
+                conversation_id: "conv-stop".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            store
+                .get_session("sess-stop")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Interrupted,
+            "slash.stop must drive on_stop -> stop_session"
+        );
+        let replies = sink.replies();
+        let (token, text) = slash_reply(&replies);
+        assert_eq!(token, "tok-s");
+        assert_eq!(text, "⏹️ stopping the current turn");
+    }
+
+    /// `slash.status` is a pure reply — no session op — echoing native's text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn slash_status_replies_without_a_session_op() {
+        let (cp, _store, _db) = wired_control_plane(empty_log_harness()).await;
+        let sink = drive_slash(
+            &cp,
+            vec![],
+            InboundEvent::SlashStatus {
+                token: "tok-x".into(),
+            },
+        )
+        .await;
+        let replies = sink.replies();
+        let (token, text) = slash_reply(&replies);
+        assert_eq!(token, "tok-x");
+        assert_eq!(text, "harness is running ✅");
+    }
+
+    /// A slash event that arrives before `set_router` is dropped with a warning
+    /// (mirroring native's "interactions before set_router are dropped" rule) —
+    /// no reply is produced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slash_events_before_set_router_are_dropped_without_reply() {
+        let router: Arc<OnceLock<Arc<Router>>> = Arc::new(OnceLock::new()); // never set
+        let sink = Arc::new(RecordingReplySink::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (event_type, payload) = InboundEvent::SlashStatus {
+            token: "tok".into(),
+        }
+        .encode();
+        tx.send(GatewayInboundEvent {
+            event_type,
+            payload,
+            sequence: 1,
+        })
+        .unwrap();
+        drop(tx);
+        drain_inbound(
+            rx,
+            Arc::new(Correlation::new()),
+            router,
+            Arc::clone(&sink) as Arc<dyn OutboundReplySink>,
+            "acme-gateway".to_string(),
+        )
+        .await;
+        assert!(
+            sink.replies().is_empty(),
+            "a slash event with no router set must be dropped, not replied to"
+        );
+    }
+
+    /// End-to-end through the full `WasmGateway`/supervisor/fixture stack: the
+    /// fixture's "slash-flow" endpoint emits one `slash.connect`, which must
+    /// route through the supervisor's inbound forwarding + the drain loop into
+    /// `Router::on_connect` — proven by `create_workspace:proj` (the mapped
+    /// name) reaching the gateway registered under this id. `workdir_root` is
+    /// set so `on_connect`'s provisioning has a scratch root; the reply content
+    /// is asserted deterministically by the direct-drain tests above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn inbound_slash_connect_drives_on_connect_through_the_full_stack() {
+        let _guard = StateDirGuard::new();
+        let workdir = tempfile::tempdir().unwrap();
+        let (cp, store, _db) = wired_control_plane(empty_log_harness()).await;
+        SettingsStore::new(store.clone())
+            .set("workdir_root", workdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let recording = Arc::new(RecordingGateway::new("acme-gateway"));
+        let router = Arc::new(Router::new(
+            Arc::clone(&cp),
+            vec![recording.clone() as Arc<dyn Gateway>],
+        ));
+        let (gateway, _tmp) = build_test_gateway(GatewayConfig {
+            account: "acme".to_string(),
+            endpoint: "slash-flow".to_string(),
+        })
+        .await;
+        gateway.set_router(Arc::clone(&router));
+
+        let mut calls = Vec::new();
+        for _ in 0..300 {
+            calls = recording.calls();
+            if calls.iter().any(|c| c == "create_workspace:proj") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            calls.iter().any(|c| c == "create_workspace:proj"),
+            "the fixture's slash.connect must route through the supervisor + \
+             drain into on_connect (create_workspace:proj); got: {calls:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Task 6: daemon-wiring / migration — build_wasm_gateways
+    // -------------------------------------------------------------
+
+    /// Install the built `component-gateway` fixture as an active bundle under
+    /// `root` for `id`, and (optionally) enable it. Bypasses the signed-install
+    /// pipeline: `load_active_bundles` verifies the on-disk pointer + release
+    /// ledger + component hash, NOT the signature (that is verified at install
+    /// time), so a direct upsert + `set_active` + files is sufficient.
+    async fn install_active_gateway_bundle(
+        root: &std::path::Path,
+        store: &Store,
+        id: &str,
+        enabled: bool,
+    ) {
+        use sha2::Digest as _;
+        build_fixtures();
+        let version = "0.1.0";
+        let component = "plugin.wasm";
+        let wasm = std::fs::read(gateway_artifact()).unwrap();
+        let sha = format!("{:x}", sha2::Sha256::digest(&wasm));
+        let version_dir = root.join(id).join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join(component), &wasm).unwrap();
+        std::fs::write(
+            version_dir.join("ryuzi-plugin.toml"),
+            format!(
+                "id = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\nwit-api = \"^0.1.0\"\nlifecycle = \"singleton\"\ncomponent = \"{component}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            version_dir.join("release.json"),
+            format!(
+                "{{\"id\":\"{id}\",\"version\":\"{version}\",\"wit-api\":\"0.1.0\",\"component_url\":\"https://example.invalid/{id}.wasm\",\"component_sha256\":\"{sha}\"}}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join(id).join("current"), version).unwrap();
+        store
+            .upsert_component_release(&ComponentPluginReleaseRecord {
+                plugin_id: id.into(),
+                version: version.into(),
+                source_url: "https://example.invalid".into(),
+                sha256: sha,
+                signing_key_id: "test".into(),
+                installed_at: 0,
+                active: false,
+                revoked: false,
+                revocation_reason: None,
+            })
+            .await
+            .unwrap();
+        store
+            .set_active_component_release(id, version)
+            .await
+            .unwrap();
+        if enabled {
+            // Raw write: `plugin.<generic-id>.enabled` is not a validated
+            // known-setting key for a bundle not in the catalog, but
+            // `component_plugin_enabled` reads it raw all the same.
+            store
+                .set_setting_raw(&format!("plugin.{id}.enabled"), "true")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The daemon-wiring path (`build_wasm_gateways`) constructs + registers a
+    /// `WasmGateway` for each installed+ENABLED long-lived gateway bundle and
+    /// SKIPS a disabled one — driven entirely by the manifest id + enablement,
+    /// with no `id == "discord"` branch (the constructed set here is two generic
+    /// non-Discord bundles; nothing names Discord).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_path_constructs_enabled_gateway_bundles_and_skips_disabled() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(db.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+
+        // One ENABLED and one DISABLED (never enabled -> default false) generic,
+        // NON-Discord long-lived gateway bundle, both installed + active.
+        install_active_gateway_bundle(root.path(), &store, "acme-gateway", true).await;
+        install_active_gateway_bundle(root.path(), &store, "beta-gateway", false).await;
+
+        let gateways = build_wasm_gateways(
+            Arc::clone(&store),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(
+            gateways.len(),
+            1,
+            "only the enabled bundle is constructed + registered"
+        );
+        assert_eq!(gateways[0].id(), "acme-gateway");
+        assert!(
+            !gateways.iter().any(|g| g.id() == "beta-gateway"),
+            "the disabled bundle must be skipped"
+        );
+        assert!(
+            !gateways.iter().any(|g| g.id() == "discord"),
+            "the constructed set is generic — nothing names Discord outside a bundle"
+        );
+
+        // The daemon's start path would start it — a no-op over the
+        // already-spawned supervisor, returning Ok.
+        gateways[0]
+            .start()
+            .await
+            .expect("the daemon start path starts the constructed gateway");
     }
 }

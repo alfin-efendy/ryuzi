@@ -603,26 +603,42 @@ fn describe_gateway_error(error: &wit::GatewayError) -> String {
     }
 }
 
-/// Discover every active WASM component bundle, keep only the ENABLED ones that
-/// export `ryuzi:gateway/gateway`, and spawn one [`WasmGatewaySupervisor`] per
-/// bundle — the daemon-owned analogue of
-/// `control::lifecycle::build_wasm_session_providers`. Every failure mode is
+/// One enabled, long-lived gateway component discovered off-disk and compiled,
+/// but not yet supervised — the shared ingredients a [`WasmGatewaySupervisor`]
+/// (or the host bridge's `WasmGateway`, Task 6) needs to `spawn`. Produced by
+/// [`discover_gateway_components`].
+pub(crate) struct GatewayComponent {
+    pub id: String,
+    pub compiled: Arc<CompiledComponent>,
+    pub ctx: Arc<PluginCapabilityContext>,
+    pub config: GatewayConfig,
+}
+
+/// Discover every active WASM component bundle under `root`, keep only the
+/// ENABLED ones that export `ryuzi:gateway/gateway`, and compile each into the
+/// ingredients a supervisor / `WasmGateway` needs — the daemon-owned analogue
+/// of `control::lifecycle::build_wasm_session_providers`. Every failure mode is
 /// warn-and-skip (missing root, discovery error, unavailable runtime, per-bundle
 /// compile failure, enablement-lookup error), so a broken component plugin never
 /// blocks daemon startup. Returns an empty vec when nothing enabled/long-lived
-/// is installed, so the common case spawns nothing.
-pub async fn build_gateway_supervisors(
+/// is installed, so the common case discovers nothing.
+///
+/// `root` is a parameter (rather than always
+/// [`crate::plugins::bundle::installed_bundle_root`]) purely so the daemon-wiring
+/// migration tests can point discovery at a hermetic install root; production
+/// passes the real per-user root.
+pub(crate) async fn discover_gateway_components(
     store: Arc<Store>,
     settings: &SettingsStore,
     telemetry: Arc<dyn Telemetry>,
-) -> Vec<WasmGatewaySupervisor> {
+    root: &std::path::Path,
+) -> Vec<GatewayComponent> {
     use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
 
-    let root = crate::plugins::bundle::installed_bundle_root();
     if !root.exists() {
         return Vec::new();
     }
-    let bundles = match crate::plugins::bundle::load_active_bundles(&root, &store).await {
+    let bundles = match crate::plugins::bundle::load_active_bundles(root, &store).await {
         Ok(bundles) => bundles,
         Err(error) => {
             tracing::warn!("wasm gateway: discovering component bundles failed: {error}");
@@ -639,7 +655,7 @@ pub async fn build_gateway_supervisors(
             return Vec::new();
         }
     };
-    let mut supervisors = Vec::new();
+    let mut components = Vec::new();
     for bundle in bundles {
         let id = bundle.manifest.id.clone();
         match crate::plugins::host::component_plugin_enabled(settings, &id).await {
@@ -703,15 +719,14 @@ pub async fn build_gateway_supervisors(
                 .flatten()
                 .unwrap_or_default(),
         };
-        supervisors.push(WasmGatewaySupervisor::spawn(
+        components.push(GatewayComponent {
             id,
             compiled,
             ctx,
             config,
-            SupervisorTuning::default(),
-        ));
+        });
     }
-    supervisors
+    components
 }
 
 #[cfg(test)]
