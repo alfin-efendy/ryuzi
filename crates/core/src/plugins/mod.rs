@@ -9,17 +9,17 @@
 //! entirely — see `host`'s module doc for how `Registries::add_plugin`
 //! supersedes the old `Integration` trait).
 //!
-//! [`builtin`] holds first-party plugins that don't have a more natural home
-//! beside their own implementation module — `native` lives beside its
-//! harness code in `harness::native`; `discord` lives here since
-//! `gateway::discord` is data/protocol-only.
+//! The `native` first-party plugin lives beside its harness code in
+//! `harness::native`. Gateways ship as signed WASM component bundles (the
+//! migrated Discord component and any future one), discovered off-disk and
+//! driven through `plugins::wasm_gateway_bridge::WasmGateway` — there is no
+//! native (in-process) gateway plugin.
 //!
 //! [`providers`] generates manifest-only plugins from the static provider
 //! catalog (`llm_router::registry::CATALOG`) rather than hand-authoring one
 //! manifest per entry. [`install_builtins`] adds them plus the embedded
 //! catalog in one call.
 
-pub mod builtin;
 pub mod bundle;
 pub mod capabilities;
 pub mod catalog;
@@ -281,7 +281,6 @@ pub fn install_builtins(regs: &mut Registries) {
 /// read back from the `Registries` itself.
 pub fn register_builtin_plugin_fields() {
     let mut regs = Registries::new();
-    regs.add_plugin(builtin::discord_plugin());
     regs.add_plugin(crate::harness::native::native_plugin());
     install_builtins(&mut regs);
     load_skill_pack_plugins(&mut regs);
@@ -700,9 +699,9 @@ mod toggle_enabled_tests {
     async fn gateway_capable_toggles_enabled_gateways_csv() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // Deliberately not "discord" — a fresh store seeds
-        // `enabled_gateways = "discord"`, which would defeat the "off by
-        // default" half of this test.
+        // A fresh store no longer seeds `enabled_gateways` (the native Discord
+        // seed was removed with the native gateway), so this starts empty and
+        // proves the CSV add/remove round-trip in isolation.
         host.add(gateway_only("slack"));
 
         toggle_enabled(&host, &settings, "slack", true)
@@ -710,14 +709,14 @@ mod toggle_enabled_tests {
             .unwrap();
         assert_eq!(
             settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("discord,slack")
+            Some("slack")
         );
         toggle_enabled(&host, &settings, "slack", false)
             .await
             .unwrap();
         assert_eq!(
             settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("discord")
+            Some("")
         );
     }
 
@@ -1069,14 +1068,13 @@ mod install_builtins_tests {
     }
 
     #[test]
-    fn install_builtins_ids_never_collide_with_native_claude_code_or_discord() {
+    fn install_builtins_ids_never_collide_with_native() {
         let mut regs = Registries::new();
         regs.add_plugin(crate::harness::native::native_plugin());
-        regs.add_plugin(builtin::discord_plugin());
         assert_eq!(
             regs.plugins.list().len(),
-            2,
-            "sanity: two builtins registered before install_builtins"
+            1,
+            "sanity: one builtin registered before install_builtins"
         );
 
         install_builtins(&mut regs);
@@ -1094,17 +1092,17 @@ mod install_builtins_tests {
             "duplicate plugin ids after install_builtins: {ids:?}"
         );
 
-        // 2 pre-registered (native, discord) + every provider + every
-        // embedded integration-catalog entry (`catalog::CATALOG_MANIFESTS`,
-        // disjoint from all of the above by construction — see `catalog`'s
-        // own collision test).
+        // 1 pre-registered (native) + every provider + every embedded
+        // integration-catalog entry (`catalog::CATALOG_MANIFESTS`, disjoint
+        // from all of the above by construction — see `catalog`'s own
+        // collision test).
         let expected =
-            2 + crate::llm_router::registry::CATALOG.len() + catalog::CATALOG_MANIFESTS.len();
+            1 + crate::llm_router::registry::CATALOG.len() + catalog::CATALOG_MANIFESTS.len();
         assert_eq!(
             ids.len(),
             expected,
             "install_builtins silently dropped a colliding id instead of staying disjoint \
-             from the native/discord builtins"
+             from the native builtin"
         );
     }
 }

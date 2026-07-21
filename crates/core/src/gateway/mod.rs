@@ -5,8 +5,6 @@ use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-pub mod discord;
-
 /// A reference to a previously-posted message a gateway can edit later (e.g.
 /// a status line updated in place). Keeps the originating `Surface` rather
 /// than a bare channel id, so an edit can be routed back through the same
@@ -143,12 +141,12 @@ pub trait Gateway: Send + Sync {
     /// the `Router` (the `Router` itself needs the already-built gateway
     /// list — see `router.rs`'s module doc on why a second, inbound-only
     /// `Router` instance is built for this). A gateway whose INBOUND
-    /// routing needs a `Router` (Discord's `DiscordGateway`) can't receive
+    /// routing needs a `Router` (e.g. the WASM gateway bridge) can't receive
     /// one at construction time, so `build_daemon` calls `set_router` on
     /// every gateway right after building that inbound `Router` instead.
     /// Inbound events arriving at a gateway before its `set_router` is
     /// called are dropped with a warning — see
-    /// `gateway::discord::DiscordGateway`.
+    /// `crate::plugins::wasm_gateway_bridge::WasmGateway`.
     fn set_router(&self, _router: Arc<Router>) {}
 
     /// Subscribe to operational connection changes. Gateways without an
@@ -274,17 +272,17 @@ mod tests {
     struct FakeGatewayFactory;
     impl GatewayFactory for FakeGatewayFactory {
         fn create(&self, _config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
-            Ok(Arc::new(FakeGateway::new("discord")))
+            Ok(Arc::new(FakeGateway::new("acme-gw")))
         }
     }
 
     #[test]
     fn registry_resolves_gateway_factory_by_name() {
         let mut reg: GatewayRegistry = GatewayRegistry::new();
-        reg.register("discord", Arc::new(FakeGatewayFactory));
-        assert!(reg.get("discord").is_some());
+        reg.register("acme-gw", Arc::new(FakeGatewayFactory));
+        assert!(reg.get("acme-gw").is_some());
         assert!(reg.get("slack").is_none());
-        assert_eq!(reg.names(), vec!["discord".to_string()]);
+        assert_eq!(reg.names(), vec!["acme-gw".to_string()]);
     }
 
     #[tokio::test]
@@ -292,7 +290,7 @@ mod tests {
         let f = FakeGatewayFactory;
         let gw = f.create(&serde_json::json!({})).unwrap();
         let surface = Surface {
-            gateway: "discord".into(),
+            gateway: "acme-gw".into(),
             conversation_id: "c1".into(),
         };
         let req = ApprovalRequest {
@@ -313,12 +311,12 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_surface_lifecycle_calls_are_recorded_in_order() {
-        let gw = FakeGateway::new("discord");
+        let gw = FakeGateway::new("acme-gw");
         gw.start().await.unwrap();
         let ws = gw.create_workspace("proj").await.unwrap();
         let conv = gw.create_conversation(&ws, "title").await.unwrap();
         let surface = Surface {
-            gateway: "discord".into(),
+            gateway: "acme-gw".into(),
             conversation_id: conv,
         };
         let r1 = gw.post_status(&surface, "working").await.unwrap();

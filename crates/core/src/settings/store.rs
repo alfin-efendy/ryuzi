@@ -588,15 +588,11 @@ mod tests {
             .set("default_perm_mode", "acceptEdits")
             .await
             .unwrap();
-        // fresh-db missing list, exact order (seeds enable discord):
+        // fresh-db missing list: only the one required global (no native
+        // gateway seeds required fields anymore).
         assert_eq!(
             settings.missing_required().await.unwrap(),
-            vec![
-                "workdir_root",
-                "discord.token",
-                "discord.app_id",
-                "discord.guild_id"
-            ]
+            vec!["workdir_root"]
         );
         // empty string counts as set:
         settings.set("workdir_root", "").await.unwrap();
@@ -606,14 +602,10 @@ mod tests {
             .unwrap()
             .iter()
             .any(|k| k == "workdir_root"));
+        // No gateway enabled yet (the native Discord seed is gone) → not configured.
         assert!(!settings.is_configured().await.unwrap());
-        for (k, v) in [
-            ("discord.token", "t"),
-            ("discord.app_id", "a"),
-            ("discord.guild_id", "g"),
-        ] {
-            settings.set(k, v).await.unwrap();
-        }
+        // Enabling a gateway (one with no required catalog fields) satisfies it.
+        settings.set("enabled_gateways", "acme-gw").await.unwrap();
         assert!(settings.is_configured().await.unwrap());
     }
 }

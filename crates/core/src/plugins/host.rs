@@ -8,8 +8,7 @@
 //! is a manifest (`CorePlugin.manifest`) paired with typed `Option<Arc<dyn
 //! _>>` capability fields — the manifest is the thing a catalog/user plugin
 //! can actually author (as TOML), while a Rust built-in constructs both the
-//! manifest and its capabilities in code (see `plugins::builtin` and
-//! `harness::native`).
+//! manifest and its capabilities in code (see `harness::native`).
 //!
 //! `Registries::add_plugin` is the one place a `CorePlugin` becomes "live":
 //! a `harness` capability replaces the single `Registries.harness` slot, a

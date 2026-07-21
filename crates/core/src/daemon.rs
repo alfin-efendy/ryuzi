@@ -42,8 +42,11 @@ pub struct BuildDaemonOpts {
     /// Override the telemetry backend (used by tests). `None` selects
     /// Console, or OTLP behind the `otel` feature once `otel_endpoint` is set.
     pub telemetry: Option<Arc<dyn Telemetry>>,
-    /// Gateway factories available to wire, keyed by the id an entry in the
-    /// `enabled_gateways` setting names (e.g. `"discord"`).
+    /// Native (in-process) gateway factories available to wire, keyed by the
+    /// id an entry in the `enabled_gateways` setting names. Empty in
+    /// production today — Discord migrated to a WASM component bundle (wired
+    /// via `build_wasm_gateways` below) — but retained as the generic
+    /// injection seam a future native gateway (and the daemon tests) use.
     pub extra_gateway_factories: Vec<(String, Arc<dyn GatewayFactory>)>,
     /// Test seam: replace the single native harness factory with a fake.
     /// `None` (production) uses the real native runtime.
@@ -539,22 +542,24 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         let Some(factory) = factories.get(&id) else {
             continue; // no registered factory for this id — skip silently
         };
-        let Some(descriptor) = CATALOG.gateway(&id) else {
-            continue; // no catalog entry to build a config from — skip silently
-        };
+        // Assemble the gateway's config from its CATALOG-declared settings
+        // fields, if any. A native gateway with no catalog descriptor (or no
+        // declared fields) builds with an empty config.
         let mut config = serde_json::Map::new();
-        for field in descriptor.fields {
-            let value = settings.get(field.key).await?.unwrap_or_default();
-            config.insert(field.key.to_string(), serde_json::Value::String(value));
+        if let Some(descriptor) = CATALOG.gateway(&id) {
+            for field in descriptor.fields {
+                let value = settings.get(field.key).await?.unwrap_or_default();
+                config.insert(field.key.to_string(), serde_json::Value::String(value));
+            }
         }
         // A gateway that cannot be built from its settings is a configuration
-        // gap, not an engine fault — skip it (like the two cases above) rather
-        // than failing the whole daemon. A fresh install seeds
-        // `enabled_gateways = "discord"` with no token, so making this fatal
-        // meant a clean machine could never boot the engine at all: the daemon
-        // exited, and Cockpit's `setup()` panicked before showing its window.
-        // The gateway stays enabled in settings and starts on the next boot
-        // once its fields are filled in.
+        // gap, not an engine fault — skip it (like the case above) rather than
+        // failing the whole daemon: a clean machine must still boot the engine
+        // even when an enabled gateway is missing required credentials (this
+        // is why a fatal error here once left a fresh install unable to boot —
+        // the daemon exited and Cockpit's `setup()` panicked before showing
+        // its window). The gateway stays enabled in settings and starts on the
+        // next boot once its fields are filled in.
         let gw = match factory.create(&serde_json::Value::Object(config)) {
             Ok(gw) => gw,
             Err(e) => {
@@ -566,14 +571,15 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     }
 
     // Construct + register one `WasmGateway` per enabled, long-lived gateway
-    // bundle (design §5.5), alongside the native factory gateways above.
+    // bundle (design §5.5), alongside any native factory gateways above.
     // Registering them into `gateways` HERE — before the status subscription,
     // the outbound/inbound `Router`, and the approval fan-out below — wires each
     // WASM gateway (the migrated Discord component and any future one) into all
     // three through the very same paths native gateways use, with NO plugin-id
     // host branch. Discovery is warn-and-skip and returns empty on a clean
-    // install (nothing enabled/long-lived), so the common case adds nothing. The
-    // native Discord factory path above coexists until Unit 4 removes it.
+    // install (nothing enabled/long-lived), so the common case adds nothing.
+    // This is the sole gateway path in production now that native Discord has
+    // been removed.
     for gw in crate::plugins::wasm_gateway_bridge::build_wasm_gateways(
         Arc::clone(&store),
         &settings,
@@ -590,12 +596,11 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
     // Two `Router` instances sharing the same `cp`/`store` — see `router.rs`'s
     // module doc. `router_out` drives the outbound render loop (`run`
     // consumes `self`); `router_in` is handed to every gateway via
-    // `set_router` (Task 6: `DiscordGateway`'s `new(port)` + `set_router`
-    // inversion — see `gateway::discord::mod`'s doc — needs a `Router` to
-    // exist, but a `Router` needs the already-built gateway list, so
-    // gateways are built first and given a `Router` handle right after one
-    // exists; most gateways ignore it via `Gateway::set_router`'s default
-    // no-op).
+    // `set_router` (a gateway whose inbound routing needs a `Router` — e.g.
+    // the WASM gateway bridge — needs a `Router` to exist, but a `Router`
+    // needs the already-built gateway list, so gateways are built first and
+    // given a `Router` handle right after one exists; most gateways ignore it
+    // via `Gateway::set_router`'s default no-op).
     let router_out = Router::new(Arc::clone(&cp), gateways.clone());
     let router_handle = tokio::spawn(router_out.run(cp.subscribe()));
 
@@ -1621,20 +1626,18 @@ mod tests {
     impl GatewayFactory for CapturingGatewayFactory {
         fn create(&self, config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
             *self.captured.lock().unwrap() = Some(config.clone());
-            Ok(Arc::new(FakeGateway::new("discord", GwBehavior::Allow)))
+            Ok(Arc::new(FakeGateway::new("acme-gw", GwBehavior::Allow)))
         }
     }
 
-    /// Stands in for a real factory that cannot build from the configuration
-    /// it was given — e.g. the Discord factory with a blank `discord.token`,
-    /// which is exactly what a fresh install has. Kept feature-independent:
-    /// `cargo test -p ryuzi-core` (what CI runs) builds without the `discord`
-    /// feature, so `discord::factory_entries()` is empty here and the real
-    /// factory cannot be used to cover this.
+    /// Stands in for a real native gateway factory that cannot build from the
+    /// configuration it was given — e.g. a gateway with missing required
+    /// credentials, which is what a machine with the gateway enabled but
+    /// unconfigured has.
     struct UnconfiguredGatewayFactory;
     impl GatewayFactory for UnconfiguredGatewayFactory {
         fn create(&self, _config: &serde_json::Value) -> anyhow::Result<Arc<dyn Gateway>> {
-            anyhow::bail!("discord gateway requires a non-empty discord.token");
+            anyhow::bail!("gateway requires credentials that are not configured");
         }
     }
 
@@ -1705,32 +1708,34 @@ mod tests {
         }
     }
 
-    /// Fresh install: `Store::open` seeds `enabled_gateways = "discord"` (a
-    /// runner-era default) while `discord.token` is unset, so the factory
-    /// cannot build the gateway. That is a configuration gap, not an engine
-    /// fault: the daemon must still boot with the gateway skipped. When this
-    /// failed the build instead, the engine daemon exited, and Cockpit's
+    /// An ENABLED gateway whose factory cannot build from the current settings
+    /// (e.g. missing required credentials) is a configuration gap, not an
+    /// engine fault: the daemon must still boot with the gateway skipped. When
+    /// this failed the build instead, the engine daemon exited, and Cockpit's
     /// `setup()` panicked on `.expect("engine daemon unreachable")` before the
-    /// window was ever shown — a fresh install just silently did nothing.
-    ///
-    /// No settings are written here on purpose; the seed alone reproduces it.
+    /// window was ever shown.
     #[tokio::test]
     async fn build_daemon_skips_an_enabled_gateway_its_factory_cannot_build() {
         let (_guard, db_path) = temp_db_path();
+        {
+            let store = Store::open(&db_path).await.unwrap();
+            let settings = SettingsStore::new(Arc::new(store));
+            settings.set("enabled_gateways", "acme-gw").await.unwrap();
+        }
 
         let daemon = build_daemon(BuildDaemonOpts {
             db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
             extra_gateway_factories: vec![(
-                "discord".to_string(),
+                "acme-gw".to_string(),
                 Arc::new(UnconfiguredGatewayFactory) as Arc<dyn GatewayFactory>,
             )],
             harness_factory: None,
             component_bootstrap: None,
         })
         .await
-        .expect("a fresh install must boot even though the seeded gateway is unconfigured");
+        .expect("the daemon must boot even though the enabled gateway is unconfigured");
 
         assert!(
             daemon.gateways.is_empty(),
@@ -1745,10 +1750,9 @@ mod tests {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
             settings
-                .set("enabled_gateways", "discord,bogus")
+                .set("enabled_gateways", "acme-gw,bogus")
                 .await
                 .unwrap();
-            settings.set("discord.token", "tok-xyz").await.unwrap();
         }
 
         let captured = Arc::new(Mutex::new(None));
@@ -1759,18 +1763,18 @@ mod tests {
             db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_gateway_factories: vec![("acme-gw".to_string(), factory)],
             harness_factory: None,
             component_bootstrap: None,
         })
         .await
         .unwrap();
 
+        // Only the id with a registered factory is wired; the unknown id is skipped.
         assert_eq!(daemon.gateways.len(), 1);
+        // A gateway with no CATALOG-declared settings fields receives an empty config.
         let cfg = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(cfg["discord.token"], "tok-xyz");
-        assert_eq!(cfg["discord.app_id"], "");
-        assert_eq!(cfg["discord.guild_id"], "");
+        assert_eq!(cfg, serde_json::json!({}));
     }
 
     #[tokio::test]
@@ -1779,11 +1783,10 @@ mod tests {
         {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "discord").await.unwrap();
-            settings.set("discord.token", "tok-xyz").await.unwrap();
+            settings.set("enabled_gateways", "acme-gw").await.unwrap();
         }
 
-        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
         let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
             gateway: gateway.clone(),
         });
@@ -1791,7 +1794,7 @@ mod tests {
             db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_gateway_factories: vec![("acme-gw".to_string(), factory)],
             harness_factory: None,
             component_bootstrap: None,
         })
@@ -1859,11 +1862,10 @@ mod tests {
         {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "discord").await.unwrap();
-            settings.set("discord.token", "tok-xyz").await.unwrap();
+            settings.set("enabled_gateways", "acme-gw").await.unwrap();
         }
 
-        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
         let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
             gateway: gateway.clone(),
         });
@@ -1871,7 +1873,7 @@ mod tests {
             db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_gateway_factories: vec![("acme-gw".to_string(), factory)],
             harness_factory: None,
             component_bootstrap: None,
         })
@@ -1966,11 +1968,10 @@ mod tests {
         {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "discord").await.unwrap();
-            settings.set("discord.token", "tok-xyz").await.unwrap();
+            settings.set("enabled_gateways", "acme-gw").await.unwrap();
         }
 
-        let gateway = Arc::new(FakeGateway::with_status_subscription("discord"));
+        let gateway = Arc::new(FakeGateway::with_status_subscription("acme-gw"));
         let factory: Arc<dyn GatewayFactory> = Arc::new(StaticGatewayFactory {
             gateway: gateway.clone(),
         });
@@ -1978,7 +1979,7 @@ mod tests {
             db_path,
             config_root: tempfile::tempdir().unwrap().keep(),
             telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_gateway_factories: vec![("acme-gw".to_string(), factory)],
             harness_factory: None,
             component_bootstrap: None,
         })
@@ -2228,13 +2229,13 @@ mod tests {
         let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", Some("starter-1")).await;
-        store.add_surface("discord", "chan1", "s1").await.unwrap();
+        store.add_surface("acme-gw", "chan1", "s1").await.unwrap();
         SettingsStore::new(store.clone())
             .set("approver_role_ids", "role-a, role-b")
             .await
             .unwrap();
 
-        let gw = FakeGateway::new("discord", GwBehavior::Allow);
+        let gw = FakeGateway::new("acme-gw", GwBehavior::Allow);
         let last_req = gw.last_req.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
@@ -2296,9 +2297,9 @@ mod tests {
         let (cp, store, _guard) = control_plane_with_telemetry(telemetry).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
-        store.add_surface("discord", "chan1", "s1").await.unwrap();
+        store.add_surface("acme-gw", "chan1", "s1").await.unwrap();
 
-        let gw = FakeGateway::new("discord", GwBehavior::SleepThenAllow(150));
+        let gw = FakeGateway::new("acme-gw", GwBehavior::SleepThenAllow(150));
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
         let approval = cp.approvals_for_test_register("run-2", "req-2");
 
@@ -2325,7 +2326,7 @@ mod tests {
         seed_session(&store, "s1", "p1", None).await;
         // Deliberately no add_surface.
 
-        let gw = FakeGateway::new("discord", GwBehavior::Allow);
+        let gw = FakeGateway::new("acme-gw", GwBehavior::Allow);
         let calls = gw.calls.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
         let approval = cp.approvals_for_test_register("run-3", "req-3");
@@ -2397,15 +2398,15 @@ mod tests {
         let (cp, store, _guard) = control_plane_with_telemetry(Arc::new(NoopTelemetry)).await;
         seed_project(&store, "p1").await;
         seed_session(&store, "s1", "p1", None).await;
-        // The persisted Discord surface can become unavailable after session
+        // The persisted gateway surface can become unavailable after session
         // setup (for example, the channel was deleted or permissions changed).
         store
-            .add_surface("discord", "deleted-channel", "s1")
+            .add_surface("acme-gw", "deleted-channel", "s1")
             .await
             .unwrap();
 
-        let discord = FakeGateway::new("discord", GwBehavior::ErrImmediately);
-        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(discord)];
+        let gw = FakeGateway::new("acme-gw", GwBehavior::ErrImmediately);
+        let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
         let mut approval = cp.approvals_for_test_register("run-race-2", "req-race-2");
 
         handle_approval(
@@ -2427,11 +2428,11 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), &mut approval)
                 .await
                 .is_err(),
-            "an unavailable Discord surface must leave the approval pending for Cockpit"
+            "an unavailable gateway surface must leave the approval pending for Cockpit"
         );
         assert!(
             cp.resolve_approval_bool("run-race-2", "req-race-2", true),
-            "Cockpit must be able to resolve an approval after Discord is unavailable"
+            "Cockpit must be able to resolve an approval after the gateway is unavailable"
         );
         assert!(
             approval.await.unwrap().allowed(),
@@ -2661,7 +2662,7 @@ mod tests {
         init_repo(repo.path());
         let project = cp.connect_project(repo.path(), "demo").await.unwrap();
 
-        let gw = FakeGateway::new("discord", GwBehavior::Allow);
+        let gw = FakeGateway::new("acme-gw", GwBehavior::Allow);
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
         let mut rx = cp.subscribe();
@@ -2687,7 +2688,7 @@ mod tests {
                     // Bind the surface now (we know the session_pk is live —
                     // the harness is already blocked awaiting the hub).
                     store
-                        .add_surface("discord", "chan1", &session_pk)
+                        .add_surface("acme-gw", "chan1", &session_pk)
                         .await
                         .unwrap();
                     handle_approval(
@@ -3250,7 +3251,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .add_surface("discord", "inbound-conversation", "inbound-session")
+            .add_surface("acme-gw", "inbound-conversation", "inbound-session")
             .await
             .unwrap();
 
@@ -3288,7 +3289,7 @@ mod tests {
         let mut reply = tokio::spawn(async move {
             reply_router
                 .on_reply(
-                    "discord",
+                    "acme-gw",
                     "inbound-conversation",
                     "actor",
                     "inbound prompt",
@@ -3373,11 +3374,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .add_surface("discord", "inbound-conversation", "inbound-session")
+            .add_surface("acme-gw", "inbound-conversation", "inbound-session")
             .await
             .unwrap();
 
-        let gateway = FakeGateway::new("discord", GwBehavior::Allow);
+        let gateway = FakeGateway::new("acme-gw", GwBehavior::Allow);
         let starts = gateway.starts.clone();
         let stops = gateway.stops.clone();
         let gateway: Arc<dyn Gateway> = Arc::new(gateway);
@@ -3418,7 +3419,7 @@ mod tests {
         let mut reply = tokio::spawn(async move {
             reply_router
                 .on_reply(
-                    "discord",
+                    "acme-gw",
                     "inbound-conversation",
                     "actor",
                     "inbound prompt",
@@ -3477,7 +3478,7 @@ mod tests {
             Arc::new(tokio::sync::Notify::new()),
         );
         let gateway = FakeGateway::new_blocking_start(
-            "discord",
+            "acme-gw",
             Arc::clone(&start_entered),
             Arc::clone(&release_start),
         );
@@ -3542,7 +3543,7 @@ mod tests {
         assert_eq!(stops.load(Ordering::SeqCst), 1);
 
         let inbound_error = router_in
-            .on_reply("discord", "inbound-conversation", "actor", "prompt", &[])
+            .on_reply("acme-gw", "inbound-conversation", "actor", "prompt", &[])
             .await
             .unwrap_err();
         assert_eq!(inbound_error.to_string(), "daemon failed to boot");
@@ -3628,12 +3629,12 @@ mod tests {
             .unwrap();
 
         store
-            .add_surface("discord", "resumed-session", "s1")
+            .add_surface("acme-gw", "resumed-session", "s1")
             .await
             .unwrap();
 
         let gw = FakeGateway::new_delayed_start(
-            "discord",
+            "acme-gw",
             GwBehavior::Allow,
             Duration::from_millis(100),
         );
@@ -3712,7 +3713,7 @@ mod tests {
         )
         .await;
 
-        let gw = FakeGateway::new("discord", GwBehavior::Allow);
+        let gw = FakeGateway::new("acme-gw", GwBehavior::Allow);
         let stops = gw.stops.clone();
         let gateways: Vec<Arc<dyn Gateway>> = vec![Arc::new(gw)];
 
@@ -3938,8 +3939,7 @@ mod tests {
         {
             let store = Store::open(&db_path).await.unwrap();
             let settings = SettingsStore::new(Arc::new(store));
-            settings.set("enabled_gateways", "discord").await.unwrap();
-            settings.set("discord.token", "tok-xyz").await.unwrap();
+            settings.set("enabled_gateways", "acme-gw").await.unwrap();
         }
 
         let captured = Arc::new(Mutex::new(None));
@@ -3951,7 +3951,7 @@ mod tests {
             db_path: db_path.clone(),
             config_root: config_root.path().to_path_buf(),
             telemetry: Some(Arc::new(NoopTelemetry)),
-            extra_gateway_factories: vec![("discord".to_string(), factory)],
+            extra_gateway_factories: vec![("acme-gw".to_string(), factory)],
             harness_factory: Some(Arc::new(PermFakeHarnessFactory)),
             component_bootstrap: None,
         })
@@ -3968,7 +3968,7 @@ mod tests {
         seed_session(&daemon.store, "s1", "p1", Some("starter-1")).await;
         daemon
             .store
-            .add_surface("discord", "chan1", "s1")
+            .add_surface("acme-gw", "chan1", "s1")
             .await
             .unwrap();
 
@@ -4042,7 +4042,7 @@ mod tests {
         seed_session(&daemon.store, "s1", "p1", Some("starter-1")).await;
         daemon
             .store
-            .add_surface("discord", "chan1", "s1")
+            .add_surface("acme-gw", "chan1", "s1")
             .await
             .unwrap();
 

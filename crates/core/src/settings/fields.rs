@@ -291,35 +291,25 @@ mod tests {
     use crate::settings::{all_fields, find_field};
 
     #[test]
-    fn schema_has_35_keys_and_correct_flags() {
+    fn schema_has_32_keys_and_correct_flags() {
+        // Native Discord (the only historical gateway with catalog fields)
+        // migrated to a WASM component bundle that declares its own settings,
+        // so the schema is now globals-only.
         let fields = all_fields();
-        assert_eq!(fields.len(), 35); // 32 global + 3 discord
+        assert_eq!(fields.len(), 32); // 32 global, no native gateway fields
         let keys: Vec<&str> = fields.iter().map(|f| f.key).collect();
-        // list order: 32 globals first, then 3 discord fields
         assert_eq!(keys[0], "workdir_root");
         assert!(keys.contains(&"max_spawn_depth"));
         assert!(keys.contains(&"approval_timeout_ms"));
-        assert_eq!(
-            &keys[32..],
-            &["discord.token", "discord.app_id", "discord.guild_id"]
-        );
-        // the only required global is workdir_root; all 3 discord fields required; token is the only secret
+        // the only required global is workdir_root; no global is secret
         let required: Vec<&str> = fields
             .iter()
             .filter(|f| f.required)
             .map(|f| f.key)
             .collect();
-        assert_eq!(
-            required,
-            vec![
-                "workdir_root",
-                "discord.token",
-                "discord.app_id",
-                "discord.guild_id"
-            ]
-        );
+        assert_eq!(required, vec!["workdir_root"]);
         let secret: Vec<&str> = fields.iter().filter(|f| f.secret).map(|f| f.key).collect();
-        assert_eq!(secret, vec!["discord.token"]);
+        assert!(secret.is_empty(), "no global field is secret: {secret:?}");
         assert_eq!(
             find_field("default_effort").unwrap().default,
             Some("medium")

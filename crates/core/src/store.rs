@@ -2160,12 +2160,6 @@ impl Store {
             migrations().to_latest(c)
         })
         .await?;
-        interact_on(&pool, |c| {
-            c.execute_batch(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES ('enabled_gateways', 'discord');",
-            )
-        })
-        .await?;
         Ok(Store {
             pool,
             #[cfg(test)]
@@ -7132,13 +7126,16 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
         store
-            .set_setting_raw("discord.token", "secret")
+            .set_setting_raw("plugin.acme.token", "secret")
             .await
             .unwrap();
-        store.delete_setting_raw("discord.token").await.unwrap();
-        assert_eq!(store.get_setting_raw("discord.token").await.unwrap(), None);
+        store.delete_setting_raw("plugin.acme.token").await.unwrap();
+        assert_eq!(
+            store.get_setting_raw("plugin.acme.token").await.unwrap(),
+            None
+        );
         // Deleting a key that doesn't exist is a no-op, not an error.
-        store.delete_setting_raw("discord.token").await.unwrap();
+        store.delete_setting_raw("plugin.acme.token").await.unwrap();
     }
 
     #[tokio::test]
@@ -8844,14 +8841,11 @@ mod tests {
     async fn settings_raw_roundtrip_and_seeds() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Store::open(tmp.path()).await.unwrap();
-        // Seeds applied on open:
+        // No gateway seed on open anymore (the native Discord seed was removed
+        // with the native gateway) — a fresh store has no `enabled_gateways`.
         assert_eq!(
-            store
-                .get_setting_raw("enabled_gateways")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("discord")
+            store.get_setting_raw("enabled_gateways").await.unwrap(),
+            None
         );
         // Upsert + empty string is a real value:
         store
@@ -8882,14 +8876,14 @@ mod tests {
         s.started_by = Some("u42".into());
         store.insert_session(s).await.unwrap();
 
-        store.add_surface("discord", "chan1", "s1").await.unwrap();
-        store.add_surface("discord", "chan1", "s1").await.unwrap(); // upsert, no error
+        store.add_surface("acme-gw", "chan1", "s1").await.unwrap();
+        store.add_surface("acme-gw", "chan1", "s1").await.unwrap(); // upsert, no error
         let surfaces = store.surfaces("s1").await.unwrap();
         assert_eq!(surfaces.len(), 1);
-        assert_eq!(surfaces[0].gateway, "discord");
+        assert_eq!(surfaces[0].gateway, "acme-gw");
         assert_eq!(surfaces[0].conversation_id, "chan1");
         let resolved = store
-            .resolve_by_conversation("discord", "chan1")
+            .resolve_by_conversation("acme-gw", "chan1")
             .await
             .unwrap()
             .unwrap();
@@ -8897,15 +8891,15 @@ mod tests {
         assert_eq!(resolved.started_by.as_deref(), Some("u42"));
         assert_eq!(resolved.resume_attempts, 0);
 
-        store.bind_project("discord", "guild1", "p1").await.unwrap();
+        store.bind_project("acme-gw", "guild1", "p1").await.unwrap();
         let proj = store
-            .resolve_project_by_workspace("discord", "guild1")
+            .resolve_project_by_workspace("acme-gw", "guild1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(proj.project_id, "p1");
         assert!(store
-            .resolve_project_by_workspace("discord", "nope")
+            .resolve_project_by_workspace("acme-gw", "nope")
             .await
             .unwrap()
             .is_none());
@@ -8940,14 +8934,6 @@ mod tests {
             s.perm_mode,
             PermMode::AcceptEdits,
             "sessions.perm_mode backfills from the owning project"
-        );
-        assert_eq!(
-            store
-                .get_setting_raw("enabled_gateways")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("discord")
         );
         // Phase 2 migration 20 (sessions rebuild: nullable project_id +
         // kind/speaker/agent/parent_session_pk) must also fire on this

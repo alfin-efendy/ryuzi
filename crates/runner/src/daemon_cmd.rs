@@ -98,15 +98,10 @@ fn daemon_opts(deps: &Deps) -> BuildDaemonOpts {
         db_path: deps.db_path.clone(),
         config_root: ryuzi_core::paths::config_dir(),
         telemetry: None,
-        // `factory_entries()` is gated INSIDE `ryuzi-core` on ITS OWN
-        // `discord` feature (see `gateway::discord::mod`'s doc on why the
-        // gate can't live here: `#[cfg(feature = "discord")]` in THIS crate
-        // would check a feature `ryuzi-runner` doesn't declare, since its
-        // `Cargo.toml` requests `ryuzi-core`'s `discord` feature directly
-        // rather than exposing its own toggle). Empty under
-        // `not(feature = "discord")`; populated for every real `ryuzi-runner`
-        // build (its `Cargo.toml` always requests `ryuzi-core/discord`).
-        extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
+        // No native (in-process) gateways: Discord migrated to a signed WASM
+        // component bundle, which `build_daemon` discovers + wires itself. The
+        // native factory seam remains for any future native gateway.
+        extra_gateway_factories: vec![],
         harness_factory: None,
         component_bootstrap: None,
     }
