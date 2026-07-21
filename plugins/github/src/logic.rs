@@ -161,21 +161,84 @@ fn require_confirm(args: &[Arg], tool: &str) -> Result<(), ToolError> {
     }
 }
 
-/// `true` if a GraphQL document is a mutation, i.e. its trimmed text begins with
-/// the `mutation` keyword (per the reconciliation rule: gate anything whose
-/// trimmed text starts with `mutation`).
+fn is_ident_start(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphabetic()
+}
+
+fn is_ident_char(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphanumeric()
+}
+
+/// `true` if a GraphQL document contains a top-level `mutation` operation, and
+/// therefore must be confirmed. Deliberately conservative — a false "needs
+/// confirm" is harmless, a missed mutation is a security bug (an unconfirmed
+/// mutation would leave the component).
+///
+/// A single naive "trimmed text starts with `mutation`" check has two bypasses
+/// this scanner closes: a leading `#` comment line before the keyword
+/// (`# star\nmutation { .. }`), and a multi-operation document that starts with
+/// a query (`query A { .. } mutation B { .. }`). We walk the whole document,
+/// skipping `#` comments and string literals (so their braces/keywords never
+/// count), tracking brace depth, and flag the `mutation` keyword only when it
+/// appears as a whole identifier at brace-depth 0 — where the only thing a bare
+/// `mutation` token can be is an operation definition (field names always sit
+/// inside braces, i.e. depth >= 1).
 pub fn is_graphql_mutation(query: &str) -> bool {
-    let trimmed = query.trim_start();
-    match trimmed.strip_prefix("mutation") {
-        // Bare `mutation` or `mutation` followed by a non-identifier boundary
-        // (name, `(`, or `{`) — not an identifier like `mutations`.
-        Some(rest) => rest
-            .chars()
-            .next()
-            .map(|c| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(true),
-        None => false,
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            // `#` comment runs to end of line — its braces/text never count.
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Skip a string literal so an embedded `}`/`mutation` can't fool the
+            // depth tracker or the keyword match. Handles block strings too.
+            b'"' => {
+                if bytes[i..].starts_with(b"\"\"\"") {
+                    i += 3;
+                    while i < bytes.len() && !bytes[i..].starts_with(b"\"\"\"") {
+                        i += 1;
+                    }
+                    i += 3;
+                } else {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        // A backslash escapes the next byte (e.g. `\"`).
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if is_ident_start(c) => {
+                let start = i;
+                while i < bytes.len() && is_ident_char(bytes[i]) {
+                    i += 1;
+                }
+                // Identifier bytes are ASCII, so `start..i` is a char boundary.
+                if depth <= 0 && &query[start..i] == "mutation" {
+                    return true;
+                }
+            }
+            _ => i += 1,
+        }
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -205,13 +268,18 @@ fn get(url: String) -> PlannedRequest {
     }
 }
 
-fn with_json_body(method: &str, url: String, body: Value) -> PlannedRequest {
-    PlannedRequest {
+fn with_json_body(method: &str, url: String, body: Value) -> Result<PlannedRequest, ToolError> {
+    // A serde_json::Value always serializes in practice, but keep the
+    // "component never panics on any input" invariant explicit rather than
+    // relying on that: surface any failure as a tool error.
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|e| ToolError::Failed(format!("failed to serialize request body: {e}")))?;
+    Ok(PlannedRequest {
         method: method.to_string(),
         url,
         headers: base_headers(true),
-        body: Some(serde_json::to_vec(&body).expect("json body always serializes")),
-    }
+        body: Some(bytes),
+    })
 }
 
 /// One valid value out of a small set, or [`ToolError::InvalidCall`]. Used for
@@ -412,11 +480,7 @@ pub fn plan_request(tool: &str, args: &[Arg]) -> Result<PlannedRequest, ToolErro
                 })?;
                 body.insert("variables".to_string(), parsed);
             }
-            Ok(with_json_body(
-                "POST",
-                format!("{API_BASE}/graphql"),
-                Value::Object(body),
-            ))
+            with_json_body("POST", format!("{API_BASE}/graphql"), Value::Object(body))
         }
         "issue_create" => {
             require_confirm(args, "issue_create")?;
@@ -428,11 +492,11 @@ pub fn plan_request(tool: &str, args: &[Arg]) -> Result<PlannedRequest, ToolErro
             if let Some(text) = opt_text(args, "body") {
                 body.insert("body".to_string(), Value::String(text));
             }
-            Ok(with_json_body(
+            with_json_body(
                 "POST",
                 format!("{API_BASE}/repos/{owner}/{repo}/issues"),
                 Value::Object(body),
-            ))
+            )
         }
         "issue_comment" => {
             require_confirm(args, "issue_comment")?;
@@ -440,11 +504,11 @@ pub fn plan_request(tool: &str, args: &[Arg]) -> Result<PlannedRequest, ToolErro
             let repo = req_text(args, "repo")?;
             let number = req_integer(args, "issue_number")?;
             let text = req_text(args, "body")?;
-            Ok(with_json_body(
+            with_json_body(
                 "POST",
                 format!("{API_BASE}/repos/{owner}/{repo}/issues/{number}/comments"),
                 serde_json::json!({ "body": text }),
-            ))
+            )
         }
         "pr_create" => {
             require_confirm(args, "pr_create")?;
@@ -460,11 +524,11 @@ pub fn plan_request(tool: &str, args: &[Arg]) -> Result<PlannedRequest, ToolErro
             if let Some(text) = opt_text(args, "body") {
                 body.insert("body".to_string(), Value::String(text));
             }
-            Ok(with_json_body(
+            with_json_body(
                 "POST",
                 format!("{API_BASE}/repos/{owner}/{repo}/pulls"),
                 Value::Object(body),
-            ))
+            )
         }
         "pr_review" => {
             require_confirm(args, "pr_review")?;
@@ -481,11 +545,11 @@ pub fn plan_request(tool: &str, args: &[Arg]) -> Result<PlannedRequest, ToolErro
             if let Some(text) = opt_text(args, "body") {
                 body.insert("body".to_string(), Value::String(text));
             }
-            Ok(with_json_body(
+            with_json_body(
                 "POST",
                 format!("{API_BASE}/repos/{owner}/{repo}/pulls/{number}/reviews"),
                 Value::Object(body),
-            ))
+            )
         }
         "pr_merge" => {
             require_confirm(args, "pr_merge")?;
@@ -496,11 +560,11 @@ pub fn plan_request(tool: &str, args: &[Arg]) -> Result<PlannedRequest, ToolErro
                 Some(method) => one_of(&method, &["merge", "squash", "rebase"], "method")?,
                 None => "merge".to_string(),
             };
-            Ok(with_json_body(
+            with_json_body(
                 "PUT",
                 format!("{API_BASE}/repos/{owner}/{repo}/pulls/{number}/merge"),
                 serde_json::json!({ "merge_method": method }),
-            ))
+            )
         }
         other => Err(ToolError::InvalidCall(format!("unknown tool: {other}"))),
     }
@@ -913,14 +977,25 @@ mod tests {
     // ---------------- the confirmation gate ----------------
 
     #[test]
-    fn is_graphql_mutation_detects_only_a_leading_mutation_keyword() {
+    fn is_graphql_mutation_detects_a_top_level_mutation_operation() {
         assert!(is_graphql_mutation("mutation { addStar }"));
         assert!(is_graphql_mutation("  \n mutation Foo { x }"));
         assert!(is_graphql_mutation("mutation"));
+        // Bypass 1: a leading `#` comment line before the keyword.
+        assert!(is_graphql_mutation("# star it\nmutation { addStar }"));
+        // Bypass 2: a multi-operation document whose FIRST op is a query.
+        assert!(is_graphql_mutation(
+            "query A { viewer { login } } mutation B { addStar }"
+        ));
+
         assert!(!is_graphql_mutation("query { viewer { login } }"));
         // A field/type merely named like the keyword is not a mutation op.
         assert!(!is_graphql_mutation("query { mutations { total } }"));
         assert!(!is_graphql_mutation("mutationsFeed { x }"));
+        // A brace/keyword inside a string or comment must not fool the scanner.
+        assert!(!is_graphql_mutation(r#"query { field(arg: "}") }"#));
+        assert!(!is_graphql_mutation(r#"query { field(arg: "mutation") }"#));
+        assert!(!is_graphql_mutation("query { x } # mutation { addStar }"));
     }
 
     #[test]
@@ -929,6 +1004,38 @@ mod tests {
         assert!(
             matches!(err, ToolError::ConfirmationRequired(_)),
             "a graphql mutation must require confirmation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_comment_prefixed_mutation_without_confirm_is_refused() {
+        let err = plan_request(
+            "graphql",
+            &[t(
+                "query",
+                "# star it\nmutation { addStar(input: {}) { starrable { id } } }",
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::ConfirmationRequired(_)),
+            "a comment-prefixed mutation must require confirmation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graphql_multi_operation_with_a_mutation_without_confirm_is_refused() {
+        let err = plan_request(
+            "graphql",
+            &[t(
+                "query",
+                "query A { viewer { login } } mutation B { addStar(input: {}) { clientMutationId } }",
+            )],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::ConfirmationRequired(_)),
+            "a multi-operation document containing a mutation must require confirmation, got {err:?}"
         );
     }
 
