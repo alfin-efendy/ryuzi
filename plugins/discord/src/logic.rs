@@ -217,9 +217,9 @@ fn on_reconnect(state: &mut GatewayState, resume: bool) -> Vec<Action> {
 /// Decide whether an op-1 heartbeat is due. The first tick after a HELLO arms
 /// the timer (nothing due yet); once an interval has elapsed a heartbeat carrying
 /// the last sequence is returned. If the previous heartbeat was never ACKed by
-/// the time the next one comes due, the connection is a zombie: signal a
-/// resume-reconnect through the state (the guest checks [`GatewayState::take_reconnect`])
-/// and send nothing.
+/// the time the next one comes due, the connection is a zombie: preserve the
+/// session and signal a RESUME-reconnect through the state (the guest checks
+/// [`GatewayState::take_reconnect`]) and send nothing.
 pub fn due_heartbeat(state: &mut GatewayState, now_ms: u64) -> Option<String> {
     let interval = state.heartbeat_interval_ms?;
     if interval == 0 {
@@ -232,6 +232,13 @@ pub fn due_heartbeat(state: &mut GatewayState, now_ms: u64) -> Option<String> {
         }
         Some(due) if now_ms >= due => {
             if !state.heartbeat_acked {
+                // Zombie connection. Keep `session_id` + `last_seq` and arm a
+                // RESUME so the recovery HELLO replays missed events, exactly
+                // like the RECONNECT / resumable-INVALID_SESSION paths — a fresh
+                // IDENTIFY here would silently drop the session and any Discord
+                // events that arrived during the heartbeat blackout.
+                state.pending_resume = true;
+                state.phase = GatewayPhase::Resuming;
                 state.reconnect = Some(true);
                 return None;
             }
@@ -430,13 +437,28 @@ mod tests {
 
     #[test]
     fn missed_heartbeat_ack_signals_reconnect() {
-        let mut state = GatewayState::new("t");
+        let mut state = GatewayState::new("bot-token");
         on_frame(&mut state, &hello(41250));
+        on_frame(&mut state, &ready(4)); // live session, last_seq = 4
         assert_eq!(due_heartbeat(&mut state, 0), None); // arm, next due 41250
         assert!(due_heartbeat(&mut state, 41250).is_some()); // send, awaiting ack
                                                              // No ACK arrives; the next due tick detects the zombie connection.
         assert_eq!(due_heartbeat(&mut state, 82500), None);
         assert_eq!(state.take_reconnect(), Some(true));
+
+        // The zombie path must preserve the session and arm a RESUME (not a
+        // fresh IDENTIFY) so no events are dropped across the blackout.
+        assert!(state.pending_resume);
+        assert_eq!(state.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(state.last_seq, Some(4));
+
+        // The recovery connection's HELLO therefore emits RESUME, carrying the
+        // preserved session id + sequence — proving no fresh IDENTIFY.
+        let actions = on_frame(&mut state, &hello(41250));
+        let frame = sent_frame(&actions);
+        assert_eq!(frame["op"].as_u64(), Some(OP_RESUME));
+        assert_eq!(frame["d"]["session_id"].as_str(), Some("sess-abc"));
+        assert_eq!(frame["d"]["seq"].as_u64(), Some(4));
     }
 
     #[test]

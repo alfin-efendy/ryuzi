@@ -105,13 +105,25 @@ impl Guest for Discord {
 
     fn health_check() -> Result<WitGatewayState, GatewayError> {
         RUNTIME.with(|cell| match &*cell.borrow() {
-            Some(runtime) => Ok(WitGatewayState {
-                running: true,
-                detail: match &runtime.last_error {
-                    Some(error) => format!("{:?}:{error}", runtime.state.phase),
-                    None => format!("{:?}", runtime.state.phase),
-                },
-            }),
+            Some(runtime) => {
+                // Report healthy only once the gateway actually holds (or is
+                // resuming) a session — a still-connecting/identifying instance
+                // or one whose last host call errored is NOT running, so the
+                // supervisor's health/restart signal is accurate rather than a
+                // blanket "a runtime exists". The reason always rides in `detail`.
+                let connected = matches!(
+                    runtime.state.phase,
+                    logic::GatewayPhase::Ready | logic::GatewayPhase::Resuming
+                );
+                let running = connected && runtime.last_error.is_none();
+                Ok(WitGatewayState {
+                    running,
+                    detail: match &runtime.last_error {
+                        Some(error) => format!("{:?}:{error}", runtime.state.phase),
+                        None => format!("{:?}", runtime.state.phase),
+                    },
+                })
+            }
             None => Ok(WitGatewayState {
                 running: false,
                 detail: "not-started".to_string(),
@@ -146,6 +158,9 @@ fn drive(runtime: &mut Runtime) {
     // Drain everything the host buffered since the last poll.
     match ws::poll(runtime.handle) {
         Ok(frames) => {
+            // A successful poll means the socket is alive; clear any stale error
+            // so `health_check`'s liveness signal reflects the current state.
+            runtime.last_error = None;
             for frame in frames {
                 if !frame.is_text {
                     continue; // Discord's json encoding is text-only.
