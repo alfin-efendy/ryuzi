@@ -5,9 +5,12 @@
 //! Deliberately thin — every protocol decision lives in [`crate::logic`]. This
 //! module only performs effects: read settings, open/poll/send/close the
 //! websocket, supply a WASI monotonic clock to the state machine, and map the
-//! machine's [`logic::Action`]s onto host calls. Message normalization (Task 8),
-//! slash commands + approvals (Task 9), and Discord REST for `deliver-outbound`
-//! (Task 10) build on this skeleton.
+//! machine's [`logic::Action`]s onto host calls. Message normalization (Task 8)
+//! is wired into [`logic::on_frame`] itself — this module's only Task 8
+//! responsibility is the `is_thread` input, currently hardcoded `false` (see
+//! `drive`'s comment) until the REST `GET /channels/{id}` channel-type
+//! classification lands in Task 10. Slash commands + approvals (Task 9) and
+//! Discord REST for `deliver-outbound` (Task 10) build on this skeleton.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -168,7 +171,13 @@ fn drive(runtime: &mut Runtime) {
                 let Ok(text) = String::from_utf8(frame.data) else {
                     continue;
                 };
-                let actions = logic::on_frame(&mut runtime.state, &text);
+                // `is_thread` (only consulted for a MESSAGE_CREATE dispatch)
+                // is hardcoded `false` until Task 10 wires the REST
+                // `GET /channels/{id}` channel-type classification round trip
+                // ahead of this call — channel messages and DMs are
+                // unaffected; a thread reply is simply not yet detected as
+                // one (falls through to the mention/bare-message rules).
+                let actions = logic::on_frame(&mut runtime.state, &text, false);
                 perform(runtime, actions);
             }
         }

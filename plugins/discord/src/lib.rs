@@ -19,8 +19,11 @@
 //! monotonic clock to the state machine, and maps the machine's emissions onto
 //! the `ryuzi:gateway` export.
 //!
-//! Message normalization (Task 8), slash commands + approval buttons (Task 9),
-//! and Discord REST + outbound-op wiring (Task 10) build on this protocol core.
+//! Message normalization (Task 8) is now wired into [`logic::on_frame`]'s
+//! `MESSAGE_CREATE` dispatch handling, reproducing the native inbound routing
+//! rules exactly (`message.mention`/`message.thread`/`message.dm`). Slash
+//! commands + approval buttons (Task 9) and Discord REST + outbound-op wiring
+//! (Task 10) build on this protocol core.
 
 pub mod logic;
 

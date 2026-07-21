@@ -102,7 +102,14 @@ impl GatewayState {
 /// Advance the state machine by one inbound gateway frame, returning the side
 /// effects the guest must carry out. A malformed / non-object frame is ignored
 /// (empty actions) — the host must never trap on garbage from the wire.
-pub fn on_frame(state: &mut GatewayState, raw_json: &str) -> Vec<Action> {
+///
+/// `is_thread` is only consulted for a `MESSAGE_CREATE` dispatch (every other
+/// frame ignores it): whether the message's channel is a thread, per Discord's
+/// channel-type classification. The real answer requires a REST
+/// `GET /channels/{id}` round trip, which is the guest's job (wired in Task
+/// 10) — this function stays pure by taking the pre-resolved answer as a
+/// parameter instead of performing the lookup itself.
+pub fn on_frame(state: &mut GatewayState, raw_json: &str, is_thread: bool) -> Vec<Action> {
     let value: Value = match serde_json::from_str(raw_json) {
         Ok(value) => value,
         Err(_) => return Vec::new(),
@@ -110,9 +117,10 @@ pub fn on_frame(state: &mut GatewayState, raw_json: &str) -> Vec<Action> {
 
     // Discord stamps the monotonic sequence `s` on DISPATCH frames only (null
     // otherwise). Capture it faithfully: it is the host-facing `sequence` for
-    // emitted `message.*` events (Task 8) and the value carried in every
-    // heartbeat + RESUME. `as_u64` is `None` for a null `s`, so non-dispatch
-    // frames leave it untouched.
+    // emitted `message.*` events (Task 8 — stamped from `last_seq` below, NOT
+    // a fresh counter, so dedup survives a RESUME replay) and the value
+    // carried in every heartbeat + RESUME. `as_u64` is `None` for a null `s`,
+    // so non-dispatch frames leave it untouched.
     if let Some(seq) = value.get("s").and_then(Value::as_u64) {
         state.last_seq = Some(seq);
     }
@@ -124,7 +132,7 @@ pub fn on_frame(state: &mut GatewayState, raw_json: &str) -> Vec<Action> {
 
     match op {
         OP_HELLO => on_hello(state, &value),
-        OP_DISPATCH => on_dispatch(state, &value),
+        OP_DISPATCH => on_dispatch(state, &value, is_thread),
         OP_HEARTBEAT => {
             // Server-requested heartbeat: send one immediately, now awaiting ack.
             state.heartbeat_acked = false;
@@ -172,9 +180,11 @@ fn on_hello(state: &mut GatewayState, value: &Value) -> Vec<Action> {
 }
 
 /// DISPATCH (op 0): `last_seq` is already updated by the caller. READY/RESUMED
-/// drive the phase + session capture; MESSAGE_CREATE / INTERACTION_CREATE and
-/// the rest are the Task 8/9 normalization hook (no emission here yet).
-fn on_dispatch(state: &mut GatewayState, value: &Value) -> Vec<Action> {
+/// drive the phase + session capture; MESSAGE_CREATE normalizes into an
+/// inbound `message.*` `gateway-event` (Task 8, stamped with the dispatch's
+/// `last_seq`); INTERACTION_CREATE and the rest remain the Task 9 hook (no
+/// emission here yet).
+fn on_dispatch(state: &mut GatewayState, value: &Value, is_thread: bool) -> Vec<Action> {
     let event = value.get("t").and_then(Value::as_str).unwrap_or_default();
     match event {
         "READY" => {
@@ -193,8 +203,192 @@ fn on_dispatch(state: &mut GatewayState, value: &Value) -> Vec<Action> {
             state.phase = GatewayPhase::Ready;
             Vec::new()
         }
+        "MESSAGE_CREATE" => {
+            let Some(data) = value.get("d") else {
+                return Vec::new();
+            };
+            let bot_user_id = state.bot_user_id.as_deref().unwrap_or("");
+            // `last_seq` was already updated (from this same frame's `s`) by
+            // `on_frame` before this call — the exact Discord sequence, not a
+            // fresh counter (see `on_frame`'s doc).
+            let sequence = state.last_seq.unwrap_or(0);
+            match normalize_message(data, bot_user_id, is_thread, sequence) {
+                Some(event) => vec![Action::EmitInbound(event)],
+                None => Vec::new(),
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+/// Normalize a raw Discord `MESSAGE_CREATE` dispatch's `d` payload into the
+/// host-facing inbound `gateway-event`, reproducing native
+/// `InboundRouting::handle_message`'s routing rules
+/// (`crates/core/src/gateway/discord/mod.rs:255-312`) exactly, IN ORDER:
+///
+/// 1. A bot-authored message (including a self-loop) is ignored.
+/// 2. A DM (`guild_id` absent) with non-empty text becomes `message.dm`; an
+///    attachment-only DM (empty text) is dropped.
+/// 3. A thread reply with non-empty content OR at least one attachment
+///    becomes `message.thread`; an empty thread message is dropped.
+/// 4. A channel message that mentions the bot has the mention stripped
+///    (`strip_mentions`); if the stripped prompt is non-empty OR there is at
+///    least one attachment it becomes `message.mention`, else it's dropped.
+/// 5. Anything else (a bare channel message with no bot mention) is dropped.
+///
+/// `bot_user_id` is the bot's own id (from READY, tracked in
+/// [`GatewayState`]) — an empty string (bot id not yet known) never matches
+/// any mention, same as native's `bot_user_id.is_some_and(..)`. `is_thread`
+/// is the guest's pre-resolved channel-type classification (see [`on_frame`]'s
+/// doc). `sequence` is the dispatch's Discord gateway `s`, stamped verbatim
+/// onto the emitted event (design §5.2's RESUME-stable dedup contract) — the
+/// caller, not this function, threads it through from [`GatewayState::last_seq`].
+fn normalize_message(
+    raw: &Value,
+    bot_user_id: &str,
+    is_thread: bool,
+    sequence: u64,
+) -> Option<InboundEvent> {
+    let author_bot = raw
+        .get("author")
+        .and_then(|a| a.get("bot"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if author_bot {
+        return None;
+    }
+
+    // Serenity leaves `guild_id` unset (missing or null) on a DM channel —
+    // mirror that here regardless of whether the key is absent or explicitly
+    // `null`.
+    let is_dm = raw.get("guild_id").map(Value::is_null).unwrap_or(true);
+    let author_id = raw
+        .get("author")
+        .and_then(|a| a.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let channel_id = raw
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let content = raw
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let attachments: Vec<String> = raw
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| a.get("url").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mentions_bot = raw
+        .get("mentions")
+        .and_then(Value::as_array)
+        .is_some_and(|mentions| {
+            mentions
+                .iter()
+                .any(|m| m.get("id").and_then(Value::as_str) == Some(bot_user_id))
+        });
+
+    if is_dm {
+        if content.is_empty() {
+            return None; // Attachment-only DM: dropped, matches native.
+        }
+        return Some(build_event(
+            "message.dm",
+            json!({
+                "conversation_id": channel_id,
+                "user_id": author_id,
+                "text": content,
+            }),
+            sequence,
+        ));
+    }
+
+    if is_thread {
+        if content.is_empty() && attachments.is_empty() {
+            return None;
+        }
+        return Some(build_event(
+            "message.thread",
+            json!({
+                "conversation_id": channel_id,
+                "actor": author_id,
+                "prompt": content,
+                "attachments": attachments,
+            }),
+            sequence,
+        ));
+    }
+
+    if mentions_bot {
+        let prompt = strip_mentions(content);
+        if prompt.is_empty() && attachments.is_empty() {
+            return None; // Bare mention, no text/attachment: dropped.
+        }
+        return Some(build_event(
+            "message.mention",
+            json!({
+                "workspace_id": channel_id,
+                "actor": author_id,
+                "prompt": prompt,
+                "attachments": attachments,
+            }),
+            sequence,
+        ));
+    }
+
+    None // Bare channel message, no mention: dropped.
+}
+
+/// Build an [`InboundEvent`] from an event-type string + JSON payload value.
+fn build_event(event_type: &str, payload: Value, sequence: u64) -> InboundEvent {
+    InboundEvent {
+        event_type: event_type.to_string(),
+        payload: payload.to_string().into_bytes(),
+        sequence,
+    }
+}
+
+/// Removes user mentions from message content, then trims the result.
+/// `<@!?\d+>` hand-rolled (no `regex` dependency in this crate, matching the
+/// native implementation's own reasoning) — a literal `<@`, an optional `!`,
+/// one-or-more ASCII digits, then `>`. Operates on `char`s (not bytes) so it's
+/// correct on non-ASCII content; only ASCII digits count (via
+/// `char::is_ascii_digit`). A **role** mention (`<@&id>`) has `&` where a
+/// digit or `!` is required, so it never matches and is left untouched — only
+/// the final trim can affect it. Ports
+/// `crates/core/src/gateway/discord/mod.rs`'s `strip_mentions` verbatim —
+/// every user mention is stripped, not just the bot's own, since a message
+/// can carry other user mentions too.
+fn strip_mentions(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '<' && i + 1 < n && chars[i + 1] == '@' {
+            let mut j = i + 2;
+            if j < n && chars[j] == '!' {
+                j += 1;
+            }
+            let digits_start = j;
+            while j < n && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > digits_start && j < n && chars[j] == '>' {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out.trim().to_string()
 }
 
 /// RECONNECT / INVALID_SESSION: plan the reconnect. A resumable one keeps the
@@ -344,7 +538,7 @@ mod tests {
     #[test]
     fn hello_sets_heartbeat_and_sends_identify() {
         let mut state = GatewayState::new("bot-token");
-        let actions = on_frame(&mut state, &hello(41250));
+        let actions = on_frame(&mut state, &hello(41250), false);
 
         assert!(actions.contains(&Action::SetHeartbeat(41250)));
         assert_eq!(state.heartbeat_interval_ms, Some(41250));
@@ -363,22 +557,24 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_updates_last_seq_without_emitting_yet() {
+    fn dispatch_updates_last_seq_and_drops_empty_message_create() {
         let mut state = GatewayState::new("t");
+        // No `content`/`author`/`channel_id` at all: normalization treats the
+        // missing content as empty — same as a DM with no text, dropped.
         let actions = on_frame(
             &mut state,
-            &dispatch("MESSAGE_CREATE", 42, json!({ "content": "hi" })),
+            &dispatch("MESSAGE_CREATE", 42, json!({})),
+            false,
         );
         assert_eq!(state.last_seq, Some(42));
-        // Message normalization is Task 8 — nothing is emitted yet.
         assert!(actions.is_empty());
     }
 
     #[test]
     fn ready_stores_session_and_bot_identity() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250));
-        on_frame(&mut state, &ready(1));
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &ready(1), false);
 
         assert_eq!(state.phase, GatewayPhase::Ready);
         assert_eq!(state.session_id.as_deref(), Some("sess-abc"));
@@ -393,8 +589,8 @@ mod tests {
     #[test]
     fn due_heartbeat_arms_then_emits_op1_with_last_seq() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250));
-        on_frame(&mut state, &dispatch("MESSAGE_CREATE", 7, json!({})));
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &dispatch("MESSAGE_CREATE", 7, json!({})), false);
 
         // First tick arms the timer; no heartbeat is due yet.
         assert_eq!(due_heartbeat(&mut state, 0), None);
@@ -408,12 +604,13 @@ mod tests {
     #[test]
     fn server_requested_heartbeat_sends_immediately() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250));
-        on_frame(&mut state, &dispatch("MESSAGE_CREATE", 5, json!({})));
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &dispatch("MESSAGE_CREATE", 5, json!({})), false);
 
         let actions = on_frame(
             &mut state,
             &json!({ "op": OP_HEARTBEAT, "d": null }).to_string(),
+            false,
         );
         let frame = sent_frame(&actions);
         assert_eq!(frame["op"].as_u64(), Some(OP_HEARTBEAT));
@@ -423,7 +620,7 @@ mod tests {
     #[test]
     fn heartbeat_ack_marks_connection_alive() {
         let mut state = GatewayState::new("t");
-        on_frame(&mut state, &hello(41250));
+        on_frame(&mut state, &hello(41250), false);
         assert_eq!(due_heartbeat(&mut state, 0), None); // arm
         assert!(due_heartbeat(&mut state, 41250).is_some()); // send -> awaiting ack
         assert!(!state.heartbeat_acked);
@@ -431,6 +628,7 @@ mod tests {
         on_frame(
             &mut state,
             &json!({ "op": OP_HEARTBEAT_ACK, "d": null }).to_string(),
+            false,
         );
         assert!(state.heartbeat_acked);
     }
@@ -438,8 +636,8 @@ mod tests {
     #[test]
     fn missed_heartbeat_ack_signals_reconnect() {
         let mut state = GatewayState::new("bot-token");
-        on_frame(&mut state, &hello(41250));
-        on_frame(&mut state, &ready(4)); // live session, last_seq = 4
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &ready(4), false); // live session, last_seq = 4
         assert_eq!(due_heartbeat(&mut state, 0), None); // arm, next due 41250
         assert!(due_heartbeat(&mut state, 41250).is_some()); // send, awaiting ack
                                                              // No ACK arrives; the next due tick detects the zombie connection.
@@ -454,7 +652,7 @@ mod tests {
 
         // The recovery connection's HELLO therefore emits RESUME, carrying the
         // preserved session id + sequence — proving no fresh IDENTIFY.
-        let actions = on_frame(&mut state, &hello(41250));
+        let actions = on_frame(&mut state, &hello(41250), false);
         let frame = sent_frame(&actions);
         assert_eq!(frame["op"].as_u64(), Some(OP_RESUME));
         assert_eq!(frame["d"]["session_id"].as_str(), Some("sess-abc"));
@@ -467,6 +665,7 @@ mod tests {
         let actions = on_frame(
             &mut state,
             &json!({ "op": OP_RECONNECT, "d": null }).to_string(),
+            false,
         );
         assert_eq!(actions, vec![Action::Reconnect { resume: true }]);
         assert!(state.pending_resume);
@@ -476,12 +675,13 @@ mod tests {
     fn invalid_session_non_resumable_requests_fresh_identify() {
         let mut state = GatewayState::new("t");
         // Pretend we had a live session that Discord now invalidates.
-        on_frame(&mut state, &hello(41250));
-        on_frame(&mut state, &ready(9));
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &ready(9), false);
 
         let actions = on_frame(
             &mut state,
             &json!({ "op": OP_INVALID_SESSION, "d": false }).to_string(),
+            false,
         );
         assert_eq!(actions, vec![Action::Reconnect { resume: false }]);
         assert!(!state.pending_resume);
@@ -494,6 +694,7 @@ mod tests {
         let actions = on_frame(
             &mut state,
             &json!({ "op": OP_INVALID_SESSION, "d": true }).to_string(),
+            false,
         );
         assert_eq!(actions, vec![Action::Reconnect { resume: true }]);
         assert!(state.pending_resume);
@@ -502,17 +703,18 @@ mod tests {
     #[test]
     fn hello_after_reconnect_sends_resume_frame() {
         let mut state = GatewayState::new("bot-token");
-        on_frame(&mut state, &hello(41250));
-        on_frame(&mut state, &ready(3));
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &ready(3), false);
         // Discord asks us to reconnect; we keep the session and plan a resume.
         on_frame(
             &mut state,
             &json!({ "op": OP_RECONNECT, "d": null }).to_string(),
+            false,
         );
         assert!(state.pending_resume);
 
         // On the fresh connection's HELLO we RESUME rather than IDENTIFY.
-        let actions = on_frame(&mut state, &hello(41250));
+        let actions = on_frame(&mut state, &hello(41250), false);
         let frame = sent_frame(&actions);
         assert_eq!(frame["op"].as_u64(), Some(OP_RESUME));
         assert_eq!(frame["d"]["token"].as_str(), Some("bot-token"));
@@ -520,5 +722,243 @@ mod tests {
         assert_eq!(frame["d"]["seq"].as_u64(), Some(3));
         assert_eq!(state.phase, GatewayPhase::Resuming);
         assert!(!state.pending_resume);
+    }
+
+    // ---- Task 8: message normalization -----------------------------------
+
+    /// A synthetic Discord `MESSAGE_CREATE` `d` payload. `guild_id: None`
+    /// produces a DM (key omitted, matching a real DM payload); `Some(id)`
+    /// produces a guild channel message.
+    fn message_create(
+        channel_id: &str,
+        guild_id: Option<&str>,
+        author_id: &str,
+        author_bot: bool,
+        content: &str,
+        mention_ids: &[&str],
+        attachment_urls: &[&str],
+    ) -> Value {
+        let mut data = json!({
+            "channel_id": channel_id,
+            "author": { "id": author_id, "bot": author_bot },
+            "content": content,
+            "mentions": mention_ids.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>(),
+            "attachments": attachment_urls
+                .iter()
+                .map(|url| json!({ "url": url }))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(guild_id) = guild_id {
+            data["guild_id"] = json!(guild_id);
+        }
+        data
+    }
+
+    /// Extract the single `EmitInbound` event from a set of actions.
+    fn emitted_event(actions: &[Action]) -> InboundEvent {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::EmitInbound(event) => Some(event.clone()),
+                _ => None,
+            })
+            .expect("expected an EmitInbound action")
+    }
+
+    fn payload_json(event: &InboundEvent) -> Value {
+        serde_json::from_slice(&event.payload).expect("payload is valid JSON")
+    }
+
+    #[test]
+    fn normalize_message_drops_bot_authored() {
+        let raw = message_create("10", Some("99"), "1", true, "hi", &[], &[]);
+        assert_eq!(normalize_message(&raw, "bot-id", false, 5), None);
+    }
+
+    #[test]
+    fn normalize_message_dm_with_content_routes_to_dm() {
+        let raw = message_create("20", None, "7", false, "hello there", &[], &[]);
+        let event = normalize_message(&raw, "bot-id", false, 42).expect("dm routed");
+        assert_eq!(event.event_type, "message.dm");
+        assert_eq!(event.sequence, 42);
+        assert_eq!(
+            payload_json(&event),
+            json!({
+                "conversation_id": "20",
+                "user_id": "7",
+                "text": "hello there",
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_message_dm_attachment_only_is_dropped() {
+        let raw = message_create(
+            "20",
+            None,
+            "7",
+            false,
+            "",
+            &[],
+            &["https://cdn.discordapp.com/f.png"],
+        );
+        assert_eq!(normalize_message(&raw, "bot-id", false, 1), None);
+    }
+
+    #[test]
+    fn normalize_message_thread_reply_with_content_routes_to_thread() {
+        let raw = message_create(
+            "30",
+            Some("99"),
+            "8",
+            false,
+            "continuing the task",
+            &[],
+            &[],
+        );
+        let event = normalize_message(&raw, "bot-id", true, 7).expect("thread routed");
+        assert_eq!(event.event_type, "message.thread");
+        assert_eq!(event.sequence, 7);
+        assert_eq!(
+            payload_json(&event),
+            json!({
+                "conversation_id": "30",
+                "actor": "8",
+                "prompt": "continuing the task",
+                "attachments": Vec::<String>::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_message_thread_attachment_only_routes_to_thread() {
+        let raw = message_create(
+            "30",
+            Some("99"),
+            "8",
+            false,
+            "",
+            &[],
+            &["https://cdn.discordapp.com/plan.pdf"],
+        );
+        let event = normalize_message(&raw, "bot-id", true, 8).expect("thread routed");
+        assert_eq!(event.event_type, "message.thread");
+        assert_eq!(
+            payload_json(&event),
+            json!({
+                "conversation_id": "30",
+                "actor": "8",
+                "prompt": "",
+                "attachments": ["https://cdn.discordapp.com/plan.pdf"],
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_message_channel_mention_strips_mention_and_routes() {
+        let raw = message_create(
+            "40",
+            Some("99"),
+            "9",
+            false,
+            "<@111222333> please build the widget",
+            &["111222333"],
+            &[],
+        );
+        let event = normalize_message(&raw, "111222333", false, 11).expect("mention routed");
+        assert_eq!(event.event_type, "message.mention");
+        assert_eq!(event.sequence, 11);
+        assert_eq!(
+            payload_json(&event),
+            json!({
+                "workspace_id": "40",
+                "actor": "9",
+                "prompt": "please build the widget",
+                "attachments": Vec::<String>::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_message_channel_mention_empty_after_strip_no_attachment_is_dropped() {
+        let raw = message_create(
+            "40",
+            Some("99"),
+            "9",
+            false,
+            "<@111222333>",
+            &["111222333"],
+            &[],
+        );
+        assert_eq!(normalize_message(&raw, "111222333", false, 1), None);
+    }
+
+    #[test]
+    fn normalize_message_bare_channel_message_no_mention_is_dropped() {
+        let raw = message_create("40", Some("99"), "9", false, "just chatting", &[], &[]);
+        assert_eq!(normalize_message(&raw, "111222333", false, 1), None);
+    }
+
+    #[test]
+    fn on_frame_wires_message_create_to_mention_event_with_dispatch_sequence() {
+        let mut state = GatewayState::new("t");
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &ready(1), false); // bot_user_id == "111222333"
+
+        let data = message_create(
+            "40",
+            Some("99"),
+            "9",
+            false,
+            "<@111222333> ship it",
+            &["111222333"],
+            &[],
+        );
+        let actions = on_frame(&mut state, &dispatch("MESSAGE_CREATE", 99, data), false);
+
+        let event = emitted_event(&actions);
+        assert_eq!(event.event_type, "message.mention");
+        // The emitted sequence is Discord's dispatch `s` (99), NOT a fresh
+        // return-order counter — required for RESUME-stable dedup.
+        assert_eq!(event.sequence, 99);
+        assert_eq!(
+            payload_json(&event),
+            json!({
+                "workspace_id": "40",
+                "actor": "9",
+                "prompt": "ship it",
+                "attachments": Vec::<String>::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn on_frame_wires_message_create_to_thread_event_when_is_thread_true() {
+        let mut state = GatewayState::new("t");
+        on_frame(&mut state, &hello(41250), false);
+        on_frame(&mut state, &ready(1), false);
+
+        let data = message_create("77", Some("99"), "5", false, "still working", &[], &[]);
+        let actions = on_frame(&mut state, &dispatch("MESSAGE_CREATE", 123, data), true);
+
+        let event = emitted_event(&actions);
+        assert_eq!(event.event_type, "message.thread");
+        assert_eq!(event.sequence, 123);
+        assert_eq!(
+            payload_json(&event),
+            json!({
+                "conversation_id": "77",
+                "actor": "5",
+                "prompt": "still working",
+                "attachments": Vec::<String>::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn strip_mentions_removes_user_mention_but_leaves_role_mention() {
+        assert_eq!(strip_mentions("<@123> hi <@!456> there"), "hi  there");
+        // A role mention (`&`) never matches the user-mention pattern.
+        assert_eq!(strip_mentions("<@&789> team ping"), "<@&789> team ping");
     }
 }
