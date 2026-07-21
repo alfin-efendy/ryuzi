@@ -39,6 +39,14 @@ pub mod wasm_hooks;
 pub mod wasm_provider;
 pub mod wit;
 
+/// End-to-end proof that the REAL first-party GitHub connector component
+/// (`plugins/github`) signs, installs, enumerates its tools, and drives its
+/// host-managed OAuth through the GENERIC pipeline (Task 13b, Step 4). Kept in
+/// its own module so the pilot's evidence lives in one place; it exercises only
+/// the generic seams (no github-specific host branch).
+#[cfg(test)]
+mod github_e2e;
+
 use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
@@ -73,6 +81,36 @@ pub(crate) fn build_fixture_components_once() {
             .status()
             .expect("fixture build script should start");
         assert!(status.success(), "fixture build failed: {status}");
+    });
+}
+
+/// Build the first-party GitHub connector component (`plugins/github`) to
+/// wasm32-wasip2 EXACTLY ONCE per test process.
+///
+/// `plugins/github` is a STANDALONE workspace crate (like `plugins/mimo`), not
+/// a `tests/fixtures/*` fixture, so [`build_fixture_components_once`] does not
+/// build it. This sibling helper runs `tests/fixtures/build-github-component.sh`,
+/// which materializes `plugins/github/wit/deps` from the SDK and builds the
+/// component the same way `scripts/plugins/build-first-party.ts` does. The
+/// script touches only `plugins/github/wit/deps` (gitignored), so it never
+/// races the fixture builder's rewrites of the `tests/fixtures/*` deps. Cached
+/// via its own `OnceLock` so the (real) github sign/install/connector e2e tests
+/// share a single build.
+#[cfg(test)]
+pub(crate) fn build_github_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-github-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("github component build script should start");
+        assert!(status.success(), "github component build failed: {status}");
     });
 }
 
