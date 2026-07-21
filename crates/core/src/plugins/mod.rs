@@ -48,6 +48,15 @@ pub mod wit;
 #[cfg(test)]
 mod github_e2e;
 
+/// De-risking proof that the REAL first-party Discord gateway component
+/// (`plugins/discord`) signs, installs, and INSTANTIATES through the host
+/// [`runtime::ComponentRuntime`] with the `ryuzi:websocket` capability linked —
+/// the gateway analog of `github_e2e` (Task 10b). Catches any import/world
+/// mismatch before the expensive real-bot manual smoke; exercises only the
+/// generic seams shipped by Phases 1-5 (no discord-specific host branch).
+#[cfg(test)]
+mod discord_e2e;
+
 use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
 
@@ -112,6 +121,37 @@ pub(crate) fn build_github_component_once() {
             .status()
             .expect("github component build script should start");
         assert!(status.success(), "github component build failed: {status}");
+    });
+}
+
+/// Build the first-party Discord gateway component (`plugins/discord`) to
+/// wasm32-wasip2 EXACTLY ONCE per test process.
+///
+/// `plugins/discord` is a STANDALONE workspace crate (like `plugins/github`),
+/// not a `tests/fixtures/*` fixture, so [`build_fixture_components_once`] does
+/// not build it. This sibling helper runs
+/// `tests/fixtures/build-discord-component.sh`, which materializes
+/// `plugins/discord/wit/deps` from the SDK and builds the component the same
+/// way `scripts/plugins/build-first-party.ts` does. The script touches only
+/// `plugins/discord/wit/deps` (gitignored), so it never races the fixture
+/// builder's or the github builder's rewrites of their own deps. Cached via
+/// its own `OnceLock` so the (real) discord instantiation e2e tests share a
+/// single build.
+#[cfg(test)]
+pub(crate) fn build_discord_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-discord-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("discord component build script should start");
+        assert!(status.success(), "discord component build failed: {status}");
     });
 }
 
