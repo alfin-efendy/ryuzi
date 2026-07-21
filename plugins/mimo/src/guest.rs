@@ -122,8 +122,7 @@ fn ensure_fingerprint() -> String {
     if let Some(existing) = storage_get_string(KEY_FINGERPRINT) {
         return existing;
     }
-    let seed = format!("mimo-fp-{}", now_nanos());
-    let fingerprint = logic::fingerprint_from_seed(seed.as_bytes());
+    let fingerprint = logic::fingerprint_from_seed(&install_seed(b"mimo-fp-"));
     storage_put_string(KEY_FINGERPRINT, &fingerprint);
     fingerprint
 }
@@ -133,10 +132,28 @@ fn ensure_session_affinity() -> String {
     if let Some(existing) = storage_get_string(KEY_SESSION_AFFINITY) {
         return existing;
     }
-    let seed = format!("mimo-sa-{}", now_nanos());
-    let affinity = logic::session_affinity_from_seed(seed.as_bytes());
+    let affinity = logic::session_affinity_from_seed(&install_seed(b"mimo-sa-"));
     storage_put_string(KEY_SESSION_AFFINITY, &affinity);
     affinity
+}
+
+/// A high-entropy, one-shot seed for a per-install device id, prefixed by
+/// `domain` so the fingerprint and affinity ids never derive from the same
+/// bytes. Prefers the host's `wasi:random/random` (via getrandom's wasip2
+/// backend — the runtime always grants the WASI random baseline), so two
+/// near-simultaneous installs don't collide the way a wall-clock seed can.
+/// Falls back to `now_nanos()` only if random is somehow unavailable; the
+/// result is hashed and persisted once by the callers, so it stays stable per
+/// install either way.
+fn install_seed(domain: &[u8]) -> Vec<u8> {
+    let mut seed = domain.to_vec();
+    let mut random = [0u8; 32];
+    if getrandom::fill(&mut random).is_ok() {
+        seed.extend_from_slice(&random);
+    } else {
+        seed.extend_from_slice(now_nanos().to_le_bytes().as_slice());
+    }
+    seed
 }
 
 fn http_post(
