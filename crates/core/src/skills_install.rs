@@ -216,7 +216,7 @@ impl RepoCloner for GitRepoCloner {
 // convenience wrappers were removed — every production install path now routes
 // through the trust gate (`begin_install`/`confirm_install` or
 // `install_skill_source_gated`). The injectable core `install_skill_source_with`
-// remains for `refresh_installed_skill` and tests; `install_skill_source_with_recorded`
+// remains for the refresh path and tests; `install_skill_source_with_recorded`
 // is now test-only (the gated/begin paths inline the equivalent ledger write).
 
 /// The live skills root (`~/.config/ryuzi/skills`, or the injected root under
@@ -275,13 +275,7 @@ async fn remove_installed_skill_recorded_with(
     Ok(())
 }
 
-pub async fn refresh_installed_skill(id: &str) -> Result<InstalledSkillPack> {
-    let roots = InstallRoots::for_user()?;
-    let cloner = GitRepoCloner;
-    refresh_installed_skill_with(id, &roots, &cloner).await
-}
-
-/// Like `refresh_installed_skill`, but also keeps the pack's `plugin_installs`
+/// Refreshes an installed skill pack and keeps the pack's `plugin_installs`
 /// ledger row in sync with the refreshed on-disk content. A bare refresh
 /// re-clones and reinstalls the CURRENTLY RECORDED source (not a new one),
 /// but still writes a fresh tree, so without this the ledger's `fingerprint`

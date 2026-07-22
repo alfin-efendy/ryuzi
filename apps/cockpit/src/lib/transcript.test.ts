@@ -13,7 +13,6 @@ import {
   toolCardHeader,
   toolCommand,
   toolInputSummary,
-  turnDurationMs,
   type ActivityItem,
   type Row,
   type TurnBlock,
@@ -424,10 +423,6 @@ test("a turn with no activity has no summary", () => {
     row({ seq: 2, role: "assistant", blockType: "text", text: "hello", createdAt: 2 }),
   ];
   expect(buildTranscript(chat, false).map((b) => b.type)).toEqual(["user", "agent"]);
-});
-
-test("turn duration is null without timestamps", () => {
-  expect(turnDurationMs([row({ seq: 1, role: "user", blockType: "text", createdAt: null })])).toBeNull();
 });
 
 test("formatTurnDuration", () => {

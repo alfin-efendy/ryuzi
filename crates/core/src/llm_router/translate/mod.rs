@@ -394,13 +394,22 @@ pub fn openai_to_anthropic_response(resp: &Value) -> Value {
     let finish = resp["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("stop");
+    // OpenAI's `prompt_tokens` includes cached tokens; report Anthropic's
+    // `input_tokens` as the uncached remainder plus a separate cache-read
+    // count (see `OpenAiToAnthropicStream::finish`).
+    let prompt_tokens = resp["usage"]["prompt_tokens"].as_i64().unwrap_or(0);
+    let cached_tokens = resp["usage"]
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     json!({
         "id": resp["id"], "type": "message", "role": "assistant",
         "model": resp["model"], "content": content,
         "stop_reason": oai_finish_to_anthropic(finish), "stop_sequence": null,
         "usage": {
-            "input_tokens": resp["usage"]["prompt_tokens"].as_i64().unwrap_or(0),
+            "input_tokens": (prompt_tokens - cached_tokens).max(0),
             "output_tokens": resp["usage"]["completion_tokens"].as_i64().unwrap_or(0),
+            "cache_read_input_tokens": cached_tokens,
         }
     })
 }
@@ -613,12 +622,17 @@ impl OpenAiToAnthropicStream {
             .as_deref()
             .map(oai_finish_to_anthropic)
             .unwrap_or("end_turn");
+        // OpenAI's `prompt_tokens` INCLUDES the cached tokens; Anthropic's
+        // `input_tokens` is the uncached remainder, reported alongside cache
+        // reads (downstream accounting sums the buckets). Subtract so cache
+        // hits visibly reduce input and totals aren't double-counted.
+        let uncached_input = (self.input_tokens - self.cache_read_tokens).max(0);
         out.push((
             "message_delta".into(),
             json!({"type": "message_delta",
                    "delta": {"stop_reason": stop, "stop_sequence": null},
                    "usage": {"output_tokens": self.output_tokens,
-                             "input_tokens": self.input_tokens,
+                             "input_tokens": uncached_input,
                              "cache_read_input_tokens": self.cache_read_tokens}}),
         ));
         out.push(("message_stop".into(), json!({"type": "message_stop"})));
@@ -975,7 +989,30 @@ mod tests {
         assert_eq!(out["stop_reason"], "tool_use");
         assert_eq!(
             out["usage"],
-            json!({"input_tokens": 10, "output_tokens": 5})
+            json!({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0})
+        );
+    }
+
+    #[test]
+    fn openai_response_reports_cached_tokens_as_uncached_input() {
+        // `prompt_tokens` (1200) includes the cached tokens (900); Anthropic
+        // `input_tokens` must be the uncached remainder (300) with cache reads
+        // reported separately.
+        let resp = json!({
+            "id": "chatcmpl-2", "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "ok"
+            }}],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 900}
+            }
+        });
+        let out = openai_to_anthropic_response(&resp);
+        assert_eq!(
+            out["usage"],
+            json!({"input_tokens": 300, "output_tokens": 7, "cache_read_input_tokens": 900})
         );
     }
 
@@ -1436,7 +1473,12 @@ mod tests {
             .find(|(name, _)| name == "message_delta")
             .expect("a message_delta event");
         assert_eq!(delta.1["usage"]["output_tokens"], 7);
-        assert_eq!(delta.1["usage"]["input_tokens"], 1200);
+        // OpenAI's `prompt_tokens` (1200) INCLUDES the cached tokens (900);
+        // Anthropic's `input_tokens` is the uncached remainder only, and the
+        // downstream accounting sums the four buckets. Report input as
+        // 1200 - 900 = 300 so cache reads visibly reduce input and the total
+        // isn't double-counted.
+        assert_eq!(delta.1["usage"]["input_tokens"], 300);
         assert_eq!(delta.1["usage"]["cache_read_input_tokens"], 900);
     }
 }

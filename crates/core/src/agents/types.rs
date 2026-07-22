@@ -156,11 +156,3 @@ pub struct RegistryDiskImage {
     pub agents: IndexMap<AgentId, String>,
     pub deleted_agent_ids: Vec<AgentId>,
 }
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RegistryCandidate {
-    pub index: AgentIndex,
-    pub profiles: IndexMap<AgentId, AgentProfile>,
-    pub subagents: SubagentConfig,
-    pub recovery: Vec<AgentRecoveryNotice>,
-}

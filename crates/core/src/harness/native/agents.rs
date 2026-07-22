@@ -28,9 +28,6 @@ impl AgentMode {
             _ => AgentMode::Primary,
         }
     }
-    pub fn is_primary(self) -> bool {
-        matches!(self, AgentMode::Primary | AgentMode::All)
-    }
     pub fn is_subagent(self) -> bool {
         matches!(self, AgentMode::Subagent | AgentMode::All)
     }

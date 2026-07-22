@@ -194,6 +194,10 @@ pub struct ResponsesToOpenAiStream {
     finished: bool,
     input_tokens: i64,
     output_tokens: i64,
+    /// Cached prompt tokens (`usage.input_tokens_details.cached_tokens`), a
+    /// subset of `input_tokens`. Surfaced downstream so prompt caching is
+    /// visible; 0 when the upstream reports no cache read.
+    cached_tokens: i64,
 }
 
 impl ResponsesToOpenAiStream {
@@ -207,6 +211,7 @@ impl ResponsesToOpenAiStream {
             finished: false,
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
         }
     }
 
@@ -292,6 +297,10 @@ impl ResponsesToOpenAiStream {
                     self.input_tokens = u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
                     self.output_tokens =
                         u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+                    self.cached_tokens = u
+                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                 }
                 out.extend(self.terminal());
             }
@@ -321,8 +330,12 @@ impl ResponsesToOpenAiStream {
             "stop"
         };
         let mut c = self.chunk(json!({}), Some(finish));
-        c["usage"] = json!({"prompt_tokens": self.input_tokens,
+        let mut usage = json!({"prompt_tokens": self.input_tokens,
             "completion_tokens": self.output_tokens});
+        if self.cached_tokens > 0 {
+            usage["prompt_tokens_details"] = json!({"cached_tokens": self.cached_tokens});
+        }
+        c["usage"] = usage;
         vec![c]
     }
 
@@ -620,6 +633,29 @@ mod tests {
 
     fn stream() -> ResponsesToOpenAiStream {
         ResponsesToOpenAiStream::new("gpt-5.2-codex")
+    }
+
+    #[test]
+    fn cached_input_tokens_flow_through_to_chat_usage() {
+        // The Responses API reports cached prompt tokens under
+        // `usage.input_tokens_details.cached_tokens` (a subset of the total
+        // `input_tokens`). The decoder must surface them as
+        // `prompt_tokens_details.cached_tokens`, or the downstream
+        // OpenAI->Anthropic translation has no way to report cache reads and
+        // the full prompt looks uncached on every turn.
+        let mut s = stream();
+        let out = s.feed(
+            "response.completed",
+            &json!({"response": {"usage": {
+                "input_tokens": 1200,
+                "output_tokens": 7,
+                "input_tokens_details": {"cached_tokens": 900}
+            }}}),
+        );
+        let usage = &out.last().unwrap()["usage"];
+        assert_eq!(usage["prompt_tokens"], 1200);
+        assert_eq!(usage["completion_tokens"], 7);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 900);
     }
 
     #[test]

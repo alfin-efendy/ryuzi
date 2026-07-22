@@ -358,13 +358,6 @@ function splitDispatchActivity(groups: Group[]): Group[] {
   });
 }
 
-/** Last-row minus user-row timestamps; null when either is missing. */
-export function turnDurationMs(turnRows: Row[]): number | null {
-  const start = turnRows.find((r) => r.role === "user")?.createdAt ?? null;
-  const end = turnRows[turnRows.length - 1]?.createdAt ?? null;
-  return start !== null && end !== null && end >= start ? end - start : null;
-}
-
 /** Start time of the in-progress turn — the last user row's createdAt, since a
  *  live turn begins at the user's message. Null when unknown (no timestamped
  *  user row yet). Drives the live "Working…" elapsed counter. */

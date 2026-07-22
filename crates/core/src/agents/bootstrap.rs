@@ -42,7 +42,8 @@ const FREE_PROVIDERS_SEEDED_MARKER: &str = "free_providers_seeded_v1";
 /// Legacy settings-KV keys that once held the single native agent's default
 /// model / permission mode. The runtime that read them is gone; only
 /// [`legacy_agent_data_exists`] still probes these rows to decide whether a
-/// first-upgrade cleanup is due (migration 39 deletes them).
+/// first-upgrade cleanup is due. A fresh baseline database never carries
+/// them; only a pre-existing install migrated from an older build could.
 const LEGACY_AGENT_MODEL_KEY: &str = "agent_model";
 const LEGACY_AGENT_PERM_MODE_KEY: &str = "agent_perm_mode";
 

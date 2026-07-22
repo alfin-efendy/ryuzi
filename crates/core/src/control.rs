@@ -4,9 +4,7 @@ use crate::automation::{
     AutomationEnvelope, AutomationSource, Dispatcher, HookActionInput, HookOrigin, HookRow,
     RateVerdict, TriggerKind, MAX_INBOUND_WEBHOOK_ENVELOPE_BYTES,
 };
-use crate::domain::{
-    ApprovalResponse, CoreEvent, Message, PermMode, Project, Session, ToolPolicyRow,
-};
+use crate::domain::{ApprovalResponse, CoreEvent, Message, Project, Session, ToolPolicyRow};
 use crate::harness::HarnessSession;
 use crate::plugins::extension::{ExtensionCtx, ExtensionHost, SHUTDOWN_GRACE};
 use crate::plugins::Registries;
@@ -883,11 +881,6 @@ impl ControlPlane {
         self.events.send(e).is_ok()
     }
 
-    /// Clone of the broadcast sender for long-running domain tasks.
-    pub fn events_sender(&self) -> broadcast::Sender<CoreEvent> {
-        self.events.clone()
-    }
-
     /// Resolve a pending approval with the user's full decision. Telemetry
     /// counts by decision so allow/deny rates stay observable.
     pub fn resolve_approval(
@@ -1015,20 +1008,6 @@ impl ControlPlane {
             Arc::downgrade(self),
             crate::domain::WriteOrigin::Agent,
         ))
-    }
-
-    /// Persist per-project preferences (host-supplied model/effort/perm overrides).
-    /// `None` leaves the corresponding column untouched.
-    pub async fn set_project_prefs(
-        &self,
-        project_id: &str,
-        model: Option<&str>,
-        effort: Option<&str>,
-        perm_mode: Option<PermMode>,
-    ) -> anyhow::Result<()> {
-        self.store
-            .update_project_prefs(project_id, model, effort, perm_mode)
-            .await
     }
 
     pub async fn list_messages(&self, session_pk: &str) -> anyhow::Result<Vec<Message>> {

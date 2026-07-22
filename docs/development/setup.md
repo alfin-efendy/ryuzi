@@ -266,8 +266,8 @@ phase's async delegation).
 
 ## Background rail & async delegation
 
-The daemon owns a durable **background rail** (`background_events` table,
-migration #23) so work that finishes outside a chat's current turn can still
+The daemon owns a durable **background rail** (`background_events` table) so
+work that finishes outside a chat's current turn can still
 find its way back into that chat, even across a daemon restart.
 
 - **Rail delivery is idle-only.** A producer (async delegation, a scheduled
