@@ -117,3 +117,7 @@ reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10
 [[IgnoredVulns]]
 id = "GHSA-xgp8-3hg3-c2mh"
 reason = "rustls-webpki 0.102 pinned by serenity 0.12.5 (latest as of 2026-07-10) via tokio-tungstenite 0.21 -> rustls 0.22; CRL checking never enabled by ryuzi. Revisit when serenity releases past 0.12.5. Tracked in #40."
+
+[[IgnoredVulns]]
+id = "GHSA-frvp-7c67-39w9"
+reason = "@hono/node-server 1.19.14 serve-static path-traversal on Windows via encoded backslash (%5C); fixed in 2.0.5. Transitive only via @modelcontextprotocol/sdk 1.29.0, which pins @hono/node-server ^1.19.9 (<2.0.0) — every 1.x is affected and 2.0.5 is outside the SDK's range, so there is no in-range fix. ryuzi uses the MCP SDK for its protocol HTTP transport, not hono serve-static to serve a middleware-guarded static subtree, so the vulnerable path is never exercised; the flaw is Windows-only and confined to the configured root. Newly published 2026-07-21 (not introduced by this branch; bun.lock unchanged). Revisit when the MCP SDK bumps @hono/node-server past 2.0.5. Tracked in #40."

@@ -1,0 +1,17 @@
+package ryuzi:atlassian@0.1.0;
+
+// The narrow world the Atlassian connector component targets: it imports the
+// plugin type vocabulary and the host-mediated OAuth egress (all Jira and
+// Confluence API I/O goes through `ryuzi:oauth/oauth`'s `authorized-request`
+// against the single `atlassian-cloud` profile, so the host injects the
+// bearer and the component never sees an access/refresh token), and exports
+// the connector interface the Task 9 adapter calls (`list-tools` +
+// `invoke`). No `ryuzi:http/http` import: every request is authenticated
+// through the OAuth profile, so there is no unauthenticated egress path. The
+// build materializes `wit/deps/` from the SDK the same way github/mimo/opencode
+// do (see scripts/plugins/build-first-party.ts).
+world atlassian {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:oauth/oauth@0.2.0;
+  export ryuzi:connector/connector@0.1.0;
+}

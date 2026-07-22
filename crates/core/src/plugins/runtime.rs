@@ -14,11 +14,13 @@ use crate::plugins::capabilities::http::{AllowedHttpClient, HttpErr};
 use crate::plugins::capabilities::oauth::{OauthErr, ProfileOauth};
 use crate::plugins::capabilities::settings::{ScopedSettings, SettingsErr};
 use crate::plugins::capabilities::storage::{PluginStorage, StorageErr};
+use crate::plugins::capabilities::websocket::{WsConnState, WsErr, WsFrame, WsHeader, WsRegistry};
 use crate::plugins::capabilities::wit_bindings::ryuzi::host::host as host_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::http::http as http_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::oauth::oauth as oauth_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::settings::settings as settings_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::storage::storage as storage_iface;
+use crate::plugins::capabilities::wit_bindings::websocket::ryuzi::websocket::websocket as websocket_iface;
 use crate::plugins::capabilities::PluginCapabilityContext;
 use ryuzi_plugin_sdk::PluginBundleManifest;
 use std::sync::Arc;
@@ -32,6 +34,11 @@ const SETTINGS_IMPORT: &str = "ryuzi:settings/settings@0.1.0";
 const STORAGE_IMPORT: &str = "ryuzi:storage/storage@0.1.0";
 const HOST_IMPORT: &str = "ryuzi:host/host@0.1.1";
 const OAUTH_IMPORT: &str = "ryuzi:oauth/oauth@0.2.0";
+/// The `ryuzi:websocket/websocket` host-import interface id. Linked by this
+/// FULLY-QUALIFIED name (never a short `"websocket"` instance name) so a
+/// component's import — always keyed by the fully-qualified id — actually
+/// matches the adapter (the Task-13b regression).
+const WEBSOCKET_IMPORT: &str = "ryuzi:websocket/websocket@0.1.0";
 const TYPES_IMPORT: &str = "ryuzi:plugin/types@0.1.0";
 const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 /// The `ryuzi:connector/connector` export interface name — the single source
@@ -103,6 +110,11 @@ pub struct HostPolicy {
     /// Grants host-mediated `ryuzi:oauth/oauth@0.2.0`; components can make
     /// authorized profile requests but never receive raw OAuth tokens.
     pub allow_oauth: bool,
+    /// Grants host-mediated `ryuzi:websocket/websocket@0.1.0`; the host owns
+    /// the raw TLS WebSocket and the component drives it. Gated on the same
+    /// non-empty-network manifest declaration as `allow_network` (a component
+    /// that declares no network host can open no WebSocket).
+    pub allow_websocket: bool,
     /// Lets this bundle set its OWN `Authorization` header on `ryuzi:http/http`
     /// requests (the initial hop to an allowlisted host only). Granted ONLY to
     /// VERIFIED first-party bundles — the caller derives it from the installed
@@ -123,6 +135,7 @@ impl HostPolicy {
             allow_settings: false,
             allow_storage: false,
             allow_oauth: false,
+            allow_websocket: false,
             allow_self_auth: false,
             limits: ResourceLimits::default(),
         }
@@ -154,6 +167,9 @@ impl HostPolicy {
             allow_settings: true,
             allow_storage: true,
             allow_oauth: !bundle.manifest.oauth.is_empty(),
+            // Same non-empty-network gate as `allow_network`: a bundle that
+            // declares no network host is granted no WebSocket capability.
+            allow_websocket: !bundle.manifest.permissions.network.is_empty(),
             allow_self_auth: bundle.release_record.signing_key_id
                 == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
             limits: ResourceLimits::default(),
@@ -241,6 +257,7 @@ fn validate_component_interfaces(
         let settings_is_authorized = name == SETTINGS_IMPORT && policy.allow_settings;
         let storage_is_authorized = name == STORAGE_IMPORT && policy.allow_storage;
         let oauth_is_authorized = name == OAUTH_IMPORT && policy.allow_oauth;
+        let websocket_is_authorized = name == WEBSOCKET_IMPORT && policy.allow_websocket;
         if !is_wasi_baseline
             && !types_is_authorized
             && !network_is_authorized
@@ -248,6 +265,7 @@ fn validate_component_interfaces(
             && !settings_is_authorized
             && !storage_is_authorized
             && !oauth_is_authorized
+            && !websocket_is_authorized
         {
             let reason = if name == HTTP_IMPORT {
                 "network requires a manifest allowlist and host policy approval".to_string()
@@ -257,6 +275,9 @@ fn validate_component_interfaces(
                 "storage access requires host policy approval".to_string()
             } else if name == OAUTH_IMPORT {
                 "OAuth access requires host policy approval".to_string()
+            } else if name == WEBSOCKET_IMPORT {
+                "WebSocket access requires a manifest network allowlist and host policy approval"
+                    .to_string()
             } else {
                 "no host capability is enabled by this runtime slice".to_string()
             };
@@ -517,6 +538,7 @@ impl CompiledComponent {
         let allow_settings = self.policy.allow_settings;
         let allow_storage = self.policy.allow_storage;
         let allow_oauth = self.policy.allow_oauth;
+        let allow_websocket = self.policy.allow_websocket;
         let allow_self_auth = self.policy.allow_self_auth;
         let network_allowlist = self.network_allowlist.clone();
         let runtime_ctx = Arc::new(PluginCapabilityContext {
@@ -548,6 +570,7 @@ impl CompiledComponent {
                 // Locked down: no preopens, no env, no stdio, no sockets.
                 wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
                 wasi_table: wasmtime::component::ResourceTable::new(),
+                ws: WsRegistry::new(),
             };
             let mut store = Store::new(&engine, state);
             store
@@ -564,14 +587,14 @@ impl CompiledComponent {
             // linked regardless of policy.
             host_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
                 &mut linker
-                    .instance("host")
+                    .instance(HOST_IMPORT)
                     .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?,
                 |s: &mut CapabilityState| s,
             )
             .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
             if allow_settings {
                 settings_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("settings").map_err(|error| {
+                    &mut linker.instance(SETTINGS_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -580,7 +603,7 @@ impl CompiledComponent {
             }
             if allow_storage {
                 storage_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("storage").map_err(|error| {
+                    &mut linker.instance(STORAGE_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -589,7 +612,7 @@ impl CompiledComponent {
             }
             if allow_network {
                 http_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("http").map_err(|error| {
+                    &mut linker.instance(HTTP_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -598,7 +621,21 @@ impl CompiledComponent {
             }
             if allow_oauth {
                 oauth_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
-                    &mut linker.instance("oauth").map_err(|error| {
+                    &mut linker.instance(OAUTH_IMPORT).map_err(|error| {
+                        PluginRuntimeError::InstantiationFailed(error.to_string())
+                    })?,
+                    |s: &mut CapabilityState| s,
+                )
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            }
+            if allow_websocket {
+                // Linked by the FULLY-QUALIFIED interface id (WEBSOCKET_IMPORT),
+                // never a short `"websocket"` instance name — a component's
+                // import is keyed by the full id, so a short name would never
+                // match (the Task-13b regression, guarded by
+                // `instantiate_links_the_websocket_capability_by_full_interface_id`).
+                websocket_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
+                    &mut linker.instance(WEBSOCKET_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -794,6 +831,12 @@ pub(crate) struct CapabilityState {
     /// the host-mediated `ryuzi:http`/`ryuzi:oauth` capabilities, never WASI.
     wasi_ctx: wasmtime_wasi::WasiCtx,
     wasi_table: wasmtime::component::ResourceTable,
+    /// Per-instance registry of host-owned `ryuzi:websocket` connections. Its
+    /// [`WsRegistry`] owns every open socket + reader task; dropping this
+    /// `CapabilityState` (on supervisor stop/restart) drops the registry, which
+    /// aborts each reader task and closes each socket — see
+    /// `capabilities::websocket`.
+    ws: WsRegistry,
 }
 
 impl wasmtime_wasi::WasiView for CapabilityState {
@@ -1068,6 +1111,97 @@ impl oauth_iface::Host for CapabilityState {
     }
 }
 
+/// Thin `ryuzi:websocket` adapter: maps the generated WIT types to the
+/// registry's adapter-local types and drives `self.ws` (the per-instance
+/// [`WsRegistry`]) using this state's captured network allowlist and runtime
+/// handle. All the socket ownership, allowlist/scheme gating, per-instance
+/// caps, and lifecycle live in `capabilities::websocket`; this is only the
+/// binding layer (mirroring `http_iface::Host` above).
+impl websocket_iface::Host for CapabilityState {
+    fn connect(
+        &mut self,
+        url: String,
+        headers: Vec<websocket_iface::WsHeader>,
+    ) -> Result<u64, websocket_iface::WsError> {
+        let headers = headers
+            .into_iter()
+            .map(|header| WsHeader {
+                name: header.name,
+                value: header.value,
+            })
+            .collect();
+        self.ws
+            .connect(
+                &self.network_allowlist,
+                &self.rt,
+                self.http_timeout,
+                &url,
+                headers,
+            )
+            .map_err(map_ws_err)
+    }
+
+    fn send(
+        &mut self,
+        handle: u64,
+        frame: websocket_iface::WsFrame,
+    ) -> Result<(), websocket_iface::WsError> {
+        let frame = WsFrame {
+            data: frame.data,
+            is_text: frame.is_text,
+        };
+        self.ws
+            .send(&self.rt, self.http_timeout, handle, frame)
+            .map_err(map_ws_err)
+    }
+
+    fn poll(
+        &mut self,
+        handle: u64,
+    ) -> Result<Vec<websocket_iface::WsFrame>, websocket_iface::WsError> {
+        self.ws
+            .poll(handle)
+            .map(|frames| {
+                frames
+                    .into_iter()
+                    .map(|frame| websocket_iface::WsFrame {
+                        data: frame.data,
+                        is_text: frame.is_text,
+                    })
+                    .collect()
+            })
+            .map_err(map_ws_err)
+    }
+
+    fn state(&mut self, handle: u64) -> Result<websocket_iface::WsState, websocket_iface::WsError> {
+        self.ws
+            .state(handle)
+            .map(|state| match state {
+                WsConnState::Connecting => websocket_iface::WsState::Connecting,
+                WsConnState::Open => websocket_iface::WsState::Open,
+                WsConnState::Closing => websocket_iface::WsState::Closing,
+                WsConnState::Closed => websocket_iface::WsState::Closed,
+            })
+            .map_err(map_ws_err)
+    }
+
+    fn close(&mut self, handle: u64) -> Result<(), websocket_iface::WsError> {
+        self.ws.close(handle).map_err(map_ws_err)
+    }
+}
+
+/// Maps the `capabilities::websocket` adapter-local error to the generated WIT
+/// `websocket::WsError`.
+fn map_ws_err(error: WsErr) -> websocket_iface::WsError {
+    match error {
+        WsErr::InvalidRequest(message) => websocket_iface::WsError::InvalidRequest(message),
+        WsErr::Rejected => websocket_iface::WsError::Rejected,
+        WsErr::Disconnected => websocket_iface::WsError::Disconnected,
+        WsErr::LimitExceeded(message) => websocket_iface::WsError::LimitExceeded(message),
+        WsErr::Failed(message) => websocket_iface::WsError::Failed(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1284,7 @@ mod tests {
                 "component-hooks-loop" => "ryuzi_component_hooks_loop_fixture.wasm",
                 "component-provider" => "ryuzi_component_provider_fixture.wasm",
                 "component-gateway" => "ryuzi_component_gateway_fixture.wasm",
+                "component-websocket-import" => "ryuzi_component_websocket_fixture.wasm",
                 _ => panic!("unknown fixture {name}"),
             })
     }
@@ -1308,6 +1443,117 @@ mod tests {
             .instantiate(&installed_bundle(dir.path()), HostPolicy::deny_all(), ctx)
             .await
             .expect("an import-free installed component should instantiate");
+    }
+
+    /// Positive instantiation proof for a host CAPABILITY import. The
+    /// `component-http-import` fixture imports `ryuzi:http/http@0.1.0`, so once
+    /// network is granted it must instantiate — which only works if the http
+    /// adapter is linked under the interface's FULLY-QUALIFIED import name.
+    ///
+    /// Regression guard: every capability adapter used to be linked under a
+    /// SHORT instance name (`linker.instance("http"/"oauth"/…)`) that no
+    /// component import — which is keyed by the fully-qualified id
+    /// (`ryuzi:http/http@0.1.0`) — can match. Every fixture except this one
+    /// imports only `ryuzi:plugin/types`, so nothing ever instantiated a
+    /// capability import positively and the mismatch stayed latent until the
+    /// first first-party component to import `ryuzi:oauth` (the github
+    /// connector) hit it. This test fails before that fix and passes after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instantiate_links_a_capability_import_by_its_full_interface_name() {
+        build_fixture_components();
+        let component_path = fixture_artifact("component-http-import");
+        let root = component_path
+            .parent()
+            .expect("fixture artifact has a parent dir")
+            .to_path_buf();
+        let bundle = InstalledBundle {
+            manifest: manifest(vec!["fixture.invalid"]),
+            release: release(),
+            release_record: component_release(),
+            root,
+            component_path,
+        };
+        // A declared network host grants the http capability under host policy.
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        assert!(policy.allow_network, "a manifest host must grant network");
+        let (ctx, _tmp) = test_ctx("acme").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime
+            .instantiate(&bundle, policy, ctx)
+            .await
+            .expect("a component importing ryuzi:http/http must instantiate once http is linked");
+    }
+
+    /// An [`InstalledBundle`] for the given prebuilt fixture artifact with an
+    /// explicit network allowlist (the caller must `build_fixture_components()`
+    /// first). Unlike [`installed_fixture_bundle`], the manifest's network
+    /// permissions are caller-supplied so `HostPolicy::for_installed_bundle`
+    /// can derive `allow_network`/`allow_websocket` from them.
+    fn installed_fixture_bundle_with_network(name: &str, network: Vec<&str>) -> InstalledBundle {
+        let component_path = fixture_artifact(name);
+        let root = component_path
+            .parent()
+            .expect("fixture artifact has a parent dir")
+            .to_path_buf();
+        InstalledBundle {
+            manifest: manifest(network),
+            release: release(),
+            release_record: component_release(),
+            root,
+            component_path,
+        }
+    }
+
+    /// Positive instantiation proof for the `ryuzi:websocket` capability: the
+    /// `component-websocket-import` fixture imports
+    /// `ryuzi:websocket/websocket@0.1.0`, so once the manifest declares a
+    /// network host — which grants `allow_websocket` — it must instantiate.
+    /// That only works if the websocket adapter is linked under the interface's
+    /// FULLY-QUALIFIED import name (the Task-13b regression guard, mirrored
+    /// here for websocket).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instantiate_links_the_websocket_capability_by_full_interface_id() {
+        build_fixture_components();
+        let bundle = installed_fixture_bundle_with_network(
+            "component-websocket-import",
+            vec!["gateway.example"],
+        );
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        assert!(
+            policy.allow_websocket,
+            "a declared network host must grant the websocket capability"
+        );
+        let (ctx, _tmp) = test_ctx("wsimport").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime.instantiate(&bundle, policy, ctx).await.expect(
+            "a component importing ryuzi:websocket must instantiate once the adapter is linked",
+        );
+    }
+
+    /// Deny proof: with an EMPTY network allowlist `allow_websocket` is false,
+    /// so a component importing `ryuzi:websocket` is rejected before it can
+    /// instantiate — and the error names the denied interface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_import_without_network_is_denied() {
+        build_fixture_components();
+        let bundle = installed_fixture_bundle_with_network("component-websocket-import", vec![]);
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        assert!(
+            !policy.allow_websocket,
+            "no manifest network host must leave the websocket capability denied"
+        );
+        let (ctx, _tmp) = test_ctx("wsimport").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let error = runtime
+            .instantiate(&bundle, policy, ctx)
+            .await
+            .expect_err("a websocket import with no network grant must be rejected");
+        match error {
+            PluginRuntimeError::DeniedImport { name, .. }
+            | PluginRuntimeError::InstantiationFailed(name)
+                if name.contains("ryuzi:websocket") => {}
+            other => panic!("expected a ryuzi:websocket denial, got {other:?}"),
+        }
     }
 
     /// An [`InstalledBundle`] pointing at a real prebuilt fixture artifact

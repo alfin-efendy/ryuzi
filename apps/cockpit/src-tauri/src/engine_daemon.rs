@@ -61,7 +61,7 @@ async fn run_inner() -> i32 {
         db_path,
         config_root: ryuzi_core::paths::config_dir(),
         telemetry: None,
-        extra_gateway_factories: ryuzi_core::gateway::discord::factory_entries(),
+        extra_gateway_factories: vec![],
         // Native-only: production uses the real in-process native harness.
         harness_factory: None,
         component_bootstrap: None,

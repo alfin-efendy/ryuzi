@@ -1,0 +1,20 @@
+package ryuzi:discord@0.1.0;
+
+// The world the Discord gateway component targets. It imports the plugin type
+// vocabulary, the host-owned `ryuzi:websocket` transport (the raw Discord
+// gateway wss stream — the host owns the TLS socket and enforces the manifest
+// network allowlist on connect + every reconnect), the host-mediated
+// `ryuzi:http` egress (Discord REST at discord.com/api/v10), host settings (bot
+// token / app id / guild id), and per-plugin storage; it exports the generic
+// `ryuzi:gateway` interface the host gateway supervisor + bridge drive
+// (start/stop/deliver-outbound/health-check/poll-inbound). The build
+// materializes `wit/deps/` from the SDK the same way mimo/opencode/github do
+// (see scripts/plugins/build-first-party.ts).
+world discord {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:websocket/websocket@0.1.0;
+  import ryuzi:http/http@0.1.0;
+  import ryuzi:settings/settings@0.1.0;
+  import ryuzi:storage/storage@0.1.0;
+  export ryuzi:gateway/gateway@0.1.0;
+}

@@ -16,7 +16,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-ryuzi-core = { path = "../core", features = ["otel", "discord"] }
+ryuzi-core = { path = "../core", features = ["otel"] }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 async-trait.workspace = true

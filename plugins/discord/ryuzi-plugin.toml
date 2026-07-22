@@ -1,0 +1,32 @@
+id = "discord"
+name = "Discord"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "singleton"
+component = "discord.wasm"
+publisher = "Ryuzi"
+description = "Discord gateway: connects the Discord gateway (wss) over the host-managed ryuzi:websocket transport and Discord REST over ryuzi:http, bridging Discord channels/threads to Cockpit projects/sessions (mentions, thread replies, DMs, the four slash commands, and tool-approval buttons)."
+
+# Every host the component may reach — enforced by the host on the websocket
+# `connect` url (and re-checked on every component-driven reconnect) and on every
+# `ryuzi:http` REST request, exactly like the other first-party components. A
+# request to any other host is rejected.
+#   - `gateway.discord.gg`  the base gateway websocket endpoint (IDENTIFY/heartbeat).
+#   - `*.discord.gg`        the per-session `resume_gateway_url` shard Discord hands
+#                           back in READY (e.g. `gateway-us-east1-b.discord.gg`) — a
+#                           RESUME dials this host, so the host allowlist MUST admit
+#                           it (host matching is exact-host + `*.`-suffix, so the
+#                           `.discord.gg` shards need their own wildcard entry).
+#   - `discord.com`         the REST API base (`discord.com/api/v10`).
+#   - `*.discord.com`       CDN/attachment hosts Discord hands back at runtime.
+#   - `*.discordapp.com`    legacy CDN host for attachments/avatars.
+[permissions]
+network = ["gateway.discord.gg", "*.discord.gg", "discord.com", "*.discord.com", "*.discordapp.com"]
+
+# The bundle manifest schema (crates/plugin-sdk/src/bundle.rs) has no `settings`
+# section — like github/mimo, the component reads its host settings at runtime by
+# key through `ryuzi:settings/settings`, and Cockpit renders the fields. The keys
+# this component reads (declared here as documentation only, NOT a parsed field):
+#   - `plugin.discord.token`   bot token, injected into IDENTIFY + `Authorization: Bot` (secret).
+#   - `plugin.discord.app_id`  application id, for slash-command registration.
+#   - `plugin.discord.guild_id` guild the slash commands are registered in.

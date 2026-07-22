@@ -109,14 +109,8 @@ mod tests {
     async fn seed_required(db: &std::path::Path) {
         let store = std::sync::Arc::new(ryuzi_core::Store::open(db).await.unwrap());
         let settings = ryuzi_core::settings::SettingsStore::new(store);
-        for (k, v) in [
-            ("workdir_root", "/repos"),
-            ("discord.token", "t"),
-            ("discord.app_id", "a"),
-            ("discord.guild_id", "g"),
-        ] {
-            settings.set(k, v).await.unwrap();
-        }
+        // workdir_root is the only required setting (no native gateway fields).
+        settings.set("workdir_root", "/repos").await.unwrap();
     }
 
     #[test]
@@ -142,10 +136,7 @@ mod tests {
         let (mut deps, out) = fake_deps_with_db(&db, true);
         let code = cmd_doctor(&mut deps);
         let lines = out.borrow();
-        assert_eq!(
-            lines[1],
-            "settings: missing workdir_root, discord.token, discord.app_id, discord.guild_id"
-        );
+        assert_eq!(lines[1], "settings: missing workdir_root");
         assert_eq!(lines[2], "doctor: FAIL");
         assert_eq!(code, 1);
     }

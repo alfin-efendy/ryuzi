@@ -17,6 +17,12 @@
 //! - [`oauth`] — host-side OAuth profile logic (Task 8 slice 2a): builds PKCE
 //!   authorize URLs and injects a stored bearer token into outbound
 //!   requests, but never hands the raw access/refresh token to a component.
+//! - [`websocket`] — `ryuzi:websocket/websocket@0.1.0`: a host-owned TLS
+//!   WebSocket the component drives (connect/send/poll/state/close). Owns the
+//!   raw `tokio-tungstenite` socket per instance, enforces the `wss`-only +
+//!   manifest-allowlist connect gate and the per-instance handle/frame/buffer
+//!   caps, and closes every socket when the instance drops. The thin
+//!   `Host` binding lives in `runtime.rs` alongside `http`/`oauth`.
 //!
 //! [`PluginCapabilityContext`] is the one value every adapter borrows from —
 //! it identifies which plugin is calling and gives access to the shared
@@ -27,6 +33,7 @@ pub mod http;
 pub mod oauth;
 pub mod settings;
 pub mod storage;
+pub mod websocket;
 pub mod wit_bindings;
 
 use std::sync::Arc;

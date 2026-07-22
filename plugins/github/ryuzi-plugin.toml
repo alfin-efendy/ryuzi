@@ -1,0 +1,36 @@
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "github.wasm"
+publisher = "Ryuzi"
+description = "GitHub connector: auth status, repositories, issues, and pull requests, plus arbitrary REST/GraphQL calls, over host-managed OAuth. Every mutating tool (issue/PR create, comment, review, merge, GraphQL mutations) is gated behind an explicit `confirm=true` argument — an unconfirmed mutation never leaves the component."
+
+# The only hosts the component may reach through the host-mediated OAuth egress
+# (`ryuzi:oauth/oauth`'s `authorized-request`, which is bounded to this same
+# allowlist). `api.github.com` carries every REST/GraphQL API call the tools
+# make; `github.com` is where the host-driven OAuth (authorize / token / device
+# code) endpoints live — the component itself never calls github.com, but the
+# profile below authorizes against it.
+[permissions]
+network = ["api.github.com", "github.com"]
+
+# Host-managed OAuth profile (Task 8). The component only ever calls
+# `authorized-request("github", ..)` / `disconnect("github")`; it never drives
+# Device Flow or PKCE and never sees a token — Cockpit + the host own that (see
+# crates/core/src/plugins/capabilities/oauth.rs). Field names mirror
+# `ryuzi_plugin_sdk::OAuthProfile` (kebab-case).
+[[oauth]]
+id = "github"
+authorize-url = "https://github.com/login/oauth/authorize"
+token-url = "https://github.com/login/oauth/access_token"
+scopes = ["repo", "read:org", "user"]
+# GitHub OAuth apps do not support RFC 7591 Dynamic Client Registration; the
+# client id is provisioned out-of-band and supplied host-side at connect time.
+dynamic-registration = false
+# NOTE: `OAuthProfile` has no `device-authorization-url` field — the host's
+# `begin_device_flow` receives the device-code endpoint explicitly from Cockpit
+# (see the module doc in capabilities/oauth.rs). GitHub's is recorded here for
+# the 13b host-side device-flow wiring:
+#   https://github.com/login/device/code

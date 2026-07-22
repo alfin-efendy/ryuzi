@@ -1223,8 +1223,8 @@ async fn compute_installed(
     let gateway_settings_complete = if kind == "gateway" {
         // A gateway with no manifest settings has nothing to configure, so its
         // installed-ness is just whether it's enabled — otherwise it could
-        // never leave Browse. Discord (the only gateway today) has 3 required
-        // settings and takes the all-present path below.
+        // never leave Browse. A gateway that declares required settings takes
+        // the all-present path below.
         if plugin.manifest.settings.is_empty() {
             enabled
         } else {
@@ -2854,11 +2854,10 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = Arc::new(crate::Store::open(tmp.path()).await.unwrap());
         let mut regs = Registries::new();
-        // Mirror the composition root: the `discord` gateway and the `native`
-        // runtime are registered explicitly before `install_builtins` adds
-        // providers, CLI agents, and the catalog (see `install_builtins`'s
-        // doc — those builtins win same-id collisions).
-        regs.add_plugin(crate::plugins::builtin::discord_plugin());
+        // Mirror the composition root: the `native` runtime is registered
+        // explicitly before `install_builtins` adds providers, CLI agents, and
+        // the catalog (see `install_builtins`'s doc — those builtins win
+        // same-id collisions).
         regs.add_plugin(crate::harness::native::native_plugin());
         crate::plugins::install_builtins(&mut regs);
         {
@@ -2896,9 +2895,6 @@ mod tests {
         assert!(list
             .iter()
             .any(|p| p.kind == "skill-pack" && p.id == "superpowers"));
-        let discord = list.iter().find(|p| p.id == "discord").expect("discord");
-        assert_eq!(discord.kind, "gateway");
-        assert!(!discord.installed, "no discord settings persisted yet");
         let anthropic = list.iter().find(|p| p.id == "anthropic").expect("provider");
         assert_eq!(anthropic.kind, "provider");
         assert_eq!(anthropic.family.as_deref(), Some("anthropic"));
@@ -3005,52 +3001,6 @@ mod tests {
     }
 
     // ---------- uninstall (kind-symmetric teardown) ----------
-
-    // `discord`'s live gateway factory (and thus `toggle_enabled`'s
-    // `enabled_gateways` path) only exists under the `discord` feature; the
-    // default `cargo test -p ryuzi-core` build has no factory, so this
-    // teardown assertion is feature-gated the same way `builtin.rs`'s gateway
-    // test is.
-    #[cfg(feature = "discord")]
-    #[tokio::test]
-    async fn uninstall_gateway_clears_settings_and_disables() {
-        let cp = test_cp().await;
-        let settings = SettingsStore::new(cp.store().clone());
-        cp.store()
-            .set_setting_raw("discord.token", "t")
-            .await
-            .unwrap();
-        cp.store()
-            .set_setting_raw("discord.app_id", "a")
-            .await
-            .unwrap();
-        cp.store()
-            .set_setting_raw("discord.guild_id", "g")
-            .await
-            .unwrap();
-        crate::plugins::toggle_enabled(cp.plugins(), &settings, "discord", true)
-            .await
-            .unwrap();
-
-        uninstall(&cp, "discord").await.unwrap();
-
-        assert_eq!(
-            cp.store().get_setting_raw("discord.token").await.unwrap(),
-            None
-        );
-        assert_eq!(
-            cp.store().get_setting_raw("discord.app_id").await.unwrap(),
-            None
-        );
-        assert_eq!(
-            cp.store()
-                .get_setting_raw("discord.guild_id")
-                .await
-                .unwrap(),
-            None
-        );
-        assert!(!cp.plugins().is_enabled(&settings, "discord").await.unwrap());
-    }
 
     #[tokio::test]
     async fn uninstall_provider_removes_every_family_connection() {

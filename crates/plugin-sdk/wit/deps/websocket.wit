@@ -1,0 +1,29 @@
+package ryuzi:websocket@0.1.0;
+
+interface websocket {
+  record ws-header { name: string, value: string }
+  // A single received frame. `is-text` distinguishes text vs binary; a close
+  // frame is surfaced via `state` returning `closed`, not as a data frame.
+  record ws-frame { data: list<u8>, is-text: bool }
+  enum ws-state { connecting, open, closing, closed }
+  variant ws-error {
+    invalid-request(string),   // malformed url / non-wss scheme / bad handle
+    rejected,                  // host not in the manifest network allowlist
+    disconnected,              // the connection dropped
+    limit-exceeded(string),    // too many handles / frame too large / buffer full
+    failed(string),
+  }
+
+  // Open a TLS WebSocket to an allowlisted `wss://` url. Returns an opaque
+  // per-instance handle. The host owns the socket and buffers inbound frames.
+  connect: func(url: string, headers: list<ws-header>) -> result<u64, ws-error>;
+  // Send one frame. Errors if the connection is closing/closed.
+  send: func(handle: u64, frame: ws-frame) -> result<_, ws-error>;
+  // Drain all inbound frames buffered since the previous poll (non-blocking;
+  // empty when idle). Order-preserving.
+  poll: func(handle: u64) -> result<list<ws-frame>, ws-error>;
+  // Current connection state, so the guest can detect a drop and reconnect.
+  state: func(handle: u64) -> result<ws-state, ws-error>;
+  // Close the connection and release the handle.
+  close: func(handle: u64) -> result<_, ws-error>;
+}

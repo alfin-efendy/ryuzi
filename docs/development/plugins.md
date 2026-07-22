@@ -1,6 +1,6 @@
 # Plugin SDK
 
-Ryuzi's extension points — model providers, the Discord gateway, and
+Ryuzi's extension points — model providers, chat gateways, and
 third-party integrations (GitHub, Notion, Slack, memory backends,
 sandboxes, deploy platforms...) — are all **plugins**: one manifest
 each, surfaced identically through the daemon's `list_plugins` RPC and
@@ -37,16 +37,18 @@ two different crates:
 A manifest **on its own** can only ever produce a *connector* (an MCP-server
 contributor) — that's what `declarative_plugin()`
 (`crates/core/src/plugins/declarative.rs`) builds automatically whenever a
-manifest declares `[[mcp]]` entries. A *harness* (the agent loop) or a
-*gateway* (a chat platform) requires actual Rust code, so those
-capabilities are hand-built-in: the native agent harness
-(`harness::native`) and the `discord` gateway
-(`crates/core/src/plugins/builtin.rs`).
+manifest declares `[[mcp]]` entries. A *harness* (the agent loop) requires
+actual Rust code, so it is hand-built-in: the native agent harness
+(`harness::native`). *Gateways* (chat platforms) now ship as signed WASM
+component bundles discovered off-disk and driven through the generic host
+gateway bridge (`crates/core/src/plugins/wasm_gateway_bridge.rs`) — the
+first-party Discord gateway lives at `plugins/discord`; there is no native
+(in-process) gateway plugin.
 
 Manifests come from three places, merged in this order (first registration
 for a given `id` wins — see `PluginHost::add`):
 
-1. **Rust built-ins** — `native`, `discord`, plus every model provider,
+1. **Rust built-ins** — `native`, plus every model provider,
    generated from the static provider catalog
    (`crates/core/src/plugins/providers.rs`).
 2. **The embedded integration catalog** — 24 TOML manifests baked into the
@@ -63,10 +65,11 @@ The daemon wires all of this at startup inside `ryuzi_core::daemon::build_daemon
 is a thin client that attaches to (or spawns) a daemon rather than building
 its own registries: register `native` unconditionally, then call
 `ryuzi_core::plugins::install_builtins` (providers, then the embedded
-catalog) and finally `ryuzi_core::plugins::load_skill_pack_plugins`. The
-`discord` gateway itself is wired separately in the same function, driven by
-the `enabled_gateways` setting and the caller-supplied
-`extra_gateway_factories`. Because plugin registration runs once at daemon
+catalog) and finally `ryuzi_core::plugins::load_skill_pack_plugins`. Gateway
+WASM component bundles are discovered off-disk and wired separately in the
+same function (`build_wasm_gateways`); the native `enabled_gateways` +
+`extra_gateway_factories` seam remains as generic infrastructure but has no
+built-in gateway today. Because plugin registration runs once at daemon
 startup, installing or refreshing a skill pack requires restarting the
 daemon to pick it up — there is no hot-reload.
 
@@ -331,7 +334,7 @@ without breaking existing manifests.
 | `oauth` | A model provider authenticated via OAuth (e.g. `anthropic-oauth`, `openai-oauth`) |
 | `free` | A free-tier model provider (e.g. `kiro`, `opencode-free`) |
 | `runtime` | The in-process native agent runtime (`native`) |
-| `chat-gateway` | A chat platform gateway (`discord`) |
+| `chat-gateway` | A chat platform gateway (the `discord` WASM component bundle) |
 | `vcs` | Source control / repos (`github`, `atlassian`) |
 | `issues` | Issue trackers (`github`, `atlassian`, `linear`) |
 | `docs` | Document stores (`notion`, `google-workspace`) |
@@ -861,8 +864,10 @@ enablement by capability, in this priority order:
 1. Unknown `id` → `false`.
 2. `native` (the built-in agent harness) → always `true`; the agent is not
    toggleable.
-3. Gateway-capable (`discord`) → whether `id` is in the `enabled_gateways`
-   CSV setting.
+3. Gateway-capable (a native `CorePlugin` with a gateway factory) → whether
+   `id` is in the `enabled_gateways` CSV setting. There is no built-in native
+   gateway today; WASM gateway component bundles are enabled via
+   `plugin.<id>.enabled` instead (see `component_plugin_enabled`).
 4. `experimental = true` (docs-only: `ngrok`, `vercel-sandbox`, `zep`) →
    always `false` — there is no capability to enable, and this wins even if
    a stray `plugin.<id>.enabled = true` row exists.
@@ -909,7 +914,7 @@ per-plugin case in either function.
 | Plugin id(s) | Source | Capability |
 | --- | --- | --- |
 | `native` | `harness::native::native_plugin()` | harness (in-process agent loop) |
-| `discord` | `plugins::builtin::discord_plugin()` | gateway (feature-gated `serenity` factory) |
+| `discord` | signed WASM component bundle (`plugins/discord`), discovered off-disk | gateway (via `wasm_gateway_bridge::WasmGateway`) |
 | `anthropic`, `openai`, `ollama`, ... (every `llm_router::registry::CATALOG` entry) | `plugins::providers::provider_plugins()` | manifest-only, `[provider]` block; category `model-provider` + `api-key`/`oauth`/`free` |
 | `github`, `atlassian`, ... (24 entries) | Embedded TOML, `plugins::catalog::catalog_plugins()` | connector (via `declarative_plugin`) |
 
@@ -1289,7 +1294,7 @@ Adding an entry to `crates/core/plugins/catalog/*.toml` (and
   substitution — never a literal token in the manifest.
 - Run `cargo test -p ryuzi-core` after adding an entry: `catalog.rs`'s test
   module parses/validates every embedded manifest, checks id uniqueness
-  (including against every built-in provider/`native`/`discord` id),
+  (including against every built-in provider/`native` id),
   requires every non-experimental entry to have `[[mcp]]`, and requires
   every `experimental` entry to have no `[[mcp]]`.
 

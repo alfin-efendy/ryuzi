@@ -141,28 +141,13 @@ impl AllowedHttpClient {
         }
     }
 
-    /// `true` if `host` is covered by this client's allowlist. Matching is
-    /// case-insensitive (`host` is lowercased before comparison, so callers
-    /// need not pre-normalize it). An entry is either:
-    ///
-    /// - a bare hostname, matched by exact (case-insensitive) equality; or
-    /// - a `*.`-prefixed wildcard (`*.github.com`), matched by any host that
-    ///   ends with `.github.com` *and* has at least one more label before
-    ///   it — i.e. `api.github.com` and `x.y.github.com` match, but the
-    ///   apex `github.com` does not (a wildcard never implies its own
-    ///   apex), and `evilgithub.com` does not (it ends with `github.com`
-    ///   but not with `.github.com`, so the required label boundary is
-    ///   absent).
+    /// `true` if `host` is covered by this client's allowlist — see the
+    /// free [`host_is_allowed`] function for the exact matching rules. Kept as
+    /// a thin method so existing callers (and the tests) stay unchanged while
+    /// the logic itself lives in one place other adapters (e.g.
+    /// `capabilities::websocket`) can reuse without re-implementing it.
     pub fn host_is_allowed(&self, host: &str) -> bool {
-        let host = host.to_lowercase();
-        self.allowlist.iter().any(|entry| {
-            if let Some(suffix) = entry.strip_prefix("*.") {
-                let dotted_suffix = format!(".{suffix}");
-                host.ends_with(&dotted_suffix)
-            } else {
-                host == *entry
-            }
-        })
+        host_is_allowed(&self.allowlist, host)
     }
 
     /// Issues one HTTP request, enforcing the allowlist on the initial
@@ -307,6 +292,33 @@ impl AllowedHttpClient {
         // iterations, so this fallback is never hit in practice.
         Err(HttpErr::Failed("redirect loop exceeded".to_string()))
     }
+}
+
+/// `true` if `host` is covered by `allowlist`. The single source of truth for
+/// plugin outbound-host matching — [`AllowedHttpClient::host_is_allowed`] and
+/// the `ryuzi:websocket` connect check both go through here so the two network
+/// surfaces can never diverge. Matching is case-insensitive (both `host` and
+/// each entry are lowercased, so neither the caller's host nor the stored
+/// allowlist needs to be pre-normalized). An entry is either:
+///
+/// - a bare hostname, matched by exact (case-insensitive) equality; or
+/// - a `*.`-prefixed wildcard (`*.github.com`), matched by any host that ends
+///   with `.github.com` *and* has at least one more label before it — i.e.
+///   `api.github.com` and `x.y.github.com` match, but the apex `github.com`
+///   does not (a wildcard never implies its own apex), and `evilgithub.com`
+///   does not (it ends with `github.com` but not with `.github.com`, so the
+///   required label boundary is absent).
+pub(crate) fn host_is_allowed(allowlist: &[String], host: &str) -> bool {
+    let host = host.to_lowercase();
+    allowlist.iter().any(|entry| {
+        let entry = entry.to_lowercase();
+        if let Some(suffix) = entry.strip_prefix("*.") {
+            let dotted_suffix = format!(".{suffix}");
+            host.ends_with(&dotted_suffix)
+        } else {
+            host == entry
+        }
+    })
 }
 
 /// Builds a [`SafeHttpResponse`] from a terminal (non-redirected, or

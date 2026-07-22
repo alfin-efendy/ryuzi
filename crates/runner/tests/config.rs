@@ -57,10 +57,16 @@ fn set_invalid_value_returns_nonzero_with_exact_message() {
 fn get_redacts_secrets_unless_revealed() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("t.sqlite");
-    run(&db, &["config", "set", "discord.token", "supersecret"]);
-    let (_, out, _) = run(&db, &["config", "get", "discord.token"]);
+    // `plugin.github.token` is a registered secret plugin field (the github
+    // catalog manifest's `auth.setting`) — see
+    // `plugin_setting_is_recognized_validated_and_redacted` below.
+    run(
+        &db,
+        &["config", "set", "plugin.github.token", "supersecret"],
+    );
+    let (_, out, _) = run(&db, &["config", "get", "plugin.github.token"]);
     assert_eq!(out.last().map(String::as_str), Some("••••••••"));
-    let (_, out, _) = run(&db, &["config", "get", "--reveal", "discord.token"]); // flag before key
+    let (_, out, _) = run(&db, &["config", "get", "--reveal", "plugin.github.token"]); // flag before key
     assert_eq!(out.last().map(String::as_str), Some("supersecret"));
     // unknown/unset key prints empty and exits 0:
     let (code, out, _) = run(&db, &["config", "get", "totally_unknown"]);
@@ -72,18 +78,16 @@ fn get_redacts_secrets_unless_revealed() {
 fn list_shows_redaction_defaults_and_unset() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("t.sqlite");
-    run(&db, &["config", "set", "discord.token", "supersecret"]);
     let (code, out, _) = run(&db, &["config", "list"]);
     assert_eq!(code, 0);
     let text = out.join("\n");
-    assert!(text.contains("discord.token"));
-    assert!(!text.contains("supersecret"));
     assert!(text.contains("default_effort = medium (default)"));
     assert!(text.contains("default_perm_mode = default (default)"));
     assert!(text.contains("approval_timeout_ms = 300000 (default)"));
     assert!(text.contains("native_tools.version = v1 (default)"));
     assert!(text.contains("workdir_root = (unset)"));
-    assert!(text.contains("enabled_gateways = discord")); // seeded, persisted (no "(default)")
+    // No native gateway seed anymore: `enabled_gateways` is unset on a fresh db.
+    assert!(text.contains("enabled_gateways = (unset)"));
     assert_eq!(out.len(), ryuzi_core::settings::all_fields().len());
     assert_eq!(out[0].split(" = ").next(), Some("workdir_root"));
 }

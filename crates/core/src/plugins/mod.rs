@@ -9,17 +9,17 @@
 //! entirely — see `host`'s module doc for how `Registries::add_plugin`
 //! supersedes the old `Integration` trait).
 //!
-//! [`builtin`] holds first-party plugins that don't have a more natural home
-//! beside their own implementation module — `native` lives beside its
-//! harness code in `harness::native`; `discord` lives here since
-//! `gateway::discord` is data/protocol-only.
+//! The `native` first-party plugin lives beside its harness code in
+//! `harness::native`. Gateways ship as signed WASM component bundles (the
+//! migrated Discord component and any future one), discovered off-disk and
+//! driven through `plugins::wasm_gateway_bridge::WasmGateway` — there is no
+//! native (in-process) gateway plugin.
 //!
 //! [`providers`] generates manifest-only plugins from the static provider
 //! catalog (`llm_router::registry::CATALOG`) rather than hand-authoring one
 //! manifest per entry. [`install_builtins`] adds them plus the embedded
 //! catalog in one call.
 
-pub mod builtin;
 pub mod bundle;
 pub mod capabilities;
 pub mod catalog;
@@ -35,9 +35,39 @@ pub mod remote_catalog;
 pub mod runtime;
 pub mod wasm_connector;
 pub mod wasm_gateway;
+pub mod wasm_gateway_bridge;
 pub mod wasm_hooks;
 pub mod wasm_provider;
 pub mod wit;
+
+/// End-to-end proof that the REAL first-party GitHub connector component
+/// (`plugins/github`) signs, installs, enumerates its tools, and drives its
+/// host-managed OAuth through the GENERIC pipeline (Task 13b, Step 4). Kept in
+/// its own module so the pilot's evidence lives in one place; it exercises only
+/// the generic seams (no github-specific host branch).
+#[cfg(test)]
+mod github_e2e;
+
+/// De-risking proof that the REAL first-party Discord gateway component
+/// (`plugins/discord`) signs, installs, and INSTANTIATES through the host
+/// [`runtime::ComponentRuntime`] with the `ryuzi:websocket` capability linked —
+/// the gateway analog of `github_e2e` (Task 10b). Catches any import/world
+/// mismatch before the expensive real-bot manual smoke; exercises only the
+/// generic seams shipped by Phases 1-5 (no discord-specific host branch).
+#[cfg(test)]
+mod discord_e2e;
+
+/// Task 15c — the OAuth-profile ISOLATION proof for the REAL first-party
+/// Atlassian (`plugins/atlassian`) and Bitbucket (`plugins/bitbucket`)
+/// connector components: both sign, install, and load through the generic
+/// pipeline, and a token seeded ONLY for `(atlassian, atlassian-cloud)` lets
+/// both Jira- and Confluence-style requests through that ONE profile while
+/// every Bitbucket request is denied absent its own separate
+/// `(bitbucket, bitbucket-cloud)` token — proving the two connectors never
+/// share a token, keyed purely by the generic `(plugin_id, profile_id)` store
+/// + `ProfileOauth::ensure_declared_profile`, with no plugin-id host branch.
+#[cfg(test)]
+mod atlassian_bitbucket_e2e;
 
 use crate::settings::{csv, SettingsStore};
 use crate::store::Store;
@@ -73,6 +103,124 @@ pub(crate) fn build_fixture_components_once() {
             .status()
             .expect("fixture build script should start");
         assert!(status.success(), "fixture build failed: {status}");
+    });
+}
+
+/// Build the first-party GitHub connector component (`plugins/github`) to
+/// wasm32-wasip2 EXACTLY ONCE per test process.
+///
+/// `plugins/github` is a STANDALONE workspace crate (like `plugins/mimo`), not
+/// a `tests/fixtures/*` fixture, so [`build_fixture_components_once`] does not
+/// build it. This sibling helper runs `tests/fixtures/build-github-component.sh`,
+/// which materializes `plugins/github/wit/deps` from the SDK and builds the
+/// component the same way `scripts/plugins/build-first-party.ts` does. The
+/// script touches only `plugins/github/wit/deps` (gitignored), so it never
+/// races the fixture builder's rewrites of the `tests/fixtures/*` deps. Cached
+/// via its own `OnceLock` so the (real) github sign/install/connector e2e tests
+/// share a single build.
+#[cfg(test)]
+pub(crate) fn build_github_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-github-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("github component build script should start");
+        assert!(status.success(), "github component build failed: {status}");
+    });
+}
+
+/// Build the first-party Discord gateway component (`plugins/discord`) to
+/// wasm32-wasip2 EXACTLY ONCE per test process.
+///
+/// `plugins/discord` is a STANDALONE workspace crate (like `plugins/github`),
+/// not a `tests/fixtures/*` fixture, so [`build_fixture_components_once`] does
+/// not build it. This sibling helper runs
+/// `tests/fixtures/build-discord-component.sh`, which materializes
+/// `plugins/discord/wit/deps` from the SDK and builds the component the same
+/// way `scripts/plugins/build-first-party.ts` does. The script touches only
+/// `plugins/discord/wit/deps` (gitignored), so it never races the fixture
+/// builder's or the github builder's rewrites of their own deps. Cached via
+/// its own `OnceLock` so the (real) discord instantiation e2e tests share a
+/// single build.
+#[cfg(test)]
+pub(crate) fn build_discord_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-discord-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("discord component build script should start");
+        assert!(status.success(), "discord component build failed: {status}");
+    });
+}
+
+/// Build the first-party Atlassian connector component (`plugins/atlassian`)
+/// to wasm32-wasip2 EXACTLY ONCE per test process.
+///
+/// `plugins/atlassian` is a STANDALONE workspace crate (like `plugins/github`),
+/// not a `tests/fixtures/*` fixture, so [`build_fixture_components_once`] does
+/// not build it. This sibling helper runs
+/// `tests/fixtures/build-atlassian-component.sh`, which materializes
+/// `plugins/atlassian/wit/deps` from the SDK and builds the component the same
+/// way `scripts/plugins/build-first-party.ts` does. The script touches only
+/// `plugins/atlassian/wit/deps` (gitignored), so it never races the other
+/// builders' rewrites of their own deps. Cached via its own `OnceLock` so the
+/// (real) atlassian/bitbucket OAuth-isolation e2e tests share a single build.
+#[cfg(test)]
+pub(crate) fn build_atlassian_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-atlassian-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("atlassian component build script should start");
+        assert!(
+            status.success(),
+            "atlassian component build failed: {status}"
+        );
+    });
+}
+
+/// Build the first-party Bitbucket connector component (`plugins/bitbucket`)
+/// to wasm32-wasip2 EXACTLY ONCE per test process. Sibling of
+/// [`build_atlassian_component_once`] — see that function's doc.
+#[cfg(test)]
+pub(crate) fn build_bitbucket_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-bitbucket-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("bitbucket component build script should start");
+        assert!(
+            status.success(),
+            "bitbucket component build failed: {status}"
+        );
     });
 }
 
@@ -133,7 +281,6 @@ pub fn install_builtins(regs: &mut Registries) {
 /// read back from the `Registries` itself.
 pub fn register_builtin_plugin_fields() {
     let mut regs = Registries::new();
-    regs.add_plugin(builtin::discord_plugin());
     regs.add_plugin(crate::harness::native::native_plugin());
     install_builtins(&mut regs);
     load_skill_pack_plugins(&mut regs);
@@ -552,9 +699,9 @@ mod toggle_enabled_tests {
     async fn gateway_capable_toggles_enabled_gateways_csv() {
         let (settings, _tmp) = open_settings().await;
         let mut host = PluginHost::new();
-        // Deliberately not "discord" — a fresh store seeds
-        // `enabled_gateways = "discord"`, which would defeat the "off by
-        // default" half of this test.
+        // A fresh store no longer seeds `enabled_gateways` (the native Discord
+        // seed was removed with the native gateway), so this starts empty and
+        // proves the CSV add/remove round-trip in isolation.
         host.add(gateway_only("slack"));
 
         toggle_enabled(&host, &settings, "slack", true)
@@ -562,14 +709,14 @@ mod toggle_enabled_tests {
             .unwrap();
         assert_eq!(
             settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("discord,slack")
+            Some("slack")
         );
         toggle_enabled(&host, &settings, "slack", false)
             .await
             .unwrap();
         assert_eq!(
             settings.get("enabled_gateways").await.unwrap().as_deref(),
-            Some("discord")
+            Some("")
         );
     }
 
@@ -921,14 +1068,13 @@ mod install_builtins_tests {
     }
 
     #[test]
-    fn install_builtins_ids_never_collide_with_native_claude_code_or_discord() {
+    fn install_builtins_ids_never_collide_with_native() {
         let mut regs = Registries::new();
         regs.add_plugin(crate::harness::native::native_plugin());
-        regs.add_plugin(builtin::discord_plugin());
         assert_eq!(
             regs.plugins.list().len(),
-            2,
-            "sanity: two builtins registered before install_builtins"
+            1,
+            "sanity: one builtin registered before install_builtins"
         );
 
         install_builtins(&mut regs);
@@ -946,17 +1092,17 @@ mod install_builtins_tests {
             "duplicate plugin ids after install_builtins: {ids:?}"
         );
 
-        // 2 pre-registered (native, discord) + every provider + every
-        // embedded integration-catalog entry (`catalog::CATALOG_MANIFESTS`,
-        // disjoint from all of the above by construction — see `catalog`'s
-        // own collision test).
+        // 1 pre-registered (native) + every provider + every embedded
+        // integration-catalog entry (`catalog::CATALOG_MANIFESTS`, disjoint
+        // from all of the above by construction — see `catalog`'s own
+        // collision test).
         let expected =
-            2 + crate::llm_router::registry::CATALOG.len() + catalog::CATALOG_MANIFESTS.len();
+            1 + crate::llm_router::registry::CATALOG.len() + catalog::CATALOG_MANIFESTS.len();
         assert_eq!(
             ids.len(),
             expected,
             "install_builtins silently dropped a colliding id instead of staying disjoint \
-             from the native/discord builtins"
+             from the native builtin"
         );
     }
 }

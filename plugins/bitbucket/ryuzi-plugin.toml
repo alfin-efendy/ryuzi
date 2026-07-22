@@ -1,0 +1,52 @@
+id = "bitbucket"
+name = "Bitbucket"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "bitbucket.wasm"
+publisher = "Ryuzi"
+description = "Bitbucket connector: Cloud repository list/get, pull request list/create/merge/comment and issue list/create, all over a host-managed bitbucket-cloud OAuth 2.0 profile — a DISTINCT profile from Atlassian's atlassian-cloud (Bitbucket Cloud's OAuth consumer is registered and granted independently of Jira/Confluence's 3LO app; the two never share a token). Every mutating tool (pr_create, pr_merge, pr_comment, issue_create) is gated behind an explicit `confirm=true` argument — an unconfirmed mutation never leaves the component."
+
+# The only hosts the component may reach through the host-mediated OAuth
+# egress (`ryuzi:oauth/oauth`'s `authorized-request`, which is bounded to this
+# same allowlist). Every Bitbucket REST call goes through the Cloud API 2.0
+# gateway at `api.bitbucket.org/2.0/...` — as of May 2026 ALL OAuth-authenticated
+# Bitbucket API requests are directed there (the legacy per-workspace hosts are
+# gone). `bitbucket.org` is where the host-driven OAuth (authorize/token)
+# endpoints live — the component itself never calls bitbucket.org (that flow is
+# host-side, see `crates/core/src/plugins/capabilities/oauth.rs`), but the
+# profile below authorizes against it, and it is kept here to mirror how the
+# Atlassian connector keeps `auth.atlassian.com` alongside `api.atlassian.com`.
+[permissions]
+network = ["api.bitbucket.org", "bitbucket.org"]
+
+# Host-managed OAuth profile (Task 8). The component only ever calls
+# `authorized-request("bitbucket-cloud", ..)`; it never drives the OAuth
+# authorize/token exchange and never sees a token — Cockpit + the host own
+# that (see crates/core/src/plugins/capabilities/oauth.rs). Field names mirror
+# `ryuzi_plugin_sdk::OAuthProfile` (kebab-case).
+#
+# THIS IS A DISTINCT PROFILE ID FROM `atlassian-cloud` — that is the whole
+# point (Task 15c isolation tests assert Jira/Confluence traffic never uses
+# this profile, and every Bitbucket request fails without it). Bitbucket
+# Cloud's OAuth consumer is a separate app registration
+# (workspace settings -> OAuth consumers -> Add consumer) from Atlassian's
+# Jira/Confluence 3LO app; the two grants share no token.
+[[oauth]]
+id = "bitbucket-cloud"
+authorize-url = "https://bitbucket.org/site/oauth2/authorize"
+token-url = "https://bitbucket.org/site/oauth2/access_token"
+# Scopes verified against developer.atlassian.com/cloud/bitbucket/bitbucket-cloud-rest-api-scopes/
+# (July 2026): `account` (GET /2.0/user, the auth_status tool); `repository`
+# (read access to repos, repo_list/repo_get) — listed explicitly even though
+# `pullrequest:write` below implies it, for the same reasons the Atlassian
+# profile lists both read and write Jira scopes; `pullrequest:write` (implies
+# `pullrequest` read + `repository:write`, covering pr_list/pr_create/
+# pr_merge/pr_comment); `issue:write` (implies `issue` read, covering
+# issue_list/issue_create).
+scopes = ["account", "repository", "pullrequest:write", "issue:write"]
+# Bitbucket Cloud OAuth consumers are registered manually per-workspace
+# (workspace settings -> OAuth consumers -> Add consumer); there is no RFC
+# 7591 Dynamic Client Registration endpoint. The client id is provisioned
+# out-of-band and supplied host-side at connect time.
+dynamic-registration = false

@@ -104,9 +104,9 @@ mod tests {
     fn setup_prompts_for_each_missing_required_and_exits_zero_when_done() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("d.sqlite");
-        // Fresh DB: default enabled gateway config requires workdir_root +
-        // discord fields (see doctor.rs tests). Answer them all.
-        let (mut deps, out) = deps_with_prompts(&db, vec!["/repos", "tok", "app", "guild"]);
+        // Fresh DB: the only required setting is workdir_root (no native
+        // gateway seeds required fields anymore). Answer it.
+        let (mut deps, out) = deps_with_prompts(&db, vec!["/repos"]);
         let code = cmd_setup(&mut deps);
         assert_eq!(code, 0, "all answered → success: {:?}", out.borrow());
         assert!(out
@@ -137,14 +137,7 @@ mod tests {
             rt.block_on(async {
                 let store = ryuzi_core::Store::open(&db).await.unwrap();
                 let settings = SettingsStore::new(Arc::new(store));
-                for (k, v) in [
-                    ("workdir_root", "/repos"),
-                    ("discord.token", "t"),
-                    ("discord.app_id", "a"),
-                    ("discord.guild_id", "g"),
-                ] {
-                    settings.set(k, v).await.unwrap();
-                }
+                settings.set("workdir_root", "/repos").await.unwrap();
             });
         }
         let (mut deps, out) = deps_with_prompts(&db, vec![]);

@@ -1,0 +1,7 @@
+package fixture:websocket-import@0.1.0;
+
+world websocket-import {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:websocket/websocket@0.1.0;
+  export ryuzi:plugin/lifecycle@0.1.0;
+}

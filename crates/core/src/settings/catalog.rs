@@ -2,7 +2,7 @@
 //! provider-specific `ConfigField`s. Field keys are user-visible contracts —
 //! settings stored under these keys must keep resolving across releases.
 
-use crate::settings::fields::{ConfigField, BASE, GLOBAL_FIELDS};
+use crate::settings::fields::{ConfigField, GLOBAL_FIELDS};
 
 pub struct GatewayDescriptor {
     pub id: &'static str,
@@ -21,42 +21,13 @@ impl ProviderCatalog {
     }
 }
 
-pub static DISCORD_FIELDS: &[ConfigField] = &[
-    ConfigField {
-        key: "discord.token",
-        label: "Bot token",
-        secret: true,
-        required: true,
-        help: "Discord Developer Portal -> your app -> Bot -> Reset Token",
-        example: Some("MTk4Nj...long.secret"),
-        ..BASE
-    },
-    ConfigField {
-        key: "discord.app_id",
-        label: "Application ID",
-        required: true,
-        help: "Developer Portal -> General Information -> Application ID",
-        example: Some("123456789012345678"),
-        ..BASE
-    },
-    ConfigField {
-        key: "discord.guild_id",
-        label: "Server (guild) ID",
-        required: true,
-        help: "Enable Developer Mode, right-click your server -> Copy Server ID",
-        example: Some("987654321098765432"),
-        ..BASE
-    },
-];
-
-pub static CATALOG: ProviderCatalog = ProviderCatalog {
-    gateways: &[GatewayDescriptor {
-        id: "discord",
-        label: "Discord",
-        description: "Drive sessions from a Discord server",
-        fields: DISCORD_FIELDS,
-    }],
-};
+/// Native (in-process) gateway descriptors. Discord — the only historical
+/// entry — migrated to a signed WASM component bundle (which declares its own
+/// settings in its manifest), so this is empty today. The
+/// `GatewayDescriptor`/`ProviderCatalog` machinery and the `enabled_gateways`
+/// settings plumbing are retained as generic infrastructure a future native
+/// gateway would populate.
+pub static CATALOG: ProviderCatalog = ProviderCatalog { gateways: &[] };
 
 /// All fields in schema order: globals, then each gateway's fields.
 pub fn all_fields() -> Vec<&'static ConfigField> {
