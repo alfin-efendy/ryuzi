@@ -22,9 +22,8 @@ use std::sync::Arc;
 /// Canonical v0 baseline schema — the squashed result of the original 49
 /// rusqlite migrations (generated 2026-07-20). SQLite regenerates the
 /// `messages_fts` FTS5 shadow tables and their seed rows from the CREATE
-/// VIRTUAL TABLE statement, and `Store::open` seeds `settings` separately, so
-/// neither is part of the baseline. The `baseline_matches_pre_squash_golden`
-/// test guards this schema against drift.
+/// VIRTUAL TABLE statement, so those are not part of the baseline. The
+/// `baseline_matches_pre_squash_golden` test guards this schema against drift.
 const BASELINE_SQL: &str = include_str!("store_baseline.sql");
 
 fn migrations() -> Migrations<'static> {

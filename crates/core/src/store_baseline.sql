@@ -1,9 +1,8 @@
 -- Canonical v0 baseline schema: the squashed result of the original 49
 -- rusqlite migrations, generated 2026-07-20 from a fresh Store::open dump.
 -- Excludes the messages_fts FTS5 shadow tables and their seed rows (SQLite
--- regenerates them from the CREATE VIRTUAL TABLE statement) and the settings
--- seed (Store::open writes enabled_gateways separately). Guarded against drift
--- by the baseline_matches_pre_squash_golden test.
+-- regenerates them from the CREATE VIRTUAL TABLE statement). Guarded against
+-- drift by the baseline_matches_pre_squash_golden test.
 
 CREATE TABLE agent_learning_queue (event_id TEXT PRIMARY KEY NOT NULL,agent_id TEXT NOT NULL,sequence INTEGER NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','claimed','delivered')),claimed_by TEXT,claimed_at INTEGER,attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,created_at INTEGER NOT NULL,delivered_at INTEGER,UNIQUE(agent_id, sequence));
 CREATE TABLE agent_learning_state (agent_id TEXT PRIMARY KEY NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 1,enqueue_blocked INTEGER NOT NULL DEFAULT 0);

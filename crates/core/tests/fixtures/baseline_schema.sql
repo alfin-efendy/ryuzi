@@ -114,4 +114,3 @@ CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages WHEN new.role IN ('user'
 INSERT INTO "messages_fts_config"("k", "v") VALUES ('version', 4);
 INSERT INTO "messages_fts_data"("id", "block") VALUES (1, X'');
 INSERT INTO "messages_fts_data"("id", "block") VALUES (10, X'00000000000000');
-INSERT INTO "settings"("key", "value") VALUES ('enabled_gateways', 'discord');
