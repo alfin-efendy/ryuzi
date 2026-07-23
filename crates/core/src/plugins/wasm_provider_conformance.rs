@@ -620,9 +620,14 @@ const OPENAI_EXPECTED_AUTHORIZATION: &str = "Bearer sk-conformance-openai-key";
 /// the component's expectations would take if it sorted, and one id the
 /// component's static context-window table does not know (so the conservative
 /// default is exercised alongside a table hit).
+///
+/// `gpt-3.5-turbo` is the table hit ON PURPOSE: its published window (16_385)
+/// DIFFERS from the component's default. A table entry whose value happened to
+/// equal the default would make the assertion below unable to tell a real
+/// lookup from the fallback, so the two expected windows must not coincide.
 const OPENAI_MODELS_BODY: &str = r#"{"object":"list","data":[
   {"id":"gpt-5.2","object":"model","created":1,"owned_by":"openai"},
-  {"id":"gpt-4o","object":"model","created":2,"owned_by":"openai"}
+  {"id":"gpt-3.5-turbo","object":"model","created":2,"owned_by":"openai"}
 ]}"#;
 
 /// An OpenAI `POST /v1/chat/completions` (non-stream) body. The flat provider
@@ -671,14 +676,17 @@ fn openai_component_conformance() -> ConformanceFixture {
                     id: "gpt-5.2".to_string(),
                     // `/models` reports no display name, so the id doubles as
                     // one; an id outside the static table takes the
-                    // conservative default window.
+                    // conservative default window (128_000).
                     display_name: "gpt-5.2".to_string(),
                     context_window: 128_000,
                 },
                 WasmModelInfo {
-                    id: "gpt-4o".to_string(),
-                    display_name: "gpt-4o".to_string(),
-                    context_window: 128_000,
+                    id: "gpt-3.5-turbo".to_string(),
+                    display_name: "gpt-3.5-turbo".to_string(),
+                    // ...and this one is a genuine static-table HIT, whose
+                    // value differs from the default above — so the pair
+                    // distinguishes "looked the model up" from "fell back".
+                    context_window: 16_385,
                 },
             ],
             // Flat-text ABI + a buffered upstream: one terminal chunk.

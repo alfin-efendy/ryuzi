@@ -467,9 +467,15 @@ pub(crate) async fn build_test_transport_with_grants(
         !grants.provider_ids.is_empty() && !grants.network_allowlist.is_empty();
     policy.limits.timeout = timeout;
 
-    // Keeps the encrypted-at-rest credential seeding below (and any other
-    // secret this store holds) off the real OS keychain / `secret.key`.
-    crate::llm_router::secrets::use_test_key_file();
+    // Keeps the encrypted-at-rest credential seeding below off the real OS
+    // keychain / `secret.key`. Guarded: this mutates the process-global
+    // `RYUZI_SECRET_KEY_FILE`, so a transport that seeds NO credential must not
+    // reach for it — a zero-grant transport has nothing to encrypt and no
+    // business perturbing shared process state for every other test in the
+    // binary.
+    if !grants.provider_credentials.is_empty() {
+        crate::llm_router::secrets::use_test_key_file();
+    }
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
     for (key, value) in &grants.storage_seed {

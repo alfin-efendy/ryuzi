@@ -104,10 +104,16 @@ fn authorized_request(
     .map_err(map_auth_error)
 }
 
-/// The upstream base: the override in this component's storage slice if the
-/// host granted storage and a value is set, else [`logic::DEFAULT_BASE_URL`].
-/// A storage error degrades to the default rather than failing the call —
-/// storage is an optional affordance, never a correctness dependency.
+/// The upstream base: the override in this component's storage slice when one
+/// is set, else [`logic::DEFAULT_BASE_URL`].
+///
+/// `ryuzi:storage` is a WORLD IMPORT, so it is always linked — a host that
+/// withheld it could not instantiate this component at all, and "storage was
+/// not granted" is therefore not a state this function can observe. The
+/// `Err(_) => None` arm covers the reachable cases instead: no value stored at
+/// this key yet, or a failed read. Either degrades to the default rather than
+/// failing the call — the override is an optional affordance, never a
+/// correctness dependency.
 fn base_url() -> String {
     let stored = match storage::get(logic::BASE_URL_STORAGE_KEY) {
         Ok(value) => String::from_utf8(value.value).ok(),

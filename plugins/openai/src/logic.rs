@@ -141,6 +141,13 @@ pub fn context_window_for(model_id: &str) -> u32 {
 /// multimodal parts. `stream` is false because the host capability is a
 /// buffered request/response: the component asks for the whole completion and
 /// returns it as one terminal chunk.
+///
+/// `temperature` is OMITTED when it is not finite (NaN/±inf): JSON has no
+/// representation for those values, so there is nothing to send. The request
+/// still goes out and the upstream applies its own default — failing an entire
+/// completion over an unrepresentable optional tuning knob would be the worse
+/// trade. Pinned by
+/// `tests::chat_body_drops_a_non_finite_temperature_rather_than_failing`.
 pub fn build_chat_body(
     model: &str,
     prompt: &str,
@@ -267,9 +274,20 @@ pub fn classify_error(status: u16, body: &[u8]) -> ProviderFail {
 
 fn parse_usage(value: &Value) -> Option<UsageOut> {
     let usage = value.get("usage")?;
-    let input = usage.get("prompt_tokens").and_then(Value::as_u64)? as u32;
-    let output = usage.get("completion_tokens").and_then(Value::as_u64)? as u32;
-    Some(UsageOut { input, output })
+    let input = usage.get("prompt_tokens").and_then(Value::as_u64)?;
+    let output = usage.get("completion_tokens").and_then(Value::as_u64)?;
+    Some(UsageOut {
+        input: saturating_u32(input),
+        output: saturating_u32(output),
+    })
+}
+
+/// Narrow a JSON-wide `u64` token count to the WIT `token-usage`'s `u32`,
+/// SATURATING rather than wrapping. A wrapping cast would turn an absurd (or
+/// hostile) upstream count into a small plausible one and silently under-report
+/// spend to the router; clamping at least stays monotonic and obviously extreme.
+fn saturating_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -342,6 +360,27 @@ mod tests {
     }
 
     #[test]
+    fn chat_body_drops_a_non_finite_temperature_rather_than_failing() {
+        // Documented behaviour (see `build_chat_body`): JSON has no
+        // representation for NaN/±inf, so such a temperature is OMITTED and the
+        // upstream applies its own default. The alternative — failing the whole
+        // completion over an unrepresentable optional tuning knob — would be
+        // worse for the caller.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let body: Value =
+                serde_json::from_slice(&build_chat_body("gpt-5.2", "hi", None, Some(bad))).unwrap();
+            assert!(
+                body.get("temperature").is_none(),
+                "a non-finite temperature ({bad}) must be omitted, not serialized"
+            );
+            assert_eq!(
+                body["messages"][0]["content"], "hi",
+                "the request still goes"
+            );
+        }
+    }
+
+    #[test]
     fn parse_models_maps_data_ids_with_a_context_window() {
         let body = br#"{"object":"list","data":[
             {"id":"gpt-4o","object":"model"},
@@ -406,6 +445,26 @@ mod tests {
             Some(UsageOut {
                 input: 7,
                 output: 3
+            })
+        );
+    }
+
+    #[test]
+    fn parse_chat_response_saturates_a_usage_count_that_exceeds_u32() {
+        // The WIT `token-usage` fields are u32 but JSON numbers are u64-wide.
+        // An absurd/hostile count must SATURATE, never wrap: a wrapping cast
+        // would turn 5_000_000_000 into 705_032_704 and silently under-report
+        // spend to the router.
+        let body = br#"{
+            "choices":[{"message":{"content":"hi"}}],
+            "usage":{"prompt_tokens":5000000000,"completion_tokens":4294967296}
+        }"#;
+        let chunks = parse_chat_response(body).unwrap();
+        assert_eq!(
+            chunks[0].usage,
+            Some(UsageOut {
+                input: u32::MAX,
+                output: u32::MAX
             })
         );
     }
