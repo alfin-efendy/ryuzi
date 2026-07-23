@@ -80,6 +80,7 @@ export const COMPONENTS: ComponentSpec[] = [
   { id: "xai", dir: "plugins/xai", crateWasmStem: "ryuzi_plugin_xai" },
   { id: "nvidia", dir: "plugins/nvidia", crateWasmStem: "ryuzi_plugin_nvidia" },
   { id: "huggingface", dir: "plugins/huggingface", crateWasmStem: "ryuzi_plugin_huggingface" },
+  { id: "google", dir: "plugins/google", crateWasmStem: "ryuzi_plugin_google" },
   { id: "github", dir: "plugins/github", crateWasmStem: "ryuzi_plugin_github" },
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
   { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },

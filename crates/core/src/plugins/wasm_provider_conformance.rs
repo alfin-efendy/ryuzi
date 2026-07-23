@@ -924,6 +924,28 @@ const NVIDIA_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
     },
 };
 
+/// `google` points at Gemini's OpenAI-COMPATIBILITY endpoint, and its
+/// descriptor seeds a model list (`["gemini-3.0-pro", "gemini-3.0-flash"]`), so
+/// its fixture uses those real ids instead of synthetic ones — served
+/// flash-first, i.e. not in the descriptor's own order.
+const GOOGLE_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "google",
+    request_model: "gemini-3.0-pro",
+    stored_api_key: "AIza-conformance-key",
+    expected_authorization: "Bearer AIza-conformance-key",
+    models_body: r#"{"object":"list","data":[
+      {"id":"gemini-3.0-flash","object":"model"},
+      {"id":"gemini-3.0-pro","object":"model"}
+    ]}"#,
+    expected_models: &[("gemini-3.0-flash", 128_000), ("gemini-3.0-pro", 128_000)],
+    completion_body: completion_body!("grounded reply", 41, 23),
+    expected_text: "grounded reply",
+    expected_usage: WasmTokenUsage {
+        input: 41,
+        output: 23,
+    },
+};
+
 const HUGGINGFACE_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
     provider_id: "huggingface",
     request_model: "huggingface-zeta",
@@ -979,6 +1001,11 @@ async fn huggingface_component_passes_the_full_conformance_battery() {
     run_openai_format_battery(HUGGINGFACE_FIXTURE).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn google_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(GOOGLE_FIXTURE).await;
+}
+
 /// Every OpenAI-format provider bundle ported so far, for the manifest audit
 /// below. Kept next to the fixtures so a new provider is added in one place.
 ///
@@ -995,6 +1022,7 @@ const OPENAI_FORMAT_FIXTURES: &[&OpenAiFormatFixture] = &[
     &XAI_FIXTURE,
     &NVIDIA_FIXTURE,
     &HUGGINGFACE_FIXTURE,
+    &GOOGLE_FIXTURE,
 ];
 
 /// The conformance battery proves each component BEHAVES like its provider.
