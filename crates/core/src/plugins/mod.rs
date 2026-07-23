@@ -40,6 +40,15 @@ pub mod wasm_hooks;
 pub mod wasm_provider;
 pub mod wit;
 
+/// Reusable provider-conformance harness (plan Task 16, Step 1): runs a
+/// provider component through the generic [`wasm_provider`] seam against a
+/// mocked, allowlisted HTTP upstream and verifies model listing,
+/// completion/order, auth absence, HTTP error mapping, and timeout mapping.
+/// Test-only, and proven against the synthetic `component-provider-http`
+/// fixture; later slices reuse it per real provider component.
+#[cfg(test)]
+mod wasm_provider_conformance;
+
 /// End-to-end proof that the REAL first-party GitHub connector component
 /// (`plugins/github`) signs, installs, enumerates its tools, and drives its
 /// host-managed OAuth through the GENERIC pipeline (Task 13b, Step 4). Kept in

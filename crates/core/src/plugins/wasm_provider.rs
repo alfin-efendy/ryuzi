@@ -272,16 +272,56 @@ pub(crate) fn provider_fixture_artifact() -> std::path::PathBuf {
         .join("ryuzi_component_provider_fixture.wasm")
 }
 
-/// Build a [`WasmProviderTransport`] over the prebuilt provider fixture, keyed
-/// by `provider_id`, under a `timeout`. Returns the store tempfile so it isn't
-/// dropped before the transport is used. Shared with the router-level test in
-/// `llm_router::client`, so it lives at module level rather than inside
-/// `mod tests`.
+/// The extra capability grants + storage seeding
+/// [`build_test_transport_with_grants`] layers onto the baseline `deny_all`
+/// policy every test transport starts from. Kept as one struct (rather than
+/// growing the function's parameter list) so a future grant — e.g. a second
+/// per-provider slice needing `ryuzi:oauth` — is one new field, not a new
+/// call-site shape.
+///
+/// [`build_test_transport`] is the zero-grants case (`Self::default()`); the
+/// provider-conformance harness
+/// (`crate::plugins::wasm_provider_conformance`) is the http+storage case —
+/// both call THIS builder so the ~80 lines of bundle/context/policy
+/// boilerplate exist exactly once.
 #[cfg(test)]
-pub(crate) async fn build_test_transport(
+#[derive(Default)]
+pub(crate) struct TestTransportGrants {
+    /// Non-empty iff the http capability should be granted: allowlists these
+    /// bare hosts (matched on host, not port) in both the manifest's
+    /// `permissions.network` declaration (what authorizes the http import in
+    /// the component linker) and `PluginCapabilityContext.network_allowlist`
+    /// (what the host's `AllowedHttpClient` actually enforces at request
+    /// time).
+    pub network_allowlist: Vec<String>,
+    /// Grants `ryuzi:storage`.
+    pub allow_storage: bool,
+    /// `(key, value)` pairs seeded into this provider's own storage slice
+    /// before the transport is handed back — the generic endpoint-override
+    /// channel a provider component reads through `ryuzi:storage` (e.g. the
+    /// conformance harness's mock upstream base URL).
+    pub storage_seed: Vec<(String, Vec<u8>)>,
+}
+
+/// Build a [`WasmProviderTransport`] over a component at `component_path`,
+/// keyed by `provider_id`, under a `timeout`, with `grants` layered onto the
+/// baseline `HostPolicy::deny_all()`. Returns the store tempfile so it isn't
+/// dropped before the transport is used. Shared with the router-level test in
+/// `llm_router::client` and the provider-conformance harness, so it lives at
+/// module level rather than inside `mod tests`.
+///
+/// This deliberately builds the policy from `HostPolicy::deny_all()` directly
+/// rather than the production `HostPolicy::for_installed_bundle` derivation —
+/// every test transport's `release_record.signing_key_id` below is an inert
+/// placeholder; `allow_self_auth` stays `false` (from `deny_all()`) no matter
+/// what that field says, which is exactly what a strict-Authorization-
+/// stripping check depends on.
+#[cfg(test)]
+pub(crate) async fn build_test_transport_with_grants(
     component_path: std::path::PathBuf,
     provider_id: &str,
     timeout: std::time::Duration,
+    grants: TestTransportGrants,
 ) -> (Arc<WasmProviderTransport>, tempfile::NamedTempFile) {
     use crate::plugins::bundle::InstalledBundle;
     use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
@@ -289,20 +329,30 @@ pub(crate) async fn build_test_transport(
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        NetworkPermission, PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
     };
 
     let mut policy = HostPolicy::deny_all();
+    policy.allow_network = !grants.network_allowlist.is_empty();
+    policy.allow_storage = grants.allow_storage;
     policy.limits.timeout = timeout;
+
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
+    for (key, value) in &grants.storage_seed {
+        store
+            .put_component_storage(provider_id, key, value)
+            .await
+            .unwrap();
+    }
+
     let ctx = Arc::new(PluginCapabilityContext {
         plugin_id: provider_id.to_string(),
         version: "0.1.0".to_string(),
         settings: SettingsStore::new(store.clone()),
         store,
         telemetry: Arc::new(NoopTelemetry),
-        network_allowlist: vec![],
+        network_allowlist: grants.network_allowlist.clone(),
         oauth_profile_ids: vec![],
     });
     let bundle = InstalledBundle {
@@ -315,7 +365,13 @@ pub(crate) async fn build_test_transport(
             component: "plugin.wasm".to_string(),
             publisher: String::new(),
             description: String::new(),
-            permissions: PluginPermissions { network: vec![] },
+            permissions: PluginPermissions {
+                network: grants
+                    .network_allowlist
+                    .iter()
+                    .map(|host| NetworkPermission(host.clone()))
+                    .collect(),
+            },
             oauth: vec![],
         },
         release: PluginRelease {
@@ -327,6 +383,9 @@ pub(crate) async fn build_test_transport(
             size_bytes: None,
             published_at: None,
         },
+        // A placeholder, non-first-party signing key id. It plays no part in
+        // `allow_self_auth` on this path (see the function doc above) — it
+        // only exists to satisfy `InstalledBundle`'s shape.
         release_record: ComponentPluginReleaseRecord {
             plugin_id: provider_id.to_string(),
             version: "0.1.0".to_string(),
@@ -351,6 +410,24 @@ pub(crate) async fn build_test_transport(
         )),
         tmp,
     )
+}
+
+/// Build a [`WasmProviderTransport`] over the prebuilt provider fixture, keyed
+/// by `provider_id`, under a `timeout`, with NO extra capability grants (the
+/// baseline case of [`build_test_transport_with_grants`]).
+#[cfg(test)]
+pub(crate) async fn build_test_transport(
+    component_path: std::path::PathBuf,
+    provider_id: &str,
+    timeout: std::time::Duration,
+) -> (Arc<WasmProviderTransport>, tempfile::NamedTempFile) {
+    build_test_transport_with_grants(
+        component_path,
+        provider_id,
+        timeout,
+        TestTransportGrants::default(),
+    )
+    .await
 }
 
 #[cfg(test)]
