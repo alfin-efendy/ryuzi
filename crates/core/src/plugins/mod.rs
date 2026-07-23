@@ -233,6 +233,30 @@ pub(crate) fn build_bitbucket_component_once() {
     });
 }
 
+/// Build the first-party OpenAI provider component (`plugins/openai`) to
+/// wasm32-wasip2 EXACTLY ONCE per test process. Sibling of
+/// [`build_atlassian_component_once`] — see that function's doc. Consumed by
+/// the provider conformance battery
+/// (`crate::plugins::wasm_provider_conformance`), which drives the real
+/// component against a loopback mock upstream.
+#[cfg(test)]
+pub(crate) fn build_openai_component_once() {
+    use std::sync::OnceLock;
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root
+            .join("tests")
+            .join("fixtures")
+            .join("build-openai-component.sh");
+        let status = std::process::Command::new("sh")
+            .arg(script)
+            .status()
+            .expect("openai component build script should start");
+        assert!(status.success(), "openai component build failed: {status}");
+    });
+}
+
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — to `regs`. Factored out of
 /// [`install_builtins`] so the daemon composition root can add providers,

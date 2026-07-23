@@ -414,6 +414,18 @@ pub(crate) struct TestTransportGrants {
     /// channel a provider component reads through `ryuzi:storage` (e.g. the
     /// conformance harness's mock upstream base URL).
     pub storage_seed: Vec<(String, Vec<u8>)>,
+    /// Router provider ids the bundle DECLARES (`provider-ids`). Non-empty
+    /// alongside a non-empty `network_allowlist` grants
+    /// `ryuzi:provider-auth` — the exact gate
+    /// [`crate::plugins::runtime::HostPolicy::for_installed_bundle`] applies in
+    /// production, mirrored here rather than re-derived, so a test transport
+    /// can never be more permissive than a real install.
+    pub provider_ids: Vec<String>,
+    /// `(provider_id, api_key)` user credentials seeded through the SAME
+    /// storage the real router uses (`llm_router::connections`, encrypted at
+    /// rest by `llm_router::secrets`), so `ryuzi:provider-auth` resolves a real
+    /// key instead of reporting `not-configured`.
+    pub provider_credentials: Vec<(String, String)>,
 }
 
 /// Build a [`WasmProviderTransport`] over a component at `component_path`,
@@ -448,8 +460,15 @@ pub(crate) async fn build_test_transport_with_grants(
     let mut policy = HostPolicy::deny_all();
     policy.allow_network = !grants.network_allowlist.is_empty();
     policy.allow_storage = grants.allow_storage;
+    // Same conjunction as `HostPolicy::for_installed_bundle`: an explicitly
+    // declared provider id AND a declared outbound host.
+    policy.allow_provider_auth =
+        !grants.provider_ids.is_empty() && !grants.network_allowlist.is_empty();
     policy.limits.timeout = timeout;
 
+    // Keeps the encrypted-at-rest credential seeding below (and any other
+    // secret this store holds) off the real OS keychain / `secret.key`.
+    crate::llm_router::secrets::use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(crate::store::Store::open(tmp.path()).await.unwrap());
     for (key, value) in &grants.storage_seed {
@@ -457,6 +476,28 @@ pub(crate) async fn build_test_transport_with_grants(
             .put_component_storage(provider_id, key, value)
             .await
             .unwrap();
+    }
+    for (credential_provider, api_key) in &grants.provider_credentials {
+        let now = crate::paths::now_ms();
+        crate::llm_router::connections::add_connection(
+            &store,
+            crate::llm_router::connections::ConnectionRow {
+                id: format!("test-conn-{credential_provider}"),
+                provider: credential_provider.clone(),
+                auth_type: "api_key".to_string(),
+                label: credential_provider.clone(),
+                priority: 0,
+                enabled: true,
+                data: crate::llm_router::connections::ConnectionData {
+                    api_key: Some(api_key.clone()),
+                    ..Default::default()
+                },
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     let ctx = Arc::new(PluginCapabilityContext {
@@ -467,7 +508,7 @@ pub(crate) async fn build_test_transport_with_grants(
         telemetry: Arc::new(NoopTelemetry),
         network_allowlist: grants.network_allowlist.clone(),
         oauth_profile_ids: vec![],
-        provider_ids: vec![],
+        provider_ids: grants.provider_ids.clone(),
     });
     let bundle = InstalledBundle {
         manifest: PluginBundleManifest {
@@ -487,7 +528,7 @@ pub(crate) async fn build_test_transport_with_grants(
                     .collect(),
             },
             oauth: vec![],
-            provider_ids: vec![],
+            provider_ids: grants.provider_ids.clone(),
         },
         release: PluginRelease {
             id: provider_id.to_string(),
