@@ -17,6 +17,8 @@
 //! The component only ever receives the upstream [`SafeHttpResponse`]; the
 //! access token itself never crosses back into adapter-returned data.
 
+use std::time::Duration;
+
 use super::http::{AllowedHttpClient, SafeHttpResponse, DEFAULT_HTTP_TIMEOUT};
 use super::PluginCapabilityContext;
 use crate::plugins::oauth::{generate_pkce_verifier, needs_refresh, pkce_challenge_s256};
@@ -82,11 +84,32 @@ pub enum DevicePollOutcome {
 /// One plugin's view of one of its declared OAuth profiles.
 pub struct ProfileOauth<'a> {
     pub ctx: &'a PluginCapabilityContext,
+    /// Bounds the outbound [`Self::authorized_request`] (connect + whole
+    /// request). The runtime's `ryuzi:oauth` host threads the component's own
+    /// per-call epoch budget in via [`Self::with_timeout`] so a stalled
+    /// allowlisted upstream surfaces promptly as [`OauthErr::Failed`] instead of
+    /// hanging the host function past an epoch deadline it can never preempt —
+    /// the SAME budget `ryuzi:provider-auth` already honours. The
+    /// host-caller-driven flows (PKCE / device) do not use this — [`Self::new`]
+    /// keeps the [`DEFAULT_HTTP_TIMEOUT`] default, and the device flows bound
+    /// themselves separately (see [`bounded_http_client`]).
+    timeout: Duration,
 }
 
 impl<'a> ProfileOauth<'a> {
     pub fn new(ctx: &'a PluginCapabilityContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            timeout: DEFAULT_HTTP_TIMEOUT,
+        }
+    }
+
+    /// Like [`Self::new`], but bounds [`Self::authorized_request`] by `timeout`
+    /// — the component's per-call epoch budget, threaded in by the runtime's
+    /// `ryuzi:oauth` host so an OAuth egress honours the SAME budget
+    /// `ryuzi:provider-auth`'s `ProviderAuth::with_timeout` already does.
+    pub fn with_timeout(ctx: &'a PluginCapabilityContext, timeout: Duration) -> Self {
+        Self { ctx, timeout }
     }
 
     /// Rejects an OAuth profile ID that the installed bundle did not declare.
@@ -194,7 +217,14 @@ impl<'a> ProfileOauth<'a> {
             return Err(OauthErr::Expired);
         }
 
-        let client = AllowedHttpClient::new(self.ctx.network_allowlist.clone());
+        // Bound the request by this profile's timeout (the component's per-call
+        // budget when constructed via `with_timeout`); `false` = never honour a
+        // component-supplied `Authorization`, the host injects its own bearer.
+        let client = AllowedHttpClient::with_self_auth(
+            self.ctx.network_allowlist.clone(),
+            false,
+            self.timeout,
+        );
         client
             .request_with_bearer(method, url, headers, body, &token.access_token)
             .await
@@ -730,6 +760,72 @@ mod tests {
             .authorized_request("default", "GET", "https://example.test/me", vec![], None)
             .await;
         assert_eq!(result, Err(OauthErr::Expired));
+    }
+
+    #[tokio::test]
+    async fn authorized_request_honours_the_per_call_timeout_on_a_stalled_upstream() {
+        // Regression guard for the OAuth-egress timeout gap the provider
+        // conformance harness exposed: `authorized_request` must be bounded by
+        // the component's per-call budget (threaded in by the runtime's
+        // `ryuzi:oauth` host), NOT the 30s `DEFAULT_HTTP_TIMEOUT`. A blocked host
+        // call is never preempted by the epoch deadline, so without this the
+        // whole engine would hang on a stalled Anthropic OAuth upstream.
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/me",
+            get(|| async {
+                // Far longer than the client budget below: the client's own
+                // timeout must fire first, not this.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "too late"
+            }),
+        );
+        let port = spawn_server(app).await;
+
+        let (store, _tmp) = open_test_store().await;
+        let ctx = ctx_for(store.clone(), "github");
+        store
+            .upsert_plugin_oauth_profile_token(
+                "github",
+                "default",
+                &PluginOauthToken {
+                    plugin_id: "github".into(),
+                    access_token: "real-host-token".into(),
+                    refresh_token: None,
+                    token_type: "Bearer".into(),
+                    expires_at: Some(crate::paths::now_ms() + 3_600_000),
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let oauth = ProfileOauth::with_timeout(&ctx, Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            oauth.authorized_request(
+                "default",
+                "GET",
+                &format!("http://127.0.0.1:{port}/me"),
+                vec![],
+                None,
+            ),
+        )
+        .await
+        .expect("the client's own 300ms timeout must fire long before this 5s guard");
+
+        assert!(
+            matches!(result, Err(OauthErr::Failed(_))),
+            "a stalled upstream must surface as Failed, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the per-call budget must catch the stall promptly, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

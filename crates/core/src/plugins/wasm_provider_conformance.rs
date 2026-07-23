@@ -248,6 +248,17 @@ pub(crate) struct ProviderExpectations {
     pub expected_authorization: Option<&'static str>,
 }
 
+/// How an OAuth provider fixture authenticates: the `[[oauth]]` profile the
+/// bundle declares (== the router provider id and the id the guest passes to
+/// `authorized-request`) and the access token seeded for it. The host injects
+/// that token as `Authorization: Bearer <token>`; the component never sees it.
+/// `None` on a fixture that reaches its upstream through plain `ryuzi:http` or
+/// host-mediated `ryuzi:provider-auth` instead.
+pub(crate) struct OAuthProfileSeed {
+    pub profile_id: &'static str,
+    pub access_token: &'static str,
+}
+
 /// Everything [`ProviderConformance`] needs for one battery run: the compiled
 /// component + provider id under test, the mock's wire-level response
 /// bodies, and the expected outputs the six checks assert against. The
@@ -279,6 +290,12 @@ pub(crate) struct ConformanceFixture {
     /// `AuthScheme`, the same DATA the host keys its injection off, so the
     /// auth-absence check need not know which provider it is running.
     pub credential_header: String,
+    /// For an OAuth provider: the `[[oauth]]` profile + seeded token that grants
+    /// `ryuzi:oauth` and lets `authorized-request` inject a host-managed bearer.
+    /// `None` for an API-key/http provider (whose auth is `stored_api_key` /
+    /// plain http instead). Exactly one of `stored_api_key`/`oauth_profile` is
+    /// `Some` for any credentialed fixture.
+    pub oauth_profile: Option<OAuthProfileSeed>,
     pub wire: MockWireBodies,
     pub expect: ProviderExpectations,
 }
@@ -315,6 +332,18 @@ impl ProviderConformance {
             .fixture
             .stored_api_key
             .map(|api_key| (self.fixture.provider_id.clone(), api_key.to_string()));
+        // An OAuth fixture grants `ryuzi:oauth` + a seeded profile token instead
+        // of `ryuzi:provider-auth` + a stored API key. The two are mutually
+        // exclusive (a fixture is one or the other), so this reuses the SAME
+        // builder and the SAME six checks — only the grant + seeded credential
+        // differ.
+        let (oauth_profile_ids, oauth_tokens) = match &self.fixture.oauth_profile {
+            Some(seed) => (
+                vec![seed.profile_id.to_string()],
+                vec![(seed.profile_id.to_string(), seed.access_token.to_string())],
+            ),
+            None => (vec![], vec![]),
+        };
         build_test_transport_with_grants(
             self.fixture.artifact.clone(),
             &self.fixture.provider_id,
@@ -331,6 +360,8 @@ impl ProviderConformance {
                     .map(|(provider, _)| provider.clone())
                     .collect(),
                 provider_credentials: provider_auth.into_iter().collect(),
+                oauth_profile_ids,
+                oauth_tokens,
             },
         )
         .await
@@ -585,6 +616,8 @@ fn synthetic_fixture_conformance() -> ConformanceFixture {
         // No credential is injected at all, so the header watched here is
         // immaterial — `authorization` matches what a guest would forge.
         credential_header: "authorization".to_string(),
+        // Plain `ryuzi:http`, not OAuth.
+        oauth_profile: None,
         wire: MockWireBodies {
             models_path: "/models".to_string(),
             models_body: MODELS_BODY.to_string(),
@@ -733,6 +766,8 @@ impl OpenAiFormatFixture {
             // Every OpenAI-format descriptor here declares `AuthScheme::Bearer`,
             // so the host injects the credential as `Authorization: Bearer …`.
             credential_header: "authorization".to_string(),
+            // API-key providers, host-mediated via `ryuzi:provider-auth`.
+            oauth_profile: None,
             wire: MockWireBodies {
                 models_path: OPENAI_FORMAT_MODELS_PATH.to_string(),
                 models_body: self.models_body.to_string(),
@@ -1284,6 +1319,8 @@ fn anthropic_conformance() -> ConformanceFixture {
         // `AuthScheme::XApiKey`: the host injects the bare key as `x-api-key`,
         // so that — not `authorization` — is the header the mock watches.
         credential_header: "x-api-key".to_string(),
+        // The x-api-key sibling authenticates via `ryuzi:provider-auth`, not OAuth.
+        oauth_profile: None,
         wire: MockWireBodies {
             models_path: "/models".to_string(),
             models_body: ANTHROPIC_MODELS_BODY.to_string(),
@@ -1355,4 +1392,272 @@ async fn anthropic_component_passes_the_full_conformance_battery() {
     ProviderConformance::new(anthropic_conformance())
         .run_full_battery()
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// The `anthropic-oauth` provider component (plan Task 16c5, Step C)
+//
+// The SAME six checks, driven through the SAME `ProviderConformance` harness —
+// but the OAUTH egress path, not `ryuzi:provider-auth`. That is the point of
+// the Step 1 parameterization AND the Step-C harness extension: an OAuth
+// provider is a `ConformanceFixture` whose `oauth_profile` is `Some` (granting
+// `ryuzi:oauth` + a seeded profile token) instead of `stored_api_key`, never
+// another copy of the checks. Anthropic-Messages wire format, shared with the
+// x-api-key sibling; the ONE behavioural difference the harness observes is who
+// puts the bearer on the wire — the HOST, from the seeded OAuth token, never
+// the guest.
+// ---------------------------------------------------------------------------
+
+/// The OAuth access token this run seeds for the `anthropic-oauth` profile.
+/// `ryuzi:oauth` resolves it host-side and injects it as `Authorization: Bearer
+/// <token>`, so the component itself never sees this value — and the auth-absence
+/// check asserts the mock upstream saw EXACTLY this, i.e. nothing the guest
+/// forged (the guest has no `ryuzi:http` to forge one with anyway).
+const ANTHROPIC_OAUTH_SEEDED_TOKEN: &str = "oauth-access-token-conformance";
+
+/// The literal `GET /models` body the OAuth endpoint serves. Uses model ids and
+/// display names distinct from the x-api-key sibling's body so a cross-wired
+/// fixture (running one component against the other's expectations) fails loudly.
+/// Served opus-first — i.e. NOT alphabetical (`haiku` would sort first) — so the
+/// battery's order assertion is not satisfied by an accidental sort.
+const ANTHROPIC_OAUTH_MODELS_BODY: &str = r#"{"data":[
+  {"type":"model","id":"claude-opus-4-8","display_name":"Claude Opus 4.8","created_at":"2026-01-01T00:00:00Z"},
+  {"type":"model","id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku 4.5","created_at":"2025-10-01T00:00:00Z"}
+],"has_more":false}"#;
+
+/// The literal `POST /messages` (non-stream) body the OAuth endpoint serves: a
+/// `content` array of typed blocks with a leading `thinking` block the component
+/// must skip, and `usage.input_tokens`/`output_tokens` distinct from the
+/// sibling's so a cross-wired fixture cannot pass.
+const ANTHROPIC_OAUTH_MESSAGE_BODY: &str = r#"{
+  "id":"msg_oauth_conformance",
+  "type":"message",
+  "role":"assistant",
+  "model":"claude-opus-4-8",
+  "content":[
+    {"type":"thinking","thinking":"private chain of thought"},
+    {"type":"text","text":"subscription reply"}
+  ],
+  "stop_reason":"end_turn",
+  "usage":{"input_tokens":51,"output_tokens":37}
+}"#;
+
+/// The `anthropic-oauth` component's built artifact — a standalone workspace
+/// crate whose cargo output is the crate name with `-` replaced by `_`.
+fn anthropic_oauth_artifact() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/anthropic-oauth/target/wasm32-wasip2/release")
+        .join("ryuzi_plugin_anthropic_oauth.wasm")
+}
+
+/// The `anthropic-oauth` conformance fixture: Anthropic-Messages wire bodies on
+/// the `/models` + `/messages` paths, the shared base-URL override key, and —
+/// the Step-C addition — an `oauth_profile` that grants `ryuzi:oauth` and seeds
+/// a profile token, so the host injects `Authorization: Bearer <token>` and the
+/// component never touches a credential.
+fn anthropic_oauth_conformance() -> ConformanceFixture {
+    ConformanceFixture {
+        artifact: anthropic_oauth_artifact(),
+        provider_id: "anthropic-oauth".to_string(),
+        request_model: "claude-opus-4-8".to_string(),
+        base_url_storage_key: OPENAI_FORMAT_BASE_URL_KEY.to_string(),
+        // OAuth, not `ryuzi:provider-auth`: no stored API key.
+        stored_api_key: None,
+        // The descriptor declares `AuthScheme::Bearer`, and the host injects the
+        // OAuth token as `Authorization: Bearer …`, so `authorization` — not
+        // `x-api-key` — is the header the mock watches.
+        credential_header: "authorization".to_string(),
+        oauth_profile: Some(OAuthProfileSeed {
+            // Matches the manifest `[[oauth]]` id, the router provider id, and
+            // `logic::OAUTH_PROFILE` — the string the guest passes to
+            // `authorized-request`. A drift is a hard `denied`.
+            profile_id: "anthropic-oauth",
+            access_token: ANTHROPIC_OAUTH_SEEDED_TOKEN,
+        }),
+        wire: MockWireBodies {
+            models_path: "/models".to_string(),
+            models_body: ANTHROPIC_OAUTH_MODELS_BODY.to_string(),
+            // ApiFormat::Anthropic generates at `/messages`; the OAuth guest
+            // appends `?beta=true`, which axum ignores for path routing so this
+            // `/messages` route still matches.
+            complete_path: "/messages".to_string(),
+            complete_success_body: ANTHROPIC_OAUTH_MESSAGE_BODY.to_string(),
+        },
+        expect: ProviderExpectations {
+            models: vec![
+                WasmModelInfo {
+                    id: "claude-opus-4-8".to_string(),
+                    display_name: "Claude Opus 4.8".to_string(),
+                    context_window: 128_000,
+                },
+                WasmModelInfo {
+                    id: "claude-haiku-4-5-20251001".to_string(),
+                    display_name: "Claude Haiku 4.5".to_string(),
+                    context_window: 128_000,
+                },
+            ],
+            // Flat-text ABI + buffered upstream: one terminal chunk carrying only
+            // the first text block (the thinking block is dropped).
+            chunk_texts: vec!["subscription reply"],
+            final_text: "subscription reply",
+            terminal_usage: Some(WasmTokenUsage {
+                input: 51,
+                output: 37,
+            }),
+            http_error_cases: vec![
+                HttpErrorCase {
+                    status: 429,
+                    expected_substring: "rate limited",
+                },
+                HttpErrorCase {
+                    status: 503,
+                    expected_substring: "unavailable",
+                },
+                // A 4xx that is NOT a not-found stays an invalid-request carrying
+                // only the status — never the upstream message. The host passes a
+                // non-2xx upstream status straight through `authorized-request`,
+                // so this exercises the SAME `classify_error` mapping as the
+                // x-api-key path.
+                HttpErrorCase {
+                    status: 400,
+                    expected_substring: "HTTP 400",
+                },
+            ],
+            timeout_error_substrings: vec![
+                "failed",
+                "timeout",
+                "timed out",
+                "budget",
+                "unavailable",
+            ],
+            // The component sets no credential header of its own — no
+            // `ryuzi:http`, no `ryuzi:provider-auth`, only host-mediated
+            // `ryuzi:oauth` — so there is no forged secret to look for.
+            guest_forged_secret: None,
+            // ...and the ONLY value the mock may see for `authorization` is the
+            // HOST-injected bearer built from the seeded OAuth token. This is the
+            // auth-absence guarantee for the OAuth path: the guest never sets or
+            // sees the bearer; the mock receives only what the host injected.
+            expected_authorization: Some("Bearer oauth-access-token-conformance"),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_oauth_component_passes_the_full_conformance_battery() {
+    crate::plugins::build_provider_component_once("anthropic-oauth");
+    ProviderConformance::new(anthropic_oauth_conformance())
+        .run_full_battery()
+        .await;
+}
+
+/// The battery proves the `anthropic-oauth` component BEHAVES like its provider.
+/// This proves its bundle is DECLARED like one — the OAuth analogue of
+/// [`assert_bundle_is_declared_like_its_provider`], which only covers API-key
+/// (`ryuzi:provider-auth`) bundles. What decides whether the host will inject
+/// the Claude-subscription bearer at all is invisible to a battery that grants
+/// `ryuzi:oauth` itself, so it is checked here against the committed manifest.
+#[test]
+fn anthropic_oauth_bundle_is_declared_like_its_oauth_provider() {
+    use crate::llm_router::registry::{self, ProviderCategory};
+    use ryuzi_plugin_sdk::PluginBundleManifest;
+
+    let id = "anthropic-oauth";
+    let descriptor =
+        registry::descriptor(id).unwrap_or_else(|| panic!("{id} must exist in the router catalog"));
+
+    // The descriptor facts this component was built from: an OAuth provider,
+    // Anthropic wire format, with a live `/models` endpoint.
+    assert_eq!(
+        descriptor.category,
+        ProviderCategory::OAuth,
+        "{id} category"
+    );
+    assert_eq!(
+        descriptor.format,
+        registry::ApiFormat::Anthropic,
+        "{id} wire format"
+    );
+    assert!(descriptor.has_models_endpoint, "{id} has_models_endpoint");
+    let oauth = descriptor
+        .oauth
+        .as_ref()
+        .unwrap_or_else(|| panic!("{id} must declare an OAuthConfig"));
+
+    // The hosts the manifest may allowlist: the API base host plus the OAuth
+    // authorize/token hosts the profile authenticates against — nothing wider.
+    let host_of = |raw: &str| {
+        url::Url::parse(raw)
+            .unwrap_or_else(|e| panic!("{id} url {raw}: {e}"))
+            .host_str()
+            .unwrap_or_else(|| panic!("{id} url {raw} has no host"))
+            .to_string()
+    };
+    let base_url = descriptor
+        .base_url
+        .unwrap_or_else(|| panic!("{id} must declare a base_url to allowlist"));
+    let mut expected_hosts = std::collections::BTreeSet::new();
+    expected_hosts.insert(host_of(base_url));
+    expected_hosts.insert(host_of(oauth.authorize_url));
+    expected_hosts.insert(host_of(oauth.token_url));
+
+    let bundle_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins")
+        .join(id);
+    let path = bundle_dir.join("ryuzi-plugin.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let manifest: PluginBundleManifest =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("{id} manifest: {e}"));
+    manifest
+        .validate()
+        .unwrap_or_else(|e| panic!("{id} manifest is invalid: {e}"));
+
+    assert_eq!(manifest.id, id, "bundle id");
+    assert_eq!(
+        manifest.provider_ids,
+        vec![id.to_string()],
+        "{id} must declare provider-ids EXPLICITLY so the router registers its \
+         transport under that id",
+    );
+    // Exactly one `[[oauth]]` profile, whose id equals the string the component
+    // passes to `authorized-request` (and the router provider id).
+    assert_eq!(manifest.oauth.len(), 1, "{id} declares one oauth profile");
+    assert_eq!(
+        manifest.oauth[0].id, id,
+        "{id} oauth profile id must equal the provider id the guest requests",
+    );
+    let hosts: std::collections::BTreeSet<String> = manifest
+        .permissions
+        .network
+        .iter()
+        .map(|host| host.0.clone())
+        .collect();
+    assert_eq!(
+        hosts, expected_hosts,
+        "{id} must allowlist exactly the API host plus the OAuth authorize/token \
+         hosts its profile authenticates against ({expected_hosts:?}) — a wider \
+         allowlist widens where a request may travel",
+    );
+
+    // The full base URL — scheme, host AND path — as the component transcribed
+    // it into its own `logic.rs`, read from source text because the bundle is a
+    // separate workspace this crate cannot link. The allowlist check matches on
+    // HOST only and the battery overrides the base URL through storage, so a
+    // wrong PATH escapes every other gate here.
+    let logic_path = bundle_dir.join("src/logic.rs");
+    let logic = std::fs::read_to_string(&logic_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", logic_path.display()));
+    let configured = configured_default_base_url(&logic).unwrap_or_else(|| {
+        panic!(
+            "{} must assign a string literal to `default_base_url`",
+            logic_path.display()
+        )
+    });
+    assert_eq!(
+        configured,
+        base_url,
+        "{} configures base URL {configured:?} but the {id} descriptor says \
+         {base_url:?}",
+        logic_path.display(),
+    );
 }

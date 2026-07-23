@@ -1128,8 +1128,13 @@ impl oauth_iface::Host for CapabilityState {
             .into_iter()
             .map(|header| (header.name, header.value))
             .collect();
+        // Thread the component's per-call epoch budget into the outbound
+        // request, exactly as the `ryuzi:provider-auth` host does below — a
+        // blocked host call is never preempted by the epoch deadline, so the
+        // HTTP client's own timeout is what actually catches a stalled upstream.
+        let http_timeout = self.http_timeout;
         let result = self.rt.block_on(async move {
-            ProfileOauth::new(&ctx)
+            ProfileOauth::with_timeout(&ctx, http_timeout)
                 .authorized_request(&profile_id, &method, &url, headers, body)
                 .await
         });

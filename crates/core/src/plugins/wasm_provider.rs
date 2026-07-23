@@ -427,6 +427,21 @@ pub(crate) struct TestTransportGrants {
     /// rest by `llm_router::secrets`), so `ryuzi:provider-auth` resolves a real
     /// key instead of reporting `not-configured`.
     pub provider_credentials: Vec<(String, String)>,
+    /// OAuth profile ids the bundle DECLARES (`[[oauth]]`). Non-empty grants
+    /// `ryuzi:oauth` — the exact gate
+    /// [`crate::plugins::runtime::HostPolicy::for_installed_bundle`] applies in
+    /// production (`allow_oauth = !manifest.oauth.is_empty()`), mirrored here so
+    /// a test transport can never be more permissive than a real install. Each
+    /// id is also declared as an `[[oauth]]` profile on the test bundle
+    /// manifest (what the compiled component reads to authorize the profile).
+    pub oauth_profile_ids: Vec<String>,
+    /// `(profile_id, access_token)` OAuth tokens seeded through the SAME store
+    /// the real host reads (`Store::upsert_plugin_oauth_profile_token`, keyed by
+    /// this bundle's plugin id), so `ryuzi:oauth`'s `authorized-request`
+    /// resolves a real bearer to inject instead of reporting `denied`. The
+    /// component never sees this value — the host injects it and returns only the
+    /// upstream response, exactly as `capabilities::oauth`'s own tests seed it.
+    pub oauth_tokens: Vec<(String, String)>,
 }
 
 /// Build a [`WasmProviderTransport`] over a component at `component_path`,
@@ -455,7 +470,8 @@ pub(crate) async fn build_test_transport_with_grants(
     use crate::store::ComponentPluginReleaseRecord;
     use crate::telemetry::NoopTelemetry;
     use ryuzi_plugin_sdk::{
-        NetworkPermission, PluginBundleManifest, PluginLifecycle, PluginPermissions, PluginRelease,
+        NetworkPermission, OAuthProfile, PluginBundleManifest, PluginLifecycle, PluginPermissions,
+        PluginRelease,
     };
 
     let mut policy = HostPolicy::deny_all();
@@ -465,6 +481,9 @@ pub(crate) async fn build_test_transport_with_grants(
     // declared provider id AND a declared outbound host.
     policy.allow_provider_auth =
         !grants.provider_ids.is_empty() && !grants.network_allowlist.is_empty();
+    // Same gate as `HostPolicy::for_installed_bundle`: a declared `[[oauth]]`
+    // profile grants `ryuzi:oauth`.
+    policy.allow_oauth = !grants.oauth_profile_ids.is_empty();
     policy.limits.timeout = timeout;
 
     // Keeps the encrypted-at-rest credential seeding below off the real OS
@@ -506,6 +525,31 @@ pub(crate) async fn build_test_transport_with_grants(
         .await
         .unwrap();
     }
+    // Seed OAuth profile tokens exactly the way `capabilities::oauth`'s own
+    // tests do, keyed by this bundle's plugin id (== provider_id) and the
+    // profile id — so the host resolves a real bearer to inject and the
+    // conformance auth-absence check sees the HOST-injected value, not a guest
+    // one. A comfortably future expiry keeps `needs_refresh` from reporting the
+    // token expired mid-battery.
+    for (profile_id, access_token) in &grants.oauth_tokens {
+        let now = crate::paths::now_ms();
+        store
+            .upsert_plugin_oauth_profile_token(
+                provider_id,
+                profile_id,
+                &crate::plugins::oauth::PluginOauthToken {
+                    plugin_id: provider_id.to_string(),
+                    access_token: access_token.clone(),
+                    refresh_token: None,
+                    token_type: "Bearer".to_string(),
+                    expires_at: Some(now + 3_600_000),
+                    scopes: vec![],
+                    reconnect_required: false,
+                },
+            )
+            .await
+            .unwrap();
+    }
 
     let ctx = Arc::new(PluginCapabilityContext {
         plugin_id: provider_id.to_string(),
@@ -514,7 +558,7 @@ pub(crate) async fn build_test_transport_with_grants(
         store,
         telemetry: Arc::new(NoopTelemetry),
         network_allowlist: grants.network_allowlist.clone(),
-        oauth_profile_ids: vec![],
+        oauth_profile_ids: grants.oauth_profile_ids.clone(),
         provider_ids: grants.provider_ids.clone(),
     });
     let bundle = InstalledBundle {
@@ -534,7 +578,25 @@ pub(crate) async fn build_test_transport_with_grants(
                     .map(|host| NetworkPermission(host.clone()))
                     .collect(),
             },
-            oauth: vec![],
+            // One minimal `[[oauth]]` profile per granted id: the compiled
+            // component reads these (`CompiledComponent.oauth_profile_ids`) to
+            // authorize the profile the guest passes to `authorized-request`.
+            // Only the id matters on the completion path — `authorized-request`
+            // resolves the seeded token, not the authorize/token URLs.
+            oauth: grants
+                .oauth_profile_ids
+                .iter()
+                .map(|id| OAuthProfile {
+                    id: id.clone(),
+                    authorize_url: None,
+                    token_url: None,
+                    resource: None,
+                    scopes: vec![],
+                    client_id_setting: None,
+                    client_secret_setting: None,
+                    dynamic_registration: false,
+                })
+                .collect(),
             provider_ids: grants.provider_ids.clone(),
         },
         release: PluginRelease {
