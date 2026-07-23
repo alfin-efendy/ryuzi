@@ -214,6 +214,7 @@ mod tests {
                 description: String::new(),
                 permissions: PluginPermissions { network: vec![] },
                 oauth: vec![],
+                provider_ids: vec![],
             },
             release: PluginRelease {
                 id: plugin_id.to_string(),

@@ -1250,6 +1250,7 @@ mod tests {
                     .collect(),
             },
             oauth: vec![],
+            provider_ids: vec![],
         }
     }
 

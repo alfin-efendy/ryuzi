@@ -591,6 +591,31 @@ pub async fn build_daemon(mut opts: BuildDaemonOpts) -> anyhow::Result<Daemon> {
         gateways.push(gw as Arc<dyn Gateway>);
     }
 
+    // Activate any enabled, installed provider component bundle (design §5.5 /
+    // plan Task 16): register a live WASM provider transport under each router
+    // provider id its manifest declares (e.g. the `mimo` bundle backs
+    // `mimo-free`). Registration is a side effect into the process-wide provider
+    // registry the router's `anthropic_messages_stream` already diverts to via
+    // `wasm_provider(&conn.provider)`, so a routed free-tier connection resolves
+    // to its component through that same generic, data-driven seam — nothing is
+    // threaded into the `Router` below, and there is no plugin-id host branch.
+    // Warn-and-skip discovery registers nothing on a clean install (no enabled
+    // provider bundle), so the common case adds nothing.
+    let registered_providers = crate::plugins::wasm_provider::discover_provider_components(
+        Arc::clone(&store),
+        &settings,
+        Arc::clone(&telemetry),
+        &crate::plugins::bundle::installed_bundle_root(),
+    )
+    .await;
+    if !registered_providers.is_empty() {
+        tracing::info!(
+            providers = ?registered_providers,
+            "registered {} wasm provider transport(s)",
+            registered_providers.len()
+        );
+    }
+
     let gateway_status_handles = Mutex::new(subscribe_gateway_statuses(Arc::clone(&cp), &gateways));
 
     // Two `Router` instances sharing the same `cp`/`store` — see `router.rs`'s

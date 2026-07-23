@@ -7,6 +7,12 @@ component = "mimo.wasm"
 publisher = "Ryuzi"
 description = "Xiaomi MiMo free-tier chat provider. Talks to api.xiaomimimo.com behind the MiMoCode anti-abuse gate (bootstrap JWT, Chrome-like headers, MiMoCode system marker)."
 
+# The LLM-router provider id(s) this bundle backs. The bundle id is `mimo`, but
+# free-tier routing resolves to the `mimo-free` provider (see the bootstrap
+# provider seeding + free-route families), so the host registers this
+# component's transport under `mimo-free`.
+provider-ids = ["mimo-free"]
+
 # Only host the component may reach through `ryuzi:http/http`. The host enforces
 # this allowlist (and re-checks it on every redirect); a request to any other
 # host is rejected. Both the bootstrap and chat endpoints live on this host.

@@ -32,6 +32,9 @@ use async_trait::async_trait;
 use crate::plugins::capabilities::wit_bindings::exports::ryuzi::provider::provider as wit;
 use crate::plugins::capabilities::PluginCapabilityContext;
 use crate::plugins::runtime::{CompiledComponent, ComponentInstance, PluginRuntimeError};
+use crate::settings::SettingsStore;
+use crate::store::Store;
+use crate::telemetry::Telemetry;
 
 /// One model a WASM provider advertises (the host-side mirror of the WIT
 /// `model-info`). Registered as a `ProviderDescriptor` model by Task 11.
@@ -262,6 +265,115 @@ pub fn unregister_wasm_provider(provider_id: &str) {
         .remove(provider_id);
 }
 
+/// Discover every active WASM component bundle under `root`, keep only the
+/// ENABLED ones that export `ryuzi:provider/provider`, compile each once, and
+/// register a live [`WasmProviderTransport`] into the process-wide
+/// [`register_wasm_provider`] registry under EACH router provider id the bundle
+/// declares (`PluginBundleManifest::resolved_provider_ids`, which falls back to
+/// the bundle id when none are declared) — the provider analogue of
+/// [`crate::plugins::wasm_gateway::discover_gateway_components`]. Returns the
+/// provider ids registered (for logging / test cleanup); the daemon consumes no
+/// value from it, since routing looks transports up out of the shared registry.
+///
+/// Every failure mode is warn-and-skip (missing root, discovery error,
+/// unavailable runtime, per-bundle compile failure, enablement-lookup error),
+/// so a broken provider plugin never blocks daemon startup, and a clean install
+/// (nothing enabled that exports a provider) registers nothing. `root` is a
+/// parameter (rather than always
+/// [`crate::plugins::bundle::installed_bundle_root`]) purely so tests can point
+/// discovery at a hermetic install root; production passes the real per-user
+/// root.
+pub(crate) async fn discover_provider_components(
+    store: Arc<Store>,
+    settings: &SettingsStore,
+    telemetry: Arc<dyn Telemetry>,
+    root: &std::path::Path,
+) -> Vec<String> {
+    use crate::plugins::runtime::{ComponentRuntime, HostPolicy};
+
+    if !root.exists() {
+        return Vec::new();
+    }
+    let bundles = match crate::plugins::bundle::load_active_bundles(root, &store).await {
+        Ok(bundles) => bundles,
+        Err(error) => {
+            tracing::warn!("wasm provider: discovering component bundles failed: {error}");
+            return Vec::new();
+        }
+    };
+    if bundles.is_empty() {
+        return Vec::new();
+    }
+    let runtime = match ComponentRuntime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!("wasm provider: component runtime unavailable: {error}");
+            return Vec::new();
+        }
+    };
+    let mut registered = Vec::new();
+    for bundle in bundles {
+        let id = bundle.manifest.id.clone();
+        match crate::plugins::host::component_plugin_enabled(settings, &id).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(plugin = %id, "wasm provider: enablement check failed: {error}");
+                continue;
+            }
+        }
+        // Single source of truth for the installed-bundle capability policy
+        // (incl. the first-party-only `allow_self_auth` gate that keeps mimo's
+        // bootstrap JWT header) — see `HostPolicy::for_installed_bundle`.
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        let compiled = match runtime.compile(&bundle, policy) {
+            Ok(compiled) => Arc::new(compiled),
+            Err(error) => {
+                tracing::warn!(plugin = %id, "wasm provider: component compile failed: {error}");
+                continue;
+            }
+        };
+        // Only provider bundles are registered; a gateway/connector/hooks-only
+        // bundle is skipped before any instantiation (IMP-2).
+        if !compiled.exports_provider() {
+            continue;
+        }
+        let ctx = Arc::new(PluginCapabilityContext {
+            plugin_id: id.clone(),
+            version: bundle.manifest.version.clone(),
+            settings: settings.clone(),
+            store: store.clone(),
+            telemetry: telemetry.clone(),
+            network_allowlist: bundle
+                .manifest
+                .permissions
+                .network
+                .iter()
+                .map(|entry| entry.0.clone())
+                .collect(),
+            oauth_profile_ids: bundle
+                .manifest
+                .oauth
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect(),
+        });
+        // One transport per DECLARED router provider id (mimo -> `mimo-free`),
+        // all sharing the single compiled component + capability context. The
+        // bundle-id -> router-id mapping is data-driven from the manifest, so
+        // there is NO plugin-id host branch here.
+        for provider_id in bundle.manifest.resolved_provider_ids() {
+            register_wasm_provider(Arc::new(WasmProviderTransport::new(
+                compiled.clone(),
+                ctx.clone(),
+                provider_id.clone(),
+            )));
+            registered.push(provider_id);
+        }
+    }
+    registered
+}
+
 /// The prebuilt provider fixture artifact (caller must build fixtures first).
 /// Module-level (not inside `mod tests`) so the router-level test in
 /// `llm_router::client` can reuse it.
@@ -373,6 +485,7 @@ pub(crate) async fn build_test_transport_with_grants(
                     .collect(),
             },
             oauth: vec![],
+            provider_ids: vec![],
         },
         release: PluginRelease {
             id: provider_id.to_string(),
@@ -559,5 +672,270 @@ mod tests {
         assert!(wasm_provider("wasm-prov-registry").is_some());
         unregister_wasm_provider("wasm-prov-registry");
         assert!(wasm_provider("wasm-prov-registry").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // discover_provider_components: production discovery + registration
+    // -----------------------------------------------------------------
+
+    use crate::store::ComponentPluginReleaseRecord;
+    use crate::telemetry::NoopTelemetry;
+
+    fn gateway_fixture_artifact() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/component-gateway/target/wasm32-wasip2/release")
+            .join("ryuzi_component_gateway_fixture.wasm")
+    }
+
+    /// Lay a verified, active bundle onto `root` in the exact on-disk layout
+    /// [`crate::plugins::bundle::load_active_bundles`] requires (versioned dir +
+    /// `current` pointer + `ryuzi-plugin.toml` + `release.json` + the component,
+    /// hashes all agreeing) and seed the matching active release row into
+    /// `store`. Signed under the first-party key so
+    /// `HostPolicy::for_installed_bundle` grants `allow_self_auth`, exactly like
+    /// the real mimo/opencode bundles.
+    async fn install_bundle_on_disk(
+        root: &std::path::Path,
+        store: &Store,
+        plugin_id: &str,
+        component_artifact: &std::path::Path,
+        provider_ids: &[&str],
+    ) {
+        use sha2::{Digest, Sha256};
+
+        let version = "0.1.0";
+        let component_name = "plugin.wasm";
+        let version_dir = root.join(plugin_id).join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let bytes = std::fs::read(component_artifact).unwrap();
+        std::fs::write(version_dir.join(component_name), &bytes).unwrap();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+
+        let provider_ids_line = if provider_ids.is_empty() {
+            String::new()
+        } else {
+            let quoted = provider_ids
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("provider-ids = [{quoted}]\n")
+        };
+        let manifest = format!(
+            "id = \"{plugin_id}\"\n\
+             name = \"{plugin_id}\"\n\
+             version = \"{version}\"\n\
+             wit-api = \"^0.1.0\"\n\
+             lifecycle = \"per-call\"\n\
+             component = \"{component_name}\"\n\
+             {provider_ids_line}"
+        );
+        std::fs::write(version_dir.join("ryuzi-plugin.toml"), manifest).unwrap();
+
+        let release = serde_json::json!({
+            "id": plugin_id,
+            "version": version,
+            "wit-api": "0.1.0",
+            "component_url": "https://example.invalid/x.wasm",
+            "component_sha256": sha,
+        });
+        std::fs::write(
+            version_dir.join("release.json"),
+            serde_json::to_vec(&release).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join(plugin_id).join("current"), version).unwrap();
+
+        let record = ComponentPluginReleaseRecord {
+            plugin_id: plugin_id.to_string(),
+            version: version.to_string(),
+            source_url: "https://example.invalid/x.wasm".to_string(),
+            sha256: sha,
+            signing_key_id: crate::plugins::first_party_key::FIRST_PARTY_KEY_ID.to_string(),
+            installed_at: 0,
+            active: false,
+            revoked: false,
+            revocation_reason: None,
+        };
+        store.upsert_component_release(&record).await.unwrap();
+        store
+            .set_active_component_release(plugin_id, version)
+            .await
+            .unwrap();
+    }
+
+    /// A fresh temp store + a `SettingsStore` over it + a throwaway on-disk
+    /// install root, all sharing one lifetime tempfile so nothing is dropped
+    /// mid-test.
+    async fn discovery_env() -> (
+        Arc<Store>,
+        SettingsStore,
+        tempfile::TempDir,
+        tempfile::NamedTempFile,
+    ) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(tmp.path()).await.unwrap());
+        let settings = SettingsStore::new(store.clone());
+        let root = tempfile::tempdir().unwrap();
+        (store, settings, root, tmp)
+    }
+
+    /// Flip a component plugin's enablement on. Writes the raw
+    /// `plugin.<id>.enabled` row `component_plugin_enabled` reads (the schema
+    /// `SettingsStore::set` path rejects a key for a plugin not registered in a
+    /// `PluginHost`, which these hermetically installed on-disk bundles are not).
+    async fn enable(store: &Store, plugin_id: &str) {
+        store
+            .set_setting_raw(&format!("plugin.{plugin_id}.enabled"), "true")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabled_provider_bundle_registers_under_its_declared_id() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "disc-prov-enabled",
+            &provider_artifact(),
+            &["disc-prov-enabled-served"],
+        )
+        .await;
+        enable(&store, "disc-prov-enabled").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert_eq!(registered, vec!["disc-prov-enabled-served".to_string()]);
+        let transport = wasm_provider("disc-prov-enabled-served")
+            .expect("an enabled provider bundle must register a live transport");
+        assert_eq!(transport.provider_id(), "disc-prov-enabled-served");
+
+        for id in registered {
+            unregister_wasm_provider(&id);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_provider_ids_are_honored_and_empty_falls_back_to_manifest_id() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        // A bundle whose router id (`disc-map-free`) differs from its bundle id
+        // (`disc-map`) — the mimo/opencode shape.
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "disc-map",
+            &provider_artifact(),
+            &["disc-map-free"],
+        )
+        .await;
+        enable(&store, "disc-map").await;
+        // A bundle that declares NO provider-ids: it must fall back to its id.
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "disc-fallback",
+            &provider_artifact(),
+            &[],
+        )
+        .await;
+        enable(&store, "disc-fallback").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        // Registered under the DECLARED router id, never the bundle id.
+        assert!(
+            wasm_provider("disc-map-free").is_some(),
+            "must register under the declared router id",
+        );
+        assert!(
+            wasm_provider("disc-map").is_none(),
+            "must NOT register under the bundle id when provider-ids is declared",
+        );
+        // The no-declaration bundle falls back to its manifest id.
+        assert!(
+            wasm_provider("disc-fallback").is_some(),
+            "an empty provider-ids must fall back to the manifest id",
+        );
+
+        for id in registered {
+            unregister_wasm_provider(&id);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabled_provider_bundle_registers_nothing() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        // Installed + active but NOT enabled (component plugins default to
+        // disabled — no auto-enable for providers).
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "disc-disabled",
+            &provider_artifact(),
+            &["disc-disabled-served"],
+        )
+        .await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert!(
+            registered.is_empty(),
+            "a disabled bundle must register nothing: {registered:?}",
+        );
+        assert!(wasm_provider("disc-disabled-served").is_none());
+        assert!(wasm_provider("disc-disabled").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_provider_bundle_registers_nothing() {
+        build_fixtures();
+        let (store, settings, root, _tmp) = discovery_env().await;
+        // A gateway fixture: enabled + compiles, but exports gateway, not
+        // provider — the `exports_provider()` gate must skip it.
+        install_bundle_on_disk(
+            root.path(),
+            &store,
+            "disc-gateway",
+            &gateway_fixture_artifact(),
+            &[],
+        )
+        .await;
+        enable(&store, "disc-gateway").await;
+
+        let registered = super::discover_provider_components(
+            store.clone(),
+            &settings,
+            Arc::new(NoopTelemetry),
+            root.path(),
+        )
+        .await;
+
+        assert!(
+            registered.is_empty(),
+            "a non-provider (gateway) bundle must register nothing: {registered:?}",
+        );
+        assert!(wasm_provider("disc-gateway").is_none());
     }
 }
