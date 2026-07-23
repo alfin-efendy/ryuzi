@@ -13,10 +13,22 @@
 //! whose every field maps to a descriptor field. A component crate is then a
 //! config constant, a thin wrapper, and the [`provider_component!`] guest glue.
 //!
+//! # Egress-agnostic: how a component reaches the network is the ONE seam
+//! Request-BUILDING and response-PARSING (everything on [`OpenAiFormat`], plus
+//! [`status_is_success`], [`error_tag`], [`seeded_models`](OpenAiFormat::seeded_models)
+//! and [`oauth_error_to_provider_error`]) are wholly independent of HOW the
+//! request is sent. The single egress seam lives in the guest glue: an API-key
+//! component sends its built request through host-mediated `ryuzi:provider-auth`
+//! ([`provider_component!`]); an OAuth component sends the SAME built request
+//! through `ryuzi:oauth`'s `authorized-request` ([`oauth_provider_component!`]).
+//! Both macros share one core ([`__openai_provider_guest_core!`]) and differ
+//! only in that seam — the wire logic is never forked.
+//!
 //! # Nothing here touches a credential
-//! Provider components authenticate through the host-mediated
-//! `ryuzi:provider-auth` capability: the HOST resolves the user's stored API key
-//! and injects it. No function in this crate sees, stores, or renders one — and
+//! Provider components authenticate host-side: the API-key variant through
+//! `ryuzi:provider-auth` (the host resolves the user's stored key and injects
+//! it), the OAuth variant through `ryuzi:oauth` (the host injects the bearer for
+//! the profile). No function in this crate sees, stores, or renders one — and
 //! [`error_tag`] exists specifically to keep upstream error PROSE (which can
 //! echo a submitted key) out of the guest-visible error string.
 //!
@@ -245,6 +257,25 @@ impl OpenAiFormat {
             .collect())
     }
 
+    /// The provider's SEEDED model list, for a descriptor whose
+    /// `has_models_endpoint` is `false` — its `/models` route 404s, so the honest
+    /// `list-models` is the static seed the router itself falls back to, NOT a
+    /// fetch. Each id doubles as the display name (an OpenAI-format listing
+    /// carries none anyway) and takes its window from [`Self::context_window_for`].
+    /// Served order is preserved. This is the format-level counterpart to
+    /// [`Self::parse_models`]: same [`ModelOut`] shape, no network. The mapping is
+    /// egress-agnostic, so it is written and tested ONCE here rather than in each
+    /// seeded provider's own component.
+    pub fn seeded_models(&self, ids: &[&str]) -> Vec<ModelOut> {
+        ids.iter()
+            .map(|id| ModelOut {
+                display_name: (*id).to_string(),
+                context_window: self.context_window_for(id),
+                id: (*id).to_string(),
+            })
+            .collect()
+    }
+
     /// Convert a buffered (non-stream) chat completion into ordered completion
     /// chunks: the assistant message content becomes a single terminal chunk
     /// carrying the response's token usage when present.
@@ -308,6 +339,49 @@ const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
 /// classified as an error).
 pub fn status_is_success(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+/// A host OAuth-egress failure, mirrored host-free so mapping it to a
+/// [`ProviderFail`] is natively testable — the WIT `oauth-error` variant only
+/// exists in a component's wasm32 guest build. The OAuth egress glue (see
+/// [`oauth_provider_component!`]) converts the generated `oauth-error` into this
+/// and calls [`oauth_error_to_provider_error`]. Mirrors `ryuzi:oauth`'s
+/// `oauth-error` variant set exactly (`invalid-request` / `denied` / `expired` /
+/// `failed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthFail {
+    InvalidRequest(String),
+    Denied,
+    Expired,
+    Failed(String),
+}
+
+/// Map a host `oauth-error` onto a [`ProviderFail`], credential-safe.
+///
+/// `denied`/`expired` become actionable `invalid-request`s (the request cannot
+/// proceed until the user (re)connects — not a transient condition), each naming
+/// the provider via `label`. The host's own `oauth-error` contract keeps the
+/// access/refresh token out of every message it returns, and nothing here
+/// fabricates or echoes a URL: the `denied`/`expired` messages this function
+/// ORIGINATES name only the provider and the action to take, so even a hostile
+/// host string cannot smuggle a token through them. This is the OpenAI-format
+/// analogue of the mapping the `anthropic-oauth` component carries, shared here
+/// because every OpenAI-format OAuth provider needs the identical behaviour.
+pub fn oauth_error_to_provider_error(label: &str, fail: OAuthFail) -> ProviderFail {
+    match fail {
+        OAuthFail::Denied => ProviderFail::InvalidRequest(format!(
+            "{label} is not connected — connect it in Settings > Providers."
+        )),
+        OAuthFail::Expired => ProviderFail::InvalidRequest(format!(
+            "{label} authorization expired — reconnect it in Settings > Providers."
+        )),
+        // The host's invalid-request message is credential-free by contract;
+        // surface it so the caller learns what was wrong with the request.
+        OAuthFail::InvalidRequest(message) => ProviderFail::InvalidRequest(message),
+        OAuthFail::Failed(message) => {
+            ProviderFail::Failed(format!("{label} request failed: {message}"))
+        }
+    }
 }
 
 /// The short, machine-readable `error.code` (preferred) or `error.type` from an
@@ -735,5 +809,96 @@ mod tests {
         assert!(status_is_success(299));
         assert!(!status_is_success(300));
         assert!(!status_is_success(199));
+    }
+
+    #[test]
+    fn seeded_models_maps_ids_with_the_configs_window_table() {
+        // A provider whose descriptor sets `has_models_endpoint: false` (its
+        // `/models` route 404s) advertises its SEEDED model list instead of
+        // fetching. The id doubles as the display name (an OpenAI-format listing
+        // carries no display name), and the window comes from the config's table
+        // / default — never a fetch.
+        let seeded = OPENAI.seeded_models(&["gpt-4o", "gpt-5.2", "gpt-3.5-turbo"]);
+        assert_eq!(
+            seeded,
+            vec![
+                ModelOut {
+                    id: "gpt-4o".to_string(),
+                    display_name: "gpt-4o".to_string(),
+                    context_window: 128_000,
+                },
+                ModelOut {
+                    id: "gpt-5.2".to_string(),
+                    display_name: "gpt-5.2".to_string(),
+                    context_window: DEFAULT_CONTEXT_WINDOW,
+                },
+                ModelOut {
+                    id: "gpt-3.5-turbo".to_string(),
+                    display_name: "gpt-3.5-turbo".to_string(),
+                    context_window: 16_385,
+                },
+            ],
+            "served order is preserved, id is the display name, window comes from the config",
+        );
+        // A config with an EMPTY table gives every seeded id its own default.
+        let other = OTHER.seeded_models(&["a", "b"]);
+        assert_eq!(
+            other.iter().map(|m| m.context_window).collect::<Vec<_>>(),
+            vec![32_768, 32_768],
+        );
+        assert!(OPENAI.seeded_models(&[]).is_empty(), "no ids, no models");
+    }
+
+    #[test]
+    fn oauth_errors_map_to_actionable_provider_errors_naming_the_provider() {
+        // denied/expired become actionable invalid-requests (the request cannot
+        // proceed until the user (re)connects — not a transient condition), each
+        // naming the provider from the config label.
+        assert_eq!(
+            oauth_error_to_provider_error("Qwen Code", OAuthFail::Denied),
+            ProviderFail::InvalidRequest(
+                "Qwen Code is not connected — connect it in Settings > Providers.".to_string()
+            ),
+        );
+        assert!(matches!(
+            oauth_error_to_provider_error("Qwen Code", OAuthFail::Expired),
+            ProviderFail::InvalidRequest(message)
+                if message.contains("Qwen Code") && message.contains("expired")
+        ));
+        // A host invalid-request message is credential-free by contract; surface
+        // it so the caller learns what was wrong with the request.
+        assert_eq!(
+            oauth_error_to_provider_error(
+                "Qwen Code",
+                OAuthFail::InvalidRequest("bad method".into())
+            ),
+            ProviderFail::InvalidRequest("bad method".to_string()),
+        );
+        // A host transport failure stays Failed carrying the provider label and
+        // the host's (token-free) message — what the conformance timeout check
+        // reads as "caught it, didn't hang".
+        match oauth_error_to_provider_error(
+            "Qwen Code",
+            OAuthFail::Failed("connect timeout".into()),
+        ) {
+            ProviderFail::Failed(message) => {
+                assert!(message.contains("Qwen Code"));
+                assert!(message.contains("failed"), "{message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mapped_oauth_error_never_contains_a_bearer_token() {
+        // The denied/expired arms originate their OWN text and never interpolate
+        // the host message, so even a hostile host string cannot smuggle a token
+        // through them.
+        let rendered = format!(
+            "{:?}",
+            oauth_error_to_provider_error("Qwen Code", OAuthFail::Denied)
+        );
+        assert!(!rendered.to_lowercase().contains("bearer"));
+        assert!(!rendered.contains("access_token"));
     }
 }
