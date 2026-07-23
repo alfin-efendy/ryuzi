@@ -67,6 +67,9 @@ impl Guest for ProviderComponent {
             &request.prompt,
             request.max_tokens,
             request.temperature,
+            // The x-api-key path sends no Claude-subscription system marker;
+            // that marker is the OAuth variant's business (see plugins/anthropic-oauth).
+            None,
         );
         let response = authorized_request("POST", &url, Some(body)).map_err(map_fail)?;
         let chunks = if logic::status_is_success(response.status) {
