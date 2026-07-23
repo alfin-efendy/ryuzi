@@ -15,10 +15,11 @@ description = "xAI chat provider. Talks to api.x.ai with the user's stored API k
 provider-ids = ["xai"]
 
 
-# The only host the component may reach — the host of the `xai` descriptor's
-# `base_url` (`https://api.x.ai/v1`). The host enforces this allowlist on every
-# credentialed request and re-checks it on each redirect hop, so the user's API
-# key can only ever travel to api.x.ai. Covers both the `/models` and
+# The only host the component may reach — the host of the `xai`
+# descriptor's `base_url` (`https://api.x.ai/v1`).
+# The host enforces this allowlist on every credentialed request and
+# re-checks it on each redirect hop, so the user's API key can only ever
+# travel to api.x.ai. Covers both the `/models` and
 # `/chat/completions` endpoints.
 [permissions]
 network = ["api.x.ai"]

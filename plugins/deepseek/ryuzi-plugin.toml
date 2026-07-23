@@ -15,10 +15,11 @@ description = "DeepSeek chat provider. Talks to api.deepseek.com with the user's
 provider-ids = ["deepseek"]
 
 
-# The only host the component may reach — the host of the `deepseek` descriptor's
-# `base_url` (`https://api.deepseek.com/v1`). The host enforces this allowlist on every
-# credentialed request and re-checks it on each redirect hop, so the user's API
-# key can only ever travel to api.deepseek.com. Covers both the `/models` and
+# The only host the component may reach — the host of the `deepseek`
+# descriptor's `base_url` (`https://api.deepseek.com/v1`).
+# The host enforces this allowlist on every credentialed request and
+# re-checks it on each redirect hop, so the user's API key can only ever
+# travel to api.deepseek.com. Covers both the `/models` and
 # `/chat/completions` endpoints.
 [permissions]
 network = ["api.deepseek.com"]

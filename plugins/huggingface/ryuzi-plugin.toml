@@ -18,10 +18,11 @@ provider-ids = ["huggingface"]
 # free usage path — but it is still an API-KEY provider: the user supplies a key
 # and the host injects it. That badge changes the UI, not this component.
 
-# The only host the component may reach — the host of the `huggingface` descriptor's
-# `base_url` (`https://router.huggingface.co/v1`). The host enforces this allowlist on every
-# credentialed request and re-checks it on each redirect hop, so the user's API
-# key can only ever travel to router.huggingface.co. Covers both the `/models` and
+# The only host the component may reach — the host of the `huggingface`
+# descriptor's `base_url` (`https://router.huggingface.co/v1`).
+# The host enforces this allowlist on every credentialed request and
+# re-checks it on each redirect hop, so the user's API key can only ever
+# travel to router.huggingface.co. Covers both the `/models` and
 # `/chat/completions` endpoints.
 [permissions]
 network = ["router.huggingface.co"]

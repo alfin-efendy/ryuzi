@@ -18,10 +18,11 @@ provider-ids = ["nvidia"]
 # free usage path — but it is still an API-KEY provider: the user supplies a key
 # and the host injects it. That badge changes the UI, not this component.
 
-# The only host the component may reach — the host of the `nvidia` descriptor's
-# `base_url` (`https://integrate.api.nvidia.com/v1`). The host enforces this allowlist on every
-# credentialed request and re-checks it on each redirect hop, so the user's API
-# key can only ever travel to integrate.api.nvidia.com. Covers both the `/models` and
+# The only host the component may reach — the host of the `nvidia`
+# descriptor's `base_url` (`https://integrate.api.nvidia.com/v1`).
+# The host enforces this allowlist on every credentialed request and
+# re-checks it on each redirect hop, so the user's API key can only ever
+# travel to integrate.api.nvidia.com. Covers both the `/models` and
 # `/chat/completions` endpoints.
 [permissions]
 network = ["integrate.api.nvidia.com"]

@@ -15,10 +15,11 @@ description = "Mistral chat provider. Talks to api.mistral.ai with the user's st
 provider-ids = ["mistral"]
 
 
-# The only host the component may reach — the host of the `mistral` descriptor's
-# `base_url` (`https://api.mistral.ai/v1`). The host enforces this allowlist on every
-# credentialed request and re-checks it on each redirect hop, so the user's API
-# key can only ever travel to api.mistral.ai. Covers both the `/models` and
+# The only host the component may reach — the host of the `mistral`
+# descriptor's `base_url` (`https://api.mistral.ai/v1`).
+# The host enforces this allowlist on every credentialed request and
+# re-checks it on each redirect hop, so the user's API key can only ever
+# travel to api.mistral.ai. Covers both the `/models` and
 # `/chat/completions` endpoints.
 [permissions]
 network = ["api.mistral.ai"]
