@@ -1808,6 +1808,7 @@ impl ControlPlane {
                     .iter()
                     .map(|profile| profile.id.clone())
                     .collect(),
+                provider_ids: bundle.manifest.resolved_provider_ids(),
             });
             let principal = crate::domain::Principal {
                 plugin_id: id.clone(),

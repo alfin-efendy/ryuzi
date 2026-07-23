@@ -441,6 +441,7 @@ async fn activation_for(bundle: &InstalledBundle, store: &Arc<Store>) -> Arc<Was
             .map(|n| n.0.clone())
             .collect(),
         oauth_profile_ids: bundle.manifest.oauth.iter().map(|o| o.id.clone()).collect(),
+        provider_ids: bundle.manifest.resolved_provider_ids(),
     });
     Arc::new(WasmActivation::new(
         compiled,
@@ -559,6 +560,7 @@ fn ctx_for(
         telemetry: Arc::new(NoopTelemetry),
         network_allowlist: network_allowlist.into_iter().map(String::from).collect(),
         oauth_profile_ids: bundle.manifest.oauth.iter().map(|o| o.id.clone()).collect(),
+        provider_ids: bundle.manifest.resolved_provider_ids(),
     }
 }
 

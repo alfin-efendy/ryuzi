@@ -701,6 +701,7 @@ pub(crate) async fn discover_gateway_components(
                 .iter()
                 .map(|profile| profile.id.clone())
                 .collect(),
+            provider_ids: bundle.manifest.resolved_provider_ids(),
         });
         // The connection config the gateway `start`s with, read from the
         // plugin's own scoped settings (best-effort; empty when unset). Full
@@ -767,6 +768,7 @@ mod tests {
             telemetry: Arc::new(NoopTelemetry),
             network_allowlist: vec![],
             oauth_profile_ids: vec![],
+            provider_ids: vec![],
         });
         let bundle = InstalledBundle {
             manifest: PluginBundleManifest {

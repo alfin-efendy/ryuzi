@@ -357,6 +357,7 @@ pub(crate) async fn discover_provider_components(
                 .iter()
                 .map(|profile| profile.id.clone())
                 .collect(),
+            provider_ids: bundle.manifest.resolved_provider_ids(),
         });
         // One transport per DECLARED router provider id (mimo -> `mimo-free`),
         // all sharing the single compiled component + capability context. The
@@ -466,6 +467,7 @@ pub(crate) async fn build_test_transport_with_grants(
         telemetry: Arc::new(NoopTelemetry),
         network_allowlist: grants.network_allowlist.clone(),
         oauth_profile_ids: vec![],
+        provider_ids: vec![],
     });
     let bundle = InstalledBundle {
         manifest: PluginBundleManifest {

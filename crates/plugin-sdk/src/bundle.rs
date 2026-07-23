@@ -50,6 +50,12 @@ pub struct PluginBundleManifest {
     /// existing manifest that omits it keeps working, falling back to `[id]`
     /// via [`PluginBundleManifest::resolved_provider_ids`]. Ignored for
     /// non-provider bundles.
+    ///
+    /// Declaring this EXPLICITLY is also what lets the host grant the bundle
+    /// the `ryuzi:provider-auth` capability (host-injected user API keys) — and
+    /// it bounds which providers' credentials the bundle may use. The `[id]`
+    /// fallback exists only for transport registration and never authorizes a
+    /// credential.
     #[serde(default, rename = "provider-ids")]
     pub provider_ids: Vec<String>,
 }

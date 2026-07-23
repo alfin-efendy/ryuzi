@@ -12,9 +12,11 @@ use crate::plugins::bundle::{InstalledBundle, VerifiedBundle};
 use crate::plugins::capabilities::host::HostInfo;
 use crate::plugins::capabilities::http::{AllowedHttpClient, HttpErr};
 use crate::plugins::capabilities::oauth::{OauthErr, ProfileOauth};
+use crate::plugins::capabilities::provider_auth::{ProviderAuth, ProviderAuthErr};
 use crate::plugins::capabilities::settings::{ScopedSettings, SettingsErr};
 use crate::plugins::capabilities::storage::{PluginStorage, StorageErr};
 use crate::plugins::capabilities::websocket::{WsConnState, WsErr, WsFrame, WsHeader, WsRegistry};
+use crate::plugins::capabilities::wit_bindings::provider_auth::ryuzi::provider_auth::provider_auth as provider_auth_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::host::host as host_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::http::http as http_iface;
 use crate::plugins::capabilities::wit_bindings::ryuzi::oauth::oauth as oauth_iface;
@@ -39,6 +41,12 @@ const OAUTH_IMPORT: &str = "ryuzi:oauth/oauth@0.2.0";
 /// component's import — always keyed by the fully-qualified id — actually
 /// matches the adapter (the Task-13b regression).
 const WEBSOCKET_IMPORT: &str = "ryuzi:websocket/websocket@0.1.0";
+/// The `ryuzi:provider-auth/provider-auth` host-import interface id (Task
+/// 16c1). Like `ryuzi:websocket`, this is an ADDITIVE capability package that
+/// the root `ryuzi:plugin@0.1.0` world deliberately does not import, so every
+/// already-installed component's `wit-api` range keeps resolving unchanged;
+/// only a bundle that imports it (and is granted it) links it.
+const PROVIDER_AUTH_IMPORT: &str = "ryuzi:provider-auth/provider-auth@0.1.0";
 const TYPES_IMPORT: &str = "ryuzi:plugin/types@0.1.0";
 const LIFECYCLE_EXPORT: &str = "ryuzi:plugin/lifecycle@0.1.0";
 /// The `ryuzi:connector/connector` export interface name — the single source
@@ -115,6 +123,11 @@ pub struct HostPolicy {
     /// non-empty-network manifest declaration as `allow_network` (a component
     /// that declares no network host can open no WebSocket).
     pub allow_websocket: bool,
+    /// Grants host-mediated `ryuzi:provider-auth/provider-auth@0.1.0`: the
+    /// component can issue a request authenticated with the user's STORED
+    /// provider API key for a provider id its manifest declares, without ever
+    /// receiving the key itself (see `capabilities::provider_auth`).
+    pub allow_provider_auth: bool,
     /// Lets this bundle set its OWN `Authorization` header on `ryuzi:http/http`
     /// requests (the initial hop to an allowlisted host only). Granted ONLY to
     /// VERIFIED first-party bundles — the caller derives it from the installed
@@ -136,6 +149,7 @@ impl HostPolicy {
             allow_storage: false,
             allow_oauth: false,
             allow_websocket: false,
+            allow_provider_auth: false,
             allow_self_auth: false,
             limits: ResourceLimits::default(),
         }
@@ -155,6 +169,8 @@ impl HostPolicy {
     ///   scoped settings/storage are safe by construction, and real outbound
     ///   network stays gated by the host-mediated `ryuzi:http`/`ryuzi:oauth`
     ///   capabilities;
+    /// - `allow_provider_auth` only when the manifest EXPLICITLY declares
+    ///   `provider-ids` AND declares a network host;
     /// - `allow_self_auth` (let the bundle set its own `Authorization` header)
     ///   ONLY for a VERIFIED first-party bundle, keyed off the installed
     ///   release's `signing_key_id == first_party_key::FIRST_PARTY_KEY_ID` — set
@@ -170,6 +186,14 @@ impl HostPolicy {
             // Same non-empty-network gate as `allow_network`: a bundle that
             // declares no network host is granted no WebSocket capability.
             allow_websocket: !bundle.manifest.permissions.network.is_empty(),
+            // Fail-closed and EXPLICIT: the bundle must both declare the router
+            // provider ids it serves (`provider-ids` — the `[id]` fallback of
+            // `resolved_provider_ids` is for transport registration, never for
+            // credential authorization) and declare at least one outbound host,
+            // since an injected credential is only ever useful on a real
+            // request and `AllowedHttpClient` refuses every host otherwise.
+            allow_provider_auth: !bundle.manifest.provider_ids.is_empty()
+                && !bundle.manifest.permissions.network.is_empty(),
             allow_self_auth: bundle.release_record.signing_key_id
                 == crate::plugins::first_party_key::FIRST_PARTY_KEY_ID,
             limits: ResourceLimits::default(),
@@ -258,6 +282,8 @@ fn validate_component_interfaces(
         let storage_is_authorized = name == STORAGE_IMPORT && policy.allow_storage;
         let oauth_is_authorized = name == OAUTH_IMPORT && policy.allow_oauth;
         let websocket_is_authorized = name == WEBSOCKET_IMPORT && policy.allow_websocket;
+        let provider_auth_is_authorized =
+            name == PROVIDER_AUTH_IMPORT && policy.allow_provider_auth;
         if !is_wasi_baseline
             && !types_is_authorized
             && !network_is_authorized
@@ -266,6 +292,7 @@ fn validate_component_interfaces(
             && !storage_is_authorized
             && !oauth_is_authorized
             && !websocket_is_authorized
+            && !provider_auth_is_authorized
         {
             let reason = if name == HTTP_IMPORT {
                 "network requires a manifest allowlist and host policy approval".to_string()
@@ -277,6 +304,10 @@ fn validate_component_interfaces(
                 "OAuth access requires host policy approval".to_string()
             } else if name == WEBSOCKET_IMPORT {
                 "WebSocket access requires a manifest network allowlist and host policy approval"
+                    .to_string()
+            } else if name == PROVIDER_AUTH_IMPORT {
+                "provider credential injection requires declared manifest `provider-ids`, \
+                 a manifest network allowlist, and host policy approval"
                     .to_string()
             } else {
                 "no host capability is enabled by this runtime slice".to_string()
@@ -381,6 +412,13 @@ impl ComponentRuntime {
             .iter()
             .map(|profile| profile.id.clone())
             .collect();
+        // The router provider ids this bundle is authorized to borrow a stored
+        // user API key for. `resolved_provider_ids` falls back to `[id]`, but
+        // the `provider-auth` import is only ever LINKED when the manifest
+        // declares the list explicitly (see `HostPolicy::allow_provider_auth`),
+        // so whenever this list is reachable by a guest it equals the
+        // explicitly-declared `provider-ids`.
+        let provider_ids = bundle.manifest.resolved_provider_ids();
         Ok(CompiledComponent {
             engine,
             component,
@@ -389,6 +427,7 @@ impl ComponentRuntime {
             version: bundle.manifest.version.clone(),
             network_allowlist,
             oauth_profile_ids,
+            provider_ids,
             exports,
         })
     }
@@ -469,6 +508,10 @@ pub struct CompiledComponent {
     version: String,
     network_allowlist: Vec<String>,
     oauth_profile_ids: Vec<String>,
+    /// The router provider ids this bundle declared it serves — the ONLY
+    /// providers whose stored user API key the `ryuzi:provider-auth` adapter
+    /// will inject on its behalf (see `capabilities::provider_auth`).
+    provider_ids: Vec<String>,
     /// The component's exported interface names (a subset of `ALLOWED_EXPORTS`),
     /// captured at compile time so an adapter can skip instantiating/probing a
     /// component that does not export the interface it wants (IMP-2).
@@ -539,6 +582,7 @@ impl CompiledComponent {
         let allow_storage = self.policy.allow_storage;
         let allow_oauth = self.policy.allow_oauth;
         let allow_websocket = self.policy.allow_websocket;
+        let allow_provider_auth = self.policy.allow_provider_auth;
         let allow_self_auth = self.policy.allow_self_auth;
         let network_allowlist = self.network_allowlist.clone();
         let runtime_ctx = Arc::new(PluginCapabilityContext {
@@ -549,6 +593,7 @@ impl CompiledComponent {
             telemetry: ctx.telemetry.clone(),
             network_allowlist: network_allowlist.clone(),
             oauth_profile_ids: self.oauth_profile_ids.clone(),
+            provider_ids: self.provider_ids.clone(),
         });
         // Captured on the async caller's thread — inside `spawn_blocking`
         // there is no ambient Tokio reactor, so the sync `Host` trait impls
@@ -636,6 +681,20 @@ impl CompiledComponent {
                 // `instantiate_links_the_websocket_capability_by_full_interface_id`).
                 websocket_iface::add_to_linker_instance::<CapabilityState, HasSelf<CapabilityState>>(
                     &mut linker.instance(WEBSOCKET_IMPORT).map_err(|error| {
+                        PluginRuntimeError::InstantiationFailed(error.to_string())
+                    })?,
+                    |s: &mut CapabilityState| s,
+                )
+                .map_err(|error| PluginRuntimeError::InstantiationFailed(error.to_string()))?;
+            }
+            if allow_provider_auth {
+                // Linked by the FULLY-QUALIFIED interface id, like every other
+                // capability above (the Task-13b regression guard).
+                provider_auth_iface::add_to_linker_instance::<
+                    CapabilityState,
+                    HasSelf<CapabilityState>,
+                >(
+                    &mut linker.instance(PROVIDER_AUTH_IMPORT).map_err(|error| {
                         PluginRuntimeError::InstantiationFailed(error.to_string())
                     })?,
                     |s: &mut CapabilityState| s,
@@ -1111,6 +1170,65 @@ impl oauth_iface::Host for CapabilityState {
     }
 }
 
+/// Thin `ryuzi:provider-auth` adapter (Task 16c1): maps the generated WIT types
+/// to the adapter-local ones and bridges the async call through
+/// `self.rt.block_on(...)` exactly like `oauth_iface::Host` above. Caller
+/// authorization, credential lookup, descriptor-driven injection, and the
+/// allowlist/redirect enforcement all live in `capabilities::provider_auth`;
+/// this is only the binding layer. Note the guest never gets a "which
+/// credential is stored" oracle beyond the typed `not-configured` error, and no
+/// variant carries credential material.
+impl provider_auth_iface::Host for CapabilityState {
+    fn authorized_request(
+        &mut self,
+        provider_id: String,
+        request: provider_auth_iface::ProviderRequest,
+    ) -> Result<provider_auth_iface::ProviderResponse, provider_auth_iface::ProviderAuthError> {
+        let ctx = self.ctx.clone();
+        let provider_auth_iface::ProviderRequest {
+            method,
+            url,
+            headers,
+            body,
+        } = request;
+        let headers = headers
+            .into_iter()
+            .map(|header| (header.name, header.value))
+            .collect();
+        let http_timeout = self.http_timeout;
+        let result = self.rt.block_on(async move {
+            ProviderAuth::with_timeout(&ctx, http_timeout)
+                .authorized_request(&provider_id, &method, &url, headers, body)
+                .await
+        });
+        match result {
+            Ok(response) => Ok(provider_auth_iface::ProviderResponse {
+                status: response.status,
+                headers: response
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| provider_auth_iface::Header { name, value })
+                    .collect(),
+                body: response.body,
+            }),
+            Err(ProviderAuthErr::InvalidRequest(message)) => Err(
+                provider_auth_iface::ProviderAuthError::InvalidRequest(message),
+            ),
+            Err(ProviderAuthErr::Denied) => Err(provider_auth_iface::ProviderAuthError::Denied),
+            Err(ProviderAuthErr::NotConfigured) => {
+                Err(provider_auth_iface::ProviderAuthError::NotConfigured)
+            }
+            Err(ProviderAuthErr::Rejected) => Err(provider_auth_iface::ProviderAuthError::Rejected),
+            Err(ProviderAuthErr::Unavailable) => {
+                Err(provider_auth_iface::ProviderAuthError::Unavailable)
+            }
+            Err(ProviderAuthErr::Failed(message)) => {
+                Err(provider_auth_iface::ProviderAuthError::Failed(message))
+            }
+        }
+    }
+}
+
 /// Thin `ryuzi:websocket` adapter: maps the generated WIT types to the
 /// registry's adapter-local types and drives `self.ws` (the per-instance
 /// [`WsRegistry`]) using this state's captured network allowlist and runtime
@@ -1228,6 +1346,7 @@ mod tests {
                 telemetry: Arc::new(NoopTelemetry),
                 network_allowlist: vec![],
                 oauth_profile_ids: vec![],
+                provider_ids: vec![],
             }),
             tmp,
         )
@@ -1286,6 +1405,7 @@ mod tests {
                 "component-provider" => "ryuzi_component_provider_fixture.wasm",
                 "component-gateway" => "ryuzi_component_gateway_fixture.wasm",
                 "component-websocket-import" => "ryuzi_component_websocket_fixture.wasm",
+                "component-provider-auth-import" => "ryuzi_component_provider_auth_fixture.wasm",
                 _ => panic!("unknown fixture {name}"),
             })
     }
@@ -1796,6 +1916,149 @@ mod tests {
                 &policy,
             )
             .expect("OAuth import must validate once host policy grants it");
+    }
+
+    /// Positive INSTANTIATION proof for `ryuzi:provider-auth` — the guard for
+    /// the Task-13b regression class: an adapter linked under a short instance
+    /// name can never satisfy a component's import, which is always keyed by
+    /// the fully-qualified interface id. This drives the REAL
+    /// `component-provider-auth-import` fixture (which actually calls the
+    /// import, so wit-bindgen retains the import edge); a hand-written WAT
+    /// component with an empty instance type would NOT catch the regression,
+    /// because wasmtime satisfies an empty instance import trivially.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instantiate_links_the_provider_auth_capability_by_full_interface_id() {
+        build_fixture_components();
+        let mut bundle = installed_fixture_bundle_with_network(
+            "component-provider-auth-import",
+            vec!["api.openai.com"],
+        );
+        bundle.manifest.provider_ids = vec!["openai".to_string()];
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        assert!(
+            policy.allow_provider_auth,
+            "declared provider-ids + a network host must grant provider-auth"
+        );
+        let (ctx, _tmp) = test_ctx("acme").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        runtime.instantiate(&bundle, policy, ctx).await.expect(
+            "a component importing ryuzi:provider-auth must instantiate once the adapter is linked",
+        );
+    }
+
+    /// Deny proof on the same real fixture: without declared `provider-ids` the
+    /// policy withholds the grant, so the component is rejected before it can
+    /// instantiate — and the error names the denied interface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_auth_import_without_declared_provider_ids_is_denied() {
+        build_fixture_components();
+        let bundle = installed_fixture_bundle_with_network(
+            "component-provider-auth-import",
+            vec!["api.openai.com"],
+        );
+        let policy = HostPolicy::for_installed_bundle(&bundle);
+        assert!(
+            !policy.allow_provider_auth,
+            "no declared provider-ids must leave provider-auth denied"
+        );
+        let (ctx, _tmp) = test_ctx("acme").await;
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let error = runtime
+            .instantiate(&bundle, policy, ctx)
+            .await
+            .expect_err("a provider-auth import with no grant must be rejected");
+        match error {
+            PluginRuntimeError::DeniedImport { name, .. }
+            | PluginRuntimeError::InstantiationFailed(name)
+                if name.contains("ryuzi:provider-auth") => {}
+            other => panic!("expected a ryuzi:provider-auth denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_auth_import_without_policy_grant_is_denied() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let result = runtime.validate_component_bytes(
+            &manifest(vec!["api.openai.com"]),
+            br#"(component (import "ryuzi:provider-auth/provider-auth@0.1.0" (instance)))"#,
+            &HostPolicy::deny_all(),
+        );
+        let Err(error) = result else {
+            panic!("provider credential injection must require host policy approval");
+        };
+        assert!(
+            matches!(error, PluginRuntimeError::DeniedImport { name, .. } if name == PROVIDER_AUTH_IMPORT)
+        );
+    }
+
+    #[test]
+    fn provider_auth_import_is_allowed_when_policy_grants_it() {
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let policy = HostPolicy {
+            allow_provider_auth: true,
+            ..HostPolicy::deny_all()
+        };
+        runtime
+            .validate_component_bytes(
+                &manifest(vec!["api.openai.com"]),
+                br#"(component (import "ryuzi:provider-auth/provider-auth@0.1.0" (instance)))"#,
+                &policy,
+            )
+            .expect("provider-auth import must validate once host policy grants it");
+    }
+
+    /// The provider-auth grant is fail-closed and needs BOTH halves of the
+    /// declaration: explicit manifest `provider-ids` (the `[id]` fallback of
+    /// `resolved_provider_ids` must not silently hand a bundle a credential)
+    /// and a network allowlist.
+    #[test]
+    fn host_policy_grants_provider_auth_only_with_declared_provider_ids_and_network() {
+        fn bundle_with(provider_ids: Vec<&str>, network: Vec<&str>) -> InstalledBundle {
+            let mut manifest = manifest(network);
+            manifest.provider_ids = provider_ids.into_iter().map(str::to_string).collect();
+            InstalledBundle {
+                manifest,
+                release: release(),
+                release_record: component_release(),
+                root: std::path::PathBuf::from("nonexistent"),
+                component_path: std::path::PathBuf::from("nonexistent/plugin.wasm"),
+            }
+        }
+
+        assert!(
+            HostPolicy::for_installed_bundle(&bundle_with(vec!["openai"], vec!["api.openai.com"]))
+                .allow_provider_auth,
+            "declared provider-ids + a network host must grant provider-auth"
+        );
+        assert!(
+            !HostPolicy::for_installed_bundle(&bundle_with(vec![], vec!["api.openai.com"]))
+                .allow_provider_auth,
+            "the resolved-provider-id fallback must NOT grant provider-auth"
+        );
+        assert!(
+            !HostPolicy::for_installed_bundle(&bundle_with(vec!["openai"], vec![]))
+                .allow_provider_auth,
+            "no declared network host must leave provider-auth denied"
+        );
+        assert!(
+            !HostPolicy::deny_all().allow_provider_auth,
+            "deny-all must deny provider-auth"
+        );
+    }
+
+    /// A bundle that DOES declare `provider-ids` carries them into the
+    /// capability context the guest's calls are authorized against, so the
+    /// authorization set is manifest-derived and never caller-supplied.
+    #[tokio::test]
+    async fn compile_carries_declared_provider_ids_into_the_capability_context() {
+        build_fixture_components();
+        let mut bundle = installed_fixture_bundle("component-noop");
+        bundle.manifest.provider_ids = vec!["mimo-free".to_string()];
+        let runtime = ComponentRuntime::new().expect("runtime should configure");
+        let compiled = runtime
+            .compile(&bundle, HostPolicy::for_installed_bundle(&bundle))
+            .expect("noop fixture should compile");
+        assert_eq!(compiled.provider_ids, vec!["mimo-free".to_string()]);
     }
 
     #[test]

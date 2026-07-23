@@ -1,0 +1,7 @@
+package fixture:provider-auth-import@0.1.0;
+
+world provider-auth-import {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:provider-auth/provider-auth@0.1.0;
+  export ryuzi:plugin/lifecycle@0.1.0;
+}

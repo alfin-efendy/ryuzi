@@ -444,6 +444,7 @@ mod tests {
             telemetry: Arc::new(NoopTelemetry),
             network_allowlist: vec!["127.0.0.1".to_string(), "example.test".to_string()],
             oauth_profile_ids: vec!["default".to_string(), "p1".to_string()],
+            provider_ids: vec![],
         }
     }
 

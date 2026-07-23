@@ -47,3 +47,4 @@ build_fixture component-provider ryuzi_component_provider_fixture
 build_fixture component-provider-http ryuzi_component_provider_http_fixture
 build_fixture component-gateway ryuzi_component_gateway_fixture
 build_fixture component-websocket-import ryuzi_component_websocket_fixture
+build_fixture component-provider-auth-import ryuzi_component_provider_auth_fixture

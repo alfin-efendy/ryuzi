@@ -1,0 +1,57 @@
+package ryuzi:provider-auth@0.1.0;
+
+/// Host-mediated authentication with the USER's stored provider API key.
+///
+/// A provider component can neither read the key (`ryuzi:settings` returns an
+/// empty value for any secret field) nor set its own `Authorization`
+/// (`ryuzi:http` strips it), which is exactly the point: the host looks the
+/// credential up, injects it according to the provider descriptor's declared
+/// auth scheme, and hands the component only the upstream response. The key
+/// itself never crosses into the guest — not in the response, its headers, or
+/// any error.
+///
+/// This package is deliberately NOT imported by the root `ryuzi:plugin` world:
+/// it is an additive capability a component opts into by importing it, so
+/// existing bundles are unaffected.
+interface provider-auth {
+  record header {
+    name: string,
+    value: string,
+  }
+
+  record provider-request {
+    method: string,
+    url: string,
+    headers: list<header>,
+    body: option<list<u8>>,
+  }
+
+  record provider-response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  variant provider-auth-error {
+    /// The request itself was malformed, or `provider-id` names no known
+    /// provider descriptor.
+    invalid-request(string),
+    /// The calling bundle did not declare `provider-id` in its manifest
+    /// `provider-ids`.
+    denied,
+    /// The provider needs a credential and the user has stored none.
+    not-configured,
+    /// The target host (or a redirect hop) is not in the bundle's manifest
+    /// network allowlist.
+    rejected,
+    /// The host could not reach the upstream.
+    unavailable,
+    failed(string),
+  }
+
+  /// Sends one HTTP request authenticated with the stored credential for
+  /// `provider-id`. Any credential header the component supplies is discarded
+  /// before the host injects its own, so a forged credential can never reach
+  /// the wire or override the user's.
+  authorized-request: func(provider-id: string, request: provider-request) -> result<provider-response, provider-auth-error>;
+}

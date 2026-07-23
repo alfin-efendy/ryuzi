@@ -1878,6 +1878,7 @@ async fn profile_capability_context(
             .map(|entry| entry.0.clone())
             .collect(),
         oauth_profile_ids: manifest.oauth.iter().map(|p| p.id.clone()).collect(),
+        provider_ids: manifest.resolved_provider_ids(),
     };
     Ok((ctx, manifest))
 }
