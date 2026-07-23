@@ -11,11 +11,18 @@ description = "First-party OpenAI provider component (ryuzi:provider/provider, a
 crate-type = ["cdylib"]
 
 # `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
-# guest module; the pure `logic` module (and its native `cargo test`) never
-# touches the generated host bindings.
+# guest module (by `ryuzi_openai_format::provider_component!`, which expands
+# `wit_bindgen::generate!` HERE so `path: "wit"` resolves against this crate's
+# manifest dir); the pure config module and its native `cargo test` never touch
+# the generated host bindings.
+#
+# `ryuzi-openai-format` is a path dependency on a sibling standalone workspace
+# (see its Cargo.toml) — the mechanism for sharing code across the independently
+# buildable `plugins/<id>/` bundles.
 [dependencies]
 wit-bindgen = "0.57"
 serde_json = "1"
+ryuzi-openai-format = { path = "../openai-format" }
 
 [profile.release]
 # Small, reproducible components: no debug info, abort on panic (a panicking

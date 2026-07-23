@@ -14,24 +14,25 @@
 //! response. The guest never reads, sets, or can forge an `Authorization`
 //! header — it has no plain HTTP capability to try it with.
 //!
-//! # Architecture: pure `logic` vs. wasm `guest`
+//! # Architecture: shared wire logic vs. per-provider config
 //! Every piece of behaviour that does not need a live host — base-URL
 //! resolution, request-body shaping, response/model parsing, upstream-status
-//! classification — lives in the [`logic`] module as pure functions over plain
-//! Rust types, so the whole wire mapping is exercised by native `cargo test`
-//! without a wasm host. The `guest` module (compiled only for `wasm32`) is thin
-//! glue: it wires `logic` to the `ryuzi:provider-auth`/`ryuzi:storage` host
-//! imports and maps the plain types to/from the generated WIT types.
+//! classification — lives in the shared `ryuzi_openai_format` crate as pure
+//! functions over plain Rust types, so the whole wire mapping is exercised by
+//! that crate's native `cargo test` without a wasm host. This crate is two thin
+//! pieces on top: [`logic::CONFIG`], the `openai` descriptor transcribed into
+//! that crate's `OpenAiFormat`, and a `guest` module (compiled only for
+//! `wasm32`) that is a single `provider_component!` invocation.
 //!
 //! # Base-URL override
-//! The upstream base defaults to [`logic::DEFAULT_BASE_URL`]
+//! The upstream base defaults to the descriptor's `base_url`
 //! (`https://api.openai.com/v1`) but is overridden by a non-empty value at the
-//! [`logic::BASE_URL_STORAGE_KEY`] key of this component's own (host-scoped)
-//! `ryuzi:storage` slice. That serves two real purposes: pointing the component
-//! at an OpenAI-compatible proxy or gateway, and letting the provider
-//! conformance harness aim it at a loopback mock upstream. The manifest network
-//! allowlist still applies to whatever the override resolves to, so an override
-//! can never widen where the user's key may travel.
+//! `ryuzi_openai_format::BASE_URL_STORAGE_KEY` key of this component's own
+//! (host-scoped) `ryuzi:storage` slice. That serves two real purposes: pointing
+//! the component at an OpenAI-compatible proxy or gateway, and letting the
+//! provider conformance harness aim it at a loopback mock upstream. The
+//! manifest network allowlist still applies to whatever the override resolves
+//! to, so an override can never widen where the user's key may travel.
 //!
 //! # Accepted ABI limitation
 //! `ryuzi:provider/provider` is flat text (a `prompt` string in, text chunks
