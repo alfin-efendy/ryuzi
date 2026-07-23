@@ -394,9 +394,10 @@ pub(crate) fn provider_fixture_artifact() -> std::path::PathBuf {
 ///
 /// [`build_test_transport`] is the zero-grants case (`Self::default()`); the
 /// provider-conformance harness
-/// (`crate::plugins::wasm_provider_conformance`) is the http+storage case —
-/// both call THIS builder so the ~80 lines of bundle/context/policy
-/// boilerplate exist exactly once.
+/// (`crate::plugins::wasm_provider_conformance`) drives both the http+storage
+/// case (the synthetic fixture) and the http+storage+provider-auth case (the
+/// real `openai` component) — all of them call THIS builder so the ~80 lines
+/// of bundle/context/policy boilerplate exist exactly once.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestTransportGrants {

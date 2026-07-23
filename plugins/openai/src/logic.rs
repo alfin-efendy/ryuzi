@@ -501,6 +501,18 @@ mod tests {
             None,
             "an over-long or whitespace-bearing tag is not a machine code and is dropped"
         );
+        // Length alone is disqualifying, independent of the whitespace rule.
+        let long = "x".repeat(MAX_ERROR_TAG_LEN + 1);
+        assert_eq!(
+            error_tag(format!(r#"{{"error":{{"code":"{long}"}}}}"#).as_bytes()),
+            None
+        );
+        // ...and a tag exactly at the limit is still accepted.
+        let at_limit = "y".repeat(MAX_ERROR_TAG_LEN);
+        assert_eq!(
+            error_tag(format!(r#"{{"error":{{"code":"{at_limit}"}}}}"#).as_bytes()).as_deref(),
+            Some(at_limit.as_str())
+        );
     }
 
     #[test]
