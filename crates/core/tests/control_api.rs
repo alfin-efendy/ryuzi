@@ -1,6 +1,6 @@
 //! End-to-end: a built daemon serving the control API — auth, rpc, SSE.
 
-use ryuzi_core::daemon::{build_daemon, BuildDaemonOpts};
+use ryuzi_core::daemon::{build_daemon, BuildDaemonOpts, ComponentBootstrapConfig};
 use ryuzi_core::domain::WriteOrigin;
 use ryuzi_core::serve::{serve, ApiState, ServeOpts};
 use ryuzi_core::store::Store;
@@ -8,6 +8,50 @@ use ryuzi_core::telemetry::NoopTelemetry;
 use serde_json::json;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+
+/// An offline first-party component bootstrap for these end-to-end tests.
+///
+/// `build_daemon` runs a best-effort first-party component bootstrap on first
+/// run. Left to its default (`component_bootstrap: None`), it builds a real
+/// `reqwest` client and fetches release assets from the public GitHub release
+/// host — a live network dependency that hangs indefinitely on CI runners with
+/// no outbound network (the macOS `cargo test` job timed out at 20 minutes for
+/// exactly this reason). Injecting an EMPTY trusted-key set makes
+/// `bootstrap_first_party_components` return before it issues any HTTP request,
+/// so these tests never touch the network. The `http`/`base_url`/`root` fields
+/// are consequently never exercised; a loopback sentinel base and a throwaway
+/// root keep them inert.
+fn offline_component_bootstrap(root: std::path::PathBuf) -> ComponentBootstrapConfig {
+    ComponentBootstrapConfig {
+        http: Arc::new(ryuzi_core::plugins::remote_catalog::ReqwestCatalogHttp::new()),
+        trusted_keys: std::collections::HashMap::new(),
+        base_url: "http://127.0.0.1:0/offline".to_string(),
+        root,
+    }
+}
+
+/// Point the secret cipher at a process-unique temp file via
+/// `RYUZI_SECRET_KEY_FILE` instead of the real OS keychain, so these tests stay
+/// hermetic. Mirrors `ryuzi_core`'s own `#[cfg(test)]` `use_test_key_file`
+/// helper and the identical copy in `tests/secrets_e2e.rs` (both unreachable
+/// from this separate integration crate).
+///
+/// This is load-bearing on macOS: `build_daemon` runs `secrets::init_and_sweep`,
+/// which forces the process-global cipher and, absent this seam, calls the
+/// Security-framework keychain. On a headless CI runner with a locked login
+/// keychain that call BLOCKS synchronously, hanging every test here until the
+/// job's 20-minute cap (the macOS `cargo test` timeout this file's fixes
+/// address). The `CIPHER`/`STATUS` globals resolve exactly once per test
+/// binary, so the env var must be set before the first `build_daemon`; the
+/// `Once` makes repeated calls from each test cheap and race-free.
+fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
+}
 
 // ---- P2-9: pair -> device token -> authed rpc/sse over pinned TLS ----
 //
@@ -130,6 +174,7 @@ fn pinned_client(fingerprint: &str) -> reqwest::Client {
 /// RPC route and open the SSE stream, all over the SAME pinned-TLS client.
 #[tokio::test]
 async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
+    use_test_key_file();
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("ryuzi.sqlite");
 
@@ -139,7 +184,7 @@ async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
-        component_bootstrap: None,
+        component_bootstrap: Some(offline_component_bootstrap(tmp.path().join("components"))),
     })
     .await
     .unwrap();
@@ -239,6 +284,7 @@ async fn remote_pair_then_authed_rpc_and_sse_over_pinned_tls() {
 
 #[tokio::test]
 async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
+    use_test_key_file();
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("ryuzi.sqlite");
 
@@ -248,7 +294,7 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
-        component_bootstrap: None,
+        component_bootstrap: Some(offline_component_bootstrap(tmp.path().join("components"))),
     })
     .await
     .unwrap();
@@ -362,6 +408,7 @@ async fn daemon_control_api_serves_rpc_and_sse_end_to_end() {
 /// `endpoint_status` reads `srv.status()` (see its `status_info` helper).
 #[tokio::test]
 async fn daemon_start_autostarts_the_endpoint_server_when_configured() {
+    use_test_key_file();
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("ryuzi.sqlite");
 
@@ -390,7 +437,7 @@ async fn daemon_start_autostarts_the_endpoint_server_when_configured() {
         telemetry: Some(Arc::new(NoopTelemetry)),
         extra_gateway_factories: vec![],
         harness_factory: None,
-        component_bootstrap: None,
+        component_bootstrap: Some(offline_component_bootstrap(tmp.path().join("components"))),
     })
     .await
     .unwrap();

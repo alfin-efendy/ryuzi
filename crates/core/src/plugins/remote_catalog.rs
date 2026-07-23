@@ -133,9 +133,20 @@ pub struct ReqwestCatalogHttp {
 
 impl ReqwestCatalogHttp {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        // Explicit timeouts, matching the rest of the crate's reqwest clients
+        // (see `free_route`, `plugins_api`, `connections_api`): a catalog/release
+        // host that never answers must fail fast, not hang. This client backs
+        // the best-effort, non-fatal first-party component bootstrap that runs
+        // during `build_daemon`; without a bound, a blackholed connection (e.g.
+        // a CI runner with no outbound network) blocks daemon boot until the OS
+        // TCP timeout, which can be many minutes. `connect_timeout` bounds the
+        // handshake specifically; `timeout` bounds the whole request/response.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
     }
 }
 

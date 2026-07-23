@@ -15,6 +15,29 @@ use ryuzi_core::Store;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// Point the secret cipher at a process-unique temp file via
+/// `RYUZI_SECRET_KEY_FILE` instead of the real OS keychain, so these tests stay
+/// hermetic. Mirrors `ryuzi_core`'s own `#[cfg(test)]` `use_test_key_file`
+/// helper and the copy in `tests/secrets_e2e.rs` (both unreachable from this
+/// separate integration crate).
+///
+/// Load-bearing on macOS: seeding a connection / creating an endpoint key
+/// (`connections::add_connection`, `keys::create_key`) encrypts secrets, which
+/// forces the process-global cipher and, absent this seam, calls the
+/// Security-framework keychain. On a headless CI runner with a locked login
+/// keychain that call BLOCKS synchronously, hanging these tests until the job's
+/// 20-minute cap. `CIPHER`/`STATUS` resolve exactly once per test binary, so the
+/// env var must be set before the first secret touch; the `Once` makes repeated
+/// calls from each test cheap and race-free.
+fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // AWS event-stream frame builder (copied from `aws_stream.rs`'s own
 // `#[cfg(test)]` module — integration tests can't reach a lib-private test
@@ -250,6 +273,7 @@ async fn mock_kiro_refresh_server() -> (u16, tokio::task::JoinHandle<()>) {
 /// create an endpoint key, and start the router. Returns the owned
 /// `RouterServer` so the caller can `.stop()` it explicitly.
 async fn setup_kiro(kiro_port: u16) -> (Arc<Store>, String, u16, RouterServer) {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     let now = chrono::Utc::now().timestamp_millis();
@@ -601,6 +625,7 @@ async fn anthropic_client_non_stream_tool_only_response_has_no_empty_text_block(
 /// the newly-refreshed bearer token.
 #[tokio::test]
 async fn kiro_403_triggers_refresh_and_retries_with_new_bearer() {
+    use_test_key_file();
     let (up_port, _h_up, auths) = mock_kiro_upstream_403_then_ok().await;
     let (refresh_port, _h_refresh) = mock_kiro_refresh_server().await;
 

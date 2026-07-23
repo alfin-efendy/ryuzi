@@ -37,6 +37,23 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
+/// Point the secret cipher at a process-unique temp file via
+/// `RYUZI_SECRET_KEY_FILE` instead of the real OS keychain, so these tests stay
+/// hermetic. Mirrors `ryuzi_core`'s own `#[cfg(test)]` `use_test_key_file`
+/// helper and the copy in `tests/secrets_e2e.rs`. Load-bearing on macOS:
+/// seeding a connection encrypts secrets, forcing the process-global cipher;
+/// absent this seam that calls the Security-framework keychain, which BLOCKS on
+/// a headless CI runner with a locked login keychain and hangs the suite until
+/// the job cap. The `Once` makes repeated calls race-free.
+fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
+}
+
 const SESSION_PK: &str = "native-tools-v2-regressions";
 const MAIN_AGENT_ID: &str = "ryuzi";
 
@@ -292,6 +309,7 @@ fn parse_envelope(block: &Value) -> ParsedV2Envelope {
 
 #[tokio::test]
 async fn five_reported_failures_return_ordered_v2_envelopes_without_side_effects() {
+    use_test_key_file();
     let worktree = tempfile::tempdir().unwrap();
     let source_dir = worktree.path().join("apps/cockpit/src");
     std::fs::create_dir_all(&source_dir).unwrap();
