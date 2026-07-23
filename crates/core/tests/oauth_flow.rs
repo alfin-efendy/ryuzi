@@ -12,6 +12,23 @@ use ryuzi_core::Store;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Point the secret cipher at a process-unique temp file via
+/// `RYUZI_SECRET_KEY_FILE` instead of the real OS keychain, so these tests stay
+/// hermetic. Mirrors `ryuzi_core`'s own `#[cfg(test)]` `use_test_key_file`
+/// helper and the copy in `tests/secrets_e2e.rs`. Load-bearing on macOS:
+/// persisting an oauth connection encrypts secrets, forcing the process-global
+/// cipher; absent this seam that calls the Security-framework keychain, which
+/// BLOCKS on a headless CI runner with a locked login keychain and hangs the
+/// suite until the job cap. The `Once` makes repeated calls race-free.
+fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
+}
+
 /// Mock Anthropic token server; returns canned tokens for any code.
 async fn mock_token_server() -> u16 {
     use axum::{routing::post, Json, Router};
@@ -32,6 +49,7 @@ async fn mock_token_server() -> u16 {
 }
 
 async fn mem_store() -> Arc<Store> {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     Arc::new(Store::open(tmp.path()).await.unwrap())
 }

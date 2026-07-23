@@ -68,7 +68,11 @@ const { AgentActionsMenu } = await import("./AgentActionsMenu");
 const { useAgents } = await import("@/store-agents");
 const { useNav } = await import("@/store-nav");
 
-beforeEach(() => {
+beforeEach(async () => {
+  // The agents store serializes mutations on a module-lifetime queue that
+  // survives across tests. Let any in-flight mutation from a prior test settle
+  // before seeding, so its trailing state write can't clobber this fixture.
+  await waitFor(() => expect(useAgents.getState().saving).toBe(false));
   duplicateAgent.mockClear();
   deleteAgent.mockClear();
   useAgents.setState({
@@ -132,7 +136,8 @@ test("Delete confirms with the exact copy and stays on the hub after success", a
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "Delete Reviewer?" })).toBeNull());
   // Deletion from the hub stays on the hub.
   expect(useNav.getState().history.current).toEqual({ kind: "agents" });
-  expect(useAgents.getState().registry?.agents.map((a) => a.id)).toEqual(["ryuzi"]);
+  // The roster update lands from the async mutation queue; poll until it settles.
+  await waitFor(() => expect(useAgents.getState().registry?.agents.map((a) => a.id)).toEqual(["ryuzi"]));
 });
 
 test("Delete failure keeps the confirmation open and stays on the hub", async () => {

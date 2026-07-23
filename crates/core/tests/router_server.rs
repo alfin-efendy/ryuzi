@@ -5,6 +5,24 @@ use ryuzi_core::Store;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Point the secret cipher at a process-unique temp file via
+/// `RYUZI_SECRET_KEY_FILE` instead of the real OS keychain, so these tests stay
+/// hermetic. Mirrors `ryuzi_core`'s own `#[cfg(test)]` `use_test_key_file`
+/// helper and the copy in `tests/secrets_e2e.rs`. Load-bearing on macOS:
+/// seeding a connection / creating an endpoint key encrypts secrets, forcing the
+/// process-global cipher; absent this seam that calls the Security-framework
+/// keychain, which BLOCKS on a headless CI runner with a locked login keychain
+/// and hangs the suite until the job cap. The `Once` makes repeated calls
+/// race-free.
+fn use_test_key_file() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let path =
+            std::env::temp_dir().join(format!("ryuzi-test-secret-{}.key", std::process::id()));
+        std::env::set_var("RYUZI_SECRET_KEY_FILE", path);
+    });
+}
+
 /// Register `custom-openai`/`custom-anthropic` as user custom providers so the
 /// router resolves their wire format/auth exactly as the (now-removed) static
 /// catalog entries did: OpenAI/Bearer and Anthropic/x-api-key, base-URL-driven.
@@ -116,6 +134,7 @@ async fn mock_anthropic_upstream() -> (u16, tokio::task::JoinHandle<()>) {
 }
 
 async fn setup() -> (Arc<Store>, String, u16) {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let (_, path) = tmp.keep().unwrap();
     let store = Arc::new(Store::open(&path).await.unwrap());
@@ -155,6 +174,7 @@ async fn setup() -> (Arc<Store>, String, u16) {
 /// (connection `c2`, provider `custom-anthropic`) so cross-format streaming
 /// can be exercised in both directions.
 async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let (_, path) = tmp.keep().unwrap();
     let store = Arc::new(Store::open(&path).await.unwrap());
@@ -212,6 +232,7 @@ async fn setup_with_anthropic() -> (Arc<Store>, String, u16) {
 
 #[tokio::test]
 async fn anthropic_client_routes_to_openai_upstream() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -233,6 +254,7 @@ async fn anthropic_client_routes_to_openai_upstream() {
 
 #[tokio::test]
 async fn openai_client_passes_through() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -250,6 +272,7 @@ async fn openai_client_passes_through() {
 
 #[tokio::test]
 async fn missing_or_bad_key_is_rejected_in_client_format() {
+    use_test_key_file();
     let (_store, _key, port) = setup().await;
     let client = reqwest::Client::new();
     let r1 = client
@@ -275,6 +298,7 @@ async fn missing_or_bad_key_is_rejected_in_client_format() {
 
 #[tokio::test]
 async fn unknown_model_is_404_and_models_lists_connections() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let r = client
@@ -304,6 +328,7 @@ async fn unknown_model_is_404_and_models_lists_connections() {
 /// `anthropic-oauth/<model>` id leaks.
 #[tokio::test]
 async fn models_dedupes_family_members_under_family_id() {
+    use_test_key_file();
     let (store, key, port) = setup().await;
     let now = chrono::Utc::now().timestamp_millis();
     connections::add_connection(
@@ -378,6 +403,7 @@ async fn models_dedupes_family_members_under_family_id() {
 
 #[tokio::test]
 async fn count_tokens_estimates_locally() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let r: serde_json::Value = client
@@ -396,6 +422,7 @@ async fn count_tokens_estimates_locally() {
 
 #[tokio::test]
 async fn anthropic_client_streams_from_openai_upstream() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -476,6 +503,7 @@ async fn anthropic_client_streams_from_openai_upstream() {
 
 #[tokio::test]
 async fn openai_client_streams_from_anthropic_upstream() {
+    use_test_key_file();
     let (_store, key, port) = setup_with_anthropic().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -530,6 +558,7 @@ async fn openai_client_streams_from_anthropic_upstream() {
 /// axum's 2 MB default body limit must not 413 those.
 #[tokio::test]
 async fn large_bodies_are_accepted() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let big_content = "a".repeat(3_000_000);
@@ -582,6 +611,7 @@ async fn mock_truncating_openai_upstream() -> (u16, tokio::task::JoinHandle<()>)
 
 #[tokio::test]
 async fn anthropic_client_gets_error_frame_when_upstream_truncates() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     register_custom_test_providers();
@@ -673,6 +703,7 @@ async fn mock_clean_eof_no_terminal_openai_upstream() -> (u16, tokio::task::Join
 /// a fake clean `message_stop`.
 #[tokio::test]
 async fn anthropic_client_gets_error_frame_on_clean_eof_before_terminal() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     register_custom_test_providers();
@@ -732,6 +763,7 @@ async fn anthropic_client_gets_error_frame_on_clean_eof_before_terminal() {
 
 #[tokio::test]
 async fn passthrough_streaming_preserves_sse() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -761,6 +793,7 @@ async fn passthrough_streaming_preserves_sse() {
 
 #[tokio::test]
 async fn responses_endpoint_non_stream_round_trips() {
+    use_test_key_file();
     let (_store, key, port) = setup().await; // custom-openai -> openai mock, key
     let client = reqwest::Client::new();
     let resp = client
@@ -781,6 +814,7 @@ async fn responses_endpoint_non_stream_round_trips() {
 
 #[tokio::test]
 async fn responses_endpoint_streams_sse() {
+    use_test_key_file();
     let (_store, key, port) = setup().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -803,6 +837,7 @@ async fn responses_endpoint_streams_sse() {
 /// upstream token counts (zero tokens + status 200 is the intended shape).
 #[tokio::test]
 async fn served_request_records_usage() {
+    use_test_key_file();
     let (store, key, port) = setup().await; // existing helper: custom-openai -> mock, key created
     let client = reqwest::Client::new();
     let _ = client
@@ -869,6 +904,7 @@ async fn mock_counting_anthropic_upstream(
 /// upstream exactly once.
 #[tokio::test]
 async fn messages_fails_over_to_next_connection_on_retryable_upstream_error() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
@@ -967,6 +1003,7 @@ async fn messages_fails_over_to_next_connection_on_retryable_upstream_error() {
 /// second connection (pins the `should_try_next_target` wiring).
 #[tokio::test]
 async fn messages_does_not_fail_over_on_non_retryable_upstream_error() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
@@ -1089,6 +1126,7 @@ async fn mock_anthropic_oauth_upstream() -> (
 /// Claude-Code system prompt injected ahead of the caller's own system text.
 #[tokio::test]
 async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt() {
+    use_test_key_file();
     let (up_port, _h, captured) = mock_anthropic_oauth_upstream().await;
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1162,6 +1200,7 @@ async fn oauth_anthropic_upstream_receives_bearer_beta_header_and_system_prompt(
 
 #[tokio::test]
 async fn anthropic_oauth_streaming_and_json_responses_decloak_tools() {
+    use_test_key_file();
     use axum::body::Body;
     use axum::http::header;
     use axum::response::{IntoResponse, Response};
@@ -1375,6 +1414,7 @@ async fn mock_anthropic_oauth_upstream_401_then_200_capturing_auth() -> (
 /// one the first call used).
 #[tokio::test]
 async fn oauth_401_triggers_refresh_and_retries_once() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     let now = chrono::Utc::now().timestamp_millis();
@@ -1563,6 +1603,7 @@ async fn mock_counting_sse_anthropic_upstream(
 /// Responses wire) and the request served by the api-key sibling — NOT a 400.
 #[tokio::test]
 async fn chat_skips_openai_oauth_when_openai_apikey_sibling_serves_model() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     let now = chrono::Utc::now().timestamp_millis();
@@ -1661,6 +1702,7 @@ async fn chat_skips_openai_oauth_when_openai_apikey_sibling_serves_model() {
 /// to an error only when it was the sole candidate.
 #[tokio::test]
 async fn chat_only_openai_oauth_target_returns_wrong_route_400() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
     let now = chrono::Utc::now().timestamp_millis();
@@ -1725,6 +1767,7 @@ async fn chat_only_openai_oauth_target_returns_wrong_route_400() {
 /// mock's stream — trying the first upstream exactly once.
 #[tokio::test]
 async fn messages_streaming_fails_over_pre_stream_to_next_connection() {
+    use_test_key_file();
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(tmp.path()).await.unwrap());
 
@@ -1809,6 +1852,7 @@ async fn messages_streaming_fails_over_pre_stream_to_next_connection() {
 
 #[tokio::test]
 async fn openai_target_gets_max_completion_tokens_while_custom_openai_keeps_max_tokens() {
+    use_test_key_file();
     use axum::{routing::post, Json, Router};
     use std::sync::Mutex;
 
@@ -1942,6 +1986,7 @@ async fn openai_target_gets_max_completion_tokens_while_custom_openai_keeps_max_
 /// chat-shaped body before it goes upstream, same as the `/v1/messages` path.
 #[tokio::test]
 async fn responses_endpoint_applies_max_completion_tokens_for_openai_target() {
+    use_test_key_file();
     use axum::{routing::post, Json, Router};
     use std::sync::Mutex;
 
