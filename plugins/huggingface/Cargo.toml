@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "ryuzi-plugin-huggingface"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "First-party Hugging Face provider component (ryuzi:provider/provider, authenticated through ryuzi:provider-auth)."
+
+[lib]
+crate-type = ["cdylib"]
+
+# `wit-bindgen` is only invoked inside the `#[cfg(target_arch = "wasm32")]`
+# guest module (by `ryuzi_openai_format::provider_component!`, which expands
+# `wit_bindgen::generate!` HERE so `path: "wit"` resolves against this crate's
+# manifest dir); the pure config module and its native `cargo test` never touch
+# the generated host bindings.
+#
+# `ryuzi-openai-format` is a path dependency on a sibling standalone workspace —
+# the mechanism for sharing code across the independently buildable
+# `plugins/<id>/` bundles.
+[dependencies]
+wit-bindgen = "0.57"
+serde_json = "1"
+ryuzi-openai-format = { path = "../openai-format" }
+
+[profile.release]
+# Small, reproducible components: no debug info, abort on panic (a panicking
+# guest is caught by the host fuel/epoch budget as a trap either way).
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

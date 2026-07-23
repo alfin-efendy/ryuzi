@@ -1,0 +1,24 @@
+id = "xai"
+name = "xAI"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "xai.wasm"
+publisher = "Ryuzi"
+description = "xAI chat provider. Talks to api.x.ai with the user's stored API key, which the host injects through ryuzi:provider-auth — the component never sees the key."
+
+# The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is
+# what authorizes the host-mediated `ryuzi:provider-auth` capability
+# (`HostPolicy::for_installed_bundle` requires a non-empty `provider-ids` AND a
+# network host; the `[id]` fallback used for transport registration
+# deliberately does NOT grant credential access).
+provider-ids = ["xai"]
+
+
+# The only host the component may reach — the host of the `xai` descriptor's
+# `base_url` (`https://api.x.ai/v1`). The host enforces this allowlist on every
+# credentialed request and re-checks it on each redirect hop, so the user's API
+# key can only ever travel to api.x.ai. Covers both the `/models` and
+# `/chat/completions` endpoints.
+[permissions]
+network = ["api.x.ai"]

@@ -69,7 +69,17 @@ export interface ComponentSpec {
 export const COMPONENTS: ComponentSpec[] = [
   { id: "mimo", dir: "plugins/mimo", crateWasmStem: "ryuzi_plugin_mimo" },
   { id: "opencode", dir: "plugins/opencode", crateWasmStem: "ryuzi_plugin_opencode" },
+  // OpenAI-chat provider components. All share the `plugins/openai-format`
+  // crate (which is NOT a bundle and so is not listed here — it has no manifest
+  // and produces no .wasm; it is pulled in as a path dependency of each).
   { id: "openai", dir: "plugins/openai", crateWasmStem: "ryuzi_plugin_openai" },
+  { id: "openrouter", dir: "plugins/openrouter", crateWasmStem: "ryuzi_plugin_openrouter" },
+  { id: "groq", dir: "plugins/groq", crateWasmStem: "ryuzi_plugin_groq" },
+  { id: "deepseek", dir: "plugins/deepseek", crateWasmStem: "ryuzi_plugin_deepseek" },
+  { id: "mistral", dir: "plugins/mistral", crateWasmStem: "ryuzi_plugin_mistral" },
+  { id: "xai", dir: "plugins/xai", crateWasmStem: "ryuzi_plugin_xai" },
+  { id: "nvidia", dir: "plugins/nvidia", crateWasmStem: "ryuzi_plugin_nvidia" },
+  { id: "huggingface", dir: "plugins/huggingface", crateWasmStem: "ryuzi_plugin_huggingface" },
   { id: "github", dir: "plugins/github", crateWasmStem: "ryuzi_plugin_github" },
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
   { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },

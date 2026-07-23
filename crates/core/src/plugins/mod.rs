@@ -233,28 +233,43 @@ pub(crate) fn build_bitbucket_component_once() {
     });
 }
 
-/// Build the first-party OpenAI provider component (`plugins/openai`) to
-/// wasm32-wasip2 EXACTLY ONCE per test process. Sibling of
-/// [`build_atlassian_component_once`] — see that function's doc. Consumed by
-/// the provider conformance battery
-/// (`crate::plugins::wasm_provider_conformance`), which drives the real
-/// component against a loopback mock upstream.
+/// Build the first-party LLM PROVIDER component in `plugins/<plugin_dir>` to
+/// wasm32-wasip2 EXACTLY ONCE per test process, per directory. Sibling of
+/// [`build_atlassian_component_once`] — see that function's doc — but
+/// parameterized, because the provider migration ships one such bundle per
+/// OpenAI-format provider and they are otherwise built identically.
+///
+/// Consumed by the provider conformance battery
+/// (`crate::plugins::wasm_provider_conformance`), which drives each real
+/// component against a loopback mock upstream. The builds are serialized behind
+/// one mutex so concurrent conformance tests do not race cargo, and each
+/// directory is built at most once however many tests ask for it.
 #[cfg(test)]
-pub(crate) fn build_openai_component_once() {
-    use std::sync::OnceLock;
-    static BUILT: OnceLock<()> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let script = root
-            .join("tests")
-            .join("fixtures")
-            .join("build-openai-component.sh");
-        let status = std::process::Command::new("sh")
-            .arg(script)
-            .status()
-            .expect("openai component build script should start");
-        assert!(status.success(), "openai component build failed: {status}");
-    });
+pub(crate) fn build_provider_component_once(plugin_dir: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static BUILT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut built = BUILT
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !built.insert(plugin_dir.to_string()) {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root
+        .join("tests")
+        .join("fixtures")
+        .join("build-provider-component.sh");
+    let status = std::process::Command::new("sh")
+        .arg(script)
+        .arg(plugin_dir)
+        .status()
+        .expect("provider component build script should start");
+    assert!(
+        status.success(),
+        "{plugin_dir} component build failed: {status}"
+    );
 }
 
 /// Add every generated manifest-only builtin — every model provider

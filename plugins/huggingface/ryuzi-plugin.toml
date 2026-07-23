@@ -1,0 +1,27 @@
+id = "huggingface"
+name = "Hugging Face"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "huggingface.wasm"
+publisher = "Ryuzi"
+description = "Hugging Face chat provider. Talks to router.huggingface.co with the user's stored API key, which the host injects through ryuzi:provider-auth — the component never sees the key."
+
+# The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is
+# what authorizes the host-mediated `ryuzi:provider-auth` capability
+# (`HostPolicy::for_installed_bundle` requires a non-empty `provider-ids` AND a
+# network host; the `[id]` fallback used for transport registration
+# deliberately does NOT grant credential access).
+provider-ids = ["huggingface"]
+
+# The `huggingface` descriptor sets `free_tier: true` — the provider offers a genuinely
+# free usage path — but it is still an API-KEY provider: the user supplies a key
+# and the host injects it. That badge changes the UI, not this component.
+
+# The only host the component may reach — the host of the `huggingface` descriptor's
+# `base_url` (`https://router.huggingface.co/v1`). The host enforces this allowlist on every
+# credentialed request and re-checks it on each redirect hop, so the user's API
+# key can only ever travel to router.huggingface.co. Covers both the `/models` and
+# `/chat/completions` endpoints.
+[permissions]
+network = ["router.huggingface.co"]

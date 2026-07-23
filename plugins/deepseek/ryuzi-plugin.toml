@@ -1,0 +1,24 @@
+id = "deepseek"
+name = "DeepSeek"
+version = "0.1.0"
+wit-api = ">=0.1.0, <0.2.0"
+lifecycle = "per-call"
+component = "deepseek.wasm"
+publisher = "Ryuzi"
+description = "DeepSeek chat provider. Talks to api.deepseek.com with the user's stored API key, which the host injects through ryuzi:provider-auth — the component never sees the key."
+
+# The LLM-router provider id(s) this bundle backs. Declaring it EXPLICITLY is
+# what authorizes the host-mediated `ryuzi:provider-auth` capability
+# (`HostPolicy::for_installed_bundle` requires a non-empty `provider-ids` AND a
+# network host; the `[id]` fallback used for transport registration
+# deliberately does NOT grant credential access).
+provider-ids = ["deepseek"]
+
+
+# The only host the component may reach — the host of the `deepseek` descriptor's
+# `base_url` (`https://api.deepseek.com/v1`). The host enforces this allowlist on every
+# credentialed request and re-checks it on each redirect hop, so the user's API
+# key can only ever travel to api.deepseek.com. Covers both the `/models` and
+# `/chat/completions` endpoints.
+[permissions]
+network = ["api.deepseek.com"]

@@ -25,11 +25,12 @@
 //! override" channel a real provider component would read too), and drives the
 //! actual host seam.
 //!
-//! Two fixtures live below and share the SAME six checks: the synthetic
+//! Every fixture below shares the SAME six checks: the synthetic
 //! `component-provider-http` fixture (plain `ryuzi:http`, tab-separated wire
-//! format) and the real `plugins/openai` component (host-mediated
-//! `ryuzi:provider-auth`, OpenAI JSON). Later per-provider slices add one more
-//! [`ConformanceFixture`] each — never another copy of the checks.
+//! format), plus one per real OpenAI-chat provider component (`plugins/openai`,
+//! `plugins/groq`, … — host-mediated `ryuzi:provider-auth`, OpenAI JSON), built
+//! through [`OpenAiFormatFixture`]. A later per-provider slice adds one more
+//! [`ConformanceFixture`] — never another copy of the checks.
 //!
 //! Everything here is `#[cfg(test)]` lib-test code (the integration-test build
 //! OOMs on the dev box); the module is gated behind `#[cfg(test)]` in
@@ -600,138 +601,471 @@ async fn provider_component_passes_the_full_conformance_battery() {
 }
 
 // ---------------------------------------------------------------------------
-// The REAL `openai` provider component (plan Task 16, Step 2)
+// The REAL OpenAI-CHAT provider components (plan Task 16, Steps 2 + 3)
 //
-// Same six checks, a real component, and OpenAI's actual wire format. Nothing
-// below touches the harness itself — it is one more [`ConformanceFixture`],
-// which is the point of the Step 1 parameterization.
+// Same six checks, real components, and OpenAI's actual wire format. Nothing
+// below touches the harness itself — each provider is one more
+// [`ConformanceFixture`], which is the point of the Step 1 parameterization.
+//
+// Every component here is built on the shared `ryuzi-openai-format` crate, so
+// their endpoint paths, storage override key and error mapping are properties
+// of the FORMAT rather than of any one provider. [`OpenAiFormatFixture`]
+// therefore carries only what genuinely differs — the provider id, the model
+// it is asked for, the stored credential, and the literal wire bodies its mock
+// upstream serves — and fills the format-level fields in itself.
 // ---------------------------------------------------------------------------
 
-/// The user API key this run stores for `openai` through the real
-/// `provider_connections` path. `ryuzi:provider-auth` resolves it host-side and
-/// injects it as `Authorization: Bearer …` (the `openai` descriptor declares
-/// `AuthScheme::Bearer`), so the component itself never sees this value.
-const OPENAI_STORED_KEY: &str = "sk-conformance-openai-key";
+/// Model-discovery path every OpenAI-format component GETs (its descriptor's
+/// `has_models_endpoint` is `true` and none of them override the default).
+const OPENAI_FORMAT_MODELS_PATH: &str = "/models";
 
-/// Exactly what the mock upstream must therefore observe — and nothing else.
-const OPENAI_EXPECTED_AUTHORIZATION: &str = "Bearer sk-conformance-openai-key";
+/// Chat-generation path every OpenAI-format component POSTs to (every
+/// descriptor here leaves `chat_path` at `None`).
+const OPENAI_FORMAT_CHAT_PATH: &str = "/chat/completions";
 
-/// An OpenAI `GET /v1/models` body. Two models, deliberately NOT in the order
-/// the component's expectations would take if it sorted, and one id the
-/// component's static context-window table does not know (so the conservative
-/// default is exercised alongside a table hit).
+/// The base-URL override key these components read from their own storage
+/// slice (`ryuzi_openai_format::BASE_URL_STORAGE_KEY`) — the real product-level
+/// proxy override, which the harness reuses to aim them at its mock.
+const OPENAI_FORMAT_BASE_URL_KEY: &str = "base-url";
+
+/// One real OpenAI-format provider component's conformance data.
 ///
-/// `gpt-3.5-turbo` is the table hit ON PURPOSE: its published window (16_385)
-/// DIFFERS from the component's default. A table entry whose value happened to
-/// equal the default would make the assertion below unable to tell a real
-/// lookup from the fallback, so the two expected windows must not coincide.
-const OPENAI_MODELS_BODY: &str = r#"{"object":"list","data":[
-  {"id":"gpt-5.2","object":"model","created":1,"owned_by":"openai"},
-  {"id":"gpt-3.5-turbo","object":"model","created":2,"owned_by":"openai"}
-]}"#;
-
-/// An OpenAI `POST /v1/chat/completions` (non-stream) body. The flat provider
-/// ABI collapses this to ONE terminal chunk, so the text below is the whole
-/// completion.
-const OPENAI_COMPLETION_BODY: &str = r#"{
-  "id": "chatcmpl-conformance",
-  "object": "chat.completion",
-  "choices": [
-    {"index": 0, "message": {"role": "assistant", "content": "Zeta Alpha Mu"}, "finish_reason": "stop"}
-  ],
-  "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14}
-}"#;
-
-/// The prebuilt `plugins/openai` component (built on demand by
-/// [`crate::plugins::build_openai_component_once`] — it is a standalone
-/// workspace crate, not a `tests/fixtures/*` fixture).
-fn openai_component_artifact() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../plugins/openai/target/wasm32-wasip2/release")
-        .join("ryuzi_plugin_openai.wasm")
+/// Deliberately NOT a generator of its own expectations: the wire bodies are
+/// literal JSON and the expected models/text/usage are literal values, so the
+/// battery still compares what the COMPONENT parsed against what a human wrote
+/// down, not one derivation against another.
+struct OpenAiFormatFixture {
+    /// Router provider id — also the `plugins/<dir>` name, the manifest
+    /// `provider-ids` entry, and (via `ryuzi_plugin_<id>`) the built artifact's
+    /// stem. A drift in any of those surfaces as a load or `denied` failure.
+    provider_id: &'static str,
+    /// The model id put on every `complete` request.
+    request_model: &'static str,
+    /// The user API key this run stores through the real `provider_connections`
+    /// path. `ryuzi:provider-auth` resolves it host-side and injects it as
+    /// `Authorization: Bearer …` (every descriptor here declares
+    /// `AuthScheme::Bearer`), so the component itself never sees this value.
+    stored_api_key: &'static str,
+    /// Exactly what the mock upstream must therefore observe — and nothing else.
+    expected_authorization: &'static str,
+    /// Literal `GET /models` body the mock serves.
+    models_body: &'static str,
+    /// `(id, context_window)` per model, in served order. The display name is
+    /// asserted to equal the id, which is a property of the format: an
+    /// OpenAI-shaped `/models` response carries no display name.
+    expected_models: &'static [(&'static str, u32)],
+    /// Literal `POST /chat/completions` (non-stream) body the mock serves.
+    completion_body: &'static str,
+    /// The whole completion — the flat ABI collapses the response to ONE
+    /// terminal chunk, so this is both the only chunk's text and the final text.
+    expected_text: &'static str,
+    /// Usage the terminal chunk must carry, from `completion_body`'s `usage`.
+    expected_usage: WasmTokenUsage,
 }
 
-/// The real `openai` component's conformance config: its actual endpoint paths
-/// (`/models`, `/chat/completions`), its real `base-url` storage override key,
-/// OpenAI-shaped JSON bodies, and the models/chunks/errors its own `logic`
-/// module produces from them.
-fn openai_component_conformance() -> ConformanceFixture {
-    ConformanceFixture {
-        artifact: openai_component_artifact(),
-        // The router provider id the bundle declares — and therefore the id
-        // whose stored credential `ryuzi:provider-auth` will inject.
-        provider_id: "openai".to_string(),
-        request_model: "gpt-5.2".to_string(),
-        base_url_storage_key: "base-url".to_string(),
-        stored_api_key: Some(OPENAI_STORED_KEY),
-        wire: MockWireBodies {
-            models_path: "/models".to_string(),
-            models_body: OPENAI_MODELS_BODY.to_string(),
-            complete_path: "/chat/completions".to_string(),
-            complete_success_body: OPENAI_COMPLETION_BODY.to_string(),
-        },
-        expect: ProviderExpectations {
-            models: vec![
-                WasmModelInfo {
-                    id: "gpt-5.2".to_string(),
-                    // `/models` reports no display name, so the id doubles as
-                    // one; an id outside the static table takes the
-                    // conservative default window (128_000).
-                    display_name: "gpt-5.2".to_string(),
-                    context_window: 128_000,
-                },
-                WasmModelInfo {
-                    id: "gpt-3.5-turbo".to_string(),
-                    display_name: "gpt-3.5-turbo".to_string(),
-                    // ...and this one is a genuine static-table HIT, whose
-                    // value differs from the default above — so the pair
-                    // distinguishes "looked the model up" from "fell back".
-                    context_window: 16_385,
-                },
-            ],
-            // Flat-text ABI + a buffered upstream: one terminal chunk.
-            chunk_texts: vec!["Zeta Alpha Mu"],
-            final_text: "Zeta Alpha Mu",
-            terminal_usage: Some(WasmTokenUsage {
-                input: 11,
-                output: 3,
-            }),
-            http_error_cases: vec![
-                HttpErrorCase {
-                    status: 429,
-                    expected_substring: "rate limited",
-                },
-                HttpErrorCase {
-                    status: 503,
-                    expected_substring: "unavailable",
-                },
-                // A 4xx that is NOT a model-not-found stays an invalid-request
-                // carrying only the status — never the upstream message.
-                HttpErrorCase {
-                    status: 400,
-                    expected_substring: "HTTP 400",
-                },
-            ],
-            timeout_error_substrings: vec![
-                "failed",
-                "timeout",
-                "timed out",
-                "budget",
-                "unavailable",
-            ],
-            // The component sets no credential header of its own — it has no
-            // `ryuzi:http` import to set one with — so there is no forged
-            // secret to look for.
-            guest_forged_secret: None,
-            // ...and the ONLY credential on the wire is the host-injected one.
-            expected_authorization: Some(OPENAI_EXPECTED_AUTHORIZATION),
-        },
+impl OpenAiFormatFixture {
+    /// The built component artifact. Each `plugins/<id>` is a standalone
+    /// workspace crate (not a `tests/fixtures/*` fixture), and cargo names its
+    /// output after the crate with `-` replaced by `_`.
+    fn artifact(&self) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins")
+            .join(self.provider_id)
+            .join("target/wasm32-wasip2/release")
+            .join(format!(
+                "ryuzi_plugin_{}.wasm",
+                self.provider_id.replace('-', "_")
+            ))
+    }
+
+    /// Expand into a full [`ConformanceFixture`], supplying the format-level
+    /// fields (paths, storage key, error mapping) every OpenAI-format component
+    /// shares by construction.
+    fn into_conformance(self) -> ConformanceFixture {
+        ConformanceFixture {
+            artifact: self.artifact(),
+            provider_id: self.provider_id.to_string(),
+            request_model: self.request_model.to_string(),
+            base_url_storage_key: OPENAI_FORMAT_BASE_URL_KEY.to_string(),
+            stored_api_key: Some(self.stored_api_key),
+            wire: MockWireBodies {
+                models_path: OPENAI_FORMAT_MODELS_PATH.to_string(),
+                models_body: self.models_body.to_string(),
+                complete_path: OPENAI_FORMAT_CHAT_PATH.to_string(),
+                complete_success_body: self.completion_body.to_string(),
+            },
+            expect: ProviderExpectations {
+                models: self
+                    .expected_models
+                    .iter()
+                    .map(|(id, context_window)| WasmModelInfo {
+                        id: (*id).to_string(),
+                        display_name: (*id).to_string(),
+                        context_window: *context_window,
+                    })
+                    .collect(),
+                // Flat-text ABI + a buffered upstream: one terminal chunk.
+                chunk_texts: vec![self.expected_text],
+                final_text: self.expected_text,
+                terminal_usage: Some(self.expected_usage),
+                http_error_cases: vec![
+                    HttpErrorCase {
+                        status: 429,
+                        expected_substring: "rate limited",
+                    },
+                    HttpErrorCase {
+                        status: 503,
+                        expected_substring: "unavailable",
+                    },
+                    // A 4xx that is NOT a model-not-found stays an
+                    // invalid-request carrying only the status — never the
+                    // upstream message.
+                    HttpErrorCase {
+                        status: 400,
+                        expected_substring: "HTTP 400",
+                    },
+                ],
+                timeout_error_substrings: vec![
+                    "failed",
+                    "timeout",
+                    "timed out",
+                    "budget",
+                    "unavailable",
+                ],
+                // These components set no credential header of their own — they
+                // have no `ryuzi:http` import to set one with — so there is no
+                // forged secret to look for.
+                guest_forged_secret: None,
+                // ...and the ONLY credential on the wire is the host-injected one.
+                expected_authorization: Some(self.expected_authorization),
+            },
+        }
     }
 }
 
+/// Build the component under test, then run the whole six-point battery against
+/// it. One line per provider below.
+async fn run_openai_format_battery(fixture: OpenAiFormatFixture) {
+    crate::plugins::build_provider_component_once(fixture.provider_id);
+    ProviderConformance::new(fixture.into_conformance())
+        .run_full_battery()
+        .await;
+}
+
+/// A two-model `/models` body for a provider whose descriptor seeds NO model
+/// list. The ids are synthetic on purpose — inventing real-looking ones would
+/// assert a catalog this repo has no source for — and the component treats a
+/// `/models` id opaquely anyway. They are served in NON-alphabetical order so
+/// the battery's order assertion is not satisfied by an accidental sort, and
+/// they embed the provider id so a cross-wired fixture (running provider A's
+/// component against provider B's expectations) fails loudly.
+macro_rules! synthetic_models_body {
+    ($id:literal) => {
+        concat!(
+            r#"{"object":"list","data":[{"id":""#,
+            $id,
+            r#"-zeta","object":"model"},{"id":""#,
+            $id,
+            r#"-alpha","object":"model"}]}"#
+        )
+    };
+}
+
+/// The matching expectations for [`synthetic_models_body!`]. Both windows are
+/// the shared conservative default (`ryuzi_openai_format::DEFAULT_CONTEXT_WINDOW`):
+/// these providers ship an EMPTY static context-window table, because their
+/// `/models` responses carry no context length and their descriptors pin no
+/// per-model values. That the two windows coincide here is therefore the
+/// behaviour under test, not the blind spot M1 fixed for `openai` — `openai` is
+/// the one component with a real table, and its fixture below still asserts two
+/// DIFFERENT windows.
+macro_rules! synthetic_models_expected {
+    ($id:literal) => {
+        &[
+            (concat!($id, "-zeta"), 128_000),
+            (concat!($id, "-alpha"), 128_000),
+        ]
+    };
+}
+
+/// A non-stream chat-completion body. `text` is the whole completion (the flat
+/// ABI collapses the response to one terminal chunk) and the usage counts are
+/// per-provider so a cross-wired fixture cannot pass.
+macro_rules! completion_body {
+    ($text:literal, $input:literal, $output:literal) => {
+        concat!(
+            r#"{"id":"chatcmpl-conformance","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":""#,
+            $text,
+            r#""},"finish_reason":"stop"}],"usage":{"prompt_tokens":"#,
+            $input,
+            r#","completion_tokens":"#,
+            $output,
+            r#"}}"#
+        )
+    };
+}
+
+/// The real `openai` component. The ONLY fixture here with a populated static
+/// context-window table, so its two expected windows deliberately DIFFER:
+/// `gpt-5.2` is unknown to the table and takes the conservative default,
+/// `gpt-3.5-turbo` is a genuine table hit at its published 16_385. A pair that
+/// coincided could not tell a lookup from a fallback.
+const OPENAI_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "openai",
+    request_model: "gpt-5.2",
+    stored_api_key: "sk-conformance-openai-key",
+    expected_authorization: "Bearer sk-conformance-openai-key",
+    models_body: r#"{"object":"list","data":[
+      {"id":"gpt-5.2","object":"model","created":1,"owned_by":"openai"},
+      {"id":"gpt-3.5-turbo","object":"model","created":2,"owned_by":"openai"}
+    ]}"#,
+    expected_models: &[("gpt-5.2", 128_000), ("gpt-3.5-turbo", 16_385)],
+    completion_body: completion_body!("Zeta Alpha Mu", 11, 3),
+    expected_text: "Zeta Alpha Mu",
+    expected_usage: WasmTokenUsage {
+        input: 11,
+        output: 3,
+    },
+};
+
+const OPENROUTER_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "openrouter",
+    request_model: "openrouter-zeta",
+    stored_api_key: "sk-or-conformance-key",
+    expected_authorization: "Bearer sk-or-conformance-key",
+    models_body: synthetic_models_body!("openrouter"),
+    expected_models: synthetic_models_expected!("openrouter"),
+    completion_body: completion_body!("routed reply", 21, 5),
+    expected_text: "routed reply",
+    expected_usage: WasmTokenUsage {
+        input: 21,
+        output: 5,
+    },
+};
+
+const GROQ_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "groq",
+    request_model: "groq-zeta",
+    stored_api_key: "gsk-conformance-key",
+    expected_authorization: "Bearer gsk-conformance-key",
+    models_body: synthetic_models_body!("groq"),
+    expected_models: synthetic_models_expected!("groq"),
+    completion_body: completion_body!("fast reply", 13, 7),
+    expected_text: "fast reply",
+    expected_usage: WasmTokenUsage {
+        input: 13,
+        output: 7,
+    },
+};
+
+/// `deepseek` is the one non-`openai` descriptor here that SEEDS a model list
+/// (`["deepseek-chat", "deepseek-reasoner"]`), so its fixture uses those real
+/// ids instead of synthetic ones — served reasoner-first, i.e. not sorted.
+const DEEPSEEK_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "deepseek",
+    request_model: "deepseek-chat",
+    stored_api_key: "sk-ds-conformance-key",
+    expected_authorization: "Bearer sk-ds-conformance-key",
+    models_body: r#"{"object":"list","data":[
+      {"id":"deepseek-reasoner","object":"model"},
+      {"id":"deepseek-chat","object":"model"}
+    ]}"#,
+    expected_models: &[("deepseek-reasoner", 128_000), ("deepseek-chat", 128_000)],
+    completion_body: completion_body!("reasoned reply", 17, 9),
+    expected_text: "reasoned reply",
+    expected_usage: WasmTokenUsage {
+        input: 17,
+        output: 9,
+    },
+};
+
+const MISTRAL_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "mistral",
+    request_model: "mistral-zeta",
+    stored_api_key: "mi-conformance-key",
+    expected_authorization: "Bearer mi-conformance-key",
+    models_body: synthetic_models_body!("mistral"),
+    expected_models: synthetic_models_expected!("mistral"),
+    completion_body: completion_body!("le reply", 23, 11),
+    expected_text: "le reply",
+    expected_usage: WasmTokenUsage {
+        input: 23,
+        output: 11,
+    },
+};
+
+const XAI_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "xai",
+    request_model: "xai-zeta",
+    stored_api_key: "xai-conformance-key",
+    expected_authorization: "Bearer xai-conformance-key",
+    models_body: synthetic_models_body!("xai"),
+    expected_models: synthetic_models_expected!("xai"),
+    completion_body: completion_body!("witty reply", 29, 13),
+    expected_text: "witty reply",
+    expected_usage: WasmTokenUsage {
+        input: 29,
+        output: 13,
+    },
+};
+
+const NVIDIA_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "nvidia",
+    request_model: "nvidia-zeta",
+    stored_api_key: "nvapi-conformance-key",
+    expected_authorization: "Bearer nvapi-conformance-key",
+    models_body: synthetic_models_body!("nvidia"),
+    expected_models: synthetic_models_expected!("nvidia"),
+    completion_body: completion_body!("accelerated reply", 31, 17),
+    expected_text: "accelerated reply",
+    expected_usage: WasmTokenUsage {
+        input: 31,
+        output: 17,
+    },
+};
+
+const HUGGINGFACE_FIXTURE: OpenAiFormatFixture = OpenAiFormatFixture {
+    provider_id: "huggingface",
+    request_model: "huggingface-zeta",
+    stored_api_key: "hf-conformance-key",
+    expected_authorization: "Bearer hf-conformance-key",
+    models_body: synthetic_models_body!("huggingface"),
+    expected_models: synthetic_models_expected!("huggingface"),
+    completion_body: completion_body!("routed hub reply", 37, 19),
+    expected_text: "routed hub reply",
+    expected_usage: WasmTokenUsage {
+        input: 37,
+        output: 19,
+    },
+};
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_component_passes_the_full_conformance_battery() {
-    crate::plugins::build_openai_component_once();
-    let harness = ProviderConformance::new(openai_component_conformance());
-    harness.run_full_battery().await;
+    run_openai_format_battery(OPENAI_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openrouter_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(OPENROUTER_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn groq_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(GROQ_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deepseek_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(DEEPSEEK_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mistral_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(MISTRAL_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xai_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(XAI_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nvidia_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(NVIDIA_FIXTURE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn huggingface_component_passes_the_full_conformance_battery() {
+    run_openai_format_battery(HUGGINGFACE_FIXTURE).await;
+}
+
+/// Every OpenAI-format provider bundle ported so far, for the manifest audit
+/// below. Kept next to the fixtures so a new provider is added in one place.
+const OPENAI_FORMAT_FIXTURES: &[&OpenAiFormatFixture] = &[
+    &OPENAI_FIXTURE,
+    &OPENROUTER_FIXTURE,
+    &GROQ_FIXTURE,
+    &DEEPSEEK_FIXTURE,
+    &MISTRAL_FIXTURE,
+    &XAI_FIXTURE,
+    &NVIDIA_FIXTURE,
+    &HUGGINGFACE_FIXTURE,
+];
+
+/// The conformance battery proves each component BEHAVES like its provider.
+/// This proves each bundle is DECLARED like one — which is what decides whether
+/// the host will hand it the user's credential at all, and is invisible to a
+/// battery that grants capabilities itself.
+///
+/// For every ported provider, the committed `ryuzi-plugin.toml` must:
+/// - parse and validate as a `PluginBundleManifest`;
+/// - declare `provider-ids` EXPLICITLY (the `[id]` fallback does not authorize
+///   `ryuzi:provider-auth`) and name exactly this provider;
+/// - allowlist exactly one host, and that host must be the host of the
+///   provider's OWN `ProviderDescriptor::base_url` — so the user's key can only
+///   travel to the endpoint the router itself would have used.
+///
+/// It also re-checks the descriptor facts this whole slice assumes: an API-key,
+/// bearer-authenticated provider with a live `/models` endpoint. A descriptor
+/// that drifts away from those makes its component wrong, and this fails first.
+#[test]
+fn every_ported_provider_bundle_declares_provider_auth_and_only_its_own_host() {
+    use crate::llm_router::registry::{self, AuthScheme, ProviderCategory};
+    use ryuzi_plugin_sdk::PluginBundleManifest;
+
+    for fixture in OPENAI_FORMAT_FIXTURES {
+        let id = fixture.provider_id;
+        let descriptor = registry::descriptor(id)
+            .unwrap_or_else(|| panic!("{id} must exist in the router catalog"));
+        let base_url = descriptor
+            .base_url
+            .unwrap_or_else(|| panic!("{id} must declare a base_url to allowlist"));
+        let expected_host = url::Url::parse(base_url)
+            .unwrap_or_else(|e| panic!("{id} base_url {base_url}: {e}"))
+            .host_str()
+            .unwrap_or_else(|| panic!("{id} base_url {base_url} has no host"))
+            .to_string();
+
+        // The descriptor facts every component in this slice was built from.
+        assert_eq!(
+            descriptor.category,
+            ProviderCategory::ApiKey,
+            "{id} category"
+        );
+        assert_eq!(descriptor.auth, AuthScheme::Bearer, "{id} auth scheme");
+        assert!(descriptor.has_models_endpoint, "{id} has_models_endpoint");
+        assert_eq!(descriptor.chat_path, None, "{id} chat_path");
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins")
+            .join(id)
+            .join("ryuzi-plugin.toml");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let manifest: PluginBundleManifest =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("{id} manifest: {e}"));
+        manifest
+            .validate()
+            .unwrap_or_else(|e| panic!("{id} manifest is invalid: {e}"));
+
+        assert_eq!(manifest.id, id, "bundle id");
+        assert_eq!(
+            manifest.provider_ids,
+            vec![id.to_string()],
+            "{id} must declare provider-ids EXPLICITLY — the [id] fallback does \
+             not grant ryuzi:provider-auth",
+        );
+        let hosts: Vec<&str> = manifest
+            .permissions
+            .network
+            .iter()
+            .map(|host| host.0.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![expected_host.as_str()],
+            "{id} must allowlist exactly the host of its descriptor's base_url \
+             ({base_url}) — a wider allowlist widens where the user's key may go",
+        );
+    }
 }
