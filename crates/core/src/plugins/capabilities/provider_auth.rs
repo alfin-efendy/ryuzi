@@ -34,9 +34,18 @@
 //! 4. **Inject per the descriptor's [`AuthScheme`]** — bearer vs `x-api-key`
 //!    is DATA on the descriptor, so no provider id is ever named in host code
 //!    here (Global Constraint: no plugin-ID-specific host branch).
-//! 5. **Send through [`AllowedHttpClient`]**, having first discarded every
+//! 5. **Require TLS once a credential is in play** — a resolved credential is
+//!    only ever sent over `https` (see [`ProviderAuth::ensure_transport_security`]).
+//! 6. **Send through [`AllowedHttpClient`]**, having first discarded every
 //!    credential-shaped header the component supplied, so a forged credential
 //!    can neither reach the wire nor sit alongside the host's.
+//!
+//! # What this does NOT constrain
+//! The manifest network allowlist decides which hosts a credentialed request
+//! may target. Injection is NOT bound to the descriptor's own `base_url` host,
+//! so a bundle that declares both a provider id and a broad allowlist can aim
+//! the user's key at any host in that allowlist. Narrowing that is tracked as
+//! a follow-up, not a guarantee this module makes today.
 
 use super::http::{AllowedHttpClient, HttpErr, SafeHttpResponse, DEFAULT_HTTP_TIMEOUT};
 use super::PluginCapabilityContext;
@@ -166,6 +175,11 @@ impl<'a> ProviderAuth<'a> {
             ProviderAuthErr::InvalidRequest(format!("unknown provider `{provider_id}`"))
         })?;
         let injection = self.resolve_injection(descriptor, provider_id).await?;
+        // Pre-flight, BEFORE any client is built or byte sent: a credential that
+        // is actually going to be injected may only travel over TLS.
+        if !matches!(injection, CredentialInjection::None) {
+            ensure_transport_security(url)?;
+        }
 
         // Whatever the scheme, the component's own credential headers are
         // dropped first, so the host's value is the only one that can reach the
@@ -189,10 +203,14 @@ impl<'a> ProviderAuth<'a> {
                     .request_with_bearer(method, url, headers, body, &credential)
                     .await
             }
+            // Handed to the client as an INJECTED credential rather than mixed
+            // into the component's header list, so it obeys the same
+            // same-origin redirect rule the bearer does — see
+            // `AllowedHttpClient::request_impl`.
             CredentialInjection::Headers(injected) => {
-                let mut headers = headers;
-                headers.extend(injected);
-                client.request(method, url, headers, body).await
+                client
+                    .request_with_credential_headers(method, url, headers, body, &injected)
+                    .await
             }
             CredentialInjection::None => client.request(method, url, headers, body).await,
         };
@@ -224,6 +242,52 @@ impl<'a> ProviderAuth<'a> {
             // rather than a silently unauthenticated request.
             AuthScheme::None => CredentialInjection::None,
         })
+    }
+}
+
+/// Refuses to put the user's long-lived provider key on a cleartext wire.
+///
+/// The manifest network allowlist matches on HOST only — it says nothing about
+/// the scheme — so without this gate a bundle declaring `network = ["h"]` could
+/// have the host send the credential to `http://h/...` in the clear. `ryuzi`
+/// already sets this norm for its other host-owned credentialed channel:
+/// `capabilities::websocket` requires `wss` in production and permits plaintext
+/// only for a loopback address under `#[cfg(test)]`. This mirrors that shape.
+///
+/// Applied ONLY when a credential is actually being injected: an
+/// [`AuthScheme::None`] provider (a local Ollama endpoint, a free-tier
+/// passthrough) has nothing to protect and keeps working over plain `http`.
+fn ensure_transport_security(url: &str) -> Result<(), ProviderAuthErr> {
+    let parsed =
+        url::Url::parse(url).map_err(|error| ProviderAuthErr::InvalidRequest(error.to_string()))?;
+    if parsed.scheme().eq_ignore_ascii_case("https") {
+        return Ok(());
+    }
+    if is_test_loopback(parsed.host_str().unwrap_or_default()) {
+        return Ok(());
+    }
+    // Names the scheme only. The URL itself is never echoed back: a component's
+    // request URL can carry query-string secrets, and this error crosses into
+    // the guest.
+    Err(ProviderAuthErr::InvalidRequest(format!(
+        "scheme `{}` cannot carry a provider credential; https is required",
+        parsed.scheme()
+    )))
+}
+
+/// Whether `host` is a loopback address a plaintext credentialed request is
+/// allowed to reach. `true` ONLY under `#[cfg(test)]` — the production build
+/// always returns `false`, so production can never send a provider key in
+/// cleartext. Mirrors `capabilities::websocket::is_test_loopback`.
+fn is_test_loopback(host: &str) -> bool {
+    #[cfg(test)]
+    {
+        matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    }
+    #[cfg(not(test))]
+    {
+        let _ = host;
+        false
     }
 }
 
@@ -381,19 +445,53 @@ mod tests {
         ([("x-upstream-note", "no-credential-here")], "upstream-ok")
     }
 
-    /// A mock upstream plus the slot recording what it saw.
+    /// A mock upstream plus the slot recording what it saw. `/v1/redirect`
+    /// bounces to `/v1/chat` on the SAME origin, so a test can pin what the
+    /// host does with the credential across a same-origin hop.
     async fn spawn_recording_server() -> (u16, Arc<Mutex<SeenAuth>>) {
         let seen = Arc::new(Mutex::new(SeenAuth::default()));
         let app = Router::new()
             .route("/v1/chat", get(record_auth))
+            .route(
+                "/v1/redirect",
+                get(|| async { Redirect::temporary("/v1/chat") }),
+            )
             .with_state(seen.clone());
         (spawn_server(app).await, seen)
     }
 
+    /// A mock upstream whose `/v1/chat` redirects to the absolute `target`
+    /// (used to build a CROSS-origin hop that the allowlist still permits).
+    async fn spawn_redirecting_server(target: String) -> u16 {
+        let app = Router::new().route(
+            "/v1/chat",
+            get(move || {
+                let target = target.clone();
+                async move { Redirect::temporary(&target) }
+            }),
+        );
+        spawn_server(app).await
+    }
+
+    /// Keeps a test-only descriptor in the process-wide custom-provider cache
+    /// for as long as it is held, and removes it on drop. Without this a test
+    /// would leave a fake provider id resolvable for the rest of the test
+    /// binary (`llm_router::client`'s tests unregister explicitly; drop-based
+    /// cleanup also survives a failing assertion).
+    struct TestDescriptor(&'static str);
+
+    impl Drop for TestDescriptor {
+        fn drop(&mut self) {
+            registry::unregister_custom_descriptor(self.0);
+        }
+    }
+
     /// Test-only catalog entry with an explicit [`AuthScheme`] and an id no
     /// host code could possibly know about — the proof that injection is
-    /// driven by descriptor DATA rather than a per-provider-id branch.
-    fn register_test_descriptor(id: &'static str, auth: AuthScheme) {
+    /// driven by descriptor DATA rather than a per-provider-id branch. The
+    /// returned guard must be held for the duration of the test.
+    #[must_use]
+    fn register_test_descriptor(id: &'static str, auth: AuthScheme) -> TestDescriptor {
         let descriptor: &'static ProviderDescriptor = Box::leak(Box::new(ProviderDescriptor {
             id,
             name: "Task 16c1 Test Provider",
@@ -418,6 +516,7 @@ mod tests {
             device_grant: None,
         }));
         registry::register_custom_descriptor(descriptor);
+        TestDescriptor(id)
     }
 
     #[tokio::test]
@@ -692,8 +791,8 @@ mod tests {
     /// scheme is chosen at runtime, still authenticates correctly.
     #[tokio::test]
     async fn injection_is_descriptor_driven_for_an_id_no_host_code_knows() {
-        register_test_descriptor("task16c1-xapikey", AuthScheme::XApiKey);
-        register_test_descriptor("task16c1-bearer", AuthScheme::Bearer);
+        let _xapikey = register_test_descriptor("task16c1-xapikey", AuthScheme::XApiKey);
+        let _bearer = register_test_descriptor("task16c1-bearer", AuthScheme::Bearer);
 
         let (port, seen) = spawn_recording_server().await;
         let url = format!("http://127.0.0.1:{port}/v1/chat");
@@ -752,10 +851,163 @@ mod tests {
         );
     }
 
+    /// A declared, KEYED provider requested over plain `http://` on a
+    /// non-loopback allowlisted host is refused BEFORE anything is sent: the
+    /// manifest allowlist matches on host only, so without this gate the user's
+    /// long-lived key would go out in the clear. The refusal is the pre-flight
+    /// `invalid-request` — a request that had actually been attempted would
+    /// surface as `failed`/`unavailable` from the transport instead.
+    #[tokio::test]
+    async fn a_credentialed_request_over_plaintext_http_is_refused_before_it_is_sent() {
+        let (store, _tmp) = open_test_store().await;
+        seed_api_key(&store, "openai", "sk-real-user-key").await;
+        // `example.test` IS in this context's allowlist (see `ctx_for`), so the
+        // only thing that can refuse the request is the scheme gate.
+        let ctx = ctx_for(store, "openai-provider", &["openai"]);
+
+        let result = ProviderAuth::new(&ctx)
+            .authorized_request("openai", "GET", "http://example.test/v1/chat", vec![], None)
+            .await;
+
+        match result {
+            Err(ProviderAuthErr::InvalidRequest(message)) => {
+                assert!(
+                    message.contains("https"),
+                    "the refusal must name the TLS requirement: {message}"
+                );
+                assert!(
+                    !message.contains("sk-real-user-key") && !message.contains("example.test"),
+                    "the refusal must leak neither the credential nor the URL: {message}"
+                );
+            }
+            other => panic!("a cleartext credentialed request must be refused, got {other:?}"),
+        }
+    }
+
+    /// The scheme gate runs before the network layer is even constructed, so an
+    /// unlisted host over `http://` reports the scheme refusal rather than the
+    /// allowlist one — proof that nothing was attempted.
+    #[tokio::test]
+    async fn the_plaintext_refusal_precedes_the_allowlist_check() {
+        let (store, _tmp) = open_test_store().await;
+        seed_api_key(&store, "openai", "sk-real-user-key").await;
+        let ctx = PluginCapabilityContext {
+            network_allowlist: vec!["api.openai.com".to_string()],
+            ..ctx_for(store, "openai-provider", &["openai"])
+        };
+
+        let result = ProviderAuth::new(&ctx)
+            .authorized_request("openai", "GET", "http://unlisted.test/v1", vec![], None)
+            .await;
+
+        assert!(
+            matches!(result, Err(ProviderAuthErr::InvalidRequest(ref m)) if m.contains("https")),
+            "the scheme gate must fire before the client exists, got {result:?}"
+        );
+    }
+
+    /// An `https` target is NOT refused by the scheme gate — it gets as far as
+    /// the allowlist, which is the next check.
+    #[tokio::test]
+    async fn an_https_credentialed_request_passes_the_scheme_gate() {
+        let (store, _tmp) = open_test_store().await;
+        seed_api_key(&store, "openai", "sk-real-user-key").await;
+        let ctx = PluginCapabilityContext {
+            network_allowlist: vec!["api.openai.com".to_string()],
+            ..ctx_for(store, "openai-provider", &["openai"])
+        };
+
+        let result = ProviderAuth::new(&ctx)
+            .authorized_request("openai", "GET", "https://unlisted.test/v1", vec![], None)
+            .await;
+
+        assert_eq!(
+            result,
+            Err(ProviderAuthErr::Rejected),
+            "an https request must reach the allowlist check, not the scheme gate"
+        );
+    }
+
+    /// The credential IS re-injected on a SAME-ORIGIN redirect (ordinary
+    /// upstream path normalization must not silently deauthenticate the call),
+    /// and both descriptor schemes behave identically.
+    #[tokio::test]
+    async fn the_credential_survives_a_same_origin_redirect_for_both_schemes() {
+        let (port, seen) = spawn_recording_server().await;
+        let url = format!("http://127.0.0.1:{port}/v1/redirect");
+        let (store, _tmp) = open_test_store().await;
+        seed_api_key(&store, "openai", "sk-bearer-key").await;
+        seed_api_key(&store, "anthropic", "sk-ant-key").await;
+        let ctx = ctx_for(store, "multi-provider", &["openai", "anthropic"]);
+
+        // `openai` => AuthScheme::Bearer.
+        let response = ProviderAuth::new(&ctx)
+            .authorized_request("openai", "GET", &url, vec![], None)
+            .await
+            .expect("a same-origin redirect must be followed");
+        assert_eq!(response.body, b"upstream-ok");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            SeenAuth {
+                authorization: Some("Bearer sk-bearer-key".to_string()),
+                x_api_key: None,
+            }
+        );
+
+        // `anthropic` => AuthScheme::XApiKey, same rule.
+        let response = ProviderAuth::new(&ctx)
+            .authorized_request("anthropic", "GET", &url, vec![], None)
+            .await
+            .expect("a same-origin redirect must be followed");
+        assert_eq!(response.body, b"upstream-ok");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            SeenAuth {
+                authorization: None,
+                x_api_key: Some("sk-ant-key".to_string()),
+            }
+        );
+    }
+
+    /// ...but the credential is DROPPED on a cross-origin hop the allowlist
+    /// still permits (`127.0.0.1:{a}` -> `127.0.0.1:{b}` — same allowlisted
+    /// host, different port => different origin, exactly the shape a `*.`
+    /// wildcard allowlist would produce across subdomains). Both schemes agree:
+    /// before this rule a bearer key was re-sent to the redirect target while
+    /// an `x-api-key` one was silently dropped.
+    #[tokio::test]
+    async fn the_credential_is_dropped_on_a_cross_origin_redirect_for_both_schemes() {
+        let (landing_port, seen) = spawn_recording_server().await;
+        let start_port =
+            spawn_redirecting_server(format!("http://127.0.0.1:{landing_port}/v1/chat")).await;
+        let url = format!("http://127.0.0.1:{start_port}/v1/chat");
+
+        let (store, _tmp) = open_test_store().await;
+        seed_api_key(&store, "openai", "sk-bearer-key").await;
+        seed_api_key(&store, "anthropic", "sk-ant-key").await;
+        let ctx = ctx_for(store, "multi-provider", &["openai", "anthropic"]);
+
+        for provider in ["openai", "anthropic"] {
+            let response = ProviderAuth::new(&ctx)
+                .authorized_request(provider, "GET", &url, vec![], None)
+                .await
+                .expect("the allowlisted cross-origin hop must still be followed");
+            // The landing recorder really was reached...
+            assert_eq!(response.body, b"upstream-ok");
+            // ...and saw no credential of either shape.
+            assert_eq!(
+                *seen.lock().unwrap(),
+                SeenAuth::default(),
+                "`{provider}`'s credential must not follow a redirect to another origin"
+            );
+        }
+    }
+
     /// `AuthScheme::None` providers (local endpoints like Ollama) need no
     /// credential at all: the request goes out unauthenticated rather than
-    /// failing as unconfigured — and a guest-forged credential header is still
-    /// stripped.
+    /// failing as unconfigured — over plain `http` too, since the TLS gate
+    /// applies only when a credential is actually injected — and a
+    /// guest-forged credential header is still stripped.
     #[tokio::test]
     async fn a_none_scheme_provider_needs_no_stored_credential() {
         let (port, seen) = spawn_recording_server().await;

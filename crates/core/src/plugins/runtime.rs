@@ -413,12 +413,13 @@ impl ComponentRuntime {
             .map(|profile| profile.id.clone())
             .collect();
         // The router provider ids this bundle is authorized to borrow a stored
-        // user API key for. `resolved_provider_ids` falls back to `[id]`, but
-        // the `provider-auth` import is only ever LINKED when the manifest
-        // declares the list explicitly (see `HostPolicy::allow_provider_auth`),
-        // so whenever this list is reachable by a guest it equals the
-        // explicitly-declared `provider-ids`.
-        let provider_ids = bundle.manifest.resolved_provider_ids();
+        // user API key for. ONE rule governs that authorization: the EXPLICIT
+        // manifest `provider-ids`, read from the same field
+        // `HostPolicy::allow_provider_auth` gates the capability grant on. The
+        // `[id]` fallback of `resolved_provider_ids` exists for transport
+        // registration and must never widen a credential grant, so it is
+        // deliberately not used here.
+        let provider_ids = bundle.manifest.provider_ids.clone();
         Ok(CompiledComponent {
             engine,
             component,
@@ -1928,11 +1929,9 @@ mod tests {
     /// because wasmtime satisfies an empty instance import trivially.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn instantiate_links_the_provider_auth_capability_by_full_interface_id() {
+        const FIXTURE: &str = "component-provider-auth-import";
         build_fixture_components();
-        let mut bundle = installed_fixture_bundle_with_network(
-            "component-provider-auth-import",
-            vec!["api.openai.com"],
-        );
+        let mut bundle = installed_fixture_bundle_with_network(FIXTURE, vec!["api.openai.com"]);
         bundle.manifest.provider_ids = vec!["openai".to_string()];
         let policy = HostPolicy::for_installed_bundle(&bundle);
         assert!(
@@ -1941,6 +1940,22 @@ mod tests {
         );
         let (ctx, _tmp) = test_ctx("acme").await;
         let runtime = ComponentRuntime::new().expect("runtime should configure");
+
+        // The fixture must actually IMPORT the interface, or the instantiation
+        // below would prove nothing about linking (mirrors the HTTP_IMPORT
+        // assertion in `real_fixture_components_expose_expected_wit_contracts`).
+        let component = Component::from_file(&runtime.engine, fixture_artifact(FIXTURE))
+            .expect("provider-auth fixture component should parse");
+        let imports: Vec<_> = component
+            .component_type()
+            .imports(&runtime.engine)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(
+            imports.iter().any(|name| name == PROVIDER_AUTH_IMPORT),
+            "the fixture must import {PROVIDER_AUTH_IMPORT}; got {imports:?}"
+        );
+
         runtime.instantiate(&bundle, policy, ctx).await.expect(
             "a component importing ryuzi:provider-auth must instantiate once the adapter is linked",
         );
@@ -2059,6 +2074,25 @@ mod tests {
             .compile(&bundle, HostPolicy::for_installed_bundle(&bundle))
             .expect("noop fixture should compile");
         assert_eq!(compiled.provider_ids, vec!["mimo-free".to_string()]);
+
+        // ONE rule governs the credential grant: the EXPLICIT manifest
+        // `provider-ids`. A bundle that declares none gets none — the
+        // `resolved_provider_ids` `[id]` fallback (for transport registration)
+        // must never seed a credential authorization set.
+        let undeclared = installed_fixture_bundle("component-noop");
+        assert!(undeclared.manifest.provider_ids.is_empty());
+        assert_eq!(
+            undeclared.manifest.resolved_provider_ids(),
+            vec![undeclared.manifest.id.clone()],
+            "the transport fallback still resolves to the bundle id"
+        );
+        let compiled = runtime
+            .compile(&undeclared, HostPolicy::for_installed_bundle(&undeclared))
+            .expect("noop fixture should compile");
+        assert!(
+            compiled.provider_ids.is_empty(),
+            "an undeclared bundle must carry no provider credential authorization"
+        );
     }
 
     #[test]

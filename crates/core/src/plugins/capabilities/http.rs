@@ -23,6 +23,15 @@
 //! first-party self-set `Authorization` is dropped on every redirect hop so
 //! it can never leak to a different origin, and never coexists with a
 //! host-injected OAuth bearer (see [`AllowedHttpClient::request_impl`]).
+//!
+//! # Host-injected credentials and redirects
+//! Capability adapters that authenticate ON BEHALF of a component (the OAuth
+//! bearer in `capabilities::oauth`, the provider API key in
+//! `capabilities::provider_auth`) hand their credential to
+//! [`AllowedHttpClient`] as an [`InjectedCredential`] rather than as an
+//! ordinary header, so ONE rule governs every shape of injected credential:
+//! it is applied only while the request is still on the origin the caller
+//! named. See [`AllowedHttpClient::request_impl`].
 
 use std::time::Duration;
 
@@ -66,6 +75,45 @@ pub enum HttpErr {
     Rejected,
     Unavailable,
     Failed(String),
+}
+
+/// Credential material the HOST injects into one outbound request — never
+/// anything a component supplied. Every variant is applied LAST (after the
+/// component's own, already-filtered headers) and under the identical
+/// same-origin redirect rule documented on
+/// [`AllowedHttpClient::request_impl`], so a bearer-authenticated upstream and
+/// a header-authenticated one cannot drift apart.
+pub(crate) enum InjectedCredential<'a> {
+    /// No host credential: the request goes out unauthenticated (and a
+    /// verified first-party bundle may then set its own `Authorization`).
+    None,
+    /// `Authorization: Bearer <token>` — host-managed OAuth tokens and
+    /// bearer-scheme provider keys.
+    Bearer(&'a str),
+    /// Literal credential headers, e.g. `x-api-key: <key>` for a provider
+    /// whose descriptor declares that scheme.
+    Headers(&'a [(String, String)]),
+}
+
+impl InjectedCredential<'_> {
+    /// `true` when the host injects no credential of its own for this request.
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// `true` when this credential itself supplies the (already lowercased)
+    /// header `name`, so a component-supplied copy must be dropped rather than
+    /// travel to the upstream alongside the host's value (`reqwest`'s builder
+    /// APPENDS headers, it does not replace them).
+    fn injects_header(&self, lowercase_name: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Bearer(_) => lowercase_name == "authorization",
+            Self::Headers(headers) => headers
+                .iter()
+                .any(|(name, _)| name.to_lowercase() == lowercase_name),
+        }
+    }
 }
 
 /// An adapter-local response: status, headers, and raw body bytes, mapped to
@@ -175,7 +223,8 @@ impl AllowedHttpClient {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
     ) -> Result<SafeHttpResponse, HttpErr> {
-        self.request_impl(method, url, headers, body, None).await
+        self.request_impl(method, url, headers, body, InjectedCredential::None)
+            .await
     }
 
     /// Host-trusted variant of [`Self::request`] for capability adapters
@@ -187,6 +236,9 @@ impl AllowedHttpClient {
     /// so a component cannot smuggle its own `Authorization` header past the
     /// strip by any ordering trick; the host's bearer always wins and is the
     /// only `Authorization` value that can ever reach the wire.
+    ///
+    /// The bearer is subject to the same-origin redirect rule described on
+    /// [`Self::request_impl`]: it is not re-sent to a hop on another origin.
     pub async fn request_with_bearer(
         &self,
         method: &str,
@@ -195,20 +247,75 @@ impl AllowedHttpClient {
         body: Option<Vec<u8>>,
         bearer: &str,
     ) -> Result<SafeHttpResponse, HttpErr> {
-        self.request_impl(method, url, headers, body, Some(bearer))
-            .await
+        self.request_impl(
+            method,
+            url,
+            headers,
+            body,
+            InjectedCredential::Bearer(bearer),
+        )
+        .await
     }
 
+    /// Host-trusted variant of [`Self::request`] for capability adapters whose
+    /// credential is carried by literal headers rather than a bearer — e.g.
+    /// `capabilities::provider_auth` injecting `x-api-key` for a provider whose
+    /// descriptor declares that scheme.
+    ///
+    /// `credential_headers` are applied last, after the component's own headers
+    /// (any component-supplied copy of one of those header names is dropped
+    /// first, so the host's value cannot be shadowed or duplicated), and under
+    /// the same same-origin redirect rule as [`Self::request_with_bearer`] —
+    /// see [`Self::request_impl`].
+    pub async fn request_with_credential_headers(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<Vec<u8>>,
+        credential_headers: &[(String, String)],
+    ) -> Result<SafeHttpResponse, HttpErr> {
+        self.request_impl(
+            method,
+            url,
+            headers,
+            body,
+            InjectedCredential::Headers(credential_headers),
+        )
+        .await
+    }
+
+    /// # Host-injected credentials across redirects
+    /// A host-injected credential — [`InjectedCredential::Bearer`] or
+    /// [`InjectedCredential::Headers`] — is applied ONLY while the request is
+    /// still on the origin the CALLER named: scheme, host, and port must all
+    /// still match (see [`same_origin`]). Concretely:
+    ///
+    /// - a same-origin redirect (`/v1/chat` → `/v1/chat/`, the ordinary
+    ///   path-normalization case) is re-issued WITH the credential, so an
+    ///   upstream that normalizes its own paths still authenticates;
+    /// - any other hop — a different host reached under a `*.` wildcard
+    ///   allowlist, a different port, or an `https` → `http` downgrade — is
+    ///   issued WITHOUT it, even though the allowlist may permit the host.
+    ///
+    /// Both injection shapes obey this identical rule. That is the point: the
+    /// allowlist answers "may the host be reached at all", which is a strictly
+    /// weaker question than "should the user's long-lived credential be handed
+    /// to it", and before this rule the two shapes disagreed (a bearer was
+    /// re-sent to every hop while an injected header was silently dropped,
+    /// turning a cross-origin redirect into either a credential leak or a
+    /// confusing upstream 401 depending only on the provider's auth scheme).
     async fn request_impl(
         &self,
         method: &str,
         url: &str,
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
-        bearer: Option<&str>,
+        credential: InjectedCredential<'_>,
     ) -> Result<SafeHttpResponse, HttpErr> {
         let mut current_url =
             url::Url::parse(url).map_err(|error| HttpErr::InvalidRequest(error.to_string()))?;
+        let credential_origin = current_url.clone();
         let mut current_method = method.to_string();
         let mut current_body = body;
         let mut current_headers = headers;
@@ -232,12 +339,12 @@ impl AllowedHttpClient {
                     // ONLY exception is a VERIFIED first-party bundle
                     // (`allow_self_auth`), and even then only on the INITIAL hop
                     // AND only when the host is not itself injecting a managed
-                    // OAuth bearer for this request (`bearer.is_none()`) — the
+                    // credential for this request (`credential.is_none()`) — the
                     // two auth sources must never both reach the wire. Redirect
                     // hops clear `current_headers` entirely (see the redirect
                     // branch below), so a self-set bearer is never carried
                     // across a redirect to another origin.
-                    if self.allow_self_auth && bearer.is_none() {
+                    if self.allow_self_auth && credential.is_none() {
                         builder = builder.header(name, value);
                     }
                     continue;
@@ -245,11 +352,28 @@ impl AllowedHttpClient {
                 if ALWAYS_STRIPPED_REQUEST_HEADERS.contains(&lower.as_str()) {
                     continue;
                 }
+                // A component copy of a header the host itself injects would be
+                // APPENDED alongside the host's value, not replaced by it.
+                if credential.injects_header(&lower) {
+                    continue;
+                }
                 builder = builder.header(name, value);
             }
-            if let Some(bearer) = bearer {
-                builder =
-                    builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
+            // The host credential is applied last and only on the origin the
+            // caller named — see this function's doc comment.
+            if same_origin(&credential_origin, &current_url) {
+                match credential {
+                    InjectedCredential::None => {}
+                    InjectedCredential::Bearer(bearer) => {
+                        builder = builder
+                            .header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
+                    }
+                    InjectedCredential::Headers(credential_headers) => {
+                        for (name, value) in credential_headers {
+                            builder = builder.header(name, value);
+                        }
+                    }
+                }
             }
             if let Some(bytes) = current_body.clone() {
                 builder = builder.body(bytes);
@@ -319,6 +443,20 @@ pub(crate) fn host_is_allowed(allowlist: &[String], host: &str) -> bool {
             host == entry
         }
     })
+}
+
+/// `true` when `a` and `b` share the same ORIGIN — same scheme, same host, and
+/// same effective port, with each scheme's default port filled in so
+/// `https://h/` and `https://h:443/` compare equal and an `https` → `http`
+/// downgrade never does. Host and scheme are compared case-insensitively.
+///
+/// This is deliberately stricter than the allowlist's host matching: the
+/// allowlist decides reachability, this decides whether a host-injected
+/// credential may travel — see [`AllowedHttpClient::request_impl`].
+fn same_origin(a: &url::Url, b: &url::Url) -> bool {
+    a.scheme().eq_ignore_ascii_case(b.scheme())
+        && a.host_str().map(str::to_lowercase) == b.host_str().map(str::to_lowercase)
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 /// Builds a [`SafeHttpResponse`] from a terminal (non-redirected, or
@@ -635,6 +773,174 @@ mod tests {
             response.body, b"no-auth",
             "a first-party self-set Authorization must be dropped on redirect"
         );
+    }
+
+    /// Echoes the `x-api-key` the server saw, or `no-key`.
+    async fn echo_api_key(headers: HeaderMap) -> impl IntoResponse {
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| format!("key:{v}"))
+            .unwrap_or_else(|| "no-key".to_string())
+    }
+
+    // A HOST-injected credential (either shape) IS re-applied on a SAME-ORIGIN
+    // redirect: the upstream is the same server the caller authenticated to, so
+    // an ordinary path normalization must not silently deauthenticate the
+    // request.
+    #[tokio::test]
+    async fn an_injected_credential_survives_a_same_origin_redirect_for_both_shapes() {
+        let app = Router::new()
+            .route("/start", get(|| async { Redirect::temporary("/landed") }))
+            .route("/landed", get(echo_authorization))
+            .route("/landed-key", get(echo_api_key))
+            .route(
+                "/start-key",
+                get(|| async { Redirect::temporary("/landed-key") }),
+            );
+        let port = spawn_server(app).await;
+        let client = AllowedHttpClient::new(vec!["127.0.0.1".to_string()]);
+
+        let bearer = client
+            .request_with_bearer(
+                "GET",
+                &format!("http://127.0.0.1:{port}/start"),
+                vec![],
+                None,
+                "host-token",
+            )
+            .await
+            .expect("the same-origin redirect must be followed");
+        assert_eq!(bearer.body, b"auth:Bearer host-token");
+
+        let keyed = client
+            .request_with_credential_headers(
+                "GET",
+                &format!("http://127.0.0.1:{port}/start-key"),
+                vec![],
+                None,
+                &[("x-api-key".to_string(), "host-key".to_string())],
+            )
+            .await
+            .expect("the same-origin redirect must be followed");
+        assert_eq!(keyed.body, b"key:host-key");
+    }
+
+    // ...but it is NOT re-applied on a CROSS-ORIGIN hop, even one the allowlist
+    // permits (here `127.0.0.1:{a}` -> `127.0.0.1:{b}`: same allowlisted host,
+    // different port => different origin). Both injection shapes must agree —
+    // before this rule the bearer was re-sent while an injected header was
+    // dropped.
+    #[tokio::test]
+    async fn an_injected_credential_is_dropped_on_a_cross_origin_redirect_for_both_shapes() {
+        let landing = Router::new()
+            .route("/landed", get(echo_authorization))
+            .route("/landed-key", get(echo_api_key));
+        let landing_port = spawn_server(landing).await;
+
+        let auth_target = format!("http://127.0.0.1:{landing_port}/landed");
+        let key_target = format!("http://127.0.0.1:{landing_port}/landed-key");
+        let start = Router::new()
+            .route(
+                "/start",
+                get(move || {
+                    let target = auth_target.clone();
+                    async move { Redirect::temporary(&target) }
+                }),
+            )
+            .route(
+                "/start-key",
+                get(move || {
+                    let target = key_target.clone();
+                    async move { Redirect::temporary(&target) }
+                }),
+            );
+        let start_port = spawn_server(start).await;
+
+        let client = AllowedHttpClient::new(vec!["127.0.0.1".to_string()]);
+
+        let bearer = client
+            .request_with_bearer(
+                "GET",
+                &format!("http://127.0.0.1:{start_port}/start"),
+                vec![],
+                None,
+                "host-token",
+            )
+            .await
+            .expect("the allowlisted cross-origin hop must still be followed");
+        assert_eq!(
+            bearer.body, b"no-auth",
+            "a host bearer must not follow a redirect to another origin"
+        );
+
+        let keyed = client
+            .request_with_credential_headers(
+                "GET",
+                &format!("http://127.0.0.1:{start_port}/start-key"),
+                vec![],
+                None,
+                &[("x-api-key".to_string(), "host-key".to_string())],
+            )
+            .await
+            .expect("the allowlisted cross-origin hop must still be followed");
+        assert_eq!(
+            keyed.body, b"no-key",
+            "an injected credential header must not follow a redirect to another origin"
+        );
+    }
+
+    // A component copy of a header the host itself injects is dropped rather
+    // than appended alongside the host's value (`reqwest` appends).
+    #[tokio::test]
+    async fn a_component_copy_of_an_injected_credential_header_is_dropped() {
+        let app = Router::new().route("/echo", get(echo_api_key));
+        let port = spawn_server(app).await;
+
+        let client = AllowedHttpClient::new(vec!["127.0.0.1".to_string()]);
+        let response = client
+            .request_with_credential_headers(
+                "GET",
+                &format!("http://127.0.0.1:{port}/echo"),
+                vec![("X-Api-Key".to_string(), "forged".to_string())],
+                None,
+                &[("x-api-key".to_string(), "host-key".to_string())],
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.body, b"key:host-key");
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_effective_port() {
+        let parse = |url: &str| url::Url::parse(url).expect("test url should parse");
+        assert!(same_origin(
+            &parse("https://api.example.com/a"),
+            &parse("https://api.example.com/b")
+        ));
+        assert!(
+            same_origin(
+                &parse("https://api.example.com/a"),
+                &parse("https://api.example.com:443/b")
+            ),
+            "the scheme's default port must be filled in"
+        );
+        assert!(
+            !same_origin(
+                &parse("https://api.example.com/a"),
+                &parse("http://api.example.com/a")
+            ),
+            "an https -> http downgrade is a different origin"
+        );
+        assert!(!same_origin(
+            &parse("https://api.example.com/a"),
+            &parse("https://other.example.com/a")
+        ));
+        assert!(!same_origin(
+            &parse("http://127.0.0.1:1234/a"),
+            &parse("http://127.0.0.1:5678/a")
+        ));
     }
 
     // Guardrail (d): self-auth does NOT widen the allowlist — a first-party

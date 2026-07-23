@@ -65,11 +65,19 @@ pub struct PluginCapabilityContext {
     /// OAuth profile IDs declared by the installed bundle. This prevents a
     /// component from selecting an undeclared same-plugin profile.
     pub oauth_profile_ids: Vec<String>,
-    /// LLM-router provider ids the installed bundle declares it serves
-    /// (`PluginBundleManifest::resolved_provider_ids`). This is the ONLY set
-    /// of providers whose stored user API key
+    /// LLM-router provider ids the installed bundle declares it serves. This
+    /// is the ONLY set of providers whose stored user API key
     /// [`provider_auth::ProviderAuth`] will inject on this bundle's behalf —
     /// it prevents a component from borrowing another provider's credential.
+    ///
+    /// For a guest-reachable context this is the EXPLICIT manifest
+    /// `provider-ids` (`ComponentRuntime::compile`), the same field
+    /// `HostPolicy::allow_provider_auth` gates the capability grant on, so one
+    /// rule governs both. Host-internal call sites that only need transport
+    /// registration may seed it from
+    /// `PluginBundleManifest::resolved_provider_ids` (which falls back to the
+    /// bundle id); that never widens a credential grant, because with no
+    /// declared `provider-ids` the capability is not linked at all.
     pub provider_ids: Vec<String>,
 }
 
