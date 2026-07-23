@@ -81,6 +81,10 @@ export const COMPONENTS: ComponentSpec[] = [
   { id: "nvidia", dir: "plugins/nvidia", crateWasmStem: "ryuzi_plugin_nvidia" },
   { id: "huggingface", dir: "plugins/huggingface", crateWasmStem: "ryuzi_plugin_huggingface" },
   { id: "google", dir: "plugins/google", crateWasmStem: "ryuzi_plugin_google" },
+  // Anthropic speaks the Messages wire format, not OpenAI-chat, so its bundle
+  // does NOT depend on `plugins/openai-format`; it is built identically all the
+  // same.
+  { id: "anthropic", dir: "plugins/anthropic", crateWasmStem: "ryuzi_plugin_anthropic" },
   { id: "github", dir: "plugins/github", crateWasmStem: "ryuzi_plugin_github" },
   { id: "discord", dir: "plugins/discord", crateWasmStem: "ryuzi_plugin_discord" },
   { id: "atlassian", dir: "plugins/atlassian", crateWasmStem: "ryuzi_plugin_atlassian" },

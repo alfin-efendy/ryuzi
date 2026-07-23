@@ -71,13 +71,15 @@ enum CompleteBehavior {
 
 /// A mock HTTP upstream the conformance harness points a provider transport
 /// at. Serves the fixture's model-list path (a caller-supplied success body)
-/// and its completion path (per [`CompleteBehavior`]), and records every
-/// `Authorization` header value it receives so the auth check can assert on
-/// exactly what reached the wire. Wire-agnostic: it serves whatever bytes the
-/// caller hands it, on whatever paths, and never parses them.
+/// and its completion path (per [`CompleteBehavior`]), and records every value
+/// it receives for the fixture's own CREDENTIAL header
+/// ([`ConformanceFixture::credential_header`] — `authorization` for a
+/// bearer-scheme provider, `x-api-key` for an Anthropic-scheme one) so the auth
+/// check can assert on exactly what reached the wire. Wire-agnostic: it serves
+/// whatever bytes the caller hands it, on whatever paths, and never parses them.
 struct MockUpstream {
     base_url: String,
-    seen_authorization: Arc<Mutex<Vec<String>>>,
+    seen_credential: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockUpstream {
@@ -86,28 +88,41 @@ impl MockUpstream {
     /// and return the running upstream. The paths come from the fixture
     /// because they are this provider's REAL endpoint paths relative to its
     /// base URL (`/models` + `/chat/completions` for an OpenAI-format
-    /// provider) — the component builds its own URLs, so the mock has to meet
-    /// it where it actually knocks.
-    async fn start(wire: &MockWireBodies, complete: CompleteBehavior) -> Self {
+    /// provider, `/models` + `/messages` for Anthropic) — the component builds
+    /// its own URLs, so the mock has to meet it where it actually knocks.
+    ///
+    /// `credential_header` is the header name whose values this upstream
+    /// records for the auth-absence check: the credential scheme is descriptor
+    /// DATA, so a bearer provider records `authorization` and an `x-api-key`
+    /// provider records `x-api-key`, without the checks below caring which.
+    async fn start(
+        wire: &MockWireBodies,
+        complete: CompleteBehavior,
+        credential_header: &str,
+    ) -> Self {
         let models_body = wire.models_body.clone();
-        let seen_authorization: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_credential: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let models_seen = seen_authorization.clone();
+        let models_seen = seen_credential.clone();
+        let models_header = credential_header.to_string();
         let models_route = get(move |headers: HeaderMap| {
             let seen = models_seen.clone();
+            let name = models_header.clone();
             let body = models_body.clone();
             async move {
-                record_authorization(&headers, &seen);
+                record_credential(&headers, &name, &seen);
                 (StatusCode::OK, body)
             }
         });
 
-        let complete_seen = seen_authorization.clone();
+        let complete_seen = seen_credential.clone();
+        let complete_header = credential_header.to_string();
         let complete_route = post(move |headers: HeaderMap| {
             let seen = complete_seen.clone();
+            let name = complete_header.clone();
             let behavior = complete.clone();
             async move {
-                record_authorization(&headers, &seen);
+                record_credential(&headers, &name, &seen);
                 match behavior {
                     CompleteBehavior::Body(body) => (StatusCode::OK, body),
                     CompleteBehavior::Status(status) => (
@@ -138,19 +153,21 @@ impl MockUpstream {
 
         MockUpstream {
             base_url: format!("http://{LOOPBACK_HOST}:{port}"),
-            seen_authorization,
+            seen_credential,
         }
     }
 
-    /// Every `Authorization` header value this upstream has received so far.
-    fn authorization_headers_seen(&self) -> Vec<String> {
-        self.seen_authorization.lock().unwrap().clone()
+    /// Every value this upstream has received for the fixture's credential
+    /// header so far.
+    fn credential_headers_seen(&self) -> Vec<String> {
+        self.seen_credential.lock().unwrap().clone()
     }
 }
 
-/// Record any `Authorization` header on an incoming mock request.
-fn record_authorization(headers: &HeaderMap, seen: &Arc<Mutex<Vec<String>>>) {
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
+/// Record any occurrence of the credential header `name` (case-insensitive) on
+/// an incoming mock request.
+fn record_credential(headers: &HeaderMap, name: &str, seen: &Arc<Mutex<Vec<String>>>) {
+    if let Some(value) = headers.get(name) {
         seen.lock()
             .unwrap()
             .push(value.to_str().unwrap_or("<non-utf8>").to_string());
@@ -212,17 +229,22 @@ pub(crate) struct ProviderExpectations {
     /// on the wire, per [`Self::expected_authorization`] — always runs
     /// regardless of this field.
     pub guest_forged_secret: Option<&'static str>,
-    /// The ONLY `Authorization` value the mock upstream may observe.
+    /// The ONLY value the mock upstream may observe for the fixture's
+    /// credential header ([`ConformanceFixture::credential_header`] —
+    /// `authorization` for a bearer provider, `x-api-key` for an
+    /// Anthropic-scheme one).
     ///
     /// `None` — the component authenticates through plain `ryuzi:http`, so no
-    /// `Authorization` may reach the upstream at all: the host strips whatever
+    /// credential header may reach the upstream at all: the host strips whatever
     /// the guest sets, and the check asserts the mock saw none.
     ///
     /// `Some(value)` — the component authenticates through
     /// `ryuzi:provider-auth`, so the HOST puts the user's stored credential on
-    /// the wire. The check then asserts every observed header equals exactly
-    /// this host-injected value, which is the same guarantee stated the other
-    /// way round: nothing a guest could contribute ever appears.
+    /// the wire (a bearer provider's value is `Bearer <key>`; an `x-api-key`
+    /// provider's is the bare key). The check then asserts every observed value
+    /// equals exactly this host-injected one, which is the same guarantee
+    /// stated the other way round: nothing a guest could contribute ever
+    /// appears.
     pub expected_authorization: Option<&'static str>,
 }
 
@@ -251,6 +273,12 @@ pub(crate) struct ConformanceFixture {
     /// host-mediated (an API-key provider); `None` for one that reaches the
     /// upstream through plain `ryuzi:http`.
     pub stored_api_key: Option<&'static str>,
+    /// The request header the mock upstream watches for this component's
+    /// host-injected credential — `authorization` for a bearer-scheme provider,
+    /// `x-api-key` for an Anthropic-scheme one. Derived from the descriptor's
+    /// `AuthScheme`, the same DATA the host keys its injection off, so the
+    /// auth-absence check need not know which provider it is running.
+    pub credential_header: String,
     pub wire: MockWireBodies,
     pub expect: ProviderExpectations,
 }
@@ -336,6 +364,7 @@ impl ProviderConformance {
         let mock = MockUpstream::start(
             &self.fixture.wire,
             CompleteBehavior::Body(self.fixture.wire.complete_success_body.clone()),
+            &self.fixture.credential_header,
         )
         .await;
         let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
@@ -358,6 +387,7 @@ impl ProviderConformance {
         let mock = MockUpstream::start(
             &self.fixture.wire,
             CompleteBehavior::Body(self.fixture.wire.complete_success_body.clone()),
+            &self.fixture.credential_header,
         )
         .await;
         let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
@@ -396,15 +426,16 @@ impl ProviderConformance {
 
     /// (4) Auth absence: nothing a GUEST contributes can reach the wire as a
     /// credential. For a plain-`ryuzi:http` component that means the mock
-    /// upstream sees no `Authorization` at all (the host strips the one the
+    /// upstream sees no credential header at all (the host strips the one the
     /// guest forges); for a `ryuzi:provider-auth` component it means the only
-    /// value the mock ever sees is the host-injected one
-    /// ([`ProviderExpectations::expected_authorization`]). Either way the guest
-    /// must never surface a credential in its output.
+    /// value the mock ever sees for the fixture's credential header is the
+    /// host-injected one ([`ProviderExpectations::expected_authorization`]).
+    /// Either way the guest must never surface a credential in its output.
     pub(crate) async fn assert_strips_guest_authorization(&self) {
         let mock = MockUpstream::start(
             &self.fixture.wire,
             CompleteBehavior::Body(self.fixture.wire.complete_success_body.clone()),
+            &self.fixture.credential_header,
         )
         .await;
         let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
@@ -414,18 +445,18 @@ impl ProviderConformance {
             .await
             .expect("complete over mocked HTTP must succeed");
 
-        let seen = mock.authorization_headers_seen();
+        let seen = mock.credential_headers_seen();
         match self.fixture.expect.expected_authorization {
             None => assert!(
                 seen.is_empty(),
-                "the guest's Authorization must be stripped before it reaches \
+                "the guest's credential header must be stripped before it reaches \
                  the upstream, but the mock saw: {seen:?}",
             ),
             Some(expected) => {
                 assert!(
                     !seen.is_empty(),
                     "the host must have injected the stored credential, but the \
-                     mock saw no Authorization at all",
+                     mock saw no credential header at all",
                 );
                 assert!(
                     seen.iter().all(|value| value == expected),
@@ -454,9 +485,12 @@ impl ProviderConformance {
     /// substring (e.g. a `429` to rate-limited, a `5xx` to unavailable).
     pub(crate) async fn assert_maps_http_errors(&self) {
         for case in &self.fixture.expect.http_error_cases {
-            let mock =
-                MockUpstream::start(&self.fixture.wire, CompleteBehavior::Status(case.status))
-                    .await;
+            let mock = MockUpstream::start(
+                &self.fixture.wire,
+                CompleteBehavior::Status(case.status),
+                &self.fixture.credential_header,
+            )
+            .await;
             let (transport, _tmp) = self.transport(&mock, Duration::from_secs(10)).await;
             let error = transport
                 .complete(self.completion_request())
@@ -478,7 +512,12 @@ impl ProviderConformance {
     /// budget (its HTTP timeout, and the epoch budget behind it) and surfaces
     /// promptly as `Err` — never a hang or panic.
     pub(crate) async fn assert_maps_timeouts(&self) {
-        let mock = MockUpstream::start(&self.fixture.wire, CompleteBehavior::Stall).await;
+        let mock = MockUpstream::start(
+            &self.fixture.wire,
+            CompleteBehavior::Stall,
+            &self.fixture.credential_header,
+        )
+        .await;
         let budget = Duration::from_millis(600);
         let (transport, _tmp) = self.transport(&mock, budget).await;
 
@@ -543,6 +582,9 @@ fn synthetic_fixture_conformance() -> ConformanceFixture {
         base_url_storage_key: "conformance-base-url".to_string(),
         // Plain `ryuzi:http` egress: no provider-auth grant, no stored key.
         stored_api_key: None,
+        // No credential is injected at all, so the header watched here is
+        // immaterial — `authorization` matches what a guest would forge.
+        credential_header: "authorization".to_string(),
         wire: MockWireBodies {
             models_path: "/models".to_string(),
             models_body: MODELS_BODY.to_string(),
@@ -688,6 +730,9 @@ impl OpenAiFormatFixture {
             request_model: self.request_model.to_string(),
             base_url_storage_key: OPENAI_FORMAT_BASE_URL_KEY.to_string(),
             stored_api_key: Some(self.stored_api_key),
+            // Every OpenAI-format descriptor here declares `AuthScheme::Bearer`,
+            // so the host injects the credential as `Authorization: Bearer …`.
+            credential_header: "authorization".to_string(),
             wire: MockWireBodies {
                 models_path: OPENAI_FORMAT_MODELS_PATH.to_string(),
                 models_body: self.models_body.to_string(),
@@ -1139,11 +1184,21 @@ fn assert_bundle_is_declared_like_its_provider(
 /// `default_base_url`, if any — the base URL that component will really send
 /// to when the user has set no override. Source-text extraction, because these
 /// bundles are separate workspaces the engine crate cannot link against.
+///
+/// Matches the ASSIGNMENT — a `default_base_url:` directly followed by a string
+/// literal — not the struct FIELD DEFINITION (`default_base_url: &'static str`),
+/// which the Anthropic component declares inline in the same file. The
+/// assignment is the first `default_base_url:` whose next non-space character
+/// opens a quoted string.
 fn configured_default_base_url(logic: &str) -> Option<&str> {
-    let assignment = logic.split("default_base_url:").nth(1)?;
-    let (_, after_open_quote) = assignment.split_once('"')?;
-    let (value, _) = after_open_quote.split_once('"')?;
-    Some(value)
+    logic
+        .split("default_base_url:")
+        .skip(1)
+        .find_map(|segment| {
+            let literal = segment.trim_start().strip_prefix('"')?;
+            let (value, _) = literal.split_once('"')?;
+            Some(value)
+        })
 }
 
 #[test]
@@ -1154,4 +1209,150 @@ fn every_ported_provider_bundle_declares_provider_auth_and_only_its_own_host() {
         // Every OpenAI-format descriptor ported so far declares Bearer auth.
         assert_bundle_is_declared_like_its_provider(fixture.provider_id, AuthScheme::Bearer);
     }
+
+    // Anthropic speaks a different wire format (`ApiFormat::Anthropic`) but is
+    // held to the identical bundle-DECLARATION contract — explicit
+    // `provider-ids`, a one-host allowlist matching its descriptor base URL, and
+    // that full base URL (path included) in its `logic.rs`. Its only difference
+    // here is the auth scheme: `x-api-key`, not bearer.
+    assert_bundle_is_declared_like_its_provider("anthropic", AuthScheme::XApiKey);
+}
+
+// ---------------------------------------------------------------------------
+// The `anthropic` provider component (plan Task 16c4, Step C)
+//
+// The SAME six checks, driven through the SAME `ProviderConformance` harness —
+// but Anthropic's `/messages` wire format, not OpenAI-chat. That is the point
+// of the Step 1 parameterization: a different format is a different
+// `ConformanceFixture` (different wire bodies, `/messages` path, `x-api-key`
+// credential header), never another copy of the checks.
+// ---------------------------------------------------------------------------
+
+/// The user API key this run stores for `anthropic`. `ryuzi:provider-auth`
+/// resolves it host-side and injects it as `x-api-key` (the `anthropic`
+/// descriptor declares `AuthScheme::XApiKey`), so the component itself never
+/// sees this value — and, unlike a bearer provider, the header the mock watches
+/// carries the BARE key, not a `Bearer …` wrapper.
+const ANTHROPIC_STORED_API_KEY: &str = "sk-ant-conformance-key";
+
+/// The literal `GET /models` body Anthropic's endpoint serves: typed `model`
+/// entries with a `display_name` the component must PREFER over the id (the
+/// OpenAI-format listing has no such field). Served opus-first, i.e. not sorted,
+/// so the battery's order assertion is not satisfied by an accidental sort.
+const ANTHROPIC_MODELS_BODY: &str = r#"{"data":[
+  {"type":"model","id":"claude-opus-4-5","display_name":"Claude Opus 4.5","created_at":"2025-01-01T00:00:00Z"},
+  {"type":"model","id":"claude-haiku-4-5","display_name":"Claude Haiku 4.5","created_at":"2025-01-01T00:00:00Z"}
+],"has_more":false}"#;
+
+/// The literal `POST /messages` (non-stream) body Anthropic serves: a `content`
+/// array of typed blocks (NOT `choices[]`) and `usage.input_tokens`/
+/// `output_tokens` (NOT `prompt_`/`completion_tokens`). A leading `thinking`
+/// block is included to prove the component skips it and never surfaces private
+/// reasoning as the completion.
+const ANTHROPIC_MESSAGE_BODY: &str = r#"{
+  "id":"msg_conformance",
+  "type":"message",
+  "role":"assistant",
+  "model":"claude-opus-4-5",
+  "content":[
+    {"type":"thinking","thinking":"private chain of thought"},
+    {"type":"text","text":"considered reply"}
+  ],
+  "stop_reason":"end_turn",
+  "usage":{"input_tokens":43,"output_tokens":29}
+}"#;
+
+/// The `anthropic` component's built artifact. Like every `plugins/<id>`, a
+/// standalone workspace crate whose cargo output is the crate name with `-`
+/// replaced by `_`.
+fn anthropic_artifact() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/anthropic/target/wasm32-wasip2/release")
+        .join("ryuzi_plugin_anthropic.wasm")
+}
+
+/// The `anthropic` conformance fixture: Anthropic-Messages wire bodies, the
+/// `/models` + `/messages` endpoint paths, the shared base-URL override key, and
+/// the `x-api-key` credential header the host injects for this scheme.
+fn anthropic_conformance() -> ConformanceFixture {
+    ConformanceFixture {
+        artifact: anthropic_artifact(),
+        provider_id: "anthropic".to_string(),
+        request_model: "claude-opus-4-5".to_string(),
+        base_url_storage_key: OPENAI_FORMAT_BASE_URL_KEY.to_string(),
+        stored_api_key: Some(ANTHROPIC_STORED_API_KEY),
+        // `AuthScheme::XApiKey`: the host injects the bare key as `x-api-key`,
+        // so that — not `authorization` — is the header the mock watches.
+        credential_header: "x-api-key".to_string(),
+        wire: MockWireBodies {
+            models_path: "/models".to_string(),
+            models_body: ANTHROPIC_MODELS_BODY.to_string(),
+            // ApiFormat::Anthropic generates at `/messages`, not
+            // `/chat/completions`.
+            complete_path: "/messages".to_string(),
+            complete_success_body: ANTHROPIC_MESSAGE_BODY.to_string(),
+        },
+        expect: ProviderExpectations {
+            // Display names come from the `/models` body, NOT the id — the one
+            // place Anthropic's listing carries more than the OpenAI shape.
+            models: vec![
+                WasmModelInfo {
+                    id: "claude-opus-4-5".to_string(),
+                    display_name: "Claude Opus 4.5".to_string(),
+                    context_window: 128_000,
+                },
+                WasmModelInfo {
+                    id: "claude-haiku-4-5".to_string(),
+                    display_name: "Claude Haiku 4.5".to_string(),
+                    context_window: 128_000,
+                },
+            ],
+            // Flat-text ABI + a buffered upstream: one terminal chunk, carrying
+            // only the first text block (the thinking block is dropped).
+            chunk_texts: vec!["considered reply"],
+            final_text: "considered reply",
+            terminal_usage: Some(WasmTokenUsage {
+                input: 43,
+                output: 29,
+            }),
+            http_error_cases: vec![
+                HttpErrorCase {
+                    status: 429,
+                    expected_substring: "rate limited",
+                },
+                HttpErrorCase {
+                    status: 503,
+                    expected_substring: "unavailable",
+                },
+                // A 4xx that is NOT a not-found stays an invalid-request
+                // carrying only the status — never the upstream message.
+                HttpErrorCase {
+                    status: 400,
+                    expected_substring: "HTTP 400",
+                },
+            ],
+            timeout_error_substrings: vec![
+                "failed",
+                "timeout",
+                "timed out",
+                "budget",
+                "unavailable",
+            ],
+            // The component sets no credential header of its own — it has no
+            // `ryuzi:http` import to set one with — so there is no forged secret
+            // to look for.
+            guest_forged_secret: None,
+            // ...and the ONLY value the mock may see for `x-api-key` is the
+            // host-injected bare key.
+            expected_authorization: Some(ANTHROPIC_STORED_API_KEY),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_component_passes_the_full_conformance_battery() {
+    crate::plugins::build_provider_component_once("anthropic");
+    ProviderConformance::new(anthropic_conformance())
+        .run_full_battery()
+        .await;
 }
