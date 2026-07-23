@@ -1,0 +1,25 @@
+package ryuzi:qwen@0.1.0;
+
+// The narrow world the Qwen Code (OAuth) provider component targets.
+//
+// It deliberately imports NEITHER `ryuzi:http/http` NOR
+// `ryuzi:provider-auth/provider-auth`: this is an OAUTH provider, not an
+// API-key one. Every byte of egress goes through `ryuzi:oauth/oauth`'s
+// `authorized-request`, so the HOST looks up the user's stored Qwen access
+// token for the `qwen` profile, injects it as the `Authorization: Bearer`
+// header (stripping any the component set), and hands the component only the
+// upstream response. The access/refresh tokens never cross into the guest, and
+// the guest has no unauthenticated escape hatch to the network either.
+//
+// `ryuzi:storage/storage` carries the OPTIONAL base-URL override (see
+// `ryuzi_openai_format::BASE_URL_STORAGE_KEY`) used both by compatible gateways
+// and by the provider conformance harness's mock upstream.
+//
+// The build materializes `wit/deps/` from the SDK the same way the other
+// bundles do (see crates/core/tests/fixtures/build-provider-component.sh).
+world qwen {
+  import ryuzi:plugin/types@0.1.0;
+  import ryuzi:oauth/oauth@0.2.0;
+  import ryuzi:storage/storage@0.1.0;
+  export ryuzi:provider/provider@0.1.0;
+}

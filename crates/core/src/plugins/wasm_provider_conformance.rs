@@ -1661,3 +1661,271 @@ fn anthropic_oauth_bundle_is_declared_like_its_oauth_provider() {
         logic_path.display(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `qwen` provider component (plan Task 16c6, Step C)
+//
+// The SAME six checks, driven through the SAME `ProviderConformance` harness —
+// the OAUTH egress path (like `anthropic-oauth`), but OpenAI-chat wire (like the
+// API-key components), and a SEEDED model list rather than a `/models` fetch
+// (`qwen`'s descriptor sets `has_models_endpoint: false`). Nothing below touches
+// the harness itself — qwen is one more `ConformanceFixture` whose `oauth_profile`
+// is `Some`, which is the point of the Step 1 parameterization + the 16c5 OAuth
+// extension.
+// ---------------------------------------------------------------------------
+
+/// The OAuth access token this run seeds for the `qwen` profile. `ryuzi:oauth`
+/// resolves it host-side and injects it as `Authorization: Bearer <token>`, so
+/// the component itself never sees this value — and the auth-absence check
+/// asserts the mock upstream saw EXACTLY this (the guest has no `ryuzi:http` to
+/// forge one with anyway).
+const QWEN_OAUTH_SEEDED_TOKEN: &str = "qwen-oauth-access-token-conformance";
+
+/// A DECOY `/models` body: `qwen` seeds its model list (`has_models_endpoint:
+/// false`), so `list-models` must NOT fetch this. If the component wrongly
+/// fetched, its result would be these ids and the seeded-models assertion below
+/// would fail loudly — that is the point of serving a decoy rather than the real
+/// seed here.
+const QWEN_DECOY_MODELS_BODY: &str =
+    r#"{"object":"list","data":[{"id":"decoy-should-not-be-fetched","object":"model"}]}"#;
+
+/// The `qwen` component's built artifact — a standalone workspace crate whose
+/// cargo output is the crate name with `-` replaced by `_`.
+fn qwen_artifact() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/qwen/target/wasm32-wasip2/release")
+        .join("ryuzi_plugin_qwen.wasm")
+}
+
+/// The `qwen` conformance fixture: OpenAI-chat wire bodies on the
+/// `/chat/completions` path, the shared base-URL override key, an `oauth_profile`
+/// that grants `ryuzi:oauth` + a seeded token, and a SEEDED model expectation
+/// (the descriptor's four models, each at the conservative default window) that
+/// the component returns WITHOUT fetching the decoy `/models` route.
+fn qwen_conformance() -> ConformanceFixture {
+    ConformanceFixture {
+        artifact: qwen_artifact(),
+        provider_id: "qwen".to_string(),
+        request_model: "qwen3-coder-plus".to_string(),
+        base_url_storage_key: OPENAI_FORMAT_BASE_URL_KEY.to_string(),
+        // OAuth, not `ryuzi:provider-auth`: no stored API key.
+        stored_api_key: None,
+        // The descriptor declares `AuthScheme::Bearer`, and the host injects the
+        // OAuth token as `Authorization: Bearer …`, so `authorization` is the
+        // header the mock watches.
+        credential_header: "authorization".to_string(),
+        oauth_profile: Some(OAuthProfileSeed {
+            // Matches the manifest `[[oauth]]` id, the router provider id, and
+            // `logic::OAUTH_PROFILE`. A drift is a hard `denied`.
+            profile_id: "qwen",
+            access_token: QWEN_OAUTH_SEEDED_TOKEN,
+        }),
+        wire: MockWireBodies {
+            // Served but never fetched — qwen seeds. The decoy proves it.
+            models_path: "/models".to_string(),
+            models_body: QWEN_DECOY_MODELS_BODY.to_string(),
+            // ApiFormat::OpenAi, chat_path None -> `/chat/completions`, the same
+            // path the native `oauth_upstream_request` qwen arm POSTs to.
+            complete_path: "/chat/completions".to_string(),
+            complete_success_body: completion_body!("qwen coded reply", 19, 13).to_string(),
+        },
+        expect: ProviderExpectations {
+            // The SEEDED list, from the descriptor's `models`, in order — each at
+            // the conservative default window (qwen pins no per-model windows),
+            // id doubling as display name. NOT the decoy `/models` body.
+            models: vec![
+                WasmModelInfo {
+                    id: "qwen3-coder-plus".to_string(),
+                    display_name: "qwen3-coder-plus".to_string(),
+                    context_window: 128_000,
+                },
+                WasmModelInfo {
+                    id: "qwen3-coder-flash".to_string(),
+                    display_name: "qwen3-coder-flash".to_string(),
+                    context_window: 128_000,
+                },
+                WasmModelInfo {
+                    id: "vision-model".to_string(),
+                    display_name: "vision-model".to_string(),
+                    context_window: 128_000,
+                },
+                WasmModelInfo {
+                    id: "coder-model".to_string(),
+                    display_name: "coder-model".to_string(),
+                    context_window: 128_000,
+                },
+            ],
+            // Flat-text ABI + a buffered upstream: one terminal chunk.
+            chunk_texts: vec!["qwen coded reply"],
+            final_text: "qwen coded reply",
+            terminal_usage: Some(WasmTokenUsage {
+                input: 19,
+                output: 13,
+            }),
+            http_error_cases: vec![
+                HttpErrorCase {
+                    status: 429,
+                    expected_substring: "rate limited",
+                },
+                HttpErrorCase {
+                    status: 503,
+                    expected_substring: "unavailable",
+                },
+                // A 4xx that is NOT a model-not-found stays an invalid-request
+                // carrying only the status — never the upstream message. The host
+                // passes a non-2xx upstream status straight through
+                // `authorized-request`, so this exercises the SAME
+                // `classify_error` mapping as the API-key path.
+                HttpErrorCase {
+                    status: 400,
+                    expected_substring: "HTTP 400",
+                },
+            ],
+            timeout_error_substrings: vec![
+                "failed",
+                "timeout",
+                "timed out",
+                "budget",
+                "unavailable",
+            ],
+            // No `ryuzi:http`, no `ryuzi:provider-auth`, only host-mediated
+            // `ryuzi:oauth` — so there is no forged secret to look for.
+            guest_forged_secret: None,
+            // ...and the ONLY value the mock may see for `authorization` is the
+            // HOST-injected bearer built from the seeded OAuth token.
+            expected_authorization: Some("Bearer qwen-oauth-access-token-conformance"),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qwen_component_passes_the_full_conformance_battery() {
+    crate::plugins::build_provider_component_once("qwen");
+    ProviderConformance::new(qwen_conformance())
+        .run_full_battery()
+        .await;
+}
+
+/// The battery proves the `qwen` component BEHAVES like its provider. This
+/// proves its bundle is DECLARED like one — the device-grant analogue of
+/// [`anthropic_oauth_bundle_is_declared_like_its_oauth_provider`]. `qwen` is an
+/// OAuth provider whose credential comes from an RFC 8628 device-authorization
+/// GRANT (`device_grant: QWEN_DEVICE_GRANT`), not a redirect+PKCE `OAuthConfig`,
+/// so the hosts its profile authenticates against are the grant's device-code +
+/// token endpoints, and it advertises a SEEDED model list
+/// (`has_models_endpoint: false`).
+#[test]
+fn qwen_bundle_is_declared_like_its_device_grant_oauth_provider() {
+    use crate::llm_router::registry::{self, ApiFormat, ProviderCategory};
+    use ryuzi_plugin_sdk::PluginBundleManifest;
+
+    let id = "qwen";
+    let descriptor =
+        registry::descriptor(id).unwrap_or_else(|| panic!("{id} must exist in the router catalog"));
+
+    // The descriptor facts this component was built from: an OAuth provider,
+    // OpenAI-chat wire, with NO live `/models` endpoint (so a seeded list).
+    assert_eq!(
+        descriptor.category,
+        ProviderCategory::OAuth,
+        "{id} category"
+    );
+    assert_eq!(descriptor.format, ApiFormat::OpenAi, "{id} wire format");
+    assert!(
+        !descriptor.has_models_endpoint,
+        "{id} has no live /models endpoint — its component advertises a seeded list",
+    );
+    assert_eq!(descriptor.chat_path, None, "{id} chat_path");
+
+    // A device-authorization grant, not a redirect+PKCE OAuthConfig.
+    let grant = registry::device_grant_config(id)
+        .unwrap_or_else(|| panic!("{id} must declare a DeviceGrantConfig"));
+
+    // The hosts the manifest may allowlist: the API base host plus the grant's
+    // device-code + token hosts the profile authenticates against — nothing wider.
+    let host_of = |raw: &str| {
+        url::Url::parse(raw)
+            .unwrap_or_else(|e| panic!("{id} url {raw}: {e}"))
+            .host_str()
+            .unwrap_or_else(|| panic!("{id} url {raw} has no host"))
+            .to_string()
+    };
+    let base_url = descriptor
+        .base_url
+        .unwrap_or_else(|| panic!("{id} must declare a base_url to allowlist"));
+    let mut expected_hosts = std::collections::BTreeSet::new();
+    expected_hosts.insert(host_of(base_url));
+    expected_hosts.insert(host_of(grant.device_code_url));
+    expected_hosts.insert(host_of(grant.token_url));
+
+    let bundle_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins")
+        .join(id);
+    let path = bundle_dir.join("ryuzi-plugin.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let manifest: PluginBundleManifest =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("{id} manifest: {e}"));
+    manifest
+        .validate()
+        .unwrap_or_else(|e| panic!("{id} manifest is invalid: {e}"));
+
+    assert_eq!(manifest.id, id, "bundle id");
+    assert_eq!(
+        manifest.provider_ids,
+        vec![id.to_string()],
+        "{id} must declare provider-ids EXPLICITLY so the router registers its \
+         transport under that id",
+    );
+    // Exactly one `[[oauth]]` profile, whose id equals the string the component
+    // passes to `authorized-request` (and the router provider id).
+    assert_eq!(manifest.oauth.len(), 1, "{id} declares one oauth profile");
+    assert_eq!(
+        manifest.oauth[0].id, id,
+        "{id} oauth profile id must equal the provider id the guest requests",
+    );
+    // The profile's token-url + scopes are transcribed from the device grant.
+    assert_eq!(
+        manifest.oauth[0].token_url.as_deref(),
+        Some(grant.token_url),
+        "{id} oauth token-url must be the device grant's token endpoint",
+    );
+    let expected_scopes: Vec<String> = grant.scope.split(' ').map(str::to_string).collect();
+    assert_eq!(
+        manifest.oauth[0].scopes, expected_scopes,
+        "{id} oauth scopes must be the device grant's scope, space-split",
+    );
+    let hosts: std::collections::BTreeSet<String> = manifest
+        .permissions
+        .network
+        .iter()
+        .map(|host| host.0.clone())
+        .collect();
+    assert_eq!(
+        hosts, expected_hosts,
+        "{id} must allowlist exactly the API host plus the device grant's \
+         device-code/token hosts ({expected_hosts:?}) — a wider allowlist widens \
+         where a request may travel",
+    );
+
+    // The full base URL — scheme, host AND path — as the component transcribed it
+    // into its own `logic.rs`, read from source text because the bundle is a
+    // separate workspace this crate cannot link. The allowlist check matches on
+    // HOST only and the battery overrides the base URL through storage, so a wrong
+    // PATH escapes every other gate here.
+    let logic_path = bundle_dir.join("src/logic.rs");
+    let logic = std::fs::read_to_string(&logic_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", logic_path.display()));
+    let configured = configured_default_base_url(&logic).unwrap_or_else(|| {
+        panic!(
+            "{} must assign a string literal to `default_base_url`",
+            logic_path.display()
+        )
+    });
+    assert_eq!(
+        configured,
+        base_url,
+        "{} configures base URL {configured:?} but the {id} descriptor says \
+         {base_url:?}",
+        logic_path.display(),
+    );
+}
