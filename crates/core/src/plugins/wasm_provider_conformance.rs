@@ -981,6 +981,11 @@ async fn huggingface_component_passes_the_full_conformance_battery() {
 
 /// Every OpenAI-format provider bundle ported so far, for the manifest audit
 /// below. Kept next to the fixtures so a new provider is added in one place.
+///
+/// HAND-MAINTAINED, and that is its one blind spot: the audit iterates this
+/// list, not `plugins/`, so a bundle added under `plugins/<id>/` WITHOUT a
+/// fixture here is audited by nothing — its manifest, allowlist and base URL go
+/// unchecked. Adding a provider means adding it here in the same change.
 const OPENAI_FORMAT_FIXTURES: &[&OpenAiFormatFixture] = &[
     &OPENAI_FIXTURE,
     &OPENROUTER_FIXTURE,
@@ -1005,67 +1010,120 @@ const OPENAI_FORMAT_FIXTURES: &[&OpenAiFormatFixture] = &[
 ///   provider's OWN `ProviderDescriptor::base_url` — so the user's key can only
 ///   travel to the endpoint the router itself would have used.
 ///
-/// It also re-checks the descriptor facts this whole slice assumes: an API-key,
-/// bearer-authenticated provider with a live `/models` endpoint. A descriptor
-/// that drifts away from those makes its component wrong, and this fails first.
-#[test]
-fn every_ported_provider_bundle_declares_provider_auth_and_only_its_own_host() {
-    use crate::llm_router::registry::{self, AuthScheme, ProviderCategory};
+/// ...and the component's own `src/logic.rs` must carry the descriptor's FULL
+/// `base_url`, PATH included. The allowlist check above matches on host only,
+/// and the conformance battery always overrides the base URL through storage to
+/// reach its mock, so a mistranscribed path (dropping groq's `/openai` segment,
+/// say) would otherwise satisfy every other gate in this file and only fail
+/// against the live upstream.
+///
+/// It also re-checks the descriptor facts this whole slice assumes: an API-key
+/// provider, with the expected auth scheme, and a live `/models` endpoint. A
+/// descriptor that drifts away from those makes its component wrong, and this
+/// fails first.
+fn assert_bundle_is_declared_like_its_provider(
+    id: &str,
+    expected_auth: crate::llm_router::registry::AuthScheme,
+) {
+    use crate::llm_router::registry::{self, ProviderCategory};
     use ryuzi_plugin_sdk::PluginBundleManifest;
 
+    let descriptor =
+        registry::descriptor(id).unwrap_or_else(|| panic!("{id} must exist in the router catalog"));
+    let base_url = descriptor
+        .base_url
+        .unwrap_or_else(|| panic!("{id} must declare a base_url to allowlist"));
+    let expected_host = url::Url::parse(base_url)
+        .unwrap_or_else(|e| panic!("{id} base_url {base_url}: {e}"))
+        .host_str()
+        .unwrap_or_else(|| panic!("{id} base_url {base_url} has no host"))
+        .to_string();
+
+    // The descriptor facts this component was built from.
+    assert_eq!(
+        descriptor.category,
+        ProviderCategory::ApiKey,
+        "{id} category"
+    );
+    assert_eq!(descriptor.auth, expected_auth, "{id} auth scheme");
+    assert!(descriptor.has_models_endpoint, "{id} has_models_endpoint");
+    assert_eq!(descriptor.chat_path, None, "{id} chat_path");
+
+    let bundle_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins")
+        .join(id);
+    let path = bundle_dir.join("ryuzi-plugin.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let manifest: PluginBundleManifest =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("{id} manifest: {e}"));
+    manifest
+        .validate()
+        .unwrap_or_else(|e| panic!("{id} manifest is invalid: {e}"));
+
+    assert_eq!(manifest.id, id, "bundle id");
+    assert_eq!(
+        manifest.provider_ids,
+        vec![id.to_string()],
+        "{id} must declare provider-ids EXPLICITLY — the [id] fallback does \
+         not grant ryuzi:provider-auth",
+    );
+    let hosts: Vec<&str> = manifest
+        .permissions
+        .network
+        .iter()
+        .map(|host| host.0.as_str())
+        .collect();
+    assert_eq!(
+        hosts,
+        vec![expected_host.as_str()],
+        "{id} must allowlist exactly the host of its descriptor's base_url \
+         ({base_url}) — a wider allowlist widens where the user's key may go",
+    );
+
+    // The full base URL — scheme, host AND path — as the component transcribed
+    // it. Read out of the source text rather than through the config constant
+    // because each `plugins/<id>` is a separate workspace this crate cannot
+    // link. Deliberately the assigned VALUE of `default_base_url`, not merely
+    // an occurrence somewhere in the file: every one of these logic modules
+    // also quotes its base URL in a doc comment, so a `contains` check would
+    // pass on a component whose real config had drifted.
+    let logic_path = bundle_dir.join("src/logic.rs");
+    let logic = std::fs::read_to_string(&logic_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", logic_path.display()));
+    let configured = configured_default_base_url(&logic).unwrap_or_else(|| {
+        panic!(
+            "{} must assign a string literal to `default_base_url`",
+            logic_path.display()
+        )
+    });
+    assert_eq!(
+        configured,
+        base_url,
+        "{} configures base URL {configured:?} but the {id} descriptor says \
+         {base_url:?} — the allowlist check matches on HOST only and the \
+         conformance battery overrides the base URL through storage, so a wrong \
+         PATH escapes every other gate in this file",
+        logic_path.display(),
+    );
+}
+
+/// The string literal a provider component's `logic.rs` assigns to
+/// `default_base_url`, if any — the base URL that component will really send
+/// to when the user has set no override. Source-text extraction, because these
+/// bundles are separate workspaces the engine crate cannot link against.
+fn configured_default_base_url(logic: &str) -> Option<&str> {
+    let assignment = logic.split("default_base_url:").nth(1)?;
+    let (_, after_open_quote) = assignment.split_once('"')?;
+    let (value, _) = after_open_quote.split_once('"')?;
+    Some(value)
+}
+
+#[test]
+fn every_ported_provider_bundle_declares_provider_auth_and_only_its_own_host() {
+    use crate::llm_router::registry::AuthScheme;
+
     for fixture in OPENAI_FORMAT_FIXTURES {
-        let id = fixture.provider_id;
-        let descriptor = registry::descriptor(id)
-            .unwrap_or_else(|| panic!("{id} must exist in the router catalog"));
-        let base_url = descriptor
-            .base_url
-            .unwrap_or_else(|| panic!("{id} must declare a base_url to allowlist"));
-        let expected_host = url::Url::parse(base_url)
-            .unwrap_or_else(|e| panic!("{id} base_url {base_url}: {e}"))
-            .host_str()
-            .unwrap_or_else(|| panic!("{id} base_url {base_url} has no host"))
-            .to_string();
-
-        // The descriptor facts every component in this slice was built from.
-        assert_eq!(
-            descriptor.category,
-            ProviderCategory::ApiKey,
-            "{id} category"
-        );
-        assert_eq!(descriptor.auth, AuthScheme::Bearer, "{id} auth scheme");
-        assert!(descriptor.has_models_endpoint, "{id} has_models_endpoint");
-        assert_eq!(descriptor.chat_path, None, "{id} chat_path");
-
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../plugins")
-            .join(id)
-            .join("ryuzi-plugin.toml");
-        let text =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let manifest: PluginBundleManifest =
-            toml::from_str(&text).unwrap_or_else(|e| panic!("{id} manifest: {e}"));
-        manifest
-            .validate()
-            .unwrap_or_else(|e| panic!("{id} manifest is invalid: {e}"));
-
-        assert_eq!(manifest.id, id, "bundle id");
-        assert_eq!(
-            manifest.provider_ids,
-            vec![id.to_string()],
-            "{id} must declare provider-ids EXPLICITLY — the [id] fallback does \
-             not grant ryuzi:provider-auth",
-        );
-        let hosts: Vec<&str> = manifest
-            .permissions
-            .network
-            .iter()
-            .map(|host| host.0.as_str())
-            .collect();
-        assert_eq!(
-            hosts,
-            vec![expected_host.as_str()],
-            "{id} must allowlist exactly the host of its descriptor's base_url \
-             ({base_url}) — a wider allowlist widens where the user's key may go",
-        );
+        // Every OpenAI-format descriptor ported so far declares Bearer auth.
+        assert_bundle_is_declared_like_its_provider(fixture.provider_id, AuthScheme::Bearer);
     }
 }

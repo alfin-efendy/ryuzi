@@ -10,8 +10,8 @@ package ryuzi:openai@0.1.0;
 // the network either.
 //
 // `ryuzi:storage/storage` carries the OPTIONAL base-URL override (see
-// `logic::BASE_URL_STORAGE_KEY`) used both by OpenAI-compatible proxies and by
-// the provider conformance harness's mock upstream.
+// `ryuzi_openai_format::BASE_URL_STORAGE_KEY`) used both by OpenAI-compatible
+// proxies and by the provider conformance harness's mock upstream.
 //
 // The build materializes `wit/deps/` from the SDK the same way the fixtures do
 // (see scripts/plugins/build-first-party.ts).

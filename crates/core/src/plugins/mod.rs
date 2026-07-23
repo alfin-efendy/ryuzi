@@ -253,7 +253,7 @@ pub(crate) fn build_provider_component_once(plugin_dir: &str) {
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !built.insert(plugin_dir.to_string()) {
+    if built.contains(plugin_dir) {
         return;
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -270,6 +270,12 @@ pub(crate) fn build_provider_component_once(plugin_dir: &str) {
         status.success(),
         "{plugin_dir} component build failed: {status}"
     );
+    // Recorded only AFTER the build succeeded. Recording it up front would
+    // make a FAILED build look done, so the next test in this process would
+    // skip the build and fail on a missing artifact instead of on the real
+    // compile error. The `assert!` above unwinds before this line, leaving the
+    // directory unrecorded so the next caller retries and sees the true error.
+    built.insert(plugin_dir.to_string());
 }
 
 /// Add every generated manifest-only builtin — every model provider
