@@ -3441,6 +3441,25 @@ impl Store {
         .await
     }
 
+    /// Every distinct `plugin_id` that has at least one row in the component
+    /// release ledger, sorted. This is the ledger-driven set of installed
+    /// component plugins `plugin_doctor` iterates — deriving it from the ledger
+    /// (rather than scanning the on-disk install root) keeps diagnostics
+    /// hermetic (a fresh store yields an empty set) and still surfaces a
+    /// revoked release whose on-disk directory was already removed.
+    pub async fn list_component_release_plugin_ids(&self) -> anyhow::Result<Vec<String>> {
+        self.with_conn(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT DISTINCT plugin_id FROM component_plugin_releases ORDER BY plugin_id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// The currently active release for `plugin_id`, if any. At most one row
     /// can be active per plugin (enforced by the partial unique index on
     /// `component_plugin_releases(plugin_id) WHERE active=1` plus

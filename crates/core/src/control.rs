@@ -336,6 +336,25 @@ impl ControlPlane {
         crate::plugins::stop_revoked_gateways(&live, revoked_ids).await
     }
 
+    /// The restart budget health of every currently-running registered gateway
+    /// that has one (`(gateway_id, health)` pairs). Read by `plugin_doctor` to
+    /// surface a long-lived WASM gateway stuck restarting. Native gateways
+    /// report no restart health and are skipped; dropped `Weak`s (a gateway
+    /// already gone) are skipped. Generic: no plugin-id branch — it delegates
+    /// entirely to [`crate::gateway::Gateway::restart_health`].
+    pub fn gateway_restart_health(&self) -> Vec<(String, crate::gateway::GatewayRestartHealth)> {
+        let guard = self.live_gateways.lock().unwrap();
+        guard
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter_map(|gateway| {
+                gateway
+                    .restart_health()
+                    .map(|health| (gateway.id().to_string(), health))
+            })
+            .collect()
+    }
+
     /// One-time, best-effort startup maintenance for the install ledger and
     /// on-disk skill/plugin trees. Call this EXACTLY ONCE, from a real
     /// long-running host, AFTER the `ControlPlane` is built — never from

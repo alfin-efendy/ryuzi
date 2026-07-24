@@ -115,6 +115,17 @@ impl Default for SupervisorTuning {
     }
 }
 
+/// Consecutive-restart count at which a supervised gateway's capped
+/// exponential backoff has reached its ceiling under the DEFAULT tuning
+/// (`base_backoff * 2^n >= max_backoff`): from here on it retries as slowly as
+/// it ever will. The supervisor never permanently gives up — it keeps
+/// restarting forever at the ceiling — so `plugin_doctor` defines
+/// "restart-exhausted" as a gateway that is NOT running while already at (or
+/// past) this steady-state slow-retry point, rather than a hard stop that does
+/// not exist. (Default tuning: `500ms * 2^6 = 32s`, capped to the `30s`
+/// ceiling; at `2^5 = 16s` it is still climbing — see the test below.)
+pub const GATEWAY_BACKOFF_CEILING_RESTARTS: u32 = 6;
+
 /// The capped exponential backoff for the `attempt`-th consecutive rapid trap
 /// (0-based). Pure and unit-testable: `base * 2^attempt`, clamped to
 /// `max_backoff`.
@@ -847,6 +858,24 @@ mod tests {
         // Capped from here on — never exceeds max_backoff.
         assert_eq!(backoff_delay(&tuning, 4), Duration::from_millis(800));
         assert_eq!(backoff_delay(&tuning, 40), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn backoff_ceiling_restart_count_matches_the_default_tuning_cap() {
+        // The doctor's `gateway-restart-exhausted` threshold must be exactly
+        // the point where the DEFAULT tuning's backoff reaches its ceiling: one
+        // restart earlier it is still climbing, and at the threshold it is
+        // pinned at `max_backoff`.
+        let tuning = SupervisorTuning::default();
+        assert!(
+            backoff_delay(&tuning, GATEWAY_BACKOFF_CEILING_RESTARTS - 1) < tuning.max_backoff,
+            "one restart before the ceiling the backoff must still be climbing"
+        );
+        assert_eq!(
+            backoff_delay(&tuning, GATEWAY_BACKOFF_CEILING_RESTARTS),
+            tuning.max_backoff,
+            "at the ceiling restart count the backoff must be pinned at max_backoff"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

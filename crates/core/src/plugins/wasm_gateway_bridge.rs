@@ -1164,6 +1164,17 @@ impl Gateway for WasmGateway {
     fn subscribe_status(&self) -> Option<GatewayStatusSubscription> {
         Some(self.status.subscribe())
     }
+
+    /// Expose the supervisor's live restart budget so `plugin_doctor` can
+    /// report a gateway stuck restarting without reaching into the private
+    /// supervisor. Reads the same observable snapshot `subscribe_status` maps.
+    fn restart_health(&self) -> Option<crate::gateway::GatewayRestartHealth> {
+        let snapshot = self.supervisor.status();
+        Some(crate::gateway::GatewayRestartHealth {
+            running: snapshot.running,
+            restart_count: snapshot.restart_count,
+        })
+    }
 }
 
 /// Construct one [`WasmGateway`] per enabled, long-lived gateway bundle under
