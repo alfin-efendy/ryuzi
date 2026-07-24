@@ -10,16 +10,20 @@ import {
 } from "./bindings";
 
 // Plugins domain store. Definitions (manifests) live in the engine — builtin,
-// embedded catalog, or user-authored — and this store mirrors the flattened
+// component bundle, or user-authored — and this store mirrors the flattened
 // `PluginInfo` list Cockpit needs for the Plugins hub screens.
 
-// The Task 11a first-party component (WASM bundle) ids, mirroring
-// `crate::plugins::remote_catalog::FIRST_PARTY_BUNDLE_IDS`. Component bundles
-// are NOT registered as `CorePlugin`s (see `plugins::host`'s doc), so they
-// never appear in `listPlugins`/`pluginDetail` — this is Cockpit's only way
-// to know which ids to ask `pluginReleaseDetail` about for the Installed
-// tab's "Component plugins" section and the bootstrap-retry banner.
-export const FIRST_PARTY_BUNDLE_IDS = ["mimo", "opencode"] as const;
+/** Ids of every component-sourced plugin in the engine's list.
+ *
+ *  Replaces the old hardcoded `FIRST_PARTY_BUNDLE_IDS`. Component bundles are
+ *  now registered as manifest-only `CorePlugin`s
+ *  (`plugins::component_catalog`, `PluginSource::Component`), so they DO appear
+ *  in `listPlugins` and the engine is the single source of truth for which
+ *  components exist — Cockpit no longer has to mirror a Rust constant to know
+ *  which ids to ask `pluginReleaseDetail` about. */
+export function componentPluginIds(plugins: Pick<PluginInfo, "id" | "source">[]): string[] {
+  return plugins.filter((p) => p.source === "component").map((p) => p.id);
+}
 
 type PluginsState = {
   plugins: PluginInfo[];
@@ -37,10 +41,10 @@ type PluginsState = {
   /** `component_bootstrap_status` snapshot for the Plugins view's retryable
    *  bootstrap banner — `null` until the first fetch resolves. */
   componentBootstrapStatus: ComponentBootstrapStatus | null;
-  /** `plugin_release_detail` for every known first-party component id
-   *  (`FIRST_PARTY_BUNDLE_IDS`) — the Installed tab's "Component plugins"
-   *  section reads this instead of `plugins` (component bundles aren't
-   *  `PluginInfo` entries). */
+  /** `plugin_release_detail` for every component-sourced id in `plugins`
+   *  (see `componentPluginIds`) — the Installed tab's "Component plugins"
+   *  section reads this for the release ledger (version, rollback), which a
+   *  `PluginInfo` row does not carry. */
   componentPlugins: ComponentReleaseDetail[];
   componentPluginsLoaded: boolean;
   load: () => Promise<void>;
@@ -202,7 +206,8 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   },
 
   loadComponentPlugins: async () => {
-    const details = await Promise.all(FIRST_PARTY_BUNDLE_IDS.map((id) => commands.pluginReleaseDetail("local", id)));
+    const ids = componentPluginIds(get().plugins);
+    const details = await Promise.all(ids.map((id) => commands.pluginReleaseDetail("local", id)));
     const componentPlugins = details.flatMap((res) => (res.status === "ok" ? [res.data] : []));
     set({ componentPlugins, componentPluginsLoaded: true });
   },
@@ -239,7 +244,8 @@ export const usePlugins = create<PluginsState>((set, get) => ({
   },
 
   retryComponentBootstrap: async () => {
-    await Promise.allSettled(FIRST_PARTY_BUNDLE_IDS.map((id) => commands.installComponentPlugin("local", id, null)));
+    const ids = componentPluginIds(get().plugins);
+    await Promise.allSettled(ids.map((id) => commands.installComponentPlugin("local", id, null)));
     await get().loadComponentPlugins();
     const res = await commands.componentBootstrapStatus("local");
     if (res.status !== "ok") return;

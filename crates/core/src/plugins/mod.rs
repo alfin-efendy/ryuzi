@@ -22,8 +22,8 @@
 
 pub mod bundle;
 pub mod capabilities;
-pub mod catalog;
 pub mod catalog_feed_key;
+pub mod component_catalog;
 pub mod declarative;
 pub mod doctor;
 pub mod extension;
@@ -280,11 +280,9 @@ pub(crate) fn build_provider_component_once(plugin_dir: &str) {
 
 /// Add every generated manifest-only builtin — every model provider
 /// ([`providers::provider_plugins`]) — to `regs`. Factored out of
-/// [`install_builtins`] so the daemon composition root can add providers,
-/// then the (embedded + remote-catalog) merged set from
-/// [`catalog::merged_catalog_plugins`], in place of the embedded-only
-/// `catalog_plugins()` loop `install_builtins` still runs for callers that
-/// don't read the remote cache (e.g. `test_cp`, `ryuzi config`).
+/// [`install_builtins`] so the daemon composition root can add providers
+/// first and the component catalog after, matching this function's own
+/// ordering guarantee.
 pub fn install_providers(regs: &mut Registries) {
     for plugin in providers::provider_plugins() {
         regs.add_plugin(plugin);
@@ -292,29 +290,28 @@ pub fn install_providers(regs: &mut Registries) {
 }
 
 /// Add every generated manifest-only builtin — every model provider
-/// ([`providers::provider_plugins`]) — plus the embedded integration catalog
-/// ([`catalog::catalog_plugins`]) to `regs`.
+/// ([`providers::provider_plugins`]) plus the first-party component catalog
+/// ([`component_catalog::component_catalog_plugins`]) — to `regs`.
 ///
-/// This deliberately does NOT add `native` or `discord`: those carry
-/// host-injected config (a gateway factory) that only the composition root
-/// can supply, so hosts add them first and call `install_builtins`
-/// afterward.
+/// This deliberately does NOT add `native`: it carries host-injected config
+/// that only the composition root can supply, so hosts add it first and call
+/// `install_builtins` afterward.
 ///
-/// The catalog is added last: `Registries::add_plugin` keeps the first
-/// registration for a colliding id, so providers (added above) always win
-/// over a same-id catalog entry, and both of those always lose to
-/// `native`/`discord` (added by the composition root before calling this
-/// function).
+/// The component catalog is added last: `Registries::add_plugin` keeps the
+/// first registration for a colliding id, so providers (added above) always
+/// win over a same-id component bundle, and both lose to `native` (added by
+/// the composition root before calling this function).
 ///
-/// This is the embedded-catalog-only path. The daemon's real composition
-/// root (`daemon::build_daemon`) does NOT call this — it calls
-/// [`install_providers`] followed by [`catalog::merged_catalog_plugins`] so
-/// the remote catalog cache can version-gate override the embedded catalog.
-/// `install_builtins` stays embedded-only for every other caller (tests,
-/// `ryuzi config`) so their behavior is unaffected by the remote cache.
+/// `daemon::build_daemon` does not call this — it inlines the same two steps
+/// in the same order so it can interleave skill-pack loading — but the
+/// resulting registration set is identical.
 pub fn install_builtins(regs: &mut Registries) {
+    // Order is load-bearing: `Registries::add_plugin` keeps the FIRST
+    // registration for an id. Providers must precede the component catalog so
+    // a colliding provider component never displaces its builtin's richer
+    // manifest (seed models, auth spec) — see `component_catalog`'s module doc.
     install_providers(regs);
-    for plugin in catalog::catalog_plugins() {
+    for plugin in component_catalog::component_catalog_plugins() {
         regs.add_plugin(plugin);
     }
 }
@@ -1319,6 +1316,49 @@ mod install_builtins_tests {
         }
     }
 
+    // The whole point of `component_catalog`: a WASM bundle under `plugins/`
+    // must be enumerable through `list_plugins`, which reads `PluginHost`.
+    #[test]
+    fn install_builtins_registers_component_bundles() {
+        let mut regs = Registries::new();
+        install_builtins(&mut regs);
+        let ids: Vec<String> = regs
+            .plugins
+            .list()
+            .iter()
+            .map(|p| p.manifest.id.clone())
+            .collect();
+
+        for id in [
+            "github",
+            "atlassian",
+            "bitbucket",
+            "discord",
+            "mimo",
+            "opencode",
+        ] {
+            assert!(ids.iter().any(|got| got == id), "`{id}` must be registered");
+        }
+    }
+
+    // Providers register first and win the id, so a colliding provider
+    // component must never displace the builtin's richer provider metadata.
+    #[test]
+    fn colliding_provider_ids_stay_owned_by_their_builtin() {
+        let mut regs = Registries::new();
+        install_builtins(&mut regs);
+        for id in component_catalog::COMPONENT_BACKED_PROVIDER_IDS {
+            let Some(plugin) = regs.plugins.get(id) else {
+                continue; // not every excluded id is in the router CATALOG
+            };
+            assert_ne!(
+                plugin.source,
+                host::PluginSource::Component,
+                "`{id}` must stay owned by its builtin, not the component"
+            );
+        }
+    }
+
     #[test]
     fn install_builtins_ids_never_collide_with_native() {
         let mut regs = Registries::new();
@@ -1344,12 +1384,13 @@ mod install_builtins_tests {
             "duplicate plugin ids after install_builtins: {ids:?}"
         );
 
-        // 1 pre-registered (native) + every provider + every embedded
-        // integration-catalog entry (`catalog::CATALOG_MANIFESTS`, disjoint
-        // from all of the above by construction — see `catalog`'s own
-        // collision test).
-        let expected =
-            1 + crate::llm_router::registry::CATALOG.len() + catalog::CATALOG_MANIFESTS.len();
+        // 1 pre-registered (native) + every provider + every component bundle
+        // the provider registry does not already own (`component_catalog`
+        // skips those rather than letting `add_plugin` drop them, so nothing
+        // is silently lost here).
+        let expected = 1
+            + crate::llm_router::registry::CATALOG.len()
+            + component_catalog::component_catalog_plugins().len();
         assert_eq!(
             ids.len(),
             expected,

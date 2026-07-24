@@ -2532,10 +2532,13 @@ pinned: boolean;
  */
 sourceSpec: string | null; resolvedCommit: string | null; installedAt: number | null; updatedAt: number | null; trustTier: string | null;
 /**
- * `embedded` | `remote` — which catalog source won for this id.
- * `None` for builtins and skill packs (never from either catalog).
+ * This id ships as a first-party WASM component bundle
+ * (`plugins::component_catalog::is_component_bundle`). True regardless of
+ * which registration won the id — a provider bundle is represented by its
+ * builtin row but is still component-backed — so Cockpit can offer
+ * release management (install / active version / rollback) for it.
  */
-catalogSource: string | null;
+componentBacked: boolean;
 /**
  * The remote catalog feed's `version` for this id, when a cached
  * `plugin_catalog_cache` row matches. `None` when the id was never seen

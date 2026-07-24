@@ -30,7 +30,7 @@ import { BackButton, DetailHeader } from "@/components/common/DetailHeader";
 import { IconChip, Pill, PluginStatusBadge } from "@/components/common/bits";
 import { pluginIcon } from "@/lib/plugin-icons";
 import { useNav } from "@/store-nav";
-import { FIRST_PARTY_BUNDLE_IDS, usePlugins } from "@/store-plugins";
+import { usePlugins } from "@/store-plugins";
 
 const WARN = "#F59E0B";
 
@@ -89,9 +89,10 @@ export function extensionStatusPillVariant(status: string): "primary" | "warn" |
 
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
 //
-// mimo/opencode (and any future first-party component) are never `CorePlugin`s
-// (see `store-plugins.ts`'s `FIRST_PARTY_BUNDLE_IDS` doc), so `pluginDetail`
-// 404s for them — this view falls back to a component-only render (below)
+// First-party components are registered manifest-only (`PluginSource::Component`,
+// see `plugins::component_catalog`), so `pluginDetail` resolves for them and
+// this view renders normally. A component with a release ledger but NO
+// registered manifest still falls back to a component-only render (below)
 // driven entirely by `plugin_release_detail`. Pure helpers here are exported
 // so they stay unit-testable without mounting the view.
 
@@ -562,13 +563,12 @@ export function PluginDetailView({ id }: { id: string }) {
   }
 
   // A component (WASM bundle) plugin — mimo/opencode today — is never a
-  // `CorePlugin`, so `detail` is always `null` for it; treat it as "known" if
-  // it's one of the documented first-party ids (so a brand-new, never-yet-
-  // installed one still opens its management page from the "Manage" button)
-  // or it already has SOME release-ledger footprint (forward-compatible with
-  // a future non-first-party component plugin).
-  const isComponentOnly =
-    !detail && releaseDetail !== null && ((FIRST_PARTY_BUNDLE_IDS as readonly string[]).includes(id) || releaseDetail.releases.length > 0);
+  // `CorePlugin`. First-party bundles now ARE registered (see
+  // `plugins::component_catalog`), so they resolve a normal `detail`; this
+  // fallback remains for any component that has a release-ledger footprint
+  // without a registered manifest — e.g. a bundle installed by id before its
+  // manifest shipped, or a future third-party component.
+  const isComponentOnly = !detail && releaseDetail !== null && releaseDetail.releases.length > 0;
 
   if (!detail && !isComponentOnly) {
     return (
@@ -1054,12 +1054,13 @@ export function PluginDetailView({ id }: { id: string }) {
           </Card>
         )}
 
-        {/* Forward-compat: a component (WASM bundle) plugin isn't a
-            `CorePlugin` today (see `isComponentOnly` above), so this never
-            renders alongside a real `detail` yet — kept so a future plugin
-            that is BOTH gets the release-management card without another
-            code path. */}
-        {releaseDetail && (releaseDetail.releases.length > 0 || releaseDetail.activeVersion !== null) && (
+        {/* A component (WASM bundle) plugin is now BOTH a registered
+            `CorePlugin` (so it has a real `detail`) AND has a release ledger,
+            so this card renders alongside the normal detail. It shows for any
+            component-backed plugin — even one never installed yet — so its
+            install / permission-acceptance gate is reachable; a non-component
+            plugin only shows it if it somehow has release footprint. */}
+        {releaseDetail && (info.componentBacked || releaseDetail.releases.length > 0 || releaseDetail.activeVersion !== null) && (
           <ComponentReleaseCard
             id={id}
             detail={releaseDetail}

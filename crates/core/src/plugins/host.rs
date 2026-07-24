@@ -138,16 +138,17 @@ fn register_plugin_fields(manifest: &PluginManifest) {
 pub enum PluginSource {
     /// Shipped inside the `ryuzi` binary (the native harness, the discord gateway).
     Builtin,
-    /// Bundled in the embedded plugin catalog.
-    Catalog,
-    /// Delivered by the signed remote catalog feed (see
-    /// `crate::plugins::remote_catalog`). Distinct from `Catalog` only so the
-    /// api layer can report `catalogSource: "remote"`.
-    RemoteCatalog,
     /// Installed as a skill pack by the skills installer
     /// (`crate::skills_install`) — carries the manifest's own on-disk
     /// directory.
     SkillPack(std::path::PathBuf),
+    /// A signed WASM component bundle shipped first-party from `plugins/<id>`
+    /// (see `crate::plugins::component_catalog`). Registered manifest-only:
+    /// the executable capability is still discovered off disk in
+    /// `daemon::build_daemon` from the *installed* bundle root, so this entry
+    /// exists purely to make the bundle visible and enumerable through
+    /// `list_plugins`.
+    Component,
 }
 
 /// A manifest bound to the behavioral capabilities it advertises. Each

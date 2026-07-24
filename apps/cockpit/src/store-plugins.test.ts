@@ -1,5 +1,5 @@
 import { test, expect, spyOn } from "bun:test";
-import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll, FIRST_PARTY_BUNDLE_IDS } from "./store-plugins";
+import { usePlugins, browsePlugins, installedPlugins, summarizeUpdateAll, componentPluginIds } from "./store-plugins";
 import { commands, type CatalogStatus, type ComponentReleaseDetail, type DoctorFinding, type PluginInfo } from "./bindings";
 import { LOCAL_RUNNER } from "@/lib/session-key";
 
@@ -66,8 +66,8 @@ const builtin: PluginInfo = {
   installedAt: null,
   updatedAt: null,
   trustTier: null,
-  catalogSource: null,
   catalogVersion: null,
+  componentBacked: false,
   blockedReason: null,
 };
 
@@ -82,7 +82,7 @@ const github: PluginInfo = {
   verified: true,
   experimental: false,
   enabled: true,
-  source: "catalog",
+  source: "component",
   capabilities: ["connector"],
   configured: false,
   kind: "integration",
@@ -94,8 +94,8 @@ const github: PluginInfo = {
   installedAt: null,
   updatedAt: null,
   trustTier: null,
-  catalogSource: null,
   catalogVersion: null,
+  componentBacked: false,
   blockedReason: null,
 };
 
@@ -405,8 +405,18 @@ test("summarizeUpdateAll counts updated/needsReack/failed outcomes", () => {
 
 // ---------- Component-plugin (WASM bundle) release management — Task 12 ----------
 
-test("FIRST_PARTY_BUNDLE_IDS mirrors the core constant", () => {
-  expect(FIRST_PARTY_BUNDLE_IDS).toEqual(["mimo", "opencode"]);
+test("componentPluginIds derives ids from the plugin list, not a hardcoded set", () => {
+  const plugins = [
+    { id: "github", source: "component" },
+    { id: "anthropic", source: "builtin" },
+    { id: "discord", source: "component" },
+    { id: "superpowers", source: "skill-pack" },
+  ];
+  expect(componentPluginIds(plugins)).toEqual(["github", "discord"]);
+});
+
+test("componentPluginIds is empty when no component plugin is registered", () => {
+  expect(componentPluginIds([{ id: "anthropic", source: "builtin" }])).toEqual([]);
 });
 
 test("loadComponentBootstrapStatus populates componentBootstrapStatus", async () => {
@@ -434,8 +444,20 @@ test("loadComponentBootstrapStatus leaves the prior status untouched on error", 
   spy.mockRestore();
 });
 
-test("loadComponentPlugins fetches every known first-party id and keeps only the ok results", async () => {
+/** Seed the plugin list with the component-sourced rows the release-management
+ *  actions derive their id list from (`componentPluginIds`). */
+function seedComponentPlugins() {
+  usePlugins.setState({
+    plugins: [
+      { ...github, id: "mimo", name: "MiMo", source: "component" },
+      { ...github, id: "opencode", name: "OpenCode", source: "component" },
+    ],
+  });
+}
+
+test("loadComponentPlugins fetches every component id and keeps only the ok results", async () => {
   reset();
+  seedComponentPlugins();
   const spy = spyOn(commands, "pluginReleaseDetail").mockImplementation(async (_runnerId, id) => {
     if (id === "mimo") return { status: "ok", data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }) };
     return { status: "error", error: { message: "boom" } };
@@ -474,6 +496,7 @@ test("pluginReleaseDetail toasts and returns null on error", async () => {
 
 test("installComponentPlugin installs, reloads componentPlugins, and returns the release detail", async () => {
   reset();
+  seedComponentPlugins();
   const installed = componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.2.0" });
   const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({ status: "ok", data: installed });
   const detailSpy = spyOn(commands, "pluginReleaseDetail").mockResolvedValue({ status: "ok", data: installed });
@@ -550,6 +573,7 @@ test("rollbackComponentPlugin toasts the error and returns null", async () => {
 
 test("retryComponentBootstrap installs every known first-party id, then reloads status and componentPlugins", async () => {
   reset();
+  seedComponentPlugins();
   const installSpy = spyOn(commands, "installComponentPlugin").mockResolvedValue({
     status: "ok",
     data: componentReleaseDetail(),
@@ -573,6 +597,7 @@ test("retryComponentBootstrap installs every known first-party id, then reloads 
 
 test("retryComponentBootstrap tolerates a per-id install failure and still refreshes the pending status", async () => {
   reset();
+  seedComponentPlugins();
   const installSpy = spyOn(commands, "installComponentPlugin").mockImplementation(async (_runnerId, id) => {
     if (id === "mimo") return { status: "ok", data: componentReleaseDetail({ pluginId: "mimo", activeVersion: "0.1.0" }) };
     return { status: "error", error: { message: "still unreachable" } };
