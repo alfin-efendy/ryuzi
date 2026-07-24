@@ -2,27 +2,23 @@ import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentOauthProfileInfo } from "@/bindings";
 
-const beginDeviceFlow = mock(
-  async (_r: string | null, _p: string, _pr: string, _u: string) => ({
-    status: "ok" as const,
-    data: {
-      deviceCode: "dev-code-xyz",
-      userCode: "WXYZ-1234",
-      verificationUri: "https://github.com/login/device",
-      verificationUriComplete: null as string | null,
-      intervalSecs: 0,
-      expiresAt: Date.now() + 600_000,
-    },
-  }),
-);
+const beginDeviceFlow = mock(async (_r: string | null, _p: string, _pr: string, _u: string) => ({
+  status: "ok" as const,
+  data: {
+    deviceCode: "dev-code-xyz",
+    userCode: "WXYZ-1234",
+    verificationUri: "https://github.com/login/device",
+    verificationUriComplete: null as string | null,
+    intervalSecs: 0,
+    expiresAt: Date.now() + 600_000,
+  },
+}));
 // Each entry is either an ok-outcome string or the literal "ERR" to simulate a
 // transient RPC failure (the store maps that to a `null` outcome).
 let pollOutcomes: string[] = ["ready"];
 const pollDeviceFlow = mock(async () => {
   const next = pollOutcomes.shift() ?? "ready";
-  return next === "ERR"
-    ? { status: "error" as const, error: { message: "error sending request" } }
-    : { status: "ok" as const, data: next };
+  return next === "ERR" ? { status: "error" as const, error: { message: "error sending request" } } : { status: "ok" as const, data: next };
 });
 const disconnect = mock(async () => ({ status: "ok" as const, data: null }));
 const openUrl = mock(async (_u: string) => {});

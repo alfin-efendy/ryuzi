@@ -205,8 +205,8 @@ test("reorderProjects seeds from currentIds and persists", () => {
 test("toggleCollapsed flips a key and persists", () => {
   useUi.setState({ collapsed: {} });
   useUi.getState().toggleCollapsed("__tasks__");
-  expect(useUi.getState().collapsed["__tasks__"]).toBe(true);
+  expect(useUi.getState().collapsed.__tasks__).toBe(true);
   useUi.getState().toggleCollapsed("__tasks__");
-  expect(useUi.getState().collapsed["__tasks__"]).toBe(false);
-  expect(JSON.parse(localStorage.getItem("cockpit.ui.collapsed")!)["__tasks__"]).toBe(false);
+  expect(useUi.getState().collapsed.__tasks__).toBe(false);
+  expect(JSON.parse(localStorage.getItem("cockpit.ui.collapsed")!).__tasks__).toBe(false);
 });

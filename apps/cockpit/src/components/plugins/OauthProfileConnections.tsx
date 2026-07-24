@@ -90,13 +90,7 @@ export function OauthProfileConnections({
         }
         await sleep(intervalMs);
         if (cancelledRef.current) return;
-        const outcome = await pollProfileDeviceFlow(
-          pluginId,
-          profile.id,
-          profile.tokenUrl,
-          start.deviceCode,
-          start.expiresAt,
-        );
+        const outcome = await pollProfileDeviceFlow(pluginId, profile.id, profile.tokenUrl, start.deviceCode, start.expiresAt);
         if (cancelledRef.current) return;
         if (outcome === null) {
           // Transient poll error (a network blip on this fresh connection).
@@ -167,12 +161,7 @@ export function OauthProfileConnections({
               </div>
               {profile.connected ? <Pill variant="primary">Connected</Pill> : <Pill variant="secondary">Not connected</Pill>}
               {profile.connected ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={busy === profile.id}
-                  onClick={() => void disconnect(profile.id)}
-                >
+                <Button variant="outline" size="sm" disabled={busy === profile.id} onClick={() => void disconnect(profile.id)}>
                   Disconnect
                 </Button>
               ) : (

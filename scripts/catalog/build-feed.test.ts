@@ -145,12 +145,23 @@ test("buildFeedObject defaults a blocked entry's sinceSequence to the feed's own
 // directory the release workflow points build-feed.ts at — so a broken
 // manifest or an id/filename drift is caught by `bun test`, not only at
 // release time.
-test("readCatalogEntries parses every real embedded catalog manifest with a matching id", async () => {
+test("the embedded catalog was removed — readCatalogEntries yields nothing", async () => {
+  // The embedded declarative catalog (crates/core/plugins/catalog/*.toml) was
+  // deleted with the component-catalog migration; `readCatalogEntries` reads
+  // the now-missing directory gracefully (Bun's glob scan yields nothing).
   const entries = await readCatalogEntries(DEFAULT_CATALOG_DIR);
-  expect(entries.length).toBeGreaterThanOrEqual(24);
+  expect(entries).toEqual([]);
+});
+
+test("readCatalogEntries parses a synthetic catalog dir with matching ids", async () => {
+  const dir = await tempDir();
+  await Bun.write(join(dir, "acme.toml"), 'id="acme"\nname="Acme"\nversion="1.0.0"');
+  await Bun.write(join(dir, "beta.toml"), 'id="beta"\nname="Beta"\nversion="1.0.0"');
+  const entries = await readCatalogEntries(dir);
+  expect(entries.length).toBe(2);
   const ids = entries.map((e) => e.id);
   expect(new Set(ids).size).toBe(ids.length); // no duplicates
-  expect(ids).toContain("github");
+  expect(ids).toContain("acme");
   for (const entry of entries) {
     const parsed = Bun.TOML.parse(entry.manifestToml) as { id: string };
     expect(parsed.id).toBe(entry.id);
